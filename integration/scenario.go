@@ -338,7 +338,11 @@ func (s *Scenario) WaitForTailscaleSync() error {
 // CreateHeadscaleEnv is a conventient method returning a set up Headcale
 // test environment with nodes of all versions, joined to the server with X
 // namespaces.
-func (s *Scenario) CreateHeadscaleEnv(namespaces map[string]int, opts ...hsic.Option) error {
+func (s *Scenario) CreateHeadscaleEnv(
+	namespaces map[string]int,
+	tailscaleOpts []tsic.Option,
+	opts ...hsic.Option,
+) error {
 	headscale, err := s.Headscale(opts...)
 	if err != nil {
 		return err

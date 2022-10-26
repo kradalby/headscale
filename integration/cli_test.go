@@ -8,6 +8,7 @@ import (
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
 	"github.com/juanfont/headscale/integration/hsic"
+	"github.com/juanfont/headscale/integration/tsic"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -37,7 +38,7 @@ func TestNamespaceCommand(t *testing.T) {
 		"namespace2": 0,
 	}
 
-	err = scenario.CreateHeadscaleEnv(spec, hsic.WithTestName("clins"))
+	err = scenario.CreateHeadscaleEnv(spec, []tsic.Option{}, hsic.WithTestName("clins"))
 	assert.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
@@ -115,10 +116,11 @@ func TestPreAuthKeyCommand(t *testing.T) {
 	assert.NoError(t, err)
 
 	spec := map[string]int{
-		namespace: 0,
+		"namespace1": 0,
+		"namespace2": 0,
 	}
 
-	err = scenario.CreateHeadscaleEnv(spec, hsic.WithTestName("clipak"))
+	err = scenario.CreateHeadscaleEnv(spec, []tsic.Option{}, hsic.WithTestName("clipak"))
 	assert.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
@@ -258,7 +260,7 @@ func TestPreAuthKeyCommandWithoutExpiry(t *testing.T) {
 		namespace: 0,
 	}
 
-	err = scenario.CreateHeadscaleEnv(spec, hsic.WithTestName("clipaknaexp"))
+	err = scenario.CreateHeadscaleEnv(spec, []tsic.Option{}, hsic.WithTestName("clipaknaexp"))
 	assert.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
@@ -323,7 +325,7 @@ func TestPreAuthKeyCommandReusableEphemeral(t *testing.T) {
 		namespace: 0,
 	}
 
-	err = scenario.CreateHeadscaleEnv(spec, hsic.WithTestName("clipakresueeph"))
+	err = scenario.CreateHeadscaleEnv(spec, []tsic.Option{}, hsic.WithTestName("clipakresueeph"))
 	assert.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
