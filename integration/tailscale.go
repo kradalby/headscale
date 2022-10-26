@@ -11,7 +11,7 @@ type TailscaleClient interface {
 	Shutdown() error
 	Version() string
 	Execute(command []string) (string, error)
-	Up(loginServer, authKey string) error
+	Up(loginServer, authKey string, enableSSH bool) error
 	IPs() ([]netip.Addr, error)
 	FQDN() (string, error)
 	Status() (*ipnstate.Status, error)

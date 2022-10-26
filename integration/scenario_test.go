@@ -157,7 +157,7 @@ func TestTailscaleNodesJoiningHeadcale(t *testing.T) {
 			t.Errorf("failed to create preauthkey: %s", err)
 		}
 
-		err = scenario.RunTailscaleUp(namespace, scenario.Headscale().GetEndpoint(), key.GetKey())
+		err = scenario.RunTailscaleUp(namespace, scenario.Headscale().GetEndpoint(), key.GetKey(), false)
 		if err != nil {
 			t.Errorf("failed to login: %s", err)
 		}

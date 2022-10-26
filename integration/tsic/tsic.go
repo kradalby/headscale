@@ -136,7 +136,7 @@ func (t *TailscaleInContainer) Execute(
 }
 
 func (t *TailscaleInContainer) Up(
-	loginServer, authKey string,
+	loginServer, authKey string, enableSSH bool,
 ) error {
 	command := []string{
 		"tailscale",
@@ -147,6 +147,10 @@ func (t *TailscaleInContainer) Up(
 		authKey,
 		"--hostname",
 		t.hostname,
+	}
+
+	if enableSSH {
+		command = append(command, "--ssh")
 	}
 
 	if _, err := t.Execute(command); err != nil {
