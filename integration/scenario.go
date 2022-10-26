@@ -47,6 +47,16 @@ var (
 	}
 )
 
+type HeadscaleSpec struct {
+	namespaces map[string]int
+	enableSSH  bool
+	acl        *headscale.ACLPolicy
+}
+
+func (h *HeadscaleSpec) aclPolicy() hsic.Option {
+	return hsic.WithACLPolicy(h.acl)
+}
+
 type Namespace struct {
 	Clients map[string]TailscaleClient
 
@@ -150,20 +160,8 @@ func (s *Scenario) Namespaces() []string {
 // Note: These functions assume that there is a _single_ headscale instance for now
 
 // TODO(kradalby): make port and headscale configurable, multiple instances support?
-func (s *Scenario) StartHeadscale() error {
-	headscale, err := hsic.New(s.pool, headscalePort, s.network,
-		hsic.WithACLPolicy(
-			&headscale.ACLPolicy{
-				ACLs: []headscale.ACL{
-					{
-						Action:       "accept",
-						Sources:      []string{"*"},
-						Destinations: []string{"*:*"},
-					},
-				},
-			},
-		),
-	)
+func (s *Scenario) StartHeadscale(opts ...hsic.Option) error {
+	headscale, err := hsic.New(s.pool, headscalePort, s.network, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to create headscale container: %w", err)
 	}
@@ -246,7 +244,7 @@ func (s *Scenario) CreateTailscaleNodesInNamespace(
 }
 
 func (s *Scenario) RunTailscaleUp(
-	namespaceStr, loginServer, authKey string,
+	namespaceStr, loginServer, authKey string, enableSSH bool,
 ) error {
 	if namespace, ok := s.namespaces[namespaceStr]; ok {
 		for _, client := range namespace.Clients {
@@ -256,7 +254,7 @@ func (s *Scenario) RunTailscaleUp(
 				defer namespace.joinWaitGroup.Done()
 
 				// TODO(kradalby): error handle this
-				_ = c.Up(loginServer, authKey)
+				_ = c.Up(loginServer, authKey, enableSSH)
 			}(client)
 		}
 		namespace.joinWaitGroup.Wait()
@@ -300,8 +298,8 @@ func (s *Scenario) WaitForTailscaleSync() error {
 // CreateHeadscaleEnv is a conventient method returning a set up Headcale
 // test environment with nodes of all versions, joined to the server with X
 // namespaces.
-func (s *Scenario) CreateHeadscaleEnv(namespaces map[string]int) error {
-	err := s.StartHeadscale()
+func (s *Scenario) CreateHeadscaleEnv(spec *HeadscaleSpec) error {
+	err := s.StartHeadscale(spec.aclPolicy())
 	if err != nil {
 		return err
 	}
@@ -311,7 +309,7 @@ func (s *Scenario) CreateHeadscaleEnv(namespaces map[string]int) error {
 		return err
 	}
 
-	for namespaceName, clientCount := range namespaces {
+	for namespaceName, clientCount := range spec.namespaces {
 		err = s.CreateNamespace(namespaceName)
 		if err != nil {
 			return err
@@ -327,7 +325,12 @@ func (s *Scenario) CreateHeadscaleEnv(namespaces map[string]int) error {
 			return err
 		}
 
-		err = s.RunTailscaleUp(namespaceName, s.Headscale().GetEndpoint(), key.GetKey())
+		err = s.RunTailscaleUp(
+			namespaceName,
+			s.Headscale().GetEndpoint(),
+			key.GetKey(),
+			spec.enableSSH,
+		)
 		if err != nil {
 			return err
 		}

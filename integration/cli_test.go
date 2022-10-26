@@ -31,9 +31,11 @@ func TestNamespaceCommand(t *testing.T) {
 	scenario, err := NewScenario()
 	assert.NoError(t, err)
 
-	spec := map[string]int{
-		"namespace1": 0,
-		"namespace2": 0,
+	spec := &HeadscaleSpec{
+		namespaces: map[string]int{
+			"namespace1": 0,
+			"namespace2": 0,
+		},
 	}
 
 	err = scenario.CreateHeadscaleEnv(spec)
@@ -110,8 +112,11 @@ func TestPreAuthKeyCommand(t *testing.T) {
 	scenario, err := NewScenario()
 	assert.NoError(t, err)
 
-	spec := map[string]int{
-		namespace: 0,
+	spec := &HeadscaleSpec{
+		namespaces: map[string]int{
+			"namespace1": 0,
+			"namespace2": 0,
+		},
 	}
 
 	err = scenario.CreateHeadscaleEnv(spec)
@@ -247,8 +252,10 @@ func TestPreAuthKeyCommandWithoutExpiry(t *testing.T) {
 	scenario, err := NewScenario()
 	assert.NoError(t, err)
 
-	spec := map[string]int{
-		namespace: 0,
+	spec := &HeadscaleSpec{
+		namespaces: map[string]int{
+			namespace: 0,
+		},
 	}
 
 	err = scenario.CreateHeadscaleEnv(spec)
@@ -309,8 +316,10 @@ func TestPreAuthKeyCommandReusableEphemeral(t *testing.T) {
 	scenario, err := NewScenario()
 	assert.NoError(t, err)
 
-	spec := map[string]int{
-		namespace: 0,
+	spec := &HeadscaleSpec{
+		namespaces: map[string]int{
+			namespace: 0,
+		},
 	}
 
 	err = scenario.CreateHeadscaleEnv(spec)

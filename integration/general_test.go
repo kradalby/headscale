@@ -17,9 +17,11 @@ func TestPingAllByIP(t *testing.T) {
 		t.Errorf("failed to create scenario: %s", err)
 	}
 
-	spec := map[string]int{
-		"namespace1": len(TailscaleVersions),
-		"namespace2": len(TailscaleVersions),
+	spec := &HeadscaleSpec{
+		namespaces: map[string]int{
+			"namespace1": len(TailscaleVersions),
+			"namespace2": len(TailscaleVersions),
+		},
 	}
 
 	err = scenario.CreateHeadscaleEnv(spec)
@@ -71,10 +73,12 @@ func TestPingAllByHostname(t *testing.T) {
 		t.Errorf("failed to create scenario: %s", err)
 	}
 
-	spec := map[string]int{
-		// Omit 1.16.2 (-1) because it does not have the FQDN field
-		"namespace3": len(TailscaleVersions) - 1,
-		"namespace4": len(TailscaleVersions) - 1,
+	spec := &HeadscaleSpec{
+		namespaces: map[string]int{
+			// Omit 1.16.2 (-1) because it does not have the FQDN field
+			"namespace3": len(TailscaleVersions) - 1,
+			"namespace4": len(TailscaleVersions) - 1,
+		},
 	}
 
 	err = scenario.CreateHeadscaleEnv(spec)
@@ -139,9 +143,11 @@ func TestTaildrop(t *testing.T) {
 		t.Errorf("failed to create scenario: %s", err)
 	}
 
-	spec := map[string]int{
-		// Omit 1.16.2 (-1) because it does not have the FQDN field
-		"taildrop": len(TailscaleVersions) - 1,
+	spec := &HeadscaleSpec{
+		namespaces: map[string]int{
+			// Omit 1.16.2 (-1) because it does not have the FQDN field
+			"taildrop": len(TailscaleVersions) - 1,
+		},
 	}
 
 	err = scenario.CreateHeadscaleEnv(spec)
@@ -265,10 +271,12 @@ func TestResolveMagicDNS(t *testing.T) {
 		t.Errorf("failed to create scenario: %s", err)
 	}
 
-	spec := map[string]int{
-		// Omit 1.16.2 (-1) because it does not have the FQDN field
-		"magicdns1": len(TailscaleVersions) - 1,
-		"magicdns2": len(TailscaleVersions) - 1,
+	spec := &HeadscaleSpec{
+		namespaces: map[string]int{
+			// Omit 1.16.2 (-1) because it does not have the FQDN field
+			"magicdns1": len(TailscaleVersions) - 1,
+			"magicdns2": len(TailscaleVersions) - 1,
+		},
 	}
 
 	err = scenario.CreateHeadscaleEnv(spec)
