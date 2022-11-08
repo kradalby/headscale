@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/juanfont/headscale"
-	"github.com/rs/zerolog/log"
 )
 
 func TestSSHIntoAll(t *testing.T) {
@@ -24,6 +23,9 @@ func TestSSHIntoAll(t *testing.T) {
 		},
 		enableSSH: true,
 		acl: &headscale.ACLPolicy{
+			Groups: map[string][]string{
+				"group:integration-test": {"namespace1", "namespace2"},
+			},
 			ACLs: []headscale.ACL{
 				{
 					Action:       "accept",
@@ -34,8 +36,8 @@ func TestSSHIntoAll(t *testing.T) {
 			SSHs: []headscale.SSH{
 				{
 					Action:       "accept",
-					Sources:      []string{"*"},
-					Destinations: []string{"*"},
+					Sources:      []string{"group:integration-test"},
+					Destinations: []string{"group:integration-test"},
 					Users:        []string{"ssh-it-user"},
 				},
 			},
@@ -74,7 +76,7 @@ func TestSSHIntoAll(t *testing.T) {
 						command := []string{
 							"ssh", "-o StrictHostKeyChecking=no",
 							fmt.Sprintf("%s@%s", "ssh-it-user", target),
-							"hostname",
+							"'hostname'",
 						}
 
 						result, err := client.Execute(command)
@@ -82,7 +84,12 @@ func TestSSHIntoAll(t *testing.T) {
 							t.Errorf("failed to execute command over SSH: %s", err)
 						}
 
-						log.Printf("Result for %s: %s\n", target, result)
+						if result != target {
+							t.Logf("result=%s, target=%s", result, target)
+							t.Fail()
+						}
+
+						t.Logf("Result for %s: %s\n", target, result)
 					},
 				)
 			}

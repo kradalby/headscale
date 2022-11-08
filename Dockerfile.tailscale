@@ -11,7 +11,7 @@ RUN apt-get update \
     && apt-get install -y ca-certificates tailscale=${TAILSCALE_VERSION} dnsutils \
     && rm -rf /var/lib/apt/lists/*
 
-RUN adduser --shell=/sbin/nologin ssh-it-user
+RUN adduser --shell=/bin/bash ssh-it-user
 
 RUN service ssh start
 
