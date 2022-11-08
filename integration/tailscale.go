@@ -17,4 +17,5 @@ type TailscaleClient interface {
 	Status() (*ipnstate.Status, error)
 	WaitForPeers(expected int) error
 	Ping(hostnameOrIP string) error
+	ID() string
 }

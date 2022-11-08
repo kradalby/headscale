@@ -108,6 +108,10 @@ func (t *TailscaleInContainer) Version() string {
 	return t.version
 }
 
+func (t *TailscaleInContainer) ID() string {
+	return t.container.Container.ID
+}
+
 func (t *TailscaleInContainer) Execute(
 	command []string,
 ) (string, error) {
