@@ -14,14 +14,14 @@ import (
 func TestSSHOneNamespaceAllToAll(t *testing.T) {
 	IntegrationSkip(t)
 
-	retry := func(times int, sleepInverval time.Duration, doWork func() (string, string, error)) (string, string, error) {
+	retry := func(times int, sleepInterval time.Duration, doWork func() (string, string, error)) (string, string, error) {
 		var err error
 		for attempts := 0; attempts < times; attempts++ {
 			result, stderr, err := doWork()
 			if err == nil {
 				return result, stderr, nil
 			}
-			time.Sleep(sleepInverval)
+			time.Sleep(sleepInterval)
 		}
 
 		return "", "", err
