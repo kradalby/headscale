@@ -226,6 +226,7 @@ func (s *Scenario) CreateTailscaleNodesInNamespace(
 	namespaceStr string,
 	requestedVersion string,
 	count int,
+	opts ...tsic.Option,
 ) error {
 	if namespace, ok := s.namespaces[namespaceStr]; ok {
 		for i := 0; i < count; i++ {
@@ -244,6 +245,11 @@ func (s *Scenario) CreateTailscaleNodesInNamespace(
 
 			namespace.createWaitGroup.Add(1)
 
+			opts = append(opts,
+				tsic.WithHeadscaleTLS(cert),
+				tsic.WithHeadscaleName(hostname),
+			)
+
 			go func() {
 				defer namespace.createWaitGroup.Done()
 
@@ -252,8 +258,7 @@ func (s *Scenario) CreateTailscaleNodesInNamespace(
 					s.pool,
 					version,
 					s.network,
-					tsic.WithHeadscaleTLS(cert),
-					tsic.WithHeadscaleName(hostname),
+					opts...,
 				)
 				if err != nil {
 					// return fmt.Errorf("failed to add tailscale node: %w", err)

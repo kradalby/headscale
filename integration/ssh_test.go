@@ -62,6 +62,7 @@ func TestSSHOneNamespaceAllToAll(t *testing.T) {
 				},
 			},
 		),
+		hsic.WithTestName("sshonensalltoall"),
 	)
 	if err != nil {
 		t.Errorf("failed to create headscale environment: %s", err)
