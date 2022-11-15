@@ -103,6 +103,7 @@ func TestSSHOneNamespaceAllToAll(t *testing.T) {
 
 					result, err := retry(10, 1*time.Second, func() (string, error) {
 						result, _, err := client.Execute(command)
+
 						return result, err
 					})
 					if err != nil {

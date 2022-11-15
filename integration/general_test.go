@@ -340,5 +340,3 @@ func TestResolveMagicDNS(t *testing.T) {
 		t.Errorf("failed to tear down scenario: %s", err)
 	}
 }
-
-

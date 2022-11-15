@@ -390,5 +390,3 @@ func TestPreAuthKeyCommandReusableEphemeral(t *testing.T) {
 	err = scenario.Shutdown()
 	assert.NoError(t, err)
 }
-
-
