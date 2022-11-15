@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale"
+	"github.com/juanfont/headscale/integration/hsic"
+	"github.com/juanfont/headscale/integration/tsic"
 )
 
 func TestSSHOneNamespaceAllToAll(t *testing.T) {
@@ -31,34 +33,35 @@ func TestSSHOneNamespaceAllToAll(t *testing.T) {
 		t.Errorf("failed to create scenario: %s", err)
 	}
 
-	spec := &HeadscaleSpec{
-		namespaces: map[string]int{
-			"namespace1": len(TailscaleVersions) - 5,
-		},
-		enableSSH: true,
-		acl: &headscale.ACLPolicy{
-			Groups: map[string][]string{
-				"group:integration-test": {"namespace1"},
-			},
-			ACLs: []headscale.ACL{
-				{
-					Action:       "accept",
-					Sources:      []string{"*"},
-					Destinations: []string{"*:*"},
-				},
-			},
-			SSHs: []headscale.SSH{
-				{
-					Action:       "accept",
-					Sources:      []string{"group:integration-test"},
-					Destinations: []string{"group:integration-test"},
-					Users:        []string{"ssh-it-user"},
-				},
-			},
-		},
+	spec := map[string]int{
+		"namespace1": len(TailscaleVersions) - 5,
 	}
 
-	err = scenario.CreateHeadscaleEnv(spec)
+	err = scenario.CreateHeadscaleEnv(spec,
+		[]tsic.Option{tsic.WithSSH()},
+		hsic.WithACLPolicy(
+			&headscale.ACLPolicy{
+				Groups: map[string][]string{
+					"group:integration-test": {"namespace1"},
+				},
+				ACLs: []headscale.ACL{
+					{
+						Action:       "accept",
+						Sources:      []string{"*"},
+						Destinations: []string{"*:*"},
+					},
+				},
+				SSHs: []headscale.SSH{
+					{
+						Action:       "accept",
+						Sources:      []string{"group:integration-test"},
+						Destinations: []string{"group:integration-test"},
+						Users:        []string{"ssh-it-user"},
+					},
+				},
+			},
+		),
+	)
 	if err != nil {
 		t.Errorf("failed to create headscale environment: %s", err)
 	}
@@ -99,7 +102,8 @@ func TestSSHOneNamespaceAllToAll(t *testing.T) {
 					}
 
 					result, err := retry(10, 1*time.Second, func() (string, error) {
-						return client.Execute(command)
+						result, _, err := client.Execute(command)
+						return result, err
 					})
 					if err != nil {
 						t.Errorf("failed to execute command over SSH: %s", err)

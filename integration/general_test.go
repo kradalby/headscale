@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/juanfont/headscale/integration/hsic"
+	"github.com/juanfont/headscale/integration/tsic"
 	"github.com/rs/zerolog/log"
 )
 
@@ -17,14 +19,12 @@ func TestPingAllByIP(t *testing.T) {
 		t.Errorf("failed to create scenario: %s", err)
 	}
 
-	spec := &HeadscaleSpec{
-		namespaces: map[string]int{
-			"namespace1": len(TailscaleVersions),
-			"namespace2": len(TailscaleVersions),
-		},
+	spec := map[string]int{
+		"namespace1": len(TailscaleVersions),
+		"namespace2": len(TailscaleVersions),
 	}
 
-	err = scenario.CreateHeadscaleEnv(spec)
+	err = scenario.CreateHeadscaleEnv(spec, []tsic.Option{}, hsic.WithTestName("pingallbyip"))
 	if err != nil {
 		t.Errorf("failed to create headscale environment: %s", err)
 	}
@@ -73,15 +73,13 @@ func TestPingAllByHostname(t *testing.T) {
 		t.Errorf("failed to create scenario: %s", err)
 	}
 
-	spec := &HeadscaleSpec{
-		namespaces: map[string]int{
-			// Omit 1.16.2 (-1) because it does not have the FQDN field
-			"namespace3": len(TailscaleVersions) - 1,
-			"namespace4": len(TailscaleVersions) - 1,
-		},
+	spec := map[string]int{
+		// Omit 1.16.2 (-1) because it does not have the FQDN field
+		"namespace3": len(TailscaleVersions) - 1,
+		"namespace4": len(TailscaleVersions) - 1,
 	}
 
-	err = scenario.CreateHeadscaleEnv(spec)
+	err = scenario.CreateHeadscaleEnv(spec, []tsic.Option{}, hsic.WithTestName("pingallbyname"))
 	if err != nil {
 		t.Errorf("failed to create headscale environment: %s", err)
 	}
@@ -143,14 +141,12 @@ func TestTaildrop(t *testing.T) {
 		t.Errorf("failed to create scenario: %s", err)
 	}
 
-	spec := &HeadscaleSpec{
-		namespaces: map[string]int{
-			// Omit 1.16.2 (-1) because it does not have the FQDN field
-			"taildrop": len(TailscaleVersions) - 1,
-		},
+	spec := map[string]int{
+		// Omit 1.16.2 (-1) because it does not have the FQDN field
+		"taildrop": len(TailscaleVersions) - 1,
 	}
 
-	err = scenario.CreateHeadscaleEnv(spec)
+	err = scenario.CreateHeadscaleEnv(spec, []tsic.Option{}, hsic.WithTestName("taildrop"))
 	if err != nil {
 		t.Errorf("failed to create headscale environment: %s", err)
 	}
@@ -174,7 +170,7 @@ func TestTaildrop(t *testing.T) {
 	for _, client := range allClients {
 		command := []string{"touch", fmt.Sprintf("/tmp/file_from_%s", client.Hostname())}
 
-		if _, err := client.Execute(command); err != nil {
+		if _, _, err := client.Execute(command); err != nil {
 			t.Errorf("failed to create taildrop file on %s, err: %s", client.Hostname(), err)
 		}
 
@@ -199,7 +195,7 @@ func TestTaildrop(t *testing.T) {
 						client.Hostname(),
 						peer.Hostname(),
 					)
-					_, err := client.Execute(command)
+					_, _, err := client.Execute(command)
 
 					return err
 				})
@@ -220,7 +216,7 @@ func TestTaildrop(t *testing.T) {
 			"get",
 			"/tmp/",
 		}
-		if _, err := client.Execute(command); err != nil {
+		if _, _, err := client.Execute(command); err != nil {
 			t.Errorf("failed to get taildrop file on %s, err: %s", client.Hostname(), err)
 		}
 
@@ -240,7 +236,7 @@ func TestTaildrop(t *testing.T) {
 					peer.Hostname(),
 				)
 
-				result, err := client.Execute(command)
+				result, _, err := client.Execute(command)
 				if err != nil {
 					t.Errorf("failed to execute command to ls taildrop: %s", err)
 				}
@@ -271,15 +267,13 @@ func TestResolveMagicDNS(t *testing.T) {
 		t.Errorf("failed to create scenario: %s", err)
 	}
 
-	spec := &HeadscaleSpec{
-		namespaces: map[string]int{
-			// Omit 1.16.2 (-1) because it does not have the FQDN field
-			"magicdns1": len(TailscaleVersions) - 1,
-			"magicdns2": len(TailscaleVersions) - 1,
-		},
+	spec := map[string]int{
+		// Omit 1.16.2 (-1) because it does not have the FQDN field
+		"magicdns1": len(TailscaleVersions) - 1,
+		"magicdns2": len(TailscaleVersions) - 1,
 	}
 
-	err = scenario.CreateHeadscaleEnv(spec)
+	err = scenario.CreateHeadscaleEnv(spec, []tsic.Option{}, hsic.WithTestName("magicdns"))
 	if err != nil {
 		t.Errorf("failed to create headscale environment: %s", err)
 	}
@@ -314,7 +308,7 @@ func TestResolveMagicDNS(t *testing.T) {
 				"tailscale",
 				"ip", peerFQDN,
 			}
-			result, err := client.Execute(command)
+			result, _, err := client.Execute(command)
 			if err != nil {
 				t.Errorf(
 					"failed to execute resolve/ip command %s from %s: %s",
@@ -346,3 +340,5 @@ func TestResolveMagicDNS(t *testing.T) {
 		t.Errorf("failed to tear down scenario: %s", err)
 	}
 }
+
+
