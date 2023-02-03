@@ -36,6 +36,8 @@ var (
 	errTailscaleNotLoggedOut           = errors.New("tailscale not logged out")
 )
 
+// TailscaleInContainer is an implementation of TailscaleClient which
+// sets up a Tailscale instance inside a container.
 type TailscaleInContainer struct {
 	version  string
 	hostname string
