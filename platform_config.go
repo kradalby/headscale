@@ -255,7 +255,9 @@ func (h *Headscale) ApplePlatformConfig(
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		writer.WriteHeader(http.StatusBadRequest)
 		_, err := writer.Write(
-			[]byte("Invalid platform. Only ios, macos-app-store and macos-standalone are supported"),
+			[]byte(
+				"Invalid platform. Only ios, macos-app-store and macos-standalone are supported",
+			),
 		)
 		if err != nil {
 			log.Error().
@@ -333,20 +335,13 @@ var commonTemplate = textTemplate.Must(
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
   <dict>
-    <key>PayloadUUID</key>
-    <string>{{.UUID}}</string>
-    <key>PayloadDisplayName</key>
-    <string>Headscale</string>
-    <key>PayloadDescription</key>
-    <string>Configure Tailscale login server to: {{.URL}}</string>
-    <key>PayloadIdentifier</key>
-    <string>com.github.juanfont.headscale</string>
-    <key>PayloadRemovalDisallowed</key>
-    <false/>
-    <key>PayloadType</key>
-    <string>Configuration</string>
-    <key>PayloadVersion</key>
-    <integer>1</integer>
+    <key>PayloadUUID</key>                 <string>{{.UUID}}</string>
+    <key>PayloadDisplayName</key>          <string>Headscale</string>
+    <key>PayloadDescription</key>          <string>Configure Tailscale login server to: {{.URL}}</string>
+    <key>PayloadIdentifier</key>           <string>com.github.juanfont.headscale</string>
+    <key>PayloadRemovalDisallowed</key>    <false/>
+    <key>PayloadType</key>                 <string>Configuration</string>
+    <key>PayloadVersion</key>              <integer>1</integer>
     <key>PayloadContent</key>
     <array>
     {{.Payload}}
@@ -357,52 +352,33 @@ var commonTemplate = textTemplate.Must(
 
 var iosTemplate = textTemplate.Must(textTemplate.New("iosTemplate").Parse(`
     <dict>
-        <key>PayloadType</key>
-        <string>io.tailscale.ipn.ios</string>
-        <key>PayloadUUID</key>
-        <string>{{.UUID}}</string>
-        <key>PayloadIdentifier</key>
-        <string>com.github.juanfont.headscale</string>
-        <key>PayloadVersion</key>
-        <integer>1</integer>
-        <key>PayloadEnabled</key>
-        <true/>
-
-        <key>ControlURL</key>
-        <string>{{.URL}}</string>
+        <key>PayloadType</key>         <string>io.tailscale.ipn.ios.network-extension</string>
+        <key>PayloadUUID</key>         <string>{{.UUID}}</string>
+        <key>PayloadIdentifier</key>   <string>com.github.juanfont.headscale</string>
+        <key>PayloadVersion</key>      <integer>1</integer>
+        <key>PayloadEnabled</key>      <true/>
+        <key>ControlURL</key>          <string>{{.URL}}</string>
     </dict>
 `))
 
 var macosAppStoreTemplate = template.Must(template.New("macosTemplate").Parse(`
     <dict>
-        <key>PayloadType</key>
-        <string>io.tailscale.ipn.macos</string>
-        <key>PayloadUUID</key>
-        <string>{{.UUID}}</string>
-        <key>PayloadIdentifier</key>
-        <string>com.github.juanfont.headscale</string>
-        <key>PayloadVersion</key>
-        <integer>1</integer>
-        <key>PayloadEnabled</key>
-        <true/>
-        <key>ControlURL</key>
-        <string>{{.URL}}</string>
+        <key>PayloadType</key>         <string>io.tailscale.ipn.macos</string>
+        <key>PayloadUUID</key>         <string>{{.UUID}}</string>
+        <key>PayloadIdentifier</key>   <string>com.github.juanfont.headscale</string>
+        <key>PayloadVersion</key>      <integer>1</integer>
+        <key>PayloadEnabled</key>      <true/>
+        <key>ControlURL</key>          <string>{{.URL}}</string>
     </dict>
 `))
 
 var macosStandaloneTemplate = template.Must(template.New("macosStandaloneTemplate").Parse(`
     <dict>
-        <key>PayloadType</key>
-        <string>io.tailscale.ipn.macsys</string>
-        <key>PayloadUUID</key>
-        <string>{{.UUID}}</string>
-        <key>PayloadIdentifier</key>
-        <string>com.github.juanfont.headscale</string>
-        <key>PayloadVersion</key>
-        <integer>1</integer>
-        <key>PayloadEnabled</key>
-        <true/>
-        <key>ControlURL</key>
-        <string>{{.URL}}</string>
+        <key>PayloadType</key>         <string>io.tailscale.ipn.macsys</string>
+        <key>PayloadUUID</key>         <string>{{.UUID}}</string>
+        <key>PayloadIdentifier</key>   <string>com.github.juanfont.headscale</string>
+        <key>PayloadVersion</key>      <integer>1</integer>
+        <key>PayloadEnabled</key>      <true/>
+        <key>ControlURL</key>          <string>{{.URL}}</string>
     </dict>
 `))
