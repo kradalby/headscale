@@ -1857,6 +1857,8 @@ func TestACLPolicy_generateFilterRules(t *testing.T) {
 }
 
 func TestReduceFilterRules(t *testing.T) {
+	intp := func(i int) *int { return &i }
+
 	tests := []struct {
 		name    string
 		machine *types.Machine
@@ -1889,6 +1891,248 @@ func TestReduceFilterRules(t *testing.T) {
 						netip.MustParseAddr("fd7a:115c:a1e0:ab12:4843:2222:6273:2222"),
 					},
 					User: types.User{Name: "mickael"},
+				},
+			},
+			want: []tailcfg.FilterRule{},
+		},
+
+		// This section contains a bunch of issues from Github which has
+		// been set up on Tailscale and the packetfilter output has been
+		// captured to make it easier to verify that we implement it correctly.
+
+		// Issue 1305 - ACL issue: specifing CIDR from subnet doesn't work
+		// ACL on tailscale.com:
+		//
+		// "hosts": {
+		// 	"lima1": "100.77.51.52",
+		// 	"lima2": "100.121.119.6",
+		//
+		// 	"ovh-vrack": "10.0.1.0/24",
+		// },
+		// "acls": [
+		// 	{
+		// 		"action": "accept",
+		// 		"src":    ["lima1"],
+		// 		"dst":    ["ovh-vrack:80,443"],
+		// 	},
+		// ],
+		{
+			name: "issue-1305-cidr-from-subnet-lima1",
+			pol: ACLPolicy{
+				Hosts: map[string]netip.Prefix{
+					"lima1": netip.MustParsePrefix("100.77.51.52/32"),
+					"lima2": netip.MustParsePrefix("100.121.119.6/32"),
+
+					"ovh-vrack": netip.MustParsePrefix("10.0.1.0/24"),
+				},
+				ACLs: []ACL{
+					{
+						Action:       "accept",
+						Sources:      []string{"lima1"},
+						Destinations: []string{"ovh-vrack:80,443"},
+					},
+				},
+			},
+			machine: types.Machine{
+				// lima1
+				IPAddresses: types.MachineAddresses{
+					netip.MustParseAddr("100.77.51.52"),
+					netip.MustParseAddr("fd7a:115c:a1e0:ab12:4843:cd96:624d:3334"),
+				},
+				User: types.User{Name: "kradalby"},
+			},
+			peers: types.Machines{
+				{
+					// lima2
+					IPAddresses: types.MachineAddresses{
+						netip.MustParseAddr("100.121.119.6"),
+						netip.MustParseAddr("fd7a:115c:a1e0:ab12:4843:cd96:6279:7706"),
+					},
+					User: types.User{Name: "kradalby"},
+				},
+			},
+			want: []tailcfg.FilterRule{},
+		},
+		{
+			name: "issue-1305-cidr-from-subnet-lima2",
+			pol: ACLPolicy{
+				Hosts: map[string]netip.Prefix{
+					"lima1": netip.MustParsePrefix("100.77.51.52/32"),
+					"lima2": netip.MustParsePrefix("100.121.119.6/32"),
+
+					"ovh-vrack": netip.MustParsePrefix("10.0.1.0/24"),
+				},
+				ACLs: []ACL{
+					{
+						Action:       "accept",
+						Sources:      []string{"lima1"},
+						Destinations: []string{"ovh-vrack:80,443"},
+					},
+				},
+			},
+			machine: types.Machine{
+				// lima2
+				IPAddresses: types.MachineAddresses{
+					netip.MustParseAddr("100.121.119.6"),
+					netip.MustParseAddr("fd7a:115c:a1e0:ab12:4843:cd96:6279:7706"),
+				},
+				User: types.User{Name: "kradalby"},
+			},
+			peers: types.Machines{
+				{
+					// lima1
+					IPAddresses: types.MachineAddresses{
+						netip.MustParseAddr("100.77.51.52"),
+						netip.MustParseAddr("fd7a:115c:a1e0:ab12:4843:cd96:624d:3334"),
+					},
+					User: types.User{Name: "kradalby"},
+				},
+			},
+			want: []tailcfg.FilterRule{
+				// TODO(kradalby): This is filtered out, I think I got the reduce
+				// filter stuff the wrong way around...
+				{
+					SrcIPs: []string{
+						"100.77.51.52/32",
+						"fd7a:115c:a1e0:ab12:4843:cd96:624d:3334/128",
+					},
+					DstPorts: []tailcfg.NetPortRange{
+						{
+							IP:   "10.0.1.0",
+							Bits: intp(24),
+							Ports: tailcfg.PortRange{
+								First: 80,
+								Last:  80,
+							},
+						},
+						{
+							IP:   "10.0.1.0",
+							Bits: intp(24),
+							Ports: tailcfg.PortRange{
+								First: 443,
+								Last:  443,
+							},
+						},
+					},
+				},
+			},
+		},
+
+		// Issue 1347 - ACLs with multiple users do not work
+		{
+			name: "issue-1347-multiple-users-does-not-work-lima1",
+			pol: ACLPolicy{
+				Groups: Groups{
+					"group:admin":  []string{"test-admin"},
+					"group:family": []string{"test-family-member"},
+				},
+				Hosts: map[string]netip.Prefix{
+					"lima2": netip.MustParsePrefix("100.121.119.6/32"),
+
+					"firewall": netip.MustParsePrefix("100.77.51.52/32"),
+					"lan":      netip.MustParsePrefix("192.168.1.0/24"),
+				},
+				ACLs: []ACL{
+					{
+						Action:       "accept",
+						Sources:      []string{"group:admin"},
+						Destinations: []string{"lan:*", "firewall:*", "group:admin:*"},
+					},
+					{
+						Action:       "accept",
+						Sources:      []string{"group:family"},
+						Destinations: []string{"lan:*", "firewall:*", "group:admin:*"},
+					},
+				},
+			},
+			machine: types.Machine{
+				// lima1
+				IPAddresses: types.MachineAddresses{
+					netip.MustParseAddr("100.77.51.52"),
+					netip.MustParseAddr("fd7a:115c:a1e0:ab12:4843:cd96:624d:3334"),
+				},
+				User: types.User{Name: "test-admin"},
+			},
+			peers: types.Machines{
+				{
+					// lima2
+					IPAddresses: types.MachineAddresses{
+						netip.MustParseAddr("100.121.119.6"),
+						netip.MustParseAddr("fd7a:115c:a1e0:ab12:4843:cd96:6279:7706"),
+					},
+					User: types.User{Name: "test-family-member"},
+				},
+			},
+			want: []tailcfg.FilterRule{
+				{
+					SrcIPs: []string{
+						"100.77.51.52/32",
+						"fd7a:115c:a1e0:ab12:4843:cd96:624d:3334/128",
+					},
+					DstPorts: []tailcfg.NetPortRange{
+						// This is the host known as firewall
+						{
+							IP:    "100.77.51.52",
+							Bits:  intp(32),
+							Ports: tailcfg.PortRangeAny,
+						},
+						// This is the network known as firewall
+						{
+							IP:    "100.77.51.52",
+							Bits:  intp(32),
+							Ports: tailcfg.PortRangeAny,
+						},
+						{
+							IP:    "fd7a:115c:a1e0:ab12:4843:cd96:624d:3334",
+							Bits:  intp(128),
+							Ports: tailcfg.PortRangeAny,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "issue-1347-multiple-users-does-not-work-lima2",
+			pol: ACLPolicy{
+				Groups: Groups{
+					"group:admin":  []string{"test-admin"},
+					"group:family": []string{"test-family-member"},
+				},
+				Hosts: map[string]netip.Prefix{
+					"lima2": netip.MustParsePrefix("100.121.119.6/32"),
+
+					"firewall": netip.MustParsePrefix("100.77.51.52/32"),
+					"lan":      netip.MustParsePrefix("192.168.1.0/24"),
+				},
+				ACLs: []ACL{
+					{
+						Action:       "accept",
+						Sources:      []string{"group:admin"},
+						Destinations: []string{"lan:*", "firewall:*", "group:admin:*"},
+					},
+					{
+						Action:       "accept",
+						Sources:      []string{"group:family"},
+						Destinations: []string{"lan:*", "firewall:*", "group:admin:*"},
+					},
+				},
+			},
+			machine: types.Machine{
+				// lima2
+				IPAddresses: types.MachineAddresses{
+					netip.MustParseAddr("100.121.119.6"),
+					netip.MustParseAddr("fd7a:115c:a1e0:ab12:4843:cd96:6279:7706"),
+				},
+				User: types.User{Name: "test-family-member"},
+			},
+			peers: types.Machines{
+				{
+					// lima1
+					IPAddresses: types.MachineAddresses{
+						netip.MustParseAddr("100.77.51.52"),
+						netip.MustParseAddr("fd7a:115c:a1e0:ab12:4843:cd96:624d:3334"),
+					},
+					User: types.User{Name: "test-admin"},
 				},
 			},
 			want: []tailcfg.FilterRule{},
