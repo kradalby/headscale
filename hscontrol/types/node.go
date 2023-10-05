@@ -20,7 +20,9 @@ import (
 
 var (
 	ErrNodeAddressesInvalid = errors.New("failed to parse node addresses")
-	ErrHostnameTooLong      = errors.New("hostname too long")
+	ErrHostnameTooLong      = errors.New("hostname too long, cannot except 255 ASCII chars")
+	ErrNodeHasNoGivenName   = errors.New("node has no given name")
+	ErrNodeUserHasNoName    = errors.New("node user has no name")
 )
 
 // Node is a Headscale client.
@@ -270,6 +272,14 @@ func (node *Node) GetHostInfo() tailcfg.Hostinfo {
 func (node *Node) GetFQDN(dnsConfig *tailcfg.DNSConfig, baseDomain string) (string, error) {
 	var hostname string
 	if dnsConfig != nil && dnsConfig.Proxied { // MagicDNS
+		if node.GivenName == "" {
+			return "", fmt.Errorf("failed to create valid FQDN: %w", ErrNodeHasNoGivenName)
+		}
+
+		if node.User.Name == "" {
+			return "", fmt.Errorf("failed to create valid FQDN: %w", ErrNodeUserHasNoName)
+		}
+
 		hostname = fmt.Sprintf(
 			"%s.%s.%s",
 			node.GivenName,
@@ -278,7 +288,7 @@ func (node *Node) GetFQDN(dnsConfig *tailcfg.DNSConfig, baseDomain string) (stri
 		)
 		if len(hostname) > MaxHostnameLength {
 			return "", fmt.Errorf(
-				"hostname %q is too long it cannot except 255 ASCII chars: %w",
+				"failed to create valid FQDN (%s): %w",
 				hostname,
 				ErrHostnameTooLong,
 			)
