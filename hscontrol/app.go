@@ -541,9 +541,12 @@ func (h *Headscale) Serve() error {
 		if tailsqlTSKey == "" {
 			log.Fatal().Msg("tailsql requires TS_AUTHKEY to be set")
 		}
-		errorGroup.Go(func() error {
-			return runTailSQLService(ctx, util.TSLogfWrapper(), tailsqlStateDir, h.cfg.DBpath)
-		})
+		go func() {
+			if err := runTailSQLService(ctx, util.TSLogfWrapper(), tailsqlStateDir, h.cfg.DBpath); err != nil {
+				log.Fatal().Err(err).Msg("failed to start tailsql")
+			}
+		}()
+
 	}
 
 	time.Sleep(10 * time.Second)
