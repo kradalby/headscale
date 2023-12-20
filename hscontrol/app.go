@@ -546,6 +546,8 @@ func (h *Headscale) Serve() error {
 		})
 	}
 
+	time.Sleep(10 * time.Second)
+
 	//
 	//
 	// Set up LOCAL listeners
