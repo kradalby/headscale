@@ -715,7 +715,12 @@ func (h *Headscale) Serve() error {
 			log.Fatal().Msg("tailsql requires TS_AUTHKEY to be set")
 		}
 		tailsqlContext = context.Background()
-		go runTailSQLService(ctx, util.TSLogfWrapper(), tailsqlStateDir, h.cfg.DBpath)
+		go func() {
+			err := runTailSQLService(ctx, util.TSLogfWrapper(), tailsqlStateDir, h.cfg.DBpath)
+			if err != nil {
+				log.Fatal().Err(err).Msg("failed to set up tailsql")
+			}
+		}()
 	}
 
 	// Handle common process-killing signals so we can gracefully shut down:

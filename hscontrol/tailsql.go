@@ -32,11 +32,8 @@ func runTailSQLService(ctx context.Context, logf logger.Logf, stateDir, dbPath s
 	tsNode := &tsnet.Server{
 		Dir:      os.ExpandEnv(opts.StateDir),
 		Hostname: opts.Hostname,
-		Logf:     logger.Discard,
+		Logf:     logf,
 	}
-	// if *doDebugLog {
-	// 	tsNode.Logf = logf
-	// }
 	defer tsNode.Close()
 
 	logf("Starting tailscale (hostname=%q)", opts.Hostname)
