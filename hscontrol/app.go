@@ -534,6 +534,18 @@ func (h *Headscale) Serve() error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	if tailsqlEnabled {
+		if h.cfg.DBtype != db.Sqlite {
+			log.Fatal().Str("type", h.cfg.DBtype).Msgf("tailsql only support %q", db.Sqlite)
+		}
+		if tailsqlTSKey == "" {
+			log.Fatal().Msg("tailsql requires TS_AUTHKEY to be set")
+		}
+		errorGroup.Go(func() error {
+			return runTailSQLService(ctx, util.TSLogfWrapper(), tailsqlStateDir, h.cfg.DBpath)
+		})
+	}
+
 	//
 	//
 	// Set up LOCAL listeners
@@ -706,23 +718,6 @@ func (h *Headscale) Serve() error {
 	log.Info().
 		Msgf("listening and serving metrics on: %s", h.cfg.MetricsAddr)
 
-	var tailsqlContext context.Context
-	if tailsqlEnabled {
-		if h.cfg.DBtype != db.Sqlite {
-			log.Fatal().Str("type", h.cfg.DBtype).Msgf("tailsql only support %q", db.Sqlite)
-		}
-		if tailsqlTSKey == "" {
-			log.Fatal().Msg("tailsql requires TS_AUTHKEY to be set")
-		}
-		tailsqlContext = context.Background()
-		go func() {
-			err := runTailSQLService(ctx, util.TSLogfWrapper(), tailsqlStateDir, h.cfg.DBpath)
-			if err != nil {
-				log.Fatal().Err(err).Msg("failed to set up tailsql")
-			}
-		}()
-	}
-
 	// Handle common process-killing signals so we can gracefully shut down:
 	h.shutdownChan = make(chan struct{})
 	sigc := make(chan os.Signal, 1)
@@ -786,10 +781,6 @@ func (h *Headscale) Serve() error {
 				if grpcServer != nil {
 					grpcServer.GracefulStop()
 					grpcListener.Close()
-				}
-
-				if tailsqlContext != nil {
-					tailsqlContext.Done()
 				}
 
 				// Close network listeners
