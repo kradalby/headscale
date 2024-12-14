@@ -197,6 +197,24 @@ func TestMigrations(t *testing.T) {
 				}
 			},
 		},
+		{
+			dbPath:  "testdata/route-23-to-24-before-unique-index-fails.sqlite",
+			wantErr: "creating route unique index",
+		},
+		// {
+		// 	dbPath: "testdata/route-23-to-24-before-unique-index-passes.sqlite",
+		// 	wantFunc: func(t *testing.T, h *HSDatabase) {
+		// 		routes, err := Read(h.DB, func(rx *gorm.DB) (types.Routes, error) {
+		// 			return GetRoutes(rx)
+		// 		})
+		// 		require.NoError(t, err)
+
+		// 		for _, route := range routes {
+		// 			t.Logf("route: %v", route)
+		// 		}
+		// 		t.Fail()
+		// 	},
+		// },
 	}
 
 	for _, tt := range tests {

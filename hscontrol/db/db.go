@@ -521,6 +521,22 @@ func NewHeadscaleDatabase(
 				},
 				Rollback: func(db *gorm.DB) error { return nil },
 			},
+			{
+				// The unique constraint of Name has been dropped
+				// in favour of a unique together of name and
+				// provider identity.
+				ID: "202412131220",
+				Migrate: func(tx *gorm.DB) error {
+					// Prevent duplicate routes of a single node to be created.
+					err = tx.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_route_prefix_node_id ON users (name);").Error
+					if err != nil {
+						return fmt.Errorf("creating route unique index: %w", err)
+					}
+
+					return nil
+				},
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
 		},
 	)
 

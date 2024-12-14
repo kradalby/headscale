@@ -78,6 +78,10 @@ type Node struct {
 	ForcedTags []string `gorm:"serializer:json"`
 
 	// TODO(kradalby): This seems like irrelevant information?
+	// 2024-12-13: This is relevant, the authkey has tags for
+	// the node, which mean we cant do a cascade delete or set null
+	// this needs to be changed to prevent the authkey from being
+	// deleted.
 	AuthKeyID *uint64     `sql:"DEFAULT:NULL"`
 	AuthKey   *PreAuthKey `gorm:"constraint:OnDelete:SET NULL;"`
 
