@@ -1,15 +1,17 @@
 package integration
 
 import (
+	"cmp"
 	"fmt"
 	"net/netip"
+	"slices"
 	"sort"
 	"testing"
 	"time"
 
 	"maps"
 
-	"github.com/google/go-cmp/cmp"
+	cmpdiff "github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
 	"github.com/juanfont/headscale/integration/hsic"
@@ -111,7 +113,7 @@ func TestOIDCAuthenticationPingAll(t *testing.T) {
 		return listUsers[i].GetId() < listUsers[j].GetId()
 	})
 
-	if diff := cmp.Diff(want, listUsers, cmpopts.IgnoreUnexported(v1.User{}), cmpopts.IgnoreFields(v1.User{}, "CreatedAt")); diff != "" {
+	if diff := cmpdiff.Diff(want, listUsers, cmpopts.IgnoreUnexported(v1.User{}), cmpopts.IgnoreFields(v1.User{}, "CreatedAt")); diff != "" {
 		t.Fatalf("unexpected users: %s", diff)
 	}
 }
@@ -127,6 +129,8 @@ func TestOIDCExpireNodesBasedOnTokenExpiry(t *testing.T) {
 		NodesPerUser: 1,
 		Users:        []string{"user1", "user2"},
 		OIDCUsers: []mockoidc.MockUser{
+			oidcMockUser("user1", true),
+			oidcMockUser("user2", false),
 			oidcMockUser("user1", true),
 			oidcMockUser("user2", false),
 		},
@@ -167,6 +171,44 @@ func TestOIDCExpireNodesBasedOnTokenExpiry(t *testing.T) {
 	})
 
 	success := pingAllHelper(t, allClients, allAddrs)
+	t.Logf("%d successful pings out of %d (before expiry)", success, len(allClients)*len(allIps))
+
+	// This is not great, but this sadly is a time dependent test, so the
+	// safe thing to do is wait out the whole TTL time (and a bit more out
+	// of safety reasons) before checking if the clients have logged out.
+	// The Wait function can't do it itself as it has an upper bound of 1
+	// min.
+	time.Sleep(shortAccessTTL + 10*time.Second)
+
+	assertTailscaleNodesLogout(t, allClients)
+
+	hs, err := scenario.Headscale()
+	assertNoErr(t, err)
+
+	slices.SortFunc(allClients, func(a, b TailscaleClient) int {
+		as := a.MustStatus()
+		bs := b.MustStatus()
+		return cmp.Compare(as.Self.ID, bs.Self.ID)
+	})
+
+	for _, client := range allClients {
+		loginURL, err := client.LoginWithURL(hs.GetEndpoint())
+		assertNoErr(t, err)
+
+		_, err = doLoginURL(client.Hostname(), loginURL)
+		assertNoErr(t, err)
+	}
+
+	err = scenario.WaitForTailscaleSync()
+	assertNoErrSync(t, err)
+
+	// assertClientsState(t, allClients)
+
+	allAddrs = lo.Map(allIps, func(x netip.Addr, index int) string {
+		return x.String()
+	})
+
+	success = pingAllHelper(t, allClients, allAddrs)
 	t.Logf("%d successful pings out of %d (before expiry)", success, len(allClients)*len(allIps))
 
 	// This is not great, but this sadly is a time dependent test, so the
@@ -341,7 +383,7 @@ func TestOIDC024UserCreation(t *testing.T) {
 				return listUsers[i].GetId() < listUsers[j].GetId()
 			})
 
-			if diff := cmp.Diff(want, listUsers, cmpopts.IgnoreUnexported(v1.User{}), cmpopts.IgnoreFields(v1.User{}, "CreatedAt")); diff != "" {
+			if diff := cmpdiff.Diff(want, listUsers, cmpopts.IgnoreUnexported(v1.User{}), cmpopts.IgnoreFields(v1.User{}, "CreatedAt")); diff != "" {
 				t.Errorf("unexpected users: %s", diff)
 			}
 		})
@@ -468,7 +510,7 @@ func TestOIDCReloginSameNodeNewUser(t *testing.T) {
 		return listUsers[i].GetId() < listUsers[j].GetId()
 	})
 
-	if diff := cmp.Diff(wantUsers, listUsers, cmpopts.IgnoreUnexported(v1.User{}), cmpopts.IgnoreFields(v1.User{}, "CreatedAt")); diff != "" {
+	if diff := cmpdiff.Diff(wantUsers, listUsers, cmpopts.IgnoreUnexported(v1.User{}), cmpopts.IgnoreFields(v1.User{}, "CreatedAt")); diff != "" {
 		t.Fatalf("unexpected users: %s", diff)
 	}
 
@@ -520,7 +562,7 @@ func TestOIDCReloginSameNodeNewUser(t *testing.T) {
 		return listUsers[i].GetId() < listUsers[j].GetId()
 	})
 
-	if diff := cmp.Diff(wantUsers, listUsers, cmpopts.IgnoreUnexported(v1.User{}), cmpopts.IgnoreFields(v1.User{}, "CreatedAt")); diff != "" {
+	if diff := cmpdiff.Diff(wantUsers, listUsers, cmpopts.IgnoreUnexported(v1.User{}), cmpopts.IgnoreFields(v1.User{}, "CreatedAt")); diff != "" {
 		t.Fatalf("unexpected users: %s", diff)
 	}
 
@@ -577,7 +619,7 @@ func TestOIDCReloginSameNodeNewUser(t *testing.T) {
 		return listUsers[i].GetId() < listUsers[j].GetId()
 	})
 
-	if diff := cmp.Diff(wantUsers, listUsers, cmpopts.IgnoreUnexported(v1.User{}), cmpopts.IgnoreFields(v1.User{}, "CreatedAt")); diff != "" {
+	if diff := cmpdiff.Diff(wantUsers, listUsers, cmpopts.IgnoreUnexported(v1.User{}), cmpopts.IgnoreFields(v1.User{}, "CreatedAt")); diff != "" {
 		t.Fatalf("unexpected users: %s", diff)
 	}
 
