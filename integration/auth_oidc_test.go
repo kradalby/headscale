@@ -173,12 +173,8 @@ func TestOIDCExpireNodesBasedOnTokenExpiry(t *testing.T) {
 	success := pingAllHelper(t, allClients, allAddrs)
 	t.Logf("%d successful pings out of %d (before expiry)", success, len(allClients)*len(allIps))
 
-	// This is not great, but this sadly is a time dependent test, so the
-	// safe thing to do is wait out the whole TTL time (and a bit more out
-	// of safety reasons) before checking if the clients have logged out.
-	// The Wait function can't do it itself as it has an upper bound of 1
-	// min.
-	time.Sleep(shortAccessTTL + 10*time.Second)
+	err = waitForExpiry(shortAccessTTL, allClients)
+	assertNoErr(t, err)
 
 	assertTailscaleNodesLogout(t, allClients)
 
@@ -211,14 +207,33 @@ func TestOIDCExpireNodesBasedOnTokenExpiry(t *testing.T) {
 	success = pingAllHelper(t, allClients, allAddrs)
 	t.Logf("%d successful pings out of %d (before expiry)", success, len(allClients)*len(allIps))
 
-	// This is not great, but this sadly is a time dependent test, so the
-	// safe thing to do is wait out the whole TTL time (and a bit more out
-	// of safety reasons) before checking if the clients have logged out.
-	// The Wait function can't do it itself as it has an upper bound of 1
-	// min.
-	time.Sleep(shortAccessTTL + 10*time.Second)
+	err = waitForExpiry(shortAccessTTL, allClients)
+	assertNoErr(t, err)
 
 	assertTailscaleNodesLogout(t, allClients)
+}
+
+func waitForExpiry(expected time.Duration, clients []TailscaleClient) error {
+	expireLimit := time.Now().Add(expected)
+	for _, client := range clients {
+		status, err := client.Status()
+		if err != nil {
+			return fmt.Errorf("getting status: %w", err)
+		}
+
+		if status.Self.KeyExpiry == nil {
+			return fmt.Errorf("key expiry is nil")
+		}
+		if !status.Self.KeyExpiry.Before(expireLimit) {
+			return fmt.Errorf("key expiry %q is not before %q", status.Self.KeyExpiry.String(), expireLimit.String())
+		}
+
+		if !status.Self.KeyExpiry.Before(time.Now()) {
+			time.Sleep(time.Second)
+		}
+	}
+
+	return nil
 }
 
 func TestOIDC024UserCreation(t *testing.T) {

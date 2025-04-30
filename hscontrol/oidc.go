@@ -296,15 +296,12 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		return
 	}
 
-	// TODO(kradalby): Is this comment right?
-	// If the node exists, then the node should be reauthenticated,
-	// if the node does not exist, and the machine key exists, then
-	// this is a new node that should be registered.
-	registrationId := a.getRegistrationIDFromState(state)
-
-	// Register the node if it does not exist.
-	if registrationId != nil {
+	if registrationId := a.getRegistrationIDFromState(state); registrationId != nil {
 		verb := "Reauthenticated"
+
+		// If the node exists, then the node should be reauthenticated,
+		// if the node does not exist, and the machine key exists, then
+		// this is a new node that should be registered.
 		newNode, err := a.handleRegistration(user, *registrationId, nodeExpiry)
 		if err != nil {
 			httpError(writer, err)

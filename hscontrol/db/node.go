@@ -358,11 +358,8 @@ func (hsdb *HSDatabase) HandleNodeFromAuthPath(
 					Str("expiresAt", fmt.Sprintf("%v", nodeExpiry)).
 					Msg("Registering node from API/CLI or auth callback")
 
-				// TODO(kradalby): This looks quite wrong? why ID 0?
-				// Why not always?
 				// Registration of expired node with different user
-				if reg.Node.ID != 0 &&
-					reg.Node.UserID != user.ID {
+				if reg.Node.UserID != user.ID {
 					return nil, ErrDifferentRegisteredUser
 				}
 
