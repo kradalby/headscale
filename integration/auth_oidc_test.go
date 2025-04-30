@@ -130,9 +130,9 @@ func TestOIDCExpireNodesBasedOnTokenExpiry(t *testing.T) {
 		Users:        []string{"user1", "user2"},
 		OIDCUsers: []mockoidc.MockUser{
 			oidcMockUser("user1", true),
-			oidcMockUser("user2", false),
+			oidcMockUser("user2", true),
 			oidcMockUser("user1", true),
-			oidcMockUser("user2", false),
+			oidcMockUser("user2", true),
 		},
 		OIDCAccessTTL: shortAccessTTL,
 	}
