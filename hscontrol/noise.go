@@ -35,14 +35,19 @@ const (
 	earlyNoiseCapabilityVersion = 49
 )
 
-type noiseServer struct {
+// noiseConn is a struct that implements the Noise protocol for the TS2021
+// protocol. It is used to upgrade the connection from HTTP/2 to Noise.
+// It describes the connection between headscale and a client.
+type noiseConn struct {
 	headscale *Headscale
 
 	httpBaseConfig *http.Server
 	http2Server    *http2.Server
 	conn           *controlbase.Conn
-	machineKey     key.MachinePublic
-	nodeKey        key.NodePublic
+
+	// machineKey is the machine key of the client.
+	machineKey key.MachinePublic
+	nodeKey    key.NodePublic
 
 	// EarlyNoise-related stuff
 	challenge       key.ChallengePrivate
@@ -70,7 +75,7 @@ func (h *Headscale) NoiseUpgradeHandler(
 		return
 	}
 
-	noiseServer := noiseServer{
+	noiseServer := noiseConn{
 		headscale: h,
 		challenge: key.NewChallenge(),
 	}
@@ -98,9 +103,11 @@ func (h *Headscale) NoiseUpgradeHandler(
 	router := mux.NewRouter()
 	router.Use(prometheusMiddleware)
 
-	router.HandleFunc("/machine/register", noiseServer.NoiseRegistrationHandler).
+	router.HandleFunc("/machine/register", noiseServer.RegistrationHandler).
 		Methods(http.MethodPost)
-	router.HandleFunc("/machine/map", noiseServer.NoisePollNetMapHandler)
+	router.HandleFunc("/machine/map", noiseServer.MapHandler)
+	router.HandleFunc("/machine/ssh/action/{src:[0-9]+}/to/{dst:[0-9]+}", noiseServer.SSHActionHandler)
+	router.HandleFunc("/machine/ssh/wait/{src:[0-9]+}/to/{dst:[0-9]+}/a/{auth}", noiseServer.SSHWaitHandler)
 
 	noiseServer.httpBaseConfig = &http.Server{
 		Handler:           router,
@@ -120,7 +127,7 @@ func unsupportedClientError(version tailcfg.CapabilityVersion) error {
 	return fmt.Errorf("unsupported client version: %s (%d)", capver.TailscaleVersion(version), version)
 }
 
-func (ns *noiseServer) earlyNoise(protocolVersion int, writer io.Writer) error {
+func (ns *noiseConn) earlyNoise(protocolVersion int, writer io.Writer) error {
 	if !isSupportedVersion(tailcfg.CapabilityVersion(protocolVersion)) {
 		return unsupportedClientError(tailcfg.CapabilityVersion(protocolVersion))
 	}
@@ -183,7 +190,7 @@ func rejectUnsupported(
 	return false
 }
 
-// NoisePollNetMapHandler takes care of /machine/:id/map using the Noise protocol
+// MapHandler takes care of /machine/:id/map using the Noise protocol
 //
 // This is the busiest endpoint, as it keeps the HTTP long poll that updates
 // the clients when something in the network changes.
@@ -192,7 +199,7 @@ func rejectUnsupported(
 // only after their first request (marked with the ReadOnly field).
 //
 // At this moment the updates are sent in a quite horrendous way, but they kinda work.
-func (ns *noiseServer) NoisePollNetMapHandler(
+func (ns *noiseConn) MapHandler(
 	writer http.ResponseWriter,
 	req *http.Request,
 ) {
@@ -234,8 +241,8 @@ func regErr(err error) *tailcfg.RegisterResponse {
 	return &tailcfg.RegisterResponse{Error: err.Error()}
 }
 
-// NoiseRegistrationHandler handles the actual registration process of a node.
-func (ns *noiseServer) NoiseRegistrationHandler(
+// RegistrationHandler handles the actual registration process of a node.
+func (ns *noiseConn) RegistrationHandler(
 	writer http.ResponseWriter,
 	req *http.Request,
 ) {
@@ -288,4 +295,54 @@ func (ns *noiseServer) NoiseRegistrationHandler(
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)
 	writer.Write(respBody)
+}
+
+// SSHActionHandler is called by a SSH destination node when a node marked with
+// "check" is trying to connect to it. It will check if the SSH source node is
+// authenticated recently.
+func (ns *noiseConn) SSHActionHandler(
+	writer http.ResponseWriter,
+	req *http.Request,
+) {
+	// src := mux.Vars(req)["src"]
+	// dst := mux.Vars(req)["dst"]
+
+	// look up dst
+	// check that mkey belongs to dst
+	//
+	// look up src
+	// reject if src is tagged (src cannot be tagged)
+	// reject if dst is not tagged and dst.User and src.User are different (no ssh between users in check)
+	// reject if src is expired (allow dst to be expired to fix it?)
+	//
+	// check if src has logged in recently (shorter than check period)
+	//   if it has, return allow
+	//
+	// if it has not, we need to make it log in. We need to trigger a login,
+	// the tailscale client has some pop url mechanism, so we want to trigger
+	// that.
+	//
+	// send a tailcfg.SSHAction with HoldAndDelegate set to the wait url (handler below)
+	// add authurl to message.
+	//
+	// wait for some sort of channel until the login is done
+	// return outcome
+}
+
+// SSHWaitHandler is called by a SSH destination node when it wants to
+// validate if a SSH source node is allowed to connect to it. It will
+// wait for the SSH source node to log in via headscale before letting it in.
+// A tailcfg.SSHAction is written to the client with the verdict.
+func (ns *noiseConn) SSHWaitHandler(
+	writer http.ResponseWriter,
+	req *http.Request,
+) {
+	// src := mux.Vars(req)["src"]
+	// dst := mux.Vars(req)["dst"]
+	// auth := mux.Vars(req)["auth"]
+
+	// look up auth
+	// check that mkey belongs to auth (maybe?)
+	// check/wait if auth is done
+	// return outcome
 }
