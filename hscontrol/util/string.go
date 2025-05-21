@@ -66,6 +66,16 @@ func MustGenerateRandomStringDNSSafe(size int) string {
 	return hash
 }
 
+// RandomString returns a URL-safe random string of the specified length.
+// If an error occurs during generation, it will panic.
+func RandomString(length int) string {
+	str, err := GenerateRandomStringURLSafe(length)
+	if err != nil {
+		panic(err)
+	}
+	return str
+}
+
 func TailNodesToString(nodes []*tailcfg.Node) string {
 	temp := make([]string, len(nodes))
 
