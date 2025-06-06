@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/creachadair/command"
@@ -46,101 +47,60 @@ func devCreateNodeCommand(env *command.Env) error {
 		return err
 	}
 
-	ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig(globalArgs.Config)
-	if err != nil {
-		return err
-	}
-	defer cancel()
-	defer conn.Close()
+	return withHeadscaleClient(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
+		request := &v1.DebugCreateNodeRequest{
+			Name:   devArgs.Name,
+			User:   devArgs.User,
+			Key:    devArgs.Key,
+			Routes: parseCommaSeparated(devArgs.Routes),
+		}
 
-	request := &v1.DebugCreateNodeRequest{
-		Name:   devArgs.Name,
-		User:   devArgs.User,
-		Key:    devArgs.Key,
-		Routes: parseCommaSeparated(devArgs.Routes),
-	}
+		response, err := client.DebugCreateNode(ctx, request)
+		if err != nil {
+			return fmt.Errorf("cannot create debug node: %w", err)
+		}
 
-	response, err := client.DebugCreateNode(ctx, request)
-	if err != nil {
-		return fmt.Errorf("cannot create debug node: %w", err)
-	}
-
-	return outputResult(response.GetNode(), "Debug node created", globalArgs.Output)
+		return outputResult(response.GetNode(), "Debug node created", globalArgs.Output)
+	})
 }
 
 // Dev command definitions
 
 func devCommands() []*command.C {
+	generateCommand := &command.C{
+		Name:  "generate",
+		Usage: "<subcommand> [flags]",
+		Help:  "Generate various resources",
+		Commands: []*command.C{
+			{
+				Name:  "private-key",
+				Usage: "",
+				Help:  "Generate a private key for the headscale server",
+				Run:   generatePrivateKeyCommand,
+			},
+		},
+	}
+
+	devCommand := &command.C{
+		Name:  "dev",
+		Usage: "<subcommand> [flags] [args...]",
+		Help:  "Development and testing commands",
+		Commands: []*command.C{
+			generateCommand,
+			{
+				Name:     "create-node",
+				Usage:    "--name <name> --user <user> --key <key> [--routes <routes>]",
+				Help:     "Create a debug node that can be registered",
+				SetFlags: command.Flags(flax.MustBind, &devArgs),
+				Run:      devCreateNodeCommand,
+			},
+		},
+	}
+
 	return []*command.C{
-		{
-			Name:  "dev",
-			Usage: "<subcommand> [flags] [args...]",
-			Help:  "Development and testing commands",
-			Commands: []*command.C{
-				{
-					Name:  "generate",
-					Usage: "<subcommand> [flags]",
-					Help:  "Generate various resources",
-					Commands: []*command.C{
-						{
-							Name:  "private-key",
-							Usage: "",
-							Help:  "Generate a private key for the headscale server",
-							Run:   generatePrivateKeyCommand,
-						},
-					},
-				},
-				{
-					Name:     "create-node",
-					Usage:    "--name <name> --user <user> --key <key> [--routes <routes>]",
-					Help:     "Create a debug node that can be registered",
-					SetFlags: command.Flags(flax.MustBind, &devArgs),
-					Run:      devCreateNodeCommand,
-				},
-			},
-		},
+		devCommand,
 		// Dev command aliases
-		{
-			Name:     "debug",
-			Usage:    "<subcommand> [flags] [args...]",
-			Help:     "Development and testing commands (alias)",
-			Unlisted: true,
-			Commands: []*command.C{
-				{
-					Name:  "generate",
-					Usage: "<subcommand> [flags]",
-					Help:  "Generate various resources",
-					Commands: []*command.C{
-						{
-							Name:  "private-key",
-							Usage: "",
-							Help:  "Generate a private key for the headscale server",
-							Run:   generatePrivateKeyCommand,
-						},
-					},
-				},
-				{
-					Name:     "create-node",
-					Usage:    "--name <name> --user <user> --key <key> [--routes <routes>]",
-					Help:     "Create a debug node that can be registered",
-					SetFlags: command.Flags(flax.MustBind, &devArgs),
-					Run:      devCreateNodeCommand,
-				},
-			},
-		},
-		{
-			Name:     "generate",
-			Usage:    "<subcommand> [flags] [args...]",
-			Help:     "Generate various resources (alias)",
-			Unlisted: true,
-			Commands: []*command.C{
-				{
-					Name:  "private-key",
-					Usage: "",
-					Help:  "Generate a private key for the headscale server",
-					Run:   generatePrivateKeyCommand,
-				},
-			},
-		},
+		createCommandAlias(devCommand, "debug", "Development and testing commands (alias)"),
+		createCommandAlias(generateCommand, "generate", "Generate various resources (alias)"),
 	}
 }

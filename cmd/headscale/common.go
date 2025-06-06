@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/creachadair/command"
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
 )
 
@@ -78,6 +79,61 @@ func ResolveUserToID(ctx context.Context, client v1.HeadscaleServiceClient, iden
 
 	default:
 		return 0, fmt.Errorf("unknown user identifier type: %s", parsed.Type)
+	}
+}
+
+// withHeadscaleClient handles the common gRPC client setup and cleanup pattern
+// It takes a function that accepts a context and client, and handles all the boilerplate
+func withHeadscaleClient(fn func(context.Context, v1.HeadscaleServiceClient) error) error {
+	ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig(globalArgs.Config)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	defer conn.Close()
+	return fn(ctx, client)
+}
+
+// resolveUserWithFallback resolves a user identifier to a user ID with backwards compatibility fallback
+// It first tries to resolve via ResolveUserToID, then falls back to parsing as direct uint64
+func resolveUserWithFallback(ctx context.Context, client v1.HeadscaleServiceClient, userIdentifier string) (uint64, error) {
+	// Try to resolve user identifier to ID
+	userID, err := ResolveUserToID(ctx, client, userIdentifier)
+	if err != nil {
+		// Fallback: try parsing as direct uint64 for backwards compatibility
+		if parsedID, parseErr := strconv.ParseUint(userIdentifier, 10, 64); parseErr == nil {
+			return parsedID, nil
+		}
+		return 0, fmt.Errorf("cannot resolve user identifier '%s': %w", userIdentifier, err)
+	}
+	return userID, nil
+}
+
+// Command alias helper functions
+
+// createCommandAlias creates a command alias with Unlisted: true
+// It copies the original command structure and updates the name and help text
+func createCommandAlias(original *command.C, aliasName, aliasHelp string) *command.C {
+	alias := &command.C{
+		Name:     aliasName,
+		Usage:    original.Usage,
+		Help:     aliasHelp,
+		Run:      original.Run,
+		SetFlags: original.SetFlags,
+		Commands: original.Commands,
+		Unlisted: true,
+	}
+	return alias
+}
+
+// createSubcommandAlias creates an alias for a subcommand within a command group
+func createSubcommandAlias(originalRun func(*command.Env) error, aliasName, usage, aliasHelp string) *command.C {
+	return &command.C{
+		Name:     aliasName,
+		Usage:    usage,
+		Help:     aliasHelp,
+		Run:      originalRun,
+		Unlisted: true,
 	}
 }
 
