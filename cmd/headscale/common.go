@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/creachadair/command"
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
@@ -193,4 +194,56 @@ func parseCommaSeparated(s string) []string {
 		}
 	}
 	return result
+}
+
+// getUserIDFromIdentifier resolves a user identifier (ID or name) to a user ID
+// This centralizes the common pattern of looking up users by ID or name
+func getUserIDFromIdentifier(ctx context.Context, client v1.HeadscaleServiceClient, id uint64, name string) (uint64, error) {
+	if id != 0 {
+		return id, nil
+	}
+
+	if name == "" {
+		return 0, fmt.Errorf("either ID or name must be provided")
+	}
+
+	// Find user by name
+	listReq := &v1.ListUsersRequest{Name: name}
+	listResp, err := client.ListUsers(ctx, listReq)
+	if err != nil {
+		return 0, fmt.Errorf("cannot find user: %w", err)
+	}
+	if len(listResp.GetUsers()) == 0 {
+		return 0, fmt.Errorf("user with name '%s' not found", name)
+	}
+
+	return listResp.GetUsers()[0].GetId(), nil
+}
+
+// confirmDeletion prompts for deletion confirmation unless force is specified
+// Returns true if the operation should proceed, false if cancelled
+func confirmDeletion(itemType, itemName string, force bool) (bool, error) {
+	if force {
+		return true, nil
+	}
+
+	// For now, just print a message and require --force
+	// TODO: Add interactive confirmation prompt when survey library is available
+	fmt.Printf("This will delete %s '%s'. Use --force to skip this confirmation.\n", itemType, itemName)
+	return false, fmt.Errorf("deletion cancelled - use --force to proceed")
+}
+
+// parseDurationWithDefault parses a duration string with a default fallback
+// This centralizes the common pattern of parsing expiration durations
+func parseDurationWithDefault(durationStr string, defaultDuration time.Duration) (time.Time, error) {
+	if durationStr == "" {
+		return time.Now().Add(defaultDuration), nil
+	}
+
+	duration, err := time.ParseDuration(durationStr)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid duration: %w", err)
+	}
+
+	return time.Now().Add(duration), nil
 }

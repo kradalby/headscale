@@ -60,14 +60,10 @@ func createPreAuthKeyCommand(env *command.Env) error {
 			return err
 		}
 
-		// Parse expiration with default
-		expiration := time.Now().Add(24 * time.Hour) // Default 24 hours
-		if preAuthArgs.Expiration != "" {
-			duration, err := time.ParseDuration(preAuthArgs.Expiration)
-			if err != nil {
-				return fmt.Errorf("invalid expiration duration: %w", err)
-			}
-			expiration = time.Now().Add(duration)
+		// Parse expiration using helper
+		expiration, err := parseDurationWithDefault(preAuthArgs.Expiration, 24*time.Hour)
+		if err != nil {
+			return err
 		}
 
 		request := &v1.CreatePreAuthKeyRequest{

@@ -126,11 +126,13 @@ func deleteNodeCommand(env *command.Env) error {
 			return fmt.Errorf("error getting node: %w", err)
 		}
 
-		if !globalArgs.Force {
-			// TODO: Add confirmation prompt
-			fmt.Printf("This will delete node %s (ID: %d). Use --force to skip this confirmation.\n",
-				getResponse.GetNode().GetName(), nodeArgs.ID)
-			return fmt.Errorf("deletion cancelled")
+		// Confirm deletion using the helper
+		shouldProceed, err := confirmDeletion("node", getResponse.GetNode().GetName(), globalArgs.Force)
+		if err != nil {
+			return err
+		}
+		if !shouldProceed {
+			return nil
 		}
 
 		deleteRequest := &v1.DeleteNodeRequest{NodeId: nodeArgs.ID}

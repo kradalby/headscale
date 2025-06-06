@@ -49,6 +49,7 @@ func main() {
 	commands = append(commands, apiKeyCommands()...)
 	commands = append(commands, policyCommands()...)
 	commands = append(commands, devCommands()...)
+	commands = append(commands, mockOIDCCommands()...)
 
 	// Create root command
 	root := &command.C{
@@ -62,7 +63,8 @@ func main() {
   preauth-keys <subcommand> [flags] [args...]
   api-keys <subcommand> [flags] [args...]
   policy <subcommand> [flags] [args...]
-  dev <subcommand> [flags] [args...]`,
+  dev <subcommand> [flags] [args...]
+  mockoidc`,
 
 		Help: `headscale - a Tailscale control server
 

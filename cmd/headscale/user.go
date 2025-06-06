@@ -66,21 +66,10 @@ func renameUserCommand(env *command.Env, newName string) error {
 	}
 
 	return withHeadscaleClient(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
-		// First, get the user to update
-		var userID uint64
-		if userArgs.ID != 0 {
-			userID = userArgs.ID
-		} else {
-			// Find user by name
-			listReq := &v1.ListUsersRequest{Name: userArgs.Name}
-			listResp, err := client.ListUsers(ctx, listReq)
-			if err != nil {
-				return fmt.Errorf("cannot find user: %w", err)
-			}
-			if len(listResp.GetUsers()) == 0 {
-				return fmt.Errorf("user with name '%s' not found", userArgs.Name)
-			}
-			userID = listResp.GetUsers()[0].GetId()
+		// Get the user ID using the helper
+		userID, err := getUserIDFromIdentifier(ctx, client, userArgs.ID, userArgs.Name)
+		if err != nil {
+			return err
 		}
 
 		request := &v1.RenameUserRequest{
@@ -104,39 +93,35 @@ func deleteUserCommand(env *command.Env) error {
 	}
 
 	return withHeadscaleClient(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
-		// First, get the user to delete
-		var userID uint64
-		if userArgs.ID != 0 {
-			userID = userArgs.ID
-		} else {
-			// Find user by name
-			listReq := &v1.ListUsersRequest{Name: userArgs.Name}
-			listResp, err := client.ListUsers(ctx, listReq)
-			if err != nil {
-				return fmt.Errorf("cannot find user: %w", err)
-			}
-			if len(listResp.GetUsers()) == 0 {
-				return fmt.Errorf("user with name '%s' not found", userArgs.Name)
-			}
-			userID = listResp.GetUsers()[0].GetId()
+		// Get the user ID using the helper
+		userID, err := getUserIDFromIdentifier(ctx, client, userArgs.ID, userArgs.Name)
+		if err != nil {
+			return err
 		}
 
-		// Confirm deletion unless --force is specified
-		if !globalArgs.Force {
-			// TODO: Add confirmation prompt
-			fmt.Printf("This will delete user ID %d. Use --force to skip this confirmation.\n", userID)
-			return fmt.Errorf("deletion cancelled")
+		// Determine the display name for confirmation
+		displayName := fmt.Sprintf("ID %d", userID)
+		if userArgs.Name != "" {
+			displayName = userArgs.Name
+		}
+
+		// Confirm deletion using the helper
+		shouldProceed, err := confirmDeletion("user", displayName, globalArgs.Force)
+		if err != nil {
+			return err
+		}
+		if !shouldProceed {
+			return nil
 		}
 
 		request := &v1.DeleteUserRequest{Id: userID}
 
-		_, err := client.DeleteUser(ctx, request)
+		_, err = client.DeleteUser(ctx, request)
 		if err != nil {
 			return fmt.Errorf("cannot delete user: %w", err)
 		}
 
-		fmt.Printf("User %d deleted successfully\n", userID)
-		return nil
+		return outputResult(map[string]interface{}{"user_id": userID}, fmt.Sprintf("User %d deleted successfully", userID), globalArgs.Output)
 	})
 }
 

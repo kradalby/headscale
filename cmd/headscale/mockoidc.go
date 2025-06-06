@@ -1,4 +1,4 @@
-package cli
+package main
 
 import (
 	"encoding/json"
@@ -9,53 +9,38 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/creachadair/command"
 	"github.com/oauth2-proxy/mockoidc"
 	"github.com/rs/zerolog/log"
-	"github.com/spf13/cobra"
 )
 
 const (
-	errMockOidcClientIDNotDefined     = Error("MOCKOIDC_CLIENT_ID not defined")
-	errMockOidcClientSecretNotDefined = Error("MOCKOIDC_CLIENT_SECRET not defined")
-	errMockOidcPortNotDefined         = Error("MOCKOIDC_PORT not defined")
+	errMockOidcClientIDNotDefined     = "MOCKOIDC_CLIENT_ID not defined"
+	errMockOidcClientSecretNotDefined = "MOCKOIDC_CLIENT_SECRET not defined"
+	errMockOidcPortNotDefined         = "MOCKOIDC_PORT not defined"
 	refreshTTL                        = 60 * time.Minute
 )
 
 var accessTTL = 2 * time.Minute
 
-func init() {
-	rootCmd.AddCommand(mockOidcCmd)
-}
+// Mock OIDC command implementation
 
-var mockOidcCmd = &cobra.Command{
-	Use:   "mockoidc",
-	Short: "Runs a mock OIDC server for testing",
-	Long:  "This internal command runs a OpenID Connect for testing purposes",
-	Run: func(cmd *cobra.Command, args []string) {
-		err := mockOIDC()
-		if err != nil {
-			log.Error().Err(err).Msgf("Error running mock OIDC server")
-			os.Exit(1)
-		}
-	},
-}
-
-func mockOIDC() error {
+func mockOIDCCommand(env *command.Env) error {
 	clientID := os.Getenv("MOCKOIDC_CLIENT_ID")
 	if clientID == "" {
-		return errMockOidcClientIDNotDefined
+		return fmt.Errorf(errMockOidcClientIDNotDefined)
 	}
 	clientSecret := os.Getenv("MOCKOIDC_CLIENT_SECRET")
 	if clientSecret == "" {
-		return errMockOidcClientSecretNotDefined
+		return fmt.Errorf(errMockOidcClientSecretNotDefined)
 	}
 	addrStr := os.Getenv("MOCKOIDC_ADDR")
 	if addrStr == "" {
-		return errMockOidcPortNotDefined
+		return fmt.Errorf(errMockOidcPortNotDefined)
 	}
 	portStr := os.Getenv("MOCKOIDC_PORT")
 	if portStr == "" {
-		return errMockOidcPortNotDefined
+		return fmt.Errorf(errMockOidcPortNotDefined)
 	}
 	accessTTLOverride := os.Getenv("MOCKOIDC_ACCESS_TTL")
 	if accessTTLOverride != "" {
@@ -143,4 +128,17 @@ func getMockOIDC(clientID string, clientSecret string, users []mockoidc.MockUser
 	})
 
 	return &mock, nil
+}
+
+// Mock OIDC command definition
+
+func mockOIDCCommands() []*command.C {
+	return []*command.C{
+		{
+			Name:  "mockoidc",
+			Usage: "",
+			Help:  "Runs a mock OIDC server for testing purposes",
+			Run:   mockOIDCCommand,
+		},
+	}
 }

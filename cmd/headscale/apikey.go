@@ -34,14 +34,10 @@ func listAPIKeysCommand(env *command.Env) error {
 
 func createAPIKeyCommand(env *command.Env) error {
 	return withHeadscaleClient(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
-		// Parse expiration
-		expiration := time.Now().Add(24 * time.Hour) // Default 24 hours
-		if apiKeyArgs.Expiration != "" {
-			duration, err := time.ParseDuration(apiKeyArgs.Expiration)
-			if err != nil {
-				return fmt.Errorf("invalid expiration duration: %w", err)
-			}
-			expiration = time.Now().Add(duration)
+		// Parse expiration using helper
+		expiration, err := parseDurationWithDefault(apiKeyArgs.Expiration, 24*time.Hour)
+		if err != nil {
+			return err
 		}
 
 		request := &v1.CreateApiKeyRequest{
