@@ -71,6 +71,8 @@ func ResolveUserToID(ctx context.Context, client v1.HeadscaleServiceClient, iden
 
 	parsed := parseUserIdentifier(identifier)
 
+	var request *v1.ListUsersRequest
+
 	switch parsed.Type {
 	case "id":
 		// Already an ID, just parse and return
@@ -81,23 +83,33 @@ func ResolveUserToID(ctx context.Context, client v1.HeadscaleServiceClient, iden
 		return id, nil
 
 	case "username":
-		// TODO: Implement gRPC call to find user by username
-		// For now, return a placeholder error
-		return 0, fmt.Errorf("user lookup by username not yet implemented - need gRPC API for GetUserByName")
+		request = &v1.ListUsersRequest{Name: parsed.Value}
 
 	case "email":
-		// TODO: Implement gRPC call to find user by email
-		// For now, return a placeholder error
-		return 0, fmt.Errorf("user lookup by email not yet implemented - need gRPC API for GetUserByEmail")
+		request = &v1.ListUsersRequest{Email: parsed.Value}
 
 	case "provider":
-		// TODO: Implement gRPC call to find user by provider identifier
-		// For now, return a placeholder error
-		return 0, fmt.Errorf("user lookup by provider ID not yet implemented - need gRPC API for GetUserByProviderIdentifier")
+		request = &v1.ListUsersRequest{ProviderId: parsed.Value}
 
 	default:
 		return 0, fmt.Errorf("unknown user identifier type: %s", parsed.Type)
 	}
+
+	response, err := client.ListUsers(ctx, request)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list users: %w", err)
+	}
+
+	users := response.GetUsers()
+	if len(users) == 0 {
+		return 0, fmt.Errorf("user with %s '%s' not found", parsed.Type, parsed.Value)
+	}
+
+	if len(users) > 1 {
+		return 0, fmt.Errorf("multiple users found with %s '%s'", parsed.Type, parsed.Value)
+	}
+
+	return users[0].GetId(), nil
 }
 
 // withHeadscaleClient handles the common gRPC client setup and cleanup pattern
@@ -146,40 +158,27 @@ func ResolveNodeToID(ctx context.Context, client v1.HeadscaleServiceClient, iden
 		return id, nil
 
 	case "name":
-		// Find node by name (searches both hostname and givenname)
-		return findNodeByName(ctx, client, parsed.Value)
+		// Find node by name using new gRPC filtering
+		request := &v1.ListNodesRequest{Name: parsed.Value}
+		response, err := client.ListNodes(ctx, request)
+		if err != nil {
+			return 0, fmt.Errorf("failed to list nodes: %w", err)
+		}
+
+		nodes := response.GetNodes()
+		if len(nodes) == 0 {
+			return 0, fmt.Errorf("node with name '%s' not found", parsed.Value)
+		}
+
+		if len(nodes) > 1 {
+			return 0, fmt.Errorf("multiple nodes found with name '%s'", parsed.Value)
+		}
+
+		return nodes[0].GetId(), nil
 
 	default:
 		return 0, fmt.Errorf("unknown node identifier type: %s", parsed.Type)
 	}
-}
-
-// findNodeByName searches for a node by name (hostname or given name)
-func findNodeByName(ctx context.Context, client v1.HeadscaleServiceClient, name string) (uint64, error) {
-	// List all nodes to search through them
-	listReq := &v1.ListNodesRequest{}
-	listResp, err := client.ListNodes(ctx, listReq)
-	if err != nil {
-		return 0, fmt.Errorf("cannot list nodes: %w", err)
-	}
-
-	var matchingNodes []*v1.Node
-	for _, node := range listResp.GetNodes() {
-		// Check if name matches either hostname (name field) or given name
-		if node.GetName() == name || node.GetGivenName() == name {
-			matchingNodes = append(matchingNodes, node)
-		}
-	}
-
-	if len(matchingNodes) == 0 {
-		return 0, fmt.Errorf("node with name '%s' not found", name)
-	}
-
-	if len(matchingNodes) > 1 {
-		return 0, fmt.Errorf("multiple nodes found with name '%s'", name)
-	}
-
-	return matchingNodes[0].GetId(), nil
 }
 
 // resolveNodeWithFallback resolves a node identifier to a node ID with backwards compatibility fallback
