@@ -11,7 +11,8 @@ import (
 
 // Node command flags
 var nodeArgs struct {
-	ID       uint64 `flag:"id,i,Node ID"`
+	ID       uint64 `flag:"id,i,Node ID (deprecated: use --node)"`
+	Node     string `flag:"node,n,Node identifier (ID, hostname, or given name)"`
 	User     string `flag:"user,u,User identifier (ID, username, email, or provider ID)"`
 	ShowTags bool   `flag:"show-tags,Show tags in output"`
 	Tags     string `flag:"tags,t,Comma-separated tags"`
@@ -77,12 +78,13 @@ func listNodesCommand(env *command.Env) error {
 }
 
 func expireNodeCommand(env *command.Env) error {
-	if err := requireUint64(nodeArgs.ID, "id"); err != nil {
-		return err
-	}
-
 	return withHeadscaleClient(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
-		request := &v1.ExpireNodeRequest{NodeId: nodeArgs.ID}
+		nodeID, err := getNodeIDFromIdentifier(ctx, client, nodeArgs.ID, nodeArgs.Node)
+		if err != nil {
+			return err
+		}
+
+		request := &v1.ExpireNodeRequest{NodeId: nodeID}
 
 		response, err := client.ExpireNode(ctx, request)
 		if err != nil {
@@ -94,13 +96,14 @@ func expireNodeCommand(env *command.Env) error {
 }
 
 func renameNodeCommand(env *command.Env, newName string) error {
-	if err := requireUint64(nodeArgs.ID, "id"); err != nil {
-		return err
-	}
-
 	return withHeadscaleClient(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
+		nodeID, err := getNodeIDFromIdentifier(ctx, client, nodeArgs.ID, nodeArgs.Node)
+		if err != nil {
+			return err
+		}
+
 		request := &v1.RenameNodeRequest{
-			NodeId:  nodeArgs.ID,
+			NodeId:  nodeID,
 			NewName: newName,
 		}
 
@@ -114,13 +117,14 @@ func renameNodeCommand(env *command.Env, newName string) error {
 }
 
 func deleteNodeCommand(env *command.Env) error {
-	if err := requireUint64(nodeArgs.ID, "id"); err != nil {
-		return err
-	}
-
 	return withHeadscaleClient(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
+		nodeID, err := getNodeIDFromIdentifier(ctx, client, nodeArgs.ID, nodeArgs.Node)
+		if err != nil {
+			return err
+		}
+
 		// Get node first for confirmation
-		getRequest := &v1.GetNodeRequest{NodeId: nodeArgs.ID}
+		getRequest := &v1.GetNodeRequest{NodeId: nodeID}
 		getResponse, err := client.GetNode(ctx, getRequest)
 		if err != nil {
 			return fmt.Errorf("error getting node: %w", err)
@@ -135,7 +139,7 @@ func deleteNodeCommand(env *command.Env) error {
 			return nil
 		}
 
-		deleteRequest := &v1.DeleteNodeRequest{NodeId: nodeArgs.ID}
+		deleteRequest := &v1.DeleteNodeRequest{NodeId: nodeID}
 		response, err := client.DeleteNode(ctx, deleteRequest)
 		if err != nil {
 			return fmt.Errorf("error deleting node: %w", err)
@@ -151,14 +155,16 @@ func deleteNodeCommand(env *command.Env) error {
 }
 
 func moveNodeCommand(env *command.Env) error {
-	if err := requireUint64(nodeArgs.ID, "id"); err != nil {
-		return err
-	}
 	if err := requireString(nodeArgs.User, "user"); err != nil {
 		return err
 	}
 
 	return withHeadscaleClient(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
+		nodeID, err := getNodeIDFromIdentifier(ctx, client, nodeArgs.ID, nodeArgs.Node)
+		if err != nil {
+			return err
+		}
+
 		// Resolve user identifier to ID with fallback
 		userID, err := resolveUserWithFallback(ctx, client, nodeArgs.User)
 		if err != nil {
@@ -166,7 +172,7 @@ func moveNodeCommand(env *command.Env) error {
 		}
 
 		request := &v1.MoveNodeRequest{
-			NodeId: nodeArgs.ID,
+			NodeId: nodeID,
 			User:   userID,
 		}
 
@@ -180,13 +186,14 @@ func moveNodeCommand(env *command.Env) error {
 }
 
 func setNodeTagsCommand(env *command.Env) error {
-	if err := requireUint64(nodeArgs.ID, "id"); err != nil {
-		return err
-	}
-
 	return withHeadscaleClient(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
+		nodeID, err := getNodeIDFromIdentifier(ctx, client, nodeArgs.ID, nodeArgs.Node)
+		if err != nil {
+			return err
+		}
+
 		request := &v1.SetTagsRequest{
-			NodeId: nodeArgs.ID,
+			NodeId: nodeID,
 			Tags:   parseCommaSeparated(nodeArgs.Tags),
 		}
 
@@ -200,13 +207,14 @@ func setNodeTagsCommand(env *command.Env) error {
 }
 
 func listNodeRoutesCommand(env *command.Env) error {
-	if err := requireUint64(nodeArgs.ID, "id"); err != nil {
-		return err
-	}
-
 	return withHeadscaleClient(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
+		nodeID, err := getNodeIDFromIdentifier(ctx, client, nodeArgs.ID, nodeArgs.Node)
+		if err != nil {
+			return err
+		}
+
 		// Get the node first to access its routes
-		request := &v1.GetNodeRequest{NodeId: nodeArgs.ID}
+		request := &v1.GetNodeRequest{NodeId: nodeID}
 		response, err := client.GetNode(ctx, request)
 		if err != nil {
 			return fmt.Errorf("cannot get node: %w", err)
@@ -224,13 +232,14 @@ func listNodeRoutesCommand(env *command.Env) error {
 }
 
 func approveNodeRoutesCommand(env *command.Env) error {
-	if err := requireUint64(nodeArgs.ID, "id"); err != nil {
-		return err
-	}
-
 	return withHeadscaleClient(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
+		nodeID, err := getNodeIDFromIdentifier(ctx, client, nodeArgs.ID, nodeArgs.Node)
+		if err != nil {
+			return err
+		}
+
 		request := &v1.SetApprovedRoutesRequest{
-			NodeId: nodeArgs.ID,
+			NodeId: nodeID,
 			Routes: parseCommaSeparated(nodeArgs.Routes),
 		}
 
@@ -282,32 +291,32 @@ func nodeCommands() []*command.C {
 			createSubcommandAlias(listNodesCommand, "ls", "[--user <user>] [flags]", "List nodes (alias)"),
 			{
 				Name:  "expire",
-				Usage: "--id <id>",
+				Usage: "--node <node> | --id <id>",
 				Help:  "Expire a node",
 				Run:   expireNodeCommand,
 			},
 			{
 				Name:  "rename",
-				Usage: "--id <id> <new-name>",
+				Usage: "--node <node> | --id <id> <new-name>",
 				Help:  "Rename a node",
 				Run:   command.Adapt(renameNodeCommand),
 			},
 			{
 				Name:  "delete",
-				Usage: "--id <id>",
+				Usage: "--node <node> | --id <id>",
 				Help:  "Delete a node",
 				Run:   deleteNodeCommand,
 			},
-			createSubcommandAlias(deleteNodeCommand, "destroy", "--id <id>", "Delete a node (alias)"),
+			createSubcommandAlias(deleteNodeCommand, "destroy", "--node <node> | --id <id>", "Delete a node (alias)"),
 			{
 				Name:  "move",
-				Usage: "--id <id> --user <user>",
+				Usage: "--node <node> | --id <id> --user <user>",
 				Help:  "Move a node to another user",
 				Run:   moveNodeCommand,
 			},
 			{
 				Name:  "tags",
-				Usage: "--id <id> --tags <tag1,tag2,...>",
+				Usage: "--node <node> | --id <id> --tags <tag1,tag2,...>",
 				Help:  "Set tags for a node",
 				Run:   setNodeTagsCommand,
 			},
@@ -318,13 +327,13 @@ func nodeCommands() []*command.C {
 				Commands: []*command.C{
 					{
 						Name:  "list",
-						Usage: "--id <id>",
+						Usage: "--node <node> | --id <id>",
 						Help:  "List routes for a node",
 						Run:   listNodeRoutesCommand,
 					},
 					{
 						Name:  "approve",
-						Usage: "--id <id> --routes <route1,route2,...>",
+						Usage: "--node <node> | --id <id> --routes <route1,route2,...>",
 						Help:  "Approve routes for a node",
 						Run:   approveNodeRoutesCommand,
 					},

@@ -24,6 +24,12 @@ type userIdentifier struct {
 	Value string
 }
 
+// nodeIdentifier represents a parsed node identifier
+type nodeIdentifier struct {
+	Type  string // "id", "name"
+	Value string
+}
+
 // parseUserIdentifier parses a user identifier string and determines its type
 func parseUserIdentifier(input string) userIdentifier {
 	// Try to parse as numeric ID first
@@ -43,6 +49,17 @@ func parseUserIdentifier(input string) userIdentifier {
 
 	// Default to username
 	return userIdentifier{Type: "username", Value: input}
+}
+
+// parseNodeIdentifier parses a node identifier string and determines its type
+func parseNodeIdentifier(input string) nodeIdentifier {
+	// Try to parse as numeric ID first
+	if id, err := strconv.ParseUint(input, 10, 64); err == nil && id > 0 {
+		return nodeIdentifier{Type: "id", Value: input}
+	}
+
+	// Default to name (will search both hostname and givenname on server side)
+	return nodeIdentifier{Type: "name", Value: input}
 }
 
 // ResolveUserToID resolves a user identifier to a user ID
@@ -110,6 +127,76 @@ func resolveUserWithFallback(ctx context.Context, client v1.HeadscaleServiceClie
 	return userID, nil
 }
 
+// ResolveNodeToID resolves a node identifier to a node ID
+// This function will make a gRPC call to find the node by different identifier types
+func ResolveNodeToID(ctx context.Context, client v1.HeadscaleServiceClient, identifier string) (uint64, error) {
+	if identifier == "" {
+		return 0, fmt.Errorf("node identifier cannot be empty")
+	}
+
+	parsed := parseNodeIdentifier(identifier)
+
+	switch parsed.Type {
+	case "id":
+		// Already an ID, just parse and return
+		id, err := strconv.ParseUint(parsed.Value, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid node ID: %w", err)
+		}
+		return id, nil
+
+	case "name":
+		// Find node by name (searches both hostname and givenname)
+		return findNodeByName(ctx, client, parsed.Value)
+
+	default:
+		return 0, fmt.Errorf("unknown node identifier type: %s", parsed.Type)
+	}
+}
+
+// findNodeByName searches for a node by name (hostname or given name)
+func findNodeByName(ctx context.Context, client v1.HeadscaleServiceClient, name string) (uint64, error) {
+	// List all nodes to search through them
+	listReq := &v1.ListNodesRequest{}
+	listResp, err := client.ListNodes(ctx, listReq)
+	if err != nil {
+		return 0, fmt.Errorf("cannot list nodes: %w", err)
+	}
+
+	var matchingNodes []*v1.Node
+	for _, node := range listResp.GetNodes() {
+		// Check if name matches either hostname (name field) or given name
+		if node.GetName() == name || node.GetGivenName() == name {
+			matchingNodes = append(matchingNodes, node)
+		}
+	}
+
+	if len(matchingNodes) == 0 {
+		return 0, fmt.Errorf("node with name '%s' not found", name)
+	}
+
+	if len(matchingNodes) > 1 {
+		return 0, fmt.Errorf("multiple nodes found with name '%s'", name)
+	}
+
+	return matchingNodes[0].GetId(), nil
+}
+
+// resolveNodeWithFallback resolves a node identifier to a node ID with backwards compatibility fallback
+// It first tries to resolve via ResolveNodeToID, then falls back to parsing as direct uint64
+func resolveNodeWithFallback(ctx context.Context, client v1.HeadscaleServiceClient, nodeIdentifier string) (uint64, error) {
+	// Try to resolve node identifier to ID
+	nodeID, err := ResolveNodeToID(ctx, client, nodeIdentifier)
+	if err != nil {
+		// Fallback: try parsing as direct uint64 for backwards compatibility
+		if parsedID, parseErr := strconv.ParseUint(nodeIdentifier, 10, 64); parseErr == nil {
+			return parsedID, nil
+		}
+		return 0, fmt.Errorf("cannot resolve node identifier '%s': %w", nodeIdentifier, err)
+	}
+	return nodeID, nil
+}
+
 // Command alias helper functions
 
 // createCommandAlias creates a command alias with Unlisted: true
@@ -172,12 +259,17 @@ func validateUserIdentifier(id uint64, name string) error {
 	return nil
 }
 
-// validateNodeIdentifier validates that either ID or name/user combination is provided for node commands
-func validateNodeIdentifier(id uint64, user string) error {
-	if id == 0 && user == "" {
-		return fmt.Errorf("either --id or --user flag is required")
+// validateNodeIdentifier validates that either ID or node identifier is provided for node commands
+func validateNodeIdentifier(id uint64, node string) error {
+	if id == 0 && node == "" {
+		return fmt.Errorf("either --id or --node flag is required")
 	}
 	return nil
+}
+
+// requireNodeIdentifier validates that either ID or node identifier is provided
+func requireNodeIdentifier(id uint64, node string) error {
+	return validateNodeIdentifier(id, node)
 }
 
 // parseCommaSeparated parses a comma-separated string into a slice of strings
@@ -218,6 +310,21 @@ func getUserIDFromIdentifier(ctx context.Context, client v1.HeadscaleServiceClie
 	}
 
 	return listResp.GetUsers()[0].GetId(), nil
+}
+
+// getNodeIDFromIdentifier resolves a node identifier (ID or node identifier) to a node ID
+// This centralizes the common pattern of looking up nodes by ID or identifier
+func getNodeIDFromIdentifier(ctx context.Context, client v1.HeadscaleServiceClient, id uint64, nodeIdentifier string) (uint64, error) {
+	if id != 0 {
+		return id, nil
+	}
+
+	if nodeIdentifier == "" {
+		return 0, fmt.Errorf("either ID or node identifier must be provided")
+	}
+
+	// Resolve node identifier to ID with fallback
+	return resolveNodeWithFallback(ctx, client, nodeIdentifier)
 }
 
 // confirmDeletion prompts for deletion confirmation unless force is specified
