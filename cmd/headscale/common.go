@@ -2,83 +2,45 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"strconv"
 	"strings"
 
-	"github.com/creachadair/command"
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
 )
 
-// Common flag structures that can be embedded
-
-// globalFlags contains flags available to all commands
-type globalFlags struct {
+// Global flags available to all commands
+var globalArgs struct {
 	Config string `flag:"config,c,Config file path"`
 	Output string `flag:"output,o,Output format (json, yaml, table)"`
 	Force  bool   `flag:"force,Skip confirmation prompts"`
 }
 
-// identifierFlags for commands that need to identify resources by ID or name
-type identifierFlags struct {
-	ID   uint64 `flag:"id,i,Resource ID"`
-	Name string `flag:"name,n,Resource name"`
-}
-
-// userFlags for commands that reference users
-type userFlags struct {
-	User string `flag:"user,u,User identifier (ID, username, email, or provider ID)"`
-}
-
-// expirationFlags for commands that set expiration
-type expirationFlags struct {
-	Expiration string `flag:"expiration,e,default=24h,Expiration duration (e.g. 1h, 24h, 7d)"`
-}
-
-// tagsFlags for commands that work with tags
-type tagsFlags struct {
-	Tags []string `flag:"tags,t,Comma-separated tags"`
-}
-
-// routesFlags for commands that work with routes
-type routesFlags struct {
-	Routes []string `flag:"routes,r,Comma-separated routes"`
-}
-
-// Helper function to simplify flag binding
-func Flags(bind func(*flag.FlagSet, interface{}), flags interface{}) func(*command.Env, *flag.FlagSet) {
-	return func(env *command.Env, fs *flag.FlagSet) {
-		bind(fs, flags)
-		env.Config = flags
-	}
-}
-
-// UserIdentifier represents a parsed user identifier
-type UserIdentifier struct {
+// userIdentifier represents a parsed user identifier
+type userIdentifier struct {
 	Type  string // "id", "username", "email", "provider"
 	Value string
 }
 
-// ParseUserIdentifier parses a user identifier string and determines its type
-func ParseUserIdentifier(input string) UserIdentifier {
+// parseUserIdentifier parses a user identifier string and determines its type
+func parseUserIdentifier(input string) userIdentifier {
 	// Try to parse as numeric ID first
 	if id, err := strconv.ParseUint(input, 10, 64); err == nil && id > 0 {
-		return UserIdentifier{Type: "id", Value: input}
+		return userIdentifier{Type: "id", Value: input}
 	}
 
 	// Check if it looks like an email
 	if strings.Contains(input, "@") && strings.Contains(input, ".") {
-		return UserIdentifier{Type: "email", Value: input}
+		return userIdentifier{Type: "email", Value: input}
 	}
 
 	// Check if it looks like a provider identifier (contains a colon)
 	if strings.Contains(input, ":") {
-		return UserIdentifier{Type: "provider", Value: input}
+		return userIdentifier{Type: "provider", Value: input}
 	}
 
 	// Default to username
-	return UserIdentifier{Type: "username", Value: input}
+	return userIdentifier{Type: "username", Value: input}
 }
 
 // ResolveUserToID resolves a user identifier to a user ID
@@ -88,7 +50,7 @@ func ResolveUserToID(ctx context.Context, client v1.HeadscaleServiceClient, iden
 		return 0, fmt.Errorf("user identifier cannot be empty")
 	}
 
-	parsed := ParseUserIdentifier(identifier)
+	parsed := parseUserIdentifier(identifier)
 
 	switch parsed.Type {
 	case "id":
@@ -119,39 +81,60 @@ func ResolveUserToID(ctx context.Context, client v1.HeadscaleServiceClient, iden
 	}
 }
 
-// RequireString validates that a required string flag is provided
-func RequireString(value, name string) error {
+// Validation helper functions
+
+// requireString validates that a required string flag is provided
+func requireString(value, name string) error {
 	if value == "" {
 		return fmt.Errorf("--%s flag is required", name)
 	}
 	return nil
 }
 
-// RequireUint64 validates that a required uint64 flag is provided
-func RequireUint64(value uint64, name string) error {
+// requireUint64 validates that a required uint64 flag is provided
+func requireUint64(value uint64, name string) error {
 	if value == 0 {
 		return fmt.Errorf("--%s flag is required", name)
 	}
 	return nil
 }
 
-// RequireEither validates that at least one of two string values is provided
-func RequireEither(value1, name1, value2, name2 string) error {
+// requireEither validates that at least one of two string values is provided
+func requireEither(value1, name1, value2, name2 string) error {
 	if value1 == "" && value2 == "" {
 		return fmt.Errorf("either --%s or --%s flag is required", name1, name2)
 	}
 	return nil
 }
 
-// ValidateIdentifier validates that either ID or name is provided
-func ValidateIdentifier(flags identifierFlags) error {
-	return RequireEither(fmt.Sprintf("%d", flags.ID), "id", flags.Name, "name")
-}
-
-// ValidateIdentifierFromFields validates that either ID or name is provided from explicit fields
-func ValidateIdentifierFromFields(id uint64, name string) error {
+// validateUserIdentifier validates that either ID or name is provided for user commands
+func validateUserIdentifier(id uint64, name string) error {
 	if id == 0 && name == "" {
 		return fmt.Errorf("either --id or --name flag is required")
 	}
 	return nil
+}
+
+// validateNodeIdentifier validates that either ID or name/user combination is provided for node commands
+func validateNodeIdentifier(id uint64, user string) error {
+	if id == 0 && user == "" {
+		return fmt.Errorf("either --id or --user flag is required")
+	}
+	return nil
+}
+
+// parseCommaSeparated parses a comma-separated string into a slice of strings
+func parseCommaSeparated(s string) []string {
+	if s == "" {
+		return []string{}
+	}
+	parts := strings.Split(s, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
 }

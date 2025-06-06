@@ -10,28 +10,16 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// API key command flag structures
-
-type listAPIKeyFlags struct {
-	globalFlags
-}
-
-type createAPIKeyFlags struct {
-	globalFlags
-	expirationFlags
-}
-
-type apiKeyActionFlags struct {
-	globalFlags
-	Prefix string `flag:"prefix,p,API key prefix (required)"`
+// API key command flags
+var apiKeyArgs struct {
+	Prefix     string `flag:"prefix,p,API key prefix"`
+	Expiration string `flag:"expiration,e,default=24h,Expiration duration"`
 }
 
 // API key command implementations
 
 func listAPIKeysCommand(env *command.Env) error {
-	flags := env.Config.(*listAPIKeyFlags)
-
-	ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig(flags.Config)
+	ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig(globalArgs.Config)
 	if err != nil {
 		return err
 	}
@@ -45,13 +33,11 @@ func listAPIKeysCommand(env *command.Env) error {
 		return fmt.Errorf("cannot list API keys: %w", err)
 	}
 
-	return outputResult(response.GetApiKeys(), "API Keys", flags.Output)
+	return outputResult(response.GetApiKeys(), "API Keys", globalArgs.Output)
 }
 
 func createAPIKeyCommand(env *command.Env) error {
-	flags := env.Config.(*createAPIKeyFlags)
-
-	ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig(flags.Config)
+	ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig(globalArgs.Config)
 	if err != nil {
 		return err
 	}
@@ -59,12 +45,14 @@ func createAPIKeyCommand(env *command.Env) error {
 	defer conn.Close()
 
 	// Parse expiration
-	duration, err := time.ParseDuration(flags.Expiration)
-	if err != nil {
-		return fmt.Errorf("could not parse duration: %w", err)
+	expiration := time.Now().Add(24 * time.Hour) // Default 24 hours
+	if apiKeyArgs.Expiration != "" {
+		duration, err := time.ParseDuration(apiKeyArgs.Expiration)
+		if err != nil {
+			return fmt.Errorf("invalid expiration duration: %w", err)
+		}
+		expiration = time.Now().Add(duration)
 	}
-
-	expiration := time.Now().UTC().Add(duration)
 
 	request := &v1.CreateApiKeyRequest{
 		Expiration: timestamppb.New(expiration),
@@ -75,17 +63,15 @@ func createAPIKeyCommand(env *command.Env) error {
 		return fmt.Errorf("cannot create API key: %w", err)
 	}
 
-	return outputResult(response.GetApiKey(), "API Key created", flags.Output)
+	return outputResult(response.GetApiKey(), "API Key created", globalArgs.Output)
 }
 
 func expireAPIKeyCommand(env *command.Env) error {
-	flags := env.Config.(*apiKeyActionFlags)
-
-	if err := RequireString(flags.Prefix, "prefix"); err != nil {
+	if err := requireString(apiKeyArgs.Prefix, "prefix"); err != nil {
 		return err
 	}
 
-	ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig(flags.Config)
+	ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig(globalArgs.Config)
 	if err != nil {
 		return err
 	}
@@ -93,7 +79,7 @@ func expireAPIKeyCommand(env *command.Env) error {
 	defer conn.Close()
 
 	request := &v1.ExpireApiKeyRequest{
-		Prefix: flags.Prefix,
+		Prefix: apiKeyArgs.Prefix,
 	}
 
 	response, err := client.ExpireApiKey(ctx, request)
@@ -101,17 +87,15 @@ func expireAPIKeyCommand(env *command.Env) error {
 		return fmt.Errorf("cannot expire API key: %w", err)
 	}
 
-	return outputResult(response, "API Key expired", flags.Output)
+	return outputResult(response, "API Key expired", globalArgs.Output)
 }
 
 func deleteAPIKeyCommand(env *command.Env) error {
-	flags := env.Config.(*apiKeyActionFlags)
-
-	if err := RequireString(flags.Prefix, "prefix"); err != nil {
+	if err := requireString(apiKeyArgs.Prefix, "prefix"); err != nil {
 		return err
 	}
 
-	ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig(flags.Config)
+	ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig(globalArgs.Config)
 	if err != nil {
 		return err
 	}
@@ -119,7 +103,7 @@ func deleteAPIKeyCommand(env *command.Env) error {
 	defer conn.Close()
 
 	request := &v1.DeleteApiKeyRequest{
-		Prefix: flags.Prefix,
+		Prefix: apiKeyArgs.Prefix,
 	}
 
 	response, err := client.DeleteApiKey(ctx, request)
@@ -127,7 +111,7 @@ func deleteAPIKeyCommand(env *command.Env) error {
 		return fmt.Errorf("cannot delete API key: %w", err)
 	}
 
-	return outputResult(response, "API Key deleted", flags.Output)
+	return outputResult(response, "API Key deleted", globalArgs.Output)
 }
 
 // API key command definitions
@@ -135,61 +119,83 @@ func deleteAPIKeyCommand(env *command.Env) error {
 func apiKeyCommands() []*command.C {
 	return []*command.C{
 		{
-			Name:  "api-keys",
-			Usage: "<subcommand> [flags] [args...]",
-			Help:  "Manage API keys",
+			Name:     "api-keys",
+			Usage:    "<subcommand> [flags] [args...]",
+			Help:     "Manage API keys",
+			SetFlags: command.Flags(flax.MustBind, &apiKeyArgs),
 			Commands: []*command.C{
 				{
-					Name:     "list",
-					Usage:    "",
-					Help:     "List API keys",
-					SetFlags: Flags(flax.MustBind, &listAPIKeyFlags{}),
-					Run:      listAPIKeysCommand,
+					Name:  "list",
+					Usage: "",
+					Help:  "List API keys",
+					Run:   listAPIKeysCommand,
 				},
 				{
 					Name:     "ls",
 					Usage:    "",
 					Help:     "List API keys (alias)",
-					SetFlags: Flags(flax.MustBind, &listAPIKeyFlags{}),
 					Run:      listAPIKeysCommand,
 					Unlisted: true,
 				},
 				{
-					Name:     "create",
-					Usage:    "[--expiration <duration>]",
-					Help:     "Create a new API key",
-					SetFlags: Flags(flax.MustBind, &createAPIKeyFlags{}),
-					Run:      createAPIKeyCommand,
+					Name:  "create",
+					Usage: "[--expiration <duration>]",
+					Help:  "Create a new API key",
+					Run:   createAPIKeyCommand,
 				},
 				{
-					Name:     "expire",
-					Usage:    "--prefix <prefix>",
-					Help:     "Expire an API key",
-					SetFlags: Flags(flax.MustBind, &apiKeyActionFlags{}),
-					Run:      expireAPIKeyCommand,
+					Name:  "expire",
+					Usage: "--prefix <prefix>",
+					Help:  "Expire an API key",
+					Run:   expireAPIKeyCommand,
 				},
 				{
-					Name:     "delete",
+					Name:  "delete",
+					Usage: "--prefix <prefix>",
+					Help:  "Delete an API key",
+					Run:   deleteAPIKeyCommand,
+				},
+				{
+					Name:     "destroy",
 					Usage:    "--prefix <prefix>",
-					Help:     "Delete an API key",
-					SetFlags: Flags(flax.MustBind, &apiKeyActionFlags{}),
+					Help:     "Delete an API key (alias)",
 					Run:      deleteAPIKeyCommand,
+					Unlisted: true,
 				},
 			},
 		},
-		// API key aliases
+		// API key management alias
 		{
-			Name:     "apikeys",
+			Name:     "api-key",
 			Usage:    "<subcommand> [flags] [args...]",
 			Help:     "Manage API keys (alias)",
-			Commands: apiKeyCommands()[0].Commands,
-			Unlisted: true,
-		},
-		{
-			Name:     "api",
-			Usage:    "<subcommand> [flags] [args...]",
-			Help:     "Manage API keys (alias)",
-			Commands: apiKeyCommands()[0].Commands,
+			SetFlags: command.Flags(flax.MustBind, &apiKeyArgs),
+			Commands: []*command.C{
+				{
+					Name:  "list",
+					Usage: "",
+					Help:  "List API keys",
+					Run:   listAPIKeysCommand,
+				},
+				{
+					Name:  "create",
+					Usage: "[--expiration <duration>]",
+					Help:  "Create a new API key",
+					Run:   createAPIKeyCommand,
+				},
+				{
+					Name:  "expire",
+					Usage: "--prefix <prefix>",
+					Help:  "Expire an API key",
+					Run:   expireAPIKeyCommand,
+				},
+				{
+					Name:  "delete",
+					Usage: "--prefix <prefix>",
+					Help:  "Delete an API key",
+					Run:   deleteAPIKeyCommand,
+				},
+			},
 			Unlisted: true,
 		},
 	}

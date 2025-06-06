@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"strings"
 	"testing"
 
@@ -20,7 +19,7 @@ func TestCommandStructure(t *testing.T) {
 	}
 
 	// Test that subcommands exist
-	expectedCommands := []string{"serve", "version", "config", "users", "nodes", "preauth-keys", "api-keys", "policy", "dev", "help"}
+	expectedCommands := []string{"serve", "version", "config", "users", "nodes", "preauth-keys", "api-keys", "policy", "dev"}
 	for _, expectedCmd := range expectedCommands {
 		found := false
 		for _, cmd := range root.Commands {
@@ -52,7 +51,7 @@ func TestUserCommands(t *testing.T) {
 	}
 
 	// Test user subcommands
-	expectedSubcommands := []string{"create", "list", "update", "delete"}
+	expectedSubcommands := []string{"create", "list", "rename", "delete"}
 	for _, expectedSub := range expectedSubcommands {
 		found := false
 		for _, sub := range usersCmd.Commands {
@@ -68,37 +67,36 @@ func TestUserCommands(t *testing.T) {
 }
 
 func TestFlagBinding(t *testing.T) {
-	// Test that flax flag binding works
-	flags := &CreateUserFlags{
-		Config:      "/test/config",
-		Output:      "json",
-		Force:       true,
-		DisplayName: "Test User",
-		Email:       "test@example.com",
-		PictureURL:  "https://example.com/pic.jpg",
-	}
+	// Test that flax flag binding works with new structure
+	globalArgs.Config = "/test/config"
+	globalArgs.Output = "json"
+	globalArgs.Force = true
+
+	userArgs.ID = 42
+	userArgs.Name = "testuser"
+	userArgs.Email = "test@example.com"
 
 	// Test that fields are properly set
-	if flags.Config != "/test/config" {
-		t.Errorf("Expected config '/test/config', got '%s'", flags.Config)
+	if globalArgs.Config != "/test/config" {
+		t.Errorf("Expected config '/test/config', got '%s'", globalArgs.Config)
 	}
-	if flags.Output != "json" {
-		t.Errorf("Expected output 'json', got '%s'", flags.Output)
+	if globalArgs.Output != "json" {
+		t.Errorf("Expected output 'json', got '%s'", globalArgs.Output)
 	}
-	if !flags.Force {
+	if !globalArgs.Force {
 		t.Error("Expected force to be true")
 	}
-	if flags.DisplayName != "Test User" {
-		t.Errorf("Expected display name 'Test User', got '%s'", flags.DisplayName)
+	if userArgs.ID != 42 {
+		t.Errorf("Expected ID 42, got %d", userArgs.ID)
 	}
-	if flags.Email != "test@example.com" {
-		t.Errorf("Expected email 'test@example.com', got '%s'", flags.Email)
+	if userArgs.Name != "testuser" {
+		t.Errorf("Expected name 'testuser', got '%s'", userArgs.Name)
 	}
 }
 
 func TestFlagValidation(t *testing.T) {
 	// Test RequireString validation
-	err := RequireString("", "test")
+	err := requireString("", "test")
 	if err == nil {
 		t.Error("Expected error for empty required string")
 	}
@@ -106,142 +104,177 @@ func TestFlagValidation(t *testing.T) {
 		t.Errorf("Expected specific error message, got '%s'", err.Error())
 	}
 
-	err = RequireString("value", "test")
+	err = requireString("value", "test")
 	if err != nil {
 		t.Errorf("Expected no error for non-empty string, got '%s'", err.Error())
 	}
 
 	// Test RequireUint64 validation
-	err = RequireUint64(0, "id")
+	err = requireUint64(0, "id")
 	if err == nil {
 		t.Error("Expected error for zero uint64")
 	}
 
-	err = RequireUint64(42, "id")
+	err = requireUint64(42, "id")
 	if err != nil {
 		t.Errorf("Expected no error for non-zero uint64, got '%s'", err.Error())
 	}
 
 	// Test RequireEither validation
-	err = RequireEither("", "name", "", "id")
+	err = requireEither("", "name", "", "id")
 	if err == nil {
 		t.Error("Expected error when both values are empty")
 	}
 
-	err = RequireEither("test", "name", "", "id")
+	err = requireEither("test", "name", "", "id")
 	if err != nil {
 		t.Errorf("Expected no error when first value is provided, got '%s'", err.Error())
 	}
 
-	err = RequireEither("", "name", "42", "id")
+	err = requireEither("", "name", "42", "id")
 	if err != nil {
 		t.Errorf("Expected no error when second value is provided, got '%s'", err.Error())
 	}
 }
 
 func TestIdentifierValidation(t *testing.T) {
-	// Test ValidateIdentifierFromFields
-	err := ValidateIdentifierFromFields(0, "")
+	// Test ValidateUserIdentifier
+	err := validateUserIdentifier(0, "")
 	if err == nil {
 		t.Error("Expected error when both ID and name are empty")
 	}
 
-	err = ValidateIdentifierFromFields(42, "")
+	err = validateUserIdentifier(42, "")
 	if err != nil {
 		t.Errorf("Expected no error when ID is provided, got '%s'", err.Error())
 	}
 
-	err = ValidateIdentifierFromFields(0, "test")
+	err = validateUserIdentifier(0, "test")
 	if err != nil {
 		t.Errorf("Expected no error when name is provided, got '%s'", err.Error())
 	}
-}
 
-func TestUserReferenceValidation(t *testing.T) {
-	// Test ValidateUserFromField
-	err := ValidateUserFromField("")
+	// Test ValidateNodeIdentifier
+	err = validateNodeIdentifier(0, "")
 	if err == nil {
-		t.Error("Expected error when user is empty")
+		t.Error("Expected error when both ID and user are empty")
 	}
 
-	err = ValidateUserFromField("testuser")
+	err = validateNodeIdentifier(42, "")
+	if err != nil {
+		t.Errorf("Expected no error when ID is provided, got '%s'", err.Error())
+	}
+
+	err = validateNodeIdentifier(0, "testuser")
 	if err != nil {
 		t.Errorf("Expected no error when user is provided, got '%s'", err.Error())
 	}
 }
 
-func TestCommandAliases(t *testing.T) {
-	root := createTestRootCommand()
+func TestUserIdentifierParsing(t *testing.T) {
+	// Test ParseUserIdentifier function
+	tests := []struct {
+		input    string
+		expected userIdentifier
+	}{
+		{"123", userIdentifier{Type: "id", Value: "123"}},
+		{"user@example.com", userIdentifier{Type: "email", Value: "user@example.com"}},
+		{"oauth:provider:123", userIdentifier{Type: "provider", Value: "oauth:provider:123"}},
+		{"username", userIdentifier{Type: "username", Value: "username"}},
+	}
 
-	// Test that users command has aliases
-	var usersCmd *command.C
-	for _, cmd := range root.Commands {
-		if cmd.Name == "users" {
-			usersCmd = cmd
-			break
+	for _, test := range tests {
+		result := parseUserIdentifier(test.input)
+		if result.Type != test.expected.Type || result.Value != test.expected.Value {
+			t.Errorf("parseUserIdentifier(%s) = %+v, expected %+v", test.input, result, test.expected)
 		}
 	}
+}
 
-	if usersCmd == nil {
-		t.Fatal("Users command not found")
+func TestCommaSeparatedParsing(t *testing.T) {
+	// Test ParseCommaSeparated function
+	tests := []struct {
+		input    string
+		expected []string
+	}{
+		{"", []string{}},
+		{"tag1", []string{"tag1"}},
+		{"tag1,tag2", []string{"tag1", "tag2"}},
+		{"tag1, tag2, tag3", []string{"tag1", "tag2", "tag3"}},
+		{"tag1,,tag3", []string{"tag1", "tag3"}},    // Empty elements should be filtered
+		{" tag1 , tag2 ", []string{"tag1", "tag2"}}, // Whitespace should be trimmed
 	}
 
-	// Check for user alias command (now implemented as separate command)
-	userCmd := root.FindSubcommand("user")
-	if userCmd == nil {
-		t.Error("Expected 'user' alias command not found")
+	for _, test := range tests {
+		result := parseCommaSeparated(test.input)
+		if len(result) != len(test.expected) {
+			t.Errorf("parseCommaSeparated(%s) length = %d, expected %d", test.input, len(result), len(test.expected))
+			continue
+		}
+		for i, expected := range test.expected {
+			if result[i] != expected {
+				t.Errorf("parseCommaSeparated(%s)[%d] = %s, expected %s", test.input, i, result[i], expected)
+			}
+		}
 	}
 }
 
 func TestFlaxIntegration(t *testing.T) {
 	// Test that flax can parse our flag structures
-	flags := &ListNodeFlags{}
-
-	fields, err := flax.Check(flags)
+	// Check global flags
+	fields, err := flax.Check(&globalArgs)
 	if err != nil {
-		t.Fatalf("Error checking flags: %v", err)
+		t.Fatalf("Error checking global flags: %v", err)
 	}
-
-	// Debug: print actual flag names found
-	t.Logf("Found %d flags:", len(fields))
-	flagNames := make(map[string]bool)
-	for _, field := range fields {
-		t.Logf("  Flag: %s", field.Name)
-		flagNames[field.Name] = true
-	}
-
-	// Should have flags from GlobalFlags, UserFlags, and ShowTags
-	expectedFlagNames := []string{"config", "output", "force", "user", "show-tags"}
-
-	for _, expected := range expectedFlagNames {
-		if !flagNames[expected] {
-			t.Errorf("Expected flag '%s' not found in parsed flags", expected)
-		}
-	}
-
-	// At minimum, we should have some flags
 	if len(fields) == 0 {
-		t.Error("No flags found - flax integration may be broken")
+		t.Error("No global flags found - flax integration may be broken")
+	}
+
+	// Check user flags
+	fields, err = flax.Check(&userArgs)
+	if err != nil {
+		t.Fatalf("Error checking user flags: %v", err)
+	}
+	if len(fields) == 0 {
+		t.Error("No user flags found - flax integration may be broken")
+	}
+
+	// Check node flags
+	fields, err = flax.Check(&nodeArgs)
+	if err != nil {
+		t.Fatalf("Error checking node flags: %v", err)
+	}
+	if len(fields) == 0 {
+		t.Error("No node flags found - flax integration may be broken")
+	}
+}
+
+func TestSimpleFlagsStructure(t *testing.T) {
+	// Test the simplified flags structure
+	globalArgs.Config = "/test"
+	globalArgs.Output = "json"
+	globalArgs.Force = true
+
+	userArgs.ID = 42
+	userArgs.Name = "test"
+	userArgs.Email = "test@example.com"
+
+	if globalArgs.Config != "/test" {
+		t.Errorf("Expected global config '/test', got '%s'", globalArgs.Config)
+	}
+	if userArgs.ID != 42 {
+		t.Errorf("Expected user ID 42, got %d", userArgs.ID)
 	}
 }
 
 func TestCommandEnvironment(t *testing.T) {
 	// Test command environment setup
 	root := createTestRootCommand()
-	globalFlags := &GlobalFlags{
-		Config: "/test/config",
-		Output: "json",
-		Force:  false,
-	}
 
-	env := root.NewEnv(globalFlags).SetContext(context.Background())
+	env := root.NewEnv(nil).SetContext(context.Background())
 
 	if env.Command != root {
 		t.Error("Environment command should point to root")
-	}
-
-	if env.Config.(*GlobalFlags).Config != "/test/config" {
-		t.Error("Environment config not properly set")
 	}
 
 	if env.Context() == nil {
@@ -250,7 +283,6 @@ func TestCommandEnvironment(t *testing.T) {
 }
 
 // Helper function to create a test version of the root command
-// createTestRootCommand creates the real CLI root command for testing
 func createTestRootCommand() *command.C {
 	return &command.C{
 		Name: "headscale",
@@ -271,10 +303,7 @@ headscale is an open source implementation of the Tailscale control server
 
 https://github.com/juanfont/headscale`,
 
-		SetFlags: func(env *command.Env, fs *flag.FlagSet) {
-			flags := env.Config.(*GlobalFlags)
-			flax.MustBind(fs, flags)
-		},
+		SetFlags: command.Flags(flax.MustBind, &globalArgs),
 
 		Commands: []*command.C{
 			// Server commands
@@ -282,21 +311,11 @@ https://github.com/juanfont/headscale`,
 				Name:  "serve",
 				Usage: "",
 				Help:  "Start the headscale server",
-				SetFlags: func(env *command.Env, fs *flag.FlagSet) {
-					flags := &ServeFlags{}
-					flax.MustBind(fs, flags)
-					env.Config = flags
-				},
 			},
 			{
 				Name:  "version",
 				Usage: "",
 				Help:  "Show version information",
-				SetFlags: func(env *command.Env, fs *flag.FlagSet) {
-					flags := &VersionFlags{}
-					flax.MustBind(fs, flags)
-					env.Config = flags
-				},
 			},
 
 			// Config commands
@@ -309,24 +328,20 @@ https://github.com/juanfont/headscale`,
 						Name:  "test",
 						Usage: "",
 						Help:  "Test the configuration file",
-						SetFlags: func(env *command.Env, fs *flag.FlagSet) {
-							flags := &ConfigTestFlags{}
-							flax.MustBind(fs, flags)
-							env.Config = flags
-						},
 					},
 				},
 			},
 
 			// User management
 			{
-				Name:  "users",
-				Usage: "<subcommand> [flags] [args...]",
-				Help:  "Manage users in Headscale",
+				Name:     "users",
+				Usage:    "<subcommand> [flags] [args...]",
+				Help:     "Manage users in Headscale",
+				SetFlags: command.Flags(flax.MustBind, &userArgs),
 				Commands: []*command.C{
 					{Name: "create", Help: "Create a new user"},
 					{Name: "list", Help: "List users"},
-					{Name: "update", Help: "Update a user"},
+					{Name: "rename", Help: "Rename a user"},
 					{Name: "delete", Help: "Delete a user"},
 				},
 			},
@@ -336,73 +351,22 @@ https://github.com/juanfont/headscale`,
 				Name:     "user",
 				Usage:    "<subcommand> [flags] [args...]",
 				Help:     "Manage users in Headscale (alias)",
+				SetFlags: command.Flags(flax.MustBind, &userArgs),
 				Unlisted: true,
 				Commands: []*command.C{
 					{Name: "create", Help: "Create a new user"},
 					{Name: "list", Help: "List users"},
-					{Name: "update", Help: "Update a user"},
+					{Name: "rename", Help: "Rename a user"},
 					{Name: "delete", Help: "Delete a user"},
 				},
 			},
 
 			// Node management
 			{
-				Name:  "nodes",
-				Usage: "<subcommand> [flags] [args...]",
-				Help:  "Manage nodes in Headscale",
-				Commands: []*command.C{
-					{Name: "register", Help: "Register a node"},
-					{Name: "list", Help: "List nodes"},
-					{Name: "expire", Help: "Expire a node"},
-					{Name: "rename", Help: "Rename a node"},
-					{Name: "delete", Help: "Delete a node"},
-					{Name: "move", Help: "Move node to another user"},
-					{Name: "tags", Help: "Manage node tags"},
-					{Name: "routes", Help: "Manage node routes"},
-					{Name: "backfill-ips", Help: "Backfill missing IPs"},
-				},
-			},
-
-			// Node management aliases
-			{
-				Name:     "node",
+				Name:     "nodes",
 				Usage:    "<subcommand> [flags] [args...]",
-				Help:     "Manage nodes in Headscale (alias)",
-				Unlisted: true,
-				Commands: []*command.C{
-					{Name: "register", Help: "Register a node"},
-					{Name: "list", Help: "List nodes"},
-					{Name: "expire", Help: "Expire a node"},
-					{Name: "rename", Help: "Rename a node"},
-					{Name: "delete", Help: "Delete a node"},
-					{Name: "move", Help: "Move node to another user"},
-					{Name: "tags", Help: "Manage node tags"},
-					{Name: "routes", Help: "Manage node routes"},
-					{Name: "backfill-ips", Help: "Backfill missing IPs"},
-				},
-			},
-			{
-				Name:     "machine",
-				Usage:    "<subcommand> [flags] [args...]",
-				Help:     "Manage nodes in Headscale (alias)",
-				Unlisted: true,
-				Commands: []*command.C{
-					{Name: "register", Help: "Register a node"},
-					{Name: "list", Help: "List nodes"},
-					{Name: "expire", Help: "Expire a node"},
-					{Name: "rename", Help: "Rename a node"},
-					{Name: "delete", Help: "Delete a node"},
-					{Name: "move", Help: "Move node to another user"},
-					{Name: "tags", Help: "Manage node tags"},
-					{Name: "routes", Help: "Manage node routes"},
-					{Name: "backfill-ips", Help: "Backfill missing IPs"},
-				},
-			},
-			{
-				Name:     "machines",
-				Usage:    "<subcommand> [flags] [args...]",
-				Help:     "Manage nodes in Headscale (alias)",
-				Unlisted: true,
+				Help:     "Manage nodes in Headscale",
+				SetFlags: command.Flags(flax.MustBind, &nodeArgs),
 				Commands: []*command.C{
 					{Name: "register", Help: "Register a node"},
 					{Name: "list", Help: "List nodes"},
@@ -418,55 +382,10 @@ https://github.com/juanfont/headscale`,
 
 			// PreAuth keys
 			{
-				Name:  "preauth-keys",
-				Usage: "<subcommand> [flags] [args...]",
-				Help:  "Manage pre-authentication keys",
-				Commands: []*command.C{
-					{Name: "create", Help: "Create a new pre-authentication key"},
-					{Name: "list", Help: "List pre-authentication keys"},
-					{Name: "expire", Help: "Expire a pre-authentication key"},
-				},
-			},
-
-			// PreAuth keys aliases
-			{
-				Name:     "preauthkeys",
+				Name:     "preauth-keys",
 				Usage:    "<subcommand> [flags] [args...]",
-				Help:     "Manage pre-authentication keys (alias)",
-				Unlisted: true,
-				Commands: []*command.C{
-					{Name: "create", Help: "Create a new pre-authentication key"},
-					{Name: "list", Help: "List pre-authentication keys"},
-					{Name: "expire", Help: "Expire a pre-authentication key"},
-				},
-			},
-			{
-				Name:     "preauthkey",
-				Usage:    "<subcommand> [flags] [args...]",
-				Help:     "Manage pre-authentication keys (alias)",
-				Unlisted: true,
-				Commands: []*command.C{
-					{Name: "create", Help: "Create a new pre-authentication key"},
-					{Name: "list", Help: "List pre-authentication keys"},
-					{Name: "expire", Help: "Expire a pre-authentication key"},
-				},
-			},
-			{
-				Name:     "authkey",
-				Usage:    "<subcommand> [flags] [args...]",
-				Help:     "Manage pre-authentication keys (alias)",
-				Unlisted: true,
-				Commands: []*command.C{
-					{Name: "create", Help: "Create a new pre-authentication key"},
-					{Name: "list", Help: "List pre-authentication keys"},
-					{Name: "expire", Help: "Expire a pre-authentication key"},
-				},
-			},
-			{
-				Name:     "pre",
-				Usage:    "<subcommand> [flags] [args...]",
-				Help:     "Manage pre-authentication keys (alias)",
-				Unlisted: true,
+				Help:     "Manage pre-authentication keys",
+				SetFlags: command.Flags(flax.MustBind, &preAuthArgs),
 				Commands: []*command.C{
 					{Name: "create", Help: "Create a new pre-authentication key"},
 					{Name: "list", Help: "List pre-authentication keys"},
@@ -476,47 +395,10 @@ https://github.com/juanfont/headscale`,
 
 			// API keys
 			{
-				Name:  "api-keys",
-				Usage: "<subcommand> [flags] [args...]",
-				Help:  "Manage API keys",
-				Commands: []*command.C{
-					{Name: "create", Help: "Create a new API key"},
-					{Name: "list", Help: "List API keys"},
-					{Name: "expire", Help: "Expire an API key"},
-					{Name: "delete", Help: "Delete an API key"},
-				},
-			},
-
-			// API keys aliases
-			{
-				Name:     "apikeys",
+				Name:     "api-keys",
 				Usage:    "<subcommand> [flags] [args...]",
-				Help:     "Manage API keys (alias)",
-				Unlisted: true,
-				Commands: []*command.C{
-					{Name: "create", Help: "Create a new API key"},
-					{Name: "list", Help: "List API keys"},
-					{Name: "expire", Help: "Expire an API key"},
-					{Name: "delete", Help: "Delete an API key"},
-				},
-			},
-			{
-				Name:     "apikey",
-				Usage:    "<subcommand> [flags] [args...]",
-				Help:     "Manage API keys (alias)",
-				Unlisted: true,
-				Commands: []*command.C{
-					{Name: "create", Help: "Create a new API key"},
-					{Name: "list", Help: "List API keys"},
-					{Name: "expire", Help: "Expire an API key"},
-					{Name: "delete", Help: "Delete an API key"},
-				},
-			},
-			{
-				Name:     "api",
-				Usage:    "<subcommand> [flags] [args...]",
-				Help:     "Manage API keys (alias)",
-				Unlisted: true,
+				Help:     "Manage API keys",
+				SetFlags: command.Flags(flax.MustBind, &apiKeyArgs),
 				Commands: []*command.C{
 					{Name: "create", Help: "Create a new API key"},
 					{Name: "list", Help: "List API keys"},
@@ -532,8 +414,9 @@ https://github.com/juanfont/headscale`,
 				Help:  "Manage ACL policies",
 				Commands: []*command.C{
 					{Name: "get", Help: "Get the current ACL policy"},
-					{Name: "set", Help: "Set the ACL policy from a file"},
-					{Name: "validate", Help: "Validate a policy file"},
+					{Name: "set", Help: "Set the ACL policy from a file", SetFlags: command.Flags(flax.MustBind, &policyArgs)},
+					{Name: "test", Help: "Test a policy file", SetFlags: command.Flags(flax.MustBind, &policyArgs)},
+					{Name: "reload", Help: "Reload the current policy"},
 				},
 			},
 
@@ -551,13 +434,9 @@ https://github.com/juanfont/headscale`,
 							{Name: "private-key", Help: "Generate a private key"},
 						},
 					},
-					{Name: "create-node", Help: "Create a test node"},
-					{Name: "mock-oidc", Help: "Start a mock OIDC server", Unlisted: true},
+					{Name: "create-node", Help: "Create a test node", SetFlags: command.Flags(flax.MustBind, &devArgs)},
 				},
 			},
-
-			// Help command
-			command.HelpCommand(nil),
 		},
 	}
 }

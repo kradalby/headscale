@@ -9,25 +9,17 @@ import (
 	"tailscale.com/types/key"
 )
 
-// Dev command flag structures
-
-type devGenerateFlags struct {
-	globalFlags
-}
-
-type devCreateNodeFlags struct {
-	globalFlags
-	userFlags
-	Name   string   `flag:"name,Node name (required)"`
-	Key    string   `flag:"key,k,Registration key (required)"`
-	Routes []string `flag:"routes,r,Comma-separated routes"`
+// Dev command flags
+var devArgs struct {
+	Name   string `flag:"name,Node name"`
+	User   string `flag:"user,u,User identifier"`
+	Key    string `flag:"key,k,Registration key"`
+	Routes string `flag:"routes,r,Comma-separated routes"`
 }
 
 // Dev command implementations
 
 func generatePrivateKeyCommand(env *command.Env) error {
-	flags := env.Config.(*devGenerateFlags)
-
 	// Generate a private key locally using Tailscale's key library
 	machineKey := key.NewMachine()
 
@@ -40,23 +32,21 @@ func generatePrivateKeyCommand(env *command.Env) error {
 		"private_key": string(machineKeyStr),
 	}
 
-	return outputResult(result, "Private key generated", flags.Output)
+	return outputResult(result, "Private key generated", globalArgs.Output)
 }
 
 func devCreateNodeCommand(env *command.Env) error {
-	flags := env.Config.(*devCreateNodeFlags)
-
-	if err := RequireString(flags.Name, "name"); err != nil {
+	if err := requireString(devArgs.Name, "name"); err != nil {
 		return err
 	}
-	if err := RequireString(flags.User, "user"); err != nil {
+	if err := requireString(devArgs.User, "user"); err != nil {
 		return err
 	}
-	if err := RequireString(flags.Key, "key"); err != nil {
+	if err := requireString(devArgs.Key, "key"); err != nil {
 		return err
 	}
 
-	ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig(flags.Config)
+	ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig(globalArgs.Config)
 	if err != nil {
 		return err
 	}
@@ -64,10 +54,10 @@ func devCreateNodeCommand(env *command.Env) error {
 	defer conn.Close()
 
 	request := &v1.DebugCreateNodeRequest{
-		Name:   flags.Name,
-		User:   flags.User,
-		Key:    flags.Key,
-		Routes: flags.Routes,
+		Name:   devArgs.Name,
+		User:   devArgs.User,
+		Key:    devArgs.Key,
+		Routes: parseCommaSeparated(devArgs.Routes),
 	}
 
 	response, err := client.DebugCreateNode(ctx, request)
@@ -75,7 +65,7 @@ func devCreateNodeCommand(env *command.Env) error {
 		return fmt.Errorf("cannot create debug node: %w", err)
 	}
 
-	return outputResult(response.GetNode(), "Debug node created", flags.Output)
+	return outputResult(response.GetNode(), "Debug node created", globalArgs.Output)
 }
 
 // Dev command definitions
@@ -93,11 +83,10 @@ func devCommands() []*command.C {
 					Help:  "Generate various resources",
 					Commands: []*command.C{
 						{
-							Name:     "private-key",
-							Usage:    "",
-							Help:     "Generate a private key for the headscale server",
-							SetFlags: Flags(flax.MustBind, &devGenerateFlags{}),
-							Run:      generatePrivateKeyCommand,
+							Name:  "private-key",
+							Usage: "",
+							Help:  "Generate a private key for the headscale server",
+							Run:   generatePrivateKeyCommand,
 						},
 					},
 				},
@@ -105,7 +94,7 @@ func devCommands() []*command.C {
 					Name:     "create-node",
 					Usage:    "--name <name> --user <user> --key <key> [--routes <routes>]",
 					Help:     "Create a debug node that can be registered",
-					SetFlags: Flags(flax.MustBind, &devCreateNodeFlags{}),
+					SetFlags: command.Flags(flax.MustBind, &devArgs),
 					Run:      devCreateNodeCommand,
 				},
 			},
@@ -115,15 +104,43 @@ func devCommands() []*command.C {
 			Name:     "debug",
 			Usage:    "<subcommand> [flags] [args...]",
 			Help:     "Development and testing commands (alias)",
-			Commands: devCommands()[0].Commands,
 			Unlisted: true,
+			Commands: []*command.C{
+				{
+					Name:  "generate",
+					Usage: "<subcommand> [flags]",
+					Help:  "Generate various resources",
+					Commands: []*command.C{
+						{
+							Name:  "private-key",
+							Usage: "",
+							Help:  "Generate a private key for the headscale server",
+							Run:   generatePrivateKeyCommand,
+						},
+					},
+				},
+				{
+					Name:     "create-node",
+					Usage:    "--name <name> --user <user> --key <key> [--routes <routes>]",
+					Help:     "Create a debug node that can be registered",
+					SetFlags: command.Flags(flax.MustBind, &devArgs),
+					Run:      devCreateNodeCommand,
+				},
+			},
 		},
 		{
 			Name:     "generate",
 			Usage:    "<subcommand> [flags] [args...]",
 			Help:     "Generate various resources (alias)",
-			Commands: devCommands()[0].Commands[0].Commands, // Just the generate subcommands
 			Unlisted: true,
+			Commands: []*command.C{
+				{
+					Name:  "private-key",
+					Usage: "",
+					Help:  "Generate a private key for the headscale server",
+					Run:   generatePrivateKeyCommand,
+				},
+			},
 		},
 	}
 }

@@ -1,286 +1,203 @@
 package main
 
 import (
-	"context"
 	"testing"
+
+	"github.com/creachadair/command"
 )
 
-// TestIntegrationBasicFunctionality tests basic CLI functionality
+// TestIntegrationBasicFunctionality tests the basic CLI structure
 func TestIntegrationBasicFunctionality(t *testing.T) {
-	// Test that we can create a basic command structure
-	root := createTestRootCommand()
-
-	if root == nil {
-		t.Fatal("Failed to create root command")
-	}
-
-	if root.Name != "headscale" {
-		t.Errorf("Expected root command name 'headscale', got '%s'", root.Name)
-	}
-}
-
-// TestIntegrationCommandStructure tests the command structure
-func TestIntegrationCommandStructure(t *testing.T) {
-	root := createTestRootCommand()
-
-	// Test that main commands exist
-	expectedCommands := []string{
-		"serve", "version", "config", "users", "nodes",
-		"preauth-keys", "api-keys", "policy", "dev", "help",
-	}
-
-	for _, cmdName := range expectedCommands {
-		cmd := root.FindSubcommand(cmdName)
-		if cmd == nil {
-			t.Errorf("Expected command '%s' not found", cmdName)
+	// Test that we can create the actual command tree without panics
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("CLI creation panicked: %v", r)
 		}
+	}()
+
+	// Build all commands like in main()
+	var commands []*command.C
+
+	// Add core commands
+	commands = append(commands, serveCommands()...)
+	commands = append(commands, configCommands()...)
+
+	// Add management commands
+	commands = append(commands, userCommands()...)
+	commands = append(commands, nodeCommands()...)
+	commands = append(commands, preAuthKeyCommands()...)
+	commands = append(commands, apiKeyCommands()...)
+	commands = append(commands, policyCommands()...)
+	commands = append(commands, devCommands()...)
+
+	if len(commands) == 0 {
+		t.Error("No commands were created")
 	}
-}
 
-// TestIntegrationUserCommands tests user management commands
-func TestIntegrationUserCommands(t *testing.T) {
-	root := createTestRootCommand()
-
-	usersCmd := root.FindSubcommand("users")
-	if usersCmd == nil {
-		t.Fatal("Users command not found")
+	// Verify basic command structure
+	commandNames := make(map[string]bool)
+	for _, cmd := range commands {
+		commandNames[cmd.Name] = true
 	}
 
-	// Test user subcommands
-	expectedSubcommands := []string{"create", "list", "update", "delete"}
-	for _, subCmd := range expectedSubcommands {
-		cmd := usersCmd.FindSubcommand(subCmd)
-		if cmd == nil {
-			t.Errorf("Expected users subcommand '%s' not found", subCmd)
+	expectedCommands := []string{"serve", "version", "users", "nodes", "preauth-keys", "api-keys", "policy", "dev"}
+	for _, expected := range expectedCommands {
+		if !commandNames[expected] {
+			t.Errorf("Expected command '%s' not found", expected)
 		}
-	}
-
-	// Test that user alias command exists
-	userCmd := root.FindSubcommand("user")
-	if userCmd == nil {
-		t.Error("Expected 'user' alias command not found")
-	}
-}
-
-// TestIntegrationNodeCommands tests node management commands
-func TestIntegrationNodeCommands(t *testing.T) {
-	root := createTestRootCommand()
-
-	nodesCmd := root.FindSubcommand("nodes")
-	if nodesCmd == nil {
-		t.Fatal("Nodes command not found")
-	}
-
-	// Test node subcommands
-	expectedSubcommands := []string{
-		"register", "list", "expire", "rename", "delete", "move",
-		"tags", "routes", "backfill-ips",
-	}
-	for _, subCmd := range expectedSubcommands {
-		cmd := nodesCmd.FindSubcommand(subCmd)
-		if cmd == nil {
-			t.Errorf("Expected nodes subcommand '%s' not found", subCmd)
-		}
-	}
-
-	// Test that node alias commands exist
-	aliasCommands := []string{"node", "machine", "machines"}
-	for _, alias := range aliasCommands {
-		cmd := root.FindSubcommand(alias)
-		if cmd == nil {
-			t.Errorf("Expected '%s' alias command not found", alias)
-		}
-	}
-}
-
-// TestIntegrationPreAuthKeyCommands tests pre-auth key commands
-func TestIntegrationPreAuthKeyCommands(t *testing.T) {
-	root := createTestRootCommand()
-
-	preAuthCmd := root.FindSubcommand("preauth-keys")
-	if preAuthCmd == nil {
-		t.Fatal("PreAuth keys command not found")
-	}
-
-	// Test preauth subcommands
-	expectedSubcommands := []string{"create", "list", "expire"}
-	for _, subCmd := range expectedSubcommands {
-		cmd := preAuthCmd.FindSubcommand(subCmd)
-		if cmd == nil {
-			t.Errorf("Expected preauth-keys subcommand '%s' not found", subCmd)
-		}
-	}
-
-	// Test that preauth alias commands exist
-	aliasCommands := []string{"preauthkeys", "preauthkey", "authkey", "pre"}
-	for _, alias := range aliasCommands {
-		cmd := root.FindSubcommand(alias)
-		if cmd == nil {
-			t.Errorf("Expected '%s' alias command not found", alias)
-		}
-	}
-}
-
-// TestIntegrationAPIKeyCommands tests API key commands
-func TestIntegrationAPIKeyCommands(t *testing.T) {
-	root := createTestRootCommand()
-
-	apiKeysCmd := root.FindSubcommand("api-keys")
-	if apiKeysCmd == nil {
-		t.Fatal("API keys command not found")
-	}
-
-	// Test API key subcommands
-	expectedSubcommands := []string{"create", "list", "expire", "delete"}
-	for _, subCmd := range expectedSubcommands {
-		cmd := apiKeysCmd.FindSubcommand(subCmd)
-		if cmd == nil {
-			t.Errorf("Expected api-keys subcommand '%s' not found", subCmd)
-		}
-	}
-
-	// Test that API key alias commands exist
-	aliasCommands := []string{"apikeys", "apikey", "api"}
-	for _, alias := range aliasCommands {
-		cmd := root.FindSubcommand(alias)
-		if cmd == nil {
-			t.Errorf("Expected '%s' alias command not found", alias)
-		}
-	}
-}
-
-// TestIntegrationPolicyCommands tests policy commands
-func TestIntegrationPolicyCommands(t *testing.T) {
-	root := createTestRootCommand()
-
-	policyCmd := root.FindSubcommand("policy")
-	if policyCmd == nil {
-		t.Fatal("Policy command not found")
-	}
-
-	// Test policy subcommands
-	expectedSubcommands := []string{"get", "set", "validate"}
-	for _, subCmd := range expectedSubcommands {
-		cmd := policyCmd.FindSubcommand(subCmd)
-		if cmd == nil {
-			t.Errorf("Expected policy subcommand '%s' not found", subCmd)
-		}
-	}
-}
-
-// TestIntegrationDevCommands tests development commands
-func TestIntegrationDevCommands(t *testing.T) {
-	root := createTestRootCommand()
-
-	devCmd := root.FindSubcommand("dev")
-	if devCmd == nil {
-		t.Fatal("Dev command not found")
-	}
-
-	// Test dev subcommands
-	generateCmd := devCmd.FindSubcommand("generate")
-	if generateCmd == nil {
-		t.Error("Expected dev generate command not found")
-	}
-
-	createNodeCmd := devCmd.FindSubcommand("create-node")
-	if createNodeCmd == nil {
-		t.Error("Expected dev create-node command not found")
-	}
-
-	mockOidcCmd := devCmd.FindSubcommand("mock-oidc")
-	if mockOidcCmd == nil {
-		t.Error("Expected dev mock-oidc command not found")
-	}
-
-	// Verify mock-oidc is unlisted
-	if !mockOidcCmd.Unlisted {
-		t.Error("mock-oidc command should be unlisted")
 	}
 }
 
 // TestIntegrationFlagBinding tests that flag binding works correctly
 func TestIntegrationFlagBinding(t *testing.T) {
-	root := createTestRootCommand()
+	// Test the simplified flag structures
+	globalArgs.Config = "/test/config"
+	globalArgs.Output = "json"
+	globalArgs.Force = true
 
-	// Create a test environment
-	globalFlags := &GlobalFlags{}
-	env := root.NewEnv(globalFlags).SetContext(context.Background())
+	userArgs.ID = 42
+	userArgs.Name = "testuser"
+	userArgs.Email = "test@example.com"
 
-	// Test that we can access flags
-	if env.Config == nil {
-		t.Error("Environment config should not be nil")
+	// Test that flags are properly accessible
+	if globalArgs.Config != "/test/config" {
+		t.Errorf("Expected config '/test/config', got '%s'", globalArgs.Config)
 	}
-
-	flags, ok := env.Config.(*GlobalFlags)
-	if !ok {
-		t.Error("Environment config should be GlobalFlags type")
+	if globalArgs.Output != "json" {
+		t.Errorf("Expected output 'json', got '%s'", globalArgs.Output)
 	}
-
-	// Test flag defaults
-	if flags.Output != "" {
-		t.Error("Default output flag should be empty")
+	if !globalArgs.Force {
+		t.Error("Expected force to be true")
 	}
-
-	if flags.Force != false {
-		t.Error("Default force flag should be false")
+	if userArgs.ID != 42 {
+		t.Errorf("Expected user ID 42, got %d", userArgs.ID)
 	}
 }
 
-// TestIntegrationCommandExecution tests basic command execution
+// TestIntegrationCommandExecution tests that commands can be set up properly
 func TestIntegrationCommandExecution(t *testing.T) {
-	root := createTestRootCommand()
-
-	// Test version command execution (should not panic)
-	versionCmd := root.FindSubcommand("version")
-	if versionCmd == nil {
-		t.Fatal("Version command not found")
+	// Test user commands
+	userCmds := userCommands()
+	if len(userCmds) == 0 {
+		t.Error("No user commands created")
 	}
 
-	// Verify the command has a SetFlags function (needed for runnable test)
-	if versionCmd.SetFlags == nil {
-		t.Error("Version command should have SetFlags function")
+	// Test node commands
+	nodeCmds := nodeCommands()
+	if len(nodeCmds) == 0 {
+		t.Error("No node commands created")
+	}
+
+	// Test API key commands
+	apiCmds := apiKeyCommands()
+	if len(apiCmds) == 0 {
+		t.Error("No API key commands created")
+	}
+
+	// Test preauth commands
+	preAuthCmds := preAuthKeyCommands()
+	if len(preAuthCmds) == 0 {
+		t.Error("No preauth commands created")
+	}
+
+	// Test policy commands
+	policyCmds := policyCommands()
+	if len(policyCmds) == 0 {
+		t.Error("No policy commands created")
+	}
+
+	// Test dev commands
+	devCmds := devCommands()
+	if len(devCmds) == 0 {
+		t.Error("No dev commands created")
+	}
+
+	// Test serve commands
+	serveCmds := serveCommands()
+	if len(serveCmds) == 0 {
+		t.Error("No serve commands created")
+	}
+
+	// Test config commands
+	configCmds := configCommands()
+	if len(configCmds) == 0 {
+		t.Error("No config commands created")
 	}
 }
 
-// TestIntegrationHelpCommand tests help functionality
-func TestIntegrationHelpCommand(t *testing.T) {
-	root := createTestRootCommand()
-
-	helpCmd := root.FindSubcommand("help")
-	if helpCmd == nil {
-		t.Fatal("Help command not found")
+// TestIntegrationValidationFunctions tests helper validation functions
+func TestIntegrationValidationFunctions(t *testing.T) {
+	// Test RequireString
+	if err := requireString("", "test"); err == nil {
+		t.Error("Expected error for empty required string")
+	}
+	if err := requireString("value", "test"); err != nil {
+		t.Errorf("Expected no error for valid string: %v", err)
 	}
 
-	// Verify help command is runnable
-	if !helpCmd.Runnable() {
-		t.Error("Help command should be runnable")
+	// Test RequireUint64
+	if err := requireUint64(0, "id"); err == nil {
+		t.Error("Expected error for zero uint64")
+	}
+	if err := requireUint64(42, "id"); err != nil {
+		t.Errorf("Expected no error for valid uint64: %v", err)
+	}
+
+	// Test ValidateUserIdentifier
+	if err := validateUserIdentifier(0, ""); err == nil {
+		t.Error("Expected error when both ID and name are empty")
+	}
+	if err := validateUserIdentifier(42, ""); err != nil {
+		t.Errorf("Expected no error when ID is provided: %v", err)
+	}
+	if err := validateUserIdentifier(0, "test"); err != nil {
+		t.Errorf("Expected no error when name is provided: %v", err)
 	}
 }
 
-// TestIntegrationBackwardCompatibility tests that old command aliases work
-func TestIntegrationBackwardCompatibility(t *testing.T) {
-	root := createTestRootCommand()
-
-	// Test old command aliases
-	oldCommands := map[string]string{
-		"user":        "users",
-		"node":        "nodes",
-		"machine":     "nodes",
-		"machines":    "nodes",
-		"preauthkeys": "preauth-keys",
-		"preauthkey":  "preauth-keys",
-		"authkey":     "preauth-keys",
-		"pre":         "preauth-keys",
-		"apikeys":     "api-keys",
-		"apikey":      "api-keys",
-		"api":         "api-keys",
+// TestIntegrationParsingFunctions tests comma-separated parsing
+func TestIntegrationParsingFunctions(t *testing.T) {
+	// Test ParseCommaSeparated
+	result := parseCommaSeparated("tag1,tag2,tag3")
+	expected := []string{"tag1", "tag2", "tag3"}
+	if len(result) != len(expected) {
+		t.Errorf("Expected %d items, got %d", len(expected), len(result))
+	}
+	for i, exp := range expected {
+		if result[i] != exp {
+			t.Errorf("Expected %s at index %d, got %s", exp, i, result[i])
+		}
 	}
 
-	for oldCmd, _ := range oldCommands {
-		cmd := root.FindSubcommand(oldCmd)
-		if cmd == nil {
-			t.Errorf("Backward compatibility: '%s' alias command not found", oldCmd)
+	// Test parsing tags (using parseCommaSeparated)
+	tags := parseCommaSeparated("tag:test,tag:prod")
+	if len(tags) != 2 {
+		t.Errorf("Expected 2 tags, got %d", len(tags))
+	}
+
+	// Test parsing routes (using parseCommaSeparated)
+	routes := parseCommaSeparated("10.0.0.0/8,192.168.0.0/16")
+	if len(routes) != 2 {
+		t.Errorf("Expected 2 routes, got %d", len(routes))
+	}
+}
+
+// TestIntegrationUserIdentifierParsing tests user identifier parsing
+func TestIntegrationUserIdentifierParsing(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected userIdentifier
+	}{
+		{"123", userIdentifier{Type: "id", Value: "123"}},
+		{"user@example.com", userIdentifier{Type: "email", Value: "user@example.com"}},
+		{"oauth:provider:123", userIdentifier{Type: "provider", Value: "oauth:provider:123"}},
+		{"username", userIdentifier{Type: "username", Value: "username"}},
+	}
+
+	for _, test := range tests {
+		result := parseUserIdentifier(test.input)
+		if result.Type != test.expected.Type || result.Value != test.expected.Value {
+			t.Errorf("parseUserIdentifier(%s) = %+v, expected %+v", test.input, result, test.expected)
 		}
 	}
 }

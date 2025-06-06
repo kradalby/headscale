@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"os"
 	"time"
 
@@ -71,16 +70,11 @@ headscale is an open source implementation of the Tailscale control server
 
 https://github.com/juanfont/headscale`,
 
-		SetFlags: func(env *command.Env, fs *flag.FlagSet) {
-			flags := &globalFlags{}
-			flax.MustBind(fs, flags)
-			env.Config = flags
-		},
-
+		SetFlags: command.Flags(flax.MustBind, &globalArgs),
 		Commands: commands,
 	}
 
 	// Execute the command
-	env := root.NewEnv(&globalFlags{}).SetContext(context.Background())
+	env := root.NewEnv(nil).SetContext(context.Background())
 	command.RunOrFail(env, os.Args[1:])
 }

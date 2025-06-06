@@ -4,29 +4,12 @@ import (
 	"fmt"
 
 	"github.com/creachadair/command"
-	"github.com/creachadair/flax"
 )
-
-// Serve and config command flag structures
-
-type serveFlags struct {
-	globalFlags
-}
-
-type configTestFlags struct {
-	globalFlags
-}
-
-type versionFlags struct {
-	globalFlags
-}
 
 // Serve and config command implementations
 
 func serveCommand(env *command.Env) error {
-	flags := env.Config.(*serveFlags)
-
-	server, err := newHeadscaleServerWithConfig(flags.Config)
+	server, err := newHeadscaleServerWithConfig(globalArgs.Config)
 	if err != nil {
 		return fmt.Errorf("failed to create server: %w", err)
 	}
@@ -35,9 +18,7 @@ func serveCommand(env *command.Env) error {
 }
 
 func configTestCommand(env *command.Env) error {
-	flags := env.Config.(*configTestFlags)
-
-	_, err := newHeadscaleServerWithConfig(flags.Config)
+	_, err := newHeadscaleServerWithConfig(globalArgs.Config)
 	if err != nil {
 		return fmt.Errorf("configuration test failed: %w", err)
 	}
@@ -47,15 +28,13 @@ func configTestCommand(env *command.Env) error {
 }
 
 func versionCommand(env *command.Env) error {
-	flags := env.Config.(*versionFlags)
-
 	versionInfo := map[string]string{
 		"version": "dev", // This should be replaced with actual version info
 		"commit":  "unknown",
 		"date":    "unknown",
 	}
 
-	return outputResult(versionInfo, "Version", flags.Output)
+	return outputResult(versionInfo, "Version", globalArgs.Output)
 }
 
 // Serve and config command definitions
@@ -63,18 +42,16 @@ func versionCommand(env *command.Env) error {
 func serveCommands() []*command.C {
 	return []*command.C{
 		{
-			Name:     "serve",
-			Usage:    "",
-			Help:     "Start the headscale server",
-			SetFlags: Flags(flax.MustBind, &serveFlags{}),
-			Run:      serveCommand,
+			Name:  "serve",
+			Usage: "",
+			Help:  "Start the headscale server",
+			Run:   serveCommand,
 		},
 		{
-			Name:     "version",
-			Usage:    "",
-			Help:     "Show version information",
-			SetFlags: Flags(flax.MustBind, &versionFlags{}),
-			Run:      versionCommand,
+			Name:  "version",
+			Usage: "",
+			Help:  "Show version information",
+			Run:   versionCommand,
 		},
 	}
 }
@@ -87,11 +64,10 @@ func configCommands() []*command.C {
 			Help:  "Configuration management commands",
 			Commands: []*command.C{
 				{
-					Name:     "test",
-					Usage:    "",
-					Help:     "Test the configuration file",
-					SetFlags: Flags(flax.MustBind, &configTestFlags{}),
-					Run:      configTestCommand,
+					Name:  "test",
+					Usage: "",
+					Help:  "Test the configuration file",
+					Run:   configTestCommand,
 				},
 			},
 		},
