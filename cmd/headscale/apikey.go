@@ -98,7 +98,7 @@ func apiKeyCommands() []*command.C {
 		Name:     "api-keys",
 		Usage:    "<subcommand> [flags] [args...]",
 		Help:     "Manage API keys",
-		SetFlags: command.Flags(flax.MustBind, &apiKeyArgs),
+		SetFlags: command.Flags(flax.MustBind, &globalArgs, &apiKeyArgs),
 		Commands: []*command.C{
 			{
 				Name:  "list",
@@ -131,7 +131,8 @@ func apiKeyCommands() []*command.C {
 
 	return []*command.C{
 		apiKeyCommand,
-		// API key management alias
+		// API key management aliases
 		createCommandAlias(apiKeyCommand, "api-key", "Manage API keys (alias)"),
+		createCommandAlias(apiKeyCommand, "apikeys", "Manage API keys (backward compatibility alias)"),
 	}
 }

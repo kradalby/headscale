@@ -117,11 +117,7 @@ func outputResult(result interface{}, overrideText string, format string) error 
 			fmt.Println(overrideText)
 		} else {
 			// Default table/human-readable output
-			jsonBytes, err := json.MarshalIndent(result, "", "  ")
-			if err != nil {
-				return fmt.Errorf("failed to marshal for display: %w", err)
-			}
-			fmt.Println(string(jsonBytes))
+			return outputTable(result)
 		}
 	}
 	return nil
@@ -187,11 +183,6 @@ func prettyPrintJSON(data interface{}) error {
 	return nil
 }
 
-// tableStyle returns the default table style for output
-func tableStyle() *pterm.TablePrinter {
-	return pterm.DefaultTable.WithHasHeader().WithHeaderRowSeparator("-")
-}
-
 // isSocketAddress checks if an address is a Unix socket
 func isSocketAddress(address string) bool {
 	return address[0] == '/'
@@ -209,28 +200,6 @@ func timestampToString(ts *time.Time) string {
 		return ""
 	}
 	return ts.Format(HeadscaleDateTimeFormat)
-}
-
-// timestampProtoToString converts a protobuf timestamp to a readable string
-func timestampProtoToString(ts interface{}) string {
-	if ts == nil {
-		return ""
-	}
-
-	// Handle different timestamp types
-	switch t := ts.(type) {
-	case *time.Time:
-		if t == nil {
-			return ""
-		}
-		return t.Format(HeadscaleDateTimeFormat)
-	default:
-		// For protobuf timestamps, try to convert to time
-		if timeVal, ok := ts.(interface{ AsTime() time.Time }); ok {
-			return timeVal.AsTime().Format(HeadscaleDateTimeFormat)
-		}
-		return ""
-	}
 }
 
 // boolToString converts a boolean to a string representation

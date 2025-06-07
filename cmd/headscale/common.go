@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/AlecAivazis/survey/v2"
 	"github.com/creachadair/command"
+	"github.com/creachadair/flax"
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
 )
 
@@ -219,6 +222,7 @@ func createSubcommandAlias(originalRun func(*command.Env) error, aliasName, usag
 		Name:     aliasName,
 		Usage:    usage,
 		Help:     aliasHelp,
+		SetFlags: command.Flags(flax.MustBind, &globalArgs),
 		Run:      originalRun,
 		Unlisted: true,
 	}
@@ -333,10 +337,18 @@ func confirmDeletion(itemType, itemName string, force bool) (bool, error) {
 		return true, nil
 	}
 
-	// For now, just print a message and require --force
-	// TODO: Add interactive confirmation prompt when survey library is available
-	fmt.Printf("This will delete %s '%s'. Use --force to skip this confirmation.\n", itemType, itemName)
-	return false, fmt.Errorf("deletion cancelled - use --force to proceed")
+	var confirmed bool
+	prompt := &survey.Confirm{
+		Message: fmt.Sprintf("Are you sure you want to delete %s '%s'?", itemType, itemName),
+		Default: false,
+	}
+
+	err := survey.AskOne(prompt, &confirmed)
+	if err != nil {
+		return false, fmt.Errorf("confirmation prompt failed: %w", err)
+	}
+
+	return confirmed, nil
 }
 
 // parseDurationWithDefault parses a duration string with a default fallback
@@ -352,4 +364,61 @@ func parseDurationWithDefault(durationStr string, defaultDuration time.Duration)
 	}
 
 	return time.Now().Add(duration), nil
+}
+
+// validateEmailFormat validates email format
+func validateEmailFormat(email string) error {
+	if email != "" && !strings.Contains(email, "@") {
+		return fmt.Errorf("invalid email format: %s", email)
+	}
+	return nil
+}
+
+// validateDuration validates duration format
+func validateDuration(durationStr string) error {
+	if durationStr == "" {
+		return nil
+	}
+	_, err := time.ParseDuration(durationStr)
+	return err
+}
+
+// validateRoutes validates route format (CIDR notation)
+func validateRoutes(routesStr string) error {
+	if routesStr == "" {
+		return nil
+	}
+	routes := parseCommaSeparated(routesStr)
+	for _, route := range routes {
+		if _, _, err := net.ParseCIDR(route); err != nil {
+			return fmt.Errorf("invalid route format '%s': %w", route, err)
+		}
+	}
+	return nil
+}
+
+// formatGRPCError converts gRPC errors to user-friendly messages
+func formatGRPCError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	// Convert gRPC errors to user-friendly messages
+	errStr := err.Error()
+
+	// Handle common gRPC error patterns
+	switch {
+	case strings.Contains(errStr, "not found") || strings.Contains(errStr, "NotFound"):
+		return fmt.Errorf("resource not found - please check your identifier")
+	case strings.Contains(errStr, "already exists") || strings.Contains(errStr, "AlreadyExists"):
+		return fmt.Errorf("resource already exists - use a different name")
+	case strings.Contains(errStr, "permission denied") || strings.Contains(errStr, "PermissionDenied"):
+		return fmt.Errorf("permission denied - check your API key or access rights")
+	case strings.Contains(errStr, "invalid argument") || strings.Contains(errStr, "InvalidArgument"):
+		return fmt.Errorf("invalid argument provided - check your input values")
+	case strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "Unavailable"):
+		return fmt.Errorf("cannot connect to headscale server - check if it's running and accessible")
+	default:
+		return err
+	}
 }

@@ -11,9 +11,20 @@ import (
 
 // User command flags
 var userArgs struct {
-	ID    uint64 `flag:"id,i,User ID"`
-	Name  string `flag:"name,n,User name"`
-	Email string `flag:"email,e,Email address"`
+	ID         uint64 `flag:"id,i,User ID"`
+	Identifier uint64 `flag:"identifier,User ID (backward compatibility alias for --id)"`
+	Name       string `flag:"name,n,User name"`
+	Email      string `flag:"email,e,Email address"`
+	NewName    string `flag:"new-name,New name for rename operations"`
+}
+
+// Helper function to get user ID from either --id or --identifier flags
+// Prioritizes --id but falls back to --identifier for backward compatibility
+func getIDFromUserFlags() uint64 {
+	if userArgs.ID != 0 {
+		return userArgs.ID
+	}
+	return userArgs.Identifier
 }
 
 // User command implementations
@@ -40,8 +51,9 @@ func listUsersCommand(env *command.Env) error {
 		request := &v1.ListUsersRequest{}
 
 		// Apply filters if specified
-		if userArgs.ID != 0 {
-			request.Id = userArgs.ID
+		userID := getIDFromUserFlags()
+		if userID != 0 {
+			request.Id = userID
 		}
 		if userArgs.Name != "" {
 			request.Name = userArgs.Name
@@ -59,21 +71,28 @@ func listUsersCommand(env *command.Env) error {
 	})
 }
 
-func renameUserCommand(env *command.Env, newName string) error {
-	// Validate that either ID or name is provided
-	if err := validateUserIdentifier(userArgs.ID, userArgs.Name); err != nil {
-		return err
+func renameUserCommand(env *command.Env) error {
+	// Get new name from flag
+	newName := userArgs.NewName
+	if newName == "" {
+		return fmt.Errorf("--new-name flag is required")
+	}
+
+	// Get user ID from either --id or --identifier
+	userID := getIDFromUserFlags()
+	if userID == 0 && userArgs.Name == "" {
+		return fmt.Errorf("either --id/--identifier or --name flag is required")
 	}
 
 	return withHeadscaleClient(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
 		// Get the user ID using the helper
-		userID, err := getUserIDFromIdentifier(ctx, client, userArgs.ID, userArgs.Name)
+		finalUserID, err := getUserIDFromIdentifier(ctx, client, userID, userArgs.Name)
 		if err != nil {
 			return err
 		}
 
 		request := &v1.RenameUserRequest{
-			OldId:   userID,
+			OldId:   finalUserID,
 			NewName: newName,
 		}
 
@@ -87,20 +106,21 @@ func renameUserCommand(env *command.Env, newName string) error {
 }
 
 func deleteUserCommand(env *command.Env) error {
-	// Validate that either ID or name is provided
-	if err := validateUserIdentifier(userArgs.ID, userArgs.Name); err != nil {
-		return err
+	// Get user ID from either --id or --identifier
+	userID := getIDFromUserFlags()
+	if userID == 0 && userArgs.Name == "" {
+		return fmt.Errorf("either --id/--identifier or --name flag is required")
 	}
 
 	return withHeadscaleClient(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
 		// Get the user ID using the helper
-		userID, err := getUserIDFromIdentifier(ctx, client, userArgs.ID, userArgs.Name)
+		finalUserID, err := getUserIDFromIdentifier(ctx, client, userID, userArgs.Name)
 		if err != nil {
 			return err
 		}
 
 		// Determine the display name for confirmation
-		displayName := fmt.Sprintf("ID %d", userID)
+		displayName := fmt.Sprintf("ID %d", finalUserID)
 		if userArgs.Name != "" {
 			displayName = userArgs.Name
 		}
@@ -114,14 +134,14 @@ func deleteUserCommand(env *command.Env) error {
 			return nil
 		}
 
-		request := &v1.DeleteUserRequest{Id: userID}
+		request := &v1.DeleteUserRequest{Id: finalUserID}
 
 		_, err = client.DeleteUser(ctx, request)
 		if err != nil {
 			return fmt.Errorf("cannot delete user: %w", err)
 		}
 
-		return outputResult(map[string]interface{}{"user_id": userID}, fmt.Sprintf("User %d deleted successfully", userID), globalArgs.Output)
+		return outputResult(map[string]interface{}{"user_id": finalUserID}, "User destroyed", globalArgs.Output)
 	})
 }
 
@@ -132,34 +152,38 @@ func userCommands() []*command.C {
 		Name:     "users",
 		Usage:    "<subcommand> [flags] [args...]",
 		Help:     "Manage users in Headscale",
-		SetFlags: command.Flags(flax.MustBind, &userArgs),
+		SetFlags: command.Flags(flax.MustBind, &globalArgs, &userArgs),
 		Commands: []*command.C{
 			{
-				Name:  "create",
-				Usage: "<username>",
-				Help:  "Create a new user",
-				Run:   command.Adapt(createUserCommand),
+				Name:     "create",
+				Usage:    "<username> [--email <email>]",
+				Help:     "Create a new user with optional email address",
+				SetFlags: command.Flags(flax.MustBind, &globalArgs, &userArgs),
+				Run:      command.Adapt(createUserCommand),
 			},
 			{
-				Name:  "list",
-				Usage: "[flags]",
-				Help:  "List users",
-				Run:   listUsersCommand,
+				Name:     "list",
+				Usage:    "[--output json|yaml|table]",
+				Help:     "List all users in the system",
+				SetFlags: command.Flags(flax.MustBind, &globalArgs, &userArgs),
+				Run:      listUsersCommand,
 			},
 			createSubcommandAlias(listUsersCommand, "ls", "[flags]", "List users (alias)"),
 			{
-				Name:  "rename",
-				Usage: "<new-name>",
-				Help:  "Rename a user",
-				Run:   command.Adapt(renameUserCommand),
+				Name:     "rename",
+				Usage:    "--id <id> | --name <n> --new-name <new-name>",
+				Help:     "Rename an existing user to a new name",
+				SetFlags: command.Flags(flax.MustBind, &globalArgs, &userArgs),
+				Run:      renameUserCommand,
 			},
 			{
-				Name:  "delete",
-				Usage: "--id <id> | --name <name>",
-				Help:  "Delete a user",
-				Run:   deleteUserCommand,
+				Name:     "delete",
+				Usage:    "--id <id> | --name <n> [--force]",
+				Help:     "Delete a user (prompts for confirmation unless --force is used)",
+				SetFlags: command.Flags(flax.MustBind, &globalArgs, &userArgs),
+				Run:      deleteUserCommand,
 			},
-			createSubcommandAlias(deleteUserCommand, "destroy", "--id <id> | --name <name>", "Delete a user (alias)"),
+			createSubcommandAlias(deleteUserCommand, "destroy", "--id <id> | --name <n> [--force]", "Delete a user (alias for delete)"),
 		},
 	}
 

@@ -119,7 +119,7 @@ func preAuthKeyCommands() []*command.C {
 		Name:     "preauth-keys",
 		Usage:    "<subcommand> [flags] [args...]",
 		Help:     "Manage pre-authentication keys",
-		SetFlags: command.Flags(flax.MustBind, &preAuthArgs),
+		SetFlags: command.Flags(flax.MustBind, &globalArgs, &preAuthArgs),
 		Commands: []*command.C{
 			{
 				Name:  "list",

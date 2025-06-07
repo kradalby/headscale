@@ -18,8 +18,8 @@ import (
 	"github.com/juanfont/headscale/integration/tsic"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"tailscale.com/tailcfg"
 	"golang.org/x/exp/slices"
+	"tailscale.com/tailcfg"
 )
 
 func executeAndUnmarshal[T any](headscale ControlServer, command []string, result T) error {
@@ -912,8 +912,6 @@ func TestNodeTagCommand(t *testing.T) {
 		"should find a node with the tag 'tag:test' in the list of nodes",
 	)
 }
-
-
 
 func TestNodeAdvertiseTagCommand(t *testing.T) {
 	IntegrationSkip(t)
