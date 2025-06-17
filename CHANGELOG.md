@@ -13,6 +13,7 @@
   [#2600](https://github.com/juanfont/headscale/pull/2600)
 - Refactor Debian/Ubuntu packaging and drop support for Ubuntu 20.04.
   [#2614](https://github.com/juanfont/headscale/pull/2614)
+- Update integration tests for CLI migration from Cobra to command framework
 
 ## 0.26.0 (2025-05-14)
 
