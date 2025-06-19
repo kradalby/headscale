@@ -14,8 +14,67 @@
   }: let
     headscaleVersion = self.shortRev or self.dirtyShortRev;
     commitHash = self.rev or self.dirtyRev;
+    
+    mkDevDeps = pkgs: with pkgs; [
+      git
+      go_1_24  
+      gnumake
+      golangci-lint
+      golangci-lint-langserver
+      golines
+      nodePackages.prettier
+      goreleaser
+      nfpm
+      gotestsum
+      gotests
+      gofumpt
+      gopls
+      ksh
+      ko
+      yq-go
+      ripgrep
+      postgresql
+      uv
+      docker
+      # 'dot' is needed for pprof graphs
+      # go tool pprof -http=: <source>
+      graphviz
+      # Protobuf dependencies
+      protobuf
+      protoc-gen-go
+      protoc-gen-go-grpc
+      protoc-gen-grpc-gateway
+      buf
+      clang-tools # clang-format
+      protobuf-language-server
+    ];
   in
     {
+      nixosConfigurations.devcontainer = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          {
+            boot.isContainer = true;
+            networking.hostName = "headscale-dev";
+            system.stateVersion = "25.05";
+            
+            networking.useHostResolvConf = false;
+            services.resolved.enable = true;
+            
+            environment.systemPackages = mkDevDeps nixpkgs.legacyPackages.x86_64-linux;
+            
+            virtualisation.docker.enable = true;
+            
+            users.users.dev = {
+              isNormalUser = true;
+              extraGroups = [ "wheel" "docker" ];
+              shell = nixpkgs.legacyPackages.x86_64-linux.bash;
+            };
+            
+            security.sudo.wheelNeedsPassword = false;
+          }
+        ];
+      };
       overlay = _: prev: let
         pkgs = nixpkgs.legacyPackages.${prev.system};
         buildGo = pkgs.buildGo124Module;
@@ -113,38 +172,7 @@
         inherit system;
       };
       buildDeps = with pkgs; [git go_1_24 gnumake];
-      devDeps = with pkgs;
-        buildDeps
-        ++ [
-          golangci-lint
-          golangci-lint-langserver
-          golines
-          nodePackages.prettier
-          goreleaser
-          nfpm
-          gotestsum
-          gotests
-          gofumpt
-          gopls
-          ksh
-          ko
-          yq-go
-          ripgrep
-          postgresql
-
-          # 'dot' is needed for pprof graphs
-          # go tool pprof -http=: <source>
-          graphviz
-
-          # Protobuf dependencies
-          protobuf
-          protoc-gen-go
-          protoc-gen-go-grpc
-          protoc-gen-grpc-gateway
-          buf
-          clang-tools # clang-format
-          protobuf-language-server
-        ];
+      devDeps = mkDevDeps pkgs;
 
       # Add entry to build a docker image with headscale
       # caveat: only works on Linux
