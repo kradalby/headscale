@@ -61,6 +61,7 @@
             networking.useHostResolvConf = true;
             networking.dhcpcd.enable = false;
             networking.useDHCP = false;
+            networking.nameservers = [ "1.1.1.1" "8.8.8.8" ];
             
             environment.systemPackages = let
               pkgs = import nixpkgs {
