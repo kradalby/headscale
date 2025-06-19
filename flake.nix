@@ -61,14 +61,24 @@
             networking.useHostResolvConf = false;
             services.resolved.enable = true;
             
-            environment.systemPackages = mkDevDeps nixpkgs.legacyPackages.x86_64-linux;
+            environment.systemPackages = let
+              pkgs = import nixpkgs {
+                overlays = [self.overlay];
+                system = "x86_64-linux";
+              };
+            in mkDevDeps pkgs;
             
             virtualisation.docker.enable = true;
             
             users.users.dev = {
               isNormalUser = true;
               extraGroups = [ "wheel" "docker" ];
-              shell = nixpkgs.legacyPackages.x86_64-linux.bash;
+              shell = let
+                pkgs = import nixpkgs {
+                  overlays = [self.overlay];
+                  system = "x86_64-linux";
+                };
+              in pkgs.bash;
             };
             
             security.sudo.wheelNeedsPassword = false;
