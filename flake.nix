@@ -66,7 +66,10 @@
                 overlays = [self.overlay];
                 system = "x86_64-linux";
               };
-            in mkDevDeps pkgs;
+            in (mkDevDeps pkgs) ++ (with pkgs; [
+              nodejs
+              tmux
+            ]);
             
             virtualisation.docker.enable = true;
             
