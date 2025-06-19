@@ -58,8 +58,9 @@
             networking.hostName = "headscale-dev";
             system.stateVersion = "25.05";
             
-            networking.useHostResolvConf = false;
-            services.resolved.enable = true;
+            networking.useHostResolvConf = true;
+            networking.dhcpcd.enable = false;
+            networking.useDHCP = false;
             
             environment.systemPackages = let
               pkgs = import nixpkgs {
