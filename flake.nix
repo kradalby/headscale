@@ -164,9 +164,15 @@
             microvm.mem = nixpkgs.lib.mkForce 16384;  # 16GB RAM
             microvm.volumes = nixpkgs.lib.mkForce [
               {
+                image = "root.img";
+                mountPoint = "/";
+                size = 16384;  # 16GB root disk
+                fsType = "ext4";
+              }
+              {
                 image = "nix-store-overlay.img";
                 mountPoint = "/nix/.rw-store";
-                size = 16384;  # 16GB storage
+                size = 16384;  # 16GB nix store overlay
               }
             ];
             networking.hostName = nixpkgs.lib.mkForce "headscale-devvm";
