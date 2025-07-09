@@ -1,10 +1,11 @@
-{ nixpkgs, microvm, mkDevDeps, self }:
+{ nixpkgs, microvm, mkDevDeps, self, overrides ? {} }:
 
 nixpkgs.lib.nixosSystem {
   system = "x86_64-linux";
   modules = [
     microvm.nixosModules.microvm
-    ({ lib, pkgs, ... }: {
+    ({ lib, pkgs, ... }: lib.mkMerge [
+    {
       # Configure dev user
       users.users.dev = {
         isNormalUser = true;
@@ -116,7 +117,9 @@ nixpkgs.lib.nixosSystem {
 
       # Set system version
       system.stateVersion = "25.05";
-    })
+    }
+    overrides
+    ])
   ];
   specialArgs = { inherit microvm; };
 }

@@ -158,28 +158,19 @@
 
       nixosConfigurations = {
         vm = import ./vm.nix { inherit nixpkgs microvm mkDevDeps self; };
-        devvm = nixpkgs.lib.nixosSystem {
-          system = "x86_64-linux";
-          modules = [
-            (import ./vm.nix { inherit nixpkgs microvm mkDevDeps self; }).config
-            {
-              # Override for higher-spec development VM
-              microvm.mem = 16384;  # 16GB RAM
-              microvm.vcpu = 4;     # 4 cores (already default)
-              
-              # Increase storage overlay size
-              microvm.volumes = [
-                {
-                  image = "nix-store-overlay.img";
-                  mountPoint = "/nix/.rw-store";
-                  size = 16384;  # 16GB storage
-                }
-              ];
-              
-              networking.hostName = "headscale-devvm";
-            }
-          ];
-          specialArgs = { inherit microvm; };
+        devvm = import ./vm.nix { 
+          inherit nixpkgs microvm mkDevDeps self; 
+          overrides = {
+            microvm.mem = 16384;  # 16GB RAM
+            microvm.volumes = [
+              {
+                image = "nix-store-overlay.img";
+                mountPoint = "/nix/.rw-store";
+                size = 16384;  # 16GB storage
+              }
+            ];
+            networking.hostName = "headscale-devvm";
+          };
         };
       };
     }
