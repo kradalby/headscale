@@ -4,16 +4,54 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    microvm.url = "github:astro/microvm.nix";
+    microvm.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs = {
     self,
     nixpkgs,
     flake-utils,
+    microvm,
     ...
   }: let
     headscaleVersion = self.shortRev or self.dirtyShortRev;
     commitHash = self.rev or self.dirtyRev;
+    mkDevDeps = pkgs: with pkgs; let
+      buildDeps = [git go_1_24 gnumake];
+    in buildDeps ++ [
+      golangci-lint
+      golangci-lint-langserver
+      golines
+      nodePackages.prettier
+      goreleaser
+      nfpm
+      gotestsum
+      gotests
+      gofumpt
+      gopls
+      ksh
+      ko
+      yq-go
+      ripgrep
+      postgresql
+
+      # 'dot' is needed for pprof graphs
+      # go tool pprof -http=: <source>
+      graphviz
+
+      # Protobuf dependencies
+      protobuf
+      protoc-gen-go
+      protoc-gen-go-grpc
+      protoc-gen-grpc-gateway
+      buf
+      clang-tools # clang-format
+      protobuf-language-server
+
+      # Add hi to make it even easier to use ci runner.
+      hi
+    ];
   in
     {
       overlay = _: prev: let
@@ -117,6 +155,10 @@
         #   buildGoModule = buildGo;
         # };
       };
+
+      nixosConfigurations = {
+        vm = import ./vm.nix { inherit nixpkgs microvm mkDevDeps self; };
+      };
     }
     // flake-utils.lib.eachDefaultSystem
     (system: let
@@ -124,42 +166,6 @@
         overlays = [self.overlay];
         inherit system;
       };
-      buildDeps = with pkgs; [git go_1_24 gnumake];
-      devDeps = with pkgs;
-        buildDeps
-        ++ [
-          golangci-lint
-          golangci-lint-langserver
-          golines
-          nodePackages.prettier
-          goreleaser
-          nfpm
-          gotestsum
-          gotests
-          gofumpt
-          gopls
-          ksh
-          ko
-          yq-go
-          ripgrep
-          postgresql
-
-          # 'dot' is needed for pprof graphs
-          # go tool pprof -http=: <source>
-          graphviz
-
-          # Protobuf dependencies
-          protobuf
-          protoc-gen-go
-          protoc-gen-go-grpc
-          protoc-gen-grpc-gateway
-          buf
-          clang-tools # clang-format
-          protobuf-language-server
-
-          # Add hi to make it even easier to use ci runner.
-          hi
-        ];
 
       # Add entry to build a docker image with headscale
       # caveat: only works on Linux
@@ -177,7 +183,7 @@
       # `nix develop`
       devShell = pkgs.mkShell {
         buildInputs =
-          devDeps
+          (mkDevDeps pkgs)
           ++ [
             (pkgs.writeShellScriptBin
               "nix-vendor-sri"
@@ -209,6 +215,7 @@
       packages = with pkgs; {
         inherit headscale;
         inherit headscale-docker;
+        vm = self.nixosConfigurations.vm.config.microvm.declaredRunner;
       };
       defaultPackage = pkgs.headscale;
 
