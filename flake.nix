@@ -161,15 +161,15 @@
         devvm = import ./vm.nix { 
           inherit nixpkgs microvm mkDevDeps self; 
           overrides = {
-            microvm.mem = 16384;  # 16GB RAM
-            microvm.volumes = [
+            microvm.mem = nixpkgs.lib.mkForce 16384;  # 16GB RAM
+            microvm.volumes = nixpkgs.lib.mkForce [
               {
                 image = "nix-store-overlay.img";
                 mountPoint = "/nix/.rw-store";
                 size = 16384;  # 16GB storage
               }
             ];
-            networking.hostName = "headscale-devvm";
+            networking.hostName = nixpkgs.lib.mkForce "headscale-devvm";
           };
         };
       };
