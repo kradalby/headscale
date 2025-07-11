@@ -161,24 +161,58 @@
         devvm = import ./vm.nix { 
           inherit nixpkgs microvm mkDevDeps self; 
           overrides = {
-            microvm.mem = nixpkgs.lib.mkForce 16384;  # 16GB RAM
             microvm.volumes = nixpkgs.lib.mkForce [
               {
-                image = "root.img";
+                image = "devvm-root.img";
                 mountPoint = "/";
                 size = 16384;  # 16GB root disk
                 fsType = "ext4";
+                autoCreate = true;
               }
               {
-                image = "nix-store-overlay.img";
+                image = "devvm-nix-store.img";
                 mountPoint = "/nix/.rw-store";
                 size = 16384;  # 16GB nix store overlay
+                autoCreate = true;
               }
             ];
             networking.hostName = nixpkgs.lib.mkForce "headscale-devvm";
           };
         };
-      };
+      } // nixpkgs.lib.listToAttrs (map (i: let
+        runnerNum = if i < 10 then "0${toString i}" else toString i;
+        runnerName = "runner${runnerNum}";
+      in {
+        name = runnerName;
+        value = import ./vm.nix { 
+          inherit nixpkgs microvm mkDevDeps self; 
+          overrides = {
+            microvm.interfaces = nixpkgs.lib.mkForce [
+              {
+                type = "tap";
+                id = "tap-${runnerName}";
+                mac = "02:00:00:00:${runnerNum}:01";
+              }
+            ];
+            microvm.volumes = nixpkgs.lib.mkForce [
+              {
+                image = "${runnerName}-root.img";
+                mountPoint = "/";
+                size = 16384;  # 16GB root disk
+                fsType = "ext4";
+                autoCreate = true;
+              }
+              {
+                image = "${runnerName}-nix-store.img";
+                mountPoint = "/nix/.rw-store";
+                size = 16384;  # 16GB nix store overlay
+                autoCreate = true;
+              }
+            ];
+            networking.hostName = nixpkgs.lib.mkForce "headscale-${runnerName}";
+          };
+        };
+      }) (nixpkgs.lib.range 1 20));
     }
     // flake-utils.lib.eachDefaultSystem
     (system: let
@@ -237,7 +271,13 @@
         inherit headscale-docker;
         vm = self.nixosConfigurations.vm.config.microvm.declaredRunner;
         devvm = self.nixosConfigurations.devvm.config.microvm.declaredRunner;
-      };
+      } // nixpkgs.lib.listToAttrs (map (i: let
+        runnerNum = if i < 10 then "0${toString i}" else toString i;
+        runnerName = "runner${runnerNum}";
+      in {
+        name = runnerName;
+        value = self.nixosConfigurations.${runnerName}.config.microvm.declaredRunner;
+      }) (nixpkgs.lib.range 1 20));
       defaultPackage = pkgs.headscale;
 
       # `nix run`

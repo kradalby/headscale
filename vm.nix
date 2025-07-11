@@ -36,8 +36,8 @@ nixpkgs.lib.nixosSystem {
       microvm = {
         hypervisor = "qemu";
         socket = "control.socket";
-        mem = 4096;  # 4GB RAM
-        vcpu = 4;    # 4 CPU cores
+        mem = 16384;  # 16GB RAM
+        vcpu = 4;     # 4 CPU cores
         interfaces = [
           {
             type = "tap";
@@ -56,12 +56,20 @@ nixpkgs.lib.nixosSystem {
         # Enable writable overlay on top of read-only store
         writableStoreOverlay = "/nix/.rw-store";
         
-        # Persistent volume for store overlay
+        # Persistent volumes
         volumes = [
           {
-            image = "nix-store-overlay.img";
+            image = "vm-root.img";
+            mountPoint = "/";
+            size = 16384;  # 16GB root disk
+            fsType = "ext4";
+            autoCreate = true;
+          }
+          {
+            image = "vm-nix-store.img";
             mountPoint = "/nix/.rw-store";
-            size = 8192;  # 8GB
+            size = 16384;  # 16GB nix store overlay
+            autoCreate = true;
           }
         ];
       };
