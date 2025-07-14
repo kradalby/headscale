@@ -17,41 +17,44 @@
   }: let
     headscaleVersion = self.shortRev or self.dirtyShortRev;
     commitHash = self.rev or self.dirtyRev;
-    mkDevDeps = pkgs: with pkgs; let
-      buildDeps = [git go_1_24 gnumake];
-    in buildDeps ++ [
-      golangci-lint
-      golangci-lint-langserver
-      golines
-      nodePackages.prettier
-      goreleaser
-      nfpm
-      gotestsum
-      gotests
-      gofumpt
-      gopls
-      ksh
-      ko
-      yq-go
-      ripgrep
-      postgresql
+    mkDevDeps = pkgs:
+      with pkgs; let
+        buildDeps = [git go_1_24 gnumake];
+      in
+        buildDeps
+        ++ [
+          golangci-lint
+          golangci-lint-langserver
+          golines
+          nodePackages.prettier
+          goreleaser
+          nfpm
+          gotestsum
+          gotests
+          gofumpt
+          gopls
+          ksh
+          ko
+          yq-go
+          ripgrep
+          postgresql
 
-      # 'dot' is needed for pprof graphs
-      # go tool pprof -http=: <source>
-      graphviz
+          # 'dot' is needed for pprof graphs
+          # go tool pprof -http=: <source>
+          graphviz
 
-      # Protobuf dependencies
-      protobuf
-      protoc-gen-go
-      protoc-gen-go-grpc
-      protoc-gen-grpc-gateway
-      buf
-      clang-tools # clang-format
-      protobuf-language-server
+          # Protobuf dependencies
+          protobuf
+          protoc-gen-go
+          protoc-gen-go-grpc
+          protoc-gen-grpc-gateway
+          buf
+          clang-tools # clang-format
+          protobuf-language-server
 
-      # Add hi to make it even easier to use ci runner.
-      hi
-    ];
+          # Add hi to make it even easier to use ci runner.
+          hi
+        ];
   in
     {
       overlay = _: prev: let
@@ -156,63 +159,14 @@
         # };
       };
 
-      nixosConfigurations = {
-        vm = import ./vm.nix { inherit nixpkgs microvm mkDevDeps self; };
-        devvm = import ./vm.nix { 
-          inherit nixpkgs microvm mkDevDeps self; 
-          overrides = {
-            microvm.volumes = nixpkgs.lib.mkForce [
-              {
-                image = "devvm-root.img";
-                mountPoint = "/";
-                size = 16384;  # 16GB root disk
-                fsType = "ext4";
-                autoCreate = true;
-              }
-              {
-                image = "devvm-nix-store.img";
-                mountPoint = "/nix/.rw-store";
-                size = 16384;  # 16GB nix store overlay
-                autoCreate = true;
-              }
-            ];
-            networking.hostName = nixpkgs.lib.mkForce "headscale-devvm";
-          };
-        };
-      } // nixpkgs.lib.listToAttrs (map (i: let
-        runnerNum = if i < 10 then "0${toString i}" else toString i;
-        runnerName = "runner${runnerNum}";
-      in {
-        name = runnerName;
-        value = import ./vm.nix { 
-          inherit nixpkgs microvm mkDevDeps self; 
-          overrides = {
-            microvm.interfaces = nixpkgs.lib.mkForce [
-              {
-                type = "tap";
-                id = "tap-${runnerName}";
-                mac = "02:00:00:00:${runnerNum}:01";
-              }
-            ];
-            microvm.volumes = nixpkgs.lib.mkForce [
-              {
-                image = "${runnerName}-root.img";
-                mountPoint = "/";
-                size = 16384;  # 16GB root disk
-                fsType = "ext4";
-                autoCreate = true;
-              }
-              {
-                image = "${runnerName}-nix-store.img";
-                mountPoint = "/nix/.rw-store";
-                size = 16384;  # 16GB nix store overlay
-                autoCreate = true;
-              }
-            ];
-            networking.hostName = nixpkgs.lib.mkForce "headscale-${runnerName}";
-          };
-        };
-      }) (nixpkgs.lib.range 1 20));
+      nixosConfigurations = let
+        vmConfigs = import ./vm.nix {inherit nixpkgs microvm mkDevDeps self;};
+      in
+        {
+          vm = vmConfigs.vm;
+        }
+        // vmConfigs.devvms
+        // vmConfigs.runners;
     }
     // flake-utils.lib.eachDefaultSystem
     (system: let
@@ -266,18 +220,18 @@
       };
 
       # `nix build`
-      packages = with pkgs; {
-        inherit headscale;
-        inherit headscale-docker;
-        vm = self.nixosConfigurations.vm.config.microvm.declaredRunner;
-        devvm = self.nixosConfigurations.devvm.config.microvm.declaredRunner;
-      } // nixpkgs.lib.listToAttrs (map (i: let
-        runnerNum = if i < 10 then "0${toString i}" else toString i;
-        runnerName = "runner${runnerNum}";
-      in {
-        name = runnerName;
-        value = self.nixosConfigurations.${runnerName}.config.microvm.declaredRunner;
-      }) (nixpkgs.lib.range 1 20));
+      packages = with pkgs; let
+        vmConfigs = import ./vm.nix {inherit nixpkgs microvm mkDevDeps self;};
+        vmPackages = nixpkgs.lib.mapAttrs (name: config: config.config.microvm.declaredRunner) (
+          vmConfigs.devvms // vmConfigs.runners
+        );
+      in
+        {
+          inherit headscale;
+          inherit headscale-docker;
+          vm = self.nixosConfigurations.vm.config.microvm.declaredRunner;
+        }
+        // vmPackages;
       defaultPackage = pkgs.headscale;
 
       # `nix run`
