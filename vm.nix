@@ -155,12 +155,6 @@
       ];
       specialArgs = {inherit microvm;};
     };
-in {
-  # Base VM configuration (for backwards compatibility)
-  vm = mkVmConfig "vm" overrides;
-
-  # VM configuration builder function
-  mkVm = mkVmConfig;
 
   # Helper function to generate VM configurations
   mkVmSet = {
@@ -205,6 +199,12 @@ in {
         overrides
       ]);
     }) (nixpkgs.lib.range 1 count));
+in {
+  # Base VM configuration (for backwards compatibility)
+  vm = mkVmConfig "vm" overrides;
+
+  # VM configuration builder function
+  mkVm = mkVmConfig;
 
   # Generate 5 devvm configurations (devvm01-devvm05) with 80GB storage
   devvms = mkVmSet {
