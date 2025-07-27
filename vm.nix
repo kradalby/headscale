@@ -172,31 +172,28 @@
       inherit name;
       value = mkVmConfig name (nixpkgs.lib.mkMerge [
         {
-          microvm = {
-            socket = nixpkgs.lib.mkForce "${name}-control.socket";
-            interfaces = nixpkgs.lib.mkForce [
-              {
-                type = "tap";
-                id = "tap-${name}";
-                mac = "02:00:00:${macPrefix}:${num}:01";
-              }
-            ];
-            volumes = nixpkgs.lib.mkForce [
-              {
-                image = "${name}-root.img";
-                mountPoint = "/";
-                size = rootSize;
-                fsType = "ext4";
-                autoCreate = true;
-              }
-              {
-                image = "${name}-nix-store.img";
-                mountPoint = "/nix/.rw-store";
-                size = storeSize;
-                autoCreate = true;
-              }
-            ];
-          };
+          microvm.interfaces = nixpkgs.lib.mkForce [
+            {
+              type = "tap";
+              id = "tap-${name}";
+              mac = "02:00:00:${macPrefix}:${num}:01";
+            }
+          ];
+          microvm.volumes = nixpkgs.lib.mkForce [
+            {
+              image = "${name}-root.img";
+              mountPoint = "/";
+              size = rootSize;
+              fsType = "ext4";
+              autoCreate = true;
+            }
+            {
+              image = "${name}-nix-store.img";
+              mountPoint = "/nix/.rw-store";
+              size = storeSize;
+              autoCreate = true;
+            }
+          ];
           networking.hostName = nixpkgs.lib.mkForce "headscale-${name}";
         }
         overrides
