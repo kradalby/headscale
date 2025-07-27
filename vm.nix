@@ -148,8 +148,8 @@
       system = "x86_64-linux";
       modules = [
         microvm.nixosModules.microvm
-        ({lib, ...}: lib.mkMerge [
-          commonVmConfig
+        ({lib, pkgs, ...}: lib.mkMerge [
+          (commonVmConfig {inherit lib pkgs;})
           vmOverrides
         ])
       ];
