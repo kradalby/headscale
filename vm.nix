@@ -17,9 +17,12 @@
       password = "dev";
       extraGroups = ["wheel" "docker"];
       shell = pkgs.fish;
-      openssh.authorizedKeys.keys = 
-        nixpkgs.lib.strings.splitString "\n" 
-        (builtins.readFile (builtins.fetchurl "https://github.com/kradalby.keys"));
+      openssh.authorizedKeys.keys = [
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBV4ZjlUvRDs70qHD/Ldi6OTkFpDEFgfbXbqSnaL2Qup"
+        "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBOm0+vlPKTRMQm9teF/bCrTPEDEqs1m+B5kMZtuLKh2rDLYM2uwsLPjNjaIlFQfkUn2vyAqGovyKOVR7Q/Z28yo="
+        "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBGqesfGzltPA+pNVQ667T1tKzQoz09qTcoQshygxl73I3EbYD5vnHFtC+tnziVbfxSx8ZDRvPDN7vHEalE5U3JU="
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJjAKM+WX/sNJwMcgOv87DXfeXD/fGG7RyCF8svQNbLL"
+      ];
     };
 
     # Configure root user
@@ -128,6 +131,8 @@
         docker
         docker-compose
         nodejs_24
+        uv
+        python3
       ]);
 
     # Enable fish
@@ -151,10 +156,15 @@
       system = "x86_64-linux";
       modules = [
         microvm.nixosModules.microvm
-        ({lib, pkgs, ...}: lib.mkMerge [
-          (commonVmConfig {inherit lib pkgs;})
-          vmOverrides
-        ])
+        ({
+          lib,
+          pkgs,
+          ...
+        }:
+          lib.mkMerge [
+            (commonVmConfig {inherit lib pkgs;})
+            vmOverrides
+          ])
       ];
       specialArgs = {inherit microvm;};
     };
@@ -166,7 +176,7 @@
     rootSize ? 16384,
     macPrefix ? "00",
     storeSize ? 16384,
-    overrides ? {}
+    overrides ? {},
   }:
     nixpkgs.lib.listToAttrs (map (i: let
       num = nixpkgs.lib.strings.fixedWidthNumber 2 i;
