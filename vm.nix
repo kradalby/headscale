@@ -115,25 +115,48 @@
     };
 
     # Install all Headscale dev dependencies
-    environment.systemPackages =
-      (mkDevDeps (import nixpkgs {
-        overlays = [self.overlay];
-        system = "x86_64-linux";
-      }))
-      ++ (with pkgs; [
-        # Additional utilities for VM
-        vim
-        curl
-        wget
-        htop
-        tmux
-        fish
-        docker
-        docker-compose
-        nodejs_24
-        uv
-        python3
-      ]);
+    environment = {
+      systemPackages =
+        (mkDevDeps (import nixpkgs {
+          overlays = [self.overlay];
+          system = "x86_64-linux";
+        }))
+        ++ (with pkgs; [
+          # Additional utilities for VM
+          vim
+          curl
+          wget
+          htop
+          tmux
+          fish
+          docker
+          docker-compose
+          nodejs_24
+          uv
+          python3
+        ]);
+
+      shellAliases = {
+        claudem = "uvx claude-monitor --plan max5 --time-format 24h --timezone Europe/Amsterdam";
+        g = "git";
+        ga = "git add";
+        gap = "git add -p";
+        gaa = "git add --update .";
+        gco = "git checkout";
+        gcob = "git checkout -b";
+        gcom = "git checkout main";
+        gd = "git diff";
+        gdc = "git diff --cached";
+        gp = "git pull";
+        gss = "git status -s";
+        gst = "git stash";
+        gfo = "git fetch origin";
+        gfu = "git fetch upstream";
+        gcum = "git checkout upstream/main";
+        gc = "git commit";
+        gcm = "git commit -m";
+      };
+    };
 
     # Enable fish
     programs.fish.enable = true;
