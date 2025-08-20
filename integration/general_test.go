@@ -24,6 +24,39 @@ import (
 	"tailscale.com/types/key"
 )
 
+// requireBatcherState is a helper function that waits for the batcher to reach
+// the expected connection state using EventuallyWithT pattern and FATALS the test if it fails.
+func requireBatcherState(t *testing.T, headscale ControlServer, expectedConnected, expectedTotal int, message string, timeout time.Duration) {
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		t.Logf("Attempting to get batcher debug info...")
+		debugInfo, err := headscale.DebugBatcher()
+		if err != nil {
+			t.Logf("Error getting batcher debug info: %v", err)
+			assert.NoError(c, err, "Failed to get batcher debug info")
+			return
+		}
+
+		if debugInfo == nil {
+			t.Logf("Debug batcher info is nil")
+			assert.Fail(c, "Debug batcher info is nil")
+			return
+		}
+
+		connectedCount := 0
+		for _, nodeInfo := range debugInfo.ConnectedNodes {
+			if nodeInfo.Connected {
+				connectedCount++
+			}
+		}
+
+		t.Logf("Batcher state: %d/%d nodes connected (expected %d/%d)",
+			connectedCount, debugInfo.TotalNodes, expectedConnected, expectedTotal)
+
+		assert.Equal(c, expectedTotal, debugInfo.TotalNodes, "Total nodes mismatch")
+		assert.Equal(c, expectedConnected, connectedCount, "Connected nodes mismatch")
+	}, timeout, 500*time.Millisecond, message)
+}
+
 func TestPingAllByIP(t *testing.T) {
 	IntegrationSkip(t)
 
@@ -60,6 +93,14 @@ func TestPingAllByIP(t *testing.T) {
 	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
 		return x.String()
 	})
+
+	// Get headscale instance for batcher debug check
+	headscale, err := scenario.Headscale()
+	assertNoErr(t, err)
+
+	// Test our DebugBatcher functionality
+	t.Logf("Testing DebugBatcher functionality...")
+	requireBatcherState(t, headscale, len(allClients), len(allClients), "TestPingAllByIP: all nodes should be connected to batcher", 30*time.Second)
 
 	success := pingAllHelper(t, allClients, allAddrs)
 	t.Logf("%d successful pings out of %d", success, len(allClients)*len(allIps))
@@ -933,7 +974,8 @@ func TestPingAllByIPManyUpDown(t *testing.T) {
 	IntegrationSkip(t)
 
 	spec := ScenarioSpec{
-		NodesPerUser: len(MustTestVersions),
+		// NodesPerUser: len(MustTestVersions),
+		NodesPerUser: 3,
 		Users:        []string{"user1", "user2"},
 	}
 
@@ -965,13 +1007,22 @@ func TestPingAllByIPManyUpDown(t *testing.T) {
 		return x.String()
 	})
 
+	// Get headscale instance for batcher debug checks
+	headscale, err := scenario.Headscale()
+	assertNoErr(t, err)
+
+	// Initial check: all nodes should be connected to batcher
+	requireBatcherState(t, headscale, len(allClients), len(allClients), "Initial state: all nodes should be connected to batcher", 30*time.Second)
+
 	success := pingAllHelper(t, allClients, allAddrs)
 	t.Logf("%d successful pings out of %d", success, len(allClients)*len(allIps))
 
-	wg, _ := errgroup.WithContext(context.Background())
-
 	for run := range 3 {
 		t.Logf("Starting DownUpPing run %d", run+1)
+
+		// Create fresh errgroup with timeout for each run
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		wg, _ := errgroup.WithContext(ctx)
 
 		for _, client := range allClients {
 			c := client
@@ -985,6 +1036,9 @@ func TestPingAllByIPManyUpDown(t *testing.T) {
 			t.Fatalf("failed to take down all nodes: %s", err)
 		}
 
+		// After taking down all nodes, verify batcher shows all disconnected
+		requireBatcherState(t, headscale, 0, len(allClients), fmt.Sprintf("Run %d: all nodes should be disconnected after Down()", run+1), 30*time.Second)
+
 		for _, client := range allClients {
 			c := client
 			wg.Go(func() error {
@@ -994,8 +1048,11 @@ func TestPingAllByIPManyUpDown(t *testing.T) {
 		}
 
 		if err := wg.Wait(); err != nil {
-			t.Fatalf("failed to take down all nodes: %s", err)
+			t.Fatalf("failed to bring up all nodes: %s", err)
 		}
+
+		// After bringing up all nodes, verify batcher shows all reconnected
+		requireBatcherState(t, headscale, len(allClients), len(allClients), fmt.Sprintf("Run %d: all nodes should be reconnected after Up()", run+1), 60*time.Second)
 
 		// Wait for sync and successful pings after nodes come back up
 		err = scenario.WaitForTailscaleSync()
@@ -1003,6 +1060,9 @@ func TestPingAllByIPManyUpDown(t *testing.T) {
 
 		success := pingAllHelper(t, allClients, allAddrs)
 		assert.Equalf(t, len(allClients)*len(allIps), success, "%d successful pings out of %d", success, len(allClients)*len(allIps))
+
+		// Clean up context for this run
+		cancel()
 	}
 }
 

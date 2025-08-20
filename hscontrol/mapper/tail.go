@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/rs/zerolog/log"
 	"github.com/samber/lo"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
@@ -133,17 +134,26 @@ func tailNode(
 		tNode.CapMap[tailcfg.NodeAttrRandomizeClientPort] = []tailcfg.RawMessage{}
 	}
 
-	// Always set LastSeen if it's valid, regardless of online status
-	// This ensures that during logout grace periods (when IsOnline might be true
-	// for DNS preservation), other nodes can still see when this node disconnected
-	if node.LastSeen().Valid() {
+	// Set LastSeen only for offline nodes to avoid confusing Tailscale clients
+	// during rapid reconnection cycles. Online nodes should not have LastSeen set
+	// as this can make clients interpret them as "not online" despite Online=true.
+	if node.LastSeen().Valid() && node.IsOnline().Valid() && !node.IsOnline().Get() {
 		lastSeen := node.LastSeen().Get()
-		// Only set LastSeen if the node is offline OR if LastSeen is recent
-		// (indicating it disconnected recently but might be in grace period)
-		if !node.IsOnline().Valid() || !node.IsOnline().Get() ||
-			time.Since(lastSeen) < 60*time.Second {
-			tNode.LastSeen = &lastSeen
+		tNode.LastSeen = &lastSeen
+	}
+
+	// Log online status for debugging online status propagation issues
+	if log.Debug().Enabled() {
+		onlineStatus := "unknown"
+		if node.IsOnline().Valid() {
+			if node.IsOnline().Get() {
+				onlineStatus = "online"
+			} else {
+				onlineStatus = "offline"
+			}
 		}
+		log.Debug().Uint64("node.id", node.ID().Uint64()).Str("hostname", node.Hostname()).
+			Str("online_status", onlineStatus).Msg("MapResponse: peer online status")
 	}
 
 	return &tNode, nil

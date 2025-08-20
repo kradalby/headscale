@@ -23,6 +23,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
+	"github.com/juanfont/headscale/hscontrol"
 	"github.com/juanfont/headscale/hscontrol/routes"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
@@ -1292,4 +1293,24 @@ func (t *HeadscaleInContainer) PrimaryRoutes() (*routes.DebugRoutes, error) {
 	}
 
 	return &debugRoutes, nil
+}
+
+// DebugBatcher fetches the batcher debug information from the debug endpoint.
+func (t *HeadscaleInContainer) DebugBatcher() (*hscontrol.DebugBatcherInfo, error) {
+	// Execute curl inside the container to access the debug endpoint locally
+	command := []string{
+		"curl", "-s", "-H", "Accept: application/json", "http://localhost:9090/debug/batcher",
+	}
+
+	result, err := t.Execute(command)
+	if err != nil {
+		return nil, fmt.Errorf("fetching batcher debug info: %w", err)
+	}
+
+	var debugInfo hscontrol.DebugBatcherInfo
+	if err := json.Unmarshal([]byte(result), &debugInfo); err != nil {
+		return nil, fmt.Errorf("decoding batcher debug response: %w", err)
+	}
+
+	return &debugInfo, nil
 }

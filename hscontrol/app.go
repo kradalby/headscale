@@ -1011,6 +1011,10 @@ func readOrCreatePrivateKey(path string) (*key.MachinePrivate, error) {
 // ignored.
 func (h *Headscale) Change(cs ...change.ChangeSet) {
 	for _, c := range cs {
+		if c.Change == change.NodeCameOnline || c.Change == change.NodeWentOffline {
+			log.Debug().Uint64("change.node.id", c.NodeID.Uint64()).Str("change.type", c.Change.String()).
+				Msg("Change: sending online/offline change to batcher")
+		}
 		h.mapBatcher.AddWork(c)
 	}
 }

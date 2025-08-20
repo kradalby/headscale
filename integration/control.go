@@ -4,6 +4,7 @@ import (
 	"net/netip"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	"github.com/juanfont/headscale/hscontrol"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/routes"
 	"github.com/ory/dockertest/v3"
@@ -32,4 +33,5 @@ type ControlServer interface {
 	GetIPInNetwork(network *dockertest.Network) string
 	SetPolicy(*policyv2.Policy) error
 	PrimaryRoutes() (*routes.DebugRoutes, error)
+	DebugBatcher() (*hscontrol.DebugBatcherInfo, error)
 }

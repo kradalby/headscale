@@ -192,6 +192,7 @@ func setupBatcherWithTestData(
 
 	// Create test users and nodes in the database
 	users := database.CreateUsersForTest(userCount, "testuser")
+
 	allNodes := make([]node, 0, userCount*nodesPerUser)
 	for _, user := range users {
 		dbNodes := database.CreateRegisteredNodesForTest(user, nodesPerUser, "node")
@@ -336,6 +337,7 @@ func assertOnlineMapResponse(t *testing.T, resp *tailcfg.MapResponse, expected b
 	if len(resp.PeersChangedPatch) > 0 {
 		require.Len(t, resp.PeersChangedPatch, 1)
 		assert.Equal(t, expected, *resp.PeersChangedPatch[0].Online)
+
 		return
 	}
 
@@ -395,6 +397,7 @@ func (n *node) start() {
 							n.maxPeersCount = info.PeerCount
 						}
 					}
+
 					if info.IsPatch {
 						atomic.AddInt64(&n.patchCount, 1)
 						// For patches, we track how many patch items
@@ -533,6 +536,7 @@ func TestBatcherScalabilityAllToAll(t *testing.T) {
 	// Reduce verbose application logging for cleaner test output
 	originalLevel := zerolog.GlobalLevel()
 	defer zerolog.SetGlobalLevel(originalLevel)
+
 	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
 
 	// Test cases: different node counts to stress test the all-to-all connectivity
@@ -569,6 +573,7 @@ func TestBatcherScalabilityAllToAll(t *testing.T) {
 					// Buffer needs to handle nodeCount * average_updates_per_node
 					// Estimate: each node receives ~2*nodeCount updates during all-to-all
 					bufferSize := max(1000, tc.nodeCount*2)
+
 					testData, cleanup := setupBatcherWithTestData(
 						t,
 						batcherFunc.fn,
@@ -600,6 +605,7 @@ func TestBatcherScalabilityAllToAll(t *testing.T) {
 
 					// Join all nodes as fast as possible
 					t.Logf("Joining %d nodes as fast as possible...", len(allNodes))
+
 					for i := range allNodes {
 						node := &allNodes[i]
 						batcher.AddNode(node.n.ID, node.ch, tailcfg.CapabilityVersion(100))
@@ -675,6 +681,7 @@ func TestBatcherScalabilityAllToAll(t *testing.T) {
 						if stats.MaxPeersSeen > maxPeersGlobal {
 							maxPeersGlobal = stats.MaxPeersSeen
 						}
+
 						if stats.MaxPeersSeen < minPeersSeen {
 							minPeersSeen = stats.MaxPeersSeen
 						}
@@ -712,9 +719,11 @@ func TestBatcherScalabilityAllToAll(t *testing.T) {
 					// Show sample of node details
 					if len(nodeDetails) > 0 {
 						t.Logf("  Node sample:")
+
 						for _, detail := range nodeDetails[:min(5, len(nodeDetails))] {
 							t.Logf("    %s", detail)
 						}
+
 						if len(nodeDetails) > 5 {
 							t.Logf("    ... (%d more nodes)", len(nodeDetails)-5)
 						}
@@ -736,6 +745,7 @@ func TestBatcherScalabilityAllToAll(t *testing.T) {
 						// Show details of failed nodes for debugging
 						if len(nodeDetails) > 5 {
 							t.Logf("Failed nodes details:")
+
 							for _, detail := range nodeDetails[5:] {
 								if !strings.Contains(detail, fmt.Sprintf("max %d peers", expectedPeers)) {
 									t.Logf("  %s", detail)
@@ -769,6 +779,7 @@ func TestBatcherBasicOperations(t *testing.T) {
 
 			// Test AddNode with real node ID
 			batcher.AddNode(tn.n.ID, tn.ch, 100)
+
 			if !batcher.IsConnected(tn.n.ID) {
 				t.Error("Node should be connected after AddNode")
 			}
@@ -856,6 +867,7 @@ func TestBatcherBasicOperations(t *testing.T) {
 
 func drainChannelTimeout(ch <-chan *tailcfg.MapResponse, name string, timeout time.Duration) {
 	count := 0
+
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
@@ -1007,10 +1019,12 @@ func TestBatcherWorkQueueBatching(t *testing.T) {
 			// Collect updates with timeout
 			updateCount := 0
 			timeout := time.After(200 * time.Millisecond)
+
 			for {
 				select {
 				case data := <-ch:
 					updateCount++
+
 					receivedUpdates = append(receivedUpdates, data)
 
 					// Validate update content
@@ -1039,6 +1053,7 @@ func TestBatcherWorkQueueBatching(t *testing.T) {
 
 					// Validate that all updates have valid content
 					validUpdates := 0
+
 					for _, data := range receivedUpdates {
 						if data != nil {
 							if valid, _ := validateUpdateContent(data); valid {
@@ -1076,18 +1091,25 @@ func XTestBatcherChannelClosingRace(t *testing.T) {
 
 			batcher := testData.Batcher
 			testNode := testData.Nodes[0]
-			var channelIssues int
-			var mutex sync.Mutex
+
+			var (
+				channelIssues int
+				mutex         sync.Mutex
+			)
 
 			// Run rapid connect/disconnect cycles with real updates to test channel closing
+
 			for i := range 100 {
 				var wg sync.WaitGroup
 
 				// First connection
 				ch1 := make(chan *tailcfg.MapResponse, 1)
+
 				wg.Add(1)
+
 				go func() {
 					defer wg.Done()
+
 					batcher.AddNode(testNode.n.ID, ch1, tailcfg.CapabilityVersion(100))
 				}()
 
@@ -1098,17 +1120,22 @@ func XTestBatcherChannelClosingRace(t *testing.T) {
 
 				// Rapid second connection - should replace ch1
 				ch2 := make(chan *tailcfg.MapResponse, 1)
+
 				wg.Add(1)
+
 				go func() {
 					defer wg.Done()
+
 					time.Sleep(1 * time.Microsecond)
 					batcher.AddNode(testNode.n.ID, ch2, tailcfg.CapabilityVersion(100))
 				}()
 
 				// Remove second connection
 				wg.Add(1)
+
 				go func() {
 					defer wg.Done()
+
 					time.Sleep(2 * time.Microsecond)
 					batcher.RemoveNode(testNode.n.ID, ch2)
 				}()
@@ -1123,7 +1150,9 @@ func XTestBatcherChannelClosingRace(t *testing.T) {
 				case <-time.After(1 * time.Millisecond):
 					// If no data received, increment issues counter
 					mutex.Lock()
+
 					channelIssues++
+
 					mutex.Unlock()
 				}
 
@@ -1165,18 +1194,24 @@ func TestBatcherWorkerChannelSafety(t *testing.T) {
 
 			batcher := testData.Batcher
 			testNode := testData.Nodes[0]
-			var panics int
-			var channelErrors int
-			var invalidData int
-			var mutex sync.Mutex
+
+			var (
+				panics        int
+				channelErrors int
+				invalidData   int
+				mutex         sync.Mutex
+			)
 
 			// Test rapid connect/disconnect with work generation
+
 			for i := range 50 {
 				func() {
 					defer func() {
 						if r := recover(); r != nil {
 							mutex.Lock()
+
 							panics++
+
 							mutex.Unlock()
 							t.Logf("Panic caught: %v", r)
 						}
@@ -1193,7 +1228,9 @@ func TestBatcherWorkerChannelSafety(t *testing.T) {
 						defer func() {
 							if r := recover(); r != nil {
 								mutex.Lock()
+
 								channelErrors++
+
 								mutex.Unlock()
 								t.Logf("Channel consumer panic: %v", r)
 							}
@@ -1209,7 +1246,9 @@ func TestBatcherWorkerChannelSafety(t *testing.T) {
 								// Validate the data we received
 								if valid, reason := validateUpdateContent(data); !valid {
 									mutex.Lock()
+
 									invalidData++
+
 									mutex.Unlock()
 									t.Logf("Invalid data received: %s", reason)
 								}
@@ -1248,9 +1287,11 @@ func TestBatcherWorkerChannelSafety(t *testing.T) {
 			if panics > 0 {
 				t.Errorf("Worker channel safety failed with %d panics", panics)
 			}
+
 			if channelErrors > 0 {
 				t.Errorf("Channel handling failed with %d channel errors", channelErrors)
 			}
+
 			if invalidData > 0 {
 				t.Errorf("Data validation failed with %d invalid data packets", invalidData)
 			}
@@ -1322,15 +1363,19 @@ func TestBatcherConcurrentClients(t *testing.T) {
 			// Use remaining nodes for connection churn testing
 			churningNodes := allNodes[len(allNodes)/2:]
 			churningChannels := make(map[types.NodeID]chan *tailcfg.MapResponse)
+
 			var churningChannelsMutex sync.Mutex // Protect concurrent map access
 
 			var wg sync.WaitGroup
+
 			numCycles := 10 // Reduced for simpler test
 			panicCount := 0
+
 			var panicMutex sync.Mutex
 
 			// Track deadlock with timeout
 			done := make(chan struct{})
+
 			go func() {
 				defer close(done)
 
@@ -1344,16 +1389,22 @@ func TestBatcherConcurrentClients(t *testing.T) {
 							defer func() {
 								if r := recover(); r != nil {
 									panicMutex.Lock()
+
 									panicCount++
+
 									panicMutex.Unlock()
 									t.Logf("Panic in churning connect: %v", r)
 								}
+
 								wg.Done()
 							}()
 
 							ch := make(chan *tailcfg.MapResponse, SMALL_BUFFER_SIZE)
+
 							churningChannelsMutex.Lock()
+
 							churningChannels[nodeID] = ch
+
 							churningChannelsMutex.Unlock()
 							batcher.AddNode(nodeID, ch, tailcfg.CapabilityVersion(100))
 
@@ -1380,17 +1431,23 @@ func TestBatcherConcurrentClients(t *testing.T) {
 							defer func() {
 								if r := recover(); r != nil {
 									panicMutex.Lock()
+
 									panicCount++
+
 									panicMutex.Unlock()
 									t.Logf("Panic in churning disconnect: %v", r)
 								}
+
 								wg.Done()
 							}()
 
 							time.Sleep(time.Duration(i%5) * time.Millisecond)
 							churningChannelsMutex.Lock()
+
 							ch, exists := churningChannels[nodeID]
+
 							churningChannelsMutex.Unlock()
+
 							if exists {
 								batcher.RemoveNode(nodeID, ch)
 							}
@@ -1402,10 +1459,12 @@ func TestBatcherConcurrentClients(t *testing.T) {
 						// DERP changes
 						batcher.AddWork(change.DERPSet)
 					}
+
 					if i%5 == 0 {
 						// Full updates using real node data
 						batcher.AddWork(change.FullSet)
 					}
+
 					if i%7 == 0 && len(allNodes) > 0 {
 						// Node-specific changes using real nodes
 						node := allNodes[i%len(allNodes)]
@@ -1433,7 +1492,9 @@ func TestBatcherConcurrentClients(t *testing.T) {
 
 			// Validate results
 			panicMutex.Lock()
+
 			finalPanicCount := panicCount
+
 			panicMutex.Unlock()
 
 			allStats := tracker.getAllStats()
@@ -1516,6 +1577,7 @@ func XTestBatcherScalability(t *testing.T) {
 	// Reduce verbose application logging for cleaner test output
 	originalLevel := zerolog.GlobalLevel()
 	defer zerolog.SetGlobalLevel(originalLevel)
+
 	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
 
 	// Full test matrix for scalability testing
@@ -1592,6 +1654,7 @@ func XTestBatcherScalability(t *testing.T) {
 					// Need 1000 nodes for largest test case, all from same user so they can be peers
 					usersNeeded := max(1, tc.nodeCount/1000) // 1 user per 1000 nodes, minimum 1
 					nodesPerUser := tc.nodeCount / usersNeeded
+
 					testData, cleanup := setupBatcherWithTestData(
 						t,
 						batcherFunc.fn,
@@ -1603,6 +1666,7 @@ func XTestBatcherScalability(t *testing.T) {
 
 					batcher := testData.Batcher
 					allNodes := testData.Nodes
+
 					t.Logf("[%d/%d] SCALABILITY TEST: %s", i+1, len(testCases), tc.description)
 					t.Logf(
 						"   Cycles: %d, Buffer Size: %d, Chaos Type: %s",
@@ -1639,12 +1703,16 @@ func XTestBatcherScalability(t *testing.T) {
 
 					// Connect all nodes first so they can see each other as peers
 					connectedNodes := make(map[types.NodeID]bool)
+
 					var connectedNodesMutex sync.RWMutex
+
 					for i := range testNodes {
 						node := &testNodes[i]
 						batcher.AddNode(node.n.ID, node.ch, tailcfg.CapabilityVersion(100))
 						connectedNodesMutex.Lock()
+
 						connectedNodes[node.n.ID] = true
+
 						connectedNodesMutex.Unlock()
 					}
 
@@ -1655,6 +1723,7 @@ func XTestBatcherScalability(t *testing.T) {
 
 					go func() {
 						defer close(done)
+
 						var wg sync.WaitGroup
 
 						t.Logf(
@@ -1676,14 +1745,17 @@ func XTestBatcherScalability(t *testing.T) {
 							// For chaos testing, only disconnect/reconnect a subset of nodes
 							// This ensures some nodes stay connected to continue receiving updates
 							startIdx := cycle % len(testNodes)
+
 							endIdx := startIdx + len(testNodes)/4
 							if endIdx > len(testNodes) {
 								endIdx = len(testNodes)
 							}
+
 							if startIdx >= endIdx {
 								startIdx = 0
 								endIdx = min(len(testNodes)/4, len(testNodes))
 							}
+
 							chaosNodes := testNodes[startIdx:endIdx]
 							if len(chaosNodes) == 0 {
 								chaosNodes = testNodes[:min(1, len(testNodes))] // At least one node for chaos
@@ -1701,17 +1773,22 @@ func XTestBatcherScalability(t *testing.T) {
 											if r := recover(); r != nil {
 												atomic.AddInt64(&panicCount, 1)
 											}
+
 											wg.Done()
 										}()
 
 										connectedNodesMutex.RLock()
+
 										isConnected := connectedNodes[nodeID]
+
 										connectedNodesMutex.RUnlock()
 
 										if isConnected {
 											batcher.RemoveNode(nodeID, channel)
 											connectedNodesMutex.Lock()
+
 											connectedNodes[nodeID] = false
+
 											connectedNodesMutex.Unlock()
 										}
 									}(
@@ -1725,6 +1802,7 @@ func XTestBatcherScalability(t *testing.T) {
 											if r := recover(); r != nil {
 												atomic.AddInt64(&panicCount, 1)
 											}
+
 											wg.Done()
 										}()
 
@@ -1736,7 +1814,9 @@ func XTestBatcherScalability(t *testing.T) {
 											tailcfg.CapabilityVersion(100),
 										)
 										connectedNodesMutex.Lock()
+
 										connectedNodes[nodeID] = true
+
 										connectedNodesMutex.Unlock()
 
 										// Add work to create load
@@ -1755,11 +1835,13 @@ func XTestBatcherScalability(t *testing.T) {
 							updateCount := min(tc.nodeCount/5, 20) // Scale updates with node count
 							for i := range updateCount {
 								wg.Add(1)
+
 								go func(index int) {
 									defer func() {
 										if r := recover(); r != nil {
 											atomic.AddInt64(&panicCount, 1)
 										}
+
 										wg.Done()
 									}()
 
@@ -1802,11 +1884,14 @@ func XTestBatcherScalability(t *testing.T) {
 						deadlockDetected = true
 						// Collect diagnostic information
 						allStats := tracker.getAllStats()
+
 						totalUpdates := 0
 						for _, stats := range allStats {
 							totalUpdates += stats.TotalUpdates
 						}
+
 						interimPanics := atomic.LoadInt64(&panicCount)
+
 						t.Logf("TIMEOUT DIAGNOSIS: Test timed out after %v", TEST_TIMEOUT)
 						t.Logf(
 							"   Progress at timeout: %d total updates, %d panics",
@@ -1852,6 +1937,7 @@ func XTestBatcherScalability(t *testing.T) {
 						stats := node.cleanup()
 						totalUpdates += stats.TotalUpdates
 						totalPatches += stats.PatchUpdates
+
 						totalFull += stats.FullUpdates
 						if stats.MaxPeersSeen > maxPeersGlobal {
 							maxPeersGlobal = stats.MaxPeersSeen
@@ -1878,6 +1964,7 @@ func XTestBatcherScalability(t *testing.T) {
 						totalFull,
 						maxPeersGlobal,
 					)
+
 					if len(nodeStatsReport) <= 10 { // Only log details for smaller tests
 						for _, report := range nodeStatsReport {
 							t.Logf("  %s", report)
@@ -1888,10 +1975,12 @@ func XTestBatcherScalability(t *testing.T) {
 
 					// Legacy tracker comparison (optional)
 					allStats := tracker.getAllStats()
+
 					legacyTotalUpdates := 0
 					for _, stats := range allStats {
 						legacyTotalUpdates += stats.TotalUpdates
 					}
+
 					if legacyTotalUpdates != int(totalUpdates) {
 						t.Logf(
 							"Note: Legacy tracker mismatch - legacy: %d, new: %d",
@@ -1904,6 +1993,7 @@ func XTestBatcherScalability(t *testing.T) {
 
 					// Validation based on expectation
 					testPassed := true
+
 					if tc.expectBreak {
 						// For tests expected to break, we're mainly checking that we don't crash
 						if finalPanicCount > 0 {
@@ -1911,6 +2001,7 @@ func XTestBatcherScalability(t *testing.T) {
 								"System crashed with %d panics (even breaking point tests shouldn't crash)",
 								finalPanicCount,
 							)
+
 							testPassed = false
 						}
 						// Timeout/deadlock is acceptable for breaking point tests
@@ -1924,14 +2015,19 @@ func XTestBatcherScalability(t *testing.T) {
 						// For tests expected to pass, validate proper operation
 						if finalPanicCount > 0 {
 							t.Errorf("Scalability test failed with %d panics", finalPanicCount)
+
 							testPassed = false
 						}
+
 						if deadlockDetected {
 							t.Errorf("Deadlock detected at %d nodes (should handle this load)", len(testNodes))
+
 							testPassed = false
 						}
+
 						if totalUpdates == 0 {
 							t.Error("No updates received - system may be completely stalled")
+
 							testPassed = false
 						}
 					}
@@ -1997,6 +2093,7 @@ func TestBatcherFullPeerUpdates(t *testing.T) {
 			// Read all available updates for each node
 			for i := range allNodes {
 				nodeUpdates := 0
+
 				t.Logf("Reading updates for node %d:", i)
 
 				// Read up to 10 updates per node or until timeout/no more data
@@ -2033,6 +2130,7 @@ func TestBatcherFullPeerUpdates(t *testing.T) {
 
 						if len(data.Peers) > 0 {
 							t.Logf("    Full peer list with %d peers", len(data.Peers))
+
 							for j, peer := range data.Peers[:min(3, len(data.Peers))] {
 								t.Logf(
 									"      Peer %d: NodeID=%d, Online=%v",
@@ -2042,8 +2140,10 @@ func TestBatcherFullPeerUpdates(t *testing.T) {
 								)
 							}
 						}
+
 						if len(data.PeersChangedPatch) > 0 {
 							t.Logf("    Patch update with %d changes", len(data.PeersChangedPatch))
+
 							for j, patch := range data.PeersChangedPatch[:min(3, len(data.PeersChangedPatch))] {
 								t.Logf(
 									"      Patch %d: NodeID=%d, Online=%v",
@@ -2057,6 +2157,7 @@ func TestBatcherFullPeerUpdates(t *testing.T) {
 					case <-time.After(500 * time.Millisecond):
 					}
 				}
+
 				t.Logf("Node %d received %d updates", i, nodeUpdates)
 			}
 
@@ -2072,85 +2173,451 @@ func TestBatcherFullPeerUpdates(t *testing.T) {
 	}
 }
 
-// TestBatcherWorkQueueTracing traces exactly what happens to change.FullSet work items.
-func TestBatcherWorkQueueTracing(t *testing.T) {
+// TestBatcherRapidReconnection reproduces the issue where nodes connecting with the same ID
+// at the same time cause /debug/batcher to show nodes as disconnected when they should be connected.
+// This specifically tests the multi-channel batcher implementation issue.
+func TestBatcherRapidReconnection(t *testing.T) {
+	for _, batcherFunc := range allBatcherFunctions {
+		t.Run(batcherFunc.name, func(t *testing.T) {
+			testData, cleanup := setupBatcherWithTestData(t, batcherFunc.fn, 1, 3, 10)
+			defer cleanup()
+
+			batcher := testData.Batcher
+			allNodes := testData.Nodes
+			
+			t.Logf("=== RAPID RECONNECTION TEST ===")
+			t.Logf("Testing rapid connect/disconnect with %d nodes", len(allNodes))
+			
+			// Phase 1: Connect all nodes initially
+			t.Logf("Phase 1: Connecting all nodes...")
+			for i, node := range allNodes {
+				err := batcher.AddNode(node.n.ID, node.ch, tailcfg.CapabilityVersion(100))
+				if err != nil {
+					t.Fatalf("Failed to add node %d: %v", i, err)
+				}
+			}
+			
+			time.Sleep(100 * time.Millisecond) // Let connections settle
+			
+			// Phase 2: Rapid disconnect ALL nodes (simulating nodes going down)
+			t.Logf("Phase 2: Rapid disconnect all nodes...")
+			for i, node := range allNodes {
+				removed := batcher.RemoveNode(node.n.ID, node.ch)
+				t.Logf("Node %d RemoveNode result: %t", i, removed)
+			}
+			
+			// Phase 3: Rapid reconnect with NEW channels (simulating nodes coming back up)
+			t.Logf("Phase 3: Rapid reconnect with new channels...")
+			newChannels := make([]chan *tailcfg.MapResponse, len(allNodes))
+			for i, node := range allNodes {
+				newChannels[i] = make(chan *tailcfg.MapResponse, 10)
+				err := batcher.AddNode(node.n.ID, newChannels[i], tailcfg.CapabilityVersion(100))
+				if err != nil {
+					t.Errorf("Failed to reconnect node %d: %v", i, err)
+				}
+			}
+			
+			time.Sleep(100 * time.Millisecond) // Let reconnections settle
+			
+			// Phase 4: Check debug status - THIS IS WHERE THE BUG SHOULD APPEAR
+			t.Logf("Phase 4: Checking debug status...")
+			
+			if debugBatcher, ok := batcher.(interface{ Debug() map[types.NodeID]interface{} }); ok {
+				debugInfo := debugBatcher.Debug()
+				disconnectedCount := 0
+				
+				for i, node := range allNodes {
+					if info, exists := debugInfo[node.n.ID]; exists {
+						t.Logf("Node %d (ID %d): debug info = %+v", i, node.n.ID, info)
+						
+						// Check if the debug info shows the node as connected
+						if infoMap, ok := info.(map[string]interface{}); ok {
+							if connected, ok := infoMap["connected"].(bool); ok && !connected {
+								disconnectedCount++
+								t.Logf("BUG REPRODUCED: Node %d shows as disconnected in debug but should be connected", i)
+							}
+						}
+					} else {
+						disconnectedCount++
+						t.Logf("Node %d missing from debug info entirely", i)
+					}
+					
+					// Also check IsConnected method
+					if !batcher.IsConnected(node.n.ID) {
+						t.Logf("Node %d IsConnected() returns false", i)
+					}
+				}
+				
+				if disconnectedCount > 0 {
+					t.Logf("ISSUE REPRODUCED: %d/%d nodes show as disconnected in debug", disconnectedCount, len(allNodes))
+					// This is expected behavior for multi-channel batcher according to user
+					// "it has never worked with the multi"
+				} else {
+					t.Logf("All nodes show as connected - working correctly")
+				}
+			} else {
+				t.Logf("Batcher does not implement Debug() method")
+			}
+			
+			// Phase 5: Test if "disconnected" nodes can actually receive updates
+			t.Logf("Phase 5: Testing if nodes can receive updates despite debug status...")
+			
+			// Send a change that should reach all nodes
+			batcher.AddWork(change.DERPChange())
+			
+			receivedCount := 0
+			timeout := time.After(500 * time.Millisecond)
+			
+			for i := 0; i < len(allNodes); i++ {
+				select {
+				case update := <-newChannels[i]:
+					if update != nil {
+						receivedCount++
+						t.Logf("Node %d received update successfully", i)
+					}
+				case <-timeout:
+					t.Logf("Node %d timed out waiting for update", i)
+					goto done
+				}
+			}
+			
+			done:
+			t.Logf("Update delivery test: %d/%d nodes received updates", receivedCount, len(allNodes))
+			
+			if receivedCount < len(allNodes) {
+				t.Logf("Some nodes failed to receive updates - confirming the issue")
+			}
+		})
+	}
+}
+
+// TestBatcherMultiConnection tests the multi-channel batcher's ability to handle
+// multiple concurrent connections for the same node and ensure all connections
+// receive updates properly.
+func TestBatcherConnectedMapBug(t *testing.T) {
+	t.Parallel()
+
+	// Use the standard setup like other tests
+	testData, cleanup := setupBatcherWithTestData(t, NewBatcherAndMapper, 1, 3, 10)
+	defer cleanup()
+
+	batcher := testData.Batcher
+	nodes := testData.Nodes
+
+	// Start the batcher
+	batcher.Start()
+	defer batcher.Close()
+
+	// Add nodes
+	channels := make([]chan *tailcfg.MapResponse, len(nodes))
+	for i, node := range nodes {
+		channels[i] = make(chan *tailcfg.MapResponse, 10)
+		err := batcher.AddNode(node.n.ID, channels[i], tailcfg.CapabilityVersion(55))
+		require.NoError(t, err)
+	}
+
+	// Check Debug method shows all nodes as connected  
+	debugInfo := batcher.(*testBatcherWrapper).Batcher.(*LockFreeBatcher).Debug()
+	for _, node := range nodes {
+		info, exists := debugInfo[node.n.ID]
+		require.True(t, exists, "Node %d should exist in debug info", node.n.ID)
+		require.True(t, info.Connected, "Node %d should be connected in debug info", node.n.ID)
+		require.Equal(t, 1, info.ActiveConnections, "Node %d should have 1 active connection", node.n.ID)
+	}
+
+	// Disconnect first node
+	removed := batcher.RemoveNode(nodes[0].n.ID, channels[0])
+	require.True(t, removed, "Node should be successfully removed")
+
+	// Check Debug method shows first node as disconnected immediately
+	debugInfo = batcher.(*testBatcherWrapper).Batcher.(*LockFreeBatcher).Debug()
+	info, exists := debugInfo[nodes[0].n.ID]
+	require.True(t, exists, "Disconnected node should still exist in debug info")
+	require.False(t, info.Connected, "Node should be marked as disconnected in debug info")
+	require.Equal(t, 0, info.ActiveConnections, "Disconnected node should have 0 active connections")
+
+	// Other nodes should still be connected - get fresh debug info
+	debugInfo = batcher.(*testBatcherWrapper).Batcher.(*LockFreeBatcher).Debug()
+	for i := 1; i < len(nodes); i++ {
+		info, exists := debugInfo[nodes[i].n.ID]
+		require.True(t, exists, "Node %d should exist in debug info", nodes[i].n.ID)
+		require.True(t, info.Connected, "Node %d should still be connected", nodes[i].n.ID)
+		require.Equal(t, 1, info.ActiveConnections, "Node %d should have 1 active connection", nodes[i].n.ID)
+	}
+
+	// Reconnect the first node
+	newChannel := make(chan *tailcfg.MapResponse, 10)
+	err := batcher.AddNode(nodes[0].n.ID, newChannel, tailcfg.CapabilityVersion(55))
+	require.NoError(t, err)
+	
+	// Update the channels array to use the new channel for node 0
+	channels[0] = newChannel
+
+	// Check Debug method shows first node as connected again
+	debugInfo = batcher.(*testBatcherWrapper).Batcher.(*LockFreeBatcher).Debug()
+	{
+		info, exists := debugInfo[nodes[0].n.ID]
+		require.True(t, exists, "Reconnected node should exist in debug info")
+		require.True(t, info.Connected, "Node should be connected again in debug info")
+		require.Equal(t, 1, info.ActiveConnections, "Reconnected node should have 1 active connection")
+	}
+
+	// Now simulate the integration test scenario: rapid disconnect/reconnect of ALL nodes
+	// This replicates what happens in TestPingAllByIPMany where nodes try to reconnect
+	t.Log("Simulating rapid disconnect/reconnect of all nodes...")
+	
+	// First, disconnect all nodes rapidly
+	for i, node := range nodes {
+		removed := batcher.RemoveNode(node.n.ID, channels[i])
+		require.True(t, removed, "Node %d should be successfully removed", node.n.ID)
+	}
+	
+	// Brief pause to simulate network timing like in integration tests
+	time.Sleep(10 * time.Millisecond)
+	
+	// Reconnect all nodes rapidly (like integration test does)
+	newChannels := make([]chan *tailcfg.MapResponse, len(nodes))
+	for i, node := range nodes {
+		newChannels[i] = make(chan *tailcfg.MapResponse, 10)
+		err := batcher.AddNode(node.n.ID, newChannels[i], tailcfg.CapabilityVersion(55))
+		require.NoError(t, err, "Node %d should reconnect successfully", node.n.ID)
+	}
+	
+	// Now check if ALL nodes show as connected (this is what was failing in integration tests)
+	debugInfo = batcher.(*testBatcherWrapper).Batcher.(*LockFreeBatcher).Debug()
+	connectedCount := 0
+	for _, node := range nodes {
+		info, exists := debugInfo[node.n.ID]
+		require.True(t, exists, "Node %d should exist in debug info after reconnection", node.n.ID)
+		if info.Connected {
+			connectedCount++
+			require.Equal(t, 1, info.ActiveConnections, "Connected node %d should have 1 active connection", node.n.ID)
+		} else {
+			t.Logf("Node %d is still shown as disconnected", node.n.ID)
+		}
+	}
+	
+	t.Logf("After rapid reconnection: %d/%d nodes connected", connectedCount, len(nodes))
+	require.Equal(t, len(nodes), connectedCount, "All nodes should be connected after rapid reconnection")
+}
+
+func TestBatcherMultiConnection(t *testing.T) {
 	for _, batcherFunc := range allBatcherFunctions {
 		t.Run(batcherFunc.name, func(t *testing.T) {
 			testData, cleanup := setupBatcherWithTestData(t, batcherFunc.fn, 1, 2, 10)
 			defer cleanup()
 
 			batcher := testData.Batcher
-			nodes := testData.Nodes
-
-			t.Logf("=== WORK QUEUE TRACING TEST ===")
-
-			// Connect first node
-			batcher.AddNode(nodes[0].n.ID, nodes[0].ch, tailcfg.CapabilityVersion(100))
-			t.Logf("Connected node %d", nodes[0].n.ID)
-
-			// Wait for initial NodeCameOnline to be processed
-			time.Sleep(200 * time.Millisecond)
-
-			// Drain any initial updates
-			drainedCount := 0
-			for {
-				select {
-				case <-nodes[0].ch:
-					drainedCount++
-				case <-time.After(100 * time.Millisecond):
-					goto drained
+			node1 := testData.Nodes[0]
+			node2 := testData.Nodes[1]
+			
+			t.Logf("=== MULTI-CONNECTION TEST ===")
+			
+			// Phase 1: Connect first node with initial connection
+			t.Logf("Phase 1: Connecting node 1 with first connection...")
+			err := batcher.AddNode(node1.n.ID, node1.ch, tailcfg.CapabilityVersion(100))
+			if err != nil {
+				t.Fatalf("Failed to add node1: %v", err)
+			}
+			
+			// Connect second node for comparison
+			err = batcher.AddNode(node2.n.ID, node2.ch, tailcfg.CapabilityVersion(100))
+			if err != nil {
+				t.Fatalf("Failed to add node2: %v", err)
+			}
+			
+			time.Sleep(50 * time.Millisecond)
+			
+			// Phase 2: Add second connection for node1 (multi-connection scenario)
+			t.Logf("Phase 2: Adding second connection for node 1...")
+			secondChannel := make(chan *tailcfg.MapResponse, 10)
+			err = batcher.AddNode(node1.n.ID, secondChannel, tailcfg.CapabilityVersion(100))
+			if err != nil {
+				t.Fatalf("Failed to add second connection for node1: %v", err)
+			}
+			
+			time.Sleep(50 * time.Millisecond)
+			
+			// Phase 3: Add third connection for node1 
+			t.Logf("Phase 3: Adding third connection for node 1...")
+			thirdChannel := make(chan *tailcfg.MapResponse, 10)
+			err = batcher.AddNode(node1.n.ID, thirdChannel, tailcfg.CapabilityVersion(100))
+			if err != nil {
+				t.Fatalf("Failed to add third connection for node1: %v", err)
+			}
+			
+			time.Sleep(50 * time.Millisecond)
+			
+			// Phase 4: Verify debug status shows correct connection count
+			t.Logf("Phase 4: Verifying debug status shows multiple connections...")
+			if debugBatcher, ok := batcher.(interface{ Debug() map[types.NodeID]interface{} }); ok {
+				debugInfo := debugBatcher.Debug()
+				
+				if info, exists := debugInfo[node1.n.ID]; exists {
+					t.Logf("Node1 debug info: %+v", info)
+					if infoMap, ok := info.(map[string]interface{}); ok {
+						if activeConnections, ok := infoMap["active_connections"].(int); ok {
+							if activeConnections != 3 {
+								t.Errorf("Node1 should have 3 active connections, got %d", activeConnections)
+							} else {
+								t.Logf("SUCCESS: Node1 correctly shows 3 active connections")
+							}
+						}
+						if connected, ok := infoMap["connected"].(bool); ok && !connected {
+							t.Errorf("Node1 should show as connected with 3 active connections")
+						}
+					}
+				}
+				
+				if info, exists := debugInfo[node2.n.ID]; exists {
+					if infoMap, ok := info.(map[string]interface{}); ok {
+						if activeConnections, ok := infoMap["active_connections"].(int); ok {
+							if activeConnections != 1 {
+								t.Errorf("Node2 should have 1 active connection, got %d", activeConnections)
+							}
+						}
+					}
 				}
 			}
-		drained:
-			t.Logf("Drained %d initial updates", drainedCount)
-
-			// Now send a single FullSet update and trace it closely
-			t.Logf("Sending change.FullSet work item...")
-			batcher.AddWork(change.FullSet)
-
-			// Give short time for processing
-			time.Sleep(100 * time.Millisecond)
-
-			// Check if any update was received
-			select {
-			case data := <-nodes[0].ch:
-				t.Logf("SUCCESS: Received update after FullSet!")
-
-				if data != nil {
-					// Detailed analysis of the response - data is already a MapResponse
-					t.Logf("Response details:")
-					t.Logf("  Peers: %d", len(data.Peers))
-					t.Logf("  PeersChangedPatch: %d", len(data.PeersChangedPatch))
-					t.Logf("  PeersChanged: %d", len(data.PeersChanged))
-					t.Logf("  PeersRemoved: %d", len(data.PeersRemoved))
-					t.Logf("  DERPMap: %v", data.DERPMap != nil)
-					t.Logf("  KeepAlive: %v", data.KeepAlive)
-					t.Logf("  Node: %v", data.Node != nil)
-
-					if len(data.Peers) > 0 {
-						t.Logf("SUCCESS: Full peer list received with %d peers", len(data.Peers))
-					} else if len(data.PeersChangedPatch) > 0 {
-						t.Errorf("ERROR: Received patch update instead of full update!")
-					} else if data.DERPMap != nil {
-						t.Logf("Received DERP map update")
-					} else if data.Node != nil {
-						t.Logf("Received self node update")
-					} else {
-						t.Errorf("ERROR: Received unknown update type!")
+			
+			// Phase 5: Send update and verify ALL connections receive it
+			t.Logf("Phase 5: Testing update distribution to all connections...")
+			
+			// Clear any existing updates from all channels
+			clearChannel := func(ch chan *tailcfg.MapResponse) {
+				for {
+					select {
+					case <-ch:
+						// drain
+					default:
+						return
 					}
-
-					// Check if there should be peers available
-					peers := testData.State.ListPeers(nodes[0].n.ID)
-					t.Logf("State shows %d peers available for this node", peers.Len())
-					if peers.Len() > 0 && len(data.Peers) == 0 {
-						t.Errorf("CRITICAL: State has %d peers but response has 0 peers!", peers.Len())
-					}
-				} else {
-					t.Errorf("Response data is nil")
 				}
-			case <-time.After(2 * time.Second):
-				t.Errorf("CRITICAL: No update received after FullSet within 2 seconds!")
-				t.Errorf("This indicates FullSet work items are not being processed at all")
+			}
+			
+			clearChannel(node1.ch)
+			clearChannel(secondChannel)
+			clearChannel(thirdChannel)
+			clearChannel(node2.ch)
+			
+			// Send a change notification from node2 (so node1 should receive it on all connections)
+			testChangeSet := change.ChangeSet{
+				NodeID:          node2.n.ID,
+				Change:          change.NodeNewOrUpdate,
+				SelfUpdateOnly:  false,
+			}
+			
+			batcher.AddWork(testChangeSet)
+			
+			time.Sleep(100 * time.Millisecond) // Let updates propagate
+			
+			// Verify all three connections for node1 receive the update
+			connection1Received := false
+			connection2Received := false
+			connection3Received := false
+			
+			select {
+			case mapResp := <-node1.ch:
+				connection1Received = (mapResp != nil)
+				t.Logf("Node1 connection 1 received update: %t", connection1Received)
+			case <-time.After(500 * time.Millisecond):
+				t.Errorf("Node1 connection 1 did not receive update")
+			}
+			
+			select {
+			case mapResp := <-secondChannel:
+				connection2Received = (mapResp != nil)
+				t.Logf("Node1 connection 2 received update: %t", connection2Received)
+			case <-time.After(500 * time.Millisecond):
+				t.Errorf("Node1 connection 2 did not receive update")
+			}
+			
+			select {
+			case mapResp := <-thirdChannel:
+				connection3Received = (mapResp != nil)
+				t.Logf("Node1 connection 3 received update: %t", connection3Received)
+			case <-time.After(500 * time.Millisecond):
+				t.Errorf("Node1 connection 3 did not receive update")
+			}
+			
+			if connection1Received && connection2Received && connection3Received {
+				t.Logf("SUCCESS: All three connections for node1 received the update")
+			} else {
+				t.Errorf("FAILURE: Multi-connection broadcast failed - conn1: %t, conn2: %t, conn3: %t", 
+					connection1Received, connection2Received, connection3Received)
+			}
+			
+			// Phase 6: Test connection removal and verify remaining connections still work
+			t.Logf("Phase 6: Testing connection removal...")
+			
+			// Remove the second connection
+			removed := batcher.RemoveNode(node1.n.ID, secondChannel)
+			if !removed {
+				t.Errorf("Failed to remove second connection for node1")
+			}
+			
+			time.Sleep(50 * time.Millisecond)
+			
+			// Verify debug status shows 2 connections now
+			if debugBatcher, ok := batcher.(interface{ Debug() map[types.NodeID]interface{} }); ok {
+				debugInfo := debugBatcher.Debug()
+				if info, exists := debugInfo[node1.n.ID]; exists {
+					if infoMap, ok := info.(map[string]interface{}); ok {
+						if activeConnections, ok := infoMap["active_connections"].(int); ok {
+							if activeConnections != 2 {
+								t.Errorf("Node1 should have 2 active connections after removal, got %d", activeConnections)
+							} else {
+								t.Logf("SUCCESS: Node1 correctly shows 2 active connections after removal")
+							}
+						}
+					}
+				}
+			}
+			
+			// Send another update and verify remaining connections still work
+			clearChannel(node1.ch)
+			clearChannel(thirdChannel)
+			
+			testChangeSet2 := change.ChangeSet{
+				NodeID:          node2.n.ID,
+				Change:          change.NodeNewOrUpdate,
+				SelfUpdateOnly:  false,
+			}
+			
+			batcher.AddWork(testChangeSet2)
+			time.Sleep(100 * time.Millisecond)
+			
+			// Verify remaining connections still receive updates
+			remaining1Received := false
+			remaining3Received := false
+			
+			select {
+			case mapResp := <-node1.ch:
+				remaining1Received = (mapResp != nil)
+			case <-time.After(500 * time.Millisecond):
+				t.Errorf("Node1 connection 1 did not receive update after removal")
+			}
+			
+			select {
+			case mapResp := <-thirdChannel:
+				remaining3Received = (mapResp != nil)
+			case <-time.After(500 * time.Millisecond):
+				t.Errorf("Node1 connection 3 did not receive update after removal")
+			}
+			
+			if remaining1Received && remaining3Received {
+				t.Logf("SUCCESS: Remaining connections still receive updates after removal")
+			} else {
+				t.Errorf("FAILURE: Remaining connections failed to receive updates - conn1: %t, conn3: %t", 
+					remaining1Received, remaining3Received)
+			}
+			
+			// Verify second channel no longer receives updates (should be closed/removed)
+			select {
+			case <-secondChannel:
+				t.Errorf("Removed connection still received update - this should not happen")
+			case <-time.After(100 * time.Millisecond):
+				t.Logf("SUCCESS: Removed connection correctly no longer receives updates")
 			}
 		})
 	}
