@@ -7,6 +7,10 @@ before:
 
 release:
   prerelease: auto
+  footer: |
+    ## Upgrade notes
+
+    Please read the [upgrade documentation](https://headscale.net/stable/setup/upgrade/) before upgrading.
 
 builds:
   - id: headscale
