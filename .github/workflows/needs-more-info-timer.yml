@@ -11,7 +11,7 @@ on:
 
 jobs:
   manage-needs-more-info:
-    if: github.repository == 'juanfont/headscale'
+    if: github.repository == 'kradalby/headscale'
     runs-on: ubuntu-latest
     permissions:
       issues: write

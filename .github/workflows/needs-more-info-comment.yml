@@ -8,7 +8,7 @@ jobs:
   post-comment:
     if: >-
       github.event.label.name == 'needs-more-info' &&
-      github.repository == 'juanfont/headscale'
+      github.repository == 'kradalby/headscale'
     runs-on: ubuntu-latest
     permissions:
       issues: write
