@@ -24,6 +24,12 @@ import (
 // ErrUnsupportedClientVersion is returned when a client connects with an unsupported protocol version.
 var ErrUnsupportedClientVersion = errors.New("unsupported client version")
 
+// ErrMissingURLParameter is returned when a required URL parameter is not provided.
+var ErrMissingURLParameter = errors.New("missing URL parameter")
+
+// ErrUnsupportedURLParameterType is returned when a URL parameter has an unsupported type.
+var ErrUnsupportedURLParameterType = errors.New("unsupported URL parameter type")
+
 const (
 	// ts2021UpgradePath is the path that the server listens on for the WebSockets upgrade.
 	ts2021UpgradePath = "/ts2021"
@@ -116,7 +122,8 @@ func (h *Headscale) NoiseUpgradeHandler(
 		r.Post("/register", ns.RegistrationHandler)
 		r.Post("/map", ns.PollNetMapHandler)
 
-		r.Get("/ssh/action/from/{src_node_id}/to/{dst_node_id}/ssh_user/{ssh_user}/local_user/{local_user}", ns.SSHAction)
+		// SSH Check mode endpoint, consulted to validate if a given SSH connection should be accepted or rejected.
+		r.Get("/ssh/action/from/{src_node_id}/to/{dst_node_id}/ssh_user/{ssh_user}/local_user/{local_user}", ns.SSHActionHandler)
 
 		// Not implemented yet
 		//
@@ -243,20 +250,62 @@ func (ns *noiseServer) NotImplementedHandler(writer http.ResponseWriter, req *ht
 	http.Error(writer, "Not implemented yet", http.StatusNotImplemented)
 }
 
-// SSHAction handles the /ssh-action endpoint, it returns a [tailcfg.SSHAction]
+func urlParam[T any](req *http.Request, key string) (T, error) {
+	var zero T
+
+	param := chi.URLParam(req, key)
+	if param == "" {
+		return zero, fmt.Errorf("%w: %s", ErrMissingURLParameter, key)
+	}
+
+	var value T
+	switch any(value).(type) {
+	case string:
+		v, ok := any(param).(T)
+		if !ok {
+			return zero, fmt.Errorf("%w: %T", ErrUnsupportedURLParameterType, value)
+		}
+
+		value = v
+	default:
+		return zero, fmt.Errorf("%w: %T", ErrUnsupportedURLParameterType, value)
+	}
+
+	return value, nil
+}
+
+// SSHActionHandler handles the /ssh-action endpoint, it returns a [tailcfg.SSHActionHandler]
 // to the client with the verdict of an SSH access request.
-func (ns *noiseServer) SSHAction(writer http.ResponseWriter, req *http.Request) {
-	srcNodeID := chi.URLParam(req, "src_node_id")
-	dstNodeID := chi.URLParam(req, "dst_node_id")
-	sshUser := chi.URLParam(req, "ssh_user")
-	localUser := chi.URLParam(req, "local_user")
+func (ns *noiseServer) SSHActionHandler(writer http.ResponseWriter, req *http.Request) {
+	srcNodeID, _ := urlParam[types.NodeID](req, "src_node_id")
+	dstNodeID, _ := urlParam[types.NodeID](req, "dst_node_id")
+	sshUser, _ := urlParam[string](req, "ssh_user")
+	localUser, _ := urlParam[string](req, "local_user")
 	log.Trace().Caller().
 		Str("path", req.URL.String()).
-		Str("src_node_id", srcNodeID).
-		Str("dst_node_id", dstNodeID).
+		Uint64("src_node_id", srcNodeID.Uint64()).
+		Uint64("dst_node_id", dstNodeID.Uint64()).
 		Str("ssh_user", sshUser).
 		Str("local_user", localUser).
 		Msg("got SSH action request")
+
+	// First, we need to determine if this request has already been started, either:
+	// 1. It is a new request, and we need to create a new "Auth" flow session for it, or
+	// 2. It is a follow-up request for an already started "Auth" flow session, and we need to retrieve it and wait for the result.
+	//
+	// if 1.:
+	// We create a new "auth" flow session, which will work with one of our two auth methods:
+	//   - OIDC: Generate a link to the OIDC provider and get a waiting channel for the result.
+	//     The client will need to open that link and complete the OIDC flow, and then we'll get the result in the waiting channel.
+	//   - CLI: We generate a random code and get a waiting channel for the result. This will work like the web auth register.
+	//     An admin with access to the headscale CLI will have to "approve" it.
+	//     TODO: does it make sense to support CLI? will anyone use it?
+	// -> In both cases, respond with a [tailcfg.SSHAction] response with the link / code for authentication
+	//    and the message for the SSH prompt
+	//
+	// if 2.:
+	// we lookup the session for this request, and wait for the result in the waiting channel.
+	// -> When result comes in, send the [tailcfg.SSHAction] response with the verdict.
 
 	accept := tailcfg.SSHAction{
 		Reject:                    false,
