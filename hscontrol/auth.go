@@ -376,13 +376,6 @@ func (h *Headscale) handleRegisterWithAuthKey(
 	// Send both changes. Empty changes are ignored by Change().
 	h.Change(changed, routesChange)
 
-	// TODO(kradalby): I think this is covered above, but we need to validate that.
-	// // If policy changed due to node registration, send a separate policy change
-	// if policyChanged {
-	// 	policyChange := change.PolicyChange()
-	// 	h.Change(policyChange)
-	// }
-
 	resp := &tailcfg.RegisterResponse{
 		MachineAuthorized: true,
 		NodeKeyExpired:    node.IsExpired(),
