@@ -1476,7 +1476,7 @@ func TestSSHPolicyRules(t *testing.T) {
 
 				require.NoError(t, err)
 
-				got, err := pm.SSHPolicy(tt.targetNode.View())
+				got, err := pm.SSHPolicy("unused-url", tt.targetNode.View())
 				require.NoError(t, err)
 
 				if diff := cmp.Diff(tt.wantSSH, got); diff != "" {
