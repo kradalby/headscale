@@ -89,7 +89,7 @@ var createNodeCmd = &cobra.Command{
 			)
 		}
 
-		_, err = types.RegistrationIDFromString(registrationID)
+		_, err = types.AuthIDFromString(registrationID)
 		if err != nil {
 			ErrorOutput(
 				err,
