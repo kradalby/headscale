@@ -520,6 +520,23 @@ func (pol *Policy) compileSSHPolicy(
 		}
 	}
 
+	// Sort rules: check (HoldAndDelegate) before accept, per Tailscale
+	// evaluation order (most-restrictive first).
+	slices.SortStableFunc(rules, func(a, b *tailcfg.SSHRule) int {
+		aIsCheck := a.Action != nil && a.Action.HoldAndDelegate != ""
+
+		bIsCheck := b.Action != nil && b.Action.HoldAndDelegate != ""
+		if aIsCheck == bIsCheck {
+			return 0
+		}
+
+		if aIsCheck {
+			return -1
+		}
+
+		return 1
+	})
+
 	return &tailcfg.SSHPolicy{
 		Rules: rules,
 	}, nil

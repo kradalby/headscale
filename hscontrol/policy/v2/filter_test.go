@@ -712,6 +712,82 @@ func TestCompileSSHPolicy_CheckAction(t *testing.T) {
 	assert.Equal(t, 24*time.Hour, rule.Action.SessionDuration)
 }
 
+// TestCompileSSHPolicy_CheckBeforeAcceptOrdering verifies that check
+// (HoldAndDelegate) rules are sorted before accept rules, even when
+// the accept rule appears first in the policy definition.
+func TestCompileSSHPolicy_CheckBeforeAcceptOrdering(t *testing.T) {
+	users := types.Users{
+		{Name: "user1", Model: gorm.Model{ID: 1}},
+		{Name: "user2", Model: gorm.Model{ID: 2}},
+	}
+
+	nodeTaggedServer := types.Node{
+		Hostname: "tagged-server",
+		IPv4:     createAddr("100.64.0.1"),
+		UserID:   new(users[0].ID),
+		User:     new(users[0]),
+		Tags:     []string{"tag:server"},
+	}
+	nodeUser2 := types.Node{
+		Hostname: "user2-device",
+		IPv4:     createAddr("100.64.0.2"),
+		UserID:   new(users[1].ID),
+		User:     new(users[1]),
+	}
+
+	nodes := types.Nodes{&nodeTaggedServer, &nodeUser2}
+
+	// Accept rule appears BEFORE check rule in policy definition.
+	policy := &Policy{
+		TagOwners: TagOwners{
+			Tag("tag:server"): Owners{up("user1@")},
+		},
+		Groups: Groups{
+			Group("group:admins"): []Username{Username("user2@")},
+		},
+		SSHs: []SSH{
+			{
+				Action:       "accept",
+				Sources:      SSHSrcAliases{gp("group:admins")},
+				Destinations: SSHDstAliases{tp("tag:server")},
+				Users:        []SSHUser{"root"},
+			},
+			{
+				Action:       "check",
+				CheckPeriod:  model.Duration(24 * time.Hour),
+				Sources:      SSHSrcAliases{gp("group:admins")},
+				Destinations: SSHDstAliases{tp("tag:server")},
+				Users:        []SSHUser{"ssh-it-user"},
+			},
+		},
+	}
+
+	err := policy.validate()
+	require.NoError(t, err)
+
+	sshPolicy, err := policy.compileSSHPolicy(
+		"unused-server-url",
+		users,
+		nodeTaggedServer.View(),
+		nodes.ViewSlice(),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, sshPolicy)
+	require.Len(t, sshPolicy.Rules, 2)
+
+	// First rule must be the check rule (HoldAndDelegate set).
+	assert.NotEmpty(t, sshPolicy.Rules[0].Action.HoldAndDelegate,
+		"first rule should be check (HoldAndDelegate)")
+	assert.False(t, sshPolicy.Rules[0].Action.Accept,
+		"first rule should not be accept")
+
+	// Second rule must be the accept rule.
+	assert.True(t, sshPolicy.Rules[1].Action.Accept,
+		"second rule should be accept")
+	assert.Empty(t, sshPolicy.Rules[1].Action.HoldAndDelegate,
+		"second rule should not have HoldAndDelegate")
+}
+
 // TestSSHIntegrationReproduction reproduces the exact scenario from the integration test
 // TestSSHOneUserToAll that was failing with empty sshUsers.
 func TestSSHIntegrationReproduction(t *testing.T) {
