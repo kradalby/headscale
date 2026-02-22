@@ -470,7 +470,7 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 	}))
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
-	r.Use(middleware.Logger)
+	r.Use(middleware.RequestLogger(&zerologRequestLogger{}))
 	r.Use(middleware.Recoverer)
 
 	r.Post(ts2021UpgradePath, h.NoiseUpgradeHandler)
@@ -1092,4 +1092,53 @@ func (l *acmeLogger) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	return resp, nil
+}
+
+// zerologRequestLogger implements chi's middleware.LogFormatter
+// to route HTTP request logs through zerolog.
+type zerologRequestLogger struct{}
+
+func (z *zerologRequestLogger) NewLogEntry(
+	r *http.Request,
+) middleware.LogEntry {
+	return &zerologLogEntry{
+		method: r.Method,
+		path:   r.URL.Path,
+		proto:  r.Proto,
+		remote: r.RemoteAddr,
+	}
+}
+
+type zerologLogEntry struct {
+	method string
+	path   string
+	proto  string
+	remote string
+}
+
+func (e *zerologLogEntry) Write(
+	status, bytes int,
+	header http.Header,
+	elapsed time.Duration,
+	extra any,
+) {
+	log.Info().
+		Str("method", e.method).
+		Str("path", e.path).
+		Str("proto", e.proto).
+		Str("remote", e.remote).
+		Int("status", status).
+		Int("bytes", bytes).
+		Dur("elapsed", elapsed).
+		Msg("http request")
+}
+
+func (e *zerologLogEntry) Panic(
+	v any,
+	stack []byte,
+) {
+	log.Error().
+		Interface("panic", v).
+		Bytes("stack", stack).
+		Msg("http handler panic")
 }
