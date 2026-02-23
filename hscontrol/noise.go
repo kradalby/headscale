@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -302,7 +303,59 @@ func (ns *noiseServer) SSHActionHandler(writer http.ResponseWriter, req *http.Re
 	action.AllowLocalPortForwarding = true
 	action.AllowRemotePortForwarding = true
 
+	// Parse check params encoded in the URL by the compiled SSH policy.
+	checkPeriodStr := req.URL.Query().Get("check_period")
+	checkExplicitStr := req.URL.Query().Get("check_explicit")
+	checkExplicit := checkExplicitStr == "true"
+
+	var checkPeriod time.Duration
+
+	if checkPeriodStr != "" {
+		var err error
+
+		checkPeriod, err = time.ParseDuration(checkPeriodStr)
+		if err != nil {
+			log.Warn().Caller().Err(err).
+				Str("check_period", checkPeriodStr).
+				Msg("failed to parse check_period, ignoring")
+		}
+	}
+
 	if authIDStr == "" {
+		// Auto-approve: if the source node was recently authenticated within
+		// the check period, skip the HoldAndDelegate flow entirely.
+		if checkPeriod > 0 {
+			if lastAuth, ok := ns.headscale.state.SSHCheckAuthTime(
+				srcNodeID, dstNodeID, checkExplicit,
+			); ok {
+				if time.Since(lastAuth) < checkPeriod {
+					log.Trace().Caller().
+						Uint64("src_node_id", srcNodeID.Uint64()).
+						Uint64("dst_node_id", dstNodeID.Uint64()).
+						Dur("check_period", checkPeriod).
+						Bool("check_explicit", checkExplicit).
+						Time("last_auth", lastAuth).
+						Msg("SSH check auto-approved within check period")
+
+					action.Accept = true
+
+					writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+					writer.WriteHeader(http.StatusOK)
+
+					err := json.NewEncoder(writer).Encode(action)
+					if err != nil {
+						log.Error().Caller().Err(err).Msg("failed to encode SSH action response")
+					}
+
+					if flusher, ok := writer.(http.Flusher); ok {
+						flusher.Flush()
+					}
+
+					return
+				}
+			}
+		}
+
 		holdURL, err := url.Parse(ns.headscale.cfg.ServerURL + "/machine/ssh/action/from/$SRC_NODE_ID/to/$DST_NODE_ID?ssh_user=$SSH_USER&local_user=$LOCAL_USER")
 		if err != nil {
 			log.Error().Caller().Err(err).Msg("failed to parse SSH action URL")
@@ -325,6 +378,14 @@ func (ns *noiseServer) SSHActionHandler(writer http.ResponseWriter, req *http.Re
 
 		q := holdURL.Query()
 		q.Set("auth_id", authID.String())
+
+		// Carry check params through to the follow-up request so
+		// RecordSSHCheckAuth uses the correct scoping.
+		if checkPeriodStr != "" {
+			q.Set("check_period", checkPeriodStr)
+			q.Set("check_explicit", checkExplicitStr)
+		}
+
 		holdURL.RawQuery = q.Encode()
 
 		action.HoldAndDelegate = holdURL.String()
@@ -358,6 +419,18 @@ func (ns *noiseServer) SSHActionHandler(writer http.ResponseWriter, req *http.Re
 		if verdict.Accept() {
 			action.Reject = false
 			action.Accept = true
+
+			// Record the successful auth for future auto-approval.
+			ns.headscale.state.RecordSSHCheckAuth(
+				srcNodeID, dstNodeID, checkExplicit,
+			)
+
+			log.Trace().Caller().
+				Str("auth_id", authID.String()).
+				Uint64("src_node_id", srcNodeID.Uint64()).
+				Uint64("dst_node_id", dstNodeID.Uint64()).
+				Bool("check_explicit", checkExplicit).
+				Msg("SSH check auth recorded for auto-approval")
 		} else {
 			action.Reject = true
 			action.Accept = false
