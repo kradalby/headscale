@@ -327,7 +327,16 @@ var sshAccept = tailcfg.SSHAction{
 	AllowRemotePortForwarding: true,
 }
 
-func sshCheck(baseURL string, duration time.Duration) tailcfg.SSHAction {
+func sshCheck(baseURL string, duration time.Duration, explicit bool) tailcfg.SSHAction {
+	holdURL := baseURL + "/machine/ssh/action/from/$SRC_NODE_ID/to/$DST_NODE_ID?ssh_user=$SSH_USER&local_user=$LOCAL_USER"
+
+	holdURL += "&check_period=" + duration.String()
+	if explicit {
+		holdURL += "&check_explicit=true"
+	} else {
+		holdURL += "&check_explicit=false"
+	}
+
 	return tailcfg.SSHAction{
 		Reject:          false,
 		Accept:          false,
@@ -339,7 +348,7 @@ func sshCheck(baseURL string, duration time.Duration) tailcfg.SSHAction {
 		//   * $DST_NODE_ID (Node.ID as int64 string)
 		//   * $SSH_USER (URL escaped, ssh user requested)
 		//   * $LOCAL_USER (URL escaped, local user mapped)
-		HoldAndDelegate:           baseURL + "/machine/ssh/action/from/$SRC_NODE_ID/to/$DST_NODE_ID?ssh_user=$SSH_USER&local_user=$LOCAL_USER",
+		HoldAndDelegate:           holdURL,
 		AllowAgentForwarding:      true,
 		AllowLocalPortForwarding:  true,
 		AllowRemotePortForwarding: true,
@@ -396,7 +405,23 @@ func (pol *Policy) compileSSHPolicy(
 		case SSHActionAccept:
 			action = sshAccept
 		case SSHActionCheck:
-			action = sshCheck(baseURL, time.Duration(rule.CheckPeriod))
+			var (
+				dur      time.Duration
+				explicit bool
+			)
+
+			switch {
+			case rule.CheckPeriod == nil:
+				dur = SSHCheckPeriodDefault
+			case rule.CheckPeriod.Always:
+				dur = 0
+				explicit = true
+			default:
+				dur = rule.CheckPeriod.Duration
+				explicit = true
+			}
+
+			action = sshCheck(baseURL, dur, explicit)
 		default:
 			return nil, fmt.Errorf("parsing SSH policy, unknown action %q, index: %d: %w", rule.Action, index, err)
 		}

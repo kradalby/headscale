@@ -13,7 +13,6 @@ import (
 	"github.com/juanfont/headscale/integration/hsic"
 	"github.com/juanfont/headscale/integration/tsic"
 	"github.com/oauth2-proxy/mockoidc"
-	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
@@ -723,7 +722,7 @@ func sshCheckPolicyWithPeriod(period time.Duration) *policyv2.Policy {
 					new(policyv2.AutoGroupTagged),
 				},
 				Users:       []policyv2.SSHUser{policyv2.SSHUser("ssh-it-user")},
-				CheckPeriod: model.Duration(period),
+				CheckPeriod: &policyv2.SSHCheckPeriod{Duration: period},
 			},
 		},
 	}
@@ -1134,6 +1133,124 @@ func TestSSHCheckModeCheckPeriodCLI(t *testing.T) {
 				)
 			case <-time.After(30 * time.Second):
 				t.Fatal("second SSH did not complete after re-auth approval")
+			}
+		}
+	}
+}
+
+// TestSSHCheckModeAutoApprove verifies that after SSH check approval, a second
+// SSH within the checkPeriod is auto-approved without requiring manual approval.
+func TestSSHCheckModeAutoApprove(t *testing.T) {
+	IntegrationSkip(t)
+
+	// 5 minute checkPeriod — long enough not to expire during test
+	scenario := sshScenario(t, sshCheckPolicyWithPeriod(5*time.Minute), 1)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	allClients, err := scenario.ListTailscaleClients()
+	requireNoErrListClients(t, err)
+
+	user1Clients, err := scenario.ListTailscaleClients("user1")
+	requireNoErrListClients(t, err)
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	err = scenario.WaitForTailscaleSync()
+	requireNoErrSync(t, err)
+
+	_, err = scenario.ListTailscaleClientsFQDNs()
+	requireNoErrListFQDN(t, err)
+
+	// === Phase 1: First SSH check — approve, verify success ===
+	for _, client := range user1Clients {
+		for _, peer := range allClients {
+			if client.Hostname() == peer.Hostname() {
+				continue
+			}
+
+			sshResult := doSSHCheck(t, client, peer)
+			firstAuthID := findSSHCheckAuthID(t, headscale)
+
+			_, err := headscale.Execute(
+				[]string{
+					"headscale", "auth", "approve",
+					"--auth-id", firstAuthID,
+				},
+			)
+			require.NoError(t, err)
+
+			select {
+			case result := <-sshResult:
+				require.NoError(t, result.err, "first SSH should succeed after approval")
+				require.Contains(
+					t,
+					peer.ContainerID(),
+					strings.ReplaceAll(result.stdout, "\n", ""),
+				)
+			case <-time.After(30 * time.Second):
+				t.Fatal("first SSH did not complete after auth approval")
+			}
+
+			// === Phase 2: Immediate retry — should auto-approve ===
+			result, _, err := doSSH(t, client, peer)
+			require.NoError(t, err, "second SSH should auto-approve without manual auth")
+			require.Contains(
+				t,
+				peer.ContainerID(),
+				strings.ReplaceAll(result, "\n", ""),
+			)
+		}
+	}
+}
+
+// TestSSHCheckModeNegativeCLI verifies that `headscale auth reject`
+// properly denies an SSH check.
+func TestSSHCheckModeNegativeCLI(t *testing.T) {
+	IntegrationSkip(t)
+
+	scenario := sshScenario(t, sshCheckPolicy(), 1)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	allClients, err := scenario.ListTailscaleClients()
+	requireNoErrListClients(t, err)
+
+	user1Clients, err := scenario.ListTailscaleClients("user1")
+	requireNoErrListClients(t, err)
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	err = scenario.WaitForTailscaleSync()
+	requireNoErrSync(t, err)
+
+	_, err = scenario.ListTailscaleClientsFQDNs()
+	requireNoErrListFQDN(t, err)
+
+	for _, client := range user1Clients {
+		for _, peer := range allClients {
+			if client.Hostname() == peer.Hostname() {
+				continue
+			}
+
+			sshResult := doSSHCheck(t, client, peer)
+			authID := findSSHCheckAuthID(t, headscale)
+
+			// Reject via CLI
+			_, err := headscale.Execute(
+				[]string{
+					"headscale", "auth", "reject",
+					"--auth-id", authID,
+				},
+			)
+			require.NoError(t, err)
+
+			select {
+			case result := <-sshResult:
+				require.Error(t, result.err, "SSH should be rejected")
+				assert.Empty(t, result.stdout, "no command output expected on rejection")
+			case <-time.After(30 * time.Second):
+				t.Fatal("SSH did not complete after auth rejection")
 			}
 		}
 	}

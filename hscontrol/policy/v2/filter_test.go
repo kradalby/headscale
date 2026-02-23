@@ -10,7 +10,6 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -680,7 +679,7 @@ func TestCompileSSHPolicy_CheckAction(t *testing.T) {
 		SSHs: []SSH{
 			{
 				Action:       "check",
-				CheckPeriod:  model.Duration(24 * time.Hour),
+				CheckPeriod:  &SSHCheckPeriod{Duration: 24 * time.Hour},
 				Sources:      SSHSrcAliases{gp("group:admins")},
 				Destinations: SSHDstAliases{tp("tag:server")},
 				Users:        []SSHUser{"ssh-it-user"},
@@ -710,6 +709,10 @@ func TestCompileSSHPolicy_CheckAction(t *testing.T) {
 	assert.NotEmpty(t, rule.Action.HoldAndDelegate)
 	assert.Contains(t, rule.Action.HoldAndDelegate, "/machine/ssh/action/")
 	assert.Equal(t, 24*time.Hour, rule.Action.SessionDuration)
+
+	// Verify check params are encoded in the URL
+	assert.Contains(t, rule.Action.HoldAndDelegate, "check_explicit=true")
+	assert.Contains(t, rule.Action.HoldAndDelegate, "check_period=24h0m0s")
 }
 
 // TestCompileSSHPolicy_CheckBeforeAcceptOrdering verifies that check
@@ -754,7 +757,7 @@ func TestCompileSSHPolicy_CheckBeforeAcceptOrdering(t *testing.T) {
 			},
 			{
 				Action:       "check",
-				CheckPeriod:  model.Duration(24 * time.Hour),
+				CheckPeriod:  &SSHCheckPeriod{Duration: 24 * time.Hour},
 				Sources:      SSHSrcAliases{gp("group:admins")},
 				Destinations: SSHDstAliases{tp("tag:server")},
 				Users:        []SSHUser{"ssh-it-user"},
@@ -2164,6 +2167,85 @@ func TestMergeFilterRules(t *testing.T) {
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Errorf("mergeFilterRules() mismatch (-want +got):\n%s", diff)
 			}
+		})
+	}
+}
+
+func TestCompileSSHPolicy_CheckPeriodVariants(t *testing.T) {
+	users := types.Users{
+		{Name: "user1", Model: gorm.Model{ID: 1}},
+	}
+
+	node := types.Node{
+		Hostname: "device",
+		IPv4:     createAddr("100.64.0.1"),
+		UserID:   new(users[0].ID),
+		User:     new(users[0]),
+	}
+
+	nodes := types.Nodes{&node}
+
+	tests := []struct {
+		name            string
+		checkPeriod     *SSHCheckPeriod
+		wantDuration    time.Duration
+		wantExplicit    string
+		wantPeriodInURL string
+	}{
+		{
+			name:            "nil period defaults to 12h",
+			checkPeriod:     nil,
+			wantDuration:    SSHCheckPeriodDefault,
+			wantExplicit:    "check_explicit=false",
+			wantPeriodInURL: "check_period=12h0m0s",
+		},
+		{
+			name:            "always period uses 0",
+			checkPeriod:     &SSHCheckPeriod{Always: true},
+			wantDuration:    0,
+			wantExplicit:    "check_explicit=true",
+			wantPeriodInURL: "check_period=0s",
+		},
+		{
+			name:            "explicit 2h",
+			checkPeriod:     &SSHCheckPeriod{Duration: 2 * time.Hour},
+			wantDuration:    2 * time.Hour,
+			wantExplicit:    "check_explicit=true",
+			wantPeriodInURL: "check_period=2h0m0s",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := &Policy{
+				SSHs: []SSH{
+					{
+						Action:       SSHActionCheck,
+						Sources:      SSHSrcAliases{up("user1@")},
+						Destinations: SSHDstAliases{agp("autogroup:member")},
+						Users:        SSHUsers{"root"},
+						CheckPeriod:  tt.checkPeriod,
+					},
+				},
+			}
+
+			err := policy.validate()
+			require.NoError(t, err)
+
+			sshPolicy, err := policy.compileSSHPolicy(
+				"http://test",
+				users,
+				node.View(),
+				nodes.ViewSlice(),
+			)
+			require.NoError(t, err)
+			require.NotNil(t, sshPolicy)
+			require.Len(t, sshPolicy.Rules, 1)
+
+			rule := sshPolicy.Rules[0]
+			assert.Equal(t, tt.wantDuration, rule.Action.SessionDuration)
+			assert.Contains(t, rule.Action.HoldAndDelegate, tt.wantExplicit)
+			assert.Contains(t, rule.Action.HoldAndDelegate, tt.wantPeriodInURL)
 		})
 	}
 }

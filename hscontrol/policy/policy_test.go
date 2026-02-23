@@ -1190,7 +1190,7 @@ func TestSSHPolicyRules(t *testing.T) {
 					Action: &tailcfg.SSHAction{
 						Accept:                    false,
 						SessionDuration:           24 * time.Hour,
-						HoldAndDelegate:           "unused-url/machine/ssh/action/from/$SRC_NODE_ID/to/$DST_NODE_ID?ssh_user=$SSH_USER&local_user=$LOCAL_USER",
+						HoldAndDelegate:           "unused-url/machine/ssh/action/from/$SRC_NODE_ID/to/$DST_NODE_ID?ssh_user=$SSH_USER&local_user=$LOCAL_USER&check_period=24h0m0s&check_explicit=true",
 						AllowAgentForwarding:      true,
 						AllowLocalPortForwarding:  true,
 						AllowRemotePortForwarding: true,
