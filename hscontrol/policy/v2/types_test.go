@@ -4041,3 +4041,468 @@ func TestSSHCheckPeriodPolicyValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestUnmarshalGrants(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    *Policy
+		wantErr string
+	}{
+		{
+			name: "valid-grant-with-ip-field",
+			input: `
+{
+	"groups": {
+		"group:eng": ["alice@example.com"]
+	},
+	"tagOwners": {
+		"tag:server": ["group:eng"]
+	},
+	"grants": [
+		{
+			"src": ["group:eng"],
+			"dst": ["tag:server"],
+			"ip": ["tcp:443", "tcp:80"]
+		}
+	]
+}
+`,
+			want: &Policy{
+				Groups: Groups{
+					Group("group:eng"): []Username{Username("alice@example.com")},
+				},
+				TagOwners: TagOwners{
+					Tag("tag:server"): Owners{gp("group:eng")},
+				},
+				Grants: []Grant{
+					{
+						Sources: Aliases{
+							gp("group:eng"),
+						},
+						Destinations: Aliases{
+							tp("tag:server"),
+						},
+						InternetProtocols: []ProtocolPort{
+							{Protocol: "tcp", Ports: []tailcfg.PortRange{{First: 443, Last: 443}}},
+							{Protocol: "tcp", Ports: []tailcfg.PortRange{{First: 80, Last: 80}}},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "valid-grant-with-app-field",
+			input: `
+{
+	"groups": {
+		"group:eng": ["alice@example.com"]
+	},
+	"tagOwners": {
+		"tag:relay": ["group:eng"]
+	},
+	"grants": [
+		{
+			"src": ["group:eng"],
+			"dst": ["tag:relay"],
+			"app": {
+				"tailscale.com/cap/relay": []
+			}
+		}
+	]
+}
+`,
+			want: &Policy{
+				Groups: Groups{
+					Group("group:eng"): []Username{Username("alice@example.com")},
+				},
+				TagOwners: TagOwners{
+					Tag("tag:relay"): Owners{gp("group:eng")},
+				},
+				Grants: []Grant{
+					{
+						Sources: Aliases{
+							gp("group:eng"),
+						},
+						Destinations: Aliases{
+							tp("tag:relay"),
+						},
+						App: tailcfg.PeerCapMap{
+							"tailscale.com/cap/relay": []tailcfg.RawMessage{},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "valid-grant-with-via-tags",
+			input: `
+{
+	"groups": {
+		"group:eng": ["alice@example.com"]
+	},
+	"tagOwners": {
+		"tag:server": ["group:eng"],
+		"tag:router": ["group:eng"]
+	},
+	"grants": [
+		{
+			"src": ["group:eng"],
+			"dst": ["autogroup:internet"],
+			"ip": ["*"],
+			"via": ["tag:router"]
+		}
+	]
+}
+`,
+			want: &Policy{
+				Groups: Groups{
+					Group("group:eng"): []Username{Username("alice@example.com")},
+				},
+				TagOwners: TagOwners{
+					Tag("tag:server"): Owners{gp("group:eng")},
+					Tag("tag:router"): Owners{gp("group:eng")},
+				},
+				Grants: []Grant{
+					{
+						Sources: Aliases{
+							gp("group:eng"),
+						},
+						Destinations: Aliases{
+							agp("autogroup:internet"),
+						},
+						InternetProtocols: []ProtocolPort{
+							{Protocol: "*", Ports: []tailcfg.PortRange{tailcfg.PortRangeAny}},
+						},
+						Via: []Tag{Tag("tag:router")},
+					},
+				},
+			},
+		},
+		{
+			name: "valid-grant-with-wildcard",
+			input: `
+{
+	"grants": [
+		{
+			"src": ["*"],
+			"dst": ["*"],
+			"ip": ["*"]
+		}
+	]
+}
+`,
+			want: &Policy{
+				Grants: []Grant{
+					{
+						Sources: Aliases{
+							Wildcard,
+						},
+						Destinations: Aliases{
+							Wildcard,
+						},
+						InternetProtocols: []ProtocolPort{
+							{Protocol: "*", Ports: []tailcfg.PortRange{tailcfg.PortRangeAny}},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "valid-grant-with-multiple-sources-destinations",
+			input: `
+{
+	"groups": {
+		"group:eng": ["alice@example.com"],
+		"group:ops": ["bob@example.com"]
+	},
+	"tagOwners": {
+		"tag:web": ["group:eng"],
+		"tag:db": ["group:ops"]
+	},
+	"hosts": {
+		"server1": "100.64.0.1"
+	},
+	"grants": [
+		{
+			"src": ["group:eng", "alice@example.com", "100.64.0.10"],
+			"dst": ["tag:web", "tag:db", "server1"],
+			"ip": ["tcp:443", "udp:53"]
+		}
+	]
+}
+`,
+			want: &Policy{
+				Groups: Groups{
+					Group("group:eng"): []Username{Username("alice@example.com")},
+					Group("group:ops"): []Username{Username("bob@example.com")},
+				},
+				TagOwners: TagOwners{
+					Tag("tag:web"): Owners{gp("group:eng")},
+					Tag("tag:db"):  Owners{gp("group:ops")},
+				},
+				Hosts: Hosts{
+					"server1": Prefix(mp("100.64.0.1/32")),
+				},
+				Grants: []Grant{
+					{
+						Sources: Aliases{
+							gp("group:eng"),
+							up("alice@example.com"),
+							func() *Prefix { p := Prefix(mp("100.64.0.10/32")); return &p }(),
+						},
+						Destinations: Aliases{
+							tp("tag:web"),
+							tp("tag:db"),
+							hp("server1"),
+						},
+						InternetProtocols: []ProtocolPort{
+							{Protocol: "tcp", Ports: []tailcfg.PortRange{{First: 443, Last: 443}}},
+							{Protocol: "udp", Ports: []tailcfg.PortRange{{First: 53, Last: 53}}},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "valid-grant-with-port-ranges",
+			input: `
+{
+	"grants": [
+		{
+			"src": ["*"],
+			"dst": ["*"],
+			"ip": ["tcp:8000-9000", "80", "443"]
+		}
+	]
+}
+`,
+			want: &Policy{
+				Grants: []Grant{
+					{
+						Sources: Aliases{
+							Wildcard,
+						},
+						Destinations: Aliases{
+							Wildcard,
+						},
+						InternetProtocols: []ProtocolPort{
+							{Protocol: "tcp", Ports: []tailcfg.PortRange{{First: 8000, Last: 9000}}},
+							{Protocol: "*", Ports: []tailcfg.PortRange{{First: 80, Last: 80}}},
+							{Protocol: "*", Ports: []tailcfg.PortRange{{First: 443, Last: 443}}},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "valid-grant-with-autogroups",
+			input: `
+{
+	"grants": [
+		{
+			"src": ["autogroup:member"],
+			"dst": ["autogroup:self"],
+			"ip": ["*"]
+		}
+	]
+}
+`,
+			want: &Policy{
+				Grants: []Grant{
+					{
+						Sources: Aliases{
+							agp("autogroup:member"),
+						},
+						Destinations: Aliases{
+							agp("autogroup:self"),
+						},
+						InternetProtocols: []ProtocolPort{
+							{Protocol: "*", Ports: []tailcfg.PortRange{tailcfg.PortRangeAny}},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "invalid-grant-both-ip-and-app",
+			input: `
+{
+	"grants": [
+		{
+			"src": ["*"],
+			"dst": ["*"],
+			"ip": ["tcp:443"],
+			"app": {
+				"tailscale.com/cap/relay": []
+			}
+		}
+	]
+}
+`,
+			wantErr: "grants cannot specify both 'ip' and 'app' fields",
+		},
+		{
+			name: "invalid-grant-missing-ip-and-app",
+			input: `
+{
+	"grants": [
+		{
+			"src": ["*"],
+			"dst": ["*"]
+		}
+	]
+}
+`,
+			wantErr: "grants must specify either 'ip' or 'app' field",
+		},
+		{
+			name: "invalid-grant-empty-sources",
+			input: `
+{
+	"grants": [
+		{
+			"src": [],
+			"dst": ["*"],
+			"ip": ["*"]
+		}
+	]
+}
+`,
+			wantErr: "grant sources cannot be empty",
+		},
+		{
+			name: "invalid-grant-empty-destinations",
+			input: `
+{
+	"grants": [
+		{
+			"src": ["*"],
+			"dst": [],
+			"ip": ["*"]
+		}
+	]
+}
+`,
+			wantErr: "grant destinations cannot be empty",
+		},
+		{
+			name: "invalid-grant-undefined-via-tag",
+			input: `
+{
+	"tagOwners": {
+		"tag:server": ["alice@example.com"]
+	},
+	"grants": [
+		{
+			"src": ["*"],
+			"dst": ["autogroup:internet"],
+			"ip": ["*"],
+			"via": ["tag:undefined-router"]
+		}
+	]
+}
+`,
+			wantErr: "grant 'via' tag is not defined in policy",
+		},
+		{
+			name: "invalid-grant-undefined-source-group",
+			input: `
+{
+	"grants": [
+		{
+			"src": ["group:undefined"],
+			"dst": ["*"],
+			"ip": ["*"]
+		}
+	]
+}
+`,
+			wantErr: "group not defined in policy",
+		},
+		{
+			name: "invalid-grant-undefined-source-tag",
+			input: `
+{
+	"grants": [
+		{
+			"src": ["tag:undefined"],
+			"dst": ["*"],
+			"ip": ["*"]
+		}
+	]
+}
+`,
+			wantErr: "tag not defined in policy",
+		},
+		{
+			name: "invalid-grant-undefined-destination-host",
+			input: `
+{
+	"grants": [
+		{
+			"src": ["*"],
+			"dst": ["host-undefined"],
+			"ip": ["*"]
+		}
+	]
+}
+`,
+			wantErr: "host not defined",
+		},
+		{
+			name: "invalid-grant-autogroup-self-with-tag-source",
+			input: `
+{
+	"tagOwners": {
+		"tag:server": ["alice@example.com"]
+	},
+	"grants": [
+		{
+			"src": ["tag:server"],
+			"dst": ["autogroup:self"],
+			"ip": ["*"]
+		}
+	]
+}
+`,
+			wantErr: "autogroup:self destination requires sources to be users, groups, or autogroup:member only",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy, err := unmarshalPolicy([]byte(tt.input))
+			if tt.wantErr != "" {
+				// Unmarshal succeeded, try validate
+				if err == nil {
+					err = policy.validate()
+				}
+
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+				}
+
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected error containing %q, got %q", tt.wantErr, err.Error())
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			// Validate the policy
+			err = policy.validate()
+			if err != nil {
+				t.Fatalf("unexpected validation error: %v", err)
+			}
+
+			if diff := cmp.Diff(tt.want, policy, cmpopts.IgnoreUnexported(Policy{}, Prefix{})); diff != "" {
+				t.Errorf("Policy unmarshal mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
