@@ -67,6 +67,13 @@ var ErrNodeNameNotUnique = errors.New("node name is not unique")
 // ErrRegistrationExpired is returned when a registration has expired.
 var ErrRegistrationExpired = errors.New("registration expired")
 
+// sshCheckPair identifies a specific (source, destination) node pair for
+// SSH check auth tracking when an explicit checkPeriod is configured.
+type sshCheckPair struct {
+	Src types.NodeID
+	Dst types.NodeID
+}
+
 // State manages Headscale's core state, coordinating between database, policy management,
 // IP allocation, and DERP routing. All methods are thread-safe.
 type State struct {
@@ -91,6 +98,28 @@ type State struct {
 
 	// primaryRoutes tracks primary route assignments for nodes
 	primaryRoutes *routes.PrimaryRoutes
+
+	// sshCheckGlobalAuth tracks when source nodes last completed SSH check
+	// auth for rules without explicit checkPeriod. Auth covers any destination.
+	//
+	// Tailscale docs: "Once re-authenticated to a destination, the user can
+	// access the device and any other device in the tailnet without
+	// re-verification for the next 12 hours."
+	// Ref: https://tailscale.com/kb/1193/tailscale-ssh
+	// Ref: https://github.com/tailscale/tailscale/issues/10480
+	// Ref: https://github.com/tailscale/tailscale/issues/7125
+	sshCheckGlobalAuth map[types.NodeID]time.Time
+
+	// sshCheckSpecificAuth tracks when source nodes last completed SSH check
+	// auth for rules with explicit checkPeriod. Auth covers only that destination.
+	//
+	// Tailscale docs: "If a different check period is specified for the
+	// connection, then the user can access specifically this device without
+	// re-verification for the duration of the check period."
+	// Ref: https://tailscale.com/kb/1193/tailscale-ssh
+	sshCheckSpecificAuth map[sshCheckPair]time.Time
+
+	sshCheckMu sync.RWMutex
 }
 
 // NewState creates and initializes a new State instance, setting up the database,
@@ -189,6 +218,9 @@ func NewState(cfg *types.Config) (*State, error) {
 		authCache:     authCache,
 		primaryRoutes: routes.New(),
 		nodeStore:     nodeStore,
+
+		sshCheckGlobalAuth:   make(map[types.NodeID]time.Time),
+		sshCheckSpecificAuth: make(map[sshCheckPair]time.Time),
 	}, nil
 }
 
@@ -226,6 +258,10 @@ func (s *State) ReloadPolicy() ([]change.Change, error) {
 	if err != nil {
 		return nil, fmt.Errorf("setting policy: %w", err)
 	}
+
+	// Clear SSH check auth times when policy changes to ensure stale
+	// approvals don't persist if checkPeriod rules are modified or removed.
+	s.ClearSSHCheckAuth()
 
 	// Rebuild peer maps after policy changes because the peersFunc in NodeStore
 	// uses the PolicyManager's filters. Without this, nodes won't see newly allowed
@@ -881,7 +917,15 @@ func (s *State) NodeCanHaveTag(node types.NodeView, tag string) bool {
 
 // SetPolicy updates the policy configuration.
 func (s *State) SetPolicy(pol []byte) (bool, error) {
-	return s.polMan.SetPolicy(pol)
+	changed, err := s.polMan.SetPolicy(pol)
+	if err != nil {
+		return changed, err
+	}
+
+	// Clear SSH check auth times when policy changes.
+	s.ClearSSHCheckAuth()
+
+	return changed, nil
 }
 
 // AutoApproveRoutes checks if a node's routes should be auto-approved.
@@ -1060,6 +1104,47 @@ func (s *State) GetAuthCacheEntry(id types.AuthID) (*types.AuthRequest, bool) {
 // SetAuthCacheEntry stores a node registration in cache.
 func (s *State) SetAuthCacheEntry(id types.AuthID, entry types.AuthRequest) {
 	s.authCache.Set(id, entry)
+}
+
+// RecordSSHCheckAuth records a successful SSH check authentication.
+// If explicit is true (rule had explicit checkPeriod), records per (src, dst).
+// If explicit is false (default period), records per src (any destination).
+func (s *State) RecordSSHCheckAuth(src, dst types.NodeID, explicit bool) {
+	s.sshCheckMu.Lock()
+	defer s.sshCheckMu.Unlock()
+
+	now := time.Now()
+	if explicit {
+		s.sshCheckSpecificAuth[sshCheckPair{Src: src, Dst: dst}] = now
+	} else {
+		s.sshCheckGlobalAuth[src] = now
+	}
+}
+
+// SSHCheckAuthTime returns when srcNodeID last authenticated for SSH check.
+// If explicit is true, looks up per (src, dst). Otherwise per src only.
+func (s *State) SSHCheckAuthTime(src, dst types.NodeID, explicit bool) (time.Time, bool) {
+	s.sshCheckMu.RLock()
+	defer s.sshCheckMu.RUnlock()
+
+	if explicit {
+		t, ok := s.sshCheckSpecificAuth[sshCheckPair{Src: src, Dst: dst}]
+		return t, ok
+	}
+
+	t, ok := s.sshCheckGlobalAuth[src]
+
+	return t, ok
+}
+
+// ClearSSHCheckAuth clears all recorded SSH check auth times.
+// Called when the policy changes to ensure stale auth times don't grant access.
+func (s *State) ClearSSHCheckAuth() {
+	s.sshCheckMu.Lock()
+	defer s.sshCheckMu.Unlock()
+
+	s.sshCheckGlobalAuth = make(map[types.NodeID]time.Time)
+	s.sshCheckSpecificAuth = make(map[sshCheckPair]time.Time)
 }
 
 // logHostinfoValidation logs warnings when hostinfo is nil or has empty hostname.
