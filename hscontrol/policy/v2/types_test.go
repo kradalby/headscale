@@ -4506,3 +4506,166 @@ func TestUnmarshalGrants(t *testing.T) {
 		})
 	}
 }
+
+func TestACLToGrants(t *testing.T) {
+	tests := []struct {
+		name string
+		acl  ACL
+		want []Grant
+	}{
+		{
+			name: "single-destination-tcp",
+			acl: ACL{
+				Action:   ActionAccept,
+				Protocol: ProtocolNameTCP,
+				Sources:  Aliases{gp("group:eng")},
+				Destinations: []AliasWithPorts{
+					{
+						Alias: tp("tag:server"),
+						Ports: []tailcfg.PortRange{{First: 443, Last: 443}},
+					},
+				},
+			},
+			want: []Grant{
+				{
+					Sources:      Aliases{gp("group:eng")},
+					Destinations: Aliases{tp("tag:server")},
+					InternetProtocols: []ProtocolPort{
+						{
+							Protocol: ProtocolNameTCP,
+							Ports:    []tailcfg.PortRange{{First: 443, Last: 443}},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "multiple-destinations-creates-multiple-grants",
+			acl: ACL{
+				Action:   ActionAccept,
+				Protocol: ProtocolNameTCP,
+				Sources:  Aliases{gp("group:eng")},
+				Destinations: []AliasWithPorts{
+					{
+						Alias: tp("tag:web"),
+						Ports: []tailcfg.PortRange{{First: 80, Last: 80}},
+					},
+					{
+						Alias: tp("tag:db"),
+						Ports: []tailcfg.PortRange{{First: 5432, Last: 5432}},
+					},
+				},
+			},
+			want: []Grant{
+				{
+					Sources:      Aliases{gp("group:eng")},
+					Destinations: Aliases{tp("tag:web")},
+					InternetProtocols: []ProtocolPort{
+						{
+							Protocol: ProtocolNameTCP,
+							Ports:    []tailcfg.PortRange{{First: 80, Last: 80}},
+						},
+					},
+				},
+				{
+					Sources:      Aliases{gp("group:eng")},
+					Destinations: Aliases{tp("tag:db")},
+					InternetProtocols: []ProtocolPort{
+						{
+							Protocol: ProtocolNameTCP,
+							Ports:    []tailcfg.PortRange{{First: 5432, Last: 5432}},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "wildcard-protocol",
+			acl: ACL{
+				Action:   ActionAccept,
+				Protocol: ProtocolNameWildcard,
+				Sources:  Aliases{gp("group:admin")},
+				Destinations: []AliasWithPorts{
+					{
+						Alias: up("alice@example.com"),
+						Ports: []tailcfg.PortRange{tailcfg.PortRangeAny},
+					},
+				},
+			},
+			want: []Grant{
+				{
+					Sources:      Aliases{gp("group:admin")},
+					Destinations: Aliases{up("alice@example.com")},
+					InternetProtocols: []ProtocolPort{
+						{
+							Protocol: ProtocolNameWildcard,
+							Ports:    []tailcfg.PortRange{tailcfg.PortRangeAny},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "udp-with-port-range",
+			acl: ACL{
+				Action:   ActionAccept,
+				Protocol: ProtocolNameUDP,
+				Sources:  Aliases{up("bob@example.com")},
+				Destinations: []AliasWithPorts{
+					{
+						Alias: tp("tag:voip"),
+						Ports: []tailcfg.PortRange{{First: 10000, Last: 20000}},
+					},
+				},
+			},
+			want: []Grant{
+				{
+					Sources:      Aliases{up("bob@example.com")},
+					Destinations: Aliases{tp("tag:voip")},
+					InternetProtocols: []ProtocolPort{
+						{
+							Protocol: ProtocolNameUDP,
+							Ports:    []tailcfg.PortRange{{First: 10000, Last: 20000}},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "icmp-protocol",
+			acl: ACL{
+				Action:   ActionAccept,
+				Protocol: ProtocolNameICMP,
+				Sources:  Aliases{gp("group:monitoring")},
+				Destinations: []AliasWithPorts{
+					{
+						Alias: new(Asterix),
+						Ports: []tailcfg.PortRange{tailcfg.PortRangeAny},
+					},
+				},
+			},
+			want: []Grant{
+				{
+					Sources:      Aliases{gp("group:monitoring")},
+					Destinations: Aliases{new(Asterix)},
+					InternetProtocols: []ProtocolPort{
+						{
+							Protocol: ProtocolNameICMP,
+							Ports:    []tailcfg.PortRange{tailcfg.PortRangeAny},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := aclToGrants(tt.acl)
+
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("aclToGrants() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
