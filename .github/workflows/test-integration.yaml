@@ -257,6 +257,8 @@ jobs:
           - TestSSHOneUserToOneCheckModeOIDC
           - TestSSHCheckModeUnapprovedTimeout
           - TestSSHCheckModeCheckPeriodCLI
+          - TestSSHCheckModeAutoApprove
+          - TestSSHCheckModeNegativeCLI
           - TestTagsAuthKeyWithTagRequestDifferentTag
           - TestTagsAuthKeyWithTagNoAdvertiseFlag
           - TestTagsAuthKeyWithTagCannotAddViaCLI
