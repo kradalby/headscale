@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/netip"
 	"strings"
@@ -4665,6 +4666,254 @@ func TestACLToGrants(t *testing.T) {
 
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Errorf("aclToGrants() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestGrantMarshalJSON(t *testing.T) {
+	tests := []struct {
+		name     string
+		grant    Grant
+		wantJSON string
+	}{
+		{
+			name: "ip-based-grant-tcp-single-port",
+			grant: Grant{
+				Sources:      Aliases{gp("group:eng")},
+				Destinations: Aliases{tp("tag:server")},
+				InternetProtocols: []ProtocolPort{
+					{
+						Protocol: ProtocolNameTCP,
+						Ports:    []tailcfg.PortRange{{First: 443, Last: 443}},
+					},
+				},
+			},
+			wantJSON: `{
+				"src": ["group:eng"],
+				"dst": ["tag:server"],
+				"ip": ["tcp:443"]
+			}`,
+		},
+		{
+			name: "ip-based-grant-udp-port-range",
+			grant: Grant{
+				Sources:      Aliases{up("alice@example.com")},
+				Destinations: Aliases{tp("tag:voip")},
+				InternetProtocols: []ProtocolPort{
+					{
+						Protocol: ProtocolNameUDP,
+						Ports:    []tailcfg.PortRange{{First: 10000, Last: 20000}},
+					},
+				},
+			},
+			wantJSON: `{
+				"src": ["alice@example.com"],
+				"dst": ["tag:voip"],
+				"ip": ["udp:10000-20000"]
+			}`,
+		},
+		{
+			name: "ip-based-grant-wildcard-protocol",
+			grant: Grant{
+				Sources:      Aliases{gp("group:admin")},
+				Destinations: Aliases{Asterix(0)},
+				InternetProtocols: []ProtocolPort{
+					{
+						Protocol: ProtocolNameWildcard,
+						Ports:    []tailcfg.PortRange{tailcfg.PortRangeAny},
+					},
+				},
+			},
+			wantJSON: `{
+				"src": ["group:admin"],
+				"dst": ["*"],
+				"ip": ["*"]
+			}`,
+		},
+		{
+			name: "ip-based-grant-icmp",
+			grant: Grant{
+				Sources:      Aliases{gp("group:monitoring")},
+				Destinations: Aliases{tp("tag:servers")},
+				InternetProtocols: []ProtocolPort{
+					{
+						Protocol: ProtocolNameICMP,
+						Ports:    []tailcfg.PortRange{tailcfg.PortRangeAny},
+					},
+				},
+			},
+			wantJSON: `{
+				"src": ["group:monitoring"],
+				"dst": ["tag:servers"],
+				"ip": ["icmp:0-65535"]
+			}`,
+		},
+		{
+			name: "ip-based-grant-multiple-protocols",
+			grant: Grant{
+				Sources:      Aliases{gp("group:web")},
+				Destinations: Aliases{tp("tag:lb")},
+				InternetProtocols: []ProtocolPort{
+					{
+						Protocol: ProtocolNameTCP,
+						Ports:    []tailcfg.PortRange{{First: 80, Last: 80}},
+					},
+					{
+						Protocol: ProtocolNameTCP,
+						Ports:    []tailcfg.PortRange{{First: 443, Last: 443}},
+					},
+				},
+			},
+			wantJSON: `{
+				"src": ["group:web"],
+				"dst": ["tag:lb"],
+				"ip": ["tcp:80", "tcp:443"]
+			}`,
+		},
+		{
+			name: "capability-based-grant",
+			grant: Grant{
+				Sources:      Aliases{gp("group:admins")},
+				Destinations: Aliases{tp("tag:database")},
+				App: tailcfg.PeerCapMap{
+					"backup": []tailcfg.RawMessage{
+						tailcfg.RawMessage(`{"action":"read"}`),
+						tailcfg.RawMessage(`{"action":"write"}`),
+					},
+				},
+			},
+			wantJSON: `{
+				"src": ["group:admins"],
+				"dst": ["tag:database"],
+				"app": {
+					"backup": [
+						{"action":"read"},
+						{"action":"write"}
+					]
+				}
+			}`,
+		},
+		{
+			name: "grant-with-both-ip-and-app",
+			grant: Grant{
+				Sources:      Aliases{up("bob@example.com")},
+				Destinations: Aliases{tp("tag:app-server")},
+				InternetProtocols: []ProtocolPort{
+					{
+						Protocol: ProtocolNameTCP,
+						Ports:    []tailcfg.PortRange{{First: 8080, Last: 8080}},
+					},
+				},
+				App: tailcfg.PeerCapMap{
+					"admin": []tailcfg.RawMessage{
+						tailcfg.RawMessage(`{"level":"superuser"}`),
+					},
+				},
+			},
+			wantJSON: `{
+				"src": ["bob@example.com"],
+				"dst": ["tag:app-server"],
+				"ip": ["tcp:8080"],
+				"app": {
+					"admin": [{"level":"superuser"}]
+				}
+			}`,
+		},
+		{
+			name: "grant-with-via",
+			grant: Grant{
+				Sources:      Aliases{gp("group:remote-workers")},
+				Destinations: Aliases{tp("tag:internal")},
+				InternetProtocols: []ProtocolPort{
+					{
+						Protocol: ProtocolNameTCP,
+						Ports:    []tailcfg.PortRange{tailcfg.PortRangeAny},
+					},
+				},
+				Via: []Tag{
+					*tp("tag:gateway1"),
+					*tp("tag:gateway2"),
+				},
+			},
+			wantJSON: `{
+				"src": ["group:remote-workers"],
+				"dst": ["tag:internal"],
+				"ip": ["tcp:0-65535"],
+				"via": ["tag:gateway1", "tag:gateway2"]
+			}`,
+		},
+		{
+			name: "grant-omitzero-app-field",
+			grant: Grant{
+				Sources:      Aliases{gp("group:users")},
+				Destinations: Aliases{tp("tag:web")},
+				InternetProtocols: []ProtocolPort{
+					{
+						Protocol: ProtocolNameTCP,
+						Ports:    []tailcfg.PortRange{{First: 80, Last: 80}},
+					},
+				},
+				App: nil,
+			},
+			wantJSON: `{
+				"src": ["group:users"],
+				"dst": ["tag:web"],
+				"ip": ["tcp:80"]
+			}`,
+		},
+		{
+			name: "grant-omitzero-via-field",
+			grant: Grant{
+				Sources:      Aliases{gp("group:users")},
+				Destinations: Aliases{tp("tag:api")},
+				InternetProtocols: []ProtocolPort{
+					{
+						Protocol: ProtocolNameTCP,
+						Ports:    []tailcfg.PortRange{{First: 443, Last: 443}},
+					},
+				},
+				Via: nil,
+			},
+			wantJSON: `{
+				"src": ["group:users"],
+				"dst": ["tag:api"],
+				"ip": ["tcp:443"]
+			}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Marshal the Grant to JSON
+			gotJSON, err := json.Marshal(tt.grant)
+			if err != nil {
+				t.Fatalf("failed to marshal Grant: %v", err)
+			}
+
+			// Compact the expected JSON to remove whitespace for comparison
+			var wantCompact bytes.Buffer
+
+			err = json.Compact(&wantCompact, []byte(tt.wantJSON))
+			if err != nil {
+				t.Fatalf("failed to compact expected JSON: %v", err)
+			}
+
+			// Compare JSON strings
+			if string(gotJSON) != wantCompact.String() {
+				t.Errorf("Grant.MarshalJSON() mismatch:\ngot:  %s\nwant: %s", string(gotJSON), wantCompact.String())
+			}
+
+			// Test round-trip: unmarshal and compare with original
+			var unmarshaled Grant
+
+			err = json.Unmarshal(gotJSON, &unmarshaled)
+			if err != nil {
+				t.Fatalf("failed to unmarshal JSON: %v", err)
+			}
+
+			if diff := cmp.Diff(tt.grant, unmarshaled); diff != "" {
+				t.Errorf("Grant round-trip mismatch (-original +unmarshaled):\n%s", diff)
 			}
 		})
 	}

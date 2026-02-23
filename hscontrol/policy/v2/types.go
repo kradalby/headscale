@@ -815,6 +815,32 @@ func (ve *ProtocolPort) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+func (ve ProtocolPort) MarshalJSON() ([]byte, error) {
+	// Handle wildcard protocol with all ports
+	if ve.Protocol == ProtocolNameWildcard && len(ve.Ports) == 1 &&
+		ve.Ports[0].First == 0 && ve.Ports[0].Last == 65535 {
+		return json.Marshal("*")
+	}
+
+	// Build port string
+	var portParts []string
+
+	for _, portRange := range ve.Ports {
+		if portRange.First == portRange.Last {
+			portParts = append(portParts, strconv.FormatUint(uint64(portRange.First), 10))
+		} else {
+			portParts = append(portParts, fmt.Sprintf("%d-%d", portRange.First, portRange.Last))
+		}
+	}
+
+	portStr := strings.Join(portParts, ",")
+
+	// Combine protocol and ports
+	result := fmt.Sprintf("%s:%s", ve.Protocol, portStr)
+
+	return json.Marshal(result)
+}
+
 func isWildcard(str string) bool {
 	return str == "*"
 }
@@ -1732,7 +1758,7 @@ type Grant struct {
 	Destinations Aliases `json:"dst"`
 
 	// TODO(kradalby): validate that either of these fields are included
-	InternetProtocols []ProtocolPort     `json:"ip"`
+	InternetProtocols []ProtocolPort     `json:"ip,omitempty"`
 	App               tailcfg.PeerCapMap `json:"app,omitzero"`
 
 	// TODO(kradalby): implement via
