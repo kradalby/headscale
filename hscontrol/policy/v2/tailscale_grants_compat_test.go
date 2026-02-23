@@ -1,5 +1,5 @@
 // This file is "generated" by Claude.
-// It contains a data-driven test that reads 212 GRANT-*.json test files
+// It contains a data-driven test that reads 237 GRANT-*.json test files
 // captured from Tailscale SaaS. Each file contains:
 //   - A policy with grants (and optionally ACLs)
 //   - The expected packet_filter_rules for each of 8 test nodes
@@ -387,7 +387,7 @@ var grantSkipReasons = map[string]string{
 	"GRANT-P15_3": "SRCIPS_FORMAT",
 
 	// ========================================================================
-	// CAPGRANT_COMPILATION (41 tests)
+	// CAPGRANT_COMPILATION (49 tests)
 	//
 	// TODO: Implement app capability grant -> CapGrant FilterRule compilation.
 	//
@@ -461,13 +461,25 @@ var grantSkipReasons = map[string]string{
 	"GRANT-K25": "CAPGRANT_COMPILATION",
 	"GRANT-K27": "CAPGRANT_COMPILATION",
 
+	// V-series: App caps on specific tags, drive cap, autogroup:self app
+	"GRANT-V02": "CAPGRANT_COMPILATION: app grant on tag:exit — CapGrant with exit-node IPs as Dsts not compiled",
+	"GRANT-V03": "CAPGRANT_COMPILATION: app grant on tag:router — CapGrant with router IPs as Dsts not compiled",
+	"GRANT-V06": "CAPGRANT_COMPILATION: multi-dst app grant on [tag:server, tag:exit] — per-node CapGrant not compiled",
+	"GRANT-V19": "CAPGRANT_COMPILATION: drive cap on tag:exit — drive CapGrant + reverse drive-sharer not compiled",
+	"GRANT-V20": "CAPGRANT_COMPILATION: kubernetes cap on tag:router — CapGrant not compiled",
+	"GRANT-V25": "CAPGRANT_COMPILATION: autogroup:self app grant — self-targeting CapGrant per member not compiled",
+
 	// ========================================================================
-	// CAPGRANT_COMPILATION_AND_SRCIPS_FORMAT (9 tests)
+	// CAPGRANT_COMPILATION_AND_SRCIPS_FORMAT (11 tests)
 	//
 	// TODO: These tests have BOTH DstPorts and CapGrant FilterRules.
 	// They require both CapGrant compilation AND SrcIPs format fixes.
 	// Grants with both "ip" and "app" fields produce two separate FilterRules:
 	// one with DstPorts (from "ip") and one with CapGrant (from "app").
+	//
+	// V09/V10: headscale currently rejects mixed ip+app grants with
+	// "grants cannot specify both 'ip' and 'app' fields", but Tailscale
+	// accepts them and produces two FilterRules per grant.
 	// ========================================================================
 
 	// F-series: Mixed ip+app grants
@@ -485,8 +497,25 @@ var grantSkipReasons = map[string]string{
 	"GRANT-K5":  "CAPGRANT_COMPILATION_AND_SRCIPS_FORMAT",
 	"GRANT-K28": "CAPGRANT_COMPILATION_AND_SRCIPS_FORMAT",
 
+	// V-series: Mixed ip+app on specific tags
+	"GRANT-V09": "CAPGRANT_COMPILATION_AND_SRCIPS_FORMAT: mixed ip+app on tag:exit — headscale rejects, Tailscale produces DstPorts + CapGrant",
+	"GRANT-V10": "CAPGRANT_COMPILATION_AND_SRCIPS_FORMAT: mixed ip+app on tag:router — headscale rejects, Tailscale produces DstPorts + CapGrant",
+
 	// ========================================================================
-	// VIA_COMPILATION_AND_SRCIPS_FORMAT (4 tests)
+	// VIA_COMPILATION (3 tests)
+	//
+	// TODO: Implement via route compilation in filter rules.
+	//
+	// Via routes with specific (non-wildcard) sources produce DstPorts rules
+	// with correctly restricted SrcIPs. These tests have no SrcIPs format
+	// issue because they use specific src identities (tags, groups, members).
+	// ========================================================================
+	"GRANT-V11": "VIA_COMPILATION: via tag:router + src:tag:client — SrcIPs = client IPs only",
+	"GRANT-V12": "VIA_COMPILATION: via tag:router + src:autogroup:member — SrcIPs = member IPs",
+	"GRANT-V13": "VIA_COMPILATION: via tag:router + src:group:developers + tcp:80,443 — group SrcIPs + specific ports",
+
+	// ========================================================================
+	// VIA_COMPILATION_AND_SRCIPS_FORMAT (7 tests)
 	//
 	// TODO: Implement via route compilation in filter rules.
 	//
@@ -494,12 +523,16 @@ var grantSkipReasons = map[string]string{
 	// CIDR should be routed through a specific tagged subnet router. The via
 	// field is currently parsed and validated but NOT compiled into FilterRules.
 	//
-	// These tests also have SrcIPs format differences.
+	// These tests also have SrcIPs format differences (wildcard src expands
+	// to split CGNAT ranges).
 	// ========================================================================
 	"GRANT-I1":  "VIA_COMPILATION_AND_SRCIPS_FORMAT",
 	"GRANT-I2":  "VIA_COMPILATION_AND_SRCIPS_FORMAT",
 	"GRANT-I3":  "VIA_COMPILATION_AND_SRCIPS_FORMAT",
 	"GRANT-K13": "VIA_COMPILATION_AND_SRCIPS_FORMAT",
+	"GRANT-V17": "VIA_COMPILATION_AND_SRCIPS_FORMAT: via tag:router + multi-dst — unadvertised subnets silently dropped",
+	"GRANT-V21": "VIA_COMPILATION_AND_SRCIPS_FORMAT: via [tag:router, tag:exit] — only advertising nodes get rules",
+	"GRANT-V23": "VIA_COMPILATION_AND_SRCIPS_FORMAT: via tag:router + tcp:22,80,443 — via + multiple ports",
 
 	// ========================================================================
 	// AUTOGROUP_DANGER_ALL (3 tests)
@@ -519,7 +552,7 @@ var grantSkipReasons = map[string]string{
 	"GRANT-K8": "AUTOGROUP_DANGER_ALL",
 
 	// ========================================================================
-	// ERROR_VALIDATION_GAP (12 tests)
+	// ERROR_VALIDATION_GAP (23 tests)
 	//
 	// TODO: Implement grant validation rules that Tailscale enforces but
 	// headscale does not yet.
@@ -555,6 +588,22 @@ var grantSkipReasons = map[string]string{
 	// Tailscale requires "via" to be a tag, rejects other values.
 	"GRANT-I4": "ERROR_VALIDATION_GAP: via can only be a tag — headscale should reject non-tag via values",
 
+	// autogroup:internet + app grants validation:
+	// Tailscale rejects app grants when dst includes autogroup:internet.
+	"GRANT-V01": "ERROR_VALIDATION_GAP: cannot use app grants with autogroup:internet — headscale does not reject",
+	"GRANT-V22": "ERROR_VALIDATION_GAP: cannot use app grants with autogroup:internet — headscale returns different error (rejects mixed ip+app instead)",
+
+	// Raw default route CIDR validation:
+	// Tailscale rejects 0.0.0.0/0 and ::/0 as grant dst, requiring "*" or
+	// "autogroup:internet" instead. This applies with or without via.
+	"GRANT-V04": "ERROR_VALIDATION_GAP: dst 0.0.0.0/0 rejected — headscale should reject raw default route CIDRs in grant dst",
+	"GRANT-V05": "ERROR_VALIDATION_GAP: dst ::/0 rejected — headscale should reject raw default route CIDRs in grant dst",
+	"GRANT-V08": "ERROR_VALIDATION_GAP: dst 0.0.0.0/0 with ip grant — same rejection as V04",
+	"GRANT-V14": "ERROR_VALIDATION_GAP: dst 0.0.0.0/0 with via — rejected even with via field",
+	"GRANT-V15": "ERROR_VALIDATION_GAP: dst ::/0 with via — rejected even with via field",
+	"GRANT-V16": "ERROR_VALIDATION_GAP: dst [0.0.0.0/0, ::/0] with via — both rejected",
+	"GRANT-V18": "ERROR_VALIDATION_GAP: dst 0.0.0.0/0 with via + app — rejected regardless of via or app",
+
 	// Empty src/dst validation difference:
 	// Tailscale ACCEPTS empty src/dst arrays (producing no filter rules),
 	// but headscale rejects them with "grant sources/destinations cannot be empty".
@@ -576,7 +625,7 @@ var grantSkipReasons = map[string]string{
 	// ========================================================================
 }
 
-// TestGrantsCompat is a data-driven test that loads all 212 GRANT-*.json
+// TestGrantsCompat is a data-driven test that loads all 237 GRANT-*.json
 // test files captured from Tailscale SaaS and compares headscale's grants
 // engine output against the real Tailscale behavior.
 //
