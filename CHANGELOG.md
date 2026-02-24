@@ -45,6 +45,7 @@ A new `headscale auth` CLI command group supports the approval flow:
 
 ### Changes
 
+- **SSH Policy**: Add support for `localpart:*@<domain>` in SSH rule `users` field, mapping each matching user's email local-part as their OS username [#3091](https://github.com/juanfont/headscale/pull/3091)
 - **ACL Policy**: Add ICMP and IPv6-ICMP protocols to default filter rules when no protocol is specified [#3036](https://github.com/juanfont/headscale/pull/3036)
 - **ACL Policy**: Fix autogroup:self handling for tagged nodes - tagged nodes no longer incorrectly receive autogroup:self filter rules [#3036](https://github.com/juanfont/headscale/pull/3036)
 - **ACL Policy**: Use CIDR format for autogroup:self destination IPs matching Tailscale behavior [#3036](https://github.com/juanfont/headscale/pull/3036)
