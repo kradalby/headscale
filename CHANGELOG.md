@@ -13,6 +13,22 @@ overall our implementation was very close.
 
 ### BREAKING
 
+- **SSH Policy**: Root SSH access is now denied by default unless explicitly allowed in the SSH rule's `users` field, matching Tailscale behavior
+  - Previously, root was only denied when `autogroup:nonroot` was specified
+  - Now, any SSH rule that does not include `"root"` in its `users` list will produce a root deny (`"root": ""`) in the compiled SSH policy
+  - To allow root access, explicitly add `"root"` to the `users` array
+- **SSH Policy**: SSH rules with `localpart:` entries now emit per-user principal groups and separate localpart rules, matching Tailscale behavior
+  - Previously, one combined rule was emitted with all source principals, and localpart rules merged the common SSH user entries
+  - Now, when `localpart:` entries are present, each source user gets their own common rule (e.g., root deny) with only their node IPs as principals
+  - Localpart rules now contain only the localpart mapping, not the common entries (root, nonroot, specific users)
+- **SSH Policy**: SSH rules with `localpart:` entries targeting non-self destinations (e.g., `tag:server`) now distribute self-access rules to source nodes not in the destination set, matching Tailscale behavior
+  - Previously, source nodes that were not in the destination set received no SSH rules from that policy entry
+  - Now, when `localpart:` entries are present, source nodes receive self-scoped SSH rules (common + matching localpart) with their own IPs as principals
+  - This only applies when `localpart:` entries are present in the SSH rule's `users` field
+- **SSH Policy**: SSH `check` action now produces `HoldAndDelegate` in the wire format, matching Tailscale behavior
+  - Previously, `check` produced `Accept: true` with `SessionDuration` set to `checkPeriod`
+  - Now, `check` produces `{HoldAndDelegate: "https://unused/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID?local_user=$LOCAL_USER"}`
+  - `checkPeriod` is a server-side concept and no longer appears in the compiled SSH policy
 - **ACL Policy**: Wildcard (`*`) in ACL sources and destinations now resolves to Tailscale's CGNAT range (`100.64.0.0/10`) and ULA range (`fd7a:115c:a1e0::/48`) instead of all IPs (`0.0.0.0/0` and `::/0`) [#3036](https://github.com/juanfont/headscale/pull/3036)
   - This better matches Tailscale's security model where `*` means "any node in the tailnet" rather than "any IP address"
   - Policies relying on wildcard to match non-Tailscale IPs will need to use explicit CIDR ranges instead
@@ -29,6 +45,16 @@ overall our implementation was very close.
 
 ### Changes
 
+- **SSH Policy**: Add support for `user:*@domain` wildcard pattern in SSH source aliases, matching Tailscale behavior
+  - Matches all users whose email ends with the specified domain (e.g., `user:*@example.com` matches `alice@example.com`)
+- **SSH Policy**: SSH check (holdAndDelegate) rules are now sorted before accept rules in the compiled policy, matching Tailscale behavior
+  - This ensures first-match-wins semantics give check precedence when both action types target the same destination
+- **SSH Policy**: Add support for `acceptEnv` field in SSH rules, matching Tailscale behavior
+  - The `acceptEnv` field specifies environment variables that are accepted during SSH sessions
+  - Supports both literal names (e.g., `"TERM"`) and wildcard patterns (e.g., `"GIT_*"`)
+- **SSH Policy**: `checkPeriod:"always"` is now accepted in SSH rules, matching Tailscale behavior
+  - Previously, `"always"` could not be parsed as a duration and caused a policy parse error
+  - `checkPeriod` is a server-side concept and does not appear in the compiled SSH policy
 - **ACL Policy**: Add ICMP and IPv6-ICMP protocols to default filter rules when no protocol is specified [#3036](https://github.com/juanfont/headscale/pull/3036)
 - **ACL Policy**: Fix autogroup:self handling for tagged nodes - tagged nodes no longer incorrectly receive autogroup:self filter rules [#3036](https://github.com/juanfont/headscale/pull/3036)
 - **ACL Policy**: Use CIDR format for autogroup:self destination IPs matching Tailscale behavior [#3036](https://github.com/juanfont/headscale/pull/3036)

@@ -5,13 +5,11 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
-	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go4.org/netipx"
@@ -740,7 +738,7 @@ func TestUnmarshalPolicy(t *testing.T) {
 						Users: []SSHUser{
 							SSHUser("root"),
 						},
-						CheckPeriod: model.Duration(24 * time.Hour),
+						CheckPeriod: SSHCheckPeriod("24h"),
 					},
 				},
 			},

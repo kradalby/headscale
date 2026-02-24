@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/netip"
 	"testing"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
@@ -1204,11 +1203,7 @@ func TestSSHPolicyRules(t *testing.T) {
 						"root": "",
 					},
 					Action: &tailcfg.SSHAction{
-						Accept:                    true,
-						SessionDuration:           24 * time.Hour,
-						AllowAgentForwarding:      true,
-						AllowLocalPortForwarding:  true,
-						AllowRemotePortForwarding: true,
+						HoldAndDelegate: "https://unused/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID?local_user=$LOCAL_USER",
 					},
 				},
 			}},
@@ -1461,6 +1456,7 @@ func TestSSHPolicyRules(t *testing.T) {
 					},
 					SSHUsers: map[string]string{
 						"debian": "debian",
+						"root":   "",
 					},
 					Action: &tailcfg.SSHAction{
 						Accept:                    true,
@@ -1488,11 +1484,31 @@ func TestSSHPolicyRules(t *testing.T) {
 					}
 				]
 			}`,
-			// Per-user rules: alice gets mapped to "alice", bob gets mapped to "bob"
+			// Per-user common+localpart interleaved: each user gets root deny then localpart.
 			wantSSH: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
 				{
 					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.6"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.6"}},
 					SSHUsers:   map[string]string{"alice": "alice"},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.7"}},
+					SSHUsers:   map[string]string{"root": ""},
 					Action: &tailcfg.SSHAction{
 						Accept:                    true,
 						AllowAgentForwarding:      true,
@@ -1529,7 +1545,7 @@ func TestSSHPolicyRules(t *testing.T) {
 					}
 				]
 			}`,
-			// Common root rule for all sources, plus alice's per-user rule merging root
+			// Common root rule followed by alice's per-user localpart rule (interleaved).
 			wantSSH: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
 				{
 					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.6"}},
@@ -1543,7 +1559,7 @@ func TestSSHPolicyRules(t *testing.T) {
 				},
 				{
 					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.6"}},
-					SSHUsers:   map[string]string{"root": "root", "alice": "alice"},
+					SSHUsers:   map[string]string{"alice": "alice"},
 					Action: &tailcfg.SSHAction{
 						Accept:                    true,
 						AllowAgentForwarding:      true,

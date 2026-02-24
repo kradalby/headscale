@@ -292,6 +292,104 @@ func (u *Username) Resolve(_ *Policy, users types.Users, nodes views.Slice[types
 	return buildIPSetMultiErr(&ips, errs)
 }
 
+// UserWildcard represents a `user:*@domain` pattern that matches all users
+// whose email ends with the specified domain. Used in SSH source aliases.
+type UserWildcard struct {
+	Domain string
+}
+
+func isUserWildcard(str string) bool {
+	return strings.HasPrefix(str, "user:*@")
+}
+
+func (u *UserWildcard) Validate() error {
+	if u.Domain == "" {
+		return fmt.Errorf("%w: user wildcard domain is empty", ErrInvalidUsername)
+	}
+
+	return nil
+}
+
+func (u *UserWildcard) String() string {
+	return "user:*@" + u.Domain
+}
+
+func (u *UserWildcard) MarshalJSON() ([]byte, error) {
+	return json.Marshal(u.String())
+}
+
+func (u *UserWildcard) UnmarshalJSON(b []byte) error {
+	str := strings.Trim(string(b), `"`)
+	if !isUserWildcard(str) {
+		return fmt.Errorf("%w: expected user:*@domain, got %q", ErrInvalidUsername, str)
+	}
+
+	u.Domain = strings.TrimPrefix(str, "user:*@")
+
+	return u.Validate()
+}
+
+func (u *UserWildcard) CanBeTagOwner() bool {
+	return false
+}
+
+func (u *UserWildcard) CanBeAutoApprover() bool {
+	return false
+}
+
+func (u *UserWildcard) Resolve(
+	_ *Policy,
+	users types.Users,
+	nodes views.Slice[types.NodeView],
+) (*netipx.IPSet, error) {
+	var (
+		ips      netipx.IPSetBuilder
+		errs     []error
+		matchIDs = make(map[uint]bool)
+	)
+
+	// Find all users whose email matches @domain
+	for _, user := range users {
+		email := user.Email
+		if email == "" {
+			email = user.Name
+		}
+
+		atIdx := strings.LastIndex(email, "@")
+		if atIdx < 0 {
+			continue
+		}
+
+		emailDomain := email[atIdx+1:]
+		if strings.EqualFold(emailDomain, u.Domain) {
+			matchIDs[user.ID] = true
+		}
+	}
+
+	if len(matchIDs) == 0 {
+		errs = append(errs, fmt.Errorf(
+			"%w: no users match domain %q",
+			ErrUserNotFound, u.Domain,
+		))
+	}
+
+	for _, node := range nodes.All() {
+		if node.IsTagged() {
+			continue
+		}
+
+		if !node.User().Valid() {
+			continue
+		}
+
+		if matchIDs[node.User().ID()] {
+			node.AppendToIPSet(&ips)
+		}
+	}
+
+	return buildIPSetMultiErr(&ips, errs)
+}
+
 // Group is a special string which is always prefixed with `group:`.
 type Group string
 
@@ -761,6 +859,15 @@ func parseAlias(vs string) (Alias, error) {
 	switch {
 	case isWildcard(vs):
 		return Wildcard, nil
+	case isUserWildcard(vs):
+		uw := &UserWildcard{Domain: strings.TrimPrefix(vs, "user:*@")}
+
+		err := uw.Validate()
+		if err != nil {
+			return nil, err
+		}
+
+		return uw, nil
 	case isUser(vs):
 		return new(Username(vs)), nil
 	case isGroup(vs):
@@ -2106,13 +2213,44 @@ func (p *Policy) validate() error {
 	return nil
 }
 
+// SSHCheckPeriod represents a check period for SSH rules.
+// It accepts standard durations (e.g., "1h", "24h") and the special value "always".
+// This field is server-side only and does not appear in the compiled SSH wire format.
+type SSHCheckPeriod string
+
+func (p *SSHCheckPeriod) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(string(b), `"`)
+
+	// Accept "always" as a special value
+	if s == "always" {
+		*p = SSHCheckPeriod(s)
+
+		return nil
+	}
+
+	// Validate that it's a parseable duration
+	_, err := model.ParseDuration(s)
+	if err != nil {
+		return err
+	}
+
+	*p = SSHCheckPeriod(s)
+
+	return nil
+}
+
+func (p SSHCheckPeriod) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + string(p) + `"`), nil
+}
+
 // SSH controls who can ssh into which machines.
 type SSH struct {
 	Action       SSHAction      `json:"action"`
 	Sources      SSHSrcAliases  `json:"src"`
 	Destinations SSHDstAliases  `json:"dst"`
 	Users        SSHUsers       `json:"users"`
-	CheckPeriod  model.Duration `json:"checkPeriod,omitempty"`
+	CheckPeriod  SSHCheckPeriod `json:"checkPeriod,omitempty"`
+	AcceptEnv    []string       `json:"acceptEnv,omitempty"`
 }
 
 // SSHSrcAliases is a list of aliases that can be used as sources in an SSH rule.
@@ -2149,7 +2287,7 @@ func (a *SSHSrcAliases) UnmarshalJSON(b []byte) error {
 	*a = make([]Alias, len(aliases))
 	for i, alias := range aliases {
 		switch alias.Alias.(type) {
-		case *Username, *Group, *Tag, *AutoGroup:
+		case *Username, *UserWildcard, *Group, *Tag, *AutoGroup:
 			(*a)[i] = alias.Alias
 		default:
 			return fmt.Errorf("%w: %T", ErrSSHSourceAliasNotSupported, alias.Alias)
