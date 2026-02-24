@@ -12,6 +12,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go4.org/netipx"
 	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
 )
@@ -431,12 +432,19 @@ func TestCompileSSHPolicy_UserMapping(t *testing.T) {
 
 	nodes := types.Nodes{&nodeTaggedServer, &nodeTaggedDB, &nodeUser2Untagged}
 
+	acceptAction := &tailcfg.SSHAction{
+		Accept:                    true,
+		AllowAgentForwarding:      true,
+		AllowLocalPortForwarding:  true,
+		AllowRemotePortForwarding: true,
+	}
+	user2Principal := []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.3"}}
+
 	tests := []struct {
-		name         string
-		targetNode   types.Node
-		policy       *Policy
-		wantSSHUsers map[string]string
-		wantEmpty    bool
+		name       string
+		targetNode types.Node
+		policy     *Policy
+		want       *tailcfg.SSHPolicy
 	}{
 		{
 			name:       "specific user mapping",
@@ -457,9 +465,13 @@ func TestCompileSSHPolicy_UserMapping(t *testing.T) {
 					},
 				},
 			},
-			wantSSHUsers: map[string]string{
-				"ssh-it-user": "ssh-it-user",
-			},
+			want: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: user2Principal,
+					SSHUsers:   map[string]string{"root": "", "ssh-it-user": "ssh-it-user"},
+					Action:     acceptAction,
+				},
+			}},
 		},
 		{
 			name:       "multiple specific users",
@@ -480,11 +492,13 @@ func TestCompileSSHPolicy_UserMapping(t *testing.T) {
 					},
 				},
 			},
-			wantSSHUsers: map[string]string{
-				"ubuntu": "ubuntu",
-				"admin":  "admin",
-				"deploy": "deploy",
-			},
+			want: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: user2Principal,
+					SSHUsers:   map[string]string{"root": "", "ubuntu": "ubuntu", "admin": "admin", "deploy": "deploy"},
+					Action:     acceptAction,
+				},
+			}},
 		},
 		{
 			name:       "autogroup:nonroot only",
@@ -505,10 +519,13 @@ func TestCompileSSHPolicy_UserMapping(t *testing.T) {
 					},
 				},
 			},
-			wantSSHUsers: map[string]string{
-				"*":    "=",
-				"root": "",
-			},
+			want: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: user2Principal,
+					SSHUsers:   map[string]string{"*": "=", "root": ""},
+					Action:     acceptAction,
+				},
+			}},
 		},
 		{
 			name:       "root only",
@@ -529,9 +546,13 @@ func TestCompileSSHPolicy_UserMapping(t *testing.T) {
 					},
 				},
 			},
-			wantSSHUsers: map[string]string{
-				"root": "root",
-			},
+			want: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: user2Principal,
+					SSHUsers:   map[string]string{"root": "root"},
+					Action:     acceptAction,
+				},
+			}},
 		},
 		{
 			name:       "autogroup:nonroot plus root",
@@ -552,10 +573,13 @@ func TestCompileSSHPolicy_UserMapping(t *testing.T) {
 					},
 				},
 			},
-			wantSSHUsers: map[string]string{
-				"*":    "=",
-				"root": "root",
-			},
+			want: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: user2Principal,
+					SSHUsers:   map[string]string{"*": "=", "root": "root"},
+					Action:     acceptAction,
+				},
+			}},
 		},
 		{
 			name:       "mixed specific users and autogroups",
@@ -576,12 +600,13 @@ func TestCompileSSHPolicy_UserMapping(t *testing.T) {
 					},
 				},
 			},
-			wantSSHUsers: map[string]string{
-				"*":      "=",
-				"root":   "root",
-				"ubuntu": "ubuntu",
-				"admin":  "admin",
-			},
+			want: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: user2Principal,
+					SSHUsers:   map[string]string{"*": "=", "root": "root", "ubuntu": "ubuntu", "admin": "admin"},
+					Action:     acceptAction,
+				},
+			}},
 		},
 		{
 			name:       "no matching destination",
@@ -603,45 +628,387 @@ func TestCompileSSHPolicy_UserMapping(t *testing.T) {
 					},
 				},
 			},
-			wantEmpty: true,
+			want: &tailcfg.SSHPolicy{},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Validate the policy
-			err := tt.policy.validate()
+			require.NoError(t, tt.policy.validate())
+
+			got, err := tt.policy.compileSSHPolicy("unused-server-url", users, tt.targetNode.View(), nodes.ViewSlice())
 			require.NoError(t, err)
 
-			// Compile SSH policy
-			sshPolicy, err := tt.policy.compileSSHPolicy("unused-server-url", users, tt.targetNode.View(), nodes.ViewSlice())
-			require.NoError(t, err)
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("compileSSHPolicy() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
 
-			if tt.wantEmpty {
-				if sshPolicy == nil {
-					return // Expected empty result
+func TestCompileSSHPolicy_LocalpartMapping(t *testing.T) {
+	users := types.Users{
+		{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}},
+		{Name: "bob", Email: "bob@example.com", Model: gorm.Model{ID: 2}},
+		{Name: "charlie", Email: "charlie@other.com", Model: gorm.Model{ID: 3}},
+		{Name: "dave", Model: gorm.Model{ID: 4}}, // CLI user, no email
+	}
+
+	nodeTaggedServer := types.Node{
+		Hostname: "tagged-server",
+		IPv4:     createAddr("100.64.0.1"),
+		UserID:   new(users[0].ID),
+		User:     new(users[0]),
+		Tags:     []string{"tag:server"},
+	}
+	nodeAlice := types.Node{
+		Hostname: "alice-device",
+		IPv4:     createAddr("100.64.0.2"),
+		UserID:   new(users[0].ID),
+		User:     new(users[0]),
+	}
+	nodeBob := types.Node{
+		Hostname: "bob-device",
+		IPv4:     createAddr("100.64.0.3"),
+		UserID:   new(users[1].ID),
+		User:     new(users[1]),
+	}
+	nodeCharlie := types.Node{
+		Hostname: "charlie-device",
+		IPv4:     createAddr("100.64.0.4"),
+		UserID:   new(users[2].ID),
+		User:     new(users[2]),
+	}
+	nodeDave := types.Node{
+		Hostname: "dave-device",
+		IPv4:     createAddr("100.64.0.5"),
+		UserID:   new(users[3].ID),
+		User:     new(users[3]),
+	}
+
+	nodes := types.Nodes{&nodeTaggedServer, &nodeAlice, &nodeBob, &nodeCharlie, &nodeDave}
+
+	acceptAction := &tailcfg.SSHAction{
+		Accept:                    true,
+		AllowAgentForwarding:      true,
+		AllowLocalPortForwarding:  true,
+		AllowRemotePortForwarding: true,
+	}
+
+	tests := []struct {
+		name       string
+		users      types.Users // nil → use default users
+		nodes      types.Nodes // nil → use default nodes
+		targetNode types.Node
+		policy     *Policy
+		want       *tailcfg.SSHPolicy
+	}{
+		{
+			name:       "localpart only",
+			targetNode: nodeTaggedServer,
+			policy: &Policy{
+				TagOwners: TagOwners{
+					Tag("tag:server"): Owners{up("alice@example.com")},
+				},
+				SSHs: []SSH{
+					{
+						Action:       "accept",
+						Sources:      SSHSrcAliases{agp("autogroup:member")},
+						Destinations: SSHDstAliases{tp("tag:server")},
+						Users:        []SSHUser{SSHUser("localpart:*@example.com")},
+					},
+				},
+			},
+			// Per-user common+localpart rules interleaved, then non-matching users.
+			want: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.2"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.2"}},
+					SSHUsers:   map[string]string{"alice": "alice"},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.3"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.3"}},
+					SSHUsers:   map[string]string{"bob": "bob"},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.4"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.5"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action:     acceptAction,
+				},
+			}},
+		},
+		{
+			name:       "localpart with root",
+			targetNode: nodeTaggedServer,
+			policy: &Policy{
+				TagOwners: TagOwners{
+					Tag("tag:server"): Owners{up("alice@example.com")},
+				},
+				SSHs: []SSH{
+					{
+						Action:       "accept",
+						Sources:      SSHSrcAliases{agp("autogroup:member")},
+						Destinations: SSHDstAliases{tp("tag:server")},
+						Users:        []SSHUser{SSHUser("localpart:*@example.com"), "root"},
+					},
+				},
+			},
+			// Per-user common+localpart rules interleaved, then non-matching users.
+			want: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.2"}},
+					SSHUsers:   map[string]string{"root": "root"},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.2"}},
+					SSHUsers:   map[string]string{"alice": "alice"},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.3"}},
+					SSHUsers:   map[string]string{"root": "root"},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.3"}},
+					SSHUsers:   map[string]string{"bob": "bob"},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.4"}},
+					SSHUsers:   map[string]string{"root": "root"},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.5"}},
+					SSHUsers:   map[string]string{"root": "root"},
+					Action:     acceptAction,
+				},
+			}},
+		},
+		{
+			name:       "localpart no matching users in domain",
+			targetNode: nodeTaggedServer,
+			policy: &Policy{
+				TagOwners: TagOwners{
+					Tag("tag:server"): Owners{up("alice@example.com")},
+				},
+				SSHs: []SSH{
+					{
+						Action:       "accept",
+						Sources:      SSHSrcAliases{agp("autogroup:member")},
+						Destinations: SSHDstAliases{tp("tag:server")},
+						Users:        []SSHUser{SSHUser("localpart:*@nonexistent.com")},
+					},
+				},
+			},
+			// No localpart matches, but per-user common rules still emitted (root deny)
+			want: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.2"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.3"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.4"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.5"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action:     acceptAction,
+				},
+			}},
+		},
+		{
+			name: "localpart with special chars in email",
+			users: types.Users{
+				{Name: "dave+sshuser", Email: "dave+sshuser@example.com", Model: gorm.Model{ID: 10}},
+			},
+			nodes: func() types.Nodes {
+				specialUser := types.User{Name: "dave+sshuser", Email: "dave+sshuser@example.com", Model: gorm.Model{ID: 10}}
+				n := types.Node{
+					Hostname: "special-device",
+					IPv4:     createAddr("100.64.0.10"),
+					UserID:   new(specialUser.ID),
+					User:     &specialUser,
 				}
 
-				assert.Empty(t, sshPolicy.Rules, "SSH policy should be empty when no rules match")
+				return types.Nodes{&nodeTaggedServer, &n}
+			}(),
+			targetNode: nodeTaggedServer,
+			policy: &Policy{
+				TagOwners: TagOwners{
+					Tag("tag:server"): Owners{up("dave+sshuser@example.com")},
+				},
+				SSHs: []SSH{
+					{
+						Action:       "accept",
+						Sources:      SSHSrcAliases{agp("autogroup:member")},
+						Destinations: SSHDstAliases{tp("tag:server")},
+						Users:        []SSHUser{SSHUser("localpart:*@example.com")},
+					},
+				},
+			},
+			// Per-user common rule (root deny), then separate localpart rule.
+			want: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.10"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.10"}},
+					SSHUsers:   map[string]string{"dave+sshuser": "dave+sshuser"},
+					Action:     acceptAction,
+				},
+			}},
+		},
+		{
+			name: "localpart excludes CLI users without email",
+			users: types.Users{
+				{Name: "dave", Model: gorm.Model{ID: 4}},
+			},
+			nodes: func() types.Nodes {
+				cliUser := types.User{Name: "dave", Model: gorm.Model{ID: 4}}
+				n := types.Node{
+					Hostname: "dave-cli-device",
+					IPv4:     createAddr("100.64.0.5"),
+					UserID:   new(cliUser.ID),
+					User:     &cliUser,
+				}
 
-				return
+				return types.Nodes{&nodeTaggedServer, &n}
+			}(),
+			targetNode: nodeTaggedServer,
+			policy: &Policy{
+				TagOwners: TagOwners{
+					Tag("tag:server"): Owners{up("dave@")},
+				},
+				SSHs: []SSH{
+					{
+						Action:       "accept",
+						Sources:      SSHSrcAliases{agp("autogroup:member")},
+						Destinations: SSHDstAliases{tp("tag:server")},
+						Users:        []SSHUser{SSHUser("localpart:*@example.com")},
+					},
+				},
+			},
+			// No localpart matches (CLI user, no email), but implicit root deny emits common rule
+			want: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.5"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action:     acceptAction,
+				},
+			}},
+		},
+		{
+			name:       "localpart with multiple domains",
+			targetNode: nodeTaggedServer,
+			policy: &Policy{
+				TagOwners: TagOwners{
+					Tag("tag:server"): Owners{up("alice@example.com")},
+				},
+				SSHs: []SSH{
+					{
+						Action:       "accept",
+						Sources:      SSHSrcAliases{agp("autogroup:member")},
+						Destinations: SSHDstAliases{tp("tag:server")},
+						Users: []SSHUser{
+							SSHUser("localpart:*@example.com"),
+							SSHUser("localpart:*@other.com"),
+						},
+					},
+				},
+			},
+			// Per-user common+localpart rules interleaved:
+			// alice/bob match *@example.com, charlie matches *@other.com.
+			want: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.2"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.2"}},
+					SSHUsers:   map[string]string{"alice": "alice"},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.3"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.3"}},
+					SSHUsers:   map[string]string{"bob": "bob"},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.4"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.4"}},
+					SSHUsers:   map[string]string{"charlie": "charlie"},
+					Action:     acceptAction,
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.5"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action:     acceptAction,
+				},
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testUsers := users
+			if tt.users != nil {
+				testUsers = tt.users
 			}
 
-			require.NotNil(t, sshPolicy)
-			require.Len(t, sshPolicy.Rules, 1, "Should have exactly one SSH rule")
+			testNodes := nodes
+			if tt.nodes != nil {
+				testNodes = tt.nodes
+			}
 
-			rule := sshPolicy.Rules[0]
-			assert.Equal(t, tt.wantSSHUsers, rule.SSHUsers, "SSH users mapping should match expected")
+			require.NoError(t, tt.policy.validate())
 
-			// Verify principals are set correctly (should contain user2's untagged device IP since that's the source)
-			require.Len(t, rule.Principals, 1)
-			assert.Equal(t, "100.64.0.3", rule.Principals[0].NodeIP)
+			got, err := tt.policy.compileSSHPolicy(
+				"unused-server-url", testUsers, tt.targetNode.View(), testNodes.ViewSlice(),
+			)
+			require.NoError(t, err)
 
-			// Verify action is set correctly
-			assert.True(t, rule.Action.Accept)
-			assert.True(t, rule.Action.AllowAgentForwarding)
-			assert.True(t, rule.Action.AllowLocalPortForwarding)
-			assert.True(t, rule.Action.AllowRemotePortForwarding)
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("compileSSHPolicy() unexpected result (-want +got):\n%s", diff)
+			}
 		})
 	}
 }
@@ -687,8 +1054,7 @@ func TestCompileSSHPolicy_CheckAction(t *testing.T) {
 		},
 	}
 
-	err := policy.validate()
-	require.NoError(t, err)
+	require.NoError(t, policy.validate())
 
 	sshPolicy, err := policy.compileSSHPolicy("unused-server-url", users, nodeTaggedServer.View(), nodes.ViewSlice())
 	require.NoError(t, err)
@@ -700,6 +1066,7 @@ func TestCompileSSHPolicy_CheckAction(t *testing.T) {
 	// Verify SSH users are correctly mapped
 	expectedUsers := map[string]string{
 		"ssh-it-user": "ssh-it-user",
+		"root":        "",
 	}
 	assert.Equal(t, expectedUsers, rule.SSHUsers)
 
@@ -833,28 +1200,28 @@ func TestSSHIntegrationReproduction(t *testing.T) {
 		},
 	}
 
-	// Validate policy
-	err := policy.validate()
-	require.NoError(t, err)
+	require.NoError(t, policy.validate())
 
 	// Test SSH policy compilation for node2 (owned by user2, who is in the group)
-	sshPolicy, err := policy.compileSSHPolicy("unused-server-url", users, node2.View(), nodes.ViewSlice())
+	got, err := policy.compileSSHPolicy("unused-server-url", users, node2.View(), nodes.ViewSlice())
 	require.NoError(t, err)
-	require.NotNil(t, sshPolicy)
-	require.Len(t, sshPolicy.Rules, 1)
 
-	rule := sshPolicy.Rules[0]
+	want := &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+		{
+			Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.2"}},
+			SSHUsers:   map[string]string{"root": "", "ssh-it-user": "ssh-it-user"},
+			Action: &tailcfg.SSHAction{
+				Accept:                    true,
+				AllowAgentForwarding:      true,
+				AllowLocalPortForwarding:  true,
+				AllowRemotePortForwarding: true,
+			},
+		},
+	}}
 
-	// This was the failing assertion in integration test - sshUsers was empty
-	assert.NotEmpty(t, rule.SSHUsers, "SSH users should not be empty")
-	assert.Contains(t, rule.SSHUsers, "ssh-it-user", "ssh-it-user should be present in SSH users")
-	assert.Equal(t, "ssh-it-user", rule.SSHUsers["ssh-it-user"], "ssh-it-user should map to itself")
-
-	// Verify that ssh-it-user is correctly mapped
-	expectedUsers := map[string]string{
-		"ssh-it-user": "ssh-it-user",
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("compileSSHPolicy() mismatch (-want +got):\n%s", diff)
 	}
-	assert.Equal(t, expectedUsers, rule.SSHUsers, "ssh-it-user should be mapped to itself")
 }
 
 // TestSSHJSONSerialization verifies that the SSH policy can be properly serialized
@@ -885,40 +1252,38 @@ func TestSSHJSONSerialization(t *testing.T) {
 		},
 	}
 
-	err := policy.validate()
+	require.NoError(t, policy.validate())
+
+	got, err := policy.compileSSHPolicy("unused-server-url", users, node.View(), nodes.ViewSlice())
 	require.NoError(t, err)
 
-	sshPolicy, err := policy.compileSSHPolicy("unused-server-url", users, node.View(), nodes.ViewSlice())
-	require.NoError(t, err)
-	require.NotNil(t, sshPolicy)
+	want := &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+		{
+			Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.1"}},
+			SSHUsers:   map[string]string{"root": "", "ssh-it-user": "ssh-it-user", "ubuntu": "ubuntu", "admin": "admin"},
+			Action: &tailcfg.SSHAction{
+				Accept:                    true,
+				AllowAgentForwarding:      true,
+				AllowLocalPortForwarding:  true,
+				AllowRemotePortForwarding: true,
+			},
+		},
+	}}
 
-	// Serialize to JSON to verify structure
-	jsonData, err := json.MarshalIndent(sshPolicy, "", "  ")
-	require.NoError(t, err)
-
-	// Parse back to verify structure
-	var parsed tailcfg.SSHPolicy
-
-	err = json.Unmarshal(jsonData, &parsed)
-	require.NoError(t, err)
-
-	// Verify the parsed structure has the expected SSH users
-	require.Len(t, parsed.Rules, 1)
-	rule := parsed.Rules[0]
-
-	expectedUsers := map[string]string{
-		"ssh-it-user": "ssh-it-user",
-		"ubuntu":      "ubuntu",
-		"admin":       "admin",
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("compileSSHPolicy() mismatch (-want +got):\n%s", diff)
 	}
-	assert.Equal(t, expectedUsers, rule.SSHUsers, "SSH users should survive JSON round-trip")
 
-	// Verify JSON contains the SSH users (not empty)
-	assert.Contains(t, string(jsonData), `"ssh-it-user"`)
-	assert.Contains(t, string(jsonData), `"ubuntu"`)
-	assert.Contains(t, string(jsonData), `"admin"`)
-	assert.NotContains(t, string(jsonData), `"sshUsers": {}`, "SSH users should not be empty")
-	assert.NotContains(t, string(jsonData), `"sshUsers": null`, "SSH users should not be null")
+	// Verify JSON round-trip preserves the full structure
+	jsonData, err := json.MarshalIndent(got, "", "  ")
+	require.NoError(t, err)
+
+	var parsed tailcfg.SSHPolicy
+	require.NoError(t, json.Unmarshal(jsonData, &parsed))
+
+	if diff := cmp.Diff(want, &parsed); diff != "" {
+		t.Errorf("JSON round-trip mismatch (-want +got):\n%s", diff)
+	}
 }
 
 func TestCompileFilterRulesForNodeWithAutogroupSelf(t *testing.T) {
@@ -2244,6 +2609,89 @@ func TestCompileSSHPolicy_CheckPeriodVariants(t *testing.T) {
 	}
 }
 
+func TestIPSetToPrincipals(t *testing.T) {
+	tests := []struct {
+		name string
+		ips  []string // IPs to add to the set
+		want []*tailcfg.SSHPrincipal
+	}{
+		{
+			name: "nil input",
+			ips:  nil,
+			want: nil,
+		},
+		{
+			name: "single IPv4",
+			ips:  []string{"100.64.0.1"},
+			want: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.1"}},
+		},
+		{
+			name: "multiple IPs",
+			ips:  []string{"100.64.0.1", "100.64.0.2"},
+			want: []*tailcfg.SSHPrincipal{
+				{NodeIP: "100.64.0.1"},
+				{NodeIP: "100.64.0.2"},
+			},
+		},
+		{
+			name: "IPv6",
+			ips:  []string{"fd7a:115c:a1e0::1"},
+			want: []*tailcfg.SSHPrincipal{{NodeIP: "fd7a:115c:a1e0::1"}},
+		},
+		{
+			name: "mixed IPv4 and IPv6",
+			ips:  []string{"100.64.0.1", "fd7a:115c:a1e0::1"},
+			want: []*tailcfg.SSHPrincipal{
+				{NodeIP: "100.64.0.1"},
+				{NodeIP: "fd7a:115c:a1e0::1"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var ipSet *netipx.IPSet
+
+			if tt.ips != nil {
+				var builder netipx.IPSetBuilder
+
+				for _, ip := range tt.ips {
+					addr := netip.MustParseAddr(ip)
+					builder.Add(addr)
+				}
+
+				var err error
+
+				ipSet, err = builder.IPSet()
+				require.NoError(t, err)
+			}
+
+			got := ipSetToPrincipals(ipSet)
+
+			// Sort for deterministic comparison
+			sortPrincipals := func(p []*tailcfg.SSHPrincipal) {
+				slices.SortFunc(p, func(a, b *tailcfg.SSHPrincipal) int {
+					if a.NodeIP < b.NodeIP {
+						return -1
+					}
+
+					if a.NodeIP > b.NodeIP {
+						return 1
+					}
+
+					return 0
+				})
+			}
+			sortPrincipals(got)
+			sortPrincipals(tt.want)
+
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("ipSetToPrincipals() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestSSHCheckParams(t *testing.T) {
 	users := types.Users{
 		{Name: "user1", Model: gorm.Model{ID: 1}},
@@ -2420,6 +2868,222 @@ func TestSSHCheckParams(t *testing.T) {
 
 			if tt.wantOK {
 				assert.Equal(t, tt.wantPeriod, period, "period mismatch")
+			}
+		})
+	}
+}
+
+func TestResolveLocalparts(t *testing.T) {
+	tests := []struct {
+		name    string
+		entries []SSHUser
+		users   types.Users
+		want    map[uint]string
+	}{
+		{
+			name:    "no entries",
+			entries: nil,
+			users:   types.Users{{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}}},
+			want:    nil,
+		},
+		{
+			name:    "single match",
+			entries: []SSHUser{"localpart:*@example.com"},
+			users: types.Users{
+				{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}},
+			},
+			want: map[uint]string{1: "alice"},
+		},
+		{
+			name:    "domain mismatch",
+			entries: []SSHUser{"localpart:*@other.com"},
+			users: types.Users{
+				{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}},
+			},
+			want: map[uint]string{},
+		},
+		{
+			name:    "case insensitive domain",
+			entries: []SSHUser{"localpart:*@EXAMPLE.COM"},
+			users: types.Users{
+				{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}},
+			},
+			want: map[uint]string{1: "alice"},
+		},
+		{
+			name:    "user without email skipped",
+			entries: []SSHUser{"localpart:*@example.com"},
+			users: types.Users{
+				{Name: "cli-user", Model: gorm.Model{ID: 1}},
+			},
+			want: map[uint]string{},
+		},
+		{
+			name: "multiple domains multiple users",
+			entries: []SSHUser{
+				"localpart:*@example.com",
+				"localpart:*@other.com",
+			},
+			users: types.Users{
+				{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}},
+				{Name: "bob", Email: "bob@other.com", Model: gorm.Model{ID: 2}},
+				{Name: "charlie", Email: "charlie@nope.com", Model: gorm.Model{ID: 3}},
+			},
+			want: map[uint]string{1: "alice", 2: "bob"},
+		},
+		{
+			name:    "special chars in local part",
+			entries: []SSHUser{"localpart:*@example.com"},
+			users: types.Users{
+				{Name: "d", Email: "dave+ssh@example.com", Model: gorm.Model{ID: 1}},
+			},
+			want: map[uint]string{1: "dave+ssh"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveLocalparts(tt.entries, tt.users)
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("resolveLocalparts() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestGroupSourcesByUser(t *testing.T) {
+	alice := types.User{
+		Name: "alice", Email: "alice@example.com",
+		Model: gorm.Model{ID: 1},
+	}
+	bob := types.User{
+		Name: "bob", Email: "bob@example.com",
+		Model: gorm.Model{ID: 2},
+	}
+
+	nodeAlice := types.Node{
+		Hostname: "alice-dev",
+		IPv4:     createAddr("100.64.0.1"),
+		UserID:   &alice.ID,
+		User:     &alice,
+	}
+	nodeBob := types.Node{
+		Hostname: "bob-dev",
+		IPv4:     createAddr("100.64.0.2"),
+		UserID:   &bob.ID,
+		User:     &bob,
+	}
+	nodeTagged := types.Node{
+		Hostname: "tagged",
+		IPv4:     createAddr("100.64.0.3"),
+		UserID:   &alice.ID,
+		User:     &alice,
+		Tags:     []string{"tag:server"},
+	}
+
+	// Build an IPSet that includes all node IPs
+	allIPs := func() *netipx.IPSet {
+		var b netipx.IPSetBuilder
+		b.AddPrefix(netip.MustParsePrefix("100.64.0.0/24"))
+
+		s, _ := b.IPSet()
+
+		return s
+	}()
+
+	tests := []struct {
+		name          string
+		nodes         types.Nodes
+		srcIPs        *netipx.IPSet
+		wantUIDs      []uint
+		wantUserCount int
+		wantHasTagged bool
+		wantTaggedLen int
+		wantAliceIP   string
+		wantBobIP     string
+		wantTaggedIP  string
+	}{
+		{
+			name:          "user-owned only",
+			nodes:         types.Nodes{&nodeAlice, &nodeBob},
+			srcIPs:        allIPs,
+			wantUIDs:      []uint{1, 2},
+			wantUserCount: 2,
+			wantAliceIP:   "100.64.0.1",
+			wantBobIP:     "100.64.0.2",
+		},
+		{
+			name:          "mixed user and tagged",
+			nodes:         types.Nodes{&nodeAlice, &nodeTagged},
+			srcIPs:        allIPs,
+			wantUIDs:      []uint{1},
+			wantUserCount: 1,
+			wantHasTagged: true,
+			wantTaggedLen: 1,
+			wantAliceIP:   "100.64.0.1",
+			wantTaggedIP:  "100.64.0.3",
+		},
+		{
+			name:          "tagged only",
+			nodes:         types.Nodes{&nodeTagged},
+			srcIPs:        allIPs,
+			wantUIDs:      nil,
+			wantUserCount: 0,
+			wantHasTagged: true,
+			wantTaggedLen: 1,
+		},
+		{
+			name:  "node not in srcIPs excluded",
+			nodes: types.Nodes{&nodeAlice, &nodeBob},
+			srcIPs: func() *netipx.IPSet {
+				var b netipx.IPSetBuilder
+				b.Add(netip.MustParseAddr("100.64.0.1")) // only alice
+
+				s, _ := b.IPSet()
+
+				return s
+			}(),
+			wantUIDs:      []uint{1},
+			wantUserCount: 1,
+			wantAliceIP:   "100.64.0.1",
+		},
+		{
+			name:          "sorted by user ID",
+			nodes:         types.Nodes{&nodeBob, &nodeAlice}, // reverse order
+			srcIPs:        allIPs,
+			wantUIDs:      []uint{1, 2}, // still sorted
+			wantUserCount: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sortedUIDs, byUser, tagged := groupSourcesByUser(
+				tt.nodes.ViewSlice(), tt.srcIPs,
+			)
+
+			assert.Equal(t, tt.wantUIDs, sortedUIDs, "sortedUIDs")
+			assert.Len(t, byUser, tt.wantUserCount, "byUser count")
+
+			if tt.wantHasTagged {
+				assert.Len(t, tagged, tt.wantTaggedLen, "tagged count")
+			} else {
+				assert.Empty(t, tagged, "tagged should be empty")
+			}
+
+			if tt.wantAliceIP != "" {
+				require.Contains(t, byUser, uint(1))
+				assert.Equal(t, tt.wantAliceIP, byUser[1][0].NodeIP)
+			}
+
+			if tt.wantBobIP != "" {
+				require.Contains(t, byUser, uint(2))
+				assert.Equal(t, tt.wantBobIP, byUser[2][0].NodeIP)
+			}
+
+			if tt.wantTaggedIP != "" {
+				require.NotEmpty(t, tagged)
+				assert.Equal(t, tt.wantTaggedIP, tagged[0].NodeIP)
 			}
 		})
 	}

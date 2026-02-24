@@ -1077,6 +1077,8 @@ func TestSSHPolicyRules(t *testing.T) {
 		{Name: "user1", Model: gorm.Model{ID: 1}},
 		{Name: "user2", Model: gorm.Model{ID: 2}},
 		{Name: "user3", Model: gorm.Model{ID: 3}},
+		{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 4}},
+		{Name: "bob", Email: "bob@example.com", Model: gorm.Model{ID: 5}},
 	}
 
 	// Create standard node setups used across tests
@@ -1108,6 +1110,20 @@ func TestSSHPolicyRules(t *testing.T) {
 		UserID:   new(uint(1)),
 		User:     new(users[0]),
 		Tags:     []string{"tag:server"},
+	}
+
+	// Nodes for localpart tests (users with email addresses)
+	nodeAlice := types.Node{
+		Hostname: "alice-device",
+		IPv4:     ap("100.64.0.6"),
+		UserID:   new(uint(4)),
+		User:     new(users[3]),
+	}
+	nodeBob := types.Node{
+		Hostname: "bob-device",
+		IPv4:     ap("100.64.0.7"),
+		UserID:   new(uint(5)),
+		User:     new(users[4]),
 	}
 
 	tests := []struct {
@@ -1446,7 +1462,110 @@ func TestSSHPolicyRules(t *testing.T) {
 					},
 					SSHUsers: map[string]string{
 						"debian": "debian",
+						"root":   "",
 					},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+			}},
+		},
+		{
+			name:       "localpart-maps-email-to-os-user",
+			targetNode: nodeTaggedServer,
+			peers:      types.Nodes{&nodeAlice, &nodeBob},
+			policy: `{
+				"tagOwners": {
+					"tag:server": ["alice@example.com"]
+				},
+				"ssh": [
+					{
+						"action": "accept",
+						"src": ["autogroup:member"],
+						"dst": ["tag:server"],
+						"users": ["localpart:*@example.com"]
+					}
+				]
+			}`,
+			// Per-user common+localpart interleaved: each user gets root deny then localpart.
+			wantSSH: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.6"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.6"}},
+					SSHUsers:   map[string]string{"alice": "alice"},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.7"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.7"}},
+					SSHUsers:   map[string]string{"bob": "bob"},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+			}},
+		},
+		{
+			name:       "localpart-combined-with-root",
+			targetNode: nodeTaggedServer,
+			peers:      types.Nodes{&nodeAlice},
+			policy: `{
+				"tagOwners": {
+					"tag:server": ["alice@example.com"]
+				},
+				"ssh": [
+					{
+						"action": "accept",
+						"src": ["autogroup:member"],
+						"dst": ["tag:server"],
+						"users": ["localpart:*@example.com", "root"]
+					}
+				]
+			}`,
+			// Common root rule followed by alice's per-user localpart rule (interleaved).
+			wantSSH: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.6"}},
+					SSHUsers:   map[string]string{"root": "root"},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.6"}},
+					SSHUsers:   map[string]string{"alice": "alice"},
 					Action: &tailcfg.SSHAction{
 						Accept:                    true,
 						AllowAgentForwarding:      true,

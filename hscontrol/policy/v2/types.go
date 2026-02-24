@@ -47,6 +47,7 @@ var (
 	ErrSSHCheckPeriodBelowMin             = errors.New("checkPeriod below minimum of 1 minute")
 	ErrSSHCheckPeriodAboveMax             = errors.New("checkPeriod above maximum of 168 hours (1 week)")
 	ErrSSHCheckPeriodOnNonCheck           = errors.New("checkPeriod is only valid with action \"check\"")
+	ErrInvalidLocalpart                   = errors.New("invalid localpart format, must be localpart:*@<domain>")
 )
 
 // SSH check period constants per Tailscale docs:
@@ -1965,6 +1966,14 @@ func (p *Policy) validate() error {
 					continue
 				}
 			}
+
+			if user.IsLocalpart() {
+				_, err := user.ParseLocalpart()
+				if err != nil {
+					errs = append(errs, err)
+					continue
+				}
+			}
 		}
 
 		for _, src := range ssh.Sources {
@@ -2191,6 +2200,7 @@ type SSH struct {
 	Destinations SSHDstAliases   `json:"dst"`
 	Users        SSHUsers        `json:"users"`
 	CheckPeriod  *SSHCheckPeriod `json:"checkPeriod,omitempty"`
+	AcceptEnv    []string        `json:"acceptEnv,omitempty"`
 }
 
 // SSHSrcAliases is a list of aliases that can be used as sources in an SSH rule.
@@ -2342,6 +2352,11 @@ type SSHDstAliases []Alias
 
 type SSHUsers []SSHUser
 
+// SSHUserLocalpartPrefix is the prefix for localpart SSH user entries.
+// Format: localpart:*@<domain>
+// See: https://tailscale.com/docs/features/tailscale-ssh#users
+const SSHUserLocalpartPrefix = "localpart:"
+
 func (u SSHUsers) ContainsRoot() bool {
 	return slices.Contains(u, "root")
 }
@@ -2350,9 +2365,25 @@ func (u SSHUsers) ContainsNonRoot() bool {
 	return slices.Contains(u, SSHUser(AutoGroupNonRoot))
 }
 
+// ContainsLocalpart returns true if any entry has the localpart: prefix.
+func (u SSHUsers) ContainsLocalpart() bool {
+	return slices.ContainsFunc(u, func(user SSHUser) bool {
+		return user.IsLocalpart()
+	})
+}
+
+// NormalUsers returns all SSH users that are not root, autogroup:nonroot,
+// or localpart: entries.
 func (u SSHUsers) NormalUsers() []SSHUser {
 	return slicesx.Filter(nil, u, func(user SSHUser) bool {
-		return user != "root" && user != SSHUser(AutoGroupNonRoot)
+		return user != "root" && user != SSHUser(AutoGroupNonRoot) && !user.IsLocalpart()
+	})
+}
+
+// LocalpartEntries returns only the localpart: prefixed entries.
+func (u SSHUsers) LocalpartEntries() []SSHUser {
+	return slicesx.Filter(nil, u, func(user SSHUser) bool {
+		return user.IsLocalpart()
 	})
 }
 
@@ -2360,6 +2391,41 @@ type SSHUser string
 
 func (u SSHUser) String() string {
 	return string(u)
+}
+
+// IsLocalpart returns true if the SSHUser has the localpart: prefix.
+func (u SSHUser) IsLocalpart() bool {
+	return strings.HasPrefix(string(u), SSHUserLocalpartPrefix)
+}
+
+// ParseLocalpart validates and extracts the domain from a localpart: entry.
+// The expected format is localpart:*@<domain>.
+// Returns the domain part or an error if the format is invalid.
+func (u SSHUser) ParseLocalpart() (string, error) {
+	if !u.IsLocalpart() {
+		return "", fmt.Errorf("%w: missing prefix %q in %q", ErrInvalidLocalpart, SSHUserLocalpartPrefix, u)
+	}
+
+	pattern := strings.TrimPrefix(string(u), SSHUserLocalpartPrefix)
+
+	// Must be *@<domain>
+	atIdx := strings.LastIndex(pattern, "@")
+	if atIdx < 0 {
+		return "", fmt.Errorf("%w: missing @ in %q", ErrInvalidLocalpart, u)
+	}
+
+	localPart := pattern[:atIdx]
+	domain := pattern[atIdx+1:]
+
+	if localPart != "*" {
+		return "", fmt.Errorf("%w: local part must be *, got %q in %q", ErrInvalidLocalpart, localPart, u)
+	}
+
+	if domain == "" {
+		return "", fmt.Errorf("%w: empty domain in %q", ErrInvalidLocalpart, u)
+	}
+
+	return domain, nil
 }
 
 // MarshalJSON marshals the SSHUser to JSON.
