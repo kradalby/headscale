@@ -260,6 +260,7 @@ jobs:
           - TestSSHCheckModeCheckPeriodCLI
           - TestSSHCheckModeAutoApprove
           - TestSSHCheckModeNegativeCLI
+          - TestSSHLocalpart
           - TestTagsAuthKeyWithTagRequestDifferentTag
           - TestTagsAuthKeyWithTagNoAdvertiseFlag
           - TestTagsAuthKeyWithTagCannotAddViaCLI
