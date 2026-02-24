@@ -12,8 +12,7 @@ import (
 
 func newTestStateForSSHCheck() *State {
 	return &State{
-		sshCheckGlobalAuth:   make(map[types.NodeID]time.Time),
-		sshCheckSpecificAuth: make(map[sshCheckPair]time.Time),
+		sshCheckAuth: make(map[sshCheckPair]time.Time),
 	}
 }
 

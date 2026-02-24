@@ -99,27 +99,24 @@ type State struct {
 	// primaryRoutes tracks primary route assignments for nodes
 	primaryRoutes *routes.PrimaryRoutes
 
-	// sshCheckGlobalAuth tracks when source nodes last completed SSH check
-	// auth for rules without explicit checkPeriod. Auth covers any destination.
+	// sshCheckAuth tracks when source nodes last completed SSH check auth.
 	//
-	// Tailscale docs: "Once re-authenticated to a destination, the user can
-	// access the device and any other device in the tailnet without
-	// re-verification for the next 12 hours."
-	// Ref: https://tailscale.com/kb/1193/tailscale-ssh
+	// For rules without explicit checkPeriod (default 12h), auth covers any
+	// destination — keyed by (src, Dst=0) where 0 is a sentinel meaning "any".
+	// Ref: "Once re-authenticated to a destination, the user can access the
+	// device and any other device in the tailnet without re-verification
+	// for the next 12 hours." — https://tailscale.com/kb/1193/tailscale-ssh
+	//
+	// For rules with explicit checkPeriod, auth covers only that specific
+	// destination — keyed by (src, dst).
+	// Ref: "If a different check period is specified for the connection,
+	// then the user can access specifically this device without
+	// re-verification for the duration of the check period."
+	//
 	// Ref: https://github.com/tailscale/tailscale/issues/10480
 	// Ref: https://github.com/tailscale/tailscale/issues/7125
-	sshCheckGlobalAuth map[types.NodeID]time.Time
-
-	// sshCheckSpecificAuth tracks when source nodes last completed SSH check
-	// auth for rules with explicit checkPeriod. Auth covers only that destination.
-	//
-	// Tailscale docs: "If a different check period is specified for the
-	// connection, then the user can access specifically this device without
-	// re-verification for the duration of the check period."
-	// Ref: https://tailscale.com/kb/1193/tailscale-ssh
-	sshCheckSpecificAuth map[sshCheckPair]time.Time
-
-	sshCheckMu sync.RWMutex
+	sshCheckAuth map[sshCheckPair]time.Time
+	sshCheckMu   sync.RWMutex
 }
 
 // NewState creates and initializes a new State instance, setting up the database,
@@ -219,8 +216,7 @@ func NewState(cfg *types.Config) (*State, error) {
 		primaryRoutes: routes.New(),
 		nodeStore:     nodeStore,
 
-		sshCheckGlobalAuth:   make(map[types.NodeID]time.Time),
-		sshCheckSpecificAuth: make(map[sshCheckPair]time.Time),
+		sshCheckAuth: make(map[sshCheckPair]time.Time),
 	}, nil
 }
 
@@ -1108,31 +1104,33 @@ func (s *State) SetAuthCacheEntry(id types.AuthID, entry types.AuthRequest) {
 
 // RecordSSHCheckAuth records a successful SSH check authentication.
 // If explicit is true (rule had explicit checkPeriod), records per (src, dst).
-// If explicit is false (default period), records per src (any destination).
+// If explicit is false (default period), records per src with Dst=0 sentinel,
+// meaning auth covers any destination.
 func (s *State) RecordSSHCheckAuth(src, dst types.NodeID, explicit bool) {
 	s.sshCheckMu.Lock()
 	defer s.sshCheckMu.Unlock()
 
-	now := time.Now()
+	key := sshCheckPair{Src: src}
 	if explicit {
-		s.sshCheckSpecificAuth[sshCheckPair{Src: src, Dst: dst}] = now
-	} else {
-		s.sshCheckGlobalAuth[src] = now
+		key.Dst = dst
 	}
+
+	s.sshCheckAuth[key] = time.Now()
 }
 
 // SSHCheckAuthTime returns when srcNodeID last authenticated for SSH check.
-// If explicit is true, looks up per (src, dst). Otherwise per src only.
+// If explicit is true, looks up per (src, dst). Otherwise looks up per src
+// with Dst=0 sentinel (global auth covering any destination).
 func (s *State) SSHCheckAuthTime(src, dst types.NodeID, explicit bool) (time.Time, bool) {
 	s.sshCheckMu.RLock()
 	defer s.sshCheckMu.RUnlock()
 
+	key := sshCheckPair{Src: src}
 	if explicit {
-		t, ok := s.sshCheckSpecificAuth[sshCheckPair{Src: src, Dst: dst}]
-		return t, ok
+		key.Dst = dst
 	}
 
-	t, ok := s.sshCheckGlobalAuth[src]
+	t, ok := s.sshCheckAuth[key]
 
 	return t, ok
 }
@@ -1143,8 +1141,7 @@ func (s *State) ClearSSHCheckAuth() {
 	s.sshCheckMu.Lock()
 	defer s.sshCheckMu.Unlock()
 
-	s.sshCheckGlobalAuth = make(map[types.NodeID]time.Time)
-	s.sshCheckSpecificAuth = make(map[sshCheckPair]time.Time)
+	s.sshCheckAuth = make(map[sshCheckPair]time.Time)
 }
 
 // logHostinfoValidation logs warnings when hostinfo is nil or has empty hostname.
