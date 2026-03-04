@@ -135,6 +135,7 @@ func newResolved(ipb *netipx.IPSetBuilder) (resolved, error) {
 	if err != nil {
 		return resolved{}, err
 	}
+
 	return resolved{ips: *ips}, nil
 }
 
@@ -142,9 +143,11 @@ func newResolvedAddresses(ips *netipx.IPSet, err error) (ResolvedAddresses, erro
 	if err != nil {
 		return nil, err
 	}
+
 	if ips == nil {
 		return nil, nil
 	}
+
 	return resolved{ips: *ips}, nil
 }
 
@@ -301,6 +304,7 @@ func (a Asterix) resolve(p *Policy, _ types.Users, _ views.Slice[types.NodeView]
 	if pfxs := p.AutoApprovers.prefixes(); len(pfxs) > 0 {
 		var ipb netipx.IPSetBuilder
 		ipb.AddSet(asterixResolved())
+
 		for _, pfx := range p.AutoApprovers.prefixes() {
 			ipb.AddPrefix(pfx)
 		}
@@ -1518,6 +1522,7 @@ func (ap AutoApproverPolicy) prefixes() []netip.Prefix {
 		if tsaddr.IsExitRoute(prefix) {
 			continue
 		}
+
 		prefixes = append(prefixes, prefix)
 	}
 
@@ -1722,9 +1727,8 @@ func (p *Protocol) Description() string {
 func (p *Protocol) toIANAProtocolNumbers() []int {
 	switch *p {
 	case "":
-		// Empty protocol applies to TCP, UDP, ICMP, and ICMPv6 traffic
-		// This matches Tailscale's behavior for protocol defaults
-		return []int{ProtocolTCP, ProtocolUDP, ProtocolICMP, ProtocolIPv6ICMP}
+		// Empty means the same as wildcard-ish, the client will add the default protocols (TCP, UDP, ICMP) if empty.
+		return nil
 	case ProtocolNameWildcard:
 		// Wildcard protocol - defensive handling (should not reach here due to validation)
 		return nil
