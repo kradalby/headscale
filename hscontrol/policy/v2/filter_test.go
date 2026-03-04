@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go4.org/netipx"
@@ -98,9 +99,8 @@ func TestParsing(t *testing.T) {
 					DstPorts: []tailcfg.NetPortRange{
 						{IP: "*", Ports: tailcfg.PortRange{First: 22, Last: 22}},
 						{IP: "*", Ports: tailcfg.PortRange{First: 3389, Last: 3389}},
-						{IP: "100.100.100.100/32", Ports: tailcfg.PortRangeAny},
+						{IP: "100.100.100.100", Ports: tailcfg.PortRangeAny},
 					},
-					IPProto: []int{ProtocolTCP, ProtocolUDP, ProtocolICMP, ProtocolIPv6ICMP},
 				},
 			},
 			wantErr: false,
@@ -150,23 +150,23 @@ func TestParsing(t *testing.T) {
 }`,
 			want: []tailcfg.FilterRule{
 				{
-					SrcIPs: []string{"100.64.0.0/10", "fd7a:115c:a1e0::/48"},
+					SrcIPs: []string{"100.64.0.0-100.115.91.255", "100.115.94.0-100.127.255.255", "fd7a:115c:a1e0::/48"},
 					DstPorts: []tailcfg.NetPortRange{
-						{IP: "100.100.100.100/32", Ports: tailcfg.PortRangeAny},
+						{IP: "100.100.100.100", Ports: tailcfg.PortRangeAny},
 					},
 					IPProto: []int{ProtocolTCP},
 				},
 				{
-					SrcIPs: []string{"100.64.0.0/10", "fd7a:115c:a1e0::/48"},
+					SrcIPs: []string{"100.64.0.0-100.115.91.255", "100.115.94.0-100.127.255.255", "fd7a:115c:a1e0::/48"},
 					DstPorts: []tailcfg.NetPortRange{
-						{IP: "100.100.100.100/32", Ports: tailcfg.PortRange{First: 53, Last: 53}},
+						{IP: "100.100.100.100", Ports: tailcfg.PortRange{First: 53, Last: 53}},
 					},
 					IPProto: []int{ProtocolUDP},
 				},
 				{
-					SrcIPs: []string{"100.64.0.0/10", "fd7a:115c:a1e0::/48"},
+					SrcIPs: []string{"100.64.0.0-100.115.91.255", "100.115.94.0-100.127.255.255", "fd7a:115c:a1e0::/48"},
 					DstPorts: []tailcfg.NetPortRange{
-						{IP: "100.100.100.100/32", Ports: tailcfg.PortRangeAny},
+						{IP: "100.100.100.100", Ports: tailcfg.PortRangeAny},
 					},
 					// proto:icmp only includes ICMP (1), not ICMPv6 (58)
 					IPProto: []int{ProtocolICMP},
@@ -199,11 +199,10 @@ func TestParsing(t *testing.T) {
 `,
 			want: []tailcfg.FilterRule{
 				{
-					SrcIPs: []string{"100.64.0.0/10", "fd7a:115c:a1e0::/48"},
+					SrcIPs: []string{"100.64.0.0-100.115.91.255", "100.115.94.0-100.127.255.255", "fd7a:115c:a1e0::/48"},
 					DstPorts: []tailcfg.NetPortRange{
-						{IP: "100.100.100.100/32", Ports: tailcfg.PortRangeAny},
+						{IP: "100.100.100.100", Ports: tailcfg.PortRangeAny},
 					},
-					IPProto: []int{ProtocolTCP, ProtocolUDP, ProtocolICMP, ProtocolIPv6ICMP},
 				},
 			},
 			wantErr: false,
@@ -236,11 +235,10 @@ func TestParsing(t *testing.T) {
 					SrcIPs: []string{"100.100.101.0/24"},
 					DstPorts: []tailcfg.NetPortRange{
 						{
-							IP:    "100.100.100.100/32",
+							IP:    "100.100.100.100",
 							Ports: tailcfg.PortRange{First: 5400, Last: 5500},
 						},
 					},
-					IPProto: []int{ProtocolTCP, ProtocolUDP, ProtocolICMP, ProtocolIPv6ICMP},
 				},
 			},
 			wantErr: false,
@@ -276,11 +274,10 @@ func TestParsing(t *testing.T) {
 `,
 			want: []tailcfg.FilterRule{
 				{
-					SrcIPs: []string{"200.200.200.200/32"},
+					SrcIPs: []string{"200.200.200.200"},
 					DstPorts: []tailcfg.NetPortRange{
-						{IP: "100.100.100.100/32", Ports: tailcfg.PortRangeAny},
+						{IP: "100.100.100.100", Ports: tailcfg.PortRangeAny},
 					},
-					IPProto: []int{ProtocolTCP, ProtocolUDP, ProtocolICMP, ProtocolIPv6ICMP},
 				},
 			},
 			wantErr: false,
@@ -310,11 +307,10 @@ func TestParsing(t *testing.T) {
 `,
 			want: []tailcfg.FilterRule{
 				{
-					SrcIPs: []string{"200.200.200.200/32"},
+					SrcIPs: []string{"200.200.200.200"},
 					DstPorts: []tailcfg.NetPortRange{
-						{IP: "100.100.100.100/32", Ports: tailcfg.PortRangeAny},
+						{IP: "100.100.100.100", Ports: tailcfg.PortRangeAny},
 					},
-					IPProto: []int{ProtocolTCP, ProtocolUDP, ProtocolICMP, ProtocolIPv6ICMP},
 				},
 			},
 			wantErr: false,
@@ -344,11 +340,10 @@ func TestParsing(t *testing.T) {
 `,
 			want: []tailcfg.FilterRule{
 				{
-					SrcIPs: []string{"100.64.0.0/10", "fd7a:115c:a1e0::/48"},
+					SrcIPs: []string{"100.64.0.0-100.115.91.255", "100.115.94.0-100.127.255.255", "fd7a:115c:a1e0::/48"},
 					DstPorts: []tailcfg.NetPortRange{
-						{IP: "100.100.100.100/32", Ports: tailcfg.PortRangeAny},
+						{IP: "100.100.100.100", Ports: tailcfg.PortRangeAny},
 					},
-					IPProto: []int{ProtocolTCP, ProtocolUDP, ProtocolICMP, ProtocolIPv6ICMP},
 				},
 			},
 			wantErr: false,
@@ -1366,16 +1361,20 @@ func TestCompileFilterRulesForNodeWithAutogroupSelf(t *testing.T) {
 
 		addr := netip.MustParseAddr(expectedIP)
 
-		for _, prefix := range rule.SrcIPs {
-			pref := netip.MustParsePrefix(prefix)
-			if pref.Contains(addr) {
+		for _, srcEntry := range rule.SrcIPs {
+			ipSet, err := util.ParseIPSet(srcEntry, nil)
+			if err != nil {
+				t.Fatalf("failed to parse SrcIP %q: %v", srcEntry, err)
+			}
+
+			if ipSet.Contains(addr) {
 				found = true
 				break
 			}
 		}
 
 		if !found {
-			t.Errorf("expected source IP %s to be covered by generated prefixes %v", expectedIP, rule.SrcIPs)
+			t.Errorf("expected source IP %s to be covered by generated SrcIPs %v", expectedIP, rule.SrcIPs)
 		}
 	}
 
@@ -1384,15 +1383,19 @@ func TestCompileFilterRulesForNodeWithAutogroupSelf(t *testing.T) {
 	for _, excludedIP := range excludedSourceIPs {
 		addr := netip.MustParseAddr(excludedIP)
 
-		for _, prefix := range rule.SrcIPs {
-			pref := netip.MustParsePrefix(prefix)
-			if pref.Contains(addr) {
-				t.Errorf("SECURITY VIOLATION: source IP %s should not be included but found in prefix %s", excludedIP, prefix)
+		for _, srcEntry := range rule.SrcIPs {
+			ipSet, err := util.ParseIPSet(srcEntry, nil)
+			if err != nil {
+				t.Fatalf("failed to parse SrcIP %q: %v", srcEntry, err)
+			}
+
+			if ipSet.Contains(addr) {
+				t.Errorf("SECURITY VIOLATION: source IP %s should not be included but found in SrcIP %s", excludedIP, srcEntry)
 			}
 		}
 	}
 
-	expectedDestIPs := []string{"100.64.0.1/32", "100.64.0.2/32"}
+	expectedDestIPs := []string{"100.64.0.1", "100.64.0.2"}
 
 	actualDestIPs := make([]string, 0, len(rule.DstPorts))
 	for _, dst := range rule.DstPorts {
@@ -1400,7 +1403,21 @@ func TestCompileFilterRulesForNodeWithAutogroupSelf(t *testing.T) {
 	}
 
 	for _, expectedIP := range expectedDestIPs {
-		found := slices.Contains(actualDestIPs, expectedIP)
+		addr := netip.MustParseAddr(expectedIP)
+
+		found := false
+
+		for _, destIP := range actualDestIPs {
+			ipSet, err := util.ParseIPSet(destIP, nil)
+			if err != nil {
+				t.Fatalf("failed to parse DstPort IP %q: %v", destIP, err)
+			}
+
+			if ipSet.Contains(addr) {
+				found = true
+				break
+			}
+		}
 
 		if !found {
 			t.Errorf("expected destination IP %s to be included, got: %v", expectedIP, actualDestIPs)
@@ -1408,11 +1425,18 @@ func TestCompileFilterRulesForNodeWithAutogroupSelf(t *testing.T) {
 	}
 
 	// Verify that other users' devices and tagged devices are not in destinations
-	excludedDestIPs := []string{"100.64.0.3/32", "100.64.0.4/32", "100.64.0.5/32", "100.64.0.6/32"}
+	excludedDestIPs := []string{"100.64.0.3", "100.64.0.4", "100.64.0.5", "100.64.0.6"}
 	for _, excludedIP := range excludedDestIPs {
-		for _, actualIP := range actualDestIPs {
-			if actualIP == excludedIP {
-				t.Errorf("SECURITY: destination IP %s should not be included but found in destinations", excludedIP)
+		addr := netip.MustParseAddr(excludedIP)
+
+		for _, destIP := range actualDestIPs {
+			ipSet, err := util.ParseIPSet(destIP, nil)
+			if err != nil {
+				t.Fatalf("failed to parse DstPort IP %q: %v", destIP, err)
+			}
+
+			if ipSet.Contains(addr) {
+				t.Errorf("SECURITY: destination IP %s should not be included but found in dest %s", excludedIP, destIP)
 			}
 		}
 	}
@@ -1730,9 +1754,11 @@ func TestAutogroupSelfWithSpecificUserSource(t *testing.T) {
 		found := false
 		addr := netip.MustParseAddr(expectedIP)
 
-		for _, prefix := range rules[0].SrcIPs {
-			pref := netip.MustParsePrefix(prefix)
-			if pref.Contains(addr) {
+		for _, srcEntry := range rules[0].SrcIPs {
+			ipSet, err := util.ParseIPSet(srcEntry, nil)
+			require.NoError(t, err, "failed to parse SrcIP %q", srcEntry)
+
+			if ipSet.Contains(addr) {
 				found = true
 				break
 			}
@@ -1802,9 +1828,11 @@ func TestAutogroupSelfWithGroupSource(t *testing.T) {
 		found := false
 		addr := netip.MustParseAddr(expectedIP)
 
-		for _, prefix := range rules[0].SrcIPs {
-			pref := netip.MustParsePrefix(prefix)
-			if pref.Contains(addr) {
+		for _, srcEntry := range rules[0].SrcIPs {
+			ipSet, err := util.ParseIPSet(srcEntry, nil)
+			require.NoError(t, err, "failed to parse SrcIP %q", srcEntry)
+
+			if ipSet.Contains(addr) {
 				found = true
 				break
 			}
@@ -2982,19 +3010,20 @@ func TestGroupSourcesByUser(t *testing.T) {
 	}
 
 	// Build an IPSet that includes all node IPs
-	allIPs := func() *netipx.IPSet {
+	allIPs := func() ResolvedAddresses {
 		var b netipx.IPSetBuilder
 		b.AddPrefix(netip.MustParsePrefix("100.64.0.0/24"))
 
 		s, _ := b.IPSet()
+		r, _ := newResolvedAddresses(s, nil)
 
-		return s
+		return r
 	}()
 
 	tests := []struct {
 		name          string
 		nodes         types.Nodes
-		srcIPs        *netipx.IPSet
+		srcIPs        ResolvedAddresses
 		wantUIDs      []uint
 		wantUserCount int
 		wantHasTagged bool
@@ -3035,13 +3064,14 @@ func TestGroupSourcesByUser(t *testing.T) {
 		{
 			name:  "node not in srcIPs excluded",
 			nodes: types.Nodes{&nodeAlice, &nodeBob},
-			srcIPs: func() *netipx.IPSet {
+			srcIPs: func() ResolvedAddresses {
 				var b netipx.IPSetBuilder
 				b.Add(netip.MustParseAddr("100.64.0.1")) // only alice
 
 				s, _ := b.IPSet()
+				r, _ := newResolvedAddresses(s, nil)
 
-				return s
+				return r
 			}(),
 			wantUIDs:      []uint{1},
 			wantUserCount: 1,
