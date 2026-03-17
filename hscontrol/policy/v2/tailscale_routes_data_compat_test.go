@@ -88,13 +88,24 @@ func buildRoutesUsersAndNodes(
 ) (types.Users, types.Nodes) {
 	t.Helper()
 
-	// Build users
-	users := make(types.Users, 0, len(topo.Users))
-	for _, u := range topo.Users {
-		users = append(users, types.User{
-			Model: gorm.Model{ID: u.ID},
-			Name:  u.Name,
-		})
+	// Build users — if topology has users section, use it.
+	// Otherwise fall back to the standard 3-user setup matching
+	// the grant topology (used by Tailscale SaaS captures).
+	var users types.Users
+	if len(topo.Users) > 0 {
+		users = make(types.Users, 0, len(topo.Users))
+		for _, u := range topo.Users {
+			users = append(users, types.User{
+				Model: gorm.Model{ID: u.ID},
+				Name:  u.Name,
+			})
+		}
+	} else {
+		users = types.Users{
+			{Model: gorm.Model{ID: 1}, Name: "kratail2tid", Email: "kratail2tid@example.com"},
+			{Model: gorm.Model{ID: 2}, Name: "kristoffer", Email: "kristoffer@example.com"},
+			{Model: gorm.Model{ID: 3}, Name: "monitorpasskeykradalby", Email: "monitorpasskeykradalby@example.com"},
+		}
 	}
 
 	// Build nodes
@@ -206,8 +217,11 @@ func TestRoutesCompat(t *testing.T) {
 			// Build topology from JSON
 			users, nodes := buildRoutesUsersAndNodes(t, tf.Topology)
 
+			// Convert Tailscale SaaS user emails to headscale format
+			policyJSON := convertPolicyUserEmails(tf.Input.FullPolicy)
+
 			// Parse and validate policy
-			pol, err := unmarshalPolicy(tf.Input.FullPolicy)
+			pol, err := unmarshalPolicy(policyJSON)
 			require.NoError(
 				t,
 				err,
