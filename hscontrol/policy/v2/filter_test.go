@@ -1442,8 +1442,9 @@ func TestCompileFilterRulesForNodeWithAutogroupSelf(t *testing.T) {
 	}
 }
 
-// TestTagUserMutualExclusivity tests that user-owned nodes and tagged nodes
-// are treated as separate identity classes and cannot inadvertently access each other.
+// TestTagUserMutualExclusivity tests that without explicit cross-identity ACL
+// rules, user-owned nodes and tagged nodes are isolated from each other.
+// It also verifies that tag-to-tag rules work correctly.
 func TestTagUserMutualExclusivity(t *testing.T) {
 	users := types.Users{
 		{Model: gorm.Model{ID: 1}, Name: "user1"},
@@ -1473,21 +1474,13 @@ func TestTagUserMutualExclusivity(t *testing.T) {
 		},
 	}
 
-	policy := &Policy{
+	pol := &Policy{
 		TagOwners: TagOwners{
 			Tag("tag:server"):   Owners{new(Username("user1@"))},
 			Tag("tag:database"): Owners{new(Username("user2@"))},
 		},
 		ACLs: []ACL{
-			// Rule 1: user1 (user-owned) should NOT be able to reach tagged nodes
-			{
-				Action:  "accept",
-				Sources: []Alias{up("user1@")},
-				Destinations: []AliasWithPorts{
-					aliasWithPorts(tp("tag:server"), tailcfg.PortRangeAny),
-				},
-			},
-			// Rule 2: tag:server should be able to reach tag:database
+			// Only tag-to-tag rule, no user-to-tag rules.
 			{
 				Action:  "accept",
 				Sources: []Alias{tp("tag:server")},
@@ -1498,63 +1491,134 @@ func TestTagUserMutualExclusivity(t *testing.T) {
 		},
 	}
 
-	err := policy.validate()
-	if err != nil {
-		t.Fatalf("policy validation failed: %v", err)
-	}
+	err := pol.validate()
+	require.NoError(t, err)
 
-	// Test user1's user-owned node (100.64.0.1)
+	// User1's user-owned node should have no rules reaching tagged nodes
+	// since there is no explicit user→tag ACL rule.
 	userNode := nodes[0].View()
 
-	userRules, err := policy.compileFilterRulesForNode(users, userNode, nodes.ViewSlice())
-	if err != nil {
-		t.Fatalf("unexpected error for user node: %v", err)
-	}
+	userRules, err := pol.compileFilterRulesForNode(users, userNode, nodes.ViewSlice())
+	require.NoError(t, err)
 
-	// User1's user-owned node should NOT reach tag:server (100.64.0.10)
-	// because user1@ as a source only matches user1's user-owned devices, NOT tagged devices
 	for _, rule := range userRules {
 		for _, dst := range rule.DstPorts {
-			if dst.IP == "100.64.0.10" {
-				t.Errorf("SECURITY: user-owned node should NOT reach tagged node (got dest %s in rule)", dst.IP)
+			ipSet, parseErr := util.ParseIPSet(dst.IP, nil)
+			require.NoError(t, parseErr)
+
+			if ipSet.Contains(netip.MustParseAddr("100.64.0.10")) {
+				t.Errorf("user-owned node should not reach tag:server without explicit grant (got dest %s)", dst.IP)
+			}
+
+			if ipSet.Contains(netip.MustParseAddr("100.64.0.11")) {
+				t.Errorf("user-owned node should not reach tag:database without explicit grant (got dest %s)", dst.IP)
 			}
 		}
 	}
 
-	// Test tag:server node (100.64.0.10)
-	// compileFilterRulesForNode returns rules for what the node can ACCESS (as source)
+	// Tag:server should be able to reach tag:database via the tag-to-tag rule.
 	taggedNode := nodes[2].View()
 
-	taggedRules, err := policy.compileFilterRulesForNode(users, taggedNode, nodes.ViewSlice())
-	if err != nil {
-		t.Fatalf("unexpected error for tagged node: %v", err)
-	}
+	taggedRules, err := pol.compileFilterRulesForNode(users, taggedNode, nodes.ViewSlice())
+	require.NoError(t, err)
 
-	// Tag:server (as source) should be able to reach tag:database (100.64.0.11)
-	// Check destinations in the rules for this node
 	foundDatabaseDest := false
 
 	for _, rule := range taggedRules {
-		// Check if this rule applies to tag:server as source
-		if !slices.Contains(rule.SrcIPs, "100.64.0.10/32") {
-			continue
-		}
-
-		// Check if tag:database is in destinations
 		for _, dst := range rule.DstPorts {
-			if dst.IP == "100.64.0.11/32" {
+			ipSet, parseErr := util.ParseIPSet(dst.IP, nil)
+			require.NoError(t, parseErr)
+
+			if ipSet.Contains(netip.MustParseAddr("100.64.0.11")) {
 				foundDatabaseDest = true
 				break
 			}
 		}
+	}
 
-		if foundDatabaseDest {
-			break
+	assert.True(t, foundDatabaseDest, "tag:server should reach tag:database")
+}
+
+// TestUserToTagCrossIdentityGrant tests that an explicit ACL rule granting
+// user-owned nodes access to tagged nodes works correctly. The tags-as-identity
+// model separates identity classes, but explicit ACL grants across classes
+// are valid and should produce filter rules.
+func TestUserToTagCrossIdentityGrant(t *testing.T) {
+	users := types.Users{
+		{Model: gorm.Model{ID: 1}, Name: "user1"},
+		{Model: gorm.Model{ID: 2}, Name: "user2"},
+	}
+
+	nodes := types.Nodes{
+		{
+			User: new(users[0]),
+			IPv4: ap("100.64.0.1"),
+		},
+		{
+			User: new(users[1]),
+			IPv4: ap("100.64.0.2"),
+		},
+		{
+			User: &users[0], // "created by" tracking
+			IPv4: ap("100.64.0.10"),
+			Tags: []string{"tag:server"},
+		},
+	}
+
+	pol := &Policy{
+		TagOwners: TagOwners{
+			Tag("tag:server"): Owners{new(Username("user1@"))},
+		},
+		ACLs: []ACL{
+			// Explicit cross-identity grant: user1's devices can reach tag:server.
+			{
+				Action:  "accept",
+				Sources: []Alias{up("user1@")},
+				Destinations: []AliasWithPorts{
+					aliasWithPorts(tp("tag:server"), tailcfg.PortRangeAny),
+				},
+			},
+		},
+	}
+
+	err := pol.validate()
+	require.NoError(t, err)
+
+	// Compile rules for the tag:server node — it is the destination,
+	// so the filter should include user1's IP as source.
+	taggedNode := nodes[2].View()
+
+	rules, err := pol.compileFilterRulesForNode(users, taggedNode, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	// user1's IP should appear as a source that can reach tag:server.
+	foundUser1Src := false
+
+	for _, rule := range rules {
+		for _, srcEntry := range rule.SrcIPs {
+			ipSet, parseErr := util.ParseIPSet(srcEntry, nil)
+			require.NoError(t, parseErr)
+
+			if ipSet.Contains(netip.MustParseAddr("100.64.0.1")) {
+				foundUser1Src = true
+				break
+			}
 		}
 	}
 
-	if !foundDatabaseDest {
-		t.Errorf("tag:server should reach tag:database but didn't find 100.64.0.11 in destinations")
+	assert.True(t, foundUser1Src,
+		"explicit user1@ -> tag:server ACL should allow user1 devices to reach tagged node")
+
+	// user2 should NOT appear as a source.
+	for _, rule := range rules {
+		for _, srcEntry := range rule.SrcIPs {
+			ipSet, parseErr := util.ParseIPSet(srcEntry, nil)
+			require.NoError(t, parseErr)
+
+			if ipSet.Contains(netip.MustParseAddr("100.64.0.2")) {
+				t.Errorf("user2 should not reach tag:server (found in SrcIP %s)", srcEntry)
+			}
+		}
 	}
 }
 
