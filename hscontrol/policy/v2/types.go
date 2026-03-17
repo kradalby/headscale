@@ -140,15 +140,11 @@ func newResolved(ipb *netipx.IPSetBuilder) (resolved, error) {
 }
 
 func newResolvedAddresses(ips *netipx.IPSet, err error) (ResolvedAddresses, error) {
-	if err != nil {
+	if ips == nil {
 		return nil, err
 	}
 
-	if ips == nil {
-		return nil, nil
-	}
-
-	return resolved{ips: *ips}, nil
+	return resolved{ips: *ips}, err
 }
 
 func ipSetToStrings(ips *netipx.IPSet) []string {
@@ -301,7 +297,7 @@ func (a Asterix) Resolve(p *Policy, u types.Users, n views.Slice[types.NodeView]
 }
 
 func (a Asterix) resolve(p *Policy, _ types.Users, _ views.Slice[types.NodeView]) (*netipx.IPSet, error) {
-	if pfxs := p.AutoApprovers.prefixes(); len(pfxs) > 0 {
+	if p != nil && len(p.AutoApprovers.prefixes()) > 0 {
 		var ipb netipx.IPSetBuilder
 		ipb.AddSet(asterixResolved())
 

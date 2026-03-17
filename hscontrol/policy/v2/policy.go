@@ -1198,8 +1198,10 @@ func resolveTagOwners(p *Policy, users types.Users, nodes views.Slice[types.Node
 			case Alias:
 				// If it does not resolve, that means the tag is not associated with any IP addresses.
 				resolved, _ := o.Resolve(p, users, nodes)
-				for _, pref := range resolved.Prefixes() {
-					ips.AddPrefix(pref)
+				if resolved != nil {
+					for _, pref := range resolved.Prefixes() {
+						ips.AddPrefix(pref)
+					}
 				}
 
 			default:
