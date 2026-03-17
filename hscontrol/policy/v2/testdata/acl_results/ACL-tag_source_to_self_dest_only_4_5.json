@@ -1,0 +1,27 @@
+{
+  "test_id": "ACL-tag_source_to_self_dest_only_4_5",
+  "source": "headscale_adapted",
+  "error": true,
+  "headscale_differs": true,
+  "input": {
+    "full_policy": {
+      "groups": {
+        "group:admins": ["kratail2tid@"]
+      },
+      "tagOwners": {
+        "tag:client": ["kratail2tid@"]
+      },
+      "acls": [
+        {
+          "action": "accept",
+          "src": ["tag:client"],
+          "dst": ["autogroup:self:*"]
+        }
+      ]
+    },
+    "api_response_code": 400,
+    "api_response_body": {
+      "message": "autogroup:self can only be used with users, groups, or supported autogroups (400)"
+    }
+  }
+}
