@@ -38,70 +38,64 @@ func ptrAddr(s string) *netip.Addr {
 	return &addr
 }
 
-// setupTailscaleCompatUsers returns the test users for compatibility tests.
-func setupTailscaleCompatUsers() types.Users {
+// setupACLCompatUsers returns the 3 test users for ACL compatibility tests.
+// Email addresses use @example.com domain, matching the converted Tailscale
+// policy format (Tailscale uses @passkey and @dalby.cc).
+func setupACLCompatUsers() types.Users {
 	return types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "kratail2tid"},
+		{Model: gorm.Model{ID: 1}, Name: "kratail2tid", Email: "kratail2tid@example.com"},
+		{Model: gorm.Model{ID: 2}, Name: "kristoffer", Email: "kristoffer@example.com"},
+		{Model: gorm.Model{ID: 3}, Name: "monitorpasskeykradalby", Email: "monitorpasskeykradalby@example.com"},
 	}
 }
 
-// setupTailscaleCompatNodes returns the test nodes for compatibility tests.
-// The node configuration matches the Tailscale test environment:
-//   - 1 user-owned node (user1)
-//   - 4 tagged nodes (tagged-server, tagged-client, tagged-db, tagged-web).
-func setupTailscaleCompatNodes(users types.Users) types.Nodes {
-	nodeUser1 := &types.Node{
-		ID:        1,
-		GivenName: "user1",
-		User:      &users[0],
-		UserID:    &users[0].ID,
-		IPv4:      ptrAddr("100.90.199.68"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::2d01:c747"),
-		Hostinfo:  &tailcfg.Hostinfo{},
-	}
-
-	nodeTaggedServer := &types.Node{
-		ID:        2,
-		GivenName: "tagged-server",
-		IPv4:      ptrAddr("100.108.74.26"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::b901:4a87"),
-		Tags:      []string{"tag:server"},
-		Hostinfo:  &tailcfg.Hostinfo{},
-	}
-
-	nodeTaggedClient := &types.Node{
-		ID:        3,
-		GivenName: "tagged-client",
-		IPv4:      ptrAddr("100.80.238.75"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::7901:ee86"),
-		Tags:      []string{"tag:client"},
-		Hostinfo:  &tailcfg.Hostinfo{},
-	}
-
-	nodeTaggedDB := &types.Node{
-		ID:        4,
-		GivenName: "tagged-db",
-		IPv4:      ptrAddr("100.74.60.128"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::2f01:3c9c"),
-		Tags:      []string{"tag:database"},
-		Hostinfo:  &tailcfg.Hostinfo{},
-	}
-
-	nodeTaggedWeb := &types.Node{
-		ID:        5,
-		GivenName: "tagged-web",
-		IPv4:      ptrAddr("100.94.92.91"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::ef01:5c81"),
-		Tags:      []string{"tag:web"},
-		Hostinfo:  &tailcfg.Hostinfo{},
-	}
-
+// setupACLCompatNodes returns the 8 test nodes for ACL compatibility tests.
+// Uses the same topology as the grants compat tests.
+func setupACLCompatNodes(users types.Users) types.Nodes {
 	return types.Nodes{
-		nodeUser1,
-		nodeTaggedServer,
-		nodeTaggedClient,
-		nodeTaggedDB,
-		nodeTaggedWeb,
+		{
+			ID: 1, GivenName: "user1",
+			User: &users[0], UserID: &users[0].ID,
+			IPv4: ptrAddr("100.90.199.68"), IPv6: ptrAddr("fd7a:115c:a1e0::2d01:c747"),
+			Hostinfo: &tailcfg.Hostinfo{},
+		},
+		{
+			ID: 2, GivenName: "user-kris",
+			User: &users[1], UserID: &users[1].ID,
+			IPv4: ptrAddr("100.110.121.96"), IPv6: ptrAddr("fd7a:115c:a1e0::1737:7960"),
+			Hostinfo: &tailcfg.Hostinfo{},
+		},
+		{
+			ID: 3, GivenName: "user-mon",
+			User: &users[2], UserID: &users[2].ID,
+			IPv4: ptrAddr("100.103.90.82"), IPv6: ptrAddr("fd7a:115c:a1e0::9e37:5a52"),
+			Hostinfo: &tailcfg.Hostinfo{},
+		},
+		{
+			ID: 4, GivenName: "tagged-server",
+			IPv4: ptrAddr("100.108.74.26"), IPv6: ptrAddr("fd7a:115c:a1e0::b901:4a87"),
+			Tags: []string{"tag:server"}, Hostinfo: &tailcfg.Hostinfo{},
+		},
+		{
+			ID: 5, GivenName: "tagged-prod",
+			IPv4: ptrAddr("100.103.8.15"), IPv6: ptrAddr("fd7a:115c:a1e0::5b37:80f"),
+			Tags: []string{"tag:prod"}, Hostinfo: &tailcfg.Hostinfo{},
+		},
+		{
+			ID: 6, GivenName: "tagged-client",
+			IPv4: ptrAddr("100.83.200.69"), IPv6: ptrAddr("fd7a:115c:a1e0::c537:c845"),
+			Tags: []string{"tag:client"}, Hostinfo: &tailcfg.Hostinfo{},
+		},
+		{
+			ID: 7, GivenName: "subnet-router",
+			IPv4: ptrAddr("100.92.142.61"), IPv6: ptrAddr("fd7a:115c:a1e0::3e37:8e3d"),
+			Tags: []string{"tag:router"}, Hostinfo: &tailcfg.Hostinfo{},
+		},
+		{
+			ID: 8, GivenName: "exit-node",
+			IPv4: ptrAddr("100.85.66.106"), IPv6: ptrAddr("fd7a:115c:a1e0::7c37:426a"),
+			Tags: []string{"tag:exit"}, Hostinfo: &tailcfg.Hostinfo{},
+		},
 	}
 }
 
@@ -217,8 +211,8 @@ func TestACLCompat(t *testing.T) {
 
 	t.Logf("Loaded %d ACL test files", len(files))
 
-	users := setupTailscaleCompatUsers()
-	nodes := setupTailscaleCompatNodes(users)
+	users := setupACLCompatUsers()
+	nodes := setupACLCompatNodes(users)
 
 	for _, file := range files {
 		tf := loadACLTestFile(t, file)
@@ -251,7 +245,9 @@ func TestACLCompat(t *testing.T) {
 func testACLError(t *testing.T, tf aclTestFile) {
 	t.Helper()
 
-	pol, err := unmarshalPolicy(tf.Input.FullPolicy)
+	policyJSON := convertPolicyUserEmails(tf.Input.FullPolicy)
+
+	pol, err := unmarshalPolicy(policyJSON)
 	if err != nil {
 		// Parse-time error — valid for some error tests
 		if tf.Input.APIResponseBody != nil {
@@ -338,7 +334,10 @@ func testACLSuccess(
 ) {
 	t.Helper()
 
-	pol, err := unmarshalPolicy(tf.Input.FullPolicy)
+	// Convert Tailscale SaaS user emails to headscale @example.com format.
+	policyJSON := convertPolicyUserEmails(tf.Input.FullPolicy)
+
+	pol, err := unmarshalPolicy(policyJSON)
 	require.NoError(
 		t,
 		err,
