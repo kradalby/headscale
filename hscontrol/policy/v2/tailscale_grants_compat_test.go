@@ -217,9 +217,8 @@ func loadGrantTestFile(t *testing.T, path string) grantTestFile {
 //	ERROR_VALIDATION_GAP               -  23 tests: Implement missing grant validation rules
 //	AUTOGROUP_DANGER_ALL               -   3 tests: Implement autogroup:danger-all support
 //	USER_PASSKEY_WILDCARD              -   2 tests: user:*@passkey wildcard pattern unresolvable
-//	VALIDATION_STRICTNESS              -   2 tests: headscale too strict (rejects what Tailscale accepts)
 //
-// Total: 30 tests skipped, ~207 tests expected to pass.
+// Total: 28 tests skipped, ~209 tests expected to pass.
 var grantSkipReasons = map[string]string{
 	// ========================================================================
 	// USER_PASSKEY_WILDCARD (2 tests)
@@ -313,12 +312,7 @@ var grantSkipReasons = map[string]string{
 	"GRANT-V16": "ERROR_VALIDATION_GAP: dst [0.0.0.0/0, ::/0] with via — both rejected",
 	"GRANT-V18": "ERROR_VALIDATION_GAP: dst 0.0.0.0/0 with via + app — rejected regardless of via or app",
 
-	// Empty src/dst validation difference:
-	// Tailscale ACCEPTS empty src/dst arrays (producing no filter rules),
-	// but headscale rejects them with "grant sources/destinations cannot be empty".
-	// headscale is stricter here — should match Tailscale and accept empty arrays.
-	"GRANT-H4": "VALIDATION_STRICTNESS: headscale rejects empty src=[] but Tailscale accepts it (producing no rules)",
-	"GRANT-H5": "VALIDATION_STRICTNESS: headscale rejects empty dst=[] but Tailscale accepts it (producing no rules)",
+	// (VALIDATION_STRICTNESS tests H4/H5 removed — empty src/dst now accepted)
 
 	// ========================================================================
 	// NIL_VS_EMPTY_RULES (varies)
@@ -352,9 +346,8 @@ var grantSkipReasons = map[string]string{
 //	ERROR_VALIDATION_GAP               -  23 tests: Implement missing grant validation rules
 //	AUTOGROUP_DANGER_ALL               -   3 tests: Implement autogroup:danger-all support
 //	USER_PASSKEY_WILDCARD              -   2 tests: user:*@passkey wildcard pattern unresolvable
-//	VALIDATION_STRICTNESS              -   2 tests: headscale too strict (rejects what Tailscale accepts)
 //
-// Total: 30 tests skipped, ~207 tests expected to pass.
+// Total: 28 tests skipped, ~209 tests expected to pass.
 func TestGrantsCompat(t *testing.T) {
 	t.Parallel()
 

@@ -2386,11 +2386,7 @@ func (p *Policy) validate() error {
 			errs = append(errs, ErrGrantMissingIPOrApp)
 		}
 
-		// Validate sources
-		if len(grant.Sources) == 0 {
-			errs = append(errs, ErrGrantEmptySources)
-		}
-
+		// Validate sources (empty arrays are allowed — they produce no rules)
 		for _, src := range grant.Sources {
 			switch src := src.(type) {
 			case *Host:
@@ -2429,11 +2425,7 @@ func (p *Policy) validate() error {
 			}
 		}
 
-		// Validate destinations
-		if len(grant.Destinations) == 0 {
-			errs = append(errs, ErrGrantEmptyDestinations)
-		}
-
+		// Validate destinations (empty arrays are allowed — they produce no rules)
 		for _, dst := range grant.Destinations {
 			switch h := dst.(type) {
 			case *Host:
