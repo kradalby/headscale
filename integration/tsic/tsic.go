@@ -1393,7 +1393,7 @@ func (t *TailscaleInContainer) Ping(hostnameOrIP string, opts ...PingOption) err
 	}
 
 	if !args.direct {
-		if strings.Contains(result, "via DERP") {
+		if strings.Contains(result, "via DERP") || strings.Contains(result, "via relay") {
 			return nil
 		} else {
 			return errTailscalePingNotDERP
@@ -1613,6 +1613,11 @@ func (t *TailscaleInContainer) GetNodePrivateKey() (*key.NodePrivate, error) {
 	}
 
 	return &p.Persist.PrivateNodeKey, nil
+}
+
+// ConnectToNetwork connects the Tailscale container to an additional Docker network.
+func (t *TailscaleInContainer) ConnectToNetwork(network *dockertest.Network) error {
+	return t.container.ConnectToNetwork(network)
 }
 
 // PacketFilter returns the current packet filter rules from the client's network map.
