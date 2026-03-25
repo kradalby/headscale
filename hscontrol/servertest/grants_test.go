@@ -1,6 +1,8 @@
 package servertest_test
 
 import (
+	"context"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -15,7 +17,7 @@ import (
 // TestGrantPolicies verifies that grant-based policies propagate
 // correctly through the full control plane (policy -> state -> mapper)
 // and produce the expected packet filter rules in client netmaps.
-func TestGrantPolicies(t *testing.T) {
+func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 	t.Parallel()
 
 	t.Run("grant_only_policy", func(t *testing.T) {
@@ -479,6 +481,178 @@ func TestGrantPolicies(t *testing.T) {
 			"c2 should have Dsts rules from ACL")
 		assert.True(t, hasCapMatches(nm2.PacketFilter),
 			"c2 should have CapMatch rules from grant")
+	})
+
+	t.Run("grant_via_subnet_steering", func(t *testing.T) {
+		t.Parallel()
+
+		srv := servertest.NewServer(t)
+		routerUser := srv.CreateUser(t, "router-user")
+		clientUser := srv.CreateUser(t, "client-user")
+
+		route := netip.MustParsePrefix("10.0.0.0/24")
+
+		// Set policy with via grants steering different client groups
+		// to different routers for the same subnet.
+		changed, err := srv.State().SetPolicy([]byte(`{
+			"tagOwners": {
+				"tag:router-a": ["router-user@"],
+				"tag:router-b": ["router-user@"],
+				"tag:group-a":  ["client-user@"],
+				"tag:group-b":  ["client-user@"]
+			},
+			"grants": [
+				{
+					"src": ["tag:router-a", "tag:router-b", "tag:group-a", "tag:group-b"],
+					"dst": ["tag:router-a", "tag:router-b", "tag:group-a", "tag:group-b"],
+					"ip": ["*"]
+				},
+				{
+					"src": ["tag:group-a"],
+					"dst": ["10.0.0.0/24"],
+					"ip": ["*"],
+					"via": ["tag:router-a"]
+				},
+				{
+					"src": ["tag:group-b"],
+					"dst": ["10.0.0.0/24"],
+					"ip": ["*"],
+					"via": ["tag:router-b"]
+				}
+			],
+			"autoApprovers": {
+				"routes": {
+					"10.0.0.0/24": ["tag:router-a", "tag:router-b"]
+				}
+			}
+		}`))
+		require.NoError(t, err)
+
+		if changed {
+			changes, err := srv.State().ReloadPolicy()
+			require.NoError(t, err)
+			srv.App.Change(changes...)
+		}
+
+		// Create routers and clients with tags.
+		routerA := servertest.NewClient(t, srv, "router-a",
+			servertest.WithUser(routerUser),
+			servertest.WithTags("tag:router-a"))
+		routerB := servertest.NewClient(t, srv, "router-b",
+			servertest.WithUser(routerUser),
+			servertest.WithTags("tag:router-b"))
+		clientA := servertest.NewClient(t, srv, "client-a",
+			servertest.WithUser(clientUser),
+			servertest.WithTags("tag:group-a"))
+		clientB := servertest.NewClient(t, srv, "client-b",
+			servertest.WithUser(clientUser),
+			servertest.WithTags("tag:group-b"))
+
+		// Wait for all nodes to see each other.
+		routerA.WaitForPeers(t, 3, 15*time.Second)
+		routerB.WaitForPeers(t, 3, 15*time.Second)
+		clientA.WaitForPeers(t, 3, 15*time.Second)
+		clientB.WaitForPeers(t, 3, 15*time.Second)
+
+		// Advertise route from both routers.
+		routerA.Direct().SetHostinfo(&tailcfg.Hostinfo{
+			BackendLogID: "servertest-router-a",
+			Hostname:     "router-a",
+			RoutableIPs:  []netip.Prefix{route},
+		})
+
+		ctxA, cancelA := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelA()
+
+		_ = routerA.Direct().SendUpdate(ctxA)
+
+		routerB.Direct().SetHostinfo(&tailcfg.Hostinfo{
+			BackendLogID: "servertest-router-b",
+			Hostname:     "router-b",
+			RoutableIPs:  []netip.Prefix{route},
+		})
+
+		ctxB, cancelB := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelB()
+
+		_ = routerB.Direct().SendUpdate(ctxB)
+
+		// Approve routes on both routers.
+		routerAID := findNodeID(t, srv, "router-a")
+		_, routeChangeA, err := srv.State().SetApprovedRoutes(
+			routerAID, []netip.Prefix{route})
+		require.NoError(t, err)
+		srv.App.Change(routeChangeA)
+
+		routerBID := findNodeID(t, srv, "router-b")
+		_, routeChangeB, err := srv.State().SetApprovedRoutes(
+			routerBID, []netip.Prefix{route})
+		require.NoError(t, err)
+		srv.App.Change(routeChangeB)
+
+		// clientA should see routerA with the route in AllowedIPs.
+		clientA.WaitForCondition(t, "clientA sees route via router-a",
+			15*time.Second,
+			func(nm *netmap.NetworkMap) bool {
+				for _, p := range nm.Peers {
+					hi := p.Hostinfo()
+					if hi.Valid() && hi.Hostname() == "router-a" {
+						for i := range p.AllowedIPs().Len() {
+							if p.AllowedIPs().At(i) == route {
+								return true
+							}
+						}
+					}
+				}
+
+				return false
+			})
+
+		// clientA should NOT see routerB with the route in AllowedIPs.
+		nmA := clientA.Netmap()
+		require.NotNil(t, nmA)
+
+		for _, p := range nmA.Peers {
+			hi := p.Hostinfo()
+			if hi.Valid() && hi.Hostname() == "router-b" {
+				for i := range p.AllowedIPs().Len() {
+					assert.NotEqual(t, route, p.AllowedIPs().At(i),
+						"clientA should NOT see 10.0.0.0/24 via router-b")
+				}
+			}
+		}
+
+		// clientB should see routerB with the route in AllowedIPs.
+		clientB.WaitForCondition(t, "clientB sees route via router-b",
+			15*time.Second,
+			func(nm *netmap.NetworkMap) bool {
+				for _, p := range nm.Peers {
+					hi := p.Hostinfo()
+					if hi.Valid() && hi.Hostname() == "router-b" {
+						for i := range p.AllowedIPs().Len() {
+							if p.AllowedIPs().At(i) == route {
+								return true
+							}
+						}
+					}
+				}
+
+				return false
+			})
+
+		// clientB should NOT see routerA with the route in AllowedIPs.
+		nmB := clientB.Netmap()
+		require.NotNil(t, nmB)
+
+		for _, p := range nmB.Peers {
+			hi := p.Hostinfo()
+			if hi.Valid() && hi.Hostname() == "router-a" {
+				for i := range p.AllowedIPs().Len() {
+					assert.NotEqual(t, route, p.AllowedIPs().At(i),
+						"clientB should NOT see 10.0.0.0/24 via router-a")
+				}
+			}
+		}
 	})
 }
 
