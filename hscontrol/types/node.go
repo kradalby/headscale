@@ -1044,6 +1044,10 @@ func (nv NodeView) HasNetworkChanges(other NodeView) bool {
 		return true
 	}
 
+	if !slices.Equal(nv.ExitRoutes(), other.ExitRoutes()) {
+		return true
+	}
+
 	return false
 }
 
