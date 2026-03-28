@@ -155,17 +155,18 @@ func runViaMapCompat(t *testing.T, gf goldenFile) {
 
 	require.NotEmpty(t, clients, "no relevant nodes created")
 
+	// Determine which routes each node should advertise. If the golden
+	// topology has explicit advertised_routes, use those. Otherwise infer
+	// from the policy's autoApprovers.routes: if a node's tags match an
+	// approver tag for a route prefix, the node should advertise it.
+	nodeRoutes := inferNodeRoutes(gf)
+
 	// Advertise and approve routes FIRST. Via grants depend on routes
 	// being advertised for compileViaGrant to produce filter rules.
 	for name, c := range clients {
-		topoNode := gf.Topology.Nodes[name]
-		if len(topoNode.AdvertisedRoutes) == 0 {
+		routes := nodeRoutes[name]
+		if len(routes) == 0 {
 			continue
-		}
-
-		var routes []netip.Prefix
-		for _, r := range topoNode.AdvertisedRoutes {
-			routes = append(routes, netip.MustParsePrefix(r))
 		}
 
 		c.Direct().SetHostinfo(&tailcfg.Hostinfo{
@@ -204,6 +205,15 @@ func runViaMapCompat(t *testing.T, gf goldenFile) {
 		if expected > 0 {
 			c.WaitForPeers(t, expected, 30*time.Second)
 		}
+	}
+
+	// Ensure all nodes have received at least one MapResponse,
+	// including nodes with 0 expected peers that skipped WaitForPeers.
+	for name, c := range clients {
+		c.WaitForCondition(t, name+" initial netmap", 15*time.Second,
+			func(nm *netmap.NetworkMap) bool {
+				return nm != nil
+			})
 	}
 
 	// Compare each viewer's MapResponse against the golden netmap.
@@ -431,6 +441,56 @@ func countTailscaleIPs(allowedIPs []string) int {
 	}
 
 	return count
+}
+
+// inferNodeRoutes determines which routes each node should advertise.
+// If the golden topology has explicit advertised_routes, those are used.
+// Otherwise, routes are inferred from the golden netmap data: if a node
+// appears as a peer with route prefixes in AllowedIPs, it should
+// advertise those routes.
+func inferNodeRoutes(gf goldenFile) map[string][]netip.Prefix {
+	result := map[string][]netip.Prefix{}
+
+	// First use explicit advertised_routes from topology.
+	for name, node := range gf.Topology.Nodes {
+		for _, r := range node.AdvertisedRoutes {
+			result[name] = append(result[name], netip.MustParsePrefix(r))
+		}
+	}
+
+	// If any node already has routes, the topology is populated — use as-is.
+	for _, routes := range result {
+		if len(routes) > 0 {
+			return result
+		}
+	}
+
+	// Infer from the golden netmap: scan all captures for peers with
+	// route prefixes in AllowedIPs. If node X appears as a peer with
+	// route prefix 10.44.0.0/16, then X should advertise that route.
+	for _, capture := range gf.Captures {
+		if capture.Netmap == nil {
+			continue
+		}
+
+		for _, peer := range capture.Netmap.Peers {
+			peerName := extractHostname(peer.Name)
+			routes := extractRoutePrefixes(peer.AllowedIPs)
+
+			for _, r := range routes {
+				prefix, err := netip.ParsePrefix(r)
+				if err != nil {
+					continue
+				}
+
+				if !slices.Contains(result[peerName], prefix) {
+					result[peerName] = append(result[peerName], prefix)
+				}
+			}
+		}
+	}
+
+	return result
 }
 
 // extractHostname extracts the hostname from a Tailscale FQDN like

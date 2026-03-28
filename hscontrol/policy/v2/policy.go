@@ -899,7 +899,6 @@ func (pm *PolicyManager) ViaRoutesForPeer(viewer, peer types.NodeView) types.Via
 
 		// Collect destination prefixes that the peer actually advertises.
 		peerSubnetRoutes := peer.SubnetRoutes()
-		peerExitRoutes := peer.ExitRoutes()
 
 		var matchedPrefixes []netip.Prefix
 
@@ -911,9 +910,11 @@ func (pm *PolicyManager) ViaRoutesForPeer(viewer, peer types.NodeView) types.Via
 					matchedPrefixes = append(matchedPrefixes, dstPrefix)
 				}
 			case *AutoGroup:
-				if d.Is(AutoGroupInternet) && len(peerExitRoutes) > 0 {
-					matchedPrefixes = append(matchedPrefixes, peerExitRoutes...)
-				}
+				// autogroup:internet via grants do NOT affect AllowedIPs or
+				// route steering for exit nodes. Tailscale SaaS handles exit
+				// traffic forwarding through the client's exit node selection
+				// mechanism, not through AllowedIPs. Verified by golden
+				// captures GRANT-V14 through GRANT-V36.
 			}
 		}
 
