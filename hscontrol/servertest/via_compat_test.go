@@ -48,25 +48,15 @@ type goldenCapture struct {
 }
 
 type goldenNetmap struct {
-	SelfNode          json.RawMessage `json:"SelfNode"`
 	Peers             []goldenPeer    `json:"Peers"`
-	PacketFilter      json.RawMessage `json:"PacketFilter"`
 	PacketFilterRules json.RawMessage `json:"PacketFilterRules"`
-	DNS               json.RawMessage `json:"DNS"`
-	SSHPolicy         json.RawMessage `json:"SSHPolicy"`
-	Domain            string          `json:"Domain"`
-	UserProfiles      json.RawMessage `json:"UserProfiles"`
 }
 
 type goldenPeer struct {
-	Name           string   `json:"Name"`
-	Addresses      []string `json:"Addresses"`
-	AllowedIPs     []string `json:"AllowedIPs"`
-	PrimaryRoutes  []string `json:"PrimaryRoutes"`
-	Tags           []string `json:"Tags"`
-	ExitNodeOption *bool    `json:"ExitNodeOption"`
-	Online         *bool    `json:"Online"`
-	Cap            int      `json:"Cap"`
+	Name          string   `json:"Name"`
+	AllowedIPs    []string `json:"AllowedIPs"`
+	PrimaryRoutes []string `json:"PrimaryRoutes"`
+	Tags          []string `json:"Tags"`
 }
 
 type goldenWhois struct {
@@ -86,13 +76,11 @@ var viaCompatTests = []struct {
 }
 
 // TestViaGrantMapCompat loads golden captures from Tailscale SaaS and
-// compares headscale's full MapResponse against the captured netmap.
+// compares headscale's MapResponse structure against the captured netmap.
 //
-// For each viewing node, it compares:
-//   - Peer set (which peers are visible)
-//   - Per-peer AllowedIPs (via steering changes which routes appear on which peer)
-//   - Per-peer PrimaryRoutes (which node is primary for a subnet)
-//   - PacketFilter rule count
+// The comparison is IP-independent: it validates peer visibility, route
+// prefixes in AllowedIPs, and PrimaryRoutes — not literal Tailscale IP
+// addresses which differ between Tailscale SaaS and headscale allocation.
 func TestViaGrantMapCompat(t *testing.T) {
 	t.Parallel()
 
@@ -119,9 +107,7 @@ func TestViaGrantMapCompat(t *testing.T) {
 	}
 }
 
-// taggedNodes are the nodes we create in the servertest. User-owned nodes
-// are excluded because the servertest uses a single user for all tagged
-// nodes, which doesn't map to the multi-user Tailscale topology.
+// taggedNodes are the nodes we create in the servertest.
 var taggedNodes = []string{
 	"exit-a", "exit-b", "exit-node",
 	"group-a-client", "group-b-client",
@@ -169,35 +155,8 @@ func runViaMapCompat(t *testing.T, gf goldenFile) {
 
 	require.NotEmpty(t, clients, "no relevant nodes created")
 
-	// Compute expected peer counts from golden netmap.
-	expectedPeerCounts := map[string]int{}
-
-	for viewerName := range clients {
-		capture := gf.Captures[viewerName]
-		if capture.Netmap != nil {
-			// Count peers from golden netmap that are in our client set.
-			count := 0
-
-			for _, peer := range capture.Netmap.Peers {
-				peerName := extractHostname(peer.Name)
-				if _, isOurs := clients[peerName]; isOurs {
-					count++
-				}
-			}
-
-			expectedPeerCounts[viewerName] = count
-		}
-	}
-
-	// Wait for expected peers.
-	for name, c := range clients {
-		expected := expectedPeerCounts[name]
-		if expected > 0 {
-			c.WaitForPeers(t, expected, 30*time.Second)
-		}
-	}
-
-	// Advertise and approve routes.
+	// Advertise and approve routes FIRST. Via grants depend on routes
+	// being advertised for compileViaGrant to produce filter rules.
 	for name, c := range clients {
 		topoNode := gf.Topology.Nodes[name]
 		if len(topoNode.AdvertisedRoutes) == 0 {
@@ -226,12 +185,25 @@ func runViaMapCompat(t *testing.T, gf goldenFile) {
 		srv.App.Change(routeChange)
 	}
 
-	// Wait for route propagation.
-	for _, c := range clients {
-		c.WaitForCondition(t, "routes settled", 15*time.Second,
-			func(nm *netmap.NetworkMap) bool {
-				return nm != nil
-			})
+	// Wait for peers based on golden netmap expected counts.
+	for viewerName, c := range clients {
+		capture := gf.Captures[viewerName]
+		if capture.Netmap == nil {
+			continue
+		}
+
+		expected := 0
+
+		for _, peer := range capture.Netmap.Peers {
+			peerName := extractHostname(peer.Name)
+			if _, isOurs := clients[peerName]; isOurs {
+				expected++
+			}
+		}
+
+		if expected > 0 {
+			c.WaitForPeers(t, expected, 30*time.Second)
+		}
 	}
 
 	// Compare each viewer's MapResponse against the golden netmap.
@@ -245,14 +217,20 @@ func runViaMapCompat(t *testing.T, gf goldenFile) {
 			nm := c.Netmap()
 			require.NotNil(t, nm, "netmap is nil")
 
-			compareNetmap(t, viewerName, nm, capture.Netmap, clients)
+			compareNetmap(t, nm, capture.Netmap, clients)
 		})
 	}
 }
 
+// compareNetmap compares the headscale MapResponse against the golden
+// netmap data in an IP-independent way. It validates:
+//   - Peer visibility (which peers are present, by hostname)
+//   - Route prefixes in AllowedIPs (non-Tailscale-IP entries like 10.44.0.0/16)
+//   - Number of Tailscale IPs per peer (should be 2: one v4 + one v6)
+//   - PrimaryRoutes per peer
+//   - PacketFilter rule count
 func compareNetmap(
 	t *testing.T,
-	_ string, // viewerName unused but kept for signature clarity
 	got *netmap.NetworkMap,
 	want *goldenNetmap,
 	clients map[string]*servertest.TestClient,
@@ -293,12 +271,22 @@ func compareNetmap(
 			continue
 		}
 
-		var aips []string
+		// Separate AllowedIPs into Tailscale IPs (node addresses)
+		// and route prefixes (subnets, exit routes).
+		var tsIPs []netip.Prefix
+
+		var routePrefixes []string
+
 		for i := range peer.AllowedIPs().Len() {
-			aips = append(aips, peer.AllowedIPs().At(i).String())
+			prefix := peer.AllowedIPs().At(i)
+			if isTailscaleIP(prefix) {
+				tsIPs = append(tsIPs, prefix)
+			} else {
+				routePrefixes = append(routePrefixes, prefix.String())
+			}
 		}
 
-		slices.Sort(aips)
+		slices.Sort(routePrefixes)
 
 		var proutes []string
 		for i := range peer.PrimaryRoutes().Len() {
@@ -308,28 +296,55 @@ func compareNetmap(
 		slices.Sort(proutes)
 
 		gotPeers[name] = peerSummary{
-			AllowedIPs:    aips,
+			TailscaleIPs:  tsIPs,
+			RoutePrefixes: routePrefixes,
 			PrimaryRoutes: proutes,
 		}
 	}
 
-	// Compare peer visibility.
+	// Compare peer visibility: golden peers must be present.
 	for name, wantPeer := range wantPeers {
 		gotPeer, visible := gotPeers[name]
 		if !visible {
-			t.Errorf("peer %s: visible in Tailscale SaaS (AllowedIPs=%v), missing in headscale",
-				name, wantPeer.AllowedIPs)
+			wantRoutes := extractRoutePrefixes(wantPeer.AllowedIPs)
+			t.Errorf("peer %s: visible in Tailscale SaaS (routes=%v), missing in headscale",
+				name, wantRoutes)
 
 			continue
 		}
 
-		// Compare AllowedIPs.
-		wantAIPs := make([]string, len(wantPeer.AllowedIPs))
-		copy(wantAIPs, wantPeer.AllowedIPs)
-		slices.Sort(wantAIPs)
+		// Compare route prefixes in AllowedIPs (IP-independent).
+		wantRoutes := extractRoutePrefixes(wantPeer.AllowedIPs)
+		slices.Sort(wantRoutes)
 
-		assert.Equalf(t, wantAIPs, gotPeer.AllowedIPs,
-			"peer %s: AllowedIPs mismatch", name)
+		assert.Equalf(t, wantRoutes, gotPeer.RoutePrefixes,
+			"peer %s: route prefixes in AllowedIPs mismatch", name)
+
+		// Tailscale IPs: count should match, and they must belong to
+		// this peer (not some other node's IPs).
+		wantTSIPCount := countTailscaleIPs(wantPeer.AllowedIPs)
+
+		assert.Lenf(t, gotPeer.TailscaleIPs, wantTSIPCount,
+			"peer %s: Tailscale IP count mismatch", name)
+
+		// Verify the Tailscale IPs are actually this peer's addresses.
+		if peerClient, ok := clients[name]; ok {
+			peerNM := peerClient.Netmap()
+			if peerNM != nil && peerNM.SelfNode.Valid() {
+				peerAddrs := map[netip.Prefix]bool{}
+
+				addrs := peerNM.SelfNode.Addresses()
+				for i := range addrs.Len() {
+					peerAddrs[addrs.At(i)] = true
+				}
+
+				for _, tsIP := range gotPeer.TailscaleIPs {
+					assert.Truef(t, peerAddrs[tsIP],
+						"peer %s: AllowedIPs contains Tailscale IP %s which is NOT this peer's address (peer has %v)",
+						name, tsIP, peerAddrs)
+				}
+			}
+		}
 
 		// Compare PrimaryRoutes.
 		assert.ElementsMatchf(t, wantPeer.PrimaryRoutes, gotPeer.PrimaryRoutes,
@@ -355,8 +370,67 @@ func compareNetmap(
 }
 
 type peerSummary struct {
-	AllowedIPs    []string
-	PrimaryRoutes []string
+	TailscaleIPs  []netip.Prefix // Tailscale address entries from AllowedIPs
+	RoutePrefixes []string       // non-Tailscale-IP AllowedIPs (sorted)
+	PrimaryRoutes []string       // sorted
+}
+
+// isTailscaleIP returns true if the prefix is a single-host Tailscale
+// address (/32 for IPv4 in CGNAT range, /128 for IPv6 in Tailscale ULA).
+func isTailscaleIP(prefix netip.Prefix) bool {
+	addr := prefix.Addr()
+
+	if addr.Is4() && prefix.Bits() == 32 {
+		// CGNAT range 100.64.0.0/10
+		return addr.As4()[0] == 100 && (addr.As4()[1]&0xC0) == 64
+	}
+
+	if addr.Is6() && prefix.Bits() == 128 {
+		// Tailscale ULA fd7a:115c:a1e0::/48
+		b := addr.As16()
+
+		return b[0] == 0xfd && b[1] == 0x7a && b[2] == 0x11 && b[3] == 0x5c //nolint:gosec // As16 returns [16]byte, indexing [0..3] is safe
+	}
+
+	return false
+}
+
+// extractRoutePrefixes returns the non-Tailscale-IP entries from an
+// AllowedIPs list (subnet routes, exit routes, etc.).
+func extractRoutePrefixes(allowedIPs []string) []string {
+	var routes []string
+
+	for _, aip := range allowedIPs {
+		prefix, err := netip.ParsePrefix(aip)
+		if err != nil {
+			continue
+		}
+
+		if !isTailscaleIP(prefix) {
+			routes = append(routes, aip)
+		}
+	}
+
+	return routes
+}
+
+// countTailscaleIPs returns the number of Tailscale IP entries in an
+// AllowedIPs list.
+func countTailscaleIPs(allowedIPs []string) int {
+	count := 0
+
+	for _, aip := range allowedIPs {
+		prefix, err := netip.ParsePrefix(aip)
+		if err != nil {
+			continue
+		}
+
+		if isTailscaleIP(prefix) {
+			count++
+		}
+	}
+
+	return count
 }
 
 // extractHostname extracts the hostname from a Tailscale FQDN like
