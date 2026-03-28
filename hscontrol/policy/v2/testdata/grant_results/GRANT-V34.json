@@ -1,9 +1,9 @@
 {
-  "test_id": "GRANT-V15",
-  "timestamp": "2026-03-28T10:43:22Z",
+  "test_id": "GRANT-V34",
+  "timestamp": "2026-03-28T10:46:38Z",
   "propagation_wait_seconds": 12,
   "input": {
-    "policy_file": "grant_policies_via/grant_v15.json",
+    "policy_file": "grant_policies_via/grant_v34.json",
     "full_policy": {
       "groups": {
         "group:admins": ["kratail2tid@passkey"],
@@ -42,12 +42,14 @@
         {
           "src": ["*"],
           "dst": ["autogroup:internet"],
-          "via": ["tag:exit"],
+          "via": ["tag:exit-a", "tag:exit-b"],
           "ip": ["*"]
         }
       ]
     },
-    "grants_section": [{ "src": ["*"], "dst": ["autogroup:internet"], "via": ["tag:exit"], "ip": ["*"] }],
+    "grants_section": [
+      { "src": ["*"], "dst": ["autogroup:internet"], "via": ["tag:exit-a", "tag:exit-b"], "ip": ["*"] }
+    ],
     "api_endpoint": "https://api.tailscale.com/api/v2/tailnet/kratail2tid%40passkey/acl",
     "api_method": "POST",
     "api_response_code": 200

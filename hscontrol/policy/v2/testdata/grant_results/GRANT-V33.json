@@ -1,9 +1,9 @@
 {
-  "test_id": "GRANT-V15",
-  "timestamp": "2026-03-28T10:43:22Z",
+  "test_id": "GRANT-V33",
+  "timestamp": "2026-03-28T10:46:19Z",
   "propagation_wait_seconds": 12,
   "input": {
-    "policy_file": "grant_policies_via/grant_v15.json",
+    "policy_file": "grant_policies_via/grant_v33.json",
     "full_policy": {
       "groups": {
         "group:admins": ["kratail2tid@passkey"],
@@ -40,14 +40,23 @@
       },
       "grants": [
         {
-          "src": ["*"],
+          "src": ["tag:client"],
+          "dst": ["10.33.0.0/16"],
+          "via": ["tag:router"],
+          "ip": ["*"]
+        },
+        {
+          "src": ["tag:client"],
           "dst": ["autogroup:internet"],
           "via": ["tag:exit"],
           "ip": ["*"]
         }
       ]
     },
-    "grants_section": [{ "src": ["*"], "dst": ["autogroup:internet"], "via": ["tag:exit"], "ip": ["*"] }],
+    "grants_section": [
+      { "src": ["tag:client"], "dst": ["10.33.0.0/16"], "via": ["tag:router"], "ip": ["*"] },
+      { "src": ["tag:client"], "dst": ["autogroup:internet"], "via": ["tag:exit"], "ip": ["*"] }
+    ],
     "api_endpoint": "https://api.tailscale.com/api/v2/tailnet/kratail2tid%40passkey/acl",
     "api_method": "POST",
     "api_response_code": 200
@@ -597,8 +606,21 @@
         "packet_filter_rules": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/multi-exit-router/tailscaled.sock debug localapi POST debug-packet-filter-rules",
         "packet_filter_matches": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/multi-exit-router/tailscaled.sock debug localapi POST debug-packet-filter-matches"
       },
-      "packet_filter_rules": null,
-      "packet_filter_matches": [],
+      "packet_filter_rules": [
+        {
+          "SrcIPs": ["100.83.200.69", "fd7a:115c:a1e0::c537:c845"],
+          "DstPorts": [{ "IP": "10.33.0.0/16", "Ports": { "First": 0, "Last": 65535 } }]
+        }
+      ],
+      "packet_filter_matches": [
+        {
+          "IPProto": [6, 17, 1, 58],
+          "Srcs": ["100.83.200.69/32", "fd7a:115c:a1e0::c537:c845/128"],
+          "SrcCaps": null,
+          "Dsts": [{ "Net": "10.33.0.0/16", "Ports": { "First": 0, "Last": 65535 } }],
+          "Caps": []
+        }
+      ],
       "whois": {
         "100.124.195.93": {
           "peer_name": "exit-a",
@@ -643,7 +665,36 @@
         "100.83.200.69": {
           "peer_name": "tagged-client",
           "command": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/multi-exit-router/tailscaled.sock whois --json 100.83.200.69",
-          "response": null
+          "response": {
+            "Node": {
+              "ID": 4031348162889210,
+              "StableID": "nf7BTTgoUY11CNTRL",
+              "Name": "tagged-client.tail78f774.ts.net.",
+              "User": 1260082990019555,
+              "Key": "nodekey:3011e53353e49142ea56ae11f81e0dceae0d667093d04ee086dcb1e9c5d3c844",
+              "DiscoKey": "discokey:64af337a7e8b61dce500da3b8f7d0a95fc6fe0e57c2f9e57b9b484a9b4acbe1e",
+              "Addresses": ["100.83.200.69/32", "fd7a:115c:a1e0::c537:c845/128"],
+              "AllowedIPs": ["100.83.200.69/32", "fd7a:115c:a1e0::c537:c845/128"],
+              "Endpoints": ["77.164.248.136:47143", "10.65.0.27:47143", "172.17.0.1:47143"],
+              "HomeDERP": 8,
+              "Hostinfo": {
+                "OS": "linux",
+                "Hostname": "tagged-client",
+                "Services": [
+                  { "Proto": "peerapi4", "Port": 41378 },
+                  { "Proto": "peerapi6", "Port": 41378 }
+                ]
+              },
+              "Created": "2026-02-23T00:13:11.017324028Z",
+              "Cap": 131,
+              "Tags": ["tag:client"],
+              "Online": true,
+              "ComputedName": "tagged-client",
+              "ComputedNameWithHost": "tagged-client"
+            },
+            "UserProfile": { "ID": 1260082990019555, "LoginName": "tagged-devices", "DisplayName": "Tagged Devices" },
+            "CapMap": null
+          }
         },
         "100.103.8.15": {
           "peer_name": "tagged-prod",
@@ -837,8 +888,21 @@
         "packet_filter_rules": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/subnet-router/tailscaled.sock debug localapi POST debug-packet-filter-rules",
         "packet_filter_matches": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/subnet-router/tailscaled.sock debug localapi POST debug-packet-filter-matches"
       },
-      "packet_filter_rules": null,
-      "packet_filter_matches": [],
+      "packet_filter_rules": [
+        {
+          "SrcIPs": ["100.83.200.69", "fd7a:115c:a1e0::c537:c845"],
+          "DstPorts": [{ "IP": "10.33.0.0/16", "Ports": { "First": 0, "Last": 65535 } }]
+        }
+      ],
+      "packet_filter_matches": [
+        {
+          "IPProto": [6, 17, 1, 58],
+          "Srcs": ["100.83.200.69/32", "fd7a:115c:a1e0::c537:c845/128"],
+          "SrcCaps": null,
+          "Dsts": [{ "Net": "10.33.0.0/16", "Ports": { "First": 0, "Last": 65535 } }],
+          "Caps": []
+        }
+      ],
       "whois": {
         "100.124.195.93": {
           "peer_name": "exit-a",
@@ -883,7 +947,36 @@
         "100.83.200.69": {
           "peer_name": "tagged-client",
           "command": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/subnet-router/tailscaled.sock whois --json 100.83.200.69",
-          "response": null
+          "response": {
+            "Node": {
+              "ID": 4031348162889210,
+              "StableID": "nf7BTTgoUY11CNTRL",
+              "Name": "tagged-client.tail78f774.ts.net.",
+              "User": 1260082990019555,
+              "Key": "nodekey:3011e53353e49142ea56ae11f81e0dceae0d667093d04ee086dcb1e9c5d3c844",
+              "DiscoKey": "discokey:64af337a7e8b61dce500da3b8f7d0a95fc6fe0e57c2f9e57b9b484a9b4acbe1e",
+              "Addresses": ["100.83.200.69/32", "fd7a:115c:a1e0::c537:c845/128"],
+              "AllowedIPs": ["100.83.200.69/32", "fd7a:115c:a1e0::c537:c845/128"],
+              "Endpoints": ["77.164.248.136:47143", "10.65.0.27:47143", "172.17.0.1:47143"],
+              "HomeDERP": 8,
+              "Hostinfo": {
+                "OS": "linux",
+                "Hostname": "tagged-client",
+                "Services": [
+                  { "Proto": "peerapi4", "Port": 41378 },
+                  { "Proto": "peerapi6", "Port": 41378 }
+                ]
+              },
+              "Created": "2026-02-23T00:13:11.017324028Z",
+              "Cap": 131,
+              "Tags": ["tag:client"],
+              "Online": true,
+              "ComputedName": "tagged-client",
+              "ComputedNameWithHost": "tagged-client"
+            },
+            "UserProfile": { "ID": 1260082990019555, "LoginName": "tagged-devices", "DisplayName": "Tagged Devices" },
+            "CapMap": null
+          }
         },
         "100.103.8.15": {
           "peer_name": "tagged-prod",
@@ -948,7 +1041,37 @@
         "100.105.127.107": {
           "peer_name": "multi-exit-router",
           "command": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/tagged-client/tailscaled.sock whois --json 100.105.127.107",
-          "response": null
+          "response": {
+            "Node": {
+              "ID": 6294409699640722,
+              "StableID": "nMQuxDUk9r11CNTRL",
+              "Name": "multi-exit-router.tail78f774.ts.net.",
+              "User": 1260082990019555,
+              "Key": "nodekey:b854a0d64eba757cd3215c5bd78149cc0f927e35a2ad20342e88a15ead297f6a",
+              "DiscoKey": "discokey:762c82dd308809f511c6ac86dcc2642585837358fdd24958d55f16883c8e6c58",
+              "Addresses": ["100.105.127.107/32", "fd7a:115c:a1e0::ad37:7f6b/128"],
+              "AllowedIPs": ["100.105.127.107/32", "fd7a:115c:a1e0::ad37:7f6b/128", "10.33.0.0/16"],
+              "Endpoints": ["77.164.248.136:50766", "10.65.0.27:50766", "172.17.0.1:50766"],
+              "HomeDERP": 14,
+              "Hostinfo": {
+                "OS": "linux",
+                "Hostname": "multi-exit-router",
+                "Services": [
+                  { "Proto": "peerapi4", "Port": 62548 },
+                  { "Proto": "peerapi6", "Port": 62548 }
+                ]
+              },
+              "Created": "2026-03-28T10:38:19.117098852Z",
+              "Cap": 131,
+              "Tags": ["tag:exit", "tag:router"],
+              "PrimaryRoutes": ["10.33.0.0/16"],
+              "Online": true,
+              "ComputedName": "multi-exit-router",
+              "ComputedNameWithHost": "multi-exit-router"
+            },
+            "UserProfile": { "ID": 1260082990019555, "LoginName": "tagged-devices", "DisplayName": "Tagged Devices" },
+            "CapMap": null
+          }
         },
         "100.109.43.124": {
           "peer_name": "router-a",
@@ -963,7 +1086,36 @@
         "100.92.142.61": {
           "peer_name": "subnet-router",
           "command": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/tagged-client/tailscaled.sock whois --json 100.92.142.61",
-          "response": null
+          "response": {
+            "Node": {
+              "ID": 7489538288452506,
+              "StableID": "nTPEqJU2V121CNTRL",
+              "Name": "subnet-router.tail78f774.ts.net.",
+              "User": 1260082990019555,
+              "Key": "nodekey:887ae2351c09c3b952f1f42bdac4095ec396ebf15824a746e4193c003e9c8e3c",
+              "DiscoKey": "discokey:9e3167ceaf53735a2fcaa7d3a85ad3a6118274deb448326d594849275014cc56",
+              "Addresses": ["100.92.142.61/32", "fd7a:115c:a1e0::3e37:8e3d/128"],
+              "AllowedIPs": ["100.92.142.61/32", "fd7a:115c:a1e0::3e37:8e3d/128"],
+              "Endpoints": ["77.164.248.136:58597", "10.65.0.27:58597", "172.17.0.1:58597"],
+              "HomeDERP": 14,
+              "Hostinfo": {
+                "OS": "linux",
+                "Hostname": "subnet-router",
+                "Services": [
+                  { "Proto": "peerapi4", "Port": 63250 },
+                  { "Proto": "peerapi6", "Port": 63250 }
+                ]
+              },
+              "Created": "2026-02-23T00:13:15.731478784Z",
+              "Cap": 131,
+              "Tags": ["tag:router"],
+              "Online": true,
+              "ComputedName": "subnet-router",
+              "ComputedNameWithHost": "subnet-router"
+            },
+            "UserProfile": { "ID": 1260082990019555, "LoginName": "tagged-devices", "DisplayName": "Tagged Devices" },
+            "CapMap": null
+          }
         },
         "100.103.8.15": {
           "peer_name": "tagged-prod",

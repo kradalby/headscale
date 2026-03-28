@@ -1,9 +1,9 @@
 {
-  "test_id": "GRANT-V15",
-  "timestamp": "2026-03-28T10:43:22Z",
+  "test_id": "GRANT-V30",
+  "timestamp": "2026-03-28T10:45:22Z",
   "propagation_wait_seconds": 12,
   "input": {
-    "policy_file": "grant_policies_via/grant_v15.json",
+    "policy_file": "grant_policies_via/grant_v30.json",
     "full_policy": {
       "groups": {
         "group:admins": ["kratail2tid@passkey"],
@@ -40,14 +40,37 @@
       },
       "grants": [
         {
-          "src": ["*"],
+          "src": ["tag:group-a"],
+          "dst": ["10.44.0.0/16"],
+          "via": ["tag:router-a"],
+          "ip": ["*"]
+        },
+        {
+          "src": ["tag:group-a"],
           "dst": ["autogroup:internet"],
-          "via": ["tag:exit"],
+          "via": ["tag:exit-b"],
+          "ip": ["*"]
+        },
+        {
+          "src": ["tag:group-b"],
+          "dst": ["10.55.0.0/16"],
+          "via": ["tag:router-b"],
+          "ip": ["*"]
+        },
+        {
+          "src": ["tag:group-b"],
+          "dst": ["autogroup:internet"],
+          "via": ["tag:exit-a"],
           "ip": ["*"]
         }
       ]
     },
-    "grants_section": [{ "src": ["*"], "dst": ["autogroup:internet"], "via": ["tag:exit"], "ip": ["*"] }],
+    "grants_section": [
+      { "src": ["tag:group-a"], "dst": ["10.44.0.0/16"], "via": ["tag:router-a"], "ip": ["*"] },
+      { "src": ["tag:group-a"], "dst": ["autogroup:internet"], "via": ["tag:exit-b"], "ip": ["*"] },
+      { "src": ["tag:group-b"], "dst": ["10.55.0.0/16"], "via": ["tag:router-b"], "ip": ["*"] },
+      { "src": ["tag:group-b"], "dst": ["autogroup:internet"], "via": ["tag:exit-a"], "ip": ["*"] }
+    ],
     "api_endpoint": "https://api.tailscale.com/api/v2/tailnet/kratail2tid%40passkey/acl",
     "api_method": "POST",
     "api_response_code": 200
@@ -468,7 +491,37 @@
         "100.109.43.124": {
           "peer_name": "router-a",
           "command": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/group-a-client/tailscaled.sock whois --json 100.109.43.124",
-          "response": null
+          "response": {
+            "Node": {
+              "ID": 50590507314324,
+              "StableID": "n3kktkvuP111CNTRL",
+              "Name": "router-a.tail78f774.ts.net.",
+              "User": 1260082990019555,
+              "Key": "nodekey:b4566fef38b3b2b15684fc8890f5fbaea4525b467825f57a02801969a5ed2b7b",
+              "DiscoKey": "discokey:368ba711a8394633b4626eb7cd8e6a2df90d8e554505dc032ea9658ceee0f731",
+              "Addresses": ["100.109.43.124/32", "fd7a:115c:a1e0::a537:2b7c/128"],
+              "AllowedIPs": ["100.109.43.124/32", "fd7a:115c:a1e0::a537:2b7c/128", "10.44.0.0/16"],
+              "Endpoints": ["77.164.248.136:34130", "10.65.0.27:34130", "172.17.0.1:34130"],
+              "HomeDERP": 14,
+              "Hostinfo": {
+                "OS": "linux",
+                "Hostname": "router-a",
+                "Services": [
+                  { "Proto": "peerapi4", "Port": 49439 },
+                  { "Proto": "peerapi6", "Port": 49439 }
+                ]
+              },
+              "Created": "2026-03-28T10:38:11.734910312Z",
+              "Cap": 131,
+              "Tags": ["tag:router-a"],
+              "PrimaryRoutes": ["10.44.0.0/16"],
+              "Online": true,
+              "ComputedName": "router-a",
+              "ComputedNameWithHost": "router-a"
+            },
+            "UserProfile": { "ID": 1260082990019555, "LoginName": "tagged-devices", "DisplayName": "Tagged Devices" },
+            "CapMap": null
+          }
         },
         "100.65.172.123": {
           "peer_name": "router-b",
@@ -553,7 +606,37 @@
         "100.65.172.123": {
           "peer_name": "router-b",
           "command": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/group-b-client/tailscaled.sock whois --json 100.65.172.123",
-          "response": null
+          "response": {
+            "Node": {
+              "ID": 1399889648409786,
+              "StableID": "nPHvXBj1wB11CNTRL",
+              "Name": "router-b.tail78f774.ts.net.",
+              "User": 1260082990019555,
+              "Key": "nodekey:4e6d3473c516cea37bcefdf4368932c623fd91c24aee1aacc27ca8165a41ac7a",
+              "DiscoKey": "discokey:dd5532635b8e3ddf25186e36671c16dd17c005c8b6a6862f4b5cc4e4f459e705",
+              "Addresses": ["100.65.172.123/32", "fd7a:115c:a1e0::5a37:ac7c/128"],
+              "AllowedIPs": ["100.65.172.123/32", "fd7a:115c:a1e0::5a37:ac7c/128", "10.55.0.0/16"],
+              "Endpoints": ["77.164.248.136:35931", "10.65.0.27:35931", "172.17.0.1:35931"],
+              "HomeDERP": 14,
+              "Hostinfo": {
+                "OS": "linux",
+                "Hostname": "router-b",
+                "Services": [
+                  { "Proto": "peerapi4", "Port": 58804 },
+                  { "Proto": "peerapi6", "Port": 58804 }
+                ]
+              },
+              "Created": "2026-03-28T10:38:15.42735258Z",
+              "Cap": 131,
+              "Tags": ["tag:router-b"],
+              "PrimaryRoutes": ["10.55.0.0/16"],
+              "Online": true,
+              "ComputedName": "router-b",
+              "ComputedNameWithHost": "router-b"
+            },
+            "UserProfile": { "ID": 1260082990019555, "LoginName": "tagged-devices", "DisplayName": "Tagged Devices" },
+            "CapMap": null
+          }
         },
         "100.92.142.61": {
           "peer_name": "subnet-router",
@@ -677,8 +760,21 @@
         "packet_filter_rules": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/router-a/tailscaled.sock debug localapi POST debug-packet-filter-rules",
         "packet_filter_matches": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/router-a/tailscaled.sock debug localapi POST debug-packet-filter-matches"
       },
-      "packet_filter_rules": null,
-      "packet_filter_matches": [],
+      "packet_filter_rules": [
+        {
+          "SrcIPs": ["100.107.162.14", "fd7a:115c:a1e0::a237:a20e"],
+          "DstPorts": [{ "IP": "10.44.0.0/16", "Ports": { "First": 0, "Last": 65535 } }]
+        }
+      ],
+      "packet_filter_matches": [
+        {
+          "IPProto": [6, 17, 1, 58],
+          "Srcs": ["100.107.162.14/32", "fd7a:115c:a1e0::a237:a20e/128"],
+          "SrcCaps": null,
+          "Dsts": [{ "Net": "10.44.0.0/16", "Ports": { "First": 0, "Last": 65535 } }],
+          "Caps": []
+        }
+      ],
       "whois": {
         "100.124.195.93": {
           "peer_name": "exit-a",
@@ -698,7 +794,36 @@
         "100.107.162.14": {
           "peer_name": "group-a-client",
           "command": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/router-a/tailscaled.sock whois --json 100.107.162.14",
-          "response": null
+          "response": {
+            "Node": {
+              "ID": 6999435610919250,
+              "StableID": "nyckVfJ4fw11CNTRL",
+              "Name": "group-a-client.tail78f774.ts.net.",
+              "User": 1260082990019555,
+              "Key": "nodekey:802726716bd4942fceb5e444218c930040fadb082698b57ea3eb59a6a26ba20d",
+              "DiscoKey": "discokey:bc93c2d3b81606e44eb1c96d721e7cd73c9497aa7d3efbe2f5e0d1e2e95b190f",
+              "Addresses": ["100.107.162.14/32", "fd7a:115c:a1e0::a237:a20e/128"],
+              "AllowedIPs": ["100.107.162.14/32", "fd7a:115c:a1e0::a237:a20e/128"],
+              "Endpoints": ["77.164.248.136:51980", "10.65.0.27:51980", "172.17.0.1:51980"],
+              "HomeDERP": 14,
+              "Hostinfo": {
+                "OS": "linux",
+                "Hostname": "group-a-client",
+                "Services": [
+                  { "Proto": "peerapi4", "Port": 36543 },
+                  { "Proto": "peerapi6", "Port": 36543 }
+                ]
+              },
+              "Created": "2026-03-28T10:38:04.339428828Z",
+              "Cap": 131,
+              "Tags": ["tag:group-a"],
+              "Online": true,
+              "ComputedName": "group-a-client",
+              "ComputedNameWithHost": "group-a-client"
+            },
+            "UserProfile": { "ID": 1260082990019555, "LoginName": "tagged-devices", "DisplayName": "Tagged Devices" },
+            "CapMap": null
+          }
         },
         "100.77.135.18": {
           "peer_name": "group-b-client",
@@ -757,8 +882,21 @@
         "packet_filter_rules": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/router-b/tailscaled.sock debug localapi POST debug-packet-filter-rules",
         "packet_filter_matches": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/router-b/tailscaled.sock debug localapi POST debug-packet-filter-matches"
       },
-      "packet_filter_rules": null,
-      "packet_filter_matches": [],
+      "packet_filter_rules": [
+        {
+          "SrcIPs": ["100.77.135.18", "fd7a:115c:a1e0::4b37:8712"],
+          "DstPorts": [{ "IP": "10.55.0.0/16", "Ports": { "First": 0, "Last": 65535 } }]
+        }
+      ],
+      "packet_filter_matches": [
+        {
+          "IPProto": [6, 17, 1, 58],
+          "Srcs": ["100.77.135.18/32", "fd7a:115c:a1e0::4b37:8712/128"],
+          "SrcCaps": null,
+          "Dsts": [{ "Net": "10.55.0.0/16", "Ports": { "First": 0, "Last": 65535 } }],
+          "Caps": []
+        }
+      ],
       "whois": {
         "100.124.195.93": {
           "peer_name": "exit-a",
@@ -783,7 +921,36 @@
         "100.77.135.18": {
           "peer_name": "group-b-client",
           "command": "/home/kradalby/go/bin/tailscale --socket=/home/kradalby/.config/multi-tailscale-dev/router-b/tailscaled.sock whois --json 100.77.135.18",
-          "response": null
+          "response": {
+            "Node": {
+              "ID": 1008089393782498,
+              "StableID": "ndUwgLoZs811CNTRL",
+              "Name": "group-b-client.tail78f774.ts.net.",
+              "User": 1260082990019555,
+              "Key": "nodekey:ef35a655163204a08b33e09fdc24709f1e3aaa7f40de4efd5549cf014b4d8711",
+              "DiscoKey": "discokey:e972182cda0d0b459c91b2881624b81749a7e44390a5dde1b9bc17c1ae67715a",
+              "Addresses": ["100.77.135.18/32", "fd7a:115c:a1e0::4b37:8712/128"],
+              "AllowedIPs": ["100.77.135.18/32", "fd7a:115c:a1e0::4b37:8712/128"],
+              "Endpoints": ["77.164.248.136:49377", "10.65.0.27:49377", "172.17.0.1:49377"],
+              "HomeDERP": 14,
+              "Hostinfo": {
+                "OS": "linux",
+                "Hostname": "group-b-client",
+                "Services": [
+                  { "Proto": "peerapi4", "Port": 47173 },
+                  { "Proto": "peerapi6", "Port": 47173 }
+                ]
+              },
+              "Created": "2026-03-28T10:38:08.031309668Z",
+              "Cap": 131,
+              "Tags": ["tag:group-b"],
+              "Online": true,
+              "ComputedName": "group-b-client",
+              "ComputedNameWithHost": "group-b-client"
+            },
+            "UserProfile": { "ID": 1260082990019555, "LoginName": "tagged-devices", "DisplayName": "Tagged Devices" },
+            "CapMap": null
+          }
         },
         "100.105.127.107": {
           "peer_name": "multi-exit-router",
