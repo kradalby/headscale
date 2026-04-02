@@ -2675,9 +2675,7 @@
         {
           "type": "patch",
           "hash": "6e66a2b4c71c5289dc472054371249d3d8c0267e",
-          "files": [
-            "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/mapper/batcher_rapid_test.go"
-          ],
+          "files": ["/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/mapper/batcher_rapid_test.go"],
           "id": "prt_d40c9c664001VKNqHNVwE6NvZg",
           "sessionID": "ses_2bf7bdc67ffeMgKOZbxQbB0WTb",
           "messageID": "msg_d40bae16f0021WCm40a5Y3te3g"
@@ -2776,9 +2774,7 @@
         {
           "type": "patch",
           "hash": "9acaa636600f0e1c90c19bfac5d8c79beebeddcc",
-          "files": [
-            "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/servertest/rapid_pbt_test.go"
-          ],
+          "files": ["/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/servertest/rapid_pbt_test.go"],
           "id": "prt_d40d8c766001DBeFCJmvmpu602",
           "sessionID": "ses_2bf7bdc67ffeMgKOZbxQbB0WTb",
           "messageID": "msg_d40c9c66a002Qk0FR4VjDMY4Vt"
@@ -3085,9 +3081,7 @@
         {
           "type": "patch",
           "hash": "2e9af73836f5b164963d1ab4ae847f86b0ebbd29",
-          "files": [
-            "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/types/tailnode_rapid_test.go"
-          ],
+          "files": ["/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/types/tailnode_rapid_test.go"],
           "id": "prt_d40e7db4d001Z503NrXfhOihPQ",
           "sessionID": "ses_2bf7bdc67ffeMgKOZbxQbB0WTb",
           "messageID": "msg_d40e37189002YvHahQzsQZ72kU"
@@ -3186,9 +3180,7 @@
         {
           "type": "patch",
           "hash": "670541e311c9323b39741f9fb1a19e1979bd360e",
-          "files": [
-            "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/db/ip_rapid_test.go"
-          ],
+          "files": ["/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/db/ip_rapid_test.go"],
           "id": "prt_d40f079ed001Ge3eBjMf6La5S8",
           "sessionID": "ses_2bf7bdc67ffeMgKOZbxQbB0WTb",
           "messageID": "msg_d40e7db550022YZpu5dcpnkCgi"
@@ -3390,9 +3382,7 @@
         {
           "type": "patch",
           "hash": "83aaf2ed07c3432351a54bf9756eb486d07ce429",
-          "files": [
-            "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/mapper/builder_rapid_test.go"
-          ],
+          "files": ["/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/mapper/builder_rapid_test.go"],
           "id": "prt_d40f783ed001BTVqAd09xbkPsP",
           "sessionID": "ses_2bf7bdc67ffeMgKOZbxQbB0WTb",
           "messageID": "msg_d40f49957002tUR3gNzPgG1Vma"
@@ -4966,9 +4956,7 @@
         {
           "type": "patch",
           "hash": "c6fac0bc26d2056af219482f6b6f3fe8663ca7df",
-          "files": [
-            "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/routes/primary_rapid_test.go"
-          ],
+          "files": ["/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/routes/primary_rapid_test.go"],
           "id": "prt_d43e72541001sHrd5D7e0l0hHZ",
           "sessionID": "ses_2bf7bdc67ffeMgKOZbxQbB0WTb",
           "messageID": "msg_d43e41424002xlyKtnG3lTLS9w"
@@ -5351,9 +5339,7 @@
         {
           "type": "patch",
           "hash": "36d3012ec28831e6e6253ceb59e4d835f1f4f8f4",
-          "files": [
-            "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/policy/v2/utils_rapid_test.go"
-          ],
+          "files": ["/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/policy/v2/utils_rapid_test.go"],
           "id": "prt_d43ed4151001ipz0EkKTmXmHDZ",
           "sessionID": "ses_2bf7bdc67ffeMgKOZbxQbB0WTb",
           "messageID": "msg_d43eb74e9002se8Q8b4GJHotaU"
@@ -6577,9 +6563,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "type \"patch\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -6599,9 +6583,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "method \"fullMapResponse\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/policy/v2/types.go": [],
@@ -6655,9 +6637,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"updateTimeout\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -6677,9 +6657,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"tinyBufferSize\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -6699,9 +6677,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "method \"getStats\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/mapper/batcher_unit_test.go": [],
@@ -7162,9 +7138,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"ipv4AddressLength\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -7184,9 +7158,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"ipv6AddressLength\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/util/string.go": [
@@ -7231,9 +7203,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"oneHundred\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/db/api_key.go": [
@@ -7255,9 +7225,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"legacyAPIKeyLength\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/grpcv1.go": [
@@ -7279,9 +7247,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "method \"mustEmbedUnimplementedHeadscaleServiceServer\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/util/addr.go": [],
@@ -7304,9 +7270,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"randomByteSize\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/metrics.go": [
@@ -7328,9 +7292,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "function \"prometheusMiddleware\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/app.go": [
@@ -7352,9 +7314,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"headscaleDirPerm\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/routes/primary.go": [],
@@ -7380,9 +7340,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "function \"generateRandomNumber\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/db/db.go": [
@@ -7404,9 +7362,7 @@
                     },
                     "source": "deprecated",
                     "message": "types.Route is deprecated: Approval of routes is denormalised onto the relevant node.\nStruct is kept for GORM migrations only.",
-                    "tags": [
-                      2
-                    ]
+                    "tags": [2]
                   },
                   {
                     "range": {
@@ -7426,9 +7382,7 @@
                     },
                     "source": "deprecated",
                     "message": "types.Route is deprecated: Approval of routes is denormalised onto the relevant node.\nStruct is kept for GORM migrations only.",
-                    "tags": [
-                      2
-                    ]
+                    "tags": [2]
                   },
                   {
                     "range": {
@@ -7448,9 +7402,7 @@
                     },
                     "source": "deprecated",
                     "message": "types.Route is deprecated: Approval of routes is denormalised onto the relevant node.\nStruct is kept for GORM migrations only.",
-                    "tags": [
-                      2
-                    ]
+                    "tags": [2]
                   },
                   {
                     "range": {
@@ -7470,9 +7422,7 @@
                     },
                     "source": "deprecated",
                     "message": "types.Route is deprecated: Approval of routes is denormalised onto the relevant node.\nStruct is kept for GORM migrations only.",
-                    "tags": [
-                      2
-                    ]
+                    "tags": [2]
                   },
                   {
                     "range": {
@@ -7492,9 +7442,7 @@
                     },
                     "source": "deprecated",
                     "message": "types.Route is deprecated: Approval of routes is denormalised onto the relevant node.\nStruct is kept for GORM migrations only.",
-                    "tags": [
-                      2
-                    ]
+                    "tags": [2]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/db/suite_test.go": [],
@@ -7819,9 +7767,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -7841,9 +7787,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -7863,9 +7807,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -7987,9 +7929,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8009,9 +7949,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/db/ip_rapid_test.go": [
@@ -8063,9 +8001,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "function \"genCGNATPrefix\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8085,9 +8021,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8107,9 +8041,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8129,9 +8061,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8151,9 +8081,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8173,9 +8101,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8305,9 +8231,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8327,9 +8251,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/db/node_rapid_test.go": [
@@ -8381,9 +8303,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8403,9 +8323,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/state/node_store_rapid_test.go": [
@@ -8457,9 +8375,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8479,9 +8395,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8501,9 +8415,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8523,9 +8435,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8545,9 +8455,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8567,9 +8475,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8660,9 +8566,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8791,9 +8695,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8813,9 +8715,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8835,9 +8735,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8857,9 +8755,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8879,9 +8775,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/mapper/builder_rapid_test.go": [
@@ -8933,9 +8827,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8955,9 +8847,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8977,9 +8867,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -8999,9 +8887,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -9021,9 +8907,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -9043,9 +8927,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -9065,9 +8947,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ]
               },
@@ -9112,9 +8992,7 @@
         {
           "type": "patch",
           "hash": "0ef13e3ce6500e9af077a4c9c33b82d1a5942f55",
-          "files": [
-            "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/types/users_rapid_test.go"
-          ],
+          "files": ["/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/types/users_rapid_test.go"],
           "id": "prt_d43eecafe001BfFzOpJSs70CgZ",
           "sessionID": "ses_2bf7bdc67ffeMgKOZbxQbB0WTb",
           "messageID": "msg_d43eea143002sC7644PkCPCSRZ"
@@ -9570,9 +9448,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "type \"patch\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -9592,9 +9468,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "method \"fullMapResponse\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/policy/v2/types.go": [],
@@ -9648,9 +9522,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"updateTimeout\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -9670,9 +9542,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"tinyBufferSize\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -9692,9 +9562,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "method \"getStats\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/mapper/batcher_unit_test.go": [],
@@ -10155,9 +10023,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"ipv4AddressLength\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -10177,9 +10043,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"ipv6AddressLength\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/util/string.go": [
@@ -10224,9 +10088,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"oneHundred\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/db/api_key.go": [
@@ -10248,9 +10110,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"legacyAPIKeyLength\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/grpcv1.go": [
@@ -10272,9 +10132,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "method \"mustEmbedUnimplementedHeadscaleServiceServer\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/util/addr.go": [],
@@ -10297,9 +10155,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"randomByteSize\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/metrics.go": [
@@ -10321,9 +10177,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "function \"prometheusMiddleware\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/app.go": [
@@ -10345,9 +10199,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "const \"headscaleDirPerm\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/routes/primary.go": [],
@@ -10373,9 +10225,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "function \"generateRandomNumber\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/db/db.go": [
@@ -10397,9 +10247,7 @@
                     },
                     "source": "deprecated",
                     "message": "types.Route is deprecated: Approval of routes is denormalised onto the relevant node.\nStruct is kept for GORM migrations only.",
-                    "tags": [
-                      2
-                    ]
+                    "tags": [2]
                   },
                   {
                     "range": {
@@ -10419,9 +10267,7 @@
                     },
                     "source": "deprecated",
                     "message": "types.Route is deprecated: Approval of routes is denormalised onto the relevant node.\nStruct is kept for GORM migrations only.",
-                    "tags": [
-                      2
-                    ]
+                    "tags": [2]
                   },
                   {
                     "range": {
@@ -10441,9 +10287,7 @@
                     },
                     "source": "deprecated",
                     "message": "types.Route is deprecated: Approval of routes is denormalised onto the relevant node.\nStruct is kept for GORM migrations only.",
-                    "tags": [
-                      2
-                    ]
+                    "tags": [2]
                   },
                   {
                     "range": {
@@ -10463,9 +10307,7 @@
                     },
                     "source": "deprecated",
                     "message": "types.Route is deprecated: Approval of routes is denormalised onto the relevant node.\nStruct is kept for GORM migrations only.",
-                    "tags": [
-                      2
-                    ]
+                    "tags": [2]
                   },
                   {
                     "range": {
@@ -10485,9 +10327,7 @@
                     },
                     "source": "deprecated",
                     "message": "types.Route is deprecated: Approval of routes is denormalised onto the relevant node.\nStruct is kept for GORM migrations only.",
-                    "tags": [
-                      2
-                    ]
+                    "tags": [2]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/db/suite_test.go": [],
@@ -10812,9 +10652,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -10834,9 +10672,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -10856,9 +10692,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -10980,9 +10814,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11002,9 +10834,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/db/ip_rapid_test.go": [
@@ -11056,9 +10886,7 @@
                     },
                     "source": "unusedfunc",
                     "message": "function \"genCGNATPrefix\" is unused",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11078,9 +10906,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11100,9 +10926,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11122,9 +10946,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11144,9 +10966,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11166,9 +10986,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11298,9 +11116,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11320,9 +11136,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/db/node_rapid_test.go": [
@@ -11374,9 +11188,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11396,9 +11208,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/state/node_store_rapid_test.go": [
@@ -11450,9 +11260,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11472,9 +11280,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11494,9 +11300,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11516,9 +11320,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11538,9 +11340,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11560,9 +11360,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11653,9 +11451,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11784,9 +11580,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11806,9 +11600,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11828,9 +11620,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11850,9 +11640,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11872,9 +11660,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ],
                 "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/mapper/builder_rapid_test.go": [
@@ -11926,9 +11712,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11948,9 +11732,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11970,9 +11752,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -11992,9 +11772,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -12014,9 +11792,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -12036,9 +11812,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   },
                   {
                     "range": {
@@ -12058,9 +11832,7 @@
                     },
                     "source": "infertypeargs",
                     "message": "unnecessary type arguments",
-                    "tags": [
-                      1
-                    ]
+                    "tags": [1]
                   }
                 ]
               },
@@ -12105,9 +11877,7 @@
         {
           "type": "patch",
           "hash": "3e2606de6ba8742da1f8909c64611acbdb51b7da",
-          "files": [
-            "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/types/users_rapid_test.go"
-          ],
+          "files": ["/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/types/users_rapid_test.go"],
           "id": "prt_d43ef682c001qr3Gwrf46qM23E",
           "sessionID": "ses_2bf7bdc67ffeMgKOZbxQbB0WTb",
           "messageID": "msg_d43ef28be002WNUcwLR2IGG5YJ"
@@ -15984,9 +15754,7 @@
         {
           "type": "patch",
           "hash": "4f6fb9e76f9f0cc5329b5b84c07ac22be5f99f81",
-          "files": [
-            "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/types/node_rapid_test.go"
-          ],
+          "files": ["/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/types/node_rapid_test.go"],
           "id": "prt_d4427203c0016YL9rGm5nZKTDu",
           "sessionID": "ses_2bf7bdc67ffeMgKOZbxQbB0WTb",
           "messageID": "msg_d442326730021oVvpwpAaxFbFx"
@@ -19003,9 +18771,7 @@
         {
           "type": "patch",
           "hash": "ac2b312b92861ed0b36e3d9a5330f2467ccdf9a0",
-          "files": [
-            "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/servertest/rapid_pbt_test.go"
-          ],
+          "files": ["/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/servertest/rapid_pbt_test.go"],
           "id": "prt_d459f3d990016x6wkam6pRlw4Z",
           "sessionID": "ses_2bf7bdc67ffeMgKOZbxQbB0WTb",
           "messageID": "msg_d4590d202002i7UyhFk9AF5dp4"
@@ -19138,9 +18904,7 @@
         {
           "type": "patch",
           "hash": "9a5ac19d5a5e7f94b6d54185166c00d9f5478b38",
-          "files": [
-            "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/servertest/rapid_pbt_test.go"
-          ],
+          "files": ["/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/servertest/rapid_pbt_test.go"],
           "id": "prt_d459f5d65001e5KHLmHiUFKIJP",
           "sessionID": "ses_2bf7bdc67ffeMgKOZbxQbB0WTb",
           "messageID": "msg_d459f3dbe002wJcHRw9mOkcuC7"
@@ -19651,9 +19415,7 @@
         {
           "type": "patch",
           "hash": "a1ea30c8795311d22fa46499e15ded6d912ef61c",
-          "files": [
-            "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/servertest/rapid_pbt_test.go"
-          ],
+          "files": ["/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/servertest/rapid_pbt_test.go"],
           "id": "prt_d45b44230001SznwLAaxvIXeId",
           "sessionID": "ses_2bf7bdc67ffeMgKOZbxQbB0WTb",
           "messageID": "msg_d45b4028b002ZzfwrIAkcHyvbK"
@@ -19886,9 +19648,7 @@
         {
           "type": "patch",
           "hash": "f91ad280d34b452a32c05b8547750a3063b4fa53",
-          "files": [
-            "/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/servertest/rapid_pbt_test.go"
-          ],
+          "files": ["/home/kradalby/git/headscale/kradalby/rapid-test-explore/hscontrol/servertest/rapid_pbt_test.go"],
           "id": "prt_d45b9a386001Qcoe6tDKr3kukT",
           "sessionID": "ses_2bf7bdc67ffeMgKOZbxQbB0WTb",
           "messageID": "msg_d45b967a0002Ji2jAFSytjd1ws"

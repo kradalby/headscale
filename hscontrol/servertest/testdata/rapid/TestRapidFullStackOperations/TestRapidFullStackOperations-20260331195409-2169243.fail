@@ -56,7 +56,7 @@
 # 2026/03/31 19:54:43.261172 [TestRapidFullStackOperations] [rapid] draw reconnectIdx: 5
 # 2026/03/31 19:54:44.769318 [TestRapidFullStackOperations] [rapid] draw action: "SetRestrictivePolicy"
 # 2026/03/31 19:55:15.264701 [TestRapidFullStackOperations] SetRestrictivePolicy: convergence failed (connected=3)
-# 
+#
 v0.4.8#6201490358131731195
 0x18f706ef76f6cf
 0xfc25e8d5648c3

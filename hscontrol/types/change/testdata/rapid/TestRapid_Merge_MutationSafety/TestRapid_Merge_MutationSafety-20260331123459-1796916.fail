@@ -25,7 +25,7 @@
 # 2026/03/31 12:34:59.506773 [TestRapid_Merge_MutationSafety] [rapid] draw nodeIDs: []types.NodeID{}
 # 2026/03/31 12:34:59.506774 [TestRapid_Merge_MutationSafety] [rapid] draw numPatches: 0
 # 2026/03/31 12:34:59.506776 [TestRapid_Merge_MutationSafety] Merge mutated receiver's PeersRemoved: before=[1 1], after=[1 0]
-# 
+#
 v0.4.8#5620682472151128331
 0x0
 0x0

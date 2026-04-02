@@ -61,7 +61,7 @@
 # 2026/03/31 20:02:31.673556 [TestRapidFullStackOperations] [rapid] draw action: "ReconnectClient"
 # 2026/03/31 20:02:31.673560 [TestRapidFullStackOperations] [rapid] draw reconnectIdx: 6
 # 2026/03/31 20:03:02.176090 [TestRapidFullStackOperations] ReconnectClient(node-6, idx=6): convergence failed (connected=2)
-# 
+#
 v0.4.8#12493884566994739516
 0x1e66158dfeeaac
 0x9389f53c23439
