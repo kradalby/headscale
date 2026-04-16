@@ -1,0 +1,24 @@
+FROM rust:1.94-bookworm AS builder
+
+# Default to the kradalby fork on the env-http branch, which stacks two
+# unmerged changes we need for integration tests against a local headscale:
+#   - kradalby/env: TS_CONTROL_URL / TS_HOSTNAME / TS_CLIENT_NAME /
+#     TS_AUTH_KEY environment support in tailscale::Device::new
+#   - bradfitz/http-control (upstream PR #93): plain-HTTP control server
+#     support (scheme-aware dialer, optional challenge packet, POST /ts2021)
+ARG TAILSCALE_RS_REPO=https://github.com/kradalby/tailscale-rs.git
+ARG TAILSCALE_RS_REF=kradalby/env-http
+
+WORKDIR /app
+RUN git clone --depth 1 --branch "$TAILSCALE_RS_REF" "$TAILSCALE_RS_REPO" .
+RUN cargo build --release --features axum --example axum
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ca-certificates \
+    iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/examples/axum /usr/local/bin/axum
