@@ -172,6 +172,16 @@ func TestSSHDataCompat(t *testing.T) {
 		"no ssh-*.hujson test files found in testdata/ssh_results/",
 	)
 
+	allHujson, err := filepath.Glob(
+		filepath.Join("testdata", "ssh_results", "*.hujson"),
+	)
+	require.NoError(t, err, "failed to glob all hujson files")
+	require.Lenf(t, files, len(allHujson),
+		"ssh_results/ contains hujson files not picked up by the ssh-*.hujson loader; "+
+			"loader sees %d, directory has %d. Stale fixtures should be deleted.",
+		len(files), len(allHujson),
+	)
+
 	t.Logf("Loaded %d SSH test files", len(files))
 
 	users := setupSSHDataCompatUsers()
