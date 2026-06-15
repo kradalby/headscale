@@ -23,9 +23,8 @@ const (
 )
 
 var (
-	ErrAPIKeyFailedToParse     = errors.New("failed to parse ApiKey")
-	ErrAPIKeyGenerationFailed  = errors.New("failed to generate API key")
-	ErrAPIKeyInvalidGeneration = errors.New("generated API key failed validation")
+	ErrAPIKeyFailedToParse    = errors.New("failed to parse ApiKey")
+	ErrAPIKeyGenerationFailed = errors.New("failed to generate API key")
 )
 
 // CreateAPIKey creates a new [types.APIKey] in a user, and returns it.
@@ -38,28 +37,10 @@ func (hsdb *HSDatabase) CreateAPIKey(
 		return "", nil, err
 	}
 
-	// Validate prefix
-	if len(prefix) != apiKeyPrefixLength {
-		return "", nil, fmt.Errorf("%w: generated prefix has invalid length: expected %d, got %d", ErrAPIKeyInvalidGeneration, apiKeyPrefixLength, len(prefix))
-	}
-
-	if !isValidBase64URLSafe(prefix) {
-		return "", nil, fmt.Errorf("%w: generated prefix contains invalid characters", ErrAPIKeyInvalidGeneration)
-	}
-
 	// Generate secret (64 chars)
 	secret, err := util.GenerateRandomStringURLSafe(apiKeyHashLength)
 	if err != nil {
 		return "", nil, err
-	}
-
-	// Validate secret
-	if len(secret) != apiKeyHashLength {
-		return "", nil, fmt.Errorf("%w: generated secret has invalid length: expected %d, got %d", ErrAPIKeyInvalidGeneration, apiKeyHashLength, len(secret))
-	}
-
-	if !isValidBase64URLSafe(secret) {
-		return "", nil, fmt.Errorf("%w: generated secret contains invalid characters", ErrAPIKeyInvalidGeneration)
 	}
 
 	// Full key string (shown ONCE to user)

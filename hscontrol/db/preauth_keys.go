@@ -99,27 +99,9 @@ func CreatePreAuthKey(
 		return nil, err
 	}
 
-	// Validate generated prefix (should always be valid, but be defensive)
-	if len(prefix) != authKeyPrefixLength {
-		return nil, fmt.Errorf("%w: generated prefix has invalid length: expected %d, got %d", ErrPreAuthKeyFailedToParse, authKeyPrefixLength, len(prefix))
-	}
-
-	if !isValidBase64URLSafe(prefix) {
-		return nil, fmt.Errorf("%w: generated prefix contains invalid characters", ErrPreAuthKeyFailedToParse)
-	}
-
 	toBeHashed, err := util.GenerateRandomStringURLSafe(authKeyLength)
 	if err != nil {
 		return nil, err
-	}
-
-	// Validate generated hash (should always be valid, but be defensive)
-	if len(toBeHashed) != authKeyLength {
-		return nil, fmt.Errorf("%w: generated hash has invalid length: expected %d, got %d", ErrPreAuthKeyFailedToParse, authKeyLength, len(toBeHashed))
-	}
-
-	if !isValidBase64URLSafe(toBeHashed) {
-		return nil, fmt.Errorf("%w: generated hash contains invalid characters", ErrPreAuthKeyFailedToParse)
 	}
 
 	keyStr := authKeyPrefix + prefix + "-" + toBeHashed
