@@ -425,12 +425,7 @@ func (pol *Policy) compileSSHPolicy(
 					allPrincipals = append(allPrincipals, taggedPrincipals...)
 
 					if len(allPrincipals) > 0 {
-						rules = append(rules, &tailcfg.SSHRule{
-							Principals: allPrincipals,
-							SSHUsers:   baseUserMap,
-							Action:     &action,
-							AcceptEnv:  acceptEnv,
-						})
+						appendRules(allPrincipals, 0, false)
 					}
 				}
 			} else if hasLocalpart && slices.ContainsFunc(node.IPs(), srcIPs.Contains) {
