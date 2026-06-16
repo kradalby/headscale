@@ -63,17 +63,16 @@ func GetFirstOrCreateNetworkWithSubnet(pool *dockertest.Pool, name, subnet strin
 			})
 		}
 
-		if _, err := pool.CreateNetwork(name, opts...); err == nil { //nolint:noinlineerr // intentional inline check
-			// Create does not give us an updated version of the resource, so we need to
-			// get it again.
-			networks, err := pool.NetworksByName(name)
-			if err != nil {
-				return nil, err
-			}
-
-			return &networks[0], nil
-		} else {
+		_, err = pool.CreateNetwork(name, opts...)
+		if err != nil {
 			return nil, fmt.Errorf("creating network: %w", err)
+		}
+
+		// Create does not give us an updated version of the resource, so we need to
+		// get it again.
+		networks, err = pool.NetworksByName(name)
+		if err != nil {
+			return nil, fmt.Errorf("looking up network names: %w", err)
 		}
 	}
 
