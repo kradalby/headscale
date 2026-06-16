@@ -138,9 +138,6 @@ func NewIPAllocator(
 }
 
 func (i *IPAllocator) Next() (*netip.Addr, *netip.Addr, error) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-
 	var (
 		err  error
 		ret4 *netip.Addr
@@ -148,21 +145,17 @@ func (i *IPAllocator) Next() (*netip.Addr, *netip.Addr, error) {
 	)
 
 	if i.prefix4 != nil {
-		ret4, err = i.next(i.prev4, i.prefix4)
+		ret4, err = i.allocateNext(&i.prev4, i.prefix4)
 		if err != nil {
 			return nil, nil, fmt.Errorf("allocating IPv4 address: %w", err)
 		}
-
-		i.prev4 = *ret4
 	}
 
 	if i.prefix6 != nil {
-		ret6, err = i.next(i.prev6, i.prefix6)
+		ret6, err = i.allocateNext(&i.prev6, i.prefix6)
 		if err != nil {
 			return nil, nil, fmt.Errorf("allocating IPv6 address: %w", err)
 		}
-
-		i.prev6 = *ret6
 	}
 
 	return ret4, ret6, nil
