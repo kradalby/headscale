@@ -362,19 +362,7 @@ func CleanIdentifier(identifier string) string {
 	u, err := url.Parse(identifier)
 	if err == nil && u.Scheme != "" {
 		// Clean path by removing empty segments and whitespace within segments
-		parts := strings.FieldsFunc(u.Path, func(c rune) bool { return c == '/' })
-		for i, part := range parts {
-			parts[i] = strings.TrimSpace(part)
-		}
-		// Remove empty parts after trimming
-		cleanParts := make([]string, 0, len(parts))
-		for _, part := range parts {
-			if part != "" {
-				cleanParts = append(cleanParts, part)
-			}
-		}
-
-		if len(cleanParts) == 0 {
+		if cleanParts := cleanSlashSegments(u.Path); len(cleanParts) == 0 {
 			u.Path = ""
 		} else {
 			u.Path = "/" + strings.Join(cleanParts, "/")
@@ -386,21 +374,27 @@ func CleanIdentifier(identifier string) string {
 	}
 
 	// Handle non-URL identifiers
-	parts := strings.FieldsFunc(identifier, func(c rune) bool { return c == '/' })
-	// Clean whitespace from each part
-	cleanParts := make([]string, 0, len(parts))
-	for _, part := range parts {
-		trimmed := strings.TrimSpace(part)
-		if trimmed != "" {
-			cleanParts = append(cleanParts, trimmed)
-		}
-	}
-
+	cleanParts := cleanSlashSegments(identifier)
 	if len(cleanParts) == 0 {
 		return ""
 	}
 
 	return strings.Join(cleanParts, "/")
+}
+
+// cleanSlashSegments splits s on '/', trims whitespace from each segment, and
+// returns the non-empty segments.
+func cleanSlashSegments(s string) []string {
+	parts := strings.FieldsFunc(s, func(c rune) bool { return c == '/' })
+
+	cleanParts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			cleanParts = append(cleanParts, part)
+		}
+	}
+
+	return cleanParts
 }
 
 type OIDCUserInfo struct {
