@@ -247,7 +247,7 @@ func requireAllClientsOnlineWithSingleTimeout(t *testing.T, headscale ControlSer
 
 		// Check batcher state for expected nodes
 		for _, nodeID := range expectedNodes {
-			nodeIDStr := fmt.Sprintf("%d", nodeID)
+			nodeIDStr := nodeID.String()
 			if nodeInfo, exists := debugInfo.ConnectedNodes[nodeIDStr]; exists {
 				if status, exists := nodeStatus[nodeID]; exists {
 					status.Batcher = nodeInfo.Connected
@@ -334,8 +334,7 @@ func requireAllClientsOnlineWithSingleTimeout(t *testing.T, headscale ControlSer
 
 		var failureReport strings.Builder
 
-		ids := types.NodeIDs(slices.AppendSeq(make([]types.NodeID, 0, len(nodeStatus)), maps.Keys(nodeStatus)))
-		slices.Sort(ids)
+		ids := types.NodeIDs(slices.Sorted(maps.Keys(nodeStatus)))
 
 		for _, nodeID := range ids {
 			status := nodeStatus[nodeID]
@@ -391,7 +390,7 @@ func requireAllClientsOfflineStaged(t *testing.T, headscale ControlServer, expec
 		allBatcherOffline := true
 
 		for _, nodeID := range expectedNodes {
-			nodeIDStr := fmt.Sprintf("%d", nodeID)
+			nodeIDStr := nodeID.String()
 			if nodeInfo, exists := debugInfo.ConnectedNodes[nodeIDStr]; exists && nodeInfo.Connected {
 				allBatcherOffline = false
 
