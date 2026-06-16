@@ -403,10 +403,7 @@ func resolveSSHTestSource(
 		return nil, 0, nil
 	}
 
-	out := make([]netip.Addr, 0)
-	for a := range addrs.Iter() {
-		out = append(out, a)
-	}
+	out := slices.Collect(addrs.Iter())
 
 	var userID uint
 
