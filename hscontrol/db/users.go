@@ -202,7 +202,7 @@ func ListNodesByUser(tx *gorm.DB, uid types.UserID) (types.Nodes, error) {
 
 	uidPtr := uint(uid)
 
-	err := tx.Preload("AuthKey").Preload("AuthKey.User").Preload("User").Where(&types.Node{UserID: &uidPtr}).Find(&nodes).Error
+	err := preloadNode(tx).Where(&types.Node{UserID: &uidPtr}).Find(&nodes).Error
 	if err != nil {
 		return nil, err
 	}
