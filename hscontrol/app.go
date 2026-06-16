@@ -1030,8 +1030,6 @@ func (h *Headscale) Serve() error {
 }
 
 func (h *Headscale) getTLSSettings() (*tls.Config, error) {
-	var err error
-
 	tlsEnabled := h.cfg.TLS.LetsEncrypt.Hostname != "" || h.cfg.TLS.CertPath != ""
 	if tlsEnabled && !strings.HasPrefix(h.cfg.ServerURL, "https://") {
 		log.Warn().Msg("listening with TLS but ServerURL does not start with https://")
@@ -1085,19 +1083,26 @@ func (h *Headscale) getTLSSettings() (*tls.Config, error) {
 		default:
 			return nil, errUnsupportedLetsEncryptChallengeType
 		}
-	} else if h.cfg.TLS.CertPath == "" {
-		return nil, err
-	} else {
-		tlsConfig := &tls.Config{
-			NextProtos:   []string{"http/1.1"},
-			Certificates: make([]tls.Certificate, 1),
-			MinVersion:   tls.VersionTLS12,
-		}
-
-		tlsConfig.Certificates[0], err = tls.LoadX509KeyPair(h.cfg.TLS.CertPath, h.cfg.TLS.KeyPath)
-
-		return tlsConfig, err
 	}
+
+	if h.cfg.TLS.CertPath == "" {
+		return nil, nil //nolint:nilnil // intentional: no TLS config when neither LetsEncrypt nor a cert path is set
+	}
+
+	tlsConfig := &tls.Config{
+		NextProtos:   []string{"http/1.1"},
+		Certificates: make([]tls.Certificate, 1),
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	cert, err := tls.LoadX509KeyPair(h.cfg.TLS.CertPath, h.cfg.TLS.KeyPath)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsConfig.Certificates[0] = cert
+
+	return tlsConfig, nil
 }
 
 func readOrCreatePrivateKey(path string) (*key.MachinePrivate, error) {
