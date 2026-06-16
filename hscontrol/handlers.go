@@ -185,8 +185,6 @@ func (h *Headscale) VerifyHandler(
 		httpError(writer, err)
 		return
 	}
-
-	writer.Header().Set("Content-Type", "application/json")
 }
 
 // KeyHandler provides the Headscale pub key
@@ -304,14 +302,16 @@ func (a *AuthProviderWeb) RegisterURL(authID types.AuthID) string {
 	return fmt.Sprintf(
 		"%s/register/%s",
 		strings.TrimSuffix(a.serverURL, "/"),
-		authID.String())
+		authID.String(),
+	)
 }
 
 func (a *AuthProviderWeb) AuthURL(authID types.AuthID) string {
 	return fmt.Sprintf(
 		"%s/auth/%s",
 		strings.TrimSuffix(a.serverURL, "/"),
-		authID.String())
+		authID.String(),
+	)
 }
 
 func (a *AuthProviderWeb) AuthHandler(
