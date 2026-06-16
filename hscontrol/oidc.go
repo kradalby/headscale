@@ -296,8 +296,6 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		if userinfo2.Groups != nil {
 			claims.Groups = userinfo2.Groups
 		}
-	} else {
-		util.LogErr(err, "could not get userinfo; only using claims from id token")
 	}
 
 	// The user claims are now updated from the userinfo endpoint so we can verify the user
