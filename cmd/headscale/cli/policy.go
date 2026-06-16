@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -83,19 +84,19 @@ var getPolicy = &cobra.Command{
 
 			policyData = pol.Data
 		} else {
-			ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig()
-			if err != nil {
-				return fmt.Errorf("connecting to headscale: %w", err)
-			}
-			defer cancel()
-			defer conn.Close()
+			err := withGRPC(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
+				response, err := client.GetPolicy(ctx, &v1.GetPolicyRequest{})
+				if err != nil {
+					return fmt.Errorf("loading ACL policy: %w", err)
+				}
 
-			response, err := client.GetPolicy(ctx, &v1.GetPolicyRequest{})
-			if err != nil {
-				return fmt.Errorf("loading ACL policy: %w", err)
-			}
+				policyData = response.GetPolicy()
 
-			policyData = response.GetPolicy()
+				return nil
+			})
+			if err != nil {
+				return err
+			}
 		}
 
 		// This does not pass output format as we don't support yaml, json or
@@ -149,16 +150,16 @@ var setPolicy = &cobra.Command{
 		} else {
 			request := &v1.SetPolicyRequest{Policy: string(policyBytes)}
 
-			ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig()
-			if err != nil {
-				return fmt.Errorf("connecting to headscale: %w", err)
-			}
-			defer cancel()
-			defer conn.Close()
+			err := withGRPC(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
+				_, err := client.SetPolicy(ctx, request)
+				if err != nil {
+					return fmt.Errorf("setting ACL policy: %w", err)
+				}
 
-			_, err = client.SetPolicy(ctx, request)
+				return nil
+			})
 			if err != nil {
-				return fmt.Errorf("setting ACL policy: %w", err)
+				return err
 			}
 		}
 
@@ -224,14 +225,11 @@ var checkPolicy = &cobra.Command{
 			return nil
 		}
 
-		ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig()
-		if err != nil {
-			return fmt.Errorf("connecting to headscale: %w", err)
-		}
-		defer cancel()
-		defer conn.Close()
+		err = withGRPC(func(ctx context.Context, client v1.HeadscaleServiceClient) error {
+			_, err := client.CheckPolicy(ctx, &v1.CheckPolicyRequest{Policy: string(policyBytes)})
 
-		_, err = client.CheckPolicy(ctx, &v1.CheckPolicyRequest{Policy: string(policyBytes)})
+			return err
+		})
 		if err != nil {
 			return err
 		}
