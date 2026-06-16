@@ -245,28 +245,21 @@ func runSSHPolicyTest(
 		return res
 	}
 
-	for _, user := range test.Accept {
-		evaluateAssertion(
-			pol, users, nodes, cache,
-			srcAddrs, dstNodes, user.String(),
-			assertAccept, &res,
-		)
-	}
-
-	for _, user := range test.Deny {
-		evaluateAssertion(
-			pol, users, nodes, cache,
-			srcAddrs, dstNodes, user.String(),
-			assertDeny, &res,
-		)
-	}
-
-	for _, user := range test.Check {
-		evaluateAssertion(
-			pol, users, nodes, cache,
-			srcAddrs, dstNodes, user.String(),
-			assertCheck, &res,
-		)
+	for _, g := range []struct {
+		users []SSHUser
+		kind  sshAssertion
+	}{
+		{test.Accept, assertAccept},
+		{test.Deny, assertDeny},
+		{test.Check, assertCheck},
+	} {
+		for _, user := range g.users {
+			evaluateAssertion(
+				pol, users, nodes, cache,
+				srcAddrs, dstNodes, user.String(),
+				g.kind, &res,
+			)
+		}
 	}
 
 	return res
