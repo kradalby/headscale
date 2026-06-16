@@ -61,3 +61,19 @@ var TheInternet = sync.OnceValue(func() *netipx.IPSet {
 
 	return theInternetSet
 })
+
+// IPSetSubsetOf reports whether every prefix of candidate is contained in
+// container. A nil candidate or container returns false.
+func IPSetSubsetOf(candidate, container *netipx.IPSet) bool {
+	if candidate == nil || container == nil {
+		return false
+	}
+
+	for _, pref := range candidate.Prefixes() {
+		if !container.ContainsPrefix(pref) {
+			return false
+		}
+	}
+
+	return true
+}
