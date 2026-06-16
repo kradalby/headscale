@@ -193,6 +193,11 @@ func requireAllClientsOnlineWithSingleTimeout(t *testing.T, headscale ControlSer
 
 	var prevReport string
 
+	stateStr := stateOffline
+	if expectedOnline {
+		stateStr = stateOnline
+	}
+
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
 		// Get batcher state
 		debugInfo, err := headscale.DebugBatcher()
@@ -338,11 +343,6 @@ func requireAllClientsOnlineWithSingleTimeout(t *testing.T, headscale ControlSer
 			if !systemsMatch {
 				allMatch = false
 
-				stateStr := stateOffline
-				if expectedOnline {
-					stateStr = stateOnline
-				}
-
 				fmt.Fprintf(&failureReport, "node:%d is not fully %s (timestamp: %s):\n", nodeID, stateStr, time.Now().Format(TimestampFormat))
 				fmt.Fprintf(&failureReport, "  - batcher: %t (expected: %t)\n", status.Batcher, expectedOnline)
 				fmt.Fprintf(&failureReport, "    - conn count: %d\n", status.BatcherConnCount)
@@ -365,11 +365,6 @@ func requireAllClientsOnlineWithSingleTimeout(t *testing.T, headscale ControlSer
 			// Note: timeout_remaining not available in this context
 
 			assert.Fail(c, failureReport.String())
-		}
-
-		stateStr := stateOffline
-		if expectedOnline {
-			stateStr = stateOnline
 		}
 
 		assert.True(c, allMatch, "Not all %d nodes are %s across all systems (batcher, mapresponses, nodestore)", len(expectedNodes), stateStr)
@@ -650,7 +645,8 @@ func assertPingAll(t *testing.T, clients []TailscaleClient, addrs []string, opts
 	perPingBudget := 2 * time.Second
 	timeout := max(
 		// Floor at 30s for small matrices.
-		integrationutil.ScaledTimeout(time.Duration(pingCount)*perPingBudget*2), integrationutil.ScaledTimeout(30*time.Second))
+		integrationutil.ScaledTimeout(time.Duration(pingCount)*perPingBudget*2), integrationutil.ScaledTimeout(30*time.Second),
+	)
 
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		assertPingAllWithCollect(c, clients, addrs, opts...)
