@@ -238,7 +238,7 @@ func checkPeriodFromRule(rule SSH) time.Duration {
 	}
 }
 
-func sshCheck(baseURL string, _ time.Duration) tailcfg.SSHAction {
+func sshCheck(baseURL string) tailcfg.SSHAction {
 	holdURL := baseURL + "/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID?local_user=$LOCAL_USER"
 
 	return tailcfg.SSHAction{
@@ -302,7 +302,7 @@ func (pol *Policy) compileSSHPolicy(
 		case SSHActionAccept:
 			action = sshAccept
 		case SSHActionCheck:
-			action = sshCheck(baseURL, checkPeriodFromRule(rule))
+			action = sshCheck(baseURL)
 		default:
 			return nil, fmt.Errorf(
 				"parsing SSH policy, unknown action %q, index: %d: %w",
