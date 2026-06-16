@@ -1332,13 +1332,10 @@ func (t *HeadscaleInContainer) NodesByUser() (map[string][]*v1.Node, error) {
 		return nil, err
 	}
 
-	var userMap map[string][]*v1.Node
+	userMap := make(map[string][]*v1.Node)
 	for _, node := range nodes {
-		if _, ok := userMap[node.GetUser().GetName()]; !ok {
-			mak.Set(&userMap, node.GetUser().GetName(), []*v1.Node{node})
-		} else {
-			userMap[node.GetUser().GetName()] = append(userMap[node.GetUser().GetName()], node)
-		}
+		name := node.GetUser().GetName()
+		userMap[name] = append(userMap[name], node)
 	}
 
 	return userMap, nil
