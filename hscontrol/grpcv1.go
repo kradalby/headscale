@@ -530,23 +530,18 @@ func (api headscaleV1APIServer) ListNodes(
 	ctx context.Context,
 	request *v1.ListNodesRequest,
 ) (*v1.ListNodesResponse, error) {
-	// TODO(kradalby): it looks like this can be simplified a lot,
-	// the filtering of nodes by user, vs nodes as a whole can
-	// probably be done once.
 	// TODO(kradalby): This should be done in one tx.
+	var nodes views.Slice[types.NodeView]
 	if request.GetUser() != "" {
 		user, err := api.h.state.GetUserByName(request.GetUser())
 		if err != nil {
 			return nil, err
 		}
 
-		nodes := api.h.state.ListNodesByUser(types.UserID(user.ID))
-
-		response := nodesToProto(api.h.state, nodes)
-		return &v1.ListNodesResponse{Nodes: response}, nil
+		nodes = api.h.state.ListNodesByUser(types.UserID(user.ID))
+	} else {
+		nodes = api.h.state.ListNodes()
 	}
-
-	nodes := api.h.state.ListNodes()
 
 	response := nodesToProto(api.h.state, nodes)
 	return &v1.ListNodesResponse{Nodes: response}, nil
