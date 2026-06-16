@@ -55,6 +55,15 @@ const (
 	stateOffline = "offline"
 )
 
+// onlineLabel returns the log string for the given online state.
+func onlineLabel(online bool) string {
+	if online {
+		return stateOnline
+	}
+
+	return stateOffline
+}
+
 var errNoNewClientFound = errors.New("no new client found")
 
 // NodeSystemStatus represents the status of a node across different systems.
@@ -166,10 +175,7 @@ func requireAllClientsOnline(t *testing.T, headscale ControlServer, expectedNode
 
 	startTime := time.Now()
 
-	stateStr := stateOffline
-	if expectedOnline {
-		stateStr = stateOnline
-	}
+	stateStr := onlineLabel(expectedOnline)
 
 	t.Logf("requireAllSystemsOnline: Starting %s validation for %d nodes at %s - %s", stateStr, len(expectedNodes), startTime.Format(TimestampFormat), message)
 
@@ -193,10 +199,7 @@ func requireAllClientsOnlineWithSingleTimeout(t *testing.T, headscale ControlSer
 
 	var prevReport string
 
-	stateStr := stateOffline
-	if expectedOnline {
-		stateStr = stateOnline
-	}
+	stateStr := onlineLabel(expectedOnline)
 
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
 		// Get batcher state
