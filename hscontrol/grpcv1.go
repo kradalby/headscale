@@ -420,7 +420,7 @@ func (api headscaleV1APIServer) SetApprovedRoutes(
 }
 
 func validateTag(tag string) error {
-	if strings.Index(tag, "tag:") != 0 {
+	if !strings.HasPrefix(tag, "tag:") {
 		return errors.New("tag must start with the string 'tag:'")
 	}
 	if strings.ToLower(tag) != tag {
