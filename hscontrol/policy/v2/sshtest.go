@@ -128,11 +128,7 @@ func (pm *PolicyManager) RunSSHTests() error {
 	cache := make(map[types.NodeID]*tailcfg.SSHPolicy)
 	results := runSSHPolicyTests(pm.pol, pm.users, pm.nodes, cache)
 
-	if results.AllPassed {
-		return nil
-	}
-
-	return fmt.Errorf("%w:\n%s", errSSHPolicyTestsFailed, results.Errors())
+	return wrapTestResult(errSSHPolicyTestsFailed, results.AllPassed, results.Errors)
 }
 
 // evaluateSSHTests runs the block against pol without mutating live state.
@@ -148,11 +144,7 @@ func evaluateSSHTests(
 	cache := make(map[types.NodeID]*tailcfg.SSHPolicy)
 	results := runSSHPolicyTests(pol, users, nodes, cache)
 
-	if results.AllPassed {
-		return nil
-	}
-
-	return fmt.Errorf("%w:\n%s", errSSHPolicyTestsFailed, results.Errors())
+	return wrapTestResult(errSSHPolicyTestsFailed, results.AllPassed, results.Errors)
 }
 
 // runSSHPolicyTests evaluates every sshTests entry. The cache is keyed

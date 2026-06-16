@@ -196,6 +196,17 @@ func (r PolicyTestResults) Errors() string {
 	return strings.Join(lines, "\n")
 }
 
+// wrapTestResult returns nil when every test passed, otherwise wraps the
+// rendered failure breakdown in sentinel. errs is passed uncalled so it is
+// only evaluated on the failure path.
+func wrapTestResult(sentinel error, allPassed bool, errs func() string) error {
+	if allPassed {
+		return nil
+	}
+
+	return fmt.Errorf("%w:\n%s", sentinel, errs())
+}
+
 // RunTests evaluates the policy's own `tests` block against the live compiled
 // filter and returns a wrapped error when any test fails. Callers that need
 // the per-test breakdown can call runPolicyTests directly.
@@ -208,11 +219,8 @@ func (pm *PolicyManager) RunTests() error {
 	defer pm.mu.Unlock()
 
 	results := runPolicyTests(pm.pol, pm.filter, pm.users, pm.nodes)
-	if results.AllPassed {
-		return nil
-	}
 
-	return fmt.Errorf("%w:\n%s", errPolicyTestsFailed, results.Errors())
+	return wrapTestResult(errPolicyTestsFailed, results.AllPassed, results.Errors)
 }
 
 // evaluateTests runs the `tests` block against a fresh compilation of pol.
@@ -233,11 +241,8 @@ func evaluateTests(pol *Policy, users []types.User, nodes views.Slice[types.Node
 	}
 
 	results := runPolicyTests(pol, filter, users, nodes)
-	if results.AllPassed {
-		return nil
-	}
 
-	return fmt.Errorf("%w:\n%s", errPolicyTestsFailed, results.Errors())
+	return wrapTestResult(errPolicyTestsFailed, results.AllPassed, results.Errors)
 }
 
 // runPolicyTests is the pure evaluation function: given a policy, the
