@@ -24,13 +24,9 @@ var (
 )
 
 func TailscaleVersionNewerOrEqual(minimum, toCheck string) bool {
-	if cmpver.Compare(minimum, toCheck) <= 0 ||
+	return cmpver.Compare(minimum, toCheck) <= 0 ||
 		toCheck == "unstable" ||
-		toCheck == "head" {
-		return true
-	}
-
-	return false
+		toCheck == "head"
 }
 
 // ParseLoginURLFromCLILogin parses the output of the tailscale up command to extract the login URL.
