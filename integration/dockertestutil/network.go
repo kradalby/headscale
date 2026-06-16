@@ -217,11 +217,13 @@ func DisconnectAndReconnect(
 	return nil
 }
 
-func waitNetworkContainerAbsent(
+func waitNetworkContainer(
 	pool *dockertest.Pool,
 	network *dockertest.Network,
 	testContainer string,
 	timeout time.Duration,
+	want bool,
+	match func(docker.Endpoint) bool,
 ) error {
 	return pollUntil(timeout, func() (bool, error) {
 		net, err := pool.Client.NetworkInfo(network.Network.ID)
@@ -229,14 +231,25 @@ func waitNetworkContainerAbsent(
 			return false, fmt.Errorf("inspecting network %s: %w", network.Network.Name, err)
 		}
 
+		found := false
 		for _, c := range net.Containers {
-			if c.Name == testContainer || c.Name == "/"+testContainer {
-				return false, nil
+			if (c.Name == testContainer || c.Name == "/"+testContainer) && match(c) {
+				found = true
+				break
 			}
 		}
 
-		return true, nil
+		return found == want, nil
 	})
+}
+
+func waitNetworkContainerAbsent(
+	pool *dockertest.Pool,
+	network *dockertest.Network,
+	testContainer string,
+	timeout time.Duration,
+) error {
+	return waitNetworkContainer(pool, network, testContainer, timeout, false, func(docker.Endpoint) bool { return true })
 }
 
 func waitNetworkContainerPresent(
@@ -245,20 +258,7 @@ func waitNetworkContainerPresent(
 	testContainer string,
 	timeout time.Duration,
 ) error {
-	return pollUntil(timeout, func() (bool, error) {
-		net, err := pool.Client.NetworkInfo(network.Network.ID)
-		if err != nil {
-			return false, fmt.Errorf("inspecting network %s: %w", network.Network.Name, err)
-		}
-
-		for _, c := range net.Containers {
-			if (c.Name == testContainer || c.Name == "/"+testContainer) && c.IPv4Address != "" {
-				return true, nil
-			}
-		}
-
-		return false, nil
-	})
+	return waitNetworkContainer(pool, network, testContainer, timeout, true, func(c docker.Endpoint) bool { return c.IPv4Address != "" })
 }
 
 // waitContainerRouteAbsent polls the container's routing table until no
