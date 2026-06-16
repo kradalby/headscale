@@ -12,11 +12,10 @@ import (
 )
 
 var (
-	ErrUserExists            = errors.New("user already exists")
-	ErrUserNotFound          = errors.New("user not found")
-	ErrUserStillHasNodes     = errors.New("user not empty: node(s) found")
-	ErrUserWhereInvalidCount = errors.New("expect 0 or 1 where User structs")
-	ErrUserNotUnique         = errors.New("expected exactly one user")
+	ErrUserExists        = errors.New("user already exists")
+	ErrUserNotFound      = errors.New("user not found")
+	ErrUserStillHasNodes = errors.New("user not empty: node(s) found")
+	ErrUserNotUnique     = errors.New("expected exactly one user")
 )
 
 func (hsdb *HSDatabase) CreateUser(user types.User) (*types.User, error) {
@@ -152,24 +151,15 @@ func GetUserByOIDCIdentifier(tx *gorm.DB, id string) (*types.User, error) {
 	return &user, nil
 }
 
-func (hsdb *HSDatabase) ListUsers(where ...*types.User) ([]types.User, error) {
-	return ListUsers(hsdb.DB, where...)
+func (hsdb *HSDatabase) ListUsers(filter *types.User) ([]types.User, error) {
+	return ListUsers(hsdb.DB, filter)
 }
 
-// ListUsers gets all the existing users.
-func ListUsers(tx *gorm.DB, where ...*types.User) ([]types.User, error) {
-	if len(where) > 1 {
-		return nil, fmt.Errorf("%w, got %d", ErrUserWhereInvalidCount, len(where))
-	}
-
-	var user *types.User
-	if len(where) == 1 {
-		user = where[0]
-	}
-
+// ListUsers gets all the existing users, optionally filtered by a non-nil filter.
+func ListUsers(tx *gorm.DB, filter *types.User) ([]types.User, error) {
 	users := []types.User{}
 
-	err := tx.Where(user).Find(&users).Error
+	err := tx.Where(filter).Find(&users).Error
 	if err != nil {
 		return nil, err
 	}

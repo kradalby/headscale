@@ -220,7 +220,7 @@ AND auth_key_id NOT IN (
 			{
 				ID: "202505141324",
 				Migrate: func(tx *gorm.DB) error {
-					users, err := ListUsers(tx)
+					users, err := ListUsers(tx, nil)
 					if err != nil {
 						return fmt.Errorf("listing users: %w", err)
 					}
@@ -617,7 +617,7 @@ AND auth_key_id NOT IN (
 					}
 
 					// 2. Load users and nodes to create PolicyManager
-					users, err := ListUsers(tx)
+					users, err := ListUsers(tx, nil)
 					if err != nil {
 						return fmt.Errorf("loading users for RequestTags migration: %w", err)
 					}
