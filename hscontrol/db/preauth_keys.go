@@ -283,13 +283,9 @@ func parsePrefixedKey(
 
 // isValidBase64URLSafe checks if a string contains only base64 URL-safe characters.
 func isValidBase64URLSafe(s string) bool {
-	for _, c := range s {
-		if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' && c != '_' {
-			return false
-		}
-	}
-
-	return true
+	return !strings.ContainsFunc(s, func(c rune) bool {
+		return (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' && c != '_'
+	})
 }
 
 func (hsdb *HSDatabase) GetPreAuthKey(key string) (*types.PreAuthKey, error) {
