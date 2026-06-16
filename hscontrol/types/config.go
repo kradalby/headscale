@@ -1001,43 +1001,24 @@ func warnBanner(lines []string) {
 	log.Warn().Msg(b.String())
 }
 
-func prefixV4() (*netip.Prefix, bool, error) {
-	prefixV4Str := viper.GetString("prefixes.v4")
+func parsePrefixConfig(key string, standardRange netip.Prefix, family string) (*netip.Prefix, bool, error) {
+	s := viper.GetString(key)
 
-	if prefixV4Str == "" {
+	if s == "" {
 		return nil, false, nil
 	}
 
-	prefixV4, err := netip.ParsePrefix(prefixV4Str)
+	prefix, err := netip.ParsePrefix(s)
 	if err != nil {
-		return nil, false, fmt.Errorf("parsing IPv4 prefix from config: %w", err)
+		return nil, false, fmt.Errorf("parsing %s prefix from config: %w", family, err)
 	}
 
 	builder := netipx.IPSetBuilder{}
-	builder.AddPrefix(tsaddr.CGNATRange())
+	builder.AddPrefix(standardRange)
 
 	ipSet, _ := builder.IPSet()
 
-	return &prefixV4, !ipSet.ContainsPrefix(prefixV4), nil
-}
-
-func prefixV6() (*netip.Prefix, bool, error) {
-	prefixV6Str := viper.GetString("prefixes.v6")
-
-	if prefixV6Str == "" {
-		return nil, false, nil
-	}
-
-	prefixV6, err := netip.ParsePrefix(prefixV6Str)
-	if err != nil {
-		return nil, false, fmt.Errorf("parsing IPv6 prefix from config: %w", err)
-	}
-
-	builder := netipx.IPSetBuilder{}
-	builder.AddPrefix(tsaddr.TailscaleULARange())
-	ipSet, _ := builder.IPSet()
-
-	return &prefixV6, !ipSet.ContainsPrefix(prefixV6), nil
+	return &prefix, !ipSet.ContainsPrefix(prefix), nil
 }
 
 // trustedProxies rejects 0.0.0.0/0 and ::/0 because they defeat the
@@ -1094,12 +1075,12 @@ func LoadServerConfig() (*Config, error) {
 	logConfig := logConfig()
 	zerolog.SetGlobalLevel(logConfig.Level)
 
-	prefix4, v4NonStandard, err := prefixV4()
+	prefix4, v4NonStandard, err := parsePrefixConfig("prefixes.v4", tsaddr.CGNATRange(), "IPv4")
 	if err != nil {
 		return nil, err
 	}
 
-	prefix6, v6NonStandard, err := prefixV6()
+	prefix6, v6NonStandard, err := parsePrefixConfig("prefixes.v6", tsaddr.TailscaleULARange(), "IPv6")
 	if err != nil {
 		return nil, err
 	}
