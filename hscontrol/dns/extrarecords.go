@@ -186,22 +186,24 @@ func (e *ExtraRecordsMan) updateRecords() {
 // readExtraRecordsFromPath reads a JSON file of [tailcfg.DNSRecord]
 // and returns the records and the hash of the file.
 func readExtraRecordsFromPath(path string) ([]tailcfg.DNSRecord, [32]byte, error) {
+	var zero [32]byte
+
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, [32]byte{}, fmt.Errorf("reading path: %s, err: %w", path, err)
+		return nil, zero, fmt.Errorf("reading path: %s, err: %w", path, err)
 	}
 
 	// If the read was triggered too fast, and the file is not complete, ignore the update
 	// if the file is empty. A consecutive update will be triggered when the file is complete.
 	if len(b) == 0 {
-		return nil, [32]byte{}, nil
+		return nil, zero, nil
 	}
 
 	var records []tailcfg.DNSRecord
 
 	err = json.Unmarshal(b, &records)
 	if err != nil {
-		return nil, [32]byte{}, fmt.Errorf("unmarshalling records, content: %q: %w", string(b), err)
+		return nil, zero, fmt.Errorf("unmarshalling records, content: %q: %w", string(b), err)
 	}
 
 	hash := sha256.Sum256(b)
