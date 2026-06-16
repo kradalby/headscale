@@ -519,6 +519,15 @@ func (e *EphemeralGarbageCollector) Start() {
 	}
 }
 
+// firstOr returns the first non-empty option, or def if none is provided.
+func firstOr(def string, opt []string) string {
+	if len(opt) > 0 && opt[0] != "" {
+		return opt[0]
+	}
+
+	return def
+}
+
 func (hsdb *HSDatabase) CreateNodeForTest(user *types.User, hostname ...string) *types.Node {
 	if !testing.Testing() {
 		panic("CreateNodeForTest can only be called during tests")
@@ -528,10 +537,7 @@ func (hsdb *HSDatabase) CreateNodeForTest(user *types.User, hostname ...string) 
 		panic("CreateNodeForTest requires a valid user")
 	}
 
-	nodeName := defaultTestNodePrefix
-	if len(hostname) > 0 && hostname[0] != "" {
-		nodeName = hostname[0]
-	}
+	nodeName := firstOr(defaultTestNodePrefix, hostname)
 
 	// Create a preauth key for the node
 	pak, err := hsdb.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
@@ -601,10 +607,7 @@ func (hsdb *HSDatabase) CreateNodesForTest(user *types.User, count int, hostname
 		panic("CreateNodesForTest requires a valid user")
 	}
 
-	prefix := defaultTestNodePrefix
-	if len(hostnamePrefix) > 0 && hostnamePrefix[0] != "" {
-		prefix = hostnamePrefix[0]
-	}
+	prefix := firstOr(defaultTestNodePrefix, hostnamePrefix)
 
 	nodes := make([]*types.Node, count)
 	for i := range count {
@@ -624,10 +627,7 @@ func (hsdb *HSDatabase) CreateRegisteredNodesForTest(user *types.User, count int
 		panic("CreateRegisteredNodesForTest requires a valid user")
 	}
 
-	prefix := defaultTestNodePrefix
-	if len(hostnamePrefix) > 0 && hostnamePrefix[0] != "" {
-		prefix = hostnamePrefix[0]
-	}
+	prefix := firstOr(defaultTestNodePrefix, hostnamePrefix)
 
 	nodes := make([]*types.Node, count)
 	for i := range count {

@@ -215,10 +215,7 @@ func (hsdb *HSDatabase) CreateUserForTest(name ...string) *types.User {
 		panic("CreateUserForTest can only be called during tests")
 	}
 
-	userName := "testuser"
-	if len(name) > 0 && name[0] != "" {
-		userName = name[0]
-	}
+	userName := firstOr("testuser", name)
 
 	user, err := hsdb.CreateUser(types.User{Name: userName})
 	if err != nil {
@@ -233,10 +230,7 @@ func (hsdb *HSDatabase) CreateUsersForTest(count int, namePrefix ...string) []*t
 		panic("CreateUsersForTest can only be called during tests")
 	}
 
-	prefix := "testuser"
-	if len(namePrefix) > 0 && namePrefix[0] != "" {
-		prefix = namePrefix[0]
-	}
+	prefix := firstOr("testuser", namePrefix)
 
 	users := make([]*types.User, count)
 	for i := range count {
