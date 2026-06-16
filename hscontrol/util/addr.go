@@ -90,13 +90,9 @@ func ParseIPSet(arg string, bits *int) (*netipx.IPSet, error) {
 }
 
 func GetIPPrefixEndpoints(na netip.Prefix) (netip.Addr, netip.Addr) {
-	var network, broadcast netip.Addr
-
 	ipRange := netipx.RangeOfPrefix(na)
-	network = ipRange.From()
-	broadcast = ipRange.To()
 
-	return network, broadcast
+	return ipRange.From(), ipRange.To()
 }
 
 func StringToIPPrefix(prefixes []string) ([]netip.Prefix, error) {
