@@ -1297,23 +1297,11 @@ func isSafeServerURL(serverURL, baseDomain string) error {
 		return errServerURLSame
 	}
 
-	serverDomainParts := strings.Split(server.Host, ".")
-	baseDomainParts := strings.Split(baseDomain, ".")
-
-	if len(serverDomainParts) <= len(baseDomainParts) {
-		return nil
+	if strings.HasSuffix(server.Host, "."+baseDomain) {
+		return errServerURLSuffix
 	}
 
-	s := len(serverDomainParts)
-
-	b := len(baseDomainParts)
-	for i := range baseDomainParts {
-		if serverDomainParts[s-i-1] != baseDomainParts[b-i-1] {
-			return nil
-		}
-	}
-
-	return errServerURLSuffix
+	return nil
 }
 
 type deprecator struct {
