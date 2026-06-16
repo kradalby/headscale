@@ -2578,7 +2578,7 @@ func (s *State) HandleNodeFromPreAuthKey(
 			Expiry:                 reqExpiry,
 			RegisterMethod:         util.RegisterMethodAuthKey,
 			PreAuthKey:             pak,
-			ExistingNodeForNetinfo: cmp.Or(differentUserNode, types.NodeView{}),
+			ExistingNodeForNetinfo: differentUserNode,
 		})
 		if err != nil {
 			return types.NodeView{}, change.Change{}, fmt.Errorf("creating new node: %w", err)
