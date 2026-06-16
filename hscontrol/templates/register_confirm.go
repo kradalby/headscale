@@ -75,23 +75,19 @@ func RegisterConfirm(info RegisterConfirmInfo) *elem.Element {
 		),
 	)
 
-	return HtmlStructure(
-		elem.Title(nil, elem.Text("Headscale - Confirm node registration")),
-		mdTypesetBody(
-			headscaleLogo(),
-			H2(elem.Text("Confirm node registration")),
-			P(elem.Text(
-				"A device is asking to be added to your tailnet. "+
-					"Please review the details below and confirm that this device is yours.",
-			)),
-			deviceList,
-			form,
-			P(elem.Text(
-				"If you do not recognise this device, close this window. "+
-					"The registration request will expire automatically.",
-			)),
-			pageFooter(),
-		),
+	return page(
+		"Headscale - Confirm node registration",
+		H2(elem.Text("Confirm node registration")),
+		P(elem.Text(
+			"A device is asking to be added to your tailnet. "+
+				"Please review the details below and confirm that this device is yours.",
+		)),
+		deviceList,
+		form,
+		P(elem.Text(
+			"If you do not recognise this device, close this window. "+
+				"The registration request will expire automatically.",
+		)),
 	)
 }
 
@@ -103,7 +99,8 @@ func deviceTable(rows [4][2]string) *elem.Element {
 			val = Code(elem.Text(row[1]))
 		}
 
-		tableRows = append(tableRows, elem.Tr(nil,
+		tableRows = append(tableRows, elem.Tr(
+			nil,
 			elem.Td(attrs.Props{
 				attrs.Style: styles.Props{
 					styles.Padding:      "0.5rem 1rem 0.5rem 0",
