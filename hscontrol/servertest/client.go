@@ -429,10 +429,25 @@ func (c *TestClient) Netmap() *netmap.NetworkMap {
 func (c *TestClient) WaitForPeers(tb testing.TB, n int, timeout time.Duration) {
 	tb.Helper()
 
+	c.waitForPeers(tb, n, timeout, "WaitForPeers", func(got int) bool { return got >= n })
+}
+
+// waitForPeers blocks until match reports the current peer count
+// satisfies the caller's predicate, or until timeout expires. op
+// names the caller for the timeout failure message.
+func (c *TestClient) waitForPeers(
+	tb testing.TB,
+	n int,
+	timeout time.Duration,
+	op string,
+	match func(got int) bool,
+) {
+	tb.Helper()
+
 	deadline := time.After(timeout)
 
 	for {
-		if nm := c.Netmap(); nm != nil && len(nm.Peers) >= n {
+		if nm := c.Netmap(); nm != nil && match(len(nm.Peers)) {
 			return
 		}
 
@@ -447,7 +462,7 @@ func (c *TestClient) WaitForPeers(tb testing.TB, n int, timeout time.Duration) {
 				got = len(nm.Peers)
 			}
 
-			tb.Fatalf("servertest: WaitForPeers(%s, %d): timeout after %v (got %d peers)", c.Name, n, timeout, got)
+			tb.Fatalf("servertest: %s(%s, %d): timeout after %v (got %d peers)", op, c.Name, n, timeout, got)
 		}
 	}
 }
@@ -551,27 +566,7 @@ func (c *TestClient) SelfName() string {
 func (c *TestClient) WaitForPeerCount(tb testing.TB, n int, timeout time.Duration) {
 	tb.Helper()
 
-	deadline := time.After(timeout)
-
-	for {
-		if nm := c.Netmap(); nm != nil && len(nm.Peers) == n {
-			return
-		}
-
-		select {
-		case <-c.updates:
-			// Check again.
-		case <-deadline:
-			nm := c.Netmap()
-
-			got := 0
-			if nm != nil {
-				got = len(nm.Peers)
-			}
-
-			tb.Fatalf("servertest: WaitForPeerCount(%s, %d): timeout after %v (got %d peers)", c.Name, n, timeout, got)
-		}
-	}
+	c.waitForPeers(tb, n, timeout, "WaitForPeerCount", func(got int) bool { return got == n })
 }
 
 // WaitForCondition blocks until condFn returns true on the latest
