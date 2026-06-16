@@ -324,17 +324,15 @@ func (pol *Policy) compileOneGrant(
 		)
 	}
 
-	// Classify and store deferred self data.
-	switch {
-	case len(autogroupSelfDests) > 0:
+	// Classify and store deferred self data. The struct literal already
+	// initializes category to grantCategoryRegular (the zero value).
+	if len(autogroupSelfDests) > 0 {
 		cg.category = grantCategorySelf
 		cg.self = &selfGrantData{
 			resolvedSrcs:      resolvedSrcs,
 			internetProtocols: grant.InternetProtocols,
 			app:               grant.App,
 		}
-	default:
-		cg.category = grantCategoryRegular
 	}
 
 	return cg, nil
