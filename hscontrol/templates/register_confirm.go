@@ -1,6 +1,8 @@
 package templates
 
 import (
+	"cmp"
+
 	"github.com/chasefleming/elem-go"
 	"github.com/chasefleming/elem-go/attrs"
 	"github.com/chasefleming/elem-go/styles"
@@ -51,11 +53,11 @@ type RegisterConfirmInfo struct {
 // IdP allows silent SSO.
 func RegisterConfirm(info RegisterConfirmInfo) *elem.Element {
 	deviceList := deviceTable(
-		[4][2]string{
-			{"Hostname", info.Hostname},
-			{"OS", displayOrUnknown(info.OS)},
-			{"Machine key", info.MachineKey},
-			{"Registered to", info.User},
+		[]deviceRow{
+			{"Hostname", elem.Text(info.Hostname)},
+			{"OS", elem.Text(cmp.Or(info.OS, "(unknown)"))},
+			{"Machine key", Code(elem.Text(info.MachineKey))},
+			{"Registered to", elem.Text(info.User)},
 		},
 	)
 
@@ -91,14 +93,14 @@ func RegisterConfirm(info RegisterConfirmInfo) *elem.Element {
 	)
 }
 
-func deviceTable(rows [4][2]string) *elem.Element {
+type deviceRow struct {
+	label string
+	value elem.Node
+}
+
+func deviceTable(rows []deviceRow) *elem.Element {
 	tableRows := make([]elem.Node, 0, len(rows))
 	for _, row := range rows {
-		val := elem.Node(elem.Text(row[1]))
-		if row[0] == "Machine key" {
-			val = Code(elem.Text(row[1]))
-		}
-
 		tableRows = append(tableRows, elem.Tr(
 			nil,
 			elem.Td(attrs.Props{
@@ -109,13 +111,13 @@ func deviceTable(rows [4][2]string) *elem.Element {
 					styles.Color:        "var(--md-default-fg-color--light)",
 					styles.BorderBottom: cssBorderHS,
 				}.ToInline(),
-			}, elem.Text(row[0])),
+			}, elem.Text(row.label)),
 			elem.Td(attrs.Props{
 				attrs.Style: styles.Props{
 					styles.Padding:      "0.5rem 0",
 					styles.BorderBottom: cssBorderHS,
 				}.ToInline(),
-			}, val),
+			}, row.value),
 		))
 	}
 
@@ -127,12 +129,4 @@ func deviceTable(rows [4][2]string) *elem.Element {
 			styles.MarginBottom:   "1.5em",
 		}.ToInline(),
 	}, tableRows...)
-}
-
-func displayOrUnknown(s string) string {
-	if s == "" {
-		return "(unknown)"
-	}
-
-	return s
 }
