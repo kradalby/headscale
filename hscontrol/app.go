@@ -285,7 +285,7 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 
 	lastExpiryCheck := time.Unix(0, 0)
 
-	derpTickerChan := make(<-chan time.Time)
+	var derpTickerChan <-chan time.Time
 
 	if h.cfg.DERP.AutoUpdate && h.cfg.DERP.UpdateFrequency != 0 {
 		derpTicker := time.NewTicker(h.cfg.DERP.UpdateFrequency)
@@ -297,8 +297,6 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 	var extraRecordsUpdate <-chan []tailcfg.DNSRecord
 	if h.extraRecordMan != nil {
 		extraRecordsUpdate = h.extraRecordMan.UpdateCh()
-	} else {
-		extraRecordsUpdate = make(chan []tailcfg.DNSRecord)
 	}
 
 	var (
@@ -322,8 +320,6 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 			Dur("interval", h.cfg.Node.Routes.HA.ProbeInterval).
 			Dur("timeout", h.cfg.Node.Routes.HA.ProbeTimeout).
 			Msg("HA subnet router health probing enabled")
-	} else {
-		haHealthChan = make(<-chan time.Time)
 	}
 
 	for {
