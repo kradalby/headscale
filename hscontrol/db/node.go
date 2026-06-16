@@ -114,18 +114,22 @@ func (hsdb *HSDatabase) getNode(uid types.UserID, name string) (*types.Node, err
 
 // getNode finds a [types.Node] by name and user and returns the [types.Node] struct.
 func getNode(tx *gorm.DB, uid types.UserID, name string) (*types.Node, error) {
-	nodes, err := ListNodesByUser(tx, uid)
+	uidPtr := uint(uid)
+
+	node := types.Node{}
+
+	err := preloadNode(tx).
+		Where(&types.Node{UserID: &uidPtr, Hostname: name}).
+		First(&node).Error
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNodeNotFound
+		}
+
 		return nil, err
 	}
 
-	for _, m := range nodes {
-		if m.Hostname == name {
-			return m, nil
-		}
-	}
-
-	return nil, ErrNodeNotFound
+	return &node, nil
 }
 
 func (hsdb *HSDatabase) GetNodeByID(id types.NodeID) (*types.Node, error) {
