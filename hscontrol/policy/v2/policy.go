@@ -1477,53 +1477,29 @@ func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.S
 	// For autogroup:self, we need to clear all nodes belonging to affected users
 	// because autogroup:self rules depend on the entire user's device set.
 	for nodeID := range pm.filterRulesMap {
-		// Find the user for this cached node
+		// Find the user for this cached node using the already-built indexes.
+		node, ok := newNodeMap[nodeID]
+		if !ok {
+			node, ok = oldNodeMap[nodeID]
+		}
+
+		// Node not found in either old or new list, clear it.
+		if !ok {
+			delete(pm.filterRulesMap, nodeID)
+			delete(pm.matchersForNodeMap, nodeID)
+
+			continue
+		}
+
+		// Tagged nodes don't participate in autogroup:self, so their cache
+		// doesn't need user-based invalidation; leave nodeUserID at zero.
 		var nodeUserID types.UserID
-
-		found := false
-
-		// Check in new nodes first
-		for _, node := range newNodes.All() {
-			if node.ID() == nodeID {
-				// Tagged nodes don't participate in autogroup:self,
-				// so their cache doesn't need user-based invalidation.
-				if node.IsTagged() {
-					found = true
-					break
-				}
-
-				nodeUserID = node.TypedUserID()
-				found = true
-
-				break
-			}
+		if !node.IsTagged() {
+			nodeUserID = node.TypedUserID()
 		}
 
-		// If not found in new nodes, check old nodes
-		if !found {
-			for _, node := range oldNodes.All() {
-				if node.ID() == nodeID {
-					if node.IsTagged() {
-						found = true
-						break
-					}
-
-					nodeUserID = node.TypedUserID()
-					found = true
-
-					break
-				}
-			}
-		}
-
-		// If we found the user and they're affected, clear this cache entry
-		if found {
-			if _, affected := affectedUsers[nodeUserID]; affected {
-				delete(pm.filterRulesMap, nodeID)
-				delete(pm.matchersForNodeMap, nodeID)
-			}
-		} else {
-			// Node not found in either old or new list, clear it
+		// If the owning user is affected, clear this cache entry.
+		if _, affected := affectedUsers[nodeUserID]; affected {
 			delete(pm.filterRulesMap, nodeID)
 			delete(pm.matchersForNodeMap, nodeID)
 		}
