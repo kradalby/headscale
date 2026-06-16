@@ -11,6 +11,7 @@ import (
 	"go4.org/netipx"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/views"
+	"tailscale.com/util/set"
 )
 
 // grantCategory classifies a grant by what per-node work it needs.
@@ -464,15 +465,12 @@ func buildSrcIPStrings(
 	// individual IPs from non-wildcard sources alongside the
 	// merged CGNAT ranges rather than absorbing them.
 	if hasWildcard && len(nonWildcardSrcs) > 0 {
-		seen := make(map[string]bool, len(srcIPStrs))
-		for _, s := range srcIPStrs {
-			seen[s] = true
-		}
+		seen := set.SetOf(srcIPStrs)
 
 		for _, ips := range nonWildcardSrcs {
 			for _, s := range ips.Strings() {
-				if !seen[s] {
-					seen[s] = true
+				if !seen.Contains(s) {
+					seen.Add(s)
 					srcIPStrs = append(srcIPStrs, s)
 				}
 			}
