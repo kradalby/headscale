@@ -664,14 +664,6 @@ func (node *Node) PeerChangeFromMapRequest(req tailcfg.MapRequest) tailcfg.PeerC
 		ret.DiscoKey = &req.DiscoKey
 	}
 
-	if node.Hostinfo != nil &&
-		node.Hostinfo.NetInfo != nil &&
-		req.Hostinfo != nil &&
-		req.Hostinfo.NetInfo != nil &&
-		node.Hostinfo.NetInfo.PreferredDERP != req.Hostinfo.NetInfo.PreferredDERP {
-		ret.DERPRegion = req.Hostinfo.NetInfo.PreferredDERP
-	}
-
 	if req.Hostinfo != nil && req.Hostinfo.NetInfo != nil {
 		// If there is no stored Hostinfo or NetInfo, use
 		// the new PreferredDERP.
