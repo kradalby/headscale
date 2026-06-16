@@ -878,15 +878,23 @@ func (pm *PolicyManager) SetNodes(nodes views.Slice[types.NodeView]) (bool, erro
 	return false, nil
 }
 
+// nodeIDViewMap indexes a slice of node views by node ID. On duplicate IDs the
+// last view wins, matching the open-coded loops it replaces.
+func nodeIDViewMap(s views.Slice[types.NodeView]) map[types.NodeID]types.NodeView {
+	m := make(map[types.NodeID]types.NodeView, s.Len())
+	for _, n := range s.All() {
+		m[n.ID()] = n
+	}
+
+	return m
+}
+
 func (pm *PolicyManager) nodesHavePolicyAffectingChanges(newNodes views.Slice[types.NodeView]) bool {
 	if pm.nodes.Len() != newNodes.Len() {
 		return true
 	}
 
-	oldNodes := make(map[types.NodeID]types.NodeView, pm.nodes.Len())
-	for _, node := range pm.nodes.All() {
-		oldNodes[node.ID()] = node
-	}
+	oldNodes := nodeIDViewMap(pm.nodes)
 
 	for _, newNode := range newNodes.All() {
 		oldNode, exists := oldNodes[newNode.ID()]
@@ -1387,15 +1395,8 @@ func (pm *PolicyManager) DebugString() string {
 // the entire cache.
 func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.Slice[types.NodeView]) {
 	// Build maps for efficient lookup
-	oldNodeMap := make(map[types.NodeID]types.NodeView)
-	for _, node := range oldNodes.All() {
-		oldNodeMap[node.ID()] = node
-	}
-
-	newNodeMap := make(map[types.NodeID]types.NodeView)
-	for _, node := range newNodes.All() {
-		newNodeMap[node.ID()] = node
-	}
+	oldNodeMap := nodeIDViewMap(oldNodes)
+	newNodeMap := nodeIDViewMap(newNodes)
 
 	// Track which users are affected by changes.
 	// Tagged nodes don't participate in autogroup:self (identity is tag-based),
@@ -1553,15 +1554,8 @@ func (pm *PolicyManager) invalidateNodeCache(newNodes views.Slice[types.NodeView
 // invalidateGlobalPolicyCache invalidates only nodes whose properties affecting
 // [policyutil.ReduceFilterRules] changed. For global policies, each node's filter is independent.
 func (pm *PolicyManager) invalidateGlobalPolicyCache(newNodes views.Slice[types.NodeView]) {
-	oldNodeMap := make(map[types.NodeID]types.NodeView)
-	for _, node := range pm.nodes.All() {
-		oldNodeMap[node.ID()] = node
-	}
-
-	newNodeMap := make(map[types.NodeID]types.NodeView)
-	for _, node := range newNodes.All() {
-		newNodeMap[node.ID()] = node
-	}
+	oldNodeMap := nodeIDViewMap(pm.nodes)
+	newNodeMap := nodeIDViewMap(newNodes)
 
 	// Invalidate nodes whose properties changed
 	for nodeID, newNode := range newNodeMap {
