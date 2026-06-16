@@ -822,7 +822,7 @@ func (pm *PolicyManager) SetUsers(users []types.User) (bool, error) {
 
 	// If SSH policies exist, force a policy change when users are updated
 	// This ensures nodes get updated SSH policies even if other policy hashes didn't change
-	if pm.pol != nil && pm.pol.SSHs != nil && len(pm.pol.SSHs) > 0 {
+	if pm.pol != nil && len(pm.pol.SSHs) > 0 {
 		return true, nil
 	}
 
