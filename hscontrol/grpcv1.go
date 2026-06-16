@@ -941,7 +941,7 @@ func (api headscaleV1APIServer) AuthReject(
 	}
 
 	authReq.FinishAuth(types.AuthVerdict{
-		Err: fmt.Errorf("auth request rejected"),
+		Err: errors.New("auth request rejected"),
 	})
 
 	return &v1.AuthRejectResponse{}, nil
