@@ -267,15 +267,10 @@ func ParseTraceroute(output string) (Traceroute, error) {
 }
 
 func IsCI() bool {
-	if _, ok := os.LookupEnv("CI"); ok {
-		return true
-	}
+	_, ci := os.LookupEnv("CI")
+	_, gh := os.LookupEnv("GITHUB_RUN_ID")
 
-	if _, ok := os.LookupEnv("GITHUB_RUN_ID"); ok {
-		return true
-	}
-
-	return false
+	return ci || gh
 }
 
 // GenerateRegistrationKey generates a vanity key for tracking web authentication
