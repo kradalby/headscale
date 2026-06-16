@@ -691,23 +691,7 @@ func (node *Node) PeerChangeFromMapRequest(req tailcfg.MapRequest) tailcfg.PeerC
 // EndpointsChanged compares two endpoint slices and returns true if they differ.
 // The comparison is order-independent - endpoints are sorted before comparison.
 func EndpointsChanged(oldEndpoints, newEndpoints []netip.AddrPort) bool {
-	if len(oldEndpoints) != len(newEndpoints) {
-		return true
-	}
-
-	if len(oldEndpoints) == 0 {
-		return false
-	}
-
-	// Make copies to avoid modifying the original slices
-	oldCopy := slices.Clone(oldEndpoints)
-	newCopy := slices.Clone(newEndpoints)
-
-	// Sort both slices to enable order-independent comparison
-	slices.SortFunc(oldCopy, netip.AddrPort.Compare)
-	slices.SortFunc(newCopy, netip.AddrPort.Compare)
-
-	return !slices.Equal(oldCopy, newCopy)
+	return !equalUnordered(oldEndpoints, newEndpoints, netip.AddrPort.Compare)
 }
 
 func (node *Node) RegisterMethodToV1Enum() v1.RegisterMethod {
@@ -1129,6 +1113,13 @@ func (nv NodeView) HasNetworkChanges(other NodeView) bool {
 // prefixes, order-independent. Inputs are cloned before sorting so
 // callers' slices are not mutated.
 func equalPrefixesUnordered(a, b []netip.Prefix) bool {
+	return equalUnordered(a, b, netip.Prefix.Compare)
+}
+
+// equalUnordered reports whether a and b contain the same elements,
+// order-independent. Inputs are cloned before sorting so callers'
+// slices are not mutated.
+func equalUnordered[E comparable](a, b []E, cmp func(E, E) int) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -1136,8 +1127,8 @@ func equalPrefixesUnordered(a, b []netip.Prefix) bool {
 	ac := slices.Clone(a)
 	bc := slices.Clone(b)
 
-	slices.SortFunc(ac, netip.Prefix.Compare)
-	slices.SortFunc(bc, netip.Prefix.Compare)
+	slices.SortFunc(ac, cmp)
+	slices.SortFunc(bc, cmp)
 
 	return slices.Equal(ac, bc)
 }
