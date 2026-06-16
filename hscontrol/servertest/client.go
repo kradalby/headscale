@@ -192,15 +192,37 @@ func (c *TestClient) register(tb testing.TB) {
 func (c *TestClient) startPoll(tb testing.TB) {
 	tb.Helper()
 
+	c.startPollLoop()
+}
+
+// startPollLoop creates a fresh poll context and launches the background
+// [controlclient.Direct.PollNetMap] goroutine, which blocks until the
+// context is cancelled or the server closes the connection.
+func (c *TestClient) startPollLoop() {
 	c.pollCtx, c.pollCancel = context.WithCancel(context.Background())
 	c.pollDone = make(chan struct{})
 
 	go func() {
 		defer close(c.pollDone)
-		// [controlclient.Direct.PollNetMap] blocks until ctx is cancelled or the server closes
-		// the connection.
 		_ = c.direct.PollNetMap(c.pollCtx, c)
 	}()
+}
+
+// resetNetmapState clears the cached netmap and drains any pending
+// updates from a previous session so that convergence waits observe
+// only the new session's maps.
+func (c *TestClient) resetNetmapState() {
+	c.mu.Lock()
+	c.netmap = nil
+	c.mu.Unlock()
+
+	for {
+		select {
+		case <-c.updates:
+		default:
+			return
+		}
+	}
 }
 
 // UpdateFullNetmap implements [controlclient.NetmapUpdater].
@@ -274,23 +296,11 @@ func (c *TestClient) Reconnect(tb testing.TB) {
 		}
 	}
 
-	// Clear stale netmap data so that callers like [TestClient.WaitForPeers]
-	// actually wait for the new session's map instead of returning
-	// immediately based on the old session's cached state.
-	c.mu.Lock()
-	c.netmap = nil
-	c.mu.Unlock()
-
-	// Drain any pending updates from the old session so they
-	// don't satisfy a subsequent [TestClient.WaitForPeers]/[TestClient.WaitForUpdate].
-drain:
-	for {
-		select {
-		case <-c.updates:
-		default:
-			break drain
-		}
-	}
+	// Clear stale netmap data and drain pending updates so that callers
+	// like [TestClient.WaitForPeers] actually wait for the new session's
+	// map instead of returning immediately based on the old session's
+	// cached state.
+	c.resetNetmapState()
 
 	// Re-register and start polling again.
 	c.register(tb)
@@ -342,30 +352,8 @@ func (c *TestClient) ReloginAndPoll(ctx context.Context) error {
 		return fmt.Errorf("servertest: TryLogin(%s): unexpected auth URL %q (expected auto-auth with preauth key)", c.Name, url) //nolint:err113
 	}
 
-	// Clear stale netmap state from the previous session so that
-	// convergence waits observe only the new session's maps.
-	c.mu.Lock()
-	c.netmap = nil
-	c.mu.Unlock()
-
-	for {
-		select {
-		case <-c.updates:
-			continue
-		default:
-		}
-
-		break
-	}
-
-	c.pollCtx, c.pollCancel = context.WithCancel(context.Background())
-	c.pollDone = make(chan struct{})
-
-	go func() {
-		defer close(c.pollDone)
-
-		_ = c.direct.PollNetMap(c.pollCtx, c)
-	}()
+	c.resetNetmapState()
+	c.startPollLoop()
 
 	return nil
 }
@@ -388,14 +376,7 @@ func (c *TestClient) RestartPoll(ctx context.Context) error {
 		}
 	}
 
-	c.pollCtx, c.pollCancel = context.WithCancel(context.Background())
-	c.pollDone = make(chan struct{})
-
-	go func() {
-		defer close(c.pollDone)
-
-		_ = c.direct.PollNetMap(c.pollCtx, c)
-	}()
+	c.startPollLoop()
 
 	return nil
 }
