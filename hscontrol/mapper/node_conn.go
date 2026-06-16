@@ -143,9 +143,7 @@ func (mc *multiChannelNodeConn) stopConnection(conn *connectionEntry) {
 // Caller must hold mc.mutex.
 func (mc *multiChannelNodeConn) removeConnectionAtIndexLocked(i int, stopConnection bool) *connectionEntry {
 	conn := mc.connections[i]
-	copy(mc.connections[i:], mc.connections[i+1:])
-	mc.connections[len(mc.connections)-1] = nil // release pointer for GC
-	mc.connections = mc.connections[:len(mc.connections)-1]
+	mc.connections = slices.Delete(mc.connections, i, i+1)
 
 	if stopConnection {
 		mc.stopConnection(conn)
