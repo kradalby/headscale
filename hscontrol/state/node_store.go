@@ -734,7 +734,7 @@ func electPrimaryRoutes(
 		// would point peers at a node the prober has already declared
 		// unreachable; leaving the prefix unmapped is honest until a
 		// probe cycle picks one that responds.
-		if !found && len(candidates) >= 1 {
+		if !found {
 			if cur, ok := prev[prefix]; ok && slices.Contains(candidates, cur) {
 				selected = cur
 				found = true
