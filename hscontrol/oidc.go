@@ -119,7 +119,8 @@ func (a *AuthProviderOIDC) AuthURL(authID types.AuthID) string {
 	return fmt.Sprintf(
 		"%s/auth/%s",
 		strings.TrimSuffix(a.serverURL, "/"),
-		authID.String())
+		authID.String(),
+	)
 }
 
 func (a *AuthProviderOIDC) AuthHandler(
@@ -133,7 +134,8 @@ func (a *AuthProviderOIDC) RegisterURL(authID types.AuthID) string {
 	return fmt.Sprintf(
 		"%s/register/%s",
 		strings.TrimSuffix(a.serverURL, "/"),
-		authID.String())
+		authID.String(),
+	)
 }
 
 // RegisterHandler registers the OIDC callback handler with the given router.
@@ -479,7 +481,7 @@ func (a *AuthProviderOIDC) getOauth2Token(
 		return nil, NewHTTPError(http.StatusForbidden, "invalid code", fmt.Errorf("exchanging code for token: %w", err))
 	}
 
-	return oauth2Token, err
+	return oauth2Token, nil
 }
 
 // extractIDToken extracts the ID token from the oauth2 token.
