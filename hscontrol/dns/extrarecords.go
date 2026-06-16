@@ -27,7 +27,7 @@ type ExtraRecordsMan struct {
 
 	updateCh chan []tailcfg.DNSRecord
 	closeCh  chan struct{}
-	hashes   map[string][32]byte
+	hash     [32]byte
 }
 
 // NewExtraRecordsManager creates a new [ExtraRecordsMan] and starts watching the file at the given path.
@@ -52,12 +52,10 @@ func NewExtraRecordsManager(path string) (*ExtraRecordsMan, error) {
 	}
 
 	er := &ExtraRecordsMan{
-		watcher: watcher,
-		path:    path,
-		records: set.SetOf(records),
-		hashes: map[string][32]byte{
-			path: hash,
-		},
+		watcher:  watcher,
+		path:     path,
+		records:  set.SetOf(records),
+		hash:     hash,
 		closeCh:  make(chan struct{}),
 		updateCh: make(chan []tailcfg.DNSRecord),
 	}
@@ -160,18 +158,16 @@ func (e *ExtraRecordsMan) updateRecords() {
 	e.mu.Lock()
 
 	// If there has not been any change, ignore the update.
-	if oldHash, ok := e.hashes[e.path]; ok {
-		if newHash == oldHash {
-			e.mu.Unlock()
+	if newHash == e.hash {
+		e.mu.Unlock()
 
-			return
-		}
+		return
 	}
 
 	oldCount := e.records.Len()
 
 	e.records = set.SetOf(records)
-	e.hashes[e.path] = newHash
+	e.hash = newHash
 	toSend := e.records.Slice()
 
 	log.Trace().Caller().Interface("records", e.records).Msgf("extra records updated from path, count old: %d, new: %d", oldCount, e.records.Len())
