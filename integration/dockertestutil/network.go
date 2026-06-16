@@ -30,12 +30,7 @@ func retryDockerOp(ctx context.Context, op func() error) error {
 	bo.MaxInterval = DockerOpMaxInterval
 
 	_, err := backoff.Retry(ctx, func() (struct{}, error) {
-		err := op()
-		if err != nil {
-			return struct{}{}, err
-		}
-
-		return struct{}{}, nil
+		return struct{}{}, op()
 	}, backoff.WithBackOff(bo), backoff.WithMaxElapsedTime(DockerOpMaxElapsedTime))
 
 	return err
