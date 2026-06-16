@@ -665,14 +665,10 @@ func (node *Node) PeerChangeFromMapRequest(req tailcfg.MapRequest) tailcfg.PeerC
 	}
 
 	if req.Hostinfo != nil && req.Hostinfo.NetInfo != nil {
-		// If there is no stored Hostinfo or NetInfo, use
-		// the new PreferredDERP.
-		if node.Hostinfo == nil {
-			ret.DERPRegion = req.Hostinfo.NetInfo.PreferredDERP
-		} else if node.Hostinfo.NetInfo == nil {
-			ret.DERPRegion = req.Hostinfo.NetInfo.PreferredDERP
-		} else if node.Hostinfo.NetInfo.PreferredDERP != req.Hostinfo.NetInfo.PreferredDERP {
-			// If there is a PreferredDERP check if it has changed.
+		// Use the new PreferredDERP when there is no stored Hostinfo or
+		// NetInfo, or when the stored PreferredDERP has changed.
+		if node.Hostinfo == nil || node.Hostinfo.NetInfo == nil ||
+			node.Hostinfo.NetInfo.PreferredDERP != req.Hostinfo.NetInfo.PreferredDERP {
 			ret.DERPRegion = req.Hostinfo.NetInfo.PreferredDERP
 		}
 	}
