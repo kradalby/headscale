@@ -12,6 +12,6 @@ func AuthWeb(title, description, command string) *elem.Element {
 		title+" - Headscale",
 		H1(elem.Text(title)),
 		P(elem.Text(description)),
-		Pre(PreCode(command)),
+		codeBlockText(command),
 	)
 }

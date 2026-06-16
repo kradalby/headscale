@@ -50,7 +50,7 @@ func Apple(url string) *elem.Element {
 		P(
 			elem.Text("Use Tailscale's login command to add your profile:"),
 		),
-		Pre(PreCode("tailscale login --login-server "+url)),
+		codeBlockText("tailscale login --login-server "+url),
 		H2(elem.Text("GUI")),
 		Ol(
 			elem.Li(
@@ -125,9 +125,9 @@ func Apple(url string) *elem.Element {
 			),
 		),
 		P(elem.Text("For app store client:")),
-		Pre(PreCode("defaults write io.tailscale.ipn.macos ControlURL "+url)),
+		codeBlockText("defaults write io.tailscale.ipn.macos ControlURL "+url),
 		P(elem.Text("For standalone client:")),
-		Pre(PreCode("defaults write io.tailscale.ipn.macsys ControlURL "+url)),
+		codeBlockText("defaults write io.tailscale.ipn.macsys ControlURL "+url),
 		P(
 			elem.Text("Restart "),
 			elem.Strong(nil, elem.Text("Tailscale.app")),
@@ -135,9 +135,9 @@ func Apple(url string) *elem.Element {
 		),
 		warningBox("Caution", "You should always download and inspect the profile before installing it."),
 		P(elem.Text("For app store client:")),
-		Pre(PreCode("curl "+url+"/apple/macos-app-store")),
+		codeBlockText("curl "+url+"/apple/macos-app-store"),
 		P(elem.Text("For standalone client:")),
-		Pre(PreCode("curl "+url+"/apple/macos-standalone")),
+		codeBlockText("curl "+url+"/apple/macos-standalone"),
 		H1(elem.Text("tvOS configuration")),
 		H2(elem.Text("GUI")),
 		Ol(

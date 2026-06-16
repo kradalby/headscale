@@ -77,14 +77,10 @@ func Code(children ...elem.Node) *elem.Element {
 	return elem.Code(nil, children...)
 }
 
-// Pre creates a preformatted text block styled by .md-typeset pre
-func Pre(children ...elem.Node) *elem.Element {
-	return elem.Pre(nil, children...)
-}
-
-// PreCode creates a code block inside Pre styled by .md-typeset pre > code
-func PreCode(code string) *elem.Element {
-	return elem.Code(nil, elem.Text(code))
+// codeBlockText creates a preformatted code block styled by
+// .md-typeset pre > code.
+func codeBlockText(code string) *elem.Element {
+	return elem.Pre(nil, elem.Code(nil, elem.Text(code)))
 }
 
 // headscaleLogo returns the Headscale SVG logo for consistent branding across all pages.
