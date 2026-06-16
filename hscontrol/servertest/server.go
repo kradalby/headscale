@@ -237,9 +237,7 @@ func (s *TestServer) CreateUser(tb testing.TB, name string) *types.User {
 func (s *TestServer) CreatePreAuthKey(tb testing.TB, userID types.UserID) string {
 	tb.Helper()
 
-	uid := userID
-
-	pak, err := s.st.CreatePreAuthKey(&uid, true, false, nil, nil)
+	pak, err := s.st.CreatePreAuthKey(&userID, true, false, nil, nil)
 	if err != nil {
 		tb.Fatalf("servertest: CreatePreAuthKey: %v", err)
 	}
@@ -251,9 +249,7 @@ func (s *TestServer) CreatePreAuthKey(tb testing.TB, userID types.UserID) string
 func (s *TestServer) CreateTaggedPreAuthKey(tb testing.TB, userID types.UserID, tags []string) string {
 	tb.Helper()
 
-	uid := userID
-
-	pak, err := s.st.CreatePreAuthKey(&uid, true, false, nil, tags)
+	pak, err := s.st.CreatePreAuthKey(&userID, true, false, nil, tags)
 	if err != nil {
 		tb.Fatalf("servertest: CreateTaggedPreAuthKey: %v", err)
 	}
@@ -265,9 +261,7 @@ func (s *TestServer) CreateTaggedPreAuthKey(tb testing.TB, userID types.UserID, 
 func (s *TestServer) CreateEphemeralPreAuthKey(tb testing.TB, userID types.UserID) string {
 	tb.Helper()
 
-	uid := userID
-
-	pak, err := s.st.CreatePreAuthKey(&uid, false, true, nil, nil)
+	pak, err := s.st.CreatePreAuthKey(&userID, false, true, nil, nil)
 	if err != nil {
 		tb.Fatalf("servertest: CreateEphemeralPreAuthKey: %v", err)
 	}
