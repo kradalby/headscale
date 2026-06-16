@@ -155,7 +155,6 @@ func shuffleDERPMap(dm *tailcfg.DERPMap) {
 var crc64Table = crc64.MakeTable(crc64.ISO)
 
 var (
-	derpRandomOnce sync.Once
 	derpRandomInst *rand.Rand
 	derpRandomMu   sync.Mutex
 )
@@ -164,12 +163,10 @@ func derpRandom() *rand.Rand {
 	derpRandomMu.Lock()
 	defer derpRandomMu.Unlock()
 
-	derpRandomOnce.Do(func() {
+	if derpRandomInst == nil {
 		seed := cmp.Or(viper.GetString("dns.base_domain"), time.Now().String())
-		rnd := rand.New(rand.NewSource(0))                        //nolint:gosec // weak random is fine for DERP scrambling
-		rnd.Seed(int64(crc64.Checksum([]byte(seed), crc64Table))) //nolint:gosec // safe conversion
-		derpRandomInst = rnd
-	})
+		derpRandomInst = rand.New(rand.NewSource(int64(crc64.Checksum([]byte(seed), crc64Table)))) //nolint:gosec // weak random is fine for DERP scrambling
+	}
 
 	return derpRandomInst
 }
@@ -178,6 +175,5 @@ func resetDerpRandomForTesting() {
 	derpRandomMu.Lock()
 	defer derpRandomMu.Unlock()
 
-	derpRandomOnce = sync.Once{}
 	derpRandomInst = nil
 }
