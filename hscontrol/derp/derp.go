@@ -88,13 +88,9 @@ func mergeDERPMaps(derpMaps []*tailcfg.DERPMap) *tailcfg.DERPMap {
 		// shuffle alias regions shared with the source map or a previously
 		// served map, racing concurrent readers.
 		for id, region := range derpMap.Regions {
-			result.Regions[id] = region.Clone()
-		}
-	}
-
-	for id, region := range result.Regions {
-		if region == nil {
-			delete(result.Regions, id)
+			if cloned := region.Clone(); cloned != nil {
+				result.Regions[id] = cloned
+			}
 		}
 	}
 
