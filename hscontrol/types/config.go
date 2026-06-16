@@ -891,15 +891,15 @@ func dns() (DNSConfig, error) {
 	return dns, nil
 }
 
-// globalResolvers returns the global DNS resolvers
-// defined in the config file.
+// parseResolvers converts nameserver strings into DNS resolvers.
 // If a nameserver is a valid IP, it will be used as a regular resolver.
 // If a nameserver is a valid URL, it will be used as a DoH resolver.
 // If a nameserver is neither a valid URL nor a valid IP, it will be ignored.
-func (d *DNSConfig) globalResolvers() []*dnstype.Resolver {
+// When domain is non-empty, it is included in the warning for invalid entries.
+func parseResolvers(nameservers []string, domain string) []*dnstype.Resolver {
 	var resolvers []*dnstype.Resolver
 
-	for _, nsStr := range d.Nameservers.Global {
+	for _, nsStr := range nameservers {
 		if _, err := netip.ParseAddr(nsStr); err == nil { //nolint:noinlineerr
 			resolvers = append(resolvers, &dnstype.Resolver{
 				Addr: nsStr,
@@ -916,43 +916,29 @@ func (d *DNSConfig) globalResolvers() []*dnstype.Resolver {
 			continue
 		}
 
-		log.Warn().Str("nameserver", nsStr).Msg("invalid global nameserver, ignoring")
+		e := log.Warn().Str("nameserver", nsStr)
+		if domain != "" {
+			e = e.Str("domain", domain)
+		}
+
+		e.Msg("invalid nameserver, ignoring")
 	}
 
 	return resolvers
 }
 
+// globalResolvers returns the global DNS resolvers
+// defined in the config file.
+func (d *DNSConfig) globalResolvers() []*dnstype.Resolver {
+	return parseResolvers(d.Nameservers.Global, "")
+}
+
 // splitResolvers returns a map of domain to DNS resolvers.
-// If a nameserver is a valid IP, it will be used as a regular resolver.
-// If a nameserver is a valid URL, it will be used as a DoH resolver.
-// If a nameserver is neither a valid URL nor a valid IP, it will be ignored.
 func (d *DNSConfig) splitResolvers() map[string][]*dnstype.Resolver {
 	routes := make(map[string][]*dnstype.Resolver)
 
 	for domain, nameservers := range d.Nameservers.Split {
-		var resolvers []*dnstype.Resolver
-
-		for _, nsStr := range nameservers {
-			if _, err := netip.ParseAddr(nsStr); err == nil { //nolint:noinlineerr
-				resolvers = append(resolvers, &dnstype.Resolver{
-					Addr: nsStr,
-				})
-
-				continue
-			}
-
-			if _, err := url.Parse(nsStr); err == nil { //nolint:noinlineerr
-				resolvers = append(resolvers, &dnstype.Resolver{
-					Addr: nsStr,
-				})
-
-				continue
-			}
-
-			log.Warn().Str("nameserver", nsStr).Str("domain", domain).Msg("invalid split dns nameserver, ignoring")
-		}
-
-		routes[domain] = resolvers
+		routes[domain] = parseResolvers(nameservers, domain)
 	}
 
 	return routes
