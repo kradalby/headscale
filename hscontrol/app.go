@@ -1032,12 +1032,14 @@ func (h *Headscale) Serve() error {
 func (h *Headscale) getTLSSettings() (*tls.Config, error) {
 	var err error
 
-	if h.cfg.TLS.LetsEncrypt.Hostname != "" {
-		if !strings.HasPrefix(h.cfg.ServerURL, "https://") {
-			log.Warn().
-				Msg("Listening with TLS but ServerURL does not start with https://")
-		}
+	tlsEnabled := h.cfg.TLS.LetsEncrypt.Hostname != "" || h.cfg.TLS.CertPath != ""
+	if tlsEnabled && !strings.HasPrefix(h.cfg.ServerURL, "https://") {
+		log.Warn().Msg("listening with TLS but ServerURL does not start with https://")
+	} else if !tlsEnabled && !strings.HasPrefix(h.cfg.ServerURL, "http://") {
+		log.Warn().Msg("listening without TLS but ServerURL does not start with http://")
+	}
 
+	if h.cfg.TLS.LetsEncrypt.Hostname != "" {
 		certManager := autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
 			HostPolicy: autocert.HostWhitelist(h.cfg.TLS.LetsEncrypt.Hostname),
@@ -1084,16 +1086,8 @@ func (h *Headscale) getTLSSettings() (*tls.Config, error) {
 			return nil, errUnsupportedLetsEncryptChallengeType
 		}
 	} else if h.cfg.TLS.CertPath == "" {
-		if !strings.HasPrefix(h.cfg.ServerURL, "http://") {
-			log.Warn().Msg("listening without TLS but ServerURL does not start with http://")
-		}
-
 		return nil, err
 	} else {
-		if !strings.HasPrefix(h.cfg.ServerURL, "https://") {
-			log.Warn().Msg("listening with TLS but ServerURL does not start with https://")
-		}
-
 		tlsConfig := &tls.Config{
 			NextProtos:   []string{"http/1.1"},
 			Certificates: make([]tls.Certificate, 1),
