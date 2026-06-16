@@ -85,8 +85,8 @@ func mergeDERPMaps(derpMaps []*tailcfg.DERPMap) *tailcfg.DERPMap {
 
 	for _, derpMap := range derpMaps {
 		// Clone each region: copying the pointer would let a later in-place
-		// shuffle (shuffleRegionNoClone) alias regions shared with the source
-		// map or a previously served map, racing concurrent readers.
+		// shuffle alias regions shared with the source map or a previously
+		// served map, racing concurrent readers.
 		for id, region := range derpMap.Regions {
 			result.Regions[id] = region.Clone()
 		}
@@ -152,7 +152,7 @@ func shuffleDERPMap(dm *tailcfg.DERPMap) {
 			continue
 		}
 
-		dm.Regions[id] = shuffleRegionNoClone(region)
+		derpRandom().Shuffle(len(region.Nodes), reflect.Swapper(region.Nodes))
 	}
 }
 
@@ -184,9 +184,4 @@ func resetDerpRandomForTesting() {
 
 	derpRandomOnce = sync.Once{}
 	derpRandomInst = nil
-}
-
-func shuffleRegionNoClone(r *tailcfg.DERPRegion) *tailcfg.DERPRegion {
-	derpRandom().Shuffle(len(r.Nodes), reflect.Swapper(r.Nodes))
-	return r
 }
