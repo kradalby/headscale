@@ -527,33 +527,24 @@ func (s *NodeStore) applyBatch(batch []work) {
 	// Update node count gauge
 	nodeStoreNodesCount.Set(float64(len(nodes)))
 
-	// Send the resulting nodes to all work items that requested them
+	// Send the resulting nodes to all work items that requested them.
+	// A zero-value NodeView{} reports Valid()==false, matching node.View()
+	// for a node that was deleted or never existed.
 	for nodeID, workItems := range nodeResultRequests {
+		var nodeView types.NodeView
 		if node, exists := nodes[nodeID]; exists {
-			nodeView := node.View()
-			for _, w := range workItems {
-				w.nodeResult <- nodeView
+			nodeView = node.View()
+		}
 
-				close(w.nodeResult)
+		for _, w := range workItems {
+			w.nodeResult <- nodeView
 
-				if w.errResult != nil {
-					w.errResult <- setErrResults[w]
+			close(w.nodeResult)
 
-					close(w.errResult)
-				}
-			}
-		} else {
-			// Node was deleted or doesn't exist
-			for _, w := range workItems {
-				w.nodeResult <- types.NodeView{} // Send invalid view
+			if w.errResult != nil {
+				w.errResult <- setErrResults[w]
 
-				close(w.nodeResult)
-
-				if w.errResult != nil {
-					w.errResult <- setErrResults[w]
-
-					close(w.errResult)
-				}
+				close(w.errResult)
 			}
 		}
 	}
