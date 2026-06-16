@@ -37,6 +37,16 @@ func bypassDatabase() (*db.HSDatabase, error) {
 	return d, nil
 }
 
+// openBypassDB confirms the destructive bypass action and opens the database
+// directly. The caller is responsible for closing the returned handle.
+func openBypassDB(cmd *cobra.Command) (*db.HSDatabase, error) {
+	if !confirmAction(cmd, "DO NOT run this command if an instance of headscale is running, are you sure headscale is not running?") {
+		return nil, errAborted
+	}
+
+	return bypassDatabase()
+}
+
 func init() {
 	rootCmd.AddCommand(policyCmd)
 
@@ -67,11 +77,7 @@ var getPolicy = &cobra.Command{
 		var policyData string
 
 		if bypass, _ := cmd.Flags().GetBool(bypassFlag); bypass {
-			if !confirmAction(cmd, "DO NOT run this command if an instance of headscale is running, are you sure headscale is not running?") {
-				return errAborted
-			}
-
-			d, err := bypassDatabase()
+			d, err := openBypassDB(cmd)
 			if err != nil {
 				return err
 			}
@@ -123,11 +129,7 @@ var setPolicy = &cobra.Command{
 		}
 
 		if bypass, _ := cmd.Flags().GetBool(bypassFlag); bypass {
-			if !confirmAction(cmd, "DO NOT run this command if an instance of headscale is running, are you sure headscale is not running?") {
-				return errAborted
-			}
-
-			d, err := bypassDatabase()
+			d, err := openBypassDB(cmd)
 			if err != nil {
 				return err
 			}
@@ -186,11 +188,7 @@ var checkPolicy = &cobra.Command{
 		}
 
 		if bypass, _ := cmd.Flags().GetBool(bypassFlag); bypass {
-			if !confirmAction(cmd, "DO NOT run this command if an instance of headscale is running, are you sure headscale is not running?") {
-				return errAborted
-			}
-
-			d, err := bypassDatabase()
+			d, err := openBypassDB(cmd)
 			if err != nil {
 				return err
 			}
