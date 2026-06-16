@@ -211,7 +211,7 @@ func NewScenario(spec ScenarioSpec) (*Scenario, error) {
 
 	var userToNetwork map[string]*dockertest.Network
 
-	if spec.Networks != nil || len(spec.Networks) != 0 {
+	if spec.Networks != nil {
 		for name, netSpec := range s.spec.Networks {
 			networkName := testHashPrefix + "-" + name
 
