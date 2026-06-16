@@ -283,15 +283,14 @@ func (c *TestClient) Reconnect(tb testing.TB) {
 
 	// Drain any pending updates from the old session so they
 	// don't satisfy a subsequent [TestClient.WaitForPeers]/[TestClient.WaitForUpdate].
+drain:
 	for {
 		select {
 		case <-c.updates:
 		default:
-			goto drained
+			break drain
 		}
 	}
-
-drained:
 
 	// Re-register and start polling again.
 	c.register(tb)
