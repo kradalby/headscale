@@ -136,7 +136,7 @@ func GetNodeByID(tx *gorm.DB, id types.NodeID) (*types.Node, error) {
 		Preload("AuthKey").
 		Preload("AuthKey.User").
 		Preload("User").
-		Find(&types.Node{ID: id}).First(&mach); result.Error != nil {
+		First(&mach, "id = ?", id); result.Error != nil {
 		return nil, result.Error
 	}
 
