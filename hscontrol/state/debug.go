@@ -133,12 +133,7 @@ func (s *State) DebugOverview() string {
 	sb.WriteString("\n")
 
 	// Route information
-	primaryStr := s.PrimaryRoutesString()
-
-	routeCount := len(strings.Split(strings.TrimSpace(primaryStr), "\n"))
-	if primaryStr == "" {
-		routeCount = 0
-	}
+	routeCount := len(s.nodeStore.PrimaryRoutes())
 
 	fmt.Fprintf(&sb, "Primary Routes: %d active\n", routeCount)
 	sb.WriteString("\n")
@@ -371,14 +366,7 @@ func (s *State) DebugOverviewJSON() DebugOverviewInfo {
 	}
 
 	// Route information
-	primaryStr := s.PrimaryRoutesString()
-
-	routeCount := len(strings.Split(strings.TrimSpace(primaryStr), "\n"))
-	if primaryStr == "" {
-		routeCount = 0
-	}
-
-	info.PrimaryRoutes = routeCount
+	info.PrimaryRoutes = len(s.nodeStore.PrimaryRoutes())
 
 	return info
 }
