@@ -66,22 +66,20 @@ func parseVersion(s string) (semver, error) {
 		return semver{}, fmt.Errorf("%q: %w", s, errVersionFormat)
 	}
 
-	major, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return semver{}, fmt.Errorf("invalid major version in %q: %w", s, err)
+	var out [3]int
+
+	names := [...]string{"major", "minor", "patch"}
+
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return semver{}, fmt.Errorf("invalid %s version in %q: %w", names[i], s, err)
+		}
+
+		out[i] = n
 	}
 
-	minor, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return semver{}, fmt.Errorf("invalid minor version in %q: %w", s, err)
-	}
-
-	patch, err := strconv.Atoi(parts[2])
-	if err != nil {
-		return semver{}, fmt.Errorf("invalid patch version in %q: %w", s, err)
-	}
-
-	return semver{Major: major, Minor: minor, Patch: patch}, nil
+	return semver{Major: out[0], Minor: out[1], Patch: out[2]}, nil
 }
 
 // ensureDatabaseVersionTable creates the database_versions table if it
