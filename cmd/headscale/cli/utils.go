@@ -306,24 +306,15 @@ func printError(err error, outputFormat string) {
 		Error string `json:"error"`
 	}
 
-	e := errOutput{Error: err.Error()}
-
-	var formatted []byte
-
-	switch outputFormat {
-	case outputFormatJSON:
-		formatted, _ = json.MarshalIndent(e, "", "\t") //nolint:errchkjson // errOutput contains only a string field
-	case outputFormatJSONLine:
-		formatted, _ = json.Marshal(e) //nolint:errchkjson // errOutput contains only a string field
-	case outputFormatYAML:
-		formatted, _ = yaml.Marshal(e)
-	default:
+	if outputFormat == "" {
 		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
 
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "%s\n", formatted)
+	// formatOutput cannot fail here: errOutput is a single string field.
+	out, _ := formatOutput(errOutput{Error: err.Error()}, "", outputFormat)
+	fmt.Fprintf(os.Stderr, "%s\n", out)
 }
 
 func hasMachineOutputFlag() bool {
