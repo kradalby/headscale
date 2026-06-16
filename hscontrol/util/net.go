@@ -26,13 +26,12 @@ func PrefixesToString(prefixes []netip.Prefix) []string {
 }
 
 func MustStringsToPrefixes(strings []string) []netip.Prefix {
-	ret := make([]netip.Prefix, 0, len(strings))
-	for _, str := range strings {
-		prefix := netip.MustParsePrefix(str)
-		ret = append(ret, prefix)
+	prefixes, err := StringToIPPrefix(strings)
+	if err != nil {
+		panic(err)
 	}
 
-	return ret
+	return prefixes
 }
 
 // TheInternet returns the [netipx.IPSet] for the Internet.
