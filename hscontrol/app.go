@@ -204,13 +204,15 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		if cfg.PrefixV4 != nil {
 			magicDNSDomains = append(
 				magicDNSDomains,
-				util.GenerateIPv4DNSRootDomain(*cfg.PrefixV4)...)
+				util.GenerateIPv4DNSRootDomain(*cfg.PrefixV4)...,
+			)
 		}
 
 		if cfg.PrefixV6 != nil {
 			magicDNSDomains = append(
 				magicDNSDomains,
-				util.GenerateIPv6DNSRootDomain(*cfg.PrefixV6)...)
+				util.GenerateIPv6DNSRootDomain(*cfg.PrefixV6)...,
+			)
 		}
 
 		// we might have routes already from Split DNS
@@ -387,6 +389,20 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 	}
 }
 
+// checkBearerToken validates an "Authorization" header value. It reports
+// whether the API key is valid, whether the header carried the "Bearer "
+// prefix, and any validation error. Callers translate these outcomes into
+// their transport-specific status.
+func (h *Headscale) checkBearerToken(authHeader string) (bool, bool, error) {
+	if !strings.HasPrefix(authHeader, AuthPrefix) {
+		return false, false, nil
+	}
+
+	valid, err := h.state.ValidateAPIKey(strings.TrimPrefix(authHeader, AuthPrefix))
+
+	return valid, true, err
+}
+
 func (h *Headscale) grpcAuthenticationInterceptor(ctx context.Context,
 	req any,
 	info *grpc.UnaryServerInfo,
@@ -420,16 +436,14 @@ func (h *Headscale) grpcAuthenticationInterceptor(ctx context.Context,
 		)
 	}
 
-	token := authHeader[0]
-
-	if !strings.HasPrefix(token, AuthPrefix) {
+	valid, hasPrefix, err := h.checkBearerToken(authHeader[0])
+	if !hasPrefix {
 		return ctx, status.Error(
 			codes.Unauthenticated,
 			`missing "Bearer " prefix in "Authorization" header`,
 		)
 	}
 
-	valid, err := h.state.ValidateAPIKey(strings.TrimPrefix(token, AuthPrefix))
 	if err != nil {
 		return ctx, status.Error(codes.Internal, "validating token")
 	}
@@ -465,7 +479,8 @@ func (h *Headscale) httpAuthenticationMiddleware(next http.Handler) http.Handler
 			}
 		}
 
-		if !strings.HasPrefix(authHeader, AuthPrefix) {
+		valid, hasPrefix, err := h.checkBearerToken(authHeader)
+		if !hasPrefix {
 			log.Error().
 				Caller().
 				Str("client_address", req.RemoteAddr).
@@ -475,7 +490,6 @@ func (h *Headscale) httpAuthenticationMiddleware(next http.Handler) http.Handler
 			return
 		}
 
-		valid, err := h.state.ValidateAPIKey(strings.TrimPrefix(authHeader, AuthPrefix))
 		if err != nil {
 			log.Info().
 				Caller().
@@ -792,7 +806,8 @@ func (h *Headscale) Serve() error {
 		}
 
 		if tlsConfig != nil {
-			grpcOptions = append(grpcOptions,
+			grpcOptions = append(
+				grpcOptions,
 				grpc.Creds(credentials.NewTLS(tlsConfig)),
 			)
 		} else {
