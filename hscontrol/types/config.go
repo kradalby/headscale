@@ -602,7 +602,7 @@ func validateServerConfig() error {
 
 	// Minimum inactivity time out is keepalive timeout (60s) plus a few seconds
 	// to avoid races
-	minInactivityTimeout, _ := time.ParseDuration("65s")
+	minInactivityTimeout := 65 * time.Second
 
 	ephemeralTimeout := resolveEphemeralInactivityTimeout()
 	if ephemeralTimeout <= minInactivityTimeout {
