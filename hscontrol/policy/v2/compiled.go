@@ -619,7 +619,7 @@ func collectRelayTargetIPs(grants []compiledGrant) (*netipx.IPSet, error) {
 // traffic through it must recompute when it goes offline. Returns nil when no
 // via grants exist.
 func collectViaTargetTags(grants []compiledGrant) map[Tag]struct{} {
-	var tags map[Tag]struct{}
+	tags := make(map[Tag]struct{})
 
 	for i := range grants {
 		if grants[i].via == nil {
@@ -627,12 +627,12 @@ func collectViaTargetTags(grants []compiledGrant) map[Tag]struct{} {
 		}
 
 		for _, t := range grants[i].via.viaTags {
-			if tags == nil {
-				tags = make(map[Tag]struct{})
-			}
-
 			tags[t] = struct{}{}
 		}
+	}
+
+	if len(tags) == 0 {
+		return nil
 	}
 
 	return tags
