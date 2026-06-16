@@ -285,39 +285,28 @@ func runPolicyTest(test PolicyTest, pol *Policy, filter []tailcfg.FilterRule, us
 		return res
 	}
 
-	for _, dst := range test.Accept {
-		allowed, err := evalReachability(srcPrefixes, dst, test.Proto, pol, filter, users, nodes)
-		if err != nil {
-			res.Passed = false
-			res.Errors = append(res.Errors, fmt.Sprintf("error testing %q: %v", dst, err))
+	check := func(dsts []string, wantAllowed bool, ok, fail *[]string) {
+		for _, dst := range dsts {
+			allowed, err := evalReachability(srcPrefixes, dst, test.Proto, pol, filter, users, nodes)
+			if err != nil {
+				res.Passed = false
+				res.Errors = append(res.Errors, fmt.Sprintf("error testing %q: %v", dst, err))
 
-			continue
-		}
+				continue
+			}
 
-		if allowed {
-			res.AcceptOK = append(res.AcceptOK, dst)
-		} else {
-			res.Passed = false
-			res.AcceptFail = append(res.AcceptFail, dst)
-		}
-	}
+			if allowed == wantAllowed {
+				*ok = append(*ok, dst)
+			} else {
+				res.Passed = false
 
-	for _, dst := range test.Deny {
-		allowed, err := evalReachability(srcPrefixes, dst, test.Proto, pol, filter, users, nodes)
-		if err != nil {
-			res.Passed = false
-			res.Errors = append(res.Errors, fmt.Sprintf("error testing %q: %v", dst, err))
-
-			continue
-		}
-
-		if !allowed {
-			res.DenyOK = append(res.DenyOK, dst)
-		} else {
-			res.Passed = false
-			res.DenyFail = append(res.DenyFail, dst)
+				*fail = append(*fail, dst)
+			}
 		}
 	}
+
+	check(test.Accept, true, &res.AcceptOK, &res.AcceptFail)
+	check(test.Deny, false, &res.DenyOK, &res.DenyFail)
 
 	return res
 }
