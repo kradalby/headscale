@@ -4,6 +4,7 @@
 package hscontrol
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -11,7 +12,6 @@ import (
 	"net/netip"
 	"os"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -42,6 +42,13 @@ func newHeadscaleV1APIServer(h *Headscale) v1.HeadscaleServiceServer {
 	return headscaleV1APIServer{
 		h: h,
 	}
+}
+
+// sortByID sorts a slice of proto messages by ascending Id.
+func sortByID[T interface{ GetId() uint64 }](s []T) {
+	slices.SortFunc(s, func(a, b T) int {
+		return cmp.Compare(a.GetId(), b.GetId())
+	})
 }
 
 func (api headscaleV1APIServer) CreateUser(
@@ -137,9 +144,7 @@ func (api headscaleV1APIServer) ListUsers(
 		response[index] = user.Proto()
 	}
 
-	sort.Slice(response, func(i, j int) bool {
-		return response[i].Id < response[j].Id
-	})
+	sortByID(response)
 
 	return &v1.ListUsersResponse{Users: response}, nil
 }
@@ -223,9 +228,7 @@ func (api headscaleV1APIServer) ListPreAuthKeys(
 		response[index] = key.Proto()
 	}
 
-	sort.Slice(response, func(i, j int) bool {
-		return response[i].Id < response[j].Id
-	})
+	sortByID(response)
 
 	return &v1.ListPreAuthKeysResponse{PreAuthKeys: response}, nil
 }
@@ -564,9 +567,7 @@ func nodesToProto(state *state.State, nodes views.Slice[types.NodeView]) []*v1.N
 		response[index] = resp
 	}
 
-	sort.Slice(response, func(i, j int) bool {
-		return response[i].Id < response[j].Id
-	})
+	sortByID(response)
 
 	return response
 }
@@ -661,9 +662,7 @@ func (api headscaleV1APIServer) ListApiKeys(
 		response[index] = key.Proto()
 	}
 
-	sort.Slice(response, func(i, j int) bool {
-		return response[i].Id < response[j].Id
-	})
+	sortByID(response)
 
 	return &v1.ListApiKeysResponse{ApiKeys: response}, nil
 }
