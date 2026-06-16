@@ -94,6 +94,7 @@ type User struct {
 	// same as RegistrationMethod, without authkey.
 	Provider string
 
+	// TODO(kradalby): See if we can fill in Gravatar here.
 	ProfilePicURL string
 }
 
@@ -134,16 +135,11 @@ func (u *User) Display() string {
 	return cmp.Or(u.DisplayName, u.Username())
 }
 
-// TODO(kradalby): See if we can fill in Gravatar here.
-func (u *User) profilePicURL() string {
-	return u.ProfilePicURL
-}
-
 func (u *User) TailscaleUser() tailcfg.User {
 	return tailcfg.User{
 		ID:            tailcfg.UserID(u.ID), //nolint:gosec // UserID is bounded
 		DisplayName:   u.Display(),
-		ProfilePicURL: u.profilePicURL(),
+		ProfilePicURL: u.ProfilePicURL,
 		Created:       u.CreatedAt,
 	}
 }
@@ -165,7 +161,7 @@ func (u *User) TailscaleLogin() tailcfg.Login {
 		Provider:      u.Provider,
 		LoginName:     u.Username(),
 		DisplayName:   u.Display(),
-		ProfilePicURL: u.profilePicURL(),
+		ProfilePicURL: u.ProfilePicURL,
 	}
 }
 
@@ -178,7 +174,7 @@ func (u *User) TailscaleUserProfile() tailcfg.UserProfile {
 		ID:            tailcfg.UserID(u.ID), //nolint:gosec // UserID is bounded
 		LoginName:     u.Username(),
 		DisplayName:   u.Display(),
-		ProfilePicURL: u.profilePicURL(),
+		ProfilePicURL: u.ProfilePicURL,
 	}
 }
 
