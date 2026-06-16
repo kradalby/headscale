@@ -35,6 +35,6 @@ var DkeyComparer = cmp.Comparer(func(x, y key.DiscoPublic) bool {
 
 var ViewSliceIPProtoComparer = cmp.Comparer(views.SliceEqual[ipproto.Proto])
 
-var Comparers []cmp.Option = []cmp.Option{
+var Comparers = []cmp.Option{
 	IPComparer, PrefixComparer, AddrPortComparer, MkeyComparer, NkeyComparer, DkeyComparer, ViewSliceIPProtoComparer,
 }
