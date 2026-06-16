@@ -12,10 +12,6 @@ import (
 // This is borrowed from, and updated to use [netipx.IPSet]
 // https://github.com/tailscale/tailscale/blob/71029cea2ddf82007b80f465b256d027eab0f02d/wgengine/filter/tailcfg.go#L97-L162
 // TODO(kradalby): contribute upstream and make public.
-var (
-	zeroIP4 = netip.AddrFrom4([4]byte{})
-	zeroIP6 = netip.AddrFrom16([16]byte{})
-)
 
 // parseIPSet parses arg as one:
 //
@@ -30,8 +26,8 @@ var (
 func ParseIPSet(arg string, bits *int) (*netipx.IPSet, error) {
 	var ipSet netipx.IPSetBuilder
 	if arg == "*" {
-		ipSet.AddPrefix(netip.PrefixFrom(zeroIP4, 0))
-		ipSet.AddPrefix(netip.PrefixFrom(zeroIP6, 0))
+		ipSet.AddPrefix(netip.PrefixFrom(netip.IPv4Unspecified(), 0))
+		ipSet.AddPrefix(netip.PrefixFrom(netip.IPv6Unspecified(), 0))
 
 		return ipSet.IPSet()
 	}
