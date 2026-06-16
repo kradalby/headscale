@@ -651,6 +651,28 @@ func (a *AuthProviderOIDC) createOrUpdateUserFromClaim(
 // browser do not collide.
 const registerConfirmCSRFCookie = "headscale_register_confirm"
 
+// setRegisterConfirmCookie writes the per-session register-confirm CSRF
+// cookie. Pass the CSRF token and authCacheExpiration seconds to set it;
+// pass ("", -1) to clear it after the registration is finalised.
+func setRegisterConfirmCookie(
+	writer http.ResponseWriter,
+	req *http.Request,
+	authID types.AuthID,
+	value string,
+	maxAge int,
+) {
+	//nolint:gosec // G124: Secure set conditionally via req.TLS; HttpOnly + SameSite already set
+	http.SetCookie(writer, &http.Cookie{
+		Name:     registerConfirmCSRFCookie,
+		Value:    value,
+		Path:     "/register/confirm/" + authID.String(),
+		MaxAge:   maxAge,
+		Secure:   req.TLS != nil,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
 // renderRegistrationConfirmInterstitial captures the resolved OIDC
 // identity and node expiry into the cached [types.AuthRequest], sets the CSRF
 // cookie, and renders the confirmation page that the user must
@@ -692,16 +714,7 @@ func (a *AuthProviderOIDC) renderRegistrationConfirmInterstitial(
 		CSRF:       csrf,
 	})
 
-	//nolint:gosec // G124: Secure set conditionally via req.TLS; HttpOnly + SameSite already set
-	http.SetCookie(writer, &http.Cookie{
-		Name:     registerConfirmCSRFCookie,
-		Value:    csrf,
-		Path:     "/register/confirm/" + authID.String(),
-		MaxAge:   int(authCacheExpiration.Seconds()),
-		Secure:   req.TLS != nil,
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-	})
+	setRegisterConfirmCookie(writer, req, authID, csrf, int(authCacheExpiration.Seconds()))
 
 	regData := authReq.RegistrationData()
 
@@ -818,16 +831,7 @@ func (a *AuthProviderOIDC) RegisterConfirmHandler(
 	}
 
 	// Clear the CSRF cookie now that the registration is final.
-	//nolint:gosec // G124: Secure set conditionally via req.TLS; HttpOnly + SameSite already set
-	http.SetCookie(writer, &http.Cookie{
-		Name:     registerConfirmCSRFCookie,
-		Value:    "",
-		Path:     "/register/confirm/" + authID.String(),
-		MaxAge:   -1,
-		Secure:   req.TLS != nil,
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-	})
+	setRegisterConfirmCookie(writer, req, authID, "", -1)
 
 	content := renderRegistrationSuccessTemplate(user, newNode)
 
