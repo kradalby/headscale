@@ -71,26 +71,8 @@ func killTestContainers(ctx context.Context) error {
 	removed := 0
 
 	for _, cont := range containers {
-		shouldRemove := false
-
-		for _, name := range cont.Names {
-			if strings.Contains(name, "headscale-test-suite") ||
-				strings.Contains(name, "hs-") ||
-				strings.Contains(name, "ts-") ||
-				strings.Contains(name, "derp-") {
-				shouldRemove = true
-				break
-			}
-		}
-
-		if shouldRemove {
-			// First kill the container if it's running
-			if cont.State == "running" {
-				_ = cli.ContainerKill(ctx, cont.ID, "KILL")
-			}
-
-			// Then remove the container with retry logic
-			if removeContainerWithRetry(ctx, cli, cont.ID) {
+		if isTestContainerName(cont.Names) {
+			if killAndRemove(ctx, cli, cont) {
 				removed++
 			}
 		}
@@ -129,13 +111,7 @@ func killTestContainersByRunID(ctx context.Context, runID string) error {
 	removed := 0
 
 	for _, cont := range containers {
-		// Kill the container if it's running
-		if cont.State == "running" {
-			_ = cli.ContainerKill(ctx, cont.ID, "KILL")
-		}
-
-		// Remove the container with retry logic
-		if removeContainerWithRetry(ctx, cli, cont.ID) {
+		if killAndRemove(ctx, cli, cont) {
 			removed++
 		}
 	}
@@ -173,20 +149,8 @@ func cleanupStaleTestContainers(ctx context.Context) error {
 
 	for _, cont := range containers {
 		// Only remove containers that look like test containers
-		shouldRemove := false
-
-		for _, name := range cont.Names {
-			if strings.Contains(name, "headscale-test-suite") ||
-				strings.Contains(name, "hs-") ||
-				strings.Contains(name, "ts-") ||
-				strings.Contains(name, "derp-") {
-				shouldRemove = true
-				break
-			}
-		}
-
-		if shouldRemove {
-			if removeContainerWithRetry(ctx, cli, cont.ID) {
+		if isTestContainerName(cont.Names) {
+			if killAndRemove(ctx, cli, cont) {
 				removed++
 			}
 		}
@@ -221,6 +185,46 @@ func removeContainerWithRetry(ctx context.Context, cli *client.Client, container
 	}, backoff.WithBackOff(expBackoff), backoff.WithMaxElapsedTime(containerRemoveMaxElapsedTime))
 
 	return err == nil
+}
+
+// testContainerNamePrefixes are the name prefixes used by containers that the
+// integration test harness creates (headscale, tailscale, DERP, and k3s).
+var testContainerNamePrefixes = []string{"hs-", "ts-", "derp-", "k3s-"}
+
+// matchesTestContainerPrefix reports whether name belongs to an integration
+// test container, ignoring any leading "/" that Docker prefixes names with.
+func matchesTestContainerPrefix(name string) bool {
+	name = strings.TrimPrefix(name, "/")
+	for _, prefix := range testContainerNamePrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isTestContainerName reports whether any of the container names belong to an
+// integration test container.
+func isTestContainerName(names []string) bool {
+	for _, name := range names {
+		if strings.Contains(name, "headscale-test-suite") ||
+			matchesTestContainerPrefix(name) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// killAndRemove kills a running container then removes it with retry logic,
+// reporting whether the removal succeeded.
+func killAndRemove(ctx context.Context, cli *client.Client, cont container.Summary) bool {
+	if cont.State == "running" {
+		_ = cli.ContainerKill(ctx, cont.ID, "KILL")
+	}
+
+	return removeContainerWithRetry(ctx, cli, cont.ID)
 }
 
 // pruneDockerNetworks removes unused Docker networks.

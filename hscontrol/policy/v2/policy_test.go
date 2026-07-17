@@ -8,6 +8,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 	"tailscale.com/net/tsaddr"
@@ -122,7 +123,7 @@ func TestInvalidateAutogroupSelfCache(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	require.Len(t, pm.filterRulesMap, len(initialNodes))
+	require.Equal(t, len(initialNodes), pm.filterRulesMap.Size())
 
 	tests := []struct {
 		name            string
@@ -207,19 +208,20 @@ func TestInvalidateAutogroupSelfCache(t *testing.T) {
 				}
 			}
 
-			pm.filterRulesMap = make(map[types.NodeID][]tailcfg.FilterRule)
+			pm.filterRulesMap.Clear()
+
 			for _, n := range initialNodes {
 				_, err := pm.FilterForNode(n.View())
 				require.NoError(t, err)
 			}
 
-			initialCacheSize := len(pm.filterRulesMap)
+			initialCacheSize := pm.filterRulesMap.Size()
 			require.Equal(t, len(initialNodes), initialCacheSize)
 
 			pm.invalidateAutogroupSelfCache(initialNodes.ViewSlice(), tt.newNodes.ViewSlice())
 
 			// Verify the expected number of cache entries were cleared
-			finalCacheSize := len(pm.filterRulesMap)
+			finalCacheSize := pm.filterRulesMap.Size()
 			clearedEntries := initialCacheSize - finalCacheSize
 			require.Equal(t, tt.expectedCleared, clearedEntries, tt.description)
 		})
@@ -498,15 +500,19 @@ func TestInvalidateGlobalPolicyCache(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			pm := &PolicyManager{
-				nodes:          tt.oldNodes.ViewSlice(),
-				filterRulesMap: tt.initialCache,
+				nodes:              tt.oldNodes.ViewSlice(),
+				filterRulesMap:     xsync.NewMap[types.NodeID, []tailcfg.FilterRule](),
+				matchersForNodeMap: xsync.NewMap[types.NodeID, []matcher.Match](),
+			}
+			for id, rules := range tt.initialCache {
+				pm.filterRulesMap.Store(id, rules)
 			}
 
 			pm.invalidateGlobalPolicyCache(tt.newNodes.ViewSlice())
 
 			// Verify cache state
 			for nodeID, shouldExist := range tt.expectedCacheAfter {
-				_, exists := pm.filterRulesMap[nodeID]
+				_, exists := pm.filterRulesMap.Load(nodeID)
 				require.Equal(t, shouldExist, exists, "node %d cache existence mismatch", nodeID)
 			}
 		})
@@ -2469,4 +2475,76 @@ func TestPeerRelayGrantMakesRelayVisible(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTagOwnedByTags(t *testing.T) {
+	// tag:leaf is owned by tag:mid, which is owned by tag:root: a tag-to-tag
+	// delegation chain, the shape an operator token uses to mint narrower keys.
+	const policy = `{
+		"tagOwners": {
+			"tag:root": [],
+			"tag:mid":  ["tag:root"],
+			"tag:leaf": ["tag:mid"],
+			"tag:lone": []
+		},
+		"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]
+	}`
+
+	pm, err := NewPolicyManager([]byte(policy), nil, types.Nodes{}.ViewSlice())
+	require.NoError(t, err)
+
+	tests := []struct {
+		name      string
+		tag       string
+		ownerTags []string
+		want      bool
+	}{
+		{
+			name:      "directly held tag needs no policy",
+			tag:       "tag:lone",
+			ownerTags: []string{"tag:lone"},
+			want:      true,
+		},
+		{
+			name:      "one-hop owned-by",
+			tag:       "tag:mid",
+			ownerTags: []string{"tag:root"},
+			want:      true,
+		},
+		{
+			name:      "transitive chain root owns leaf",
+			tag:       "tag:leaf",
+			ownerTags: []string{"tag:root"},
+			want:      true,
+		},
+		{
+			name:      "owning one link does not grant a sibling",
+			tag:       "tag:lone",
+			ownerTags: []string{"tag:root"},
+			want:      false,
+		},
+		{
+			name:      "unowned tag denied",
+			tag:       "tag:leaf",
+			ownerTags: []string{"tag:unrelated"},
+			want:      false,
+		},
+		{
+			name:      "empty owners deny a delegated tag",
+			tag:       "tag:leaf",
+			ownerTags: nil,
+			want:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, pm.TagOwnedByTags(tt.tag, tt.ownerTags))
+		})
+	}
+
+	t.Run("nil policy manager denies", func(t *testing.T) {
+		var nilPM *PolicyManager
+		require.False(t, nilPM.TagOwnedByTags("tag:leaf", []string{"tag:root"}))
+	})
 }

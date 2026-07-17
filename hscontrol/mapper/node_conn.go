@@ -3,6 +3,7 @@ package mapper
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -142,9 +143,7 @@ func (mc *multiChannelNodeConn) stopConnection(conn *connectionEntry) {
 // Caller must hold mc.mutex.
 func (mc *multiChannelNodeConn) removeConnectionAtIndexLocked(i int, stopConnection bool) *connectionEntry {
 	conn := mc.connections[i]
-	copy(mc.connections[i:], mc.connections[i+1:])
-	mc.connections[len(mc.connections)-1] = nil // release pointer for GC
-	mc.connections = mc.connections[:len(mc.connections)-1]
+	mc.connections = slices.Delete(mc.connections, i, i+1)
 
 	if stopConnection {
 		mc.stopConnection(conn)
@@ -181,6 +180,16 @@ func (mc *multiChannelNodeConn) removeConnectionByChannel(c chan<- *tailcfg.MapR
 	}
 
 	return false
+}
+
+// detach removes the connection for the given channel and marks the node
+// disconnected if no active connections remain.
+func (mc *multiChannelNodeConn) detach(c chan<- *tailcfg.MapResponse) {
+	mc.removeConnectionByChannel(c)
+
+	if !mc.hasActiveConnections() {
+		mc.markDisconnected()
+	}
 }
 
 // hasActiveConnections checks if the node has any active connections.
@@ -300,6 +309,7 @@ func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
 			snapshot = append(snapshot, conn)
 		}
 	}
+
 	mc.mutex.RUnlock()
 
 	if len(snapshot) == 0 {
@@ -343,32 +353,22 @@ func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
 		// Remove by pointer identity: only remove entries that still exist
 		// in the current connections slice and match a failed pointer.
 		// New connections added since the snapshot are not affected.
-		failedSet := make(map[*connectionEntry]struct{}, len(failed))
-		for _, f := range failed {
-			failedSet[f] = struct{}{}
-		}
-
-		clean := mc.connections[:0]
-		for _, conn := range mc.connections {
-			if _, isFailed := failedSet[conn]; !isFailed {
-				clean = append(clean, conn)
-			} else {
-				mc.log.Debug().
-					Str(zf.ConnID, conn.id).
-					Msg("send: removing failed connection")
-				// Tear down the owning session so the old serveLongPoll
-				// goroutine exits instead of lingering as a stale session.
-				mc.stopConnection(conn)
+		// DeleteFunc preserves order and zeroes trailing slots so removed
+		// *connectionEntry values are not retained by the backing array.
+		mc.connections = slices.DeleteFunc(mc.connections, func(conn *connectionEntry) bool {
+			if !slices.Contains(failed, conn) {
+				return false
 			}
-		}
 
-		// Nil out trailing slots so removed *connectionEntry values
-		// are not retained by the backing array.
-		for i := len(clean); i < len(mc.connections); i++ {
-			mc.connections[i] = nil
-		}
+			mc.log.Debug().
+				Str(zf.ConnID, conn.id).
+				Msg("send: removing failed connection")
+			// Tear down the owning session so the old serveLongPoll
+			// goroutine exits instead of lingering as a stale session.
+			mc.stopConnection(conn)
 
-		mc.connections = clean
+			return true
+		})
 		mc.mutex.Unlock()
 	}
 

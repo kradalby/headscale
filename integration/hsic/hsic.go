@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,13 +19,14 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
-	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	clientv1 "github.com/juanfont/headscale/gen/client/v1"
+	clientv2 "github.com/juanfont/headscale/gen/client/v2"
 	"github.com/juanfont/headscale/hscontrol"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -36,6 +38,7 @@ import (
 	"gopkg.in/yaml.v3"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/rands"
 )
 
 const (
@@ -172,7 +175,7 @@ func WithHostPortBindings(bindings map[string][]string) Option {
 // in the Docker container name.
 func WithTestName(testName string) Option {
 	return func(hsic *HeadscaleInContainer) {
-		hash, _ := util.GenerateRandomStringDNSSafe(hsicHashLength)
+		hash := rands.HexString(hsicHashLength)
 
 		hostname := fmt.Sprintf("hs-%s-%s", testName, hash)
 		hsic.hostname = hostname
@@ -331,10 +334,7 @@ func New(
 	networks []*dockertest.Network,
 	opts ...Option,
 ) (*HeadscaleInContainer, error) {
-	hash, err := util.GenerateRandomStringDNSSafe(hsicHashLength)
-	if err != nil {
-		return nil, err
-	}
+	hash := rands.HexString(hsicHashLength)
 
 	// Include run ID in hostname for easier identification of which test run owns this container
 	runID := dockertestutil.GetIntegrationRunID()
@@ -490,7 +490,8 @@ func New(
 			for _, hostPort := range hostPorts {
 				runOptions.PortBindings[docker.Port(port)] = append(
 					runOptions.PortBindings[docker.Port(port)],
-					docker.PortBinding{HostPort: hostPort})
+					docker.PortBinding{HostPort: hostPort},
+				)
 			}
 		}
 	}
@@ -498,7 +499,7 @@ func New(
 	// dockertest isn't very good at handling containers that has already
 	// been created, this is an attempt to make sure this container isn't
 	// present.
-	err = pool.RemoveContainerByName(hsic.hostname)
+	err := pool.RemoveContainerByName(hsic.hostname)
 	if err != nil {
 		return nil, err
 	}
@@ -1024,6 +1025,90 @@ func (t *HeadscaleInContainer) GetEndpoint() string {
 	return t.getEndpoint(false)
 }
 
+var errOAuthSecretMissing = errors.New(`OAuth client response missing secret in "key" field`)
+
+// CreateOAuthClient mints an admin API key and uses it to create an OAuth client
+// via the v2 keys HTTP API (POST /api/v2/tailnet/-/keys, keyType=client),
+// returning the client id and secret. The secret is only returned once, in the
+// "key" field. It is a reusable building block for tests that need OAuth client
+// credentials (such as the Kubernetes operator).
+func (t *HeadscaleInContainer) CreateOAuthClient(
+	ctx context.Context,
+	scopes, tags []string,
+) (string, string, error) {
+	apiKey, err := t.Execute([]string{"headscale", "apikeys", "create", "--expiration", "24h"})
+	if err != nil {
+		return "", "", fmt.Errorf("creating admin api key: %w", err)
+	}
+
+	apiKey = strings.TrimSpace(apiKey)
+
+	client, err := clientv2.NewClientWithResponses(
+		t.GetEndpoint(),
+		clientv2.WithHTTPClient(t.httpClient()),
+		clientv2.WithRequestEditorFn(func(_ context.Context, req *http.Request) error {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+
+			return nil
+		}),
+	)
+	if err != nil {
+		return "", "", fmt.Errorf("building v2 API client: %w", err)
+	}
+
+	keyType := "client"
+
+	resp, err := client.CreateKeyWithResponse(ctx, "-", clientv2.CreateKeyRequest{
+		KeyType: &keyType,
+		Scopes:  &scopes,
+		Tags:    &tags,
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("creating OAuth client: %w", err)
+	}
+
+	if resp.JSON200 == nil {
+		return "", "", fmt.Errorf( //nolint:err113
+			"creating OAuth client: status %s: %s", resp.Status(), strings.TrimSpace(string(resp.Body)))
+	}
+
+	if resp.JSON200.Key == nil || *resp.JSON200.Key == "" {
+		return "", "", errOAuthSecretMissing
+	}
+
+	// The operator expects clientId and clientSecret as separate values. When the
+	// server returns a single opaque credential, the client-credentials grant
+	// splits it on "-" (id-secret), matching the Tailscale SaaS shape. Fall back
+	// to the whole key as the secret when no id is given.
+	clientID, clientSecret := resp.JSON200.Id, *resp.JSON200.Key
+
+	if clientID == "" {
+		if id, secret, ok := strings.Cut(*resp.JSON200.Key, "-"); ok {
+			clientID, clientSecret = id, secret
+		}
+	}
+
+	return clientID, clientSecret, nil
+}
+
+// httpClient returns an HTTP client that trusts this Headscale's TLS CA when TLS
+// is enabled, or a default client when it serves plain HTTP.
+func (t *HeadscaleInContainer) httpClient() *http.Client {
+	if !t.hasTLS() {
+		return &http.Client{Timeout: 30 * time.Second}
+	}
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(t.tlsCACert)
+
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+		},
+	}
+}
+
 // GetIPEndpoint returns the Headscale endpoint using IP address instead of hostname.
 func (t *HeadscaleInContainer) GetIPEndpoint() string {
 	return t.getEndpoint(true)
@@ -1096,7 +1181,7 @@ func (t *HeadscaleInContainer) WaitForRunning() error {
 // CreateUser adds a new user to the Headscale instance.
 func (t *HeadscaleInContainer) CreateUser(
 	user string,
-) (*v1.User, error) {
+) (*clientv1.User, error) {
 	command := []string{
 		binHeadscale,
 		"users",
@@ -1116,7 +1201,7 @@ func (t *HeadscaleInContainer) CreateUser(
 		return nil, err
 	}
 
-	var u v1.User
+	var u clientv1.User
 
 	err = json.Unmarshal([]byte(result), &u)
 	if err != nil {
@@ -1141,7 +1226,7 @@ type AuthKeyOptions struct {
 
 // CreateAuthKeyWithOptions creates a new "authorisation key" with the specified options.
 // This supports both user-owned and tags-only auth keys.
-func (t *HeadscaleInContainer) CreateAuthKeyWithOptions(opts AuthKeyOptions) (*v1.PreAuthKey, error) {
+func (t *HeadscaleInContainer) CreateAuthKeyWithOptions(opts AuthKeyOptions) (*clientv1.PreAuthKey, error) {
 	command := []string{
 		binHeadscale,
 	}
@@ -1151,7 +1236,8 @@ func (t *HeadscaleInContainer) CreateAuthKeyWithOptions(opts AuthKeyOptions) (*v
 		command = append(command, "--user", strconv.FormatUint(*opts.User, 10))
 	}
 
-	command = append(command,
+	command = append(
+		command,
 		"preauthkeys",
 		"create",
 		"--expiration",
@@ -1181,7 +1267,7 @@ func (t *HeadscaleInContainer) CreateAuthKeyWithOptions(opts AuthKeyOptions) (*v
 		return nil, fmt.Errorf("executing create auth key command: %w", err)
 	}
 
-	var preAuthKey v1.PreAuthKey
+	var preAuthKey clientv1.PreAuthKey
 
 	err = json.Unmarshal([]byte(result), &preAuthKey)
 	if err != nil {
@@ -1197,7 +1283,7 @@ func (t *HeadscaleInContainer) CreateAuthKey(
 	user uint64,
 	reusable bool,
 	ephemeral bool,
-) (*v1.PreAuthKey, error) {
+) (*clientv1.PreAuthKey, error) {
 	return t.CreateAuthKeyWithOptions(AuthKeyOptions{
 		User:      &user,
 		Reusable:  reusable,
@@ -1212,7 +1298,7 @@ func (t *HeadscaleInContainer) CreateAuthKeyWithTags(
 	reusable bool,
 	ephemeral bool,
 	tags []string,
-) (*v1.PreAuthKey, error) {
+) (*clientv1.PreAuthKey, error) {
 	return t.CreateAuthKeyWithOptions(AuthKeyOptions{
 		User:      &user,
 		Reusable:  reusable,
@@ -1252,8 +1338,8 @@ func (t *HeadscaleInContainer) DeleteAuthKey(
 // specific users.
 func (t *HeadscaleInContainer) ListNodes(
 	users ...string,
-) ([]*v1.Node, error) {
-	var ret []*v1.Node
+) ([]*clientv1.Node, error) {
+	var ret []*clientv1.Node
 
 	execUnmarshal := func(command []string) error {
 		result, _, err := dockertestutil.ExecuteCommand(
@@ -1265,7 +1351,7 @@ func (t *HeadscaleInContainer) ListNodes(
 			return fmt.Errorf("executing list node command: %w", err)
 		}
 
-		var nodes []*v1.Node
+		var nodes []*clientv1.Node
 
 		err = json.Unmarshal([]byte(result), &nodes)
 		if err != nil {
@@ -1293,8 +1379,11 @@ func (t *HeadscaleInContainer) ListNodes(
 		}
 	}
 
-	sort.Slice(ret, func(i, j int) bool {
-		return cmp.Compare(ret[i].GetId(), ret[j].GetId()) == -1
+	slices.SortFunc(ret, func(a, b *clientv1.Node) int {
+		ai, _ := strconv.ParseUint(a.Id, 10, 64)
+		bi, _ := strconv.ParseUint(b.Id, 10, 64)
+
+		return cmp.Compare(ai, bi)
 	})
 
 	return ret, nil
@@ -1324,40 +1413,38 @@ func (t *HeadscaleInContainer) DeleteNode(nodeID uint64) error {
 	return nil
 }
 
-func (t *HeadscaleInContainer) NodesByUser() (map[string][]*v1.Node, error) {
+func (t *HeadscaleInContainer) NodesByUser() (map[string][]*clientv1.Node, error) {
 	nodes, err := t.ListNodes()
 	if err != nil {
 		return nil, err
 	}
 
-	var userMap map[string][]*v1.Node
+	userMap := make(map[string][]*clientv1.Node)
+
 	for _, node := range nodes {
-		if _, ok := userMap[node.GetUser().GetName()]; !ok {
-			mak.Set(&userMap, node.GetUser().GetName(), []*v1.Node{node})
-		} else {
-			userMap[node.GetUser().GetName()] = append(userMap[node.GetUser().GetName()], node)
-		}
+		name := node.User.Name
+		userMap[name] = append(userMap[name], node)
 	}
 
 	return userMap, nil
 }
 
-func (t *HeadscaleInContainer) NodesByName() (map[string]*v1.Node, error) {
+func (t *HeadscaleInContainer) NodesByName() (map[string]*clientv1.Node, error) {
 	nodes, err := t.ListNodes()
 	if err != nil {
 		return nil, err
 	}
 
-	var nameMap map[string]*v1.Node
+	var nameMap map[string]*clientv1.Node
 	for _, node := range nodes {
-		mak.Set(&nameMap, node.GetName(), node)
+		mak.Set(&nameMap, node.Name, node)
 	}
 
 	return nameMap, nil
 }
 
 // ListUsers returns a list of users from Headscale.
-func (t *HeadscaleInContainer) ListUsers() ([]*v1.User, error) {
+func (t *HeadscaleInContainer) ListUsers() ([]*clientv1.User, error) {
 	command := []string{binHeadscale, "users", "list", flagOutput, "json"}
 
 	result, _, err := dockertestutil.ExecuteCommand(
@@ -1369,7 +1456,7 @@ func (t *HeadscaleInContainer) ListUsers() ([]*v1.User, error) {
 		return nil, fmt.Errorf("executing list node command: %w", err)
 	}
 
-	var users []*v1.User
+	var users []*clientv1.User
 
 	err = json.Unmarshal([]byte(result), &users)
 	if err != nil {
@@ -1381,15 +1468,15 @@ func (t *HeadscaleInContainer) ListUsers() ([]*v1.User, error) {
 
 // MapUsers returns a map of users from Headscale. It is keyed by the
 // user name.
-func (t *HeadscaleInContainer) MapUsers() (map[string]*v1.User, error) {
+func (t *HeadscaleInContainer) MapUsers() (map[string]*clientv1.User, error) {
 	users, err := t.ListUsers()
 	if err != nil {
 		return nil, err
 	}
 
-	var userMap map[string]*v1.User
+	var userMap map[string]*clientv1.User
 	for _, user := range users {
-		mak.Set(&userMap, user.GetName(), user)
+		mak.Set(&userMap, user.Name, user)
 	}
 
 	return userMap, nil
@@ -1548,7 +1635,7 @@ func (h *HeadscaleInContainer) Restart() error {
 }
 
 // ApproveRoutes approves routes for a node.
-func (t *HeadscaleInContainer) ApproveRoutes(id uint64, routes []netip.Prefix) (*v1.Node, error) {
+func (t *HeadscaleInContainer) ApproveRoutes(id uint64, routes []netip.Prefix) (*clientv1.Node, error) {
 	command := []string{
 		binHeadscale, "nodes", "approve-routes",
 		flagOutput, "json",
@@ -1570,7 +1657,7 @@ func (t *HeadscaleInContainer) ApproveRoutes(id uint64, routes []netip.Prefix) (
 		)
 	}
 
-	var node *v1.Node
+	var node *clientv1.Node
 
 	err = json.Unmarshal([]byte(result), &node)
 	if err != nil {
@@ -1636,102 +1723,48 @@ func (t *HeadscaleInContainer) SendInterrupt() error {
 }
 
 func (t *HeadscaleInContainer) GetAllMapReponses() (map[types.NodeID][]tailcfg.MapResponse, error) {
-	// Execute curl inside the container to access the debug endpoint locally
-	command := []string{
-		"curl", "-s", "-H", acceptJSON, "http://localhost:9090/debug/mapresponses",
-	}
-
-	result, err := t.Execute(command)
-	if err != nil {
-		return nil, fmt.Errorf("fetching mapresponses from debug endpoint: %w", err)
-	}
-
-	var res map[types.NodeID][]tailcfg.MapResponse
-	if err := json.Unmarshal([]byte(result), &res); err != nil { //nolint:noinlineerr
-		return nil, fmt.Errorf("decoding routes response: %w", err)
-	}
-
-	return res, nil
+	return debugJSON[map[types.NodeID][]tailcfg.MapResponse](t, "mapresponses")
 }
 
 // PrimaryRoutes fetches the primary routes from the debug endpoint.
 func (t *HeadscaleInContainer) PrimaryRoutes() (*types.DebugRoutes, error) {
-	// Execute curl inside the container to access the debug endpoint locally
-	command := []string{
-		"curl", "-s", "-H", acceptJSON, "http://localhost:9090/debug/routes",
-	}
-
-	result, err := t.Execute(command)
-	if err != nil {
-		return nil, fmt.Errorf("fetching routes from debug endpoint: %w", err)
-	}
-
-	var debugRoutes types.DebugRoutes
-	if err := json.Unmarshal([]byte(result), &debugRoutes); err != nil { //nolint:noinlineerr
-		return nil, fmt.Errorf("decoding routes response: %w", err)
-	}
-
-	return &debugRoutes, nil
+	return debugJSON[*types.DebugRoutes](t, "routes")
 }
 
 // DebugBatcher fetches the batcher debug information from the debug endpoint.
 func (t *HeadscaleInContainer) DebugBatcher() (*hscontrol.DebugBatcherInfo, error) {
-	// Execute curl inside the container to access the debug endpoint locally
-	command := []string{
-		"curl", "-s", "-H", acceptJSON, "http://localhost:9090/debug/batcher",
-	}
-
-	result, err := t.Execute(command)
-	if err != nil {
-		return nil, fmt.Errorf("fetching batcher debug info: %w", err)
-	}
-
-	var debugInfo hscontrol.DebugBatcherInfo
-	if err := json.Unmarshal([]byte(result), &debugInfo); err != nil { //nolint:noinlineerr
-		return nil, fmt.Errorf("decoding batcher debug response: %w", err)
-	}
-
-	return &debugInfo, nil
+	return debugJSON[*hscontrol.DebugBatcherInfo](t, "batcher")
 }
 
 // DebugNodeStore fetches the [state.NodeStore] data from the debug endpoint.
 func (t *HeadscaleInContainer) DebugNodeStore() (map[types.NodeID]types.Node, error) {
-	// Execute curl inside the container to access the debug endpoint locally
-	command := []string{
-		"curl", "-s", "-H", acceptJSON, "http://localhost:9090/debug/nodestore",
-	}
-
-	result, err := t.Execute(command)
-	if err != nil {
-		return nil, fmt.Errorf("fetching nodestore debug info: %w", err)
-	}
-
-	var nodeStore map[types.NodeID]types.Node
-	if err := json.Unmarshal([]byte(result), &nodeStore); err != nil { //nolint:noinlineerr
-		return nil, fmt.Errorf("decoding nodestore debug response: %w", err)
-	}
-
-	return nodeStore, nil
+	return debugJSON[map[types.NodeID]types.Node](t, "nodestore")
 }
 
 // DebugFilter fetches the current filter rules from the debug endpoint.
 func (t *HeadscaleInContainer) DebugFilter() ([]tailcfg.FilterRule, error) {
+	return debugJSON[[]tailcfg.FilterRule](t, "filter")
+}
+
+// debugJSON fetches and decodes a JSON-returning debug endpoint by name.
+func debugJSON[T any](t *HeadscaleInContainer, endpoint string) (T, error) {
+	var res T
+
 	// Execute curl inside the container to access the debug endpoint locally
 	command := []string{
-		"curl", "-s", "-H", acceptJSON, "http://localhost:9090/debug/filter",
+		"curl", "-s", "-H", acceptJSON, "http://localhost:9090/debug/" + endpoint,
 	}
 
 	result, err := t.Execute(command)
 	if err != nil {
-		return nil, fmt.Errorf("fetching filter from debug endpoint: %w", err)
+		return res, fmt.Errorf("fetching %s from debug endpoint: %w", endpoint, err)
 	}
 
-	var filterRules []tailcfg.FilterRule
-	if err := json.Unmarshal([]byte(result), &filterRules); err != nil { //nolint:noinlineerr
-		return nil, fmt.Errorf("decoding filter response: %w", err)
+	if err := json.Unmarshal([]byte(result), &res); err != nil { //nolint:noinlineerr
+		return res, fmt.Errorf("decoding %s response: %w", endpoint, err)
 	}
 
-	return filterRules, nil
+	return res, nil
 }
 
 // DebugPolicy fetches the current policy from the debug endpoint.

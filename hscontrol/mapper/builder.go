@@ -1,14 +1,16 @@
 package mapper
 
 import (
+	"cmp"
 	"net/netip"
 	"slices"
-	"sort"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/policy"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
+	"github.com/rs/zerolog/log"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/views"
 	"tailscale.com/util/multierr"
@@ -61,6 +63,16 @@ func (b *MapResponseBuilder) hasErrors() bool {
 	return len(b.errs) > 0
 }
 
+// node looks up the requesting node, recording ErrNodeNotFoundMapper on miss.
+func (b *MapResponseBuilder) node() (types.NodeView, bool) {
+	nv, ok := b.mapper.state.GetNodeByID(b.nodeID)
+	if !ok {
+		b.addError(ErrNodeNotFoundMapper)
+	}
+
+	return nv, ok
+}
+
 // WithCapabilityVersion sets the capability version for the response.
 func (b *MapResponseBuilder) WithCapabilityVersion(capVer tailcfg.CapabilityVersion) *MapResponseBuilder {
 	b.capVer = capVer
@@ -69,9 +81,8 @@ func (b *MapResponseBuilder) WithCapabilityVersion(capVer tailcfg.CapabilityVers
 
 // WithSelfNode adds the requesting node to the response.
 func (b *MapResponseBuilder) WithSelfNode() *MapResponseBuilder {
-	nv, ok := b.mapper.state.GetNodeByID(b.nodeID)
+	nv, ok := b.node()
 	if !ok {
-		b.addError(ErrNodeNotFoundMapper)
 		return b
 	}
 
@@ -136,15 +147,22 @@ func (b *MapResponseBuilder) WithDebugConfig() *MapResponseBuilder {
 
 // WithSSHPolicy adds SSH policy configuration for the requesting node.
 func (b *MapResponseBuilder) WithSSHPolicy() *MapResponseBuilder {
-	node, ok := b.mapper.state.GetNodeByID(b.nodeID)
+	node, ok := b.node()
 	if !ok {
-		b.addError(ErrNodeNotFoundMapper)
 		return b
 	}
 
 	sshPolicy, err := b.mapper.state.SSHPolicy(node)
 	if err != nil {
-		b.addError(err)
+		// SSH policy is optional for a node to function. Rather than fail the
+		// whole map (leaving the node unable to connect), log and continue
+		// without it; the node still receives a usable netmap.
+		log.Warn().Caller().
+			Err(err).
+			Uint64(zf.NodeID, node.ID().Uint64()).
+			Str(zf.NodeHostname, node.Hostname()).
+			Msg("building map response: skipping SSH policy for node; node will receive a map without SSH rules")
+
 		return b
 	}
 
@@ -155,9 +173,8 @@ func (b *MapResponseBuilder) WithSSHPolicy() *MapResponseBuilder {
 
 // WithDNSConfig adds DNS configuration for the requesting node.
 func (b *MapResponseBuilder) WithDNSConfig() *MapResponseBuilder {
-	node, ok := b.mapper.state.GetNodeByID(b.nodeID)
+	node, ok := b.node()
 	if !ok {
-		b.addError(ErrNodeNotFoundMapper)
 		return b
 	}
 
@@ -168,9 +185,8 @@ func (b *MapResponseBuilder) WithDNSConfig() *MapResponseBuilder {
 
 // WithUserProfiles adds user profiles for the requesting node and given peers.
 func (b *MapResponseBuilder) WithUserProfiles(peers views.Slice[types.NodeView]) *MapResponseBuilder {
-	node, ok := b.mapper.state.GetNodeByID(b.nodeID)
+	node, ok := b.node()
 	if !ok {
-		b.addError(ErrNodeNotFoundMapper)
 		return b
 	}
 
@@ -185,9 +201,8 @@ func (b *MapResponseBuilder) WithUserProfiles(peers views.Slice[types.NodeView])
 // For autogroup:self policies, it returns per-node compiled rules.
 // For global policies, it returns the global filter reduced for this node.
 func (b *MapResponseBuilder) WithPacketFilters() *MapResponseBuilder {
-	node, ok := b.mapper.state.GetNodeByID(b.nodeID)
+	node, ok := b.node()
 	if !ok {
-		b.addError(ErrNodeNotFoundMapper)
 		return b
 	}
 
@@ -279,7 +294,19 @@ func (b *MapResponseBuilder) buildTailPeers(peers views.Slice[types.NodeView]) (
 			return b.mapper.state.RoutesForPeer(node, peer, matchers)
 		}, b.mapper.cfg, allCapMaps[peer.ID()])
 		if err != nil {
-			return nil, err
+			// One peer with invalid data (e.g. an empty or over-long
+			// GivenName that fails GetFQDN) must not blank out the map for
+			// every node that can see it. Drop the offending peer, log it
+			// with the identity an operator needs to fix it, and keep
+			// building from the remaining valid peers.
+			log.Warn().Caller().
+				Err(err).
+				Uint64(zf.NodeID, peer.ID().Uint64()).
+				Str(zf.NodeHostname, peer.Hostname()).
+				Uint64("map.viewer.node.id", b.nodeID.Uint64()).
+				Msgf("dropping peer %d from map response: invalid node data; fix with `headscale nodes rename %d <name>`", peer.ID(), peer.ID())
+
+			continue
 		}
 
 		// [tailcfg.Node.CapMap] on a peer carries the small set of
@@ -296,8 +323,8 @@ func (b *MapResponseBuilder) buildTailPeers(peers views.Slice[types.NodeView]) (
 	}
 
 	// Peers is always returned sorted by Node.ID.
-	sort.SliceStable(tailPeers, func(x, y int) bool {
-		return tailPeers[x].ID < tailPeers[y].ID
+	slices.SortStableFunc(tailPeers, func(a, b *tailcfg.Node) int {
+		return cmp.Compare(a.ID, b.ID)
 	})
 
 	return tailPeers, nil

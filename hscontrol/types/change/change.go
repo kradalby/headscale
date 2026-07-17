@@ -213,13 +213,7 @@ func (r Change) ShouldSendToNode(nodeID types.NodeID) bool {
 
 // HasFull returns true if any response in the slice is a full update ([Change.IsFull]).
 func HasFull(rs []Change) bool {
-	for _, r := range rs {
-		if r.IsFull() {
-			return true
-		}
-	}
-
-	return false
+	return slices.ContainsFunc(rs, Change.IsFull)
 }
 
 // SplitTargetedAndBroadcast separates responses into targeted (to specific node) and broadcast.
@@ -454,22 +448,6 @@ func NodeAdded(id types.NodeID) Change {
 // NodeRemoved returns a [Change] for when a node is removed.
 func NodeRemoved(id types.NodeID) Change {
 	return PeersRemoved(id)
-}
-
-// NodeOnlineFor returns the [Change] for a node coming online: a lightweight
-// [NodeOnline] peer patch. Subnet routers, relay targets, and via targets get
-// their full peer recompute from the gated [PolicyChange] that State.Connect
-// emits, so no full update is needed here.
-func NodeOnlineFor(node types.NodeView) Change {
-	return NodeOnline(node.ID())
-}
-
-// NodeOfflineFor returns the [Change] for a node going offline: a lightweight
-// [NodeOffline] peer patch. As with [NodeOnlineFor], subnet routers and other
-// recompute-forcing nodes rely on the gated [PolicyChange] from State.Disconnect
-// for the peer recompute, so no full update is needed here.
-func NodeOfflineFor(node types.NodeView) Change {
-	return NodeOffline(node.ID())
 }
 
 // KeyExpiryFor returns a [Change] for when a node's key expiry changes.

@@ -8,7 +8,6 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"tailscale.com/tailcfg"
@@ -418,6 +417,33 @@ func TestNodeFQDN(t *testing.T) {
 	}
 }
 
+func TestValidateGivenName(t *testing.T) {
+	tests := []struct {
+		name       string
+		givenName  string
+		baseDomain string
+		wantErr    bool
+	}{
+		{"valid", "test", "example.com", false},
+		{"empty", "", "example.com", true},
+		{"invalid label chars", "not valid", "example.com", true},
+		{"label too long", strings.Repeat("a", 64), "example.com", true},
+		// A valid 63-char label whose FQDN overflows only because the base
+		// domain is long: ValidLabel passes, the FQDN-length bound rejects it.
+		{"fqdn too long under long base domain", strings.Repeat("a", 63), strings.Repeat("b", 200) + ".example.com", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateGivenName(tc.givenName, tc.baseDomain)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("ValidateGivenName(%q, %q) error = %v, wantErr %v",
+					tc.givenName, tc.baseDomain, err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestPeerChangeFromMapRequest(t *testing.T) {
 	nKeys := []key.NodePublic{
 		key.NewNode().Public(),
@@ -652,56 +678,6 @@ func TestApplyPeerChange(t *testing.T) {
 
 			if diff := cmp.Diff(tt.want, tt.nodeBefore, util.Comparers...); diff != "" {
 				t.Errorf("Patch unexpected result (-want +got):\n%s", diff)
-			}
-		})
-	}
-}
-
-func TestNodeRegisterMethodToV1Enum(t *testing.T) {
-	tests := []struct {
-		name string
-		node Node
-		want v1.RegisterMethod
-	}{
-		{
-			name: "authkey",
-			node: Node{
-				ID:             1,
-				RegisterMethod: util.RegisterMethodAuthKey,
-			},
-			want: v1.RegisterMethod_REGISTER_METHOD_AUTH_KEY,
-		},
-		{
-			name: "oidc",
-			node: Node{
-				ID:             1,
-				RegisterMethod: util.RegisterMethodOIDC,
-			},
-			want: v1.RegisterMethod_REGISTER_METHOD_OIDC,
-		},
-		{
-			name: "cli",
-			node: Node{
-				ID:             1,
-				RegisterMethod: util.RegisterMethodCLI,
-			},
-			want: v1.RegisterMethod_REGISTER_METHOD_CLI,
-		},
-		{
-			name: "unknown",
-			node: Node{
-				ID: 0,
-			},
-			want: v1.RegisterMethod_REGISTER_METHOD_UNSPECIFIED,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := tt.node.RegisterMethodToV1Enum()
-
-			if diff := cmp.Diff(tt.want, got); diff != "" {
-				t.Errorf("RegisterMethodToV1Enum() unexpected result (-want +got):\n%s", diff)
 			}
 		})
 	}
