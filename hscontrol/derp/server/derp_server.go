@@ -114,7 +114,7 @@ func (d *DERPServer) GenerateRegion() (tailcfg.DERPRegion, error) {
 		RegionName: d.cfg.ServerRegionName,
 		Nodes: []*tailcfg.DERPNode{
 			{
-				Name:     strconv.Itoa(d.cfg.ServerRegionID),
+				Name:     d.cfg.ServerRegionID.String(),
 				RegionID: d.cfg.ServerRegionID,
 				HostName: host,
 				DERPPort: port,

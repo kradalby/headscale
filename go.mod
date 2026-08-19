@@ -18,7 +18,7 @@ require (
 	github.com/go-chi/chi/v5 v5.3.0
 	github.com/go-chi/metrics v0.1.1
 	github.com/go-gormigrate/gormigrate/v2 v2.1.6
-	github.com/go-json-experiment/json v0.0.0-20260601182631-00ed12fed2a6
+	github.com/go-json-experiment/json v0.0.0-20260623181947-01eb4420fa68
 	github.com/google/go-cmp v0.7.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jagottsicher/termcolor v1.0.2
@@ -44,7 +44,7 @@ require (
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
 	golang.org/x/crypto v0.54.0
 	golang.org/x/exp v0.0.0-20260603202125-055de637280b
-	golang.org/x/net v0.56.0
+	golang.org/x/net v0.57.1-0.20260729233039-99c3b0a8f463
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sync v0.22.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -70,7 +70,7 @@ require (
 	// go get modernc.org/libc@v1.55.3 modernc.org/sqlite@v1.33.1
 	modernc.org/sqlite v1.52.0
 	pgregory.net/rapid v1.3.0
-	tailscale.com v1.103.0-pre
+	tailscale.com v1.103.0-pre.0.20260819232550-0e84b4a3a0a0
 	tailscale.com/client/tailscale/v2 v2.9.0
 	zombiezen.com/go/postgrestest v1.0.1
 )
@@ -207,7 +207,7 @@ require (
 	github.com/tailscale/peercred v0.0.0-20250107143737-35a0c7bd7edc // indirect
 	github.com/tailscale/setec v0.0.0-20260310221408-dcd97e42f251 // indirect
 	github.com/tailscale/web-client-prebuilt v0.0.0-20251127225136-f19339b67368 // indirect
-	github.com/tailscale/wireguard-go v0.0.0-20260715223240-2e01ba5b00f0 // indirect
+	github.com/tailscale/wireguard-go v0.0.0-20260813211458-aa425f19bcbf // indirect
 	github.com/toqueteos/webbrowser v1.2.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xeipuuv/gojsonpointer v0.0.0-20190905194746-02993c407bfb // indirect
@@ -245,7 +245,7 @@ require (
 	// go.mod file for the gvisor.dev/gvisor version:
 	// https://github.com/tailscale/tailscale/blob/main/go.mod
 	gvisor.dev/gvisor v0.0.0-20260224225140-573d5e7127a8 // indirect
-	k8s.io/client-go v0.34.0 // indirect
+	k8s.io/client-go v0.35.3 // indirect
 
 	// NOTE: keep in lockstep with modernc.org/sqlite; see the
 	// upgrade note in the direct require block above.
