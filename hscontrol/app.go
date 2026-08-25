@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	_ "net/http/pprof" // nolint
 	"os"
 	"os/signal"
 	"path/filepath"
