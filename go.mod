@@ -50,6 +50,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/gorm v1.31.1
+
 	// NOTE: modernc sqlite has a fragile dependency
 	// chain and it is important that they are updated
 	// in lockstep to ensure that they do not break
@@ -236,6 +237,7 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/grpc v1.81.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
+
 	// NOTE: gvisor must be updated in lockstep with
 	// tailscale.com. The version used here should match
 	// the version required by the tailscale.com dependency.
@@ -244,6 +246,7 @@ require (
 	// https://github.com/tailscale/tailscale/blob/main/go.mod
 	gvisor.dev/gvisor v0.0.0-20260224225140-573d5e7127a8 // indirect
 	k8s.io/client-go v0.34.0 // indirect
+
 	// NOTE: keep in lockstep with modernc.org/sqlite; see the
 	// upgrade note in the direct require block above.
 	modernc.org/libc v1.72.3 // indirect
