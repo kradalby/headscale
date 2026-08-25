@@ -15,7 +15,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go4.org/netipx"
-	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
 )
 
@@ -29,7 +28,7 @@ func aliasWithPorts(alias Alias, ports ...tailcfg.PortRange) AliasWithPorts {
 
 func TestParsing(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "testuser"},
+		{ID: 1, Name: "testuser"},
 	}
 	tests := []struct {
 		name    string
@@ -390,8 +389,8 @@ func TestParsing(t *testing.T) {
 
 func TestCompileSSHPolicy_UserMapping(t *testing.T) {
 	users := types.Users{
-		{Name: "user1", Model: gorm.Model{ID: 1}},
-		{Name: "user2", Model: gorm.Model{ID: 2}},
+		{Name: "user1", ID: 1},
+		{Name: "user2", ID: 2},
 	}
 
 	// Create test nodes - use tagged nodes as SSH destinations
@@ -638,10 +637,10 @@ func TestCompileSSHPolicy_UserMapping(t *testing.T) {
 
 func TestCompileSSHPolicy_LocalpartMapping(t *testing.T) {
 	users := types.Users{
-		{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}},
-		{Name: "bob", Email: "bob@example.com", Model: gorm.Model{ID: 2}},
-		{Name: "charlie", Email: "charlie@other.com", Model: gorm.Model{ID: 3}},
-		{Name: "dave", Model: gorm.Model{ID: 4}}, // CLI user, no email
+		{Name: "alice", Email: "alice@example.com", ID: 1},
+		{Name: "bob", Email: "bob@example.com", ID: 2},
+		{Name: "charlie", Email: "charlie@other.com", ID: 3},
+		{Name: "dave", ID: 4}, // CLI user, no email
 	}
 
 	nodeTaggedServer := types.Node{
@@ -836,10 +835,10 @@ func TestCompileSSHPolicy_LocalpartMapping(t *testing.T) {
 		{
 			name: "localpart with special chars in email",
 			users: types.Users{
-				{Name: "dave+sshuser", Email: "dave+sshuser@example.com", Model: gorm.Model{ID: 10}},
+				{Name: "dave+sshuser", Email: "dave+sshuser@example.com", ID: 10},
 			},
 			nodes: func() types.Nodes {
-				specialUser := types.User{Name: "dave+sshuser", Email: "dave+sshuser@example.com", Model: gorm.Model{ID: 10}}
+				specialUser := types.User{Name: "dave+sshuser", Email: "dave+sshuser@example.com", ID: 10}
 				n := types.Node{
 					Hostname: "special-device",
 					IPv4:     createAddr("100.64.0.10"),
@@ -880,10 +879,10 @@ func TestCompileSSHPolicy_LocalpartMapping(t *testing.T) {
 		{
 			name: "localpart excludes CLI users without email",
 			users: types.Users{
-				{Name: "dave", Model: gorm.Model{ID: 4}},
+				{Name: "dave", ID: 4},
 			},
 			nodes: func() types.Nodes {
-				cliUser := types.User{Name: "dave", Model: gorm.Model{ID: 4}}
+				cliUser := types.User{Name: "dave", ID: 4}
 				n := types.Node{
 					Hostname: "dave-cli-device",
 					IPv4:     createAddr("100.64.0.5"),
@@ -1005,8 +1004,8 @@ func TestCompileSSHPolicy_LocalpartMapping(t *testing.T) {
 
 func TestCompileSSHPolicy_CheckAction(t *testing.T) {
 	users := types.Users{
-		{Name: "user1", Model: gorm.Model{ID: 1}},
-		{Name: "user2", Model: gorm.Model{ID: 2}},
+		{Name: "user1", ID: 1},
+		{Name: "user2", ID: 2},
 	}
 
 	// Use tagged nodes for SSH user mapping tests
@@ -1077,8 +1076,8 @@ func TestCompileSSHPolicy_CheckAction(t *testing.T) {
 // the accept rule appears first in the policy definition.
 func TestCompileSSHPolicy_CheckBeforeAcceptOrdering(t *testing.T) {
 	users := types.Users{
-		{Name: "user1", Model: gorm.Model{ID: 1}},
-		{Name: "user2", Model: gorm.Model{ID: 2}},
+		{Name: "user1", ID: 1},
+		{Name: "user2", ID: 2},
 	}
 
 	nodeTaggedServer := types.Node{
@@ -1153,8 +1152,8 @@ func TestCompileSSHPolicy_CheckBeforeAcceptOrdering(t *testing.T) {
 func TestSSHIntegrationReproduction(t *testing.T) {
 	// Create users matching the integration test
 	users := types.Users{
-		{Name: "user1", Model: gorm.Model{ID: 1}},
-		{Name: "user2", Model: gorm.Model{ID: 2}},
+		{Name: "user1", ID: 1},
+		{Name: "user2", ID: 2},
 	}
 
 	// Create simple nodes for testing
@@ -1218,7 +1217,7 @@ func TestSSHIntegrationReproduction(t *testing.T) {
 // to JSON and that the sshUsers field is not empty.
 func TestSSHJSONSerialization(t *testing.T) {
 	users := types.Users{
-		{Name: "user1", Model: gorm.Model{ID: 1}},
+		{Name: "user1", ID: 1},
 	}
 
 	uid := uint(1)
@@ -1278,8 +1277,8 @@ func TestSSHJSONSerialization(t *testing.T) {
 
 func TestCompileFilterRulesForNodeWithAutogroupSelf(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -1439,8 +1438,8 @@ func TestCompileFilterRulesForNodeWithAutogroupSelf(t *testing.T) {
 // It also verifies that tag-to-tag rules work correctly.
 func TestTagUserMutualExclusivity(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -1541,8 +1540,8 @@ func TestTagUserMutualExclusivity(t *testing.T) {
 // are valid and should produce filter rules.
 func TestUserToTagCrossIdentityGrant(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -1626,8 +1625,8 @@ func TestAutogroupTagged(t *testing.T) {
 	t.Parallel()
 
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -1778,8 +1777,8 @@ func TestAutogroupSelfInSourceIsRejected(t *testing.T) {
 // are allowed (and only if they match the target user).
 func TestAutogroupSelfWithSpecificUserSource(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -1845,9 +1844,9 @@ func TestAutogroupSelfWithSpecificUserSource(t *testing.T) {
 // as the target are allowed.
 func TestAutogroupSelfWithGroupSource(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
-		{Model: gorm.Model{ID: 3}, Name: "user3"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
+		{ID: 3, Name: "user3"},
 	}
 
 	nodes := types.Nodes{
@@ -1914,8 +1913,8 @@ func createAddr(ip string) *netip.Addr {
 // with autogroup:self in destinations.
 func TestSSHWithAutogroupSelfInDestination(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -1996,8 +1995,8 @@ func TestSSHWithAutogroupSelfInDestination(t *testing.T) {
 // can SSH (and only if they match the target user).
 func TestSSHWithAutogroupSelfAndSpecificUser(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -2051,9 +2050,9 @@ func TestSSHWithAutogroupSelfAndSpecificUser(t *testing.T) {
 // TestSSHWithAutogroupSelfAndGroup verifies SSH with group sources and autogroup:self destinations.
 func TestSSHWithAutogroupSelfAndGroup(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
-		{Model: gorm.Model{ID: 3}, Name: "user3"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
+		{ID: 3, Name: "user3"},
 	}
 
 	nodes := types.Nodes{
@@ -2112,7 +2111,7 @@ func TestSSHWithAutogroupSelfAndGroup(t *testing.T) {
 // are excluded from both sources and destinations when autogroup:self is used.
 func TestSSHWithAutogroupSelfExcludesTaggedDevices(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
+		{ID: 1, Name: "user1"},
 	}
 
 	nodes := types.Nodes{
@@ -2173,8 +2172,8 @@ func TestSSHWithAutogroupSelfExcludesTaggedDevices(t *testing.T) {
 // autogroup:self filtering only applies to autogroup:self destinations, not others.
 func TestSSHWithAutogroupSelfAndMixedDestinations(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -2246,9 +2245,9 @@ func TestSSHWithAutogroupSelfAndMixedDestinations(t *testing.T) {
 // registered nodes.
 func TestAutogroupSelfWithNonExistentUserInGroup(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "superadmin"},
-		{Model: gorm.Model{ID: 2}, Name: "admin"},
-		{Model: gorm.Model{ID: 3}, Name: "direction"},
+		{ID: 1, Name: "superadmin"},
+		{ID: 2, Name: "admin"},
+		{ID: 3, Name: "direction"},
 	}
 
 	nodes := types.Nodes{
@@ -2600,7 +2599,7 @@ func TestMergeFilterRules(t *testing.T) {
 
 func TestCompileSSHPolicy_CheckPeriodVariants(t *testing.T) {
 	users := types.Users{
-		{Name: "user1", Model: gorm.Model{ID: 1}},
+		{Name: "user1", ID: 1},
 	}
 
 	node := types.Node{
@@ -2755,8 +2754,8 @@ func TestIPSetToPrincipals(t *testing.T) {
 
 func TestSSHCheckParams(t *testing.T) {
 	users := types.Users{
-		{Name: "user1", Model: gorm.Model{ID: 1}},
-		{Name: "user2", Model: gorm.Model{ID: 2}},
+		{Name: "user1", ID: 1},
+		{Name: "user2", ID: 2},
 	}
 
 	nodeUser1 := types.Node{
@@ -2944,14 +2943,14 @@ func TestResolveLocalparts(t *testing.T) {
 		{
 			name:    "no entries",
 			entries: nil,
-			users:   types.Users{{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}}},
+			users:   types.Users{{Name: "alice", Email: "alice@example.com", ID: 1}},
 			want:    nil,
 		},
 		{
 			name:    "single match",
 			entries: []SSHUser{"localpart:*@example.com"},
 			users: types.Users{
-				{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}},
+				{Name: "alice", Email: "alice@example.com", ID: 1},
 			},
 			want: map[uint]string{1: "alice"},
 		},
@@ -2959,7 +2958,7 @@ func TestResolveLocalparts(t *testing.T) {
 			name:    "domain mismatch",
 			entries: []SSHUser{"localpart:*@other.com"},
 			users: types.Users{
-				{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}},
+				{Name: "alice", Email: "alice@example.com", ID: 1},
 			},
 			want: map[uint]string{},
 		},
@@ -2967,7 +2966,7 @@ func TestResolveLocalparts(t *testing.T) {
 			name:    "case insensitive domain",
 			entries: []SSHUser{"localpart:*@EXAMPLE.COM"},
 			users: types.Users{
-				{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}},
+				{Name: "alice", Email: "alice@example.com", ID: 1},
 			},
 			want: map[uint]string{1: "alice"},
 		},
@@ -2975,7 +2974,7 @@ func TestResolveLocalparts(t *testing.T) {
 			name:    "user without email skipped",
 			entries: []SSHUser{"localpart:*@example.com"},
 			users: types.Users{
-				{Name: "cli-user", Model: gorm.Model{ID: 1}},
+				{Name: "cli-user", ID: 1},
 			},
 			want: map[uint]string{},
 		},
@@ -2986,9 +2985,9 @@ func TestResolveLocalparts(t *testing.T) {
 				"localpart:*@other.com",
 			},
 			users: types.Users{
-				{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}},
-				{Name: "bob", Email: "bob@other.com", Model: gorm.Model{ID: 2}},
-				{Name: "charlie", Email: "charlie@nope.com", Model: gorm.Model{ID: 3}},
+				{Name: "alice", Email: "alice@example.com", ID: 1},
+				{Name: "bob", Email: "bob@other.com", ID: 2},
+				{Name: "charlie", Email: "charlie@nope.com", ID: 3},
 			},
 			want: map[uint]string{1: "alice", 2: "bob"},
 		},
@@ -2996,7 +2995,7 @@ func TestResolveLocalparts(t *testing.T) {
 			name:    "special chars in local part",
 			entries: []SSHUser{"localpart:*@example.com"},
 			users: types.Users{
-				{Name: "d", Email: "dave+ssh@example.com", Model: gorm.Model{ID: 1}},
+				{Name: "d", Email: "dave+ssh@example.com", ID: 1},
 			},
 			want: map[uint]string{1: "dave+ssh"},
 		},
@@ -3015,11 +3014,11 @@ func TestResolveLocalparts(t *testing.T) {
 func TestGroupSourcesByUser(t *testing.T) {
 	alice := types.User{
 		Name: "alice", Email: "alice@example.com",
-		Model: gorm.Model{ID: 1},
+		ID: 1,
 	}
 	bob := types.User{
 		Name: "bob", Email: "bob@example.com",
-		Model: gorm.Model{ID: 2},
+		ID: 2,
 	}
 
 	nodeAlice := types.Node{
@@ -3481,7 +3480,7 @@ func TestFilterAllowAllFix(t *testing.T) {
 	t.Parallel()
 
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "testuser"},
+		{ID: 1, Name: "testuser"},
 	}
 	nodes := types.Nodes{
 		&types.Node{
@@ -3586,7 +3585,7 @@ func TestCompileViaGrant(t *testing.T) {
 	t.Parallel()
 
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "testuser"},
+		{ID: 1, Name: "testuser"},
 	}
 
 	allPorts := []ProtocolPort{
@@ -3882,8 +3881,8 @@ func TestCompileGrantWithAutogroupSelf_GrantPaths(t *testing.T) {
 	t.Parallel()
 
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	node1 := &types.Node{
@@ -4089,7 +4088,7 @@ func TestDestinationsToNetPortRange_AutogroupInternet(t *testing.T) {
 	t.Parallel()
 
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "testuser"},
+		{ID: 1, Name: "testuser"},
 	}
 	nodes := types.Nodes{
 		&types.Node{

@@ -27,7 +27,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/views"
 )
@@ -36,9 +35,9 @@ import (
 // tool's anonymizer rewrites the SaaS users into.
 func nodeAttrsCompatUsers() types.Users {
 	return types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "odin", Email: "odin@example.com"},
-		{Model: gorm.Model{ID: 2}, Name: "thor", Email: "thor@example.org"},
-		{Model: gorm.Model{ID: 3}, Name: "freya", Email: "freya@example.com"},
+		{ID: 1, Name: "odin", Email: "odin@example.com"},
+		{ID: 2, Name: "thor", Email: "thor@example.org"},
+		{ID: 3, Name: "freya", Email: "freya@example.com"},
 	}
 }
 

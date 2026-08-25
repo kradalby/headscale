@@ -10,7 +10,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
 )
 
@@ -19,8 +18,8 @@ import (
 // resolution is exercised across both.
 func nodeAttrsTestUsers() types.Users {
 	return types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "alice", Email: "alice@example.com"},
-		{Model: gorm.Model{ID: 2}, Name: "bob", Email: "bob@example.org"},
+		{ID: 1, Name: "alice", Email: "alice@example.com"},
+		{ID: 2, Name: "bob", Email: "bob@example.org"},
 	}
 }
 
