@@ -173,7 +173,7 @@
             # go tool pprof -http=: <source>
             graphviz
           ]
-          ++ lib.optionals pkgs.stdenv.isLinux [ traceroute ];
+          ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ traceroute ];
 
         # Add entry to build a docker image with headscale
         # caveat: only works on Linux
@@ -288,6 +288,6 @@
         }
         # The Go build/test checks are gated to Linux: parts of the tree are
         # Linux-specific and the pure unit subset is validated by CI.
-        // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux goChecks;
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux goChecks;
       });
 }
