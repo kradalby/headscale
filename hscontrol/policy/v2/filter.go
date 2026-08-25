@@ -13,6 +13,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"go4.org/netipx"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/views"
 )
 
@@ -24,8 +25,8 @@ var (
 // companionCap pairs a well-known Tailscale capability with its
 // companion capability.
 type companionCap struct {
-	original  tailcfg.PeerCapability
-	companion tailcfg.PeerCapability
+	original  peercap.Cap
+	companion peercap.Cap
 }
 
 // companionCaps lists certain well-known Tailscale capabilities and
@@ -35,8 +36,8 @@ type companionCap struct {
 // The slice is ordered by the original capability name so that
 // generated companion rules are emitted deterministically.
 var companionCaps = []companionCap{
-	{tailcfg.PeerCapabilityTaildrive, tailcfg.PeerCapabilityTaildriveSharer},
-	{tailcfg.PeerCapabilityRelay, tailcfg.PeerCapabilityRelayTarget},
+	{peercap.Taildrive, peercap.TaildriveSharer},
+	{peercap.Relay, peercap.RelayTarget},
 }
 
 // companionCapGrantRules returns additional [tailcfg.FilterRule]s for any

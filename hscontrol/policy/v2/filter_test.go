@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go4.org/netipx"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 )
 
 // aliasWithPorts creates an AliasWithPorts structure from an alias and ports.
@@ -3166,7 +3167,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 			dstIPStrings: []string{"100.64.0.1"},
 			srcPrefixes:  []netip.Prefix{mp("100.64.0.2/32")},
 			capMap: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityTaildrive: {tailcfg.RawMessage(`{}`)},
+				peercap.Taildrive: {tailcfg.RawMessage(`{}`)},
 			},
 			want: []tailcfg.FilterRule{
 				{
@@ -3175,7 +3176,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 						{
 							Dsts: []netip.Prefix{mp("100.64.0.2/32")},
 							CapMap: tailcfg.PeerCapMap{
-								tailcfg.PeerCapabilityTaildriveSharer: nil,
+								peercap.TaildriveSharer: nil,
 							},
 						},
 					},
@@ -3187,7 +3188,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 			dstIPStrings: []string{"100.64.0.10"},
 			srcPrefixes:  []netip.Prefix{mp("100.64.0.20/32")},
 			capMap: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityRelay: {tailcfg.RawMessage(`{}`)},
+				peercap.Relay: {tailcfg.RawMessage(`{}`)},
 			},
 			want: []tailcfg.FilterRule{
 				{
@@ -3196,7 +3197,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 						{
 							Dsts: []netip.Prefix{mp("100.64.0.20/32")},
 							CapMap: tailcfg.PeerCapMap{
-								tailcfg.PeerCapabilityRelayTarget: nil,
+								peercap.RelayTarget: nil,
 							},
 						},
 					},
@@ -3208,8 +3209,8 @@ func TestCompanionCapGrantRules(t *testing.T) {
 			dstIPStrings: []string{"100.64.0.1"},
 			srcPrefixes:  []netip.Prefix{mp("100.64.0.2/32")},
 			capMap: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityRelay:     {tailcfg.RawMessage(`{}`)},
-				tailcfg.PeerCapabilityTaildrive: {tailcfg.RawMessage(`{}`)},
+				peercap.Relay:     {tailcfg.RawMessage(`{}`)},
+				peercap.Taildrive: {tailcfg.RawMessage(`{}`)},
 			},
 			want: []tailcfg.FilterRule{
 				{
@@ -3219,7 +3220,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 						{
 							Dsts: []netip.Prefix{mp("100.64.0.2/32")},
 							CapMap: tailcfg.PeerCapMap{
-								tailcfg.PeerCapabilityTaildriveSharer: nil,
+								peercap.TaildriveSharer: nil,
 							},
 						},
 					},
@@ -3230,7 +3231,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 						{
 							Dsts: []netip.Prefix{mp("100.64.0.2/32")},
 							CapMap: tailcfg.PeerCapMap{
-								tailcfg.PeerCapabilityRelayTarget: nil,
+								peercap.RelayTarget: nil,
 							},
 						},
 					},
@@ -3251,7 +3252,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 			dstIPStrings: []string{"100.64.0.5"},
 			srcPrefixes:  []netip.Prefix{mp("100.64.0.6/32")},
 			capMap: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityTaildrive: {
+				peercap.Taildrive: {
 					tailcfg.RawMessage(`{"access":"rw"}`),
 				},
 			},
@@ -3262,7 +3263,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 						{
 							Dsts: []netip.Prefix{mp("100.64.0.6/32")},
 							CapMap: tailcfg.PeerCapMap{
-								tailcfg.PeerCapabilityTaildriveSharer: nil,
+								peercap.TaildriveSharer: nil,
 							},
 						},
 					},
@@ -3280,7 +3281,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 				mp("100.64.0.21/32"),
 			},
 			capMap: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityRelay: {tailcfg.RawMessage(`{}`)},
+				peercap.Relay: {tailcfg.RawMessage(`{}`)},
 			},
 			want: []tailcfg.FilterRule{
 				{
@@ -3292,7 +3293,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 								mp("100.64.0.21/32"),
 							},
 							CapMap: tailcfg.PeerCapMap{
-								tailcfg.PeerCapabilityRelayTarget: nil,
+								peercap.RelayTarget: nil,
 							},
 						},
 					},
@@ -3805,7 +3806,7 @@ func TestCompileViaGrant(t *testing.T) {
 				Sources:      Aliases{up("testuser@")},
 				Destinations: Aliases{pp("10.0.0.0/24")},
 				App: tailcfg.PeerCapMap{
-					tailcfg.PeerCapabilityRelay: {tailcfg.RawMessage(`{}`)},
+					peercap.Relay: {tailcfg.RawMessage(`{}`)},
 				},
 				Via: []Tag{"tag:relay"},
 			},

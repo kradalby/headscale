@@ -28,6 +28,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/views"
 )
 
@@ -321,7 +322,7 @@ func testNodeAttrsSuccess(
 // capMapFromView materialises a captured CapMap view into the
 // [tailcfg.NodeCapMap] shape headscale renders, so both sides of the
 // diff have the same concrete type.
-func capMapFromView(view views.MapSlice[tailcfg.NodeCapability, tailcfg.RawMessage]) tailcfg.NodeCapMap {
+func capMapFromView(view views.MapSlice[nodecap.Cap, tailcfg.RawMessage]) tailcfg.NodeCapMap {
 	if view.Len() == 0 {
 		return nil
 	}
