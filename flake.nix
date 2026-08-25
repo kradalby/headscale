@@ -82,6 +82,18 @@
           golines = prev.golines.override {
             buildGoModule = buildGo;
           };
+
+          # goimports and friends: they parse Go with the parser of the Go
+          # they were built with, so an older one rejects new syntax.
+          gotools = prev.gotools.override {
+            buildGoModule = buildGo;
+            # goimports is wrapped with this go on PATH for module lookups.
+            go = pkgs.go_latest;
+          };
+
+          golangci-lint-langserver = prev.golangci-lint-langserver.override {
+            buildGoModule = buildGo;
+          };
         };
     }
     // flake-utils.lib.eachDefaultSystem
@@ -106,6 +118,8 @@
             gotests
             gofumpt
             gopls
+            gotools
+
             ksh
             ko
             yq-go
