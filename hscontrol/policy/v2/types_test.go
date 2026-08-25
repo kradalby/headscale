@@ -16,7 +16,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"go4.org/netipx"
 	xmaps "golang.org/x/exp/maps"
-	"gorm.io/gorm"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 )
@@ -2359,12 +2358,12 @@ func p(pref string) Prefix        { return Prefix(mp(pref)) }
 
 func TestResolvePolicy(t *testing.T) {
 	users := map[string]types.User{
-		"testuser":   {Model: gorm.Model{ID: 1}, Name: "testuser"},
-		"groupuser":  {Model: gorm.Model{ID: 2}, Name: "groupuser"},
-		"groupuser1": {Model: gorm.Model{ID: 3}, Name: "groupuser1"},
-		"groupuser2": {Model: gorm.Model{ID: 4}, Name: "groupuser2"},
-		"notme":      {Model: gorm.Model{ID: 5}, Name: "notme"},
-		"testuser2":  {Model: gorm.Model{ID: 6}, Name: "testuser2"},
+		"testuser":   {ID: 1, Name: "testuser"},
+		"groupuser":  {ID: 2, Name: "groupuser"},
+		"groupuser1": {ID: 3, Name: "groupuser1"},
+		"groupuser2": {ID: 4, Name: "groupuser2"},
+		"notme":      {ID: 5, Name: "notme"},
+		"testuser2":  {ID: 6, Name: "testuser2"},
 	}
 
 	tests := []struct {
