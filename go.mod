@@ -51,34 +51,28 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/gorm v1.31.1
+	// NOTE: modernc sqlite has a fragile dependency
+	// chain and it is important that they are updated
+	// in lockstep to ensure that they do not break
+	// some architectures and similar at runtime:
+	// https://github.com/juanfont/headscale/issues/2188
+	//
+	// Fragile libc dependency:
+	// https://pkg.go.dev/modernc.org/sqlite#hdr-Fragile_modernc_org_libc_dependency
+	// https://gitlab.com/cznic/sqlite/-/issues/177
+	//
+	// To upgrade, determine the new SQLite version to
+	// be used, and consult the `go.mod` file:
+	// https://gitlab.com/cznic/sqlite/-/blob/master/go.mod
+	// to find
+	// the appropriate `libc` version, then upgrade them
+	// together, e.g:
+	// go get modernc.org/libc@v1.55.3 modernc.org/sqlite@v1.33.1
+	modernc.org/sqlite v1.52.0
 	pgregory.net/rapid v1.3.0
 	tailscale.com v1.103.0-pre
 	tailscale.com/client/tailscale/v2 v2.9.0
 	zombiezen.com/go/postgrestest v1.0.1
-)
-
-// NOTE: modernc sqlite has a fragile dependency
-// chain and it is important that they are updated
-// in lockstep to ensure that they do not break
-// some architectures and similar at runtime:
-// https://github.com/juanfont/headscale/issues/2188
-//
-// Fragile libc dependency:
-// https://pkg.go.dev/modernc.org/sqlite#hdr-Fragile_modernc_org_libc_dependency
-// https://gitlab.com/cznic/sqlite/-/issues/177
-//
-// To upgrade, determine the new SQLite version to
-// be used, and consult the `go.mod` file:
-// https://gitlab.com/cznic/sqlite/-/blob/master/go.mod
-// to find
-// the appropriate `libc` version, then upgrade them
-// together, e.g:
-// go get modernc.org/libc@v1.55.3 modernc.org/sqlite@v1.33.1
-require (
-	modernc.org/libc v1.72.3 // indirect
-	modernc.org/mathutil v1.7.1 // indirect
-	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.52.0
 )
 
 require (
@@ -251,6 +245,11 @@ require (
 	// https://github.com/tailscale/tailscale/blob/main/go.mod
 	gvisor.dev/gvisor v0.0.0-20260224225140-573d5e7127a8 // indirect
 	k8s.io/client-go v0.34.0 // indirect
+	// NOTE: keep in lockstep with modernc.org/sqlite; see the
+	// upgrade note in the direct require block above.
+	modernc.org/libc v1.72.3 // indirect
+	modernc.org/mathutil v1.7.1 // indirect
+	modernc.org/memory v1.11.0 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 	software.sslmate.com/src/go-pkcs12 v0.4.0 // indirect
 )
