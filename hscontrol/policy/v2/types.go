@@ -3076,13 +3076,10 @@ func (u SSHUser) ParseLocalpart() (string, error) {
 	pattern := strings.TrimPrefix(string(u), SSHUserLocalpartPrefix)
 
 	// Must be *@<domain>
-	atIdx := strings.LastIndex(pattern, "@")
-	if atIdx < 0 {
+	localPart, domain, found := strings.CutLast(pattern, "@")
+	if !found {
 		return "", fmt.Errorf("%w: missing @ in %q", ErrInvalidLocalpart, u)
 	}
-
-	localPart := pattern[:atIdx]
-	domain := pattern[atIdx+1:]
 
 	if localPart != "*" {
 		return "", fmt.Errorf("%w: local part must be *, got %q in %q", ErrInvalidLocalpart, localPart, u)

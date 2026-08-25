@@ -511,16 +511,16 @@ func resolveLocalparts(
 				continue
 			}
 
-			atIdx := strings.LastIndex(user.Email, "@")
-			if atIdx < 0 {
+			localpart, emailDomain, found := strings.CutLast(user.Email, "@")
+			if !found {
 				continue
 			}
 
-			if !strings.EqualFold(user.Email[atIdx+1:], domain) {
+			if !strings.EqualFold(emailDomain, domain) {
 				continue
 			}
 
-			result[user.ID] = user.Email[:atIdx]
+			result[user.ID] = localpart
 		}
 	}
 
