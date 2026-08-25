@@ -2850,7 +2850,7 @@ func (p SSHCheckPeriod) MarshalJSON() ([]byte, error) {
 
 // Validate rejects negative durations and anything above the inclusive
 // 168h max.
-func (p *SSHCheckPeriod) Validate() error {
+func (p SSHCheckPeriod) Validate() error {
 	if p.Always {
 		return nil
 	}
