@@ -2870,12 +2870,19 @@ func (s *State) updatePolicyManagerUsers() (change.Change, error) {
 
 	log.Debug().Caller().Int("user.count", len(users)).Msg("policy manager user update initiated because user list modification detected")
 
-	changed, err := s.polMan.SetUsers(users)
+	changed, peerMapChanged, err := s.polMan.SetUsers(users)
 	if err != nil {
 		return change.Change{}, fmt.Errorf("updating policy manager users: %w", err)
 	}
 
 	log.Debug().Caller().Bool("policy.changed", changed).Msg("policy manager user update completed because SetUsers operation finished")
+
+	if peerMapChanged {
+		// User-driven matcher state changed: rebuild candidate adjacency
+		// so peer visibility reflects the new policy. Without this, the
+		// cached peersByNode stays stale until the next node write.
+		s.nodeStore.RebuildPeerMaps()
+	}
 
 	if changed {
 		return change.PolicyChange(), nil

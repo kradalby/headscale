@@ -803,15 +803,18 @@ func (pm *PolicyManager) MatchersForNode(node types.NodeView) ([]matcher.Match, 
 	return matchers, nil
 }
 
-// SetUsers updates the users in the policy manager and updates the filter rules.
-func (pm *PolicyManager) SetUsers(users []types.User) (bool, error) {
+// SetUsers updates the users in the policy manager and updates the filter
+// rules. The first result reports whether clients need a policy refresh; the
+// second reports whether user-derived peer adjacency may have changed.
+func (pm *PolicyManager) SetUsers(users []types.User) (bool, bool, error) {
 	if pm == nil {
-		return false, nil
+		return false, false, nil
 	}
 
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
+	usersChanged := !equalUsers(pm.users, users)
 	pm.users = users
 
 	// Clear SSH policy map when users change to force SSH policy recomputation
@@ -821,16 +824,29 @@ func (pm *PolicyManager) SetUsers(users []types.User) (bool, error) {
 
 	changed, err := pm.updateLocked()
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 
 	// If SSH policies exist, force a policy change when users are updated
 	// This ensures nodes get updated SSH policies even if other policy hashes didn't change
 	if pm.pol != nil && len(pm.pol.SSHs) > 0 {
-		return true, nil
+		return true, usersChanged, nil
 	}
 
-	return changed, nil
+	return changed, usersChanged, nil
+}
+
+func equalUsers(a, b []types.User) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	a = slices.Clone(a)
+	b = slices.Clone(b)
+	slices.SortFunc(a, func(a, b types.User) int { return cmp.Compare(a.ID, b.ID) })
+	slices.SortFunc(b, func(a, b types.User) int { return cmp.Compare(a.ID, b.ID) })
+
+	return slices.Equal(a, b)
 }
 
 // SetNodes updates the nodes in the policy manager and updates the filter rules.

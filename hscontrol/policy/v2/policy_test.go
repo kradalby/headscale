@@ -355,6 +355,35 @@ func TestSSHCheckParamsUnhydratedUserNoPanic(t *testing.T) {
 	}, "SSHCheckParams must not panic when a non-tagged node has an unhydrated User")
 }
 
+func TestSetUsersSeparatesSSHRefreshFromPeerMapChange(t *testing.T) {
+	users := types.Users{{ID: 1, Name: "user1", Email: "user1@headscale.net"}}
+	policy := `{
+		"ssh": [
+			{
+				"action": "check",
+				"src": ["user1@headscale.net"],
+				"dst": ["autogroup:self"],
+				"users": ["root"]
+			}
+		]
+	}`
+
+	pm, err := NewPolicyManager([]byte(policy), users, types.Nodes{}.ViewSlice())
+	require.NoError(t, err)
+
+	changed, peerMapChanged, err := pm.SetUsers(slices.Clone(users))
+	require.NoError(t, err)
+	require.True(t, changed, "SSH policies still require a client policy refresh")
+	require.False(t, peerMapChanged, "an identical user list cannot change peer adjacency")
+
+	updatedUsers := slices.Clone(users)
+	updatedUsers[0].Name = "renamed"
+	changed, peerMapChanged, err = pm.SetUsers(updatedUsers)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.True(t, peerMapChanged, "a user change must conservatively rebuild peer adjacency")
+}
+
 // TestInvalidateGlobalPolicyCache tests the cache invalidation logic for global policies.
 func TestInvalidateGlobalPolicyCache(t *testing.T) {
 	mustIPPtr := func(s string) *netip.Addr {

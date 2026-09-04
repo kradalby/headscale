@@ -25,7 +25,9 @@ type PolicyManager interface {
 	// from the current policy, avoiding trust of client-provided URL params.
 	SSHCheckParams(srcNodeID, dstNodeID types.NodeID) (time.Duration, bool)
 	SetPolicy(pol []byte) (bool, error)
-	SetUsers(users []types.User) (bool, error)
+	// SetUsers returns whether clients need a policy refresh and whether
+	// user-derived peer adjacency may have changed, respectively.
+	SetUsers(users []types.User) (bool, bool, error)
 	SetNodes(nodes views.Slice[types.NodeView]) (bool, error)
 	// NodeCanHaveTag reports whether the given node can have the given tag.
 	NodeCanHaveTag(node types.NodeView, tag string) bool
