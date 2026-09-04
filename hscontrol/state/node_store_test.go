@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -78,9 +79,9 @@ func TestSnapshotFromNodes(t *testing.T) {
 
 				// Each node sees the other as peer (but not itself)
 				assert.Len(t, snapshot.peersByNode[1], 1)
-				assert.Equal(t, types.NodeID(2), snapshot.peersByNode[1][0].ID())
+				assert.Equal(t, types.NodeID(2), snapshot.peersByNode[1][0])
 				assert.Len(t, snapshot.peersByNode[2], 1)
-				assert.Equal(t, types.NodeID(1), snapshot.peersByNode[2][0].ID())
+				assert.Equal(t, types.NodeID(1), snapshot.peersByNode[2][0])
 				assert.Len(t, snapshot.nodesByUser[1], 2)
 			},
 		},
@@ -132,17 +133,17 @@ func TestSnapshotFromNodes(t *testing.T) {
 
 				// Odd nodes should only see other odd nodes as peers
 				require.Len(t, snapshot.peersByNode[1], 1)
-				assert.Equal(t, types.NodeID(3), snapshot.peersByNode[1][0].ID())
+				assert.Equal(t, types.NodeID(3), snapshot.peersByNode[1][0])
 
 				require.Len(t, snapshot.peersByNode[3], 1)
-				assert.Equal(t, types.NodeID(1), snapshot.peersByNode[3][0].ID())
+				assert.Equal(t, types.NodeID(1), snapshot.peersByNode[3][0])
 
 				// Even nodes should only see other even nodes as peers
 				require.Len(t, snapshot.peersByNode[2], 1)
-				assert.Equal(t, types.NodeID(4), snapshot.peersByNode[2][0].ID())
+				assert.Equal(t, types.NodeID(4), snapshot.peersByNode[2][0])
 
 				require.Len(t, snapshot.peersByNode[4], 1)
-				assert.Equal(t, types.NodeID(2), snapshot.peersByNode[4][0].ID())
+				assert.Equal(t, types.NodeID(2), snapshot.peersByNode[4][0])
 			},
 		},
 	}
@@ -312,9 +313,9 @@ func TestNodeStoreOperations(t *testing.T) {
 
 						// Now both nodes should see each other as peers
 						assert.Len(t, snapshot.peersByNode[1], 1)
-						assert.Equal(t, types.NodeID(2), snapshot.peersByNode[1][0].ID())
+						assert.Equal(t, types.NodeID(2), snapshot.peersByNode[1][0])
 						assert.Len(t, snapshot.peersByNode[2], 1)
-						assert.Equal(t, types.NodeID(1), snapshot.peersByNode[2][0].ID())
+						assert.Equal(t, types.NodeID(1), snapshot.peersByNode[2][0])
 						assert.Len(t, snapshot.nodesByUser[1], 2)
 					},
 				},
@@ -381,9 +382,9 @@ func TestNodeStoreOperations(t *testing.T) {
 
 						// Remaining nodes should see each other as peers
 						assert.Len(t, snapshot.peersByNode[1], 1)
-						assert.Equal(t, types.NodeID(3), snapshot.peersByNode[1][0].ID())
+						assert.Equal(t, types.NodeID(3), snapshot.peersByNode[1][0])
 						assert.Len(t, snapshot.peersByNode[3], 1)
-						assert.Equal(t, types.NodeID(1), snapshot.peersByNode[3][0].ID())
+						assert.Equal(t, types.NodeID(1), snapshot.peersByNode[3][0])
 
 						// User groupings updated
 						assert.Len(t, snapshot.nodesByUser[1], 1) // user1 now has only node 1
@@ -474,16 +475,16 @@ func TestNodeStoreOperations(t *testing.T) {
 
 						// Verify odd-even peer relationships
 						require.Len(t, snapshot.peersByNode[1], 1)
-						assert.Equal(t, types.NodeID(3), snapshot.peersByNode[1][0].ID())
+						assert.Equal(t, types.NodeID(3), snapshot.peersByNode[1][0])
 
 						require.Len(t, snapshot.peersByNode[2], 1)
-						assert.Equal(t, types.NodeID(4), snapshot.peersByNode[2][0].ID())
+						assert.Equal(t, types.NodeID(4), snapshot.peersByNode[2][0])
 
 						require.Len(t, snapshot.peersByNode[3], 1)
-						assert.Equal(t, types.NodeID(1), snapshot.peersByNode[3][0].ID())
+						assert.Equal(t, types.NodeID(1), snapshot.peersByNode[3][0])
 
 						require.Len(t, snapshot.peersByNode[4], 1)
-						assert.Equal(t, types.NodeID(2), snapshot.peersByNode[4][0].ID())
+						assert.Equal(t, types.NodeID(2), snapshot.peersByNode[4][0])
 					},
 				},
 				{
@@ -499,9 +500,9 @@ func TestNodeStoreOperations(t *testing.T) {
 
 						// Even nodes should still see each other
 						require.Len(t, snapshot.peersByNode[2], 1)
-						assert.Equal(t, types.NodeID(4), snapshot.peersByNode[2][0].ID())
+						assert.Equal(t, types.NodeID(4), snapshot.peersByNode[2][0])
 						require.Len(t, snapshot.peersByNode[4], 1)
-						assert.Equal(t, types.NodeID(2), snapshot.peersByNode[4][0].ID())
+						assert.Equal(t, types.NodeID(2), snapshot.peersByNode[4][0])
 					},
 				},
 			},
@@ -1264,8 +1265,8 @@ func TestRebuildPeerMapsWithChangedPeersFunc(t *testing.T) {
 	snapshot := store.data.Load()
 	require.Len(t, snapshot.peersByNode[1], 1, "node1 should have 1 peer initially")
 	require.Len(t, snapshot.peersByNode[2], 1, "node2 should have 1 peer initially")
-	require.Equal(t, types.NodeID(2), snapshot.peersByNode[1][0].ID())
-	require.Equal(t, types.NodeID(1), snapshot.peersByNode[2][0].ID())
+	require.Equal(t, types.NodeID(2), snapshot.peersByNode[1][0])
+	require.Equal(t, types.NodeID(1), snapshot.peersByNode[2][0])
 
 	// Now "change the policy" by disabling peers
 	allowPeers = false
@@ -1359,5 +1360,109 @@ func TestGetNodesByMachineKeyAllUsers(t *testing.T) {
 		require.Equal(t, types.NodeID(1), all[types.UserID(1)].ID())
 		require.True(t, all[types.UserID(0)].IsTagged())
 		require.Equal(t, types.NodeID(3), all[types.UserID(0)].ID())
+	})
+}
+
+// TestPeerIrrelevantWriteReusesPeerMap ensures writes that cannot alter peer
+// visibility neither run peersFunc nor copy the immutable adjacency map.
+//
+// peersByNode is derived from addresses, ownership, routes, tags, and exit-node
+// status. LastSeen and node keys are payload/index data, so neither can change
+// adjacency.
+//
+// See https://github.com/juanfont/headscale/issues/3417.
+func TestPeerIrrelevantWriteReusesPeerMap(t *testing.T) {
+	var peersCalls atomic.Int64
+
+	countingPeersFunc := func(nodes []types.NodeView) map[types.NodeID][]types.NodeView {
+		peersCalls.Add(1)
+
+		return allowAllPeersFunc(nodes)
+	}
+
+	node1 := createTestNode(1, 1, "user1", "node1")
+	node2 := createTestNode(2, 2, "user2", "node2")
+
+	store := NewNodeStore(types.Nodes{&node1, &node2}, countingPeersFunc, TestBatchSize, TestBatchTimeout)
+	store.Start()
+
+	defer store.Stop()
+
+	// Ignore the initial snapshot build.
+	peersCalls.Store(0)
+
+	before := store.data.Load()
+	require.NotEmpty(t, before.peersByNode[1])
+	beforePeerID := &before.peersByNode[1][0]
+
+	now := time.Now()
+	_, ok := store.UpdateNode(1, func(n *types.Node) {
+		n.LastSeen = &now
+	})
+	require.True(t, ok, "update should apply")
+
+	afterLastSeen := store.data.Load()
+	require.Same(t, beforePeerID, &afterLastSeen.peersByNode[1][0],
+		"payload-only writes must reuse peer adjacency without copying")
+
+	newNodeKey := key.NewNode().Public()
+	_, ok = store.UpdateNode(1, func(n *types.Node) {
+		n.NodeKey = newNodeKey
+	})
+	require.True(t, ok, "key rotation should apply")
+
+	afterKeyRotation := store.data.Load()
+	require.Same(t, beforePeerID, &afterKeyRotation.peersByNode[1][0],
+		"key rotation must reuse peer adjacency without copying")
+
+	indexed, ok := store.GetNodeByNodeKey(newNodeKey)
+	require.True(t, ok, "rotated key must be present in the rebuilt key index")
+	require.Equal(t, types.NodeID(1), indexed.ID())
+
+	require.Equalf(t, int64(0), peersCalls.Load(),
+		"payload/index-only writes must not recompute the peer map, got %d recomputations",
+		peersCalls.Load())
+
+	_, ok = store.UpdateNode(1, func(n *types.Node) {
+		n.User = nil
+	})
+	require.True(t, ok, "user association update should apply")
+	require.Equal(t, int64(1), peersCalls.Load(),
+		"a BuildPeerMap input must recompute peer adjacency")
+}
+
+func BenchmarkSnapshotPayloadDense(b *testing.B) {
+	const nodeCount = 500
+
+	nodes := make(map[types.NodeID]types.Node, nodeCount)
+	for i := 1; i <= nodeCount; i++ {
+		id := types.NodeID(i)                                   //nolint:gosec // bounded benchmark node count
+		nodes[id] = createTestNode(id, uint(i), "user", "node") //nolint:gosec // bounded benchmark node count
+	}
+
+	initial := snapshotFromNodes(nodes, allowAllPeersFunc, nil)
+	n := nodes[1]
+	n.LastSeen = new(time.Now())
+	nodes[1] = n
+
+	b.Run("reuse-peer-adjacency", func(b *testing.B) {
+		previous := initial
+
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for b.Loop() {
+			next := snapshotFromNodesReusingPeers(nodes, allowAllPeersFunc, &previous, false)
+			previous = next
+		}
+	})
+
+	b.Run("rebuild-peer-adjacency", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for b.Loop() {
+			snapshotFromNodes(nodes, allowAllPeersFunc, nil)
+		}
 	})
 }

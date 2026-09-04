@@ -89,6 +89,21 @@ var (
 		Name:      "nodestore_queue_depth",
 		Help:      "Current depth of NodeStore write queue",
 	})
+
+	// Patch metrics for https://github.com/juanfont/headscale/issues/3417.
+	// Bounded labels only — no node IDs or free-form reasons.
+	nodeStorePeerRelationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: prometheusNamespace,
+		Name:      "nodestore_peer_relations_total",
+		Help:      "Peer-relation builds by mode: recomputed (full peersFunc run) or reused (previous adjacency with fresh views).",
+	}, []string{"mode"})
+
+	// HA health write outcomes. See [State.BatchSetNodeHealth].
+	haHealthUpdatesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: prometheusNamespace,
+		Name:      "ha_health_updates_total",
+		Help:      "HA health write attempts by result: unchanged (already at target), changed (applied).",
+	}, []string{"result"})
 )
 
 // NodeStore is a thread-safe store for nodes.
@@ -148,13 +163,18 @@ func NewNodeStore(allNodes types.Nodes, peersFunc PeersFunc, batchSize int, batc
 type Snapshot struct {
 	// nodesByID is the main source of truth for nodes.
 	nodesByID map[types.NodeID]types.Node
+	// nodeViewsByID resolves peer adjacency IDs to immutable views from this
+	// snapshot without rebuilding every peer slice on each write.
+	nodeViewsByID map[types.NodeID]types.NodeView
 
 	// calculated from nodesByID
 	nodesByNodeKey    map[key.NodePublic]types.NodeView
 	nodesByMachineKey map[key.MachinePublic]map[types.UserID]types.NodeView
-	peersByNode       map[types.NodeID][]types.NodeView
-	nodesByUser       map[types.UserID][]types.NodeView
-	allNodes          []types.NodeView
+	// peersByNode stores immutable adjacency as IDs; ListPeers resolves the
+	// corresponding views through nodeViewsByID.
+	peersByNode map[types.NodeID][]types.NodeID
+	nodesByUser map[types.UserID][]types.NodeView
+	allNodes    []types.NodeView
 
 	// routes maps each prefix to its current primary advertiser. The
 	// previous assignment is carried over when still valid so the
@@ -186,6 +206,219 @@ type work struct {
 	// prober applying multiple probe results at once) cannot have a
 	// partial snapshot published between the updates.
 	multiUpdates map[types.NodeID]UpdateNodeFunc
+}
+
+// peerRelevantFields captures the subset of [types.Node] fields that feed
+// peer-relation computation (the policy peersFunc) and route election. An
+// update that leaves every one of these untouched cannot change either
+// output, so the batch can reuse the previous peer-relation map and
+// re-elect routes only if online/health state moved.
+//
+// This is an explicit allowlist: fields omitted here are treated as payload or
+// index data and reuse the existing adjacency. Every new input consumed by
+// [PeersFunc] or route election must be added here and covered by a classifier
+// regression test.
+//
+// See https://github.com/juanfont/headscale/issues/3417.
+type peerRelevantFields struct {
+	ID                 types.NodeID
+	IPv4               *netip.Addr
+	IPv6               *netip.Addr
+	UserID             *uint
+	UserAssociationID  types.UserID
+	HasUserAssociation bool
+	Tags               types.Strings
+	ApprovedRoutes     types.Prefixes
+	RoutableIPs        []netip.Prefix
+	IsExitNode         bool
+	Expiry             *time.Time
+	IsOnline           *bool
+	Unhealthy          bool
+}
+
+// capturePeerRelevant snapshots the fields that drive peer visibility and
+// route election. Returns a value suitable for comparison by
+// [peerRelevantFields.relationRelevant] and
+// [peerRelevantFields.electionRelevant].
+func capturePeerRelevant(n *types.Node) peerRelevantFields {
+	var (
+		routable []netip.Prefix
+		isExit   bool
+	)
+
+	if n.Hostinfo != nil {
+		routable = slices.Clone(n.Hostinfo.RoutableIPs)
+		slices.SortFunc(routable, netip.Prefix.Compare)
+
+		isExit = slices.ContainsFunc(routable, tsaddr.IsExitRoute)
+	}
+
+	var uid *uint
+
+	if n.UserID != nil {
+		v := *n.UserID
+		uid = &v
+	}
+
+	var (
+		userAssociationID  types.UserID
+		hasUserAssociation bool
+	)
+
+	if n.User != nil {
+		userAssociationID = types.UserID(n.User.ID)
+		hasUserAssociation = true
+	}
+
+	var exp *time.Time
+
+	if n.Expiry != nil {
+		v := *n.Expiry
+		exp = &v
+	}
+
+	var online *bool
+
+	if n.IsOnline != nil {
+		v := *n.IsOnline
+		online = &v
+	}
+
+	routes := slices.Clone(n.ApprovedRoutes)
+	slices.SortFunc(routes, netip.Prefix.Compare)
+
+	tags := slices.Clone(n.Tags)
+	slices.Sort(tags)
+
+	return peerRelevantFields{
+		ID:                 n.ID,
+		IPv4:               n.IPv4,
+		IPv6:               n.IPv6,
+		UserID:             uid,
+		UserAssociationID:  userAssociationID,
+		HasUserAssociation: hasUserAssociation,
+		Tags:               tags,
+		ApprovedRoutes:     routes,
+		RoutableIPs:        routable,
+		IsExitNode:         isExit,
+		Expiry:             exp,
+		IsOnline:           online,
+		Unhealthy:          n.Unhealthy,
+	}
+}
+
+// relationRelevant reports whether the change between two snapshots can
+// affect peer visibility (the output of peersFunc). Online state and
+// Unhealthy do NOT affect peer visibility — they only feed route
+// election — so they are excluded here.
+//
+// Every difference in the relation allowlist returns true.
+func (f peerRelevantFields) relationRelevant(o peerRelevantFields) bool {
+	if f.ID != o.ID {
+		return true
+	}
+
+	if !addrPtrEqual(f.IPv4, o.IPv4) || !addrPtrEqual(f.IPv6, o.IPv6) {
+		return true
+	}
+
+	if !uintPtrEqual(f.UserID, o.UserID) {
+		return true
+	}
+
+	if f.HasUserAssociation != o.HasUserAssociation ||
+		f.UserAssociationID != o.UserAssociationID {
+		return true
+	}
+
+	if !slices.Equal(f.Tags, o.Tags) {
+		return true
+	}
+
+	if !slices.Equal(f.ApprovedRoutes, o.ApprovedRoutes) {
+		return true
+	}
+
+	if !slices.Equal(f.RoutableIPs, o.RoutableIPs) {
+		return true
+	}
+
+	if f.IsExitNode != o.IsExitNode {
+		return true
+	}
+
+	if !timePtrEqual(f.Expiry, o.Expiry) {
+		return true
+	}
+
+	return false
+}
+
+// electionRelevant reports whether the change can affect route election.
+// This is a superset of relationRelevant: online state and health feed
+// election but not visibility.
+func (f peerRelevantFields) electionRelevant(o peerRelevantFields) bool {
+	if f.relationRelevant(o) {
+		return true
+	}
+
+	if !boolPtrEqual(f.IsOnline, o.IsOnline) {
+		return true
+	}
+
+	if f.Unhealthy != o.Unhealthy {
+		return true
+	}
+
+	return false
+}
+
+func addrPtrEqual(a, b *netip.Addr) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+
+	if a == nil {
+		return true
+	}
+
+	return *a == *b
+}
+
+func uintPtrEqual(a, b *uint) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+
+	if a == nil {
+		return true
+	}
+
+	return *a == *b
+}
+
+func boolPtrEqual(a, b *bool) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+
+	if a == nil {
+		return true
+	}
+
+	return *a == *b
+}
+
+func timePtrEqual(a, b *time.Time) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+
+	if a == nil {
+		return true
+	}
+
+	return a.Equal(*b)
 }
 
 // PutNode adds or updates a node in the store.
@@ -445,6 +678,15 @@ func (s *NodeStore) applyBatch(batch []work) {
 	// NodeView for that work.
 	setErrResults := make(map[*work]error)
 
+	// relationChanged tracks whether the batch changed any relation input
+	// (forces peersFunc re-evaluation). electionChanged tracks whether
+	// the batch changed any election input (forces route re-election).
+	// Conservative defaults: put/del/setName/rebuildPeerMaps are all
+	// treated as relation-changing; updateMulti compares pre/post state
+	// to decide.
+	relationChanged := false
+	electionChanged := false
+
 	for i := range batch {
 		w := &batch[i]
 		switch w.op {
@@ -456,6 +698,9 @@ func (s *NodeStore) applyBatch(batch []work) {
 			if w.nodeResult != nil {
 				nodeResultRequests[w.nodeID] = append(nodeResultRequests[w.nodeID], w)
 			}
+
+			relationChanged = true
+			electionChanged = true
 		case updateMulti:
 			for id, fn := range w.multiUpdates {
 				n, exists := nodes[id]
@@ -464,13 +709,22 @@ func (s *NodeStore) applyBatch(batch []work) {
 				}
 
 				oldGivenName := n.GivenName
+				pre := capturePeerRelevant(&n)
 				fn(&n)
+				post := capturePeerRelevant(&n)
 
 				if n.GivenName != oldGivenName {
 					n.GivenName = resolveGivenName(nodes, n.ID, n.GivenName)
 				}
 
 				nodes[id] = n
+
+				if pre.relationRelevant(post) {
+					relationChanged = true
+					electionChanged = true
+				} else if pre.electionRelevant(post) {
+					electionChanged = true
+				}
 			}
 		case del:
 			delete(nodes, w.nodeID)
@@ -478,6 +732,9 @@ func (s *NodeStore) applyBatch(batch []work) {
 			if w.nodeResult != nil {
 				nodeResultRequests[w.nodeID] = append(nodeResultRequests[w.nodeID], w)
 			}
+
+			relationChanged = true
+			electionChanged = true
 		case setName:
 			n, exists := nodes[w.nodeID]
 			if !exists {
@@ -513,15 +770,43 @@ func (s *NodeStore) applyBatch(batch []work) {
 			n.GivenName = w.name
 			nodes[w.nodeID] = n
 			nodeResultRequests[w.nodeID] = append(nodeResultRequests[w.nodeID], w)
+			relationChanged = true
+			electionChanged = true
 		case rebuildPeerMaps:
 			// rebuildPeerMaps doesn't modify nodes, it just forces the snapshot rebuild
 			// below to recalculate peer relationships using the current peersFunc
 			rebuildOps = append(rebuildOps, w)
+			relationChanged = true
+			electionChanged = true
 		}
 	}
 
 	prev := s.data.Load()
-	newSnap := snapshotFromNodes(nodes, s.peersFunc, prev.routes)
+
+	// Decide how to build the next snapshot:
+	//
+	//   - Relation input changed (or explicit rebuild): full
+	//     snapshotFromNodes, including peersFunc.
+	//   - Only election input changed: rebuild snapshot, but reuse
+	//     the previous peer-ID adjacency map. ListPeers resolves IDs
+	//     through the fresh snapshot views.
+	//   - Only payload (endpoint/key/DERP/LastSeen/Hostinfo) changed:
+	//     same as election-only, and routes are re-elected only if
+	//     electionChanged.
+	//
+	// See https://github.com/juanfont/headscale/issues/3417.
+	var newSnap Snapshot
+
+	if relationChanged {
+		nodeStorePeerRelationsTotal.WithLabelValues("recomputed").Inc()
+
+		newSnap = snapshotFromNodes(nodes, s.peersFunc, prev.routes)
+	} else {
+		nodeStorePeerRelationsTotal.WithLabelValues("reused").Inc()
+
+		newSnap = snapshotFromNodesReusingPeers(nodes, s.peersFunc, prev, electionChanged)
+	}
+
 	s.data.Store(&newSnap)
 
 	// Update node count gauge
@@ -608,14 +893,34 @@ func snapshotFromNodes(
 	defer timer.ObserveDuration()
 
 	allNodes := make([]types.NodeView, 0, len(nodes))
+
+	nodeViewsByID := make(map[types.NodeID]types.NodeView, len(nodes))
 	for _, n := range nodes {
-		allNodes = append(allNodes, n.View())
+		nv := n.View()
+		allNodes = append(allNodes, nv)
+		nodeViewsByID[n.ID] = nv
 	}
 
 	routes, isPrimaryRoute := electPrimaryRoutes(nodes, prevRoutes)
 
+	peersTimer := prometheus.NewTimer(nodeStorePeersCalculationDuration)
+	peers := peersFunc(allNodes)
+
+	peersTimer.ObserveDuration()
+
+	peerIDsByNode := make(map[types.NodeID][]types.NodeID, len(peers))
+	for nodeID, nodePeers := range peers {
+		peerIDs := make([]types.NodeID, 0, len(nodePeers))
+		for _, peer := range nodePeers {
+			peerIDs = append(peerIDs, peer.ID())
+		}
+
+		peerIDsByNode[nodeID] = peerIDs
+	}
+
 	newSnap := Snapshot{
 		nodesByID:         nodes,
+		nodeViewsByID:     nodeViewsByID,
 		allNodes:          allNodes,
 		nodesByNodeKey:    make(map[key.NodePublic]types.NodeView),
 		nodesByMachineKey: make(map[key.MachinePublic]map[types.UserID]types.NodeView),
@@ -624,12 +929,7 @@ func snapshotFromNodes(
 		// it will use the list of all nodes, combined with the
 		// current policy to precalculate which nodes are peers and
 		// can see each other.
-		peersByNode: func() map[types.NodeID][]types.NodeView {
-			peersTimer := prometheus.NewTimer(nodeStorePeersCalculationDuration)
-			defer peersTimer.ObserveDuration()
-
-			return peersFunc(allNodes)
-		}(),
+		peersByNode: peerIDsByNode,
 		nodesByUser: make(map[types.UserID][]types.NodeView),
 
 		routes:         routes,
@@ -638,7 +938,7 @@ func snapshotFromNodes(
 
 	// Build nodesByUser, nodesByNodeKey, and nodesByMachineKey maps
 	for _, n := range nodes {
-		nodeView := n.View()
+		nodeView := nodeViewsByID[n.ID]
 		userID := n.TypedUserID()
 
 		// Tagged nodes are owned by their tags, not a user,
@@ -650,6 +950,81 @@ func snapshotFromNodes(
 		newSnap.nodesByNodeKey[n.NodeKey] = nodeView
 
 		// Build machine key index
+		if newSnap.nodesByMachineKey[n.MachineKey] == nil {
+			newSnap.nodesByMachineKey[n.MachineKey] = make(map[types.UserID]types.NodeView)
+		}
+
+		newSnap.nodesByMachineKey[n.MachineKey][userID] = nodeView
+	}
+
+	return newSnap
+}
+
+// snapshotFromNodesReusingPeers builds a new Snapshot from nodes without
+// recomputing peer relations. The immutable peer-ID adjacency map from the
+// previous snapshot is reused directly. [NodeStore.ListPeers] resolves those
+// IDs through this snapshot's fresh nodeViewsByID map, so readers never see
+// stale endpoints, keys, Hostinfo, or LastSeen.
+//
+// Routes are re-elected iff electionChanged; otherwise the previous
+// route table is carried forward unchanged.
+//
+// See https://github.com/juanfont/headscale/issues/3417.
+func snapshotFromNodesReusingPeers(
+	nodes map[types.NodeID]types.Node,
+	peersFunc PeersFunc,
+	prev *Snapshot,
+	electionChanged bool,
+) Snapshot {
+	timer := prometheus.NewTimer(nodeStoreSnapshotBuildDuration)
+	defer timer.ObserveDuration()
+
+	_ = peersFunc // retained in signature to make the choice of mode explicit
+
+	allNodes := make([]types.NodeView, 0, len(nodes))
+	freshByID := make(map[types.NodeID]types.NodeView, len(nodes))
+
+	for _, n := range nodes {
+		nv := n.View()
+		allNodes = append(allNodes, nv)
+		freshByID[n.ID] = nv
+	}
+
+	var routes map[netip.Prefix]types.NodeID
+
+	var isPrimaryRoute map[types.NodeID]bool
+
+	if electionChanged {
+		routes, isPrimaryRoute = electPrimaryRoutes(nodes, prev.routes)
+	} else {
+		routes = prev.routes
+		isPrimaryRoute = prev.isPrimaryRoute
+	}
+
+	newSnap := Snapshot{
+		nodesByID:         nodes,
+		nodeViewsByID:     freshByID,
+		allNodes:          allNodes,
+		nodesByNodeKey:    make(map[key.NodePublic]types.NodeView),
+		nodesByMachineKey: make(map[key.MachinePublic]map[types.UserID]types.NodeView),
+		peersByNode:       prev.peersByNode,
+		nodesByUser:       make(map[types.UserID][]types.NodeView),
+
+		routes:         routes,
+		isPrimaryRoute: isPrimaryRoute,
+	}
+
+	// Build nodesByUser, nodesByNodeKey, and nodesByMachineKey maps
+	for _, n := range nodes {
+		nodeView := freshByID[n.ID]
+		userID := n.TypedUserID()
+
+		if !n.IsTagged() {
+			newSnap.nodesByUser[userID] = append(newSnap.nodesByUser[userID], nodeView)
+		}
+
+		newSnap.nodesByNodeKey[n.NodeKey] = nodeView
+
 		if newSnap.nodesByMachineKey[n.MachineKey] == nil {
 			newSnap.nodesByMachineKey[n.MachineKey] = make(map[types.UserID]types.NodeView)
 		}
@@ -882,7 +1257,17 @@ func (s *NodeStore) ListPeers(id types.NodeID) views.Slice[types.NodeView] {
 
 	nodeStoreOperations.WithLabelValues("list_peers").Inc()
 
-	return views.SliceOf(s.data.Load().peersByNode[id])
+	snapshot := s.data.Load()
+	peerIDs := snapshot.peersByNode[id]
+	peers := make([]types.NodeView, 0, len(peerIDs))
+
+	for _, peerID := range peerIDs {
+		if peer, ok := snapshot.nodeViewsByID[peerID]; ok {
+			peers = append(peers, peer)
+		}
+	}
+
+	return views.SliceOf(peers)
 }
 
 // PrimaryRouteFor returns the current primary advertiser for prefix.

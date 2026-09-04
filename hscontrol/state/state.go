@@ -1350,8 +1350,37 @@ func (s *State) BatchSetNodeHealth(updates map[types.NodeID]bool) bool {
 
 	prevRoutes := s.nodeStore.PrimaryRoutes()
 
-	fns := make(map[types.NodeID]UpdateNodeFunc, len(updates))
+	// Pre-filter unchanged writes so the NodeStore batch is smaller and
+	// the no-op short-circuit can skip publish entirely. The writer-side
+	// healthSetter remains authoritative for candidacy/race checks; this
+	// prefilter is only an optimisation.
+	changed := make(map[types.NodeID]bool, len(updates))
 	for id, healthy := range updates {
+		nv, ok := s.nodeStore.GetNode(id)
+		if !ok {
+			// Unknown node: still send through so the writer-side setter
+			// can drop it cleanly under its own lock.
+			changed[id] = healthy
+			continue
+		}
+
+		targetUnhealthy := !healthy
+		if nv.Unhealthy() == targetUnhealthy {
+			haHealthUpdatesTotal.WithLabelValues("unchanged").Inc()
+			continue
+		}
+
+		changed[id] = healthy
+
+		haHealthUpdatesTotal.WithLabelValues("changed").Inc()
+	}
+
+	if len(changed) == 0 {
+		return false
+	}
+
+	fns := make(map[types.NodeID]UpdateNodeFunc, len(changed))
+	for id, healthy := range changed {
 		fns[id] = healthSetter(healthy)
 	}
 
