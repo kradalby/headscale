@@ -44,6 +44,10 @@ keys remain all-access.
 
 - Expiring or deleting a non-existent pre-auth key now returns an error instead of silently succeeding [#3324](https://github.com/juanfont/headscale/pull/3324)
 - Improve systemd service file hardening [#3341](https://github.com/juanfont/headscale/pull/3341)
+- Fix interactive OIDC login when the confirmation page is reloaded by an ad
+  blocker, back navigation, or pull-to-refresh. The confirmation page now has
+  its own URL, keeping single-use authorization codes out of reloads
+  [#3448](https://github.com/juanfont/headscale/pull/3448)
 - Headscale now requires Go 1.27 to build
 - Fix extra-records filewatcher hanging on shutdown after the watched file is deleted, and leaking the watcher when setup fails [#3437](https://github.com/juanfont/headscale/pull/3437)
 
