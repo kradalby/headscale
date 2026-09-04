@@ -1094,9 +1094,20 @@ func equalUnordered[E comparable](a, b []E, cmp func(E, E) int) bool {
 
 // HasPolicyChange reports whether the node has changes that affect
 // policy evaluation. Includes approved subnet routes because they act
-// as source identity in [Node.CanAccess] for subnet-to-subnet ACLs.
+// as source identity in [Node.CanAccess] for subnet-to-subnet ACLs,
+// and enabled exit routes because an exit-node grant depends on which
+// exit nodes are currently advertised-and-approved.
 func (nv NodeView) HasPolicyChange(other NodeView) bool {
-	if nv.UserID() != other.UserID() {
+	// UserID returns a views.ValuePointer wrapping *uint; wrapper != is
+	// pointer identity, not value equality. Compare validity and value
+	// explicitly so two distinct pointers holding the same ID do not
+	// register as a change.
+	a, b := nv.UserID(), other.UserID()
+	if a.Valid() != b.Valid() {
+		return true
+	}
+
+	if a.Valid() && a.Get() != b.Get() {
 		return true
 	}
 
@@ -1109,6 +1120,12 @@ func (nv NodeView) HasPolicyChange(other NodeView) bool {
 	}
 
 	if !equalPrefixesUnordered(nv.SubnetRoutes(), other.SubnetRoutes()) {
+		return true
+	}
+
+	// Exit routes are a policy input: the set of usable exit nodes
+	// feeds "exit-node" grants and autogroup:internet evaluation.
+	if !equalPrefixesUnordered(nv.ExitRoutes(), other.ExitRoutes()) {
 		return true
 	}
 
