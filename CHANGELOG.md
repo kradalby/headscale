@@ -45,6 +45,7 @@ keys remain all-access.
 - Expiring or deleting a non-existent pre-auth key now returns an error instead of silently succeeding [#3324](https://github.com/juanfont/headscale/pull/3324)
 - Improve systemd service file hardening [#3341](https://github.com/juanfont/headscale/pull/3341)
 - Fix deleted nodes, and peers hidden by a policy change, staying listed in the Tailscale Android app; removed peers are now sent as their own incremental map update [#3492](https://github.com/juanfont/headscale/pull/3492)
+- Policy changes no longer resend DNS configuration to every node, sparing clients a full netmap rebuild; a node gets its DNS configuration when its own NextDNS nodeAttrs, tags or hostname change, which also fixes NextDNS device metadata going stale after a hostname change
 - Headscale now requires Go 1.27 to build
 
 ## 0.29.4 (2026-09-23)
