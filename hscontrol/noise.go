@@ -78,7 +78,7 @@ type noiseServer struct {
 	headscale *Headscale
 
 	httpBaseConfig *http.Server
-	http2Server    *http2.Server
+	http2Server    *http2.Server //nolint:staticcheck // see ServeConn below
 	conn           *controlbase.Conn
 	machineKey     key.MachinePublic
 
@@ -208,11 +208,14 @@ func (h *Headscale) NoiseUpgradeHandler(
 		Handler:           r,
 		ReadHeaderTimeout: types.HTTPTimeout,
 	}
-	ns.http2Server = &http2.Server{}
+	// x/net deprecated http2.Server in favour of net/http. Moving there
+	// means serving the Noise connection through a one-connection listener
+	// with unencrypted HTTP/2, which is its own change.
+	ns.http2Server = &http2.Server{} //nolint:staticcheck
 
-	ns.http2Server.ServeConn(
+	ns.http2Server.ServeConn( //nolint:staticcheck
 		noiseConn,
-		&http2.ServeConnOpts{
+		&http2.ServeConnOpts{ //nolint:staticcheck
 			BaseConfig: ns.httpBaseConfig,
 		},
 	)

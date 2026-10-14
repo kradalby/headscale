@@ -1193,6 +1193,15 @@ dns:
 			wantErr: "dns.base_domain must be a lowercase DNS name",
 		},
 		{
+			name: "tls DNS-01 without provider",
+			yaml: base + `tls:
+  acme:
+    hostname: headscale.example.com
+    challenge_type: DNS-01
+`,
+			wantErr: "tls.acme.challenge_type DNS-01 requires dns.challenge.provider",
+		},
+		{
 			name: "negative propagation timeout",
 			yaml: base + `  challenge:
     propagation_timeout: -1s
@@ -1269,7 +1278,7 @@ dns:
 			want: TLSConfig{ACME: ACMEConfig{
 				ChallengeType: HTTP01ChallengeType,
 				HTTPListen:    ":http",
-				CacheDir:      "/var/www/.cache",
+				CacheDir:      "/var/lib/headscale/cache",
 			}},
 		},
 		{
@@ -1304,7 +1313,7 @@ tls:
 				ACME: ACMEConfig{
 					ChallengeType: HTTP01ChallengeType,
 					HTTPListen:    ":http",
-					CacheDir:      "/var/www/.cache",
+					CacheDir:      "/var/lib/headscale/cache",
 				},
 			},
 		},
@@ -1336,7 +1345,7 @@ tls_letsencrypt_cache_dir: /var/lib/headscale/.cache
 				ACME: ACMEConfig{
 					ChallengeType: HTTP01ChallengeType,
 					HTTPListen:    ":http",
-					CacheDir:      "/var/www/.cache",
+					CacheDir:      "/var/lib/headscale/cache",
 				},
 			},
 		},

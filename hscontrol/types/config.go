@@ -272,7 +272,7 @@ var legacyTLSKeys = map[string]string{
 var tlsDefaults = map[string]string{
 	"tls.acme.challenge_type": HTTP01ChallengeType,
 	"tls.acme.http_listen":    ":http",
-	"tls.acme.cache_dir":      "/var/www/.cache",
+	"tls.acme.cache_dir":      "/var/lib/headscale/cache",
 }
 
 // warnLegacyTLSKeys points at the tls keys for flat keys in the config
@@ -743,11 +743,23 @@ func validateServerConfigInto(v *configValidator) {
 
 	validateListenerCollisions(v)
 
-	if ct := tlsKey("tls.acme.challenge_type"); ct != HTTP01ChallengeType && ct != TLSALPN01ChallengeType {
+	switch ct := tlsKey("tls.acme.challenge_type"); ct {
+	case HTTP01ChallengeType, TLSALPN01ChallengeType:
+	case DNS01ChallengeType:
+		if tlsKey("tls.acme.hostname") != "" && viper.GetString("dns.challenge.provider.name") == "" {
+			v.Add(&ConfigError{
+				Reason:  "tls.acme.challenge_type DNS-01 requires dns.challenge.provider",
+				Current: []KV{{"tls.acme.challenge_type", ct}},
+				Allowed: hsdns.ProviderNames(),
+				Hint:    "configure the DNS provider that hosts tls.acme.hostname under dns.challenge.provider",
+				See:     "https://headscale.net/stable/ref/tls/",
+			})
+		}
+	default:
 		v.Add(&ConfigError{
 			Reason:  "tls.acme.challenge_type has an unsupported value",
 			Current: []KV{{"tls.acme.challenge_type", ct}},
-			Allowed: []string{HTTP01ChallengeType, TLSALPN01ChallengeType},
+			Allowed: []string{HTTP01ChallengeType, TLSALPN01ChallengeType, DNS01ChallengeType},
 			Hint:    "pick one of the allowed values; HTTP-01 is the default",
 		})
 	}
