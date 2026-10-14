@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/stretchr/testify/require"
 )
 
@@ -37,4 +38,30 @@ func TestRenameNodeRejectsNameExceedingFQDNLimit(t *testing.T) {
 	// A short, valid name is still accepted.
 	_, _, err = s.RenameNode(node.ID, "short")
 	require.NoError(t, err)
+}
+
+// TestRenameNodeLowercasesAndRefreshesSelf proves a rename stores a
+// lowercase name, so two nodes cannot share one DNS name by case, and
+// queues a self refresh, because the node's own DNS config (CertDomains)
+// carries its name and the rename change does not resend it.
+func TestRenameNodeLowercasesAndRefreshesSelf(t *testing.T) {
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(t, err)
+
+	user := database.CreateUserForTest("rename-user")
+	node := database.CreateRegisteredNodeForTest(user, "rename-node")
+	require.NoError(t, database.Close())
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	s.DrainSelfRefreshes()
+
+	nv, _, err := s.RenameNode(node.ID, "Mixed-Case")
+	require.NoError(t, err)
+	require.Equal(t, "mixed-case", nv.GivenName())
+	require.Contains(t, s.DrainSelfRefreshes(), change.SelfUpdate(node.ID))
 }
