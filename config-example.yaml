@@ -358,6 +358,56 @@ dns:
   # Headscale processes this file on each change.
   # extra_records_path: /var/lib/headscale/extra-records.json
 
+  # TLS certificates for nodes (`tailscale cert`, HTTPS with `tailscale serve`).
+  # Nodes get a certificate for their MagicDNS name from Let's Encrypt. They run
+  # ACME themselves; headscale publishes the DNS-01 challenge TXT record through
+  # the provider in dns.challenge. base_domain must be a public domain you control.
+  # Certificates are logged publicly (Certificate Transparency), which makes node
+  # names public. See: https://headscale.net/stable/ref/dns/
+  certificates:
+    enabled: false
+
+    # The DNS zone the provider manages. Defaults to base_domain; set it when
+    # base_domain sits below the zone apex (e.g. ts.example.com in example.com).
+    # zone: example.com
+
+  # DNS provider for ACME DNS-01 challenges, used by dns.certificates and by
+  # tls.acme with challenge_type DNS-01.
+  challenge:
+    # How long to wait for a new record to show up on every authoritative
+    # nameserver of the zone before answering the node. 0 disables the check.
+    propagation_timeout: 2m
+
+    # Resolvers used to find the zone's nameservers, as ip or ip:port.
+    # Defaults to 1.1.1.1 and 8.8.8.8 for node certificates; for headscale's
+    # own certificate (tls.acme DNS-01) the default is the system resolver,
+    # and setting them also makes it check propagation through them.
+    # resolvers: []
+
+    # The provider writing the records: cloudflare, gigahost, rfc2136 or webhook.
+    # Every other key is a setting of that provider. Any text setting can
+    # instead be read from a file by adding _path to its name.
+    # provider:
+    #   name: cloudflare
+    #   api_token_path: /run/credentials/headscale.service/cloudflare-token
+    #
+    # RFC 2136 dynamic updates (BIND, Knot, PowerDNS, Technitium, ...):
+    # provider:
+    #   name: rfc2136
+    #   server: ns1.example.com:53
+    #   key_name: headscale
+    #   key_alg: hmac-sha256
+    #   key_path: /run/credentials/headscale.service/tsig-key
+    #
+    # Any other DNS provider, through an HTTP endpoint speaking lego's
+    # httpreq protocol: POST <url>/present and <url>/cleanup with
+    # {"fqdn": "_acme-challenge.node.example.com.", "value": "..."}.
+    # provider:
+    #   name: webhook
+    #   url: http://127.0.0.1:8080
+    #   username: headscale
+    #   password_path: /run/credentials/headscale.service/webhook-password
+
 # Unix socket used for the CLI to connect without authentication
 # Note: for production you will want to set this to something like:
 unix_socket: /var/run/headscale/headscale.sock

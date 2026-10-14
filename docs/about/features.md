@@ -13,6 +13,7 @@ provides on overview of Headscale's feature and compatibility with the Tailscale
     - [x] [Global and restricted nameservers (split DNS)](https://tailscale.com/docs/reference/dns-in-tailscale#nameservers)
     - [x] [search domains](https://tailscale.com/docs/reference/dns-in-tailscale#search-domains)
     - [x] [Extra DNS records (Headscale only)](../ref/dns.md#setting-extra-dns-records)
+    - [x] [TLS certificates for nodes](../ref/dns.md#tls-certificates-for-nodes) (`tailscale cert`)
 - [x] File sharing
     - [x] [Taildrive](https://tailscale.com/docs/features/taildrive)
     - [x] [Taildrop](https://tailscale.com/docs/features/taildrop)
@@ -41,5 +42,6 @@ provides on overview of Headscale's feature and compatibility with the Tailscale
     - [x] Update user profile from identity provider
     - [ ] OIDC groups cannot be used in ACLs
 - [ ] [Funnel](https://tailscale.com/docs/features/tailscale-funnel) ([#1040](https://github.com/juanfont/headscale/issues/1040))
-- [ ] [Serve](https://tailscale.com/docs/features/tailscale-serve) ([#1234](https://github.com/juanfont/headscale/issues/1921))
+- [x] [Serve](https://tailscale.com/docs/features/tailscale-serve); HTTPS needs [TLS certificates for
+  nodes](../ref/dns.md#tls-certificates-for-nodes)
 - [ ] [Network flow logs](https://tailscale.com/docs/features/logging/network-flow-logs) ([#1687](https://github.com/juanfont/headscale/issues/1687))

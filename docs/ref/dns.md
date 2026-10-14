@@ -109,3 +109,133 @@ hostname and port combination "http://hostname-in-magic-dns.myvpn.example.com:30
 
     }
     ```
+
+## TLS certificates for nodes
+
+Nodes can get a TLS certificate for their MagicDNS name with `tailscale cert`, and `tailscale serve` can serve HTTPS
+with it. The node runs ACME with Let's Encrypt itself. Headscale publishes the DNS-01 challenge for it: a TXT record
+at `_acme-challenge.<node>.<base_domain>`, written through your DNS provider.
+
+!!! warning "Before you enable it"
+
+    - `dns.base_domain` must be a public domain you control. Let's Encrypt validates the challenge over public DNS.
+    - Certificates are logged publicly ([Certificate Transparency](https://certificate.transparency.dev/)), which makes
+      the names of your nodes public.
+    - Let's Encrypt allows [50 new certificates per registered domain per week](https://letsencrypt.org/docs/rate-limits/),
+      shared by every node and everything else under the same domain. Renewals do not count.
+    - A [CAA record](https://letsencrypt.org/docs/caa/) on the domain must allow Let's Encrypt.
+    - A node chooses its name through its hostname, so any node can claim any free name under `dns.base_domain` and get
+      a certificate for it. Use a domain that holds nothing but your tailnet. Names in `dns.extra_records` are
+      excluded.
+
+1. Configure the DNS provider that hosts `dns.base_domain`, and enable certificates:
+
+    === "Cloudflare"
+
+        ```yaml title="config.yaml"
+        dns:
+          magic_dns: true
+          base_domain: ts.example.com
+          certificates:
+            enabled: true
+            # The zone at Cloudflare that holds base_domain.
+            zone: example.com
+          challenge:
+            provider:
+              name: cloudflare
+              api_token_path: /run/credentials/headscale.service/cloudflare-token
+        ```
+
+        The [API token](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/) needs the
+        `Zone:Read` and `DNS:Edit` permissions for the zone. To scope `DNS:Edit` to one zone, give a second token with
+        `Zone:Read` on all zones as `zone_token`.
+
+    === "Gigahost"
+
+        ```yaml title="config.yaml"
+        dns:
+          magic_dns: true
+          base_domain: ts.example.com
+          certificates:
+            enabled: true
+            # The zone at Gigahost that holds base_domain.
+            zone: example.com
+          challenge:
+            provider:
+              name: gigahost
+              api_key_path: /run/credentials/headscale.service/gigahost-api-key
+        ```
+
+        Use a [Gigahost](https://gigahost.no) API key with DNS access, limited to the zone if possible.
+
+    === "RFC 2136"
+
+        ```yaml title="config.yaml"
+        dns:
+          magic_dns: true
+          base_domain: ts.example.com
+          certificates:
+            enabled: true
+            # The zone on the DNS server that holds base_domain.
+            zone: example.com
+          challenge:
+            provider:
+              name: rfc2136
+              server: ns1.example.com:53
+              key_name: headscale
+              key_alg: hmac-sha256
+              key_path: /run/credentials/headscale.service/tsig-key
+        ```
+
+        RFC 2136 dynamic updates work with BIND, Knot, PowerDNS, Technitium and others. Restrict the TSIG key to TXT
+        records below `dns.base_domain`, e.g. with BIND's `update-policy`.
+
+    === "Webhook"
+
+        ```yaml title="config.yaml"
+        dns:
+          magic_dns: true
+          base_domain: ts.example.com
+          certificates:
+            enabled: true
+            # The zone that holds base_domain.
+            zone: example.com
+          challenge:
+            provider:
+              name: webhook
+              url: http://127.0.0.1:8080
+              username: headscale
+              password_path: /run/credentials/headscale.service/webhook-password
+        ```
+
+        Reach any other DNS provider through an HTTP endpoint speaking
+        [lego's httpreq protocol](https://go-acme.github.io/lego/dns/httpreq/): headscale sends
+        `POST <url>/present` to create and `POST <url>/cleanup` to remove a record, with the body
+        `{"fqdn": "_acme-challenge.node.ts.example.com.", "value": "..."}` and optional basic auth. Any 2xx response is
+        success.
+
+    `dns.certificates.zone` defaults to `dns.base_domain`; leave it out only when `dns.base_domain` is a zone of its
+    own. Every other key under `provider` is a setting of that provider. Any text setting can be read from a file by
+    adding `_path` to its name (environment variables like `${CREDENTIALS_DIRECTORY}` are expanded in the path), and
+    every setting can be set from the environment, e.g. `HEADSCALE_DNS_CHALLENGE_PROVIDER_API_TOKEN`.
+
+1. Restart headscale and request a certificate on a node:
+
+    ```console
+    tailscale cert node.ts.example.com
+    ```
+
+!!! tip "Good to know"
+
+    - Give headscale as little access as possible: delegate `dns.base_domain` as its own zone (NS records in the parent
+      zone) and use credentials that can only edit that zone.
+    - Headscale answers a node only once every authoritative nameserver of the zone serves the record, for up to
+      `dns.challenge.propagation_timeout`. It finds the nameservers through `dns.challenge.resolvers` (default
+      `1.1.1.1` and `8.8.8.8`), so it needs outbound DNS to them and to the nameservers. `tailscale serve` gives up after
+      a minute, so with a slow provider get the certificate with `tailscale cert` first.
+    - Headscale removes the records again after ten minutes or on shutdown.
+    - Wildcard certificates (`tailscale cert "*.node.ts.example.com"`) need the `dns-subdomain-resolve` attribute,
+      granted with [node attributes](policy.md#node-attributes). Other nodes cannot resolve names below a node's name
+      through MagicDNS yet. They take at least a minute: both challenges use the same record name, and headscale
+      answers the second only once the certificate authority's cached copy of the first has expired.
+    - The certificate authority is chosen by the node, not by headscale.
