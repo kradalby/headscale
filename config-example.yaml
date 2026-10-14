@@ -246,8 +246,8 @@ tls:
     # Domain name to request a TLS certificate for:
     hostname: ""
 
-    # Type of ACME challenge to use, currently supported types:
-    # HTTP-01 or TLS-ALPN-01
+    # Type of ACME challenge to use: HTTP-01, TLS-ALPN-01, or DNS-01
+    # through dns.challenge. HTTP-01 also answers TLS-ALPN-01.
     challenge_type: HTTP-01
 
     # When HTTP-01 challenge is chosen, letsencrypt must set up a

@@ -91,6 +91,20 @@ for any other provider through lego's httpreq protocol. The v2 tailnet setting
 
 [#2137](https://github.com/juanfont/headscale/issues/2137)
 
+### TLS configuration under `tls`, DNS-01 for headscale's own certificate
+
+TLS settings move under a `tls` block: `tls.cert_path`, `tls.key_path` and
+`tls.acme.*` replace `tls_cert_path`, `tls_key_path`, `tls_letsencrypt_*`,
+`acme_url` and `acme_email`. The old keys still work, with a warning.
+Headscale now gets its own certificate with CertMagic instead of autocert, and
+`tls.acme.challenge_type: DNS-01` gets it through `dns.challenge.provider`, so
+headscale needs no open port for validation. The certificate store changes
+format: the first start registers a new ACME account and obtains a new
+certificate. `tls.acme.cache_dir` now defaults to `/var/lib/headscale/cache`.
+See [the TLS docs](https://headscale.net/stable/ref/tls/).
+
+[#2527](https://github.com/juanfont/headscale/issues/2527)
+
 ### BREAKING
 
 #### Database
@@ -123,6 +137,7 @@ for any other provider through lego's httpreq protocol. The v2 tailnet setting
 
 - `settings.ephemeral_node_inactivity_timeout` is removed; set `settings.node.ephemeral.inactivity_timeout`, which headscale reads instead
 - `settings.dns.split` is removed; headscale never read it, set `settings.dns.nameservers.split`
+- The `settings.tls_*` options move to `settings.tls.*` (`tls.cert_path`, `tls.key_path`, `tls.acme.*`); old `settings.tls_*` values still reach headscale, which reads them, except `tls_letsencrypt_cache_dir`, which the module now sets as `tls.acme.cache_dir`
 
 ### Changes
 
