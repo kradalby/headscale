@@ -19,9 +19,14 @@ require (
 	github.com/go-chi/metrics v0.1.1
 	github.com/go-gormigrate/gormigrate/v2 v2.1.7
 	github.com/go-json-experiment/json v0.0.0-20260820222146-c27c302e5fc3
+	github.com/go-viper/mapstructure/v2 v2.5.0
 	github.com/google/go-cmp v0.7.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jagottsicher/termcolor v1.0.2
+	github.com/kradalby/libdns-gigahost v0.0.0-20261014145029-4c03bc63b974
+	github.com/libdns/cloudflare v0.2.2
+	github.com/libdns/libdns v1.1.1
+	github.com/libdns/rfc2136 v1.0.1
 	github.com/oapi-codegen/runtime v1.7.0
 	github.com/oauth2-proxy/mockoidc v0.0.0-20240214162133-caebfff84d25
 	github.com/ory/dockertest/v3 v3.12.0
@@ -136,7 +141,6 @@ require (
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
-	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/go4org/hashtriemap v0.0.0-20251130024219-545ba229f689 // indirect
 	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
@@ -166,6 +170,7 @@ require (
 	github.com/kamstrup/intmap v0.5.2 // indirect
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51 // indirect
 	github.com/klauspost/compress v1.20.1 // indirect
+	github.com/kradalby/gigahost-go/client v0.0.0-20261014144355-025b38b667ed // indirect
 	github.com/lib/pq v1.12.3 // indirect
 	github.com/lithammer/fuzzysearch v1.1.8 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
@@ -173,6 +178,7 @@ require (
 	github.com/mattn/go-runewidth v0.0.24 // indirect
 	github.com/mdlayher/netlink v1.8.0 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
+	github.com/miekg/dns v1.1.64 // indirect
 	github.com/mitchellh/go-ps v1.0.0 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/moby/api v1.54.2 // indirect
