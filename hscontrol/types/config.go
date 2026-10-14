@@ -1891,6 +1891,24 @@ func (c *Config) CloneTailcfgDNSConfig() *tailcfg.DNSConfig {
 	return c.TailcfgDNSConfig.Clone()
 }
 
+// isExtraRecord reports whether name is the name of an extra DNS record.
+func (c *Config) isExtraRecord(name string) bool {
+	tailcfgDNSMu.RLock()
+	defer tailcfgDNSMu.RUnlock()
+
+	if c.TailcfgDNSConfig == nil {
+		return false
+	}
+
+	for _, r := range c.TailcfgDNSConfig.ExtraRecords {
+		if strings.TrimSuffix(r.Name, ".") == name {
+			return true
+		}
+	}
+
+	return false
+}
+
 // TailcfgDebug returns the [tailcfg.Debug] for full map responses: nil when
 // logtail is enabled, leaving client log uploads as the client set them,
 // otherwise an instruction to stop uploading logs.
