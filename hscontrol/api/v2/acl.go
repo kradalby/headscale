@@ -123,13 +123,13 @@ func registerACL(api huma.API, b Backend) {
 
 		_, err = b.State.SetPolicy(in.RawBody)
 		if err != nil {
-			return nil, huma.Error400BadRequest("setting policy", err)
+			return nil, policyRefusal(err)
 		}
 
 		if nodes.Len() > 0 {
 			_, err = b.State.SSHPolicy(nodes.At(0))
 			if err != nil {
-				return nil, huma.Error400BadRequest("verifying SSH rules", err)
+				return nil, policyRefusal(err)
 			}
 		}
 
