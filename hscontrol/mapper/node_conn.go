@@ -42,6 +42,11 @@ var errNoReadyConnections = errors.New("no connections ready for updates")
 // without room before declaring those connections stale.
 const staleConnectionTimeout = 50 * time.Millisecond
 
+// maxPendingChanges is the most changes a node's pending list holds before
+// [boundPending] reduces it. Outgrowing it only costs a coalesce pass, so it
+// is set low enough to keep that pass, and the list, cheap.
+const maxPendingChanges = 128
+
 // connectionEntry represents a single connection to a node.
 type connectionEntry struct {
 	id       string // unique connection ID
@@ -315,7 +320,7 @@ func (mc *multiChannelNodeConn) offlineDuration() time.Duration {
 // Thread-safe via pendingMu; does not contend with the connection mutex.
 func (mc *multiChannelNodeConn) appendPending(changes ...change.Change) {
 	mc.pendingMu.Lock()
-	mc.pending = append(mc.pending, changes...)
+	mc.pending = boundPending(mc.id, append(mc.pending, changes...))
 	mc.pendingMu.Unlock()
 }
 
@@ -326,8 +331,38 @@ func (mc *multiChannelNodeConn) appendPending(changes ...change.Change) {
 // for stateful patches like online/offline.
 func (mc *multiChannelNodeConn) prependPending(changes ...change.Change) {
 	mc.pendingMu.Lock()
-	mc.pending = append(changes, mc.pending...)
+	mc.pending = boundPending(mc.id, append(changes, mc.pending...))
 	mc.pendingMu.Unlock()
+}
+
+// boundPending keeps nodeID's pending list within [maxPendingChanges]. Other
+// nodes decide how fast it grows (one change per map request each, queued for
+// every node), and it is only drained once per tick and not while a bundle is
+// in flight, so it is not left to grow unbounded. A list that outgrows the
+// limit is coalesced; if that does not free at least half of it, so that the
+// next appends do not each coalesce again, a full update replaces it
+// ([change.CollapseToFull]), just as an incoming full update would.
+func boundPending(nodeID types.NodeID, pending []change.Change) []change.Change {
+	if len(pending) <= maxPendingChanges {
+		return pending
+	}
+
+	pending = coalesce(nodeID, pending)
+	if len(pending) > maxPendingChanges/2 {
+		pending = change.CollapseToFull(nodeID, pending)
+	}
+
+	return pending
+}
+
+// coalesce drops and folds pending changes for nodeID that would each cost
+// a worker, and the node, a response that tells it nothing new.
+func coalesce(nodeID types.NodeID, pending []change.Change) []change.Change {
+	// One policy recompute rebuilds the whole netmap; drop the repeats.
+	pending = change.DedupePolicyChanges(pending)
+
+	// One response carries what a run of peer updates would, one each.
+	return change.CoalescePeerUpdates(nodeID, pending)
 }
 
 // collapsePendingToFull replaces pending, together with incoming, by a

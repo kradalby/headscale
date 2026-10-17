@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 )
 
 // ============================================================================
@@ -1331,4 +1332,62 @@ func TestMultiChannelSend_SSHPolicyPerConnection(t *testing.T) {
 
 	assert.Nil(t, expectReceive(t, chA, "a").SSHPolicy, "a already holds this policy")
 	assert.Same(t, data.SSHPolicy, expectReceive(t, chB, "b").SSHPolicy, "b holds an older policy")
+}
+
+// TestPending_RepeatedChangesDoNotGrow verifies that a node sending one map
+// request after another does not grow every other node's pending list by one
+// change per request, nor cost them one response per request: the repeats are
+// folded into one patch, on append once the list is long and when drained.
+func TestPending_RepeatedChangesDoNotGrow(t *testing.T) {
+	b := NewBatcher(time.Hour, 1, nil) // not started: no ticker, no workers
+	mc := newMultiChannelNodeConn(1, nil)
+	b.nodes.Store(1, mc)
+
+	var last key.DiscoPublic
+
+	for range 10 * maxPendingChanges {
+		last = key.NewDisco().Public()
+
+		// A policy recompute between two patches must not keep them apart:
+		// same-tick repeats of it are dropped before the patches are folded.
+		b.AddWork(
+			change.EndpointOrDERPUpdate(2,
+				&tailcfg.PeerChange{NodeID: 2, DiscoKey: &last}),
+			change.PolicyChange(),
+		)
+
+		mc.pendingMu.Lock()
+		assert.LessOrEqual(t, len(mc.pending), maxPendingChanges)
+		mc.pendingMu.Unlock()
+	}
+
+	b.processBatchedChanges()
+
+	bundle := (<-b.workCh).changes
+	require.Len(t, bundle, 3)
+	assert.Len(t, bundle[0].PeerPatches, 1)
+	assert.Equal(t, change.PolicyChange(), bundle[1])
+	require.Len(t, bundle[2].PeerPatches, 1)
+	assert.Equal(t, last, *bundle[2].PeerPatches[0].DiscoKey)
+}
+
+// TestAppendPending_CollapsesToFullWhenTooLong verifies that a pending list
+// that outgrows maxPendingChanges with changes that cannot be folded is
+// replaced by one full update, keeping the pings addressed to the node.
+func TestAppendPending_CollapsesToFullWhenTooLong(t *testing.T) {
+	mc := newMultiChannelNodeConn(1, nil)
+	ping := change.PingNode(1, &tailcfg.PingRequest{URL: "http://ping"})
+
+	mc.appendPending(ping)
+
+	for id := types.NodeID(2); id <= maxPendingChanges; id++ {
+		mc.appendPending(change.PeersRemoved(id))
+	}
+
+	mc.pendingMu.Lock()
+	assert.Len(t, mc.pending, maxPendingChanges)
+	mc.pendingMu.Unlock()
+
+	mc.appendPending(change.NodeOnline(2))
+	assert.Equal(t, []change.Change{change.FullUpdate(), ping}, mc.drainPending())
 }

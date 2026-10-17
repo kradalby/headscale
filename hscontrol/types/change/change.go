@@ -1,7 +1,7 @@
 // Package change declares the [Change] type: a compact description of
 // what must land in a [tailcfg.MapResponse]. The mapper reads [Change] values to
-// build responses without inspecting state, and [Change.Merge] combines
-// multiple pending changes for a single tick.
+// build responses without inspecting state, and [DedupePolicyChanges] and
+// [CoalescePeerUpdates] fold the changes pending for a node into fewer.
 package change
 
 import (
@@ -309,6 +309,147 @@ func DedupePolicyChanges(changes []Change) []Change {
 	}
 
 	return out
+}
+
+// IsPeerUpdate reports whether r is a broadcast that carries only peers:
+// whole peers ([Change.PeersChanged], rendered from the snapshot when they
+// are sent) and [Change.PeerPatches].
+func (r Change) IsPeerUpdate() bool {
+	rest := r
+	rest.PeersChanged, rest.PeerPatches = nil, nil
+
+	return !r.IsEmpty() && rest.IsEmpty() && !r.IsTargetedToNode()
+}
+
+// CoalescePeerUpdates folds each run of consecutive peer updates
+// ([Change.IsPeerUpdate]) pending for nodeID into one change that conveys the
+// same end state. A node emits one such change per map request, and each is
+// queued for every other node, so what is generated and sent must grow with
+// the number of peers that changed, not with the number of requests. Only
+// neighbours are folded, so order relative to every other change is kept.
+//
+// Peer updates that nodeID itself originated are its self updates: the mapper
+// sends it its own node instead of the change, so a run of those collapses to
+// the first, and is never folded with updates about other peers.
+func CoalescePeerUpdates(nodeID types.NodeID, changes []Change) []Change {
+	if len(changes) < 2 {
+		return changes
+	}
+
+	isSelfUpdate := func(r Change) bool {
+		return r.OriginNode != 0 && r.OriginNode == nodeID
+	}
+
+	out := make([]Change, 0, len(changes))
+
+	for len(changes) > 0 {
+		first, run := changes[0], 1
+
+		if first.IsPeerUpdate() {
+			for run < len(changes) && changes[run].IsPeerUpdate() &&
+				isSelfUpdate(changes[run]) == isSelfUpdate(first) {
+				run++
+			}
+		}
+
+		if run > 1 && !isSelfUpdate(first) {
+			first = mergePeerUpdates(changes[:run])
+		}
+
+		out = append(out, first)
+		changes = changes[run:]
+	}
+
+	return out
+}
+
+// mergePeerUpdates returns one peer update equivalent to applying updates in
+// order, for a node none of them originated from. Patches for one peer are
+// merged field by field, the later value winning; a patch for a peer that is
+// sent whole is dropped, as the whole peer is rendered from the snapshot at
+// send time. The patches are shared with every other node's pending list, so
+// they are copied, never written to.
+func mergePeerUpdates(updates []Change) Change {
+	merged := Change{Reason: updates[0].Reason}
+
+	for _, r := range updates {
+		merged.PeersChanged = append(merged.PeersChanged, r.PeersChanged...)
+	}
+
+	merged.PeersChanged = uniqueNodeIDs(merged.PeersChanged)
+
+	patchAt := make(map[tailcfg.NodeID]int)
+
+	for _, r := range updates {
+		for _, patch := range r.PeerPatches {
+			//nolint:gosec // G115: NodeID values are within int64 range
+			id := types.NodeID(patch.NodeID)
+			if _, whole := slices.BinarySearch(merged.PeersChanged, id); whole {
+				continue
+			}
+
+			if i, ok := patchAt[patch.NodeID]; ok {
+				merged.PeerPatches[i] = mergePeerPatch(*merged.PeerPatches[i], patch)
+				continue
+			}
+
+			patchAt[patch.NodeID] = len(merged.PeerPatches)
+			merged.PeerPatches = append(merged.PeerPatches, patch)
+		}
+	}
+
+	return merged
+}
+
+// mergePeerPatch returns a copy of older with every field newer sets applied
+// over it, the way a client applies the two patches in turn: a field of a
+// [tailcfg.PeerChange] that is not set, or that the wire omits (an empty
+// slice, or a pointer to a zero key or time), leaves the peer as it is.
+func mergePeerPatch(
+	older tailcfg.PeerChange,
+	newer *tailcfg.PeerChange,
+) *tailcfg.PeerChange {
+	if newer.DERPRegion != 0 {
+		older.DERPRegion = newer.DERPRegion
+	}
+
+	if newer.Cap != 0 {
+		older.Cap = newer.Cap
+	}
+
+	if len(newer.CapMap) > 0 {
+		older.CapMap = newer.CapMap
+	}
+
+	if len(newer.Endpoints) > 0 {
+		older.Endpoints = newer.Endpoints
+	}
+
+	if newer.Key != nil && !newer.Key.IsZero() {
+		older.Key = newer.Key
+	}
+
+	if len(newer.KeySignature) > 0 {
+		older.KeySignature = newer.KeySignature
+	}
+
+	if newer.DiscoKey != nil && !newer.DiscoKey.IsZero() {
+		older.DiscoKey = newer.DiscoKey
+	}
+
+	if newer.Online != nil {
+		older.Online = newer.Online
+	}
+
+	if newer.LastSeen != nil && !newer.LastSeen.IsZero() {
+		older.LastSeen = newer.LastSeen
+	}
+
+	if newer.KeyExpiry != nil && !newer.KeyExpiry.IsZero() {
+		older.KeyExpiry = newer.KeyExpiry
+	}
+
+	return &older
 }
 
 func uniqueNodeIDs(ids []types.NodeID) []types.NodeID {
