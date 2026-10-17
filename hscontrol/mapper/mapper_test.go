@@ -397,16 +397,14 @@ func TestBuildFromChangeFiltersPeerPatchesByVisibility(t *testing.T) {
 
 	m := &mapper{state: s, cfg: cfg}
 
-	// n2 (user2) comes online; n1 (user1) must NOT receive its patch.
+	// n2 (user2) comes online; n1 (user1) must NOT receive its patch, nor an
+	// emptied response in its place, which would still show that, and when,
+	// a peer it cannot see came online.
 	leakChange := change.NodeOnline(n2.ID)
 	resp, err := m.buildFromChange(n1.ID, tailcfg.CurrentCapabilityVersion, &leakChange)
 	require.NoError(t, err)
-	require.NotNil(t, resp)
-
-	for _, p := range resp.PeersChangedPatch {
-		assert.NotEqual(t, n2.ID.NodeID(), p.NodeID,
-			"n1 must not receive an online patch for n2, which its policy forbids accessing")
-	}
+	require.Nil(t, resp,
+		"n1 must not receive anything when n2, which its policy forbids accessing, comes online")
 
 	// Control: n1b (same user) coming online IS visible to n1.
 	okChange := change.NodeOnline(n1b.ID)
@@ -483,11 +481,22 @@ func TestBuildFromChangeFiltersUserProfilesByVisibility(t *testing.T) {
 	m := &mapper{state: s, cfg: cfg}
 
 	// n2 (user2) is added and broadcast. n1 (user1) cannot access it, so n1
-	// must NOT receive user2's profile.
+	// must NOT receive user2's profile, nor an emptied response in its place,
+	// which would still show that a peer it cannot see changed.
 	c := change.NodeAdded(n2.ID)
 	resp, err := m.buildFromChange(n1.ID, tailcfg.CurrentCapabilityVersion, &c)
 	require.NoError(t, err)
+	require.Nil(t, resp,
+		"n1 must not receive anything when n2 is added; n2 is not ACL-visible to n1")
+
+	// What else the change carries still reaches n1, without n2 or user2's
+	// profile.
+	c = change.PolicyAndPeers(n2.ID)
+	resp, err = m.buildFromChange(n1.ID, tailcfg.CurrentCapabilityVersion, &c)
+	require.NoError(t, err)
 	require.NotNil(t, resp)
+	assert.NotNil(t, resp.PacketFilters)
+	assert.Empty(t, resp.PeersChanged)
 
 	for _, up := range resp.UserProfiles {
 		assert.NotEqual(t, user2.TailscaleUserProfile().ID, up.ID,

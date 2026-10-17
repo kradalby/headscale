@@ -59,19 +59,6 @@ var mapStreamSkipReasons = map[string]string{
 	"map-delivery/S3.5-remove/db1/frames":  policyResponseToEveryNode,
 	"map-delivery/S3.5-restore/db1/frames": policyResponseToEveryNode,
 
-	"map-delivery/S2.1/db1/frames":      hiddenPeerChangeSent,
-	"map-delivery/S2.2/db1/frames":      hiddenPeerChangeSent,
-	"map-delivery/S2.3/db1/frames":      hiddenPeerChangeSent,
-	"map-delivery/S2.4/db1/frames":      hiddenPeerChangeSent,
-	"map-delivery/S2.5/db1/frames":      hiddenPeerChangeSent,
-	"map-delivery/S3.1/db1/frames":      hiddenPeerChangeSent,
-	"map-delivery/S3.2-down/db1/frames": hiddenPeerChangeSent,
-	"map-delivery/S3.2-up/db1/frames":   hiddenPeerChangeSent,
-	"map-delivery/S3.3-down/db1/frames": hiddenPeerChangeSent,
-	"map-delivery/S3.3-up/db1/frames":   hiddenPeerChangeSent,
-	"map-delivery/S3.5-up/db1/frames":   hiddenPeerChangeSent,
-	"map-delivery/S3.5-up/svc/frames":   hiddenPeerChangeSent,
-
 	"map-delivery/S2.1/laptop/frames":         ownReportEchoed,
 	"map-delivery/S2.3/laptop/frames":         ownReportEchoed,
 	"map-delivery/S2.5/laptop/self-endpoints": ownReportEchoed,
@@ -106,13 +93,6 @@ var mapStreamSkipReasons = map[string]string{
 	"map-delivery/S2.0/appc/peer-hostinfo":      peerServicesWhole,
 	"map-delivery/S2.0/bystander/peer-hostinfo": peerServicesWhole,
 	"map-delivery/S2.0/sshd/peer-hostinfo":      peerServicesWhole,
-
-	"hidden-peers/S4/observer/presence": hiddenPeerChangeSent,
-	"hidden-peers/S5/observer/presence": hiddenPeerChangeSent,
-	"hidden-peers/S6/observer/presence": hiddenPeerChangeSent,
-	"route-announce/RA1/wit/presence":   hiddenPeerChangeSent,
-	"route-announce/RA2/wit/presence":   hiddenPeerChangeSent,
-	"route-announce/RA5/wit/presence":   hiddenPeerChangeSent,
 
 	"hidden-peers/S2/witness/presence":   policyResponseToEveryNode,
 	"hidden-peers/S8/observer/presence":  policyResponseToEveryNode,
@@ -179,17 +159,12 @@ var mapStreamSkipReasons = map[string]string{
 	"user-role/S1-reconnect/own-b/frames": reconnectAnnounced,
 	"user-role/S2-reconnect/own-a/frames": reconnectAnnounced,
 
-	"user-role/S1-reconnect/tag-b/frames": hiddenPeerChangeSent,
-	"user-role/S2-reconnect/own-b/frames": hiddenPeerChangeSent,
-	"user-role/S2-reconnect/tag-b/frames": hiddenPeerChangeSent,
-
 	"user-role/S0/tag-a/device-user": taggedDeviceUser,
 	"user-role/S0/tag-b/device-user": taggedDeviceUser,
 }
 
 const (
 	policyResponseToEveryNode = "POLICY_RESPONSE_TO_EVERY_NODE: headscale sends every connected node a policy response when the policy, a node's tags or approved routes, or the set of nodes change; SaaS sends only the nodes whose peers or filter change"
-	hiddenPeerChangeSent      = "HIDDEN_PEER_CHANGE_SENT: headscale sends a node a frame for a change to a peer it cannot see; SaaS sends it nothing"
 	ownReportEchoed           = "OWN_REPORT_ECHOED: headscale sends a node its own endpoint or DERP report back; SaaS sends it nothing, so its own entry keeps the endpoints of its last full map"
 	restartEndpointsKept      = "RESTART_ENDPOINTS_KEPT: headscale keeps a restarted node's last endpoints at its peers until it reports new ones; SaaS sends peers the node without endpoints until then"
 	reconnectAnnounced        = "RECONNECT_ANNOUNCED: headscale tells peers a node is online after a stream gap of a few seconds; SaaS sends them nothing"
