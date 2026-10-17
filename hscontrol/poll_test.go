@@ -249,6 +249,7 @@ func TestServeLongPollWritesErrorWhenInitialMapFails(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	writer := &recordingResponseWriter{}
 	session := app.newMapSession(ctx, tailcfg.MapRequest{
+		NodeKey: nodeView.NodeKey(),
 		Stream:  true,
 		Version: tailcfg.CapabilityVersion(100),
 	}, writer, node.View())
@@ -330,6 +331,7 @@ func TestFailedReconnectDoesNotCancelEphemeralGC(t *testing.T) {
 
 	writer := &recordingResponseWriter{}
 	session := app.newMapSession(context.Background(), tailcfg.MapRequest{
+		NodeKey: nodeView.NodeKey(),
 		Stream:  true,
 		Version: tailcfg.CapabilityVersion(100),
 	}, writer, node.View())
@@ -379,6 +381,7 @@ func TestEphemeralGCDoesNotDeleteReconnectedNode(t *testing.T) {
 
 	node := nodeView.AsStruct()
 	session := app.newMapSession(context.Background(), tailcfg.MapRequest{
+		NodeKey: nodeView.NodeKey(),
 		Stream:  true,
 		Version: tailcfg.CapabilityVersion(100),
 	}, &recordingResponseWriter{}, node.View())
@@ -474,6 +477,7 @@ func TestGitHubIssue3129_TransientlyBlockedWriteDoesNotLeaveLiveStaleSession(t *
 	ctx, cancel := context.WithCancel(context.Background())
 	writer := newDelayedSuccessResponseWriter(250 * time.Millisecond)
 	session := app.newMapSession(ctx, tailcfg.MapRequest{
+		NodeKey: nodeView.NodeKey(),
 		Stream:  true,
 		Version: tailcfg.CapabilityVersion(100),
 	}, writer, node.View())
@@ -579,6 +583,7 @@ func TestDeletedNodeEndsLongPoll(t *testing.T) {
 
 	writer := newDelayedSuccessResponseWriter(0)
 	session := app.newMapSession(ctx, tailcfg.MapRequest{
+		NodeKey: nodeView.NodeKey(),
 		Stream:  true,
 		Version: tailcfg.CapabilityVersion(100),
 	}, writer, node.View())
@@ -652,6 +657,7 @@ func TestDeletedNodeInterruptsBlockedWrite(t *testing.T) {
 
 	writer := newDeadlineResponseWriter()
 	session := app.newMapSession(t.Context(), tailcfg.MapRequest{
+		NodeKey: nodeView.NodeKey(),
 		Stream:  true,
 		Version: tailcfg.CapabilityVersion(100),
 	}, writer, nodeView)
