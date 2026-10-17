@@ -245,3 +245,39 @@ func TestSSHCheckFollowsReturnedHoldURL(t *testing.T) {
 		expandHoldURL(initial.HoldAndDelegate, srcID, dstID, "root"))
 	assert.True(t, followUp.Accept, "authenticated root login must be accepted, got %+v", followUp)
 }
+
+func TestSSHCheckHeldAfterSourceTagConversion(t *testing.T) {
+	t.Parallel()
+	h := servertest.NewHarness(t, 2)
+	srcID := types.NodeID(h.Client(0).Netmap().SelfNode.ID()) //nolint:gosec
+	dstID := types.NodeID(h.Client(1).Netmap().SelfNode.ID()) //nolint:gosec
+	h.ChangePolicy(t, []byte(`{
+"tagOwners":{"tag:ci":["harness-default@"],"tag:server":["harness-default@"]},
+"ssh":[{"action":"check","src":["harness-default@","tag:ci"],
+"dst":["tag:server"],"users":["autogroup:nonroot"],"checkPeriod":"1h"}]}`))
+
+	_, c, err := h.Server.State().SetNodeTags(dstID, []string{"tag:server"})
+	require.NoError(t, err)
+	h.Server.App.Change(c)
+
+	initial := pollSSHAction(t, h.Server.URL, h.Client(1), srcID, dstID, "")
+	require.NotEmpty(t, initial.HoldAndDelegate)
+	authID := authIDFromHoldURL(t, initial.HoldAndDelegate)
+	auth, ok := h.Server.State().GetAuthCacheEntry(authID)
+	require.True(t, ok)
+	auth.FinishAuth(types.AuthVerdict{})
+
+	approved := pollSSHAction(t, h.Server.URL, h.Client(1), srcID, dstID, authID.String())
+	require.True(t, approved.Accept)
+	cached := pollSSHAction(t, h.Server.URL, h.Client(1), srcID, dstID, "")
+	require.True(t, cached.Accept)
+
+	_, c, err = h.Server.State().SetNodeTags(srcID, []string{"tag:ci"})
+	require.NoError(t, err)
+	h.Server.App.Change(c)
+	_, checkFound := h.Server.State().SSHCheckParams(srcID, dstID, sshCheckLocalUser)
+	require.True(t, checkFound)
+	after := pollSSHAction(t, h.Server.URL, h.Client(1), srcID, dstID, "")
+	assert.False(t, after.Accept)
+	assert.NotEmpty(t, after.HoldAndDelegate)
+}
