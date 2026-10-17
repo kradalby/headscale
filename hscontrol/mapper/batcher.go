@@ -614,22 +614,20 @@ func (b *Batcher) worker(workerID int) {
 			// finish — preventing out-of-order delivery and races
 			// on lastSentPeers (Clear+Store vs Range).
 			if nc, exists := b.nodes.Load(w.nodeID); exists && nc != nil {
-				// Changes that found only connections still awaiting
-				// their initial map are retried next tick: the
-				// in-flight initial map may have been generated from
-				// a snapshot older than the change, so dropping them
-				// would lose updates. Collected and prepended as a
-				// group to keep their order ahead of newer pending
-				// changes — order matters for stateful patches like
-				// online/offline.
-				var retry []change.Change
+				// A change that found a connection still awaiting its
+				// initial map is held with the rest of the bundle for
+				// the next tick: the in-flight initial map may predate
+				// it, and sending the rest first would reorder stateful
+				// patches like online/offline. Prepended ahead of newer
+				// pending changes for the same reason.
+				var held []change.Change
 
 				nc.workMu.Lock()
-				for _, ch := range w.changes {
+				for i, ch := range w.changes {
 					err := nc.change(ch)
 					if errors.Is(err, errNoReadyConnections) {
-						retry = append(retry, ch)
-						continue
+						held = w.changes[i:]
+						break
 					}
 
 					if err != nil {
@@ -642,8 +640,8 @@ func (b *Batcher) worker(workerID int) {
 				}
 				nc.workMu.Unlock()
 
-				if len(retry) > 0 {
-					nc.prependPending(retry...)
+				if len(held) > 0 {
+					nc.prependPending(held...)
 				}
 
 				// Bundle delivered; allow the next tick's bundle to queue.
