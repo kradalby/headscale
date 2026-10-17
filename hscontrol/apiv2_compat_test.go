@@ -85,11 +85,6 @@ var apiv2CompatSkipReasons = map[string]string{
 	"oauth/J3/1/detail":    refusalDetail,
 	"oauth/J4/0/detail":    refusalDetail,
 
-	"oauth/E2/0/status":   taggedAllClientAnyTag,
-	"oauth/E2/0/outcome":  taggedAllClientAnyTag,
-	"oauth/E9a/1/status":  taggedAllClientAnyTag,
-	"oauth/E9a/1/outcome": taggedAllClientAnyTag,
-
 	"oauth/E4/0/status": tagRefusalStatus,
 	"oauth/E5/0/status": tagRefusalStatus,
 	"oauth/T2/1/status": tagRefusalStatus,
@@ -229,7 +224,6 @@ func notCompared(prefixes []string, key string) bool {
 const (
 	scopeEchoAsSent        = "SCOPE_ECHO_AS_SENT: SaaS echoes a token's scopes sorted and without repeats; headscale echoes the request as sent"
 	bodyBeforeScope        = "BODY_BEFORE_SCOPE: headscale validates a createKey body before the token's scope and answers 422; SaaS answers 404 for the missing scope"
-	taggedAllClientAnyTag  = "TAGGED_ALL_CLIENT_ANY_TAG: SaaS lets a tagged all-scope client's token ask only for the client's tags; headscale lets it ask for any tag"
 	retagRemovesUnownedTag = "RETAG_REMOVES_UNOWNED_TAG: SaaS refuses a token's retag of a device holding a tag outside the token's grant with 400 cannot remove current tags; headscale replaces the tags"
 	sshTestHostnames       = "SSH_TEST_HOSTNAMES: headscale names the nodes behind a failing sshTests destination; SaaS names the destination as written"
 	v1CheckAcceptsEmpty    = "V1_CHECK_ACCEPTS_EMPTY: v1 policy check accepts a zero-length policy; SaaS's validate refuses it"
