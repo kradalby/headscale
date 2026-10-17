@@ -209,7 +209,7 @@ type work struct {
 // depends on online and health state, treating unknown online as offline.
 func updateChanges(pre, post *types.Node) (bool, bool) {
 	preView, postView := pre.View(), post.View()
-	if postView.HasPolicyChange(preView) || postView.HasNetworkChanges(preView) {
+	if postView.HasPolicyChange(preView) {
 		return true, true
 	}
 
