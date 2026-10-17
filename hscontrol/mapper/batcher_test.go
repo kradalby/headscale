@@ -1072,8 +1072,10 @@ func TestBatcherWorkQueueBatching(t *testing.T) {
 						t.Logf("Update %d: nil update", updateCount)
 					}
 				case <-timeout:
-					// Expected: 5 explicit changes + 1 initial from AddNode + 1 NodeOnline from wrapper = 7 updates
-					expectedUpdates := 7
+					// Expected: 5 explicit changes + 1 initial from AddNode = 6 updates.
+					// The wrapper's NodeOnline is about the node itself, which is
+					// not its own peer, so nothing is sent for it.
+					expectedUpdates := 6
 					t.Logf("Received %d updates from %d changes (expected %d)",
 						updateCount, 5, expectedUpdates)
 

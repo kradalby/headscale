@@ -364,6 +364,29 @@ func (m *mapper) buildFromChange(
 		return m.selfMapResponse(nodeID, capVer)
 	}
 
+	// Narrow the change to what the node may see before deciding to send:
+	// an emptied response would still show that, and when, a peer it cannot
+	// see came online, went offline or changed.
+	var peers views.Slice[types.NodeView]
+	if resp.SendAllPeers {
+		peers = m.state.ListPeers(nodeID)
+	} else if len(resp.PeersChanged) > 0 {
+		peers = m.state.ListPeers(nodeID, resp.PeersChanged...)
+	}
+
+	patches := m.filterVisiblePeerPatches(nodeID, resp.PeerPatches)
+
+	visible := *resp
+	visible.PeerPatches = patches
+
+	if peers.Len() == 0 {
+		visible.PeersChanged = nil
+	}
+
+	if visible.IsEmpty() {
+		return nil, nil //nolint:nilnil // Nothing the node may see means nothing to send, not an error
+	}
+
 	builder := m.NewMapResponseBuilder(nodeID).
 		WithCapabilityVersion(capVer).
 		WithDebugType(changeResponseDebug)
@@ -396,12 +419,10 @@ func (m *mapper) buildFromChange(
 	}
 
 	if resp.SendAllPeers {
-		peers := m.state.ListPeers(nodeID)
 		builder.WithUserProfiles(peers)
 		builder.WithPeers(peers)
 	} else {
-		if len(resp.PeersChanged) > 0 {
-			peers := m.state.ListPeers(nodeID, resp.PeersChanged...)
+		if peers.Len() > 0 {
 			builder.WithUserProfiles(peers)
 			builder.WithPeerChanges(peers)
 		}
@@ -411,7 +432,6 @@ func (m *mapper) buildFromChange(
 		}
 	}
 
-	patches := m.filterVisiblePeerPatches(nodeID, resp.PeerPatches)
 	if len(patches) > 0 {
 		builder.WithPeerChangedPatch(patches)
 	}
