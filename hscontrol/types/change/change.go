@@ -612,13 +612,23 @@ func NodeAdded(id types.NodeID) Change {
 	return c
 }
 
-// NodeRemoved returns a [Change] for when a node is removed.
-func NodeRemoved(id types.NodeID) Change {
-	return Change{
+// NodeRemoved returns the changes for a deleted node: the teardown of its own
+// sessions, which reaches no other node, and its removal from each of peers.
+func NodeRemoved(id types.NodeID, peers ...types.NodeID) []Change {
+	out := make([]Change, 0, 1+len(peers))
+	out = append(out, Change{
 		Reason:       "node removed",
-		PeersRemoved: []types.NodeID{id},
+		TargetNode:   id,
 		DeletedNodes: []types.NodeID{id},
+	})
+
+	for _, peer := range peers {
+		rm := PeersRemoved(id)
+		rm.TargetNode = peer
+		out = append(out, rm)
 	}
+
+	return out
 }
 
 // KeyExpiryFor returns a [Change] for when a node's key expiry changes.

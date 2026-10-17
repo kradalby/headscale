@@ -377,7 +377,7 @@ func TestAddToBatch_NodeRemovalCleanup(t *testing.T) {
 	_, exists := lb.b.nodes.Load(removedNode)
 	require.True(t, exists, "node 3 should exist before removal")
 
-	lb.b.addToBatch(change.NodeRemoved(removedNode))
+	lb.b.addToBatch(change.NodeRemoved(removedNode)...)
 
 	// Node should be removed from the nodes map
 	_, exists = lb.b.nodes.Load(removedNode)

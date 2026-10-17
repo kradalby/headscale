@@ -636,21 +636,23 @@ func (s *State) DeleteNode(node types.NodeView) ([]change.Change, error) {
 	// The database is the durable source of truth. Only remove the in-memory
 	// node after its row is gone so a failed database write cannot make a live
 	// node look deleted until the next restart.
-	s.nodeStore.DeleteNode(node.ID())
+	peers := s.nodeStore.DeleteNode(node.ID())
 	s.persistMu.Unlock()
 
 	s.ipAlloc.FreeIPs(node.IPs())
 
-	// An explicit removal of its own, ahead of the policy refresh, so peers
-	// learn of the deletion without depending on their sent-peers tracking.
-	removed := change.NodeRemoved(node.ID())
+	// Explicit removals of their own, ahead of the policy refresh, so peers
+	// learn of the deletion without depending on their sent-peers tracking,
+	// and nodes the policy hid it from learn nothing.
+	changes := change.NodeRemoved(node.ID(), peers...)
 
 	policyChange, err := s.updatePolicyManagerNodes(genBefore)
 	if err != nil {
-		return []change.Change{removed, policyChange}, fmt.Errorf("updating policy manager after node deletion: %w", err)
+		return append(changes, policyChange),
+			fmt.Errorf("updating policy manager after node deletion: %w", err)
 	}
 
-	return []change.Change{removed, policyChange}, nil
+	return append(changes, policyChange), nil
 }
 
 // Connect acquires a control session and returns the resulting changes

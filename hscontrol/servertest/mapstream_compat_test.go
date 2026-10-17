@@ -107,10 +107,6 @@ var mapStreamSkipReasons = map[string]string{
 	"map-delivery/S2.0/bystander/peer-hostinfo": peerServicesWhole,
 	"map-delivery/S2.0/sshd/peer-hostinfo":      peerServicesWhole,
 
-	"hidden-peers/S9/observer/removed":  removalSentToAll,
-	"hidden-peers/S10/observer/removed": removalSentToAll,
-	"hidden-peers/S13/observer/removed": removalSentToAll,
-
 	"hidden-peers/S4/observer/presence": hiddenPeerChangeSent,
 	"hidden-peers/S5/observer/presence": hiddenPeerChangeSent,
 	"hidden-peers/S6/observer/presence": hiddenPeerChangeSent,
@@ -201,7 +197,6 @@ const (
 	selfHostinfoWhole         = "SELF_HOSTINFO_WHOLE: headscale sends a node its whole reported Hostinfo; SaaS sends only Hostname, RequestTags and Services"
 	peerHostinfoWhole         = "PEER_HOSTINFO_WHOLE: headscale sends peers a node's whole reported Hostinfo; SaaS sends only Hostname, OS, Services, the SSH host keys and AppConnector"
 	peerServicesWhole         = "PEER_SERVICES_WHOLE: headscale sends peers every service a node reports; SaaS leaves out peerapi-dns-proxy"
-	removalSentToAll          = "REMOVAL_SENT_TO_ALL: headscale tells every connected node that a deleted node is gone; SaaS tells only the nodes that had it as a peer"
 	announcePolicyResend      = "ANNOUNCE_POLICY_RESEND: under an autogroup:self or via policy, headscale sends every connected node a policy response when a router changes only routes nobody approved; SaaS sends nothing to nodes that cannot see the router"
 	withdrawnRouteEnabled     = "WITHDRAWN_ROUTE_ENABLED: headscale's routes API keeps a route the device stopped advertising in enabledRoutes; SaaS lists only advertised routes as enabled"
 	taggedDeviceUser          = "TAGGED_DEVICE_USER: SaaS shows a tagged device's user as the login that made its key; headscale shows tagged-devices"

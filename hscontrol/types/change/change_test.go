@@ -567,10 +567,19 @@ func TestPeersRemoved(t *testing.T) {
 }
 
 func TestNodeRemoved(t *testing.T) {
-	r := NodeRemoved(42)
-	assert.Equal(t, "node removed", r.Reason)
-	assert.Equal(t, []types.NodeID{42}, r.PeersRemoved)
-	assert.Equal(t, []types.NodeID{42}, r.DeletedNodes)
+	rs := NodeRemoved(42, 7, 9)
+	require.Len(t, rs, 3)
+	assert.Equal(t, "node removed", rs[0].Reason)
+	assert.Equal(t, types.NodeID(42), rs[0].TargetNode,
+		"the teardown reaches no other node")
+	assert.Empty(t, rs[0].PeersRemoved)
+	assert.Equal(t, []types.NodeID{42}, rs[0].DeletedNodes)
+
+	for i, peer := range []types.NodeID{7, 9} {
+		assert.Equal(t, peer, rs[i+1].TargetNode)
+		assert.Equal(t, []types.NodeID{42}, rs[i+1].PeersRemoved)
+		assert.Empty(t, rs[i+1].DeletedNodes)
+	}
 }
 
 func TestPeerPatched(t *testing.T) {
