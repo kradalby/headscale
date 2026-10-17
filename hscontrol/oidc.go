@@ -887,6 +887,7 @@ func (a *AuthProviderOIDC) RegisterConfirmGetHandler(
 
 		if regData.Hostinfo != nil {
 			info.OS = regData.Hostinfo.OS
+			info.Tags = regData.Hostinfo.RequestTags
 		}
 
 		content = templates.RegisterConfirm(info).Render()
@@ -1071,7 +1072,7 @@ func (a *AuthProviderOIDC) handleRegistration(
 
 func renderRegistrationSuccessTemplate(
 	user *types.User,
-	_ types.NodeView,
+	node types.NodeView,
 	reauth bool,
 ) *bytes.Buffer {
 	result := templates.AuthSuccessResult{
@@ -1081,6 +1082,10 @@ func renderRegistrationSuccessTemplate(
 		User:    user.Display(),
 		Message: "You can now close this window.",
 	}
+	if node.IsTagged() {
+		result.User = strings.Join(node.Tags().AsSlice(), ", ")
+	}
+
 	if !reauth {
 		result.Title = "Headscale - Node Registered"
 		result.Heading = "Node registered"
