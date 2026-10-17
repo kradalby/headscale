@@ -703,16 +703,18 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 
-	// Precompute each node's subnet routes and exit-node status once; the
+	// Precompute each node's route ranges and exit-node status once; the
 	// O(n^2) pair scans below would otherwise recompute them for every pair.
 	type nodeRoutes struct {
-		subnet []netip.Prefix
+		subnet []netipx.IPRange
 		isExit bool
 	}
 
 	routeInfo := make(map[types.NodeID]nodeRoutes, nodes.Len())
 	for _, n := range nodes.All() {
-		routeInfo[n.ID()] = nodeRoutes{subnet: n.SubnetRoutes(), isExit: n.IsExitNode()}
+		routeInfo[n.ID()] = nodeRoutes{
+			subnet: types.RouteRanges(n.SubnetRoutes()), isExit: n.IsExitNode(),
+		}
 	}
 
 	// If we have a global filter, use it for all nodes (normal case).
@@ -747,7 +749,7 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 			for k := range pm.matchers {
 				m := &pm.matchers[k]
 
-				if m.SrcsContainsIPs(ips...) || (routed && m.SrcsOverlapsPrefixes(ri.subnet...)) {
+				if m.SrcsContainsIPs(ips...) || (routed && m.SrcsOverlapsRanges(ri.subnet)) {
 					if srcOf[i] == nil {
 						srcOf[i] = make([]uint64, words)
 					}
@@ -755,7 +757,7 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 					srcOf[i][k/64] |= 1 << (k % 64) //nolint:mnd
 				}
 
-				if m.DestsContainsIP(ips...) || (routed && m.DestsOverlapsPrefixes(ri.subnet...)) ||
+				if m.DestsContainsIP(ips...) || (routed && m.DestsOverlapsRanges(ri.subnet)) ||
 					(ri.isExit && m.DestsIsTheInternet()) {
 					if dstOf[i] == nil {
 						dstOf[i] = make([]uint64, words)
