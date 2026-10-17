@@ -38,6 +38,10 @@ var errNoActiveConnections = errors.New("no active connections")
 // lose the update.
 var errNoReadyConnections = errors.New("no connections ready for updates")
 
+// staleConnectionTimeout is how long a send blocks on connection channels
+// without room before declaring those connections stale.
+const staleConnectionTimeout = 50 * time.Millisecond
+
 // connectionEntry represents a single connection to a node.
 type connectionEntry struct {
 	id       string // unique connection ID
@@ -121,6 +125,13 @@ type multiChannelNodeConn struct {
 	// worker pool cannot deliver tick N+1 before tick N: a non-FIFO workMu
 	// cannot reorder bundles that never coexist.
 	inFlight atomic.Bool
+
+	// sendBlocked is how long [multiChannelNodeConn.send] has blocked on
+	// connection channels without room during the current bundle. The node
+	// decides how fast its connections drain and, through its own map
+	// requests, how many responses a bundle carries, so [Batcher.worker]
+	// bounds it per bundle: the worker holds workMu and serves every node.
+	sendBlocked atomic.Int64
 
 	closeOnce   sync.Once
 	updateCount atomic.Int64
@@ -309,10 +320,10 @@ func (mc *multiChannelNodeConn) appendPending(changes ...change.Change) {
 }
 
 // prependPending puts changes at the head of the pending list, ahead of
-// anything queued since. Used to retry changes that could not be
-// delivered yet (initial map in flight): they were emitted before the
-// currently pending ones, and order matters for stateful patches like
-// online/offline.
+// anything queued since. Used for the rest of a bundle that could not be
+// sent yet (an initial map in flight, or the node's send budget spent):
+// it was emitted before the currently pending changes, and order matters
+// for stateful patches like online/offline.
 func (mc *multiChannelNodeConn) prependPending(changes ...change.Change) {
 	mc.pendingMu.Lock()
 	mc.pending = append(changes, mc.pending...)
@@ -340,8 +351,8 @@ func (mc *multiChannelNodeConn) drainPending() []change.Change {
 
 // send broadcasts data to all active connections for the node.
 //
-// To avoid holding the write lock during potentially slow sends (each stale
-// connection can block for up to 50ms), the method snapshots connections under
+// To avoid holding the write lock during potentially slow sends (stale
+// connections can block for up to 50ms), the method snapshots connections under
 // a read lock, sends without any lock held, then write-locks only to remove
 // failures. New connections added between the snapshot and cleanup are safe:
 // [Batcher.AddNode] generates their initial map under workMu, after this
@@ -383,17 +394,26 @@ func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
 		Int("total_connections", len(snapshot)).
 		Msg("send: broadcasting")
 
-	// Send to all connections without holding any lock.
-	// Stale connection timeouts (50ms each) happen here without blocking
-	// other goroutines that need the mutex.
+	// Send to all connections without holding any lock, so the stale
+	// connection timeout does not block other goroutines that need the
+	// mutex. The connections share it, as the node decides how many it
+	// holds: one still without room once it is spent has not drained for
+	// that long either.
 	var (
 		lastErr      error
 		successCount int
 		failed       []*connectionEntry
 	)
 
+	wait := staleConnectionTimeout
+
 	for _, conn := range snapshot {
-		err := conn.send(conn.withSSHPolicyDelta(conn.withSelfDelta(data)))
+		blocked, err := conn.sendWithin(
+			conn.withSSHPolicyDelta(conn.withSelfDelta(data)),
+			wait,
+		)
+		wait -= blocked
+
 		if err != nil {
 			lastErr = err
 
@@ -440,6 +460,7 @@ func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
 		mc.mutex.Unlock()
 	}
 
+	mc.sendBlocked.Add(int64(staleConnectionTimeout - wait))
 	mc.updateCount.Add(1)
 
 	mc.log.Trace().
@@ -457,14 +478,33 @@ func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
 
 // send sends data to a single connection entry with timeout-based stale connection detection.
 func (entry *connectionEntry) send(data *tailcfg.MapResponse) error {
+	_, err := entry.sendWithin(data, staleConnectionTimeout)
+
+	return err
+}
+
+// sendWithin is [connectionEntry.send] with the given timeout. It reports how
+// long it blocked, which is zero if the channel had room.
+func (entry *connectionEntry) sendWithin(
+	data *tailcfg.MapResponse,
+	timeout time.Duration,
+) (time.Duration, error) {
 	if data == nil {
-		return nil
+		return 0, nil
 	}
 
 	// Check if the connection has been closed to prevent send on closed channel panic.
 	// This can happen during shutdown when Close() is called while workers are still processing.
 	if entry.closed.Load() {
-		return fmt.Errorf("connection %s: %w", entry.id, errConnectionClosed)
+		return 0, fmt.Errorf("connection %s: %w", entry.id, errConnectionClosed)
+	}
+
+	// A channel with room takes the data even when no timeout is left.
+	select {
+	case entry.c <- data:
+		entry.lastUsed.Store(time.Now().Unix())
+		return 0, nil
+	default:
 	}
 
 	// Use a short timeout to detect stale connections where the client isn't reading the channel.
@@ -472,19 +512,23 @@ func (entry *connectionEntry) send(data *tailcfg.MapResponse) error {
 	// but still have channels that appear open.
 	//
 	// Use a timer rather than time.After so the timeout is explicitly released
-	// on the fast path; both are GC-recoverable since Go 1.23.
-	timer := time.NewTimer(50 * time.Millisecond) //nolint:mnd
+	// when the send completes first; both are GC-recoverable since Go 1.23.
+	start := time.Now()
+
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	select {
 	case entry.c <- data:
 		// Update last used timestamp on successful send
 		entry.lastUsed.Store(time.Now().Unix())
-		return nil
+		return time.Since(start), nil
 	case <-timer.C:
 		// Connection is likely stale - client isn't reading from channel
 		// This catches the case where Docker containers are killed but channels remain open
-		return fmt.Errorf("connection %s: %w", entry.id, ErrConnectionSendTimeout)
+		err := fmt.Errorf("connection %s: %w", entry.id, ErrConnectionSendTimeout)
+
+		return time.Since(start), err
 	}
 }
 

@@ -295,6 +295,33 @@ func TestMultiChannelSend_AllSuccess(t *testing.T) {
 	}
 }
 
+// A node chooses how many connections it holds, and send runs on a batcher
+// worker under workMu, so stale connections must not each add a timeout.
+func TestMultiChannelSend_StaleConnectionsShareOneTimeout(t *testing.T) {
+	mc := newMultiChannelNodeConn(1, nil)
+
+	const staleCount = 40
+	for i := range staleCount {
+		ch := make(chan *tailcfg.MapResponse) // unbuffered, no reader
+		mc.addConnection(makeConnectionEntry(fmt.Sprintf("stale-%d", i), ch))
+	}
+
+	// Behind the stale ones, so the wait is used up when its turn comes.
+	goodCh := make(chan *tailcfg.MapResponse, 1)
+	mc.addConnection(makeConnectionEntry("good", goodCh))
+
+	start := time.Now()
+	err := mc.send(testMapResponse())
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	assert.Less(t, elapsed, 10*staleConnectionTimeout,
+		"send should wait out one timeout, not one per stale connection")
+	assert.Equal(t, 1, mc.getActiveConnectionCount(),
+		"all stale connections should be removed")
+	expectReceive(t, goodCh, "a connection with room should still receive")
+}
+
 func TestMultiChannelSend_PartialFailure(t *testing.T) {
 	mc := newMultiChannelNodeConn(1, nil)
 
