@@ -114,6 +114,9 @@ type NodeStore struct {
 
 	peersFunc  PeersFunc
 	writeQueue chan work
+	// reservedLabel reports labels held outside the NodeStore; nil reserves
+	// none. Set before Start: the writer reads it without a lock.
+	reservedLabel func(string) bool
 
 	// stopped is closed once by Stop to signal the writer goroutine to exit
 	// and to let in-flight writes return cleanly instead of panicking with
@@ -515,7 +518,7 @@ func (s *NodeStore) applyBatch(batch []work) {
 		switch w.op {
 		case put:
 			n := w.node
-			n.GivenName = resolveGivenName(nodes, n.ID, n.GivenName)
+			n.GivenName = resolveGivenName(nodes, n.ID, n.GivenName, s.reservedLabel)
 
 			nodes[w.nodeID] = n
 			if w.nodeResult != nil {
@@ -536,7 +539,9 @@ func (s *NodeStore) applyBatch(batch []work) {
 				fn(&n)
 
 				if n.GivenName != oldGivenName {
-					n.GivenName = resolveGivenName(nodes, n.ID, n.GivenName)
+					n.GivenName = resolveGivenName(
+						nodes, n.ID, n.GivenName, s.reservedLabel,
+					)
 				}
 
 				nodes[id] = n
@@ -574,17 +579,7 @@ func (s *NodeStore) applyBatch(batch []work) {
 				continue
 			}
 
-			taken := false
-
-			// DNS is case-insensitive: a legacy "Laptop" already holds "laptop".
-			for id, other := range nodes {
-				if id != w.nodeID && strings.EqualFold(other.GivenName, w.name) {
-					taken = true
-					break
-				}
-			}
-
-			if taken {
+			if resolveGivenName(nodes, w.nodeID, w.name, s.reservedLabel) != w.name {
 				setErrResults[w] = ErrGivenNameTaken
 				nodeResultRequests[w.nodeID] = append(nodeResultRequests[w.nodeID], w)
 
@@ -666,7 +661,12 @@ func (s *NodeStore) applyBatch(batch []work) {
 // unused wins. Must be called from the [NodeStore] writer goroutine
 // (inside [NodeStore.applyBatch]) so the nodes map reflects all earlier
 // ops in the batch and no other writer can interleave.
-func resolveGivenName(nodes map[types.NodeID]types.Node, self types.NodeID, base string) string {
+func resolveGivenName(
+	nodes map[types.NodeID]types.Node,
+	self types.NodeID,
+	base string,
+	reservedLabel func(string) bool,
+) string {
 	if base == "" {
 		base = fallbackGivenName
 	}
@@ -683,7 +683,8 @@ func resolveGivenName(nodes map[types.NodeID]types.Node, self types.NodeID, base
 
 	candidate := base
 	for i := 1; ; i++ {
-		if _, busy := taken[strings.ToLower(candidate)]; !busy {
+		_, busy := taken[strings.ToLower(candidate)]
+		if !busy && (reservedLabel == nil || !reservedLabel(candidate)) {
 			return candidate
 		}
 
