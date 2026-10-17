@@ -219,6 +219,10 @@ type State struct {
 	// persistMu serialises node-row persistence and deletion so the database
 	// always converges on [NodeStore] rather than being clobbered by a stale
 	// caller snapshot or resurrected by an update racing with deletion.
+	// Every node's persist takes it, so paths a node can trigger must not
+	// hold it across a NodeStore write. Node persists must stay UPDATE-only;
+	// then a persist between the row delete and the NodeStore delete changes
+	// nothing.
 	persistMu sync.Mutex
 
 	// selfRefresh holds nodes whose own DNS config inputs changed (NextDNS
@@ -714,9 +718,8 @@ func (s *State) DeleteNode(node types.NodeView) ([]change.Change, error) {
 	s.persistMu.Lock()
 
 	err := s.db.DeleteNode(node.AsStruct())
+	s.persistMu.Unlock()
 	if err != nil {
-		s.persistMu.Unlock()
-
 		if errors.Is(err, hsdb.ErrNodeNotFound) {
 			return nil, nil
 		}
@@ -728,7 +731,6 @@ func (s *State) DeleteNode(node types.NodeView) ([]change.Change, error) {
 	// node after its row is gone so a failed database write cannot make a live
 	// node look deleted until the next restart.
 	s.nodeStore.DeleteNode(node.ID())
-	s.persistMu.Unlock()
 
 	s.ipAlloc.FreeIPs(node.IPs())
 

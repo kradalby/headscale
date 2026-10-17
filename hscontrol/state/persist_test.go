@@ -623,6 +623,128 @@ func TestDeleteNodeTwiceReleasesAddressOnce(t *testing.T) {
 	require.ErrorIs(t, err, db.ErrCouldNotAllocateIP)
 }
 
+func TestConcurrentDeleteNodesDoNotWaitForNodeStore(t *testing.T) {
+	s, err := NewState(persistTestConfig(t.TempDir() + "/headscale.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	user := s.CreateUserForTest("batch-delete-user")
+
+	nodes := make(types.Nodes, 0, 20)
+	for range 20 {
+		nodes = append(nodes, s.CreateNodeForTest(user))
+	}
+
+	// Hold the NodeStore writer on the first delete, so every other row
+	// delete has to land while a NodeStore delete is still pending.
+	release := make(chan struct{})
+
+	var releaseOnce sync.Once
+
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+
+	s.nodeStore.Stop()
+	s.nodeStore = NewNodeStore(
+		nodes,
+		func(all []types.NodeView) map[types.NodeID][]types.NodeID {
+			if len(all) < len(nodes) {
+				<-release
+			}
+
+			return nil
+		},
+		TestBatchSize,
+		TestBatchTimeout,
+	)
+	s.nodeStore.Start()
+
+	var rowDeletes atomic.Int32
+
+	require.NoError(t, s.db.DB.Callback().Delete().After("gorm:delete").Register(
+		"count_node_delete", func(tx *gorm.DB) {
+			if tx.Statement.Table == "nodes" {
+				rowDeletes.Add(1)
+			}
+		}))
+	t.Cleanup(func() { _ = s.db.DB.Callback().Delete().Remove("count_node_delete") })
+
+	var wg sync.WaitGroup
+
+	for _, node := range nodes {
+		wg.Go(func() {
+			_, err := s.DeleteNode(node.View())
+			assert.NoError(t, err)
+		})
+	}
+
+	assert.Eventually(t, func() bool {
+		return int(rowDeletes.Load()) == len(nodes)
+	}, 5*time.Second, 10*time.Millisecond,
+		"row deletes must not wait for a pending NodeStore delete")
+	releaseOnce.Do(func() { close(release) })
+	wg.Wait()
+}
+
+func TestPersistDuringDeleteDoesNotResurrectNode(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	node, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+	s.nodeStore.Stop()
+
+	entered, release := make(chan struct{}), make(chan struct{})
+
+	var enteredOnce sync.Once
+
+	s.nodeStore = NewNodeStore(
+		types.Nodes{node.AsStruct()},
+		func(nodes []types.NodeView) map[types.NodeID][]types.NodeID {
+			if len(nodes) == 0 {
+				enteredOnce.Do(func() { close(entered) })
+				<-release
+			}
+
+			return nil
+		},
+		TestBatchSize,
+		TestBatchTimeout,
+	)
+	s.nodeStore.Start()
+
+	var releaseOnce sync.Once
+
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+
+	deleteDone := make(chan error, 1)
+
+	go func() {
+		_, err := s.DeleteNode(node)
+		deleteDone <- err
+	}()
+
+	<-entered
+
+	persistDone := make(chan error, 1)
+
+	go func() {
+		_, err := s.persistNode(node)
+		persistDone <- err
+	}()
+
+	select {
+	case err := <-persistDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Error("persist blocked behind the NodeStore delete")
+	}
+
+	_, err := s.db.GetNodeByID(nodeID)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	releaseOnce.Do(func() { close(release) })
+	require.NoError(t, <-deleteDone)
+}
+
 func TestDeleteNodeKeepsStoreOnDBFailure(t *testing.T) {
 	_, s, nodeID := persistTestSetup(t)
 	t.Cleanup(func() { _ = s.Close() })
