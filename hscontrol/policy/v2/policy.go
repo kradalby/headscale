@@ -40,6 +40,11 @@ type PolicyManager struct {
 	// nodesByID indexes nodes; see [PolicyManager.cacheableLocked].
 	nodesByID map[types.NodeID]types.NodeView
 
+	// resolvedPol is pol with its groups resolved against users and
+	// nodes, see [Policy.withResolvedGroups]. Readers that resolve
+	// aliases on demand go through it; pol itself is what is hashed.
+	resolvedPol *Policy
+
 	filterHash deephash.Sum
 	filter     []tailcfg.FilterRule
 	matchers   []matcher.Match
@@ -255,9 +260,13 @@ func NewPolicyManager(b []byte, users []types.User, nodes views.Slice[types.Node
 // pm is written, so a caller that restores its own input on error leaves pm
 // as it was, and a retry with the same input recompiles.
 func (pm *PolicyManager) updateLocked() (bool, error) {
+	// Resolve every group once for this compilation; each step below
+	// would otherwise resolve it again for every rule naming it.
+	pol := pm.pol.withResolvedGroups(pm.users, pm.nodes)
+
 	// Compile all grants once. Both global and per-node filter
 	// rules are derived from these compiled grants.
-	grants := pm.pol.compileGrants(pm.users, pm.nodes)
+	grants := pol.compileGrants(pm.users, pm.nodes)
 
 	relayTargetIPs, err := collectRelayTargetIPs(grants)
 	if err != nil {
@@ -267,12 +276,12 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 	// Order matters, tags might be used in autoapprovers, so we need to ensure
 	// that the map for tag owners is resolved before resolving autoapprovers.
 	// TODO(kradalby): Order might not matter after #2417
-	tagMap, err := resolveTagOwners(pm.pol, pm.users, pm.nodes)
+	tagMap, err := resolveTagOwners(pol, pm.users, pm.nodes)
 	if err != nil {
 		return false, fmt.Errorf("resolving tag owners map: %w", err)
 	}
 
-	autoMap, exitSet, err := resolveAutoApprovers(pm.pol, pm.users, pm.nodes)
+	autoMap, exitSet, err := resolveAutoApprovers(pol, pm.users, pm.nodes)
 	if err != nil {
 		return false, fmt.Errorf("resolving auto approvers map: %w", err)
 	}
@@ -288,12 +297,13 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 
 	var nodeAttrs map[types.NodeID]tailcfg.NodeCapMap
 	if refreshNodeAttrs {
-		nodeAttrs, err = pm.pol.compileNodeAttrs(pm.users, pm.nodes)
+		nodeAttrs, err = pol.compileNodeAttrs(pm.users, pm.nodes)
 		if err != nil {
 			return false, fmt.Errorf("compiling nodeAttrs: %w", err)
 		}
 	}
 
+	pm.resolvedPol = pol
 	pm.compiledGrants = grants
 	pm.userNodeIdx = buildUserNodeIndex(pm.nodes)
 	pm.needsPerNodeFilter = hasPerNodeGrants(pm.compiledGrants)
@@ -498,7 +508,7 @@ func (pm *PolicyManager) sshRulesLocked(baseURL string) ([]compiledSSHRule, erro
 	defer pm.sshRulesMu.Unlock()
 
 	if pm.sshRules == nil {
-		rules, err := pm.pol.compileSSHRules(baseURL, pm.users, pm.nodes)
+		rules, err := pm.resolvedPol.compileSSHRules(baseURL, pm.users, pm.nodes)
 		if err != nil {
 			return nil, err
 		}
@@ -558,7 +568,7 @@ func (pm *PolicyManager) SSHCheckParams(
 		}
 
 		// Resolve sources and check if src node matches.
-		srcIPs, err := rule.Sources.Resolve(pm.pol, pm.users, pm.nodes)
+		srcIPs, err := rule.Sources.Resolve(pm.resolvedPol, pm.users, pm.nodes)
 		if err != nil || srcIPs == nil {
 			continue
 		}
@@ -585,7 +595,7 @@ func (pm *PolicyManager) SSHCheckParams(
 
 			hasOtherDests = true
 
-			dstIPs, err := dst.Resolve(pm.pol, pm.users, pm.nodes)
+			dstIPs, err := dst.Resolve(pm.resolvedPol, pm.users, pm.nodes)
 			if err != nil || dstIPs == nil {
 				continue
 			}
@@ -1508,7 +1518,7 @@ func (pm *PolicyManager) ViaRoutesForPeer(viewer, peer types.NodeView) types.Via
 		resolved[i] = true
 
 		for _, src := range grants[i].Sources {
-			ips, err := src.Resolve(pm.pol, pm.users, pm.nodes)
+			ips, err := src.Resolve(pm.resolvedPol, pm.users, pm.nodes)
 			if err != nil {
 				continue
 			}
@@ -1522,7 +1532,7 @@ func (pm *PolicyManager) ViaRoutesForPeer(viewer, peer types.NodeView) types.Via
 
 		if viewerMatchesGrant[i] {
 			resolvedDstPrefixes[i], grantHasAutoGroupInternet[i] = resolveViaDestinations(
-				pm.pol, pm.users, pm.nodes, grants[i].Destinations,
+				pm.resolvedPol, pm.users, pm.nodes, grants[i].Destinations,
 			)
 		}
 
