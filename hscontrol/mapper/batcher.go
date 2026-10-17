@@ -623,7 +623,24 @@ func (b *Batcher) worker(workerID int) {
 				var held []change.Change
 
 				nc.workMu.Lock()
+				nc.sendBlocked.Store(0)
+
 				for i, ch := range w.changes {
+					// A node that drains slower than it is sent to must not
+					// keep the worker from the other nodes: once it has made
+					// the worker wait as long as a stale connection would,
+					// the rest waits for the next tick.
+					if time.Duration(nc.sendBlocked.Load()) >= staleConnectionTimeout {
+						held = w.changes[i:]
+
+						wlog.Debug().
+							Uint64(zf.NodeID, w.nodeID.Uint64()).
+							Int("deferred_changes", len(held)).
+							Msg("node drains slowly, deferring rest of bundle to next tick")
+
+						break
+					}
+
 					err := nc.change(ch)
 					if errors.Is(err, errNoReadyConnections) {
 						held = w.changes[i:]

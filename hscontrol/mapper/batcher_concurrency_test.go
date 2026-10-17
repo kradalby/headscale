@@ -1117,7 +1117,7 @@ func TestBug7_CleanupOfflineNodes_PendingChangesCleanedStructurally(t *testing.T
 func TestBug8_SerialTimeoutUnderWriteLock(t *testing.T) {
 	mc := newMultiChannelNodeConn(1, nil)
 
-	// Add 5 stale connections (unbuffered, no reader = will timeout at 50ms each)
+	// Add 5 stale connections (unbuffered, no reader = will timeout)
 	const staleCount = 5
 	for i := range staleCount {
 		ch := make(chan *tailcfg.MapResponse) // unbuffered
@@ -1145,8 +1145,8 @@ func TestBug8_SerialTimeoutUnderWriteLock(t *testing.T) {
 		lockAcquired <- lockWait
 	}()
 
-	// Run send() with 5 stale connections. Total wall time will be ~250ms
-	// (5 * 50ms serial timeouts), but the lock should be free during sends.
+	// Run send() with 5 stale connections. Total wall time will be ~50ms
+	// (they share one timeout), and the lock should be free during sends.
 	_ = mc.send(testMapResponse())
 
 	lockWait := <-lockAcquired
