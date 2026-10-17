@@ -114,6 +114,7 @@ const (
 	Version        = "version"
 	StatusCode     = "status_code"
 	RegistrationID = "registration_id"
+	LocalUser      = "local_user"
 )
 
 // Network fields.
