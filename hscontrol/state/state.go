@@ -2455,6 +2455,26 @@ func (s *State) processReauthTags(
 	return nil
 }
 
+// LoginNode returns the node that a login by userID on machineKey
+// re-authenticates. False means the login adds a new device. It follows
+// [State.HandleNodeFromAuthPath]: the user's own node, else the machine's
+// tagged node.
+func (s *State) LoginNode(
+	machineKey key.MachinePublic,
+	userID types.UserID,
+) (types.NodeView, bool) {
+	all := s.nodeStore.GetNodesByMachineKeyAllUsers(machineKey)
+	if node, ok := all[userID]; ok {
+		return node, true
+	}
+
+	if node, ok := all[0]; ok && node.IsTagged() {
+		return node, true
+	}
+
+	return types.NodeView{}, false
+}
+
 // HandleNodeFromAuthPath handles node registration through authentication flow (like OIDC).
 func (s *State) HandleNodeFromAuthPath(
 	authID types.AuthID,
