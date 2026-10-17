@@ -74,6 +74,19 @@ var (
 	ErrACLAutogroupSelfInvalidSource = errors.New("autogroup:self can only be used with users, groups, or supported autogroups")
 )
 
+// ErrTooManyDstPorts is returned for a policy over [maxDstPorts].
+var ErrTooManyDstPorts = errors.New(
+	"too many combinations of destination and port range",
+)
+
+// maxDstPorts bounds the [tailcfg.NetPortRange] entries the ACLs and grants
+// of one policy compile to. A rule compiles to one entry per destination
+// prefix and port range, so a grant, which lists the two separately, grows
+// the filter with the product of its lists and not with the size of the
+// policy. The limit is about what 1 MiB of policy holds when every
+// combination is written out as an ACL destination.
+const maxDstPorts = 100_000
+
 // Grant validation errors.
 var (
 	ErrGrantMissingIPOrApp             = errors.New("ip and app can not both be empty")
@@ -2370,6 +2383,17 @@ func validateGrantSrcDstCombination(sources Aliases, destinations Aliases) error
 	return nil
 }
 
+// minDstPrefixes returns how many prefixes dst resolves to as far as the
+// policy alone tells. Users, groups and tags count as one, their devices are
+// not known before the policy is compiled.
+func minDstPrefixes(dst Alias) int64 {
+	if ag, ok := dst.(*AutoGroup); ok && ag.Is(AutoGroupInternet) {
+		return int64(len(util.TheInternet().Prefixes()))
+	}
+
+	return 1
+}
+
 // validate reports if there are any errors in a policy after
 // the unmarshaling process.
 // It runs through all rules and checks if there are any inconsistencies
@@ -2384,6 +2408,10 @@ func (p *Policy) validate() error {
 	// All errors are collected and presented to the user,
 	// when adding more validation, please add to the list of errors.
 	var errs []error
+
+	// Summed over the policy, many rules just below a limit of their own
+	// would add up again. int64: an int can wrap on 32-bit builds.
+	var dstPorts int64
 
 	for _, acl := range p.ACLs {
 		for _, src := range acl.Sources {
@@ -2425,6 +2453,8 @@ func (p *Policy) validate() error {
 		}
 
 		for _, dst := range acl.Destinations {
+			dstPorts += minDstPrefixes(dst.Alias) * int64(len(dst.Ports))
+
 			switch h := dst.Alias.(type) {
 			case *Host:
 				if !p.Hosts.exist(*h) {
@@ -2663,8 +2693,12 @@ func (p *Policy) validate() error {
 			}
 		}
 
+		var dstPrefixes int64
+
 		// Validate destinations (empty arrays are allowed — they produce no rules)
 		for _, dst := range grant.Destinations {
+			dstPrefixes += minDstPrefixes(dst)
+
 			switch h := dst.(type) {
 			case *Host:
 				if !p.Hosts.exist(*h) {
@@ -2695,6 +2729,10 @@ func (p *Policy) validate() error {
 			}
 		}
 
+		for _, ipp := range grant.InternetProtocols {
+			dstPorts += dstPrefixes * int64(len(ipp.Ports))
+		}
+
 		// Validate via tags. Wording matches Tailscale SaaS
 		// ("tag %q not found"), which differs from the ACL-src
 		// wording ("src=tag not found: %q").
@@ -2714,6 +2752,12 @@ func (p *Policy) validate() error {
 		if err != nil {
 			errs = append(errs, err)
 		}
+	}
+
+	if dstPorts > maxDstPorts {
+		errs = append(errs, fmt.Errorf(
+			"%w: %d, limit %d", ErrTooManyDstPorts, dstPorts, maxDstPorts,
+		))
 	}
 
 	for _, na := range p.NodeAttrs {
