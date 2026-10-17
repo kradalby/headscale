@@ -250,6 +250,10 @@ func NewState(cfg *types.Config) (*State, error) {
 	// This ensures we don't have stale online status from previous runs
 	for _, node := range nodes {
 		node.IsOnline = new(false)
+
+		// Rows written before the client report bounds are served bounded;
+		// the next persist rewrites them.
+		node.BoundClientReport()
 	}
 
 	users, err := db.ListUsers(nil)
