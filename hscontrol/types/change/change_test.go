@@ -861,3 +861,181 @@ func TestNodeKeyRotatedSendsExpiryInUTC(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, latest.Equal(*c.PeerPatches[0].KeyExpiry))
 }
+
+func TestChange_IsPeerUpdate(t *testing.T) {
+	targeted := NodeOnline(2)
+	targeted.TargetNode = 1
+
+	tests := []struct {
+		name string
+		c    Change
+		want bool
+	}{
+		{name: "online patch", c: NodeOnline(2), want: true},
+		{name: "key rotation patch", c: KeyExpiryFor(2, time.Now()), want: true},
+		{name: "node added", c: NodeAdded(2), want: true},
+		{name: "peers changed", c: PeersChanged("peers", 2, 3), want: true},
+		{name: "targeted patch", c: targeted, want: false},
+		{name: "peers removed", c: PeersRemoved(2), want: false},
+		{name: "policy and peers", c: PolicyAndPeers(2), want: false},
+		{name: "policy change", c: PolicyChange(), want: false},
+		{name: "self update", c: SelfUpdate(2), want: false},
+		{name: "full update", c: FullUpdate(), want: false},
+		{name: "empty", c: Change{}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.c.IsPeerUpdate())
+		})
+	}
+}
+
+func TestCoalescePeerUpdates(t *testing.T) {
+	online, offline := true, false
+	disco1, disco2 := key.NewDisco().Public(), key.NewDisco().Public()
+	endpoints := []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")}
+
+	t.Run("patches for one peer become one, the newer value winning",
+		func(t *testing.T) {
+			older := &tailcfg.PeerChange{
+				NodeID:    2,
+				DiscoKey:  &disco1,
+				Endpoints: endpoints,
+				Online:    &offline,
+			}
+			newer := &tailcfg.PeerChange{NodeID: 2, DiscoKey: &disco2, Online: &online}
+
+			got := CoalescePeerUpdates(1, []Change{
+				EndpointOrDERPUpdate(2, older), EndpointOrDERPUpdate(2, newer),
+			})
+			require.Len(t, got, 1)
+			assert.Equal(t,
+				[]*tailcfg.PeerChange{{
+					NodeID:    2,
+					DiscoKey:  &disco2,
+					Endpoints: endpoints,
+					Online:    &online,
+				}},
+				got[0].PeerPatches)
+			assert.Equal(t, &disco1, older.DiscoKey,
+				"patches are shared with the other nodes' queues")
+		})
+
+	t.Run("patches for other peers are kept", func(t *testing.T) {
+		got := CoalescePeerUpdates(1, []Change{
+			NodeOnline(2), NodeOffline(3), NodeOffline(2),
+		})
+		require.Len(t, got, 1)
+		assert.Equal(t,
+			[]*tailcfg.PeerChange{
+				{NodeID: 2, Online: &offline},
+				{NodeID: 3, Online: &offline},
+			},
+			got[0].PeerPatches)
+	})
+
+	t.Run("a whole peer replaces its patches", func(t *testing.T) {
+		got := CoalescePeerUpdates(1, []Change{
+			NodeOffline(2), NodeOnline(3), NodeAdded(2), NodeOnline(2),
+		})
+		require.Len(t, got, 1)
+		assert.Equal(t, []types.NodeID{2}, got[0].PeersChanged)
+		assert.Equal(t,
+			[]*tailcfg.PeerChange{{NodeID: 3, Online: &online}},
+			got[0].PeerPatches)
+	})
+
+	t.Run("the result is not mistaken for a self update", func(t *testing.T) {
+		got := CoalescePeerUpdates(1,
+			[]Change{NodeAdded(3), NodeAdded(2), NodeAdded(3)})
+		require.Len(t, got, 1)
+		assert.Equal(t, []types.NodeID{2, 3}, got[0].PeersChanged)
+		assert.Zero(t, got[0].OriginNode)
+	})
+
+	t.Run("the origin gets one self update, which cannot carry another peer",
+		func(t *testing.T) {
+			assert.Equal(t,
+				[]Change{NodeAdded(3), NodeAdded(2), NodeAdded(3)},
+				CoalescePeerUpdates(2, []Change{
+					NodeAdded(3), NodeAdded(2), KeyExpiryFor(2, time.Now()),
+					NodeAdded(2), NodeAdded(3),
+				}))
+		})
+
+	t.Run("anything else keeps its place", func(t *testing.T) {
+		targeted := NodeOnline(3)
+		targeted.TargetNode = 1
+
+		for _, other := range []Change{
+			{},
+			PolicyChange(),
+			FullUpdate(),
+			PeersRemoved(3),
+			SelfUpdate(1),
+			DERPMap(),
+			PolicyAndPeers(3),
+			PingNode(1, &tailcfg.PingRequest{}),
+			targeted,
+		} {
+			changes := []Change{NodeOnline(2), other, other, NodeOnline(2)}
+			assert.Equal(t, changes, CoalescePeerUpdates(1, changes), other.Reason)
+		}
+	})
+}
+
+// TestMergePeerPatch_FieldSync fails when [tailcfg.PeerChange] gains a field
+// that mergePeerPatch does not carry over.
+func TestMergePeerPatch_FieldSync(t *testing.T) {
+	now := time.Now()
+	newer := &tailcfg.PeerChange{
+		NodeID:       2,
+		DERPRegion:   1,
+		Cap:          1,
+		CapMap:       tailcfg.NodeCapMap{"cap": nil},
+		Endpoints:    []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")},
+		Key:          new(key.NewNode().Public()),
+		KeySignature: []byte{1},
+		DiscoKey:     new(key.NewDisco().Public()),
+		Online:       new(true),
+		LastSeen:     &now,
+		KeyExpiry:    &now,
+	}
+
+	for field, value := range reflect.ValueOf(*newer).Fields() {
+		require.False(t, value.IsZero(),
+			"set %s here and carry it over in mergePeerPatch", field.Name)
+	}
+
+	assert.Equal(t, newer, mergePeerPatch(tailcfg.PeerChange{NodeID: 2}, newer))
+	assert.Equal(t, newer, mergePeerPatch(*newer, &tailcfg.PeerChange{NodeID: 2}))
+}
+
+// TestMergePeerPatch_WireOmittedZeroKeepsOlder pins that a newer patch's
+// pointer to a zero key or time leaves the older value: the wire omits it, so
+// a client applying the two patches in turn keeps the older one.
+func TestMergePeerPatch_WireOmittedZeroKeepsOlder(t *testing.T) {
+	now := time.Now()
+	older := tailcfg.PeerChange{
+		NodeID:    2,
+		Key:       new(key.NewNode().Public()),
+		DiscoKey:  new(key.NewDisco().Public()),
+		LastSeen:  &now,
+		KeyExpiry: &now,
+	}
+	newer := &tailcfg.PeerChange{
+		NodeID:    2,
+		Key:       new(key.NodePublic{}),
+		DiscoKey:  new(key.DiscoPublic{}),
+		LastSeen:  new(time.Time{}),
+		KeyExpiry: new(time.Time{}),
+	}
+
+	wire, err := json.Marshal(newer)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"NodeID":2}`, string(wire),
+		"the wire omits a pointer to a zero key or time")
+
+	assert.Equal(t, &older, mergePeerPatch(older, newer))
+}

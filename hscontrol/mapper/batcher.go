@@ -782,8 +782,7 @@ func (b *Batcher) processBatchedChanges() {
 			return true
 		}
 
-		// One policy recompute rebuilds the whole netmap; drop same-tick repeats.
-		pending = change.DedupePolicyChanges(pending)
+		pending = coalesce(nodeID, pending)
 
 		// Queue a single work item containing all pending changes.
 		nc.inFlight.Store(true)

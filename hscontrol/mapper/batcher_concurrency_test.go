@@ -433,7 +433,8 @@ func TestProcessBatchedChanges_ConcurrentAdd_NoDataLoss(t *testing.T) {
 	// Use a large work channel so processBatchedChanges never blocks.
 	lb.b.workCh = make(chan work, 100000)
 
-	const iterations = 500
+	// No more than may be pending at once, so none are collapsed into a full.
+	const iterations = maxPendingChanges
 
 	var addedCount atomic.Int64
 
