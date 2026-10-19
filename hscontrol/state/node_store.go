@@ -15,7 +15,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
@@ -809,25 +808,29 @@ func snapshotFromNodes(
 }
 
 // onlineAdvertisers maps each non-exit prefix to the IDs of online nodes
-// that approve it. Nodes are visited in the order of ids, so the per-prefix
-// slices preserve that order.
+// that approve it, ordered by node ID.
 func onlineAdvertisers(
 	nodes map[types.NodeID]types.Node,
-	ids []types.NodeID,
 ) map[netip.Prefix][]types.NodeID {
+	var ids []types.NodeID
+
+	for id, n := range nodes {
+		if n.IsOnline == nil || !*n.IsOnline ||
+			len(n.ApprovedRoutes) == 0 || len(n.AnnouncedRoutes()) == 0 {
+			continue
+		}
+
+		ids = append(ids, id)
+	}
+
+	// Ordinary clients do not need to participate in the election's sort.
+	slices.Sort(ids)
+
 	advertisers := make(map[netip.Prefix][]types.NodeID)
 
 	for _, id := range ids {
 		n := nodes[id]
-		if n.IsOnline == nil || !*n.IsOnline {
-			continue
-		}
-
-		for _, p := range n.AllApprovedRoutes() {
-			if tsaddr.IsExitRoute(p) {
-				continue
-			}
-
+		for _, p := range n.SubnetRoutes() {
 			advertisers[p] = append(advertisers[p], id)
 		}
 	}
@@ -848,7 +851,7 @@ func electPrimaryRoutes(
 	nodes map[types.NodeID]types.Node,
 	prev map[netip.Prefix]types.NodeID,
 ) (map[netip.Prefix]types.NodeID, map[types.NodeID]bool) {
-	advertisers := onlineAdvertisers(nodes, slices.Sorted(maps.Keys(nodes)))
+	advertisers := onlineAdvertisers(nodes)
 
 	routes := make(map[netip.Prefix]types.NodeID, len(advertisers))
 	for prefix, candidates := range advertisers {
@@ -1121,10 +1124,7 @@ func (s *NodeStore) PrimaryRoutesForNode(id types.NodeID) []netip.Prefix {
 func (s *NodeStore) HANodes() map[netip.Prefix][]types.NodeID {
 	snap := s.data.Load()
 
-	advertisers := onlineAdvertisers(
-		snap.nodesByID,
-		slices.Sorted(maps.Keys(snap.nodesByID)),
-	)
+	advertisers := onlineAdvertisers(snap.nodesByID)
 
 	out := make(map[netip.Prefix][]types.NodeID)
 
