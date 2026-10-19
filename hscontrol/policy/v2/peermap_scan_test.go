@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
+	"slices"
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
@@ -295,6 +296,8 @@ func TestBuildPeerMapMatchesPairScan(t *testing.T) {
 			want := buildPeerMapPairScan(pm, in)
 			got := pm.BuildPeerMap(in)
 			require.Equalf(t, want, got, "iteration %d, policy %s", it, polB)
+			require.Equalf(t, want, buildPeerMapPerNodeReference(pm, in),
+				"frozen current build: iteration %d, policy %s", it, polB)
 			require.Equalf(t, want, buildPeerMapSortedSlice(pm, in),
 				"sorted slice: iteration %d, policy %s", it, polB)
 			require.Equalf(t, want, buildPeerMapSliceMap(pm, in),
@@ -843,5 +846,472 @@ func benchmarkPeerMapBuilders(b *testing.B, pm *PolicyManager, nodes types.Nodes
 				builder.build(pm, nodes.ViewSlice())
 			}
 		})
+	}
+}
+
+// buildPeerMapPerNodeReference retains BuildPeerMap before per-node matcher
+// evaluation was shared across nodes. Keep it independent of the optimized path.
+//
+//nolint:gocyclo // Preserve the original implementation for differential tests and benchmarks.
+func buildPeerMapPerNodeReference(pm *PolicyManager, nodes views.Slice[types.NodeView]) map[types.NodeID][]types.NodeID {
+	if pm == nil {
+		return nil
+	}
+
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	// Precompute each node's subnet routes and exit-node status once; the
+	// O(n^2) pair scans below would otherwise recompute them for every pair.
+	type nodeRoutes struct {
+		subnet []netip.Prefix
+		isExit bool
+	}
+
+	routeInfo := make(map[types.NodeID]nodeRoutes, nodes.Len())
+	for _, n := range nodes.All() {
+		routeInfo[n.ID()] = nodeRoutes{subnet: n.SubnetRoutes(), isExit: n.IsExitNode()}
+	}
+
+	// If we have a global filter, use it for all nodes (normal case).
+	// Via grants require the per-node path because the global filter
+	// skips via grants (compileFilterRules: if len(grant.Via) > 0 { continue }).
+	if !pm.needsPerNodeFilter {
+		ret := make(map[types.NodeID][]types.NodeID, nodes.Len())
+
+		// A matcher lets a reach b when a satisfies its source side and b
+		// its destination side, exactly as [types.Node.CanAccess] tests
+		// them, and each side depends on one node only. So evaluate both
+		// sides once per node, as bitsets over pm.matchers, instead of
+		// once per pair: a can reach b iff a's source set and b's
+		// destination set intersect. That turns the O(n^2 * matchers)
+		// scan into O(n * matchers) set lookups plus O(n^2) word ANDs.
+		words := (len(pm.matchers) + 63) / 64 //nolint:mnd
+		ids := make([]types.NodeID, nodes.Len())
+		srcOf := make([][]uint64, nodes.Len()) // nil: source of no matcher
+		dstOf := make([][]uint64, nodes.Len()) // nil: destination of no matcher
+
+		for i, n := range nodes.All() {
+			ids[i] = n.ID()
+			if !n.Valid() {
+				continue
+			}
+
+			ips, ri := n.IPs(), routeInfo[n.ID()]
+			routed := len(ri.subnet) > 0
+
+			for k := range pm.matchers {
+				m := &pm.matchers[k]
+
+				if m.SrcsContainsIPs(ips...) || (routed && m.SrcsOverlapsPrefixes(ri.subnet...)) {
+					if srcOf[i] == nil {
+						srcOf[i] = make([]uint64, words)
+					}
+
+					srcOf[i][k/64] |= 1 << (k % 64) //nolint:mnd
+				}
+
+				if m.DestsContainsIP(ips...) || (routed && m.DestsOverlapsPrefixes(ri.subnet...)) ||
+					(ri.isExit && m.DestsIsTheInternet()) {
+					if dstOf[i] == nil {
+						dstOf[i] = make([]uint64, words)
+					}
+
+					dstOf[i][k/64] |= 1 << (k % 64) //nolint:mnd
+				}
+			}
+		}
+
+		canAccess := func(src, dst []uint64) bool {
+			if src == nil || dst == nil {
+				return false
+			}
+
+			for w := range src {
+				if src[w]&dst[w] != 0 {
+					return true
+				}
+			}
+
+			return false
+		}
+
+		// Build the map of all peers according to the matchers.
+		for i := range ids {
+			for j := i + 1; j < len(ids); j++ {
+				if ids[i] == ids[j] {
+					continue
+				}
+
+				if canAccess(srcOf[i], dstOf[j]) || canAccess(srcOf[j], dstOf[i]) {
+					ret[ids[i]] = append(ret[ids[i]], ids[j])
+					ret[ids[j]] = append(ret[ids[j]], ids[i])
+				}
+			}
+		}
+
+		return ret
+	}
+
+	// For autogroup:self or via grants, build per-node peer relationships
+	ret := make(map[types.NodeID][]types.NodeID, nodes.Len())
+
+	// Pre-compute per-node matchers using unreduced compiled rules
+	// We need unreduced rules to determine peer relationships correctly.
+	// Reduced rules only show destinations where the node is the target,
+	// but peer relationships require the full bidirectional access rules.
+	nodeMatchers := make(map[types.NodeID][]matcher.Match, nodes.Len())
+	for _, node := range nodes.All() {
+		unreduced := pm.filterRulesForNodeLocked(node)
+		nodeMatchers[node.ID()] = matcher.MatchesFromFilterRules(unreduced)
+	}
+
+	// Check each node pair for peer relationships.
+	// Start j at i+1 to avoid checking the same pair twice and creating duplicates.
+	// We use symmetric visibility: if EITHER node can access the other, BOTH see
+	// each other. This matches the global filter path behavior and ensures that
+	// one-way access rules (e.g., admin -> tagged server) still allow both nodes
+	// to see each other as peers, which is required for network connectivity.
+	for i := range nodes.Len() {
+		nodeI := nodes.At(i)
+		matchersI, hasFilterI := nodeMatchers[nodeI.ID()]
+		riI := routeInfo[nodeI.ID()]
+
+		for j := i + 1; j < nodes.Len(); j++ {
+			nodeJ := nodes.At(j)
+			matchersJ, hasFilterJ := nodeMatchers[nodeJ.ID()]
+			riJ := routeInfo[nodeJ.ID()]
+
+			// Check all access directions for symmetric peer visibility.
+			// For via grants, filter rules exist on the via-designated node
+			// (e.g., router-a) with sources being the client (group-a).
+			// We need to check BOTH:
+			//   1. nodeI.CanAccess(matchersI, nodeJ) — can nodeI reach nodeJ?
+			//   2. nodeJ.CanAccess(matchersI, nodeI) — can nodeJ reach nodeI
+			//      using nodeI's matchers? (reverse direction: the matchers
+			//      on the via node accept traffic FROM the source)
+			// Same for matchersJ in both directions.
+			canIAccessJ := hasFilterI && nodeI.CanAccessWithRoutes(matchersI, nodeJ, riI.subnet, riJ.subnet, riJ.isExit)
+			canJAccessI := hasFilterJ && nodeJ.CanAccessWithRoutes(matchersJ, nodeI, riJ.subnet, riI.subnet, riI.isExit)
+			canJReachI := hasFilterI && nodeJ.CanAccessWithRoutes(matchersI, nodeI, riJ.subnet, riI.subnet, riI.isExit)
+			canIReachJ := hasFilterJ && nodeI.CanAccessWithRoutes(matchersJ, nodeJ, riI.subnet, riJ.subnet, riJ.isExit)
+
+			if canIAccessJ || canJAccessI || canJReachI || canIReachJ {
+				ret[nodeI.ID()] = append(ret[nodeI.ID()], nodeJ.ID())
+				ret[nodeJ.ID()] = append(ret[nodeJ.ID()], nodeI.ID())
+			}
+		}
+	}
+
+	return ret
+}
+
+func TestBuildPeerMapPerNodeInputs(t *testing.T) {
+	users, nodes := benchNodes(70)
+	reversed := append(types.Nodes(nil), nodes...)
+	slices.Reverse(reversed)
+
+	duplicate := nodes[1].View().AsStruct()
+	duplicate.ID = nodes[0].ID
+
+	for _, pol := range benchPolicies[1:] {
+		t.Run(pol.name, func(t *testing.T) {
+			pm, err := NewPolicyManager([]byte(pol.policy), users, nodes.ViewSlice())
+			require.NoError(t, err)
+			require.True(t, pm.needsPerNodeFilter)
+
+			for _, tt := range []struct {
+				name  string
+				nodes types.Nodes
+			}{
+				{"empty", nil},
+				{"full", nodes},
+				{"reversed", reversed},
+				{"subset", nodes[:25]},
+				{"duplicate-id", append(append(types.Nodes(nil), nodes...), duplicate)},
+				{"duplicate-view", append(append(types.Nodes(nil), nodes...), nodes[1])},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					in := tt.nodes.ViewSlice()
+					want := buildPeerMapPerNodeReference(pm, in)
+					require.Equal(t, want, pm.BuildPeerMap(in))
+				})
+			}
+		})
+	}
+}
+
+func TestBuildPeerMapPerNodeRuleOwnership(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+	nodes := types.Nodes{
+		{
+			ID: 1, IPv4: ap("100.64.0.1"), User: &users[0], UserID: &users[0].ID,
+			Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{mp("10.1.0.0/24")}},
+			ApprovedRoutes: []netip.Prefix{mp("10.1.0.0/24")},
+		},
+		{
+			ID: 2, IPv4: ap("100.64.0.2"), User: &users[1], UserID: &users[1].ID,
+			Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{mp("10.2.0.0/24")}},
+			ApprovedRoutes: []netip.Prefix{mp("10.2.0.0/24")},
+		},
+		{
+			ID: 3, IPv4: ap("100.64.0.3"), Tags: []string{"tag:router"},
+			Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{mp("10.0.0.0/8")}},
+			ApprovedRoutes: []netip.Prefix{mp("10.0.0.0/8")},
+		},
+		{
+			ID: 4, IPv4: ap("100.64.0.4"), Tags: []string{"tag:other"},
+			Hostinfo: &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{mp("10.3.0.0/24")}},
+		},
+		{
+			ID: 5, IPv4: ap("100.64.0.5"), Tags: []string{"tag:other"},
+			ApprovedRoutes: []netip.Prefix{mp("10.4.0.0/24")},
+		},
+	}
+	pm, err := NewPolicyManager([]byte(`{
+		"tagOwners": {"tag:other": [], "tag:router": []},
+		"grants": [
+			{"src": ["10.0.0.0/8"], "dst": ["10.0.0.0/8"],
+			 "ip": ["*"], "via": ["tag:router"]},
+			{"src": ["autogroup:member"], "dst": ["autogroup:self"], "ip": ["*"]}
+		]
+	}`), users, nodes.ViewSlice())
+	require.NoError(t, err)
+	require.True(t, pm.needsPerNodeFilter)
+
+	want := map[types.NodeID][]types.NodeID{1: {3}, 2: {3}, 3: {1, 2}}
+	require.Equal(t, want, buildPeerMapPerNodeReference(pm, nodes.ViewSlice()))
+	require.Equal(t, want, pm.BuildPeerMap(nodes.ViewSlice()))
+}
+
+func TestBuildPeerMapPerNodeInternet(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		dst         []string
+		ipv6        bool
+		compiledDst string
+	}{
+		{"internet", []string{"autogroup:internet"}, false, ""},
+		{"merged-internet", []string{"autogroup:internet", "192.168.0.0/24"}, false, ""},
+		{"ipv4-default", []string{"autogroup:internet"}, true, "0.0.0.0/0"},
+		{"ipv6-default", []string{"autogroup:internet"}, false, "::/0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			user := types.User{ID: 1, Name: "u1"}
+			exits := []netip.Prefix{mp("0.0.0.0/0"), mp("::/0")}
+
+			private := mp("10.0.0.0/24")
+			if tt.ipv6 {
+				private = mp("fd00::/64")
+			}
+
+			nodes := types.Nodes{
+				{ID: 1, User: &user, UserID: &user.ID},
+				{
+					ID: 2, User: &user, UserID: &user.ID, Tags: []string{"tag:exit"},
+					Hostinfo: &tailcfg.Hostinfo{RoutableIPs: exits}, ApprovedRoutes: exits,
+				},
+				{
+					ID: 3, Tags: []string{"tag:exit"},
+					Hostinfo: &tailcfg.Hostinfo{RoutableIPs: exits},
+				},
+				{
+					ID: 4, Tags: []string{"tag:router"},
+					Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{private}},
+					ApprovedRoutes: []netip.Prefix{private},
+				},
+			}
+			for i, node := range nodes {
+				if tt.ipv6 {
+					node.IPv6 = ap(fmt.Sprintf("fd7a:115c:a1e0::%d", i+1))
+				} else {
+					node.IPv4 = ap(fmt.Sprintf("100.64.0.%d", i+1))
+				}
+			}
+
+			policy := must(json.Marshal(map[string]any{
+				"tagOwners": map[string][]string{"tag:exit": {}, "tag:router": {}},
+				"grants": []map[string][]string{
+					{"src": {"u1@"}, "dst": tt.dst, "ip": {"*"}},
+					{"src": {"autogroup:member"}, "dst": {"autogroup:self"}, "ip": {"*"}},
+				},
+			}))
+			pm, err := NewPolicyManager(policy, []types.User{user}, nodes.ViewSlice())
+			require.NoError(t, err)
+			require.True(t, pm.needsPerNodeFilter)
+
+			if tt.compiledDst != "" {
+				// The parser rejects explicit /0 aliases; test the legacy
+				// compiled representation directly without changing parsing.
+				pm.mu.Lock()
+				for i := range pm.compiledGrants {
+					for j := range pm.compiledGrants[i].rules {
+						pm.compiledGrants[i].rules[j].DstPorts = []tailcfg.NetPortRange{
+							{IP: tt.compiledDst, Ports: tailcfg.PortRange{First: 0, Last: 65535}},
+						}
+					}
+				}
+				pm.mu.Unlock()
+			}
+
+			want := map[types.NodeID][]types.NodeID{1: {2}, 2: {1}}
+			require.Equal(t, want, buildPeerMapPerNodeReference(pm, nodes.ViewSlice()))
+			require.Equal(t, want, pm.BuildPeerMap(nodes.ViewSlice()))
+		})
+	}
+}
+
+func TestBuildPeerMapPerNodeCapabilityOnly(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+	nodes := types.Nodes{
+		{ID: 1, IPv4: ap("100.64.0.1"), User: &users[0], UserID: &users[0].ID},
+		{
+			ID: 2, IPv4: ap("100.64.0.2"), Tags: []string{"tag:server"},
+			User: &users[0], UserID: &users[0].ID,
+		},
+		{ID: 3, IPv4: ap("100.64.0.3"), User: &users[1], UserID: &users[1].ID},
+		{
+			ID: 4, IPv4: ap("100.64.0.4"), Tags: []string{"tag:other"},
+			User: &users[0], UserID: &users[0].ID,
+		},
+	}
+	pm, err := NewPolicyManager([]byte(`{
+		"tagOwners": {"tag:server": [], "tag:other": []},
+		"grants": [
+			{"src": ["u1@"], "dst": ["tag:server"],
+			 "app": {"example.com/cap/test": [{"role": "read"}]}},
+			{"src": ["autogroup:member"], "dst": ["autogroup:self"], "ip": ["*"]}
+		]
+	}`), users, nodes.ViewSlice())
+	require.NoError(t, err)
+	require.True(t, pm.needsPerNodeFilter)
+
+	want := map[types.NodeID][]types.NodeID{1: {2}, 2: {1}}
+	require.Equal(t, want, buildPeerMapPerNodeReference(pm, nodes.ViewSlice()))
+	require.Equal(t, want, pm.BuildPeerMap(nodes.ViewSlice()))
+}
+
+func TestBuildPeerMapPerNodeWordBoundaries(t *testing.T) {
+	for _, n := range []int{1, 63, 64, 65, 127, 128, 129} {
+		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
+			user := types.User{ID: 1, Name: "u1"}
+
+			_, nodes := benchNodes(n)
+			for _, node := range nodes {
+				node.Tags = nil
+				node.User, node.UserID = &user, &user.ID
+			}
+
+			pm, err := NewPolicyManager([]byte(benchPolicies[1].policy), []types.User{user}, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			got := pm.BuildPeerMap(nodes.ViewSlice())
+			require.Equal(t, buildPeerMapPerNodeReference(pm, nodes.ViewSlice()), got)
+
+			for _, node := range nodes {
+				var peers []types.NodeID
+
+				for _, other := range nodes {
+					if other.ID != node.ID {
+						peers = append(peers, other.ID)
+					}
+				}
+
+				require.Equal(t, peers, got[node.ID])
+			}
+		})
+	}
+}
+
+func TestBuildPeerMapPerNodeStaleViews(t *testing.T) {
+	for _, pol := range benchPolicies[1:] {
+		t.Run(pol.name, func(t *testing.T) {
+			users, nodes := benchNodes(70)
+			pm, err := NewPolicyManager([]byte(pol.policy), users, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			old := nodes.ViewSlice()
+
+			updated := make(types.Nodes, len(nodes))
+			for i, node := range nodes {
+				updated[i] = node.View().AsStruct()
+			}
+
+			updated[1].User, updated[1].UserID = &users[2], &users[2].ID
+			updated[2].Tags = []string{"tag:srv"}
+			updated[20].ApprovedRoutes = nil
+			_, err = pm.SetNodes(updated.ViewSlice())
+			require.NoError(t, err)
+
+			for _, in := range []views.Slice[types.NodeView]{old, updated.ViewSlice()} {
+				require.Equal(t, buildPeerMapPerNodeReference(pm, in), pm.BuildPeerMap(in))
+			}
+		})
+	}
+}
+
+// BenchmarkBuildPeerMapPerNodeIndexes includes per-node rule compilation,
+// matcher preparation, adjacency construction, and output allocation.
+func BenchmarkBuildPeerMapPerNodeIndexes(b *testing.B) {
+	for _, pol := range benchPolicies[1:] {
+		for _, n := range []int{100, 300, 1000} {
+			users, nodes := benchNodes(n)
+			pm, err := NewPolicyManager([]byte(pol.policy), users, nodes.ViewSlice())
+			require.NoError(b, err)
+			require.True(b, pm.needsPerNodeFilter)
+
+			for _, builder := range []struct {
+				name  string
+				build func(*PolicyManager, views.Slice[types.NodeView]) map[types.NodeID][]types.NodeID
+			}{
+				{"reference", buildPeerMapPerNodeReference},
+				{"indexed", (*PolicyManager).BuildPeerMap},
+			} {
+				b.Run(fmt.Sprintf("%s/n=%d/%s", pol.name, n, builder.name), func(b *testing.B) {
+					b.ReportAllocs()
+
+					for b.Loop() {
+						builder.build(pm, nodes.ViewSlice())
+					}
+				})
+			}
+		}
+	}
+}
+
+func BenchmarkBuildPeerMapSelfOwnership(b *testing.B) {
+	for _, userCount := range []int{1, 10, 1000} {
+		users := make([]types.User, userCount)
+		for i := range users {
+			users[i] = types.User{ID: uint(i + 1), Name: fmt.Sprintf("u%d", i+1)}
+		}
+
+		_, nodes := benchNodes(1000)
+		for i, node := range nodes {
+			u := &users[i%len(users)]
+			node.Tags = nil
+			node.User, node.UserID = u, &u.ID
+		}
+
+		pm, err := NewPolicyManager([]byte(benchPolicies[1].policy), users, nodes.ViewSlice())
+		require.NoError(b, err)
+		require.True(b, pm.needsPerNodeFilter)
+		require.Equal(b, buildPeerMapPerNodeReference(pm, nodes.ViewSlice()), pm.BuildPeerMap(nodes.ViewSlice()))
+
+		for _, builder := range []struct {
+			name  string
+			build func(*PolicyManager, views.Slice[types.NodeView]) map[types.NodeID][]types.NodeID
+		}{
+			{"reference", buildPeerMapPerNodeReference},
+			{"indexed", (*PolicyManager).BuildPeerMap},
+		} {
+			b.Run(fmt.Sprintf("n=1000/users=%d/%s", userCount, builder.name), func(b *testing.B) {
+				b.ReportAllocs()
+
+				for b.Loop() {
+					builder.build(pm, nodes.ViewSlice())
+				}
+			})
+		}
 	}
 }

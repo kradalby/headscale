@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -795,52 +796,152 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 		return ret
 	}
 
-	// For autogroup:self or via grants, build per-node peer relationships
+	// Per-node rules can repeat across devices owned by the same user and
+	// across via routers. Share their evaluation, while retaining which
+	// nodes supplied each rule: a rule may connect a pair only when it
+	// belongs to at least one end of that pair.
 	ret := make(map[types.NodeID][]types.NodeID, nodes.Len())
 
-	// Pre-compute per-node matchers using unreduced compiled rules
-	// We need unreduced rules to determine peer relationships correctly.
-	// Reduced rules only show destinations where the node is the target,
-	// but peer relationships require the full bidirectional access rules.
-	nodeMatchers := make(map[types.NodeID][]matcher.Match, nodes.Len())
-	for _, node := range nodes.All() {
-		unreduced := pm.filterRulesForNodeLocked(node)
-		nodeMatchers[node.ID()] = matcher.MatchesFromFilterRules(unreduced)
+	type peerRule struct {
+		filter tailcfg.FilterRule
+		match  matcher.Match
+		owners []int
 	}
 
-	// Check each node pair for peer relationships.
-	// Start j at i+1 to avoid checking the same pair twice and creating duplicates.
-	// We use symmetric visibility: if EITHER node can access the other, BOTH see
-	// each other. This matches the global filter path behavior and ensures that
-	// one-way access rules (e.g., admin -> tagged server) still allow both nodes
-	// to see each other as peers, which is required for network connectivity.
-	for i := range nodes.Len() {
-		nodeI := nodes.At(i)
-		matchersI, hasFilterI := nodeMatchers[nodeI.ID()]
-		riI := routeInfo[nodeI.ID()]
+	var rules []peerRule
 
-		for j := i + 1; j < nodes.Len(); j++ {
-			nodeJ := nodes.At(j)
-			matchersJ, hasFilterJ := nodeMatchers[nodeJ.ID()]
-			riJ := routeInfo[nodeJ.ID()]
+	byHash := make(map[deephash.Sum][]int)
 
-			// Check all access directions for symmetric peer visibility.
-			// For via grants, filter rules exist on the via-designated node
-			// (e.g., router-a) with sources being the client (group-a).
-			// We need to check BOTH:
-			//   1. nodeI.CanAccess(matchersI, nodeJ) — can nodeI reach nodeJ?
-			//   2. nodeJ.CanAccess(matchersI, nodeI) — can nodeJ reach nodeI
-			//      using nodeI's matchers? (reverse direction: the matchers
-			//      on the via node accept traffic FROM the source)
-			// Same for matchersJ in both directions.
-			canIAccessJ := hasFilterI && nodeI.CanAccessWithRoutes(matchersI, nodeJ, riI.subnet, riJ.subnet, riJ.isExit)
-			canJAccessI := hasFilterJ && nodeJ.CanAccessWithRoutes(matchersJ, nodeI, riJ.subnet, riI.subnet, riI.isExit)
-			canJReachI := hasFilterI && nodeJ.CanAccessWithRoutes(matchersI, nodeI, riJ.subnet, riI.subnet, riI.isExit)
-			canIReachJ := hasFilterJ && nodeI.CanAccessWithRoutes(matchersJ, nodeJ, riI.subnet, riJ.subnet, riJ.isExit)
+	nodeRules := make(map[types.NodeID][]int, nodes.Len())
+	for _, node := range nodes.All() {
+		unreduced := pm.filterRulesForNodeLocked(node)
 
-			if canIAccessJ || canJAccessI || canJReachI || canIReachJ {
-				ret[nodeI.ID()] = append(ret[nodeI.ID()], nodeJ.ID())
-				ret[nodeJ.ID()] = append(ret[nodeJ.ID()], nodeI.ID())
+		indices := make([]int, 0, len(unreduced))
+		for _, rule := range unreduced {
+			hash := deephash.Hash(&rule)
+			index := -1
+
+			for _, candidate := range byHash[hash] {
+				// A hash collision must never change peer visibility.
+				if reflect.DeepEqual(rules[candidate].filter, rule) {
+					index = candidate
+
+					break
+				}
+			}
+
+			if index == -1 {
+				index = len(rules)
+				rules = append(rules, peerRule{
+					filter: rule,
+					match:  matcher.MatchFromFilterRule(rule),
+				})
+				byHash[hash] = append(byHash[hash], index)
+			}
+
+			indices = append(indices, index)
+		}
+
+		// Keep the original NodeID-keyed, last-wins rule selection when
+		// callers provide several views of the same node.
+		nodeRules[node.ID()] = indices
+	}
+
+	ids := make([]types.NodeID, nodes.Len())
+	ips := make([][]netip.Addr, nodes.Len())
+	routes := make([]nodeRoutes, nodes.Len())
+	hasExit := false
+
+	for i, node := range nodes.All() {
+		ids[i], ips[i] = node.ID(), node.IPs()
+		routes[i] = routeInfo[node.ID()]
+		hasExit = hasExit || routes[i].isExit
+
+		for _, index := range nodeRules[node.ID()] {
+			owners := rules[index].owners
+			if len(owners) == 0 || owners[len(owners)-1] != i {
+				rules[index].owners = append(owners, i)
+			}
+		}
+	}
+
+	// Scratch sets are reused per rule; adjacency stores only nonzero
+	// words, so sparse peer groups do not allocate a full node-pair matrix.
+	const wordBits = 64
+
+	words := (nodes.Len() + wordBits - 1) / wordBits
+	sources, destinations := make([]uint64, words), make([]uint64, words)
+	adjacency := make([]map[int]uint64, nodes.Len())
+
+	for _, rule := range rules {
+		if len(rule.owners) == 0 {
+			continue
+		}
+
+		clear(sources)
+		clear(destinations)
+
+		internet := hasExit && rule.match.DestsIsTheInternet()
+
+		for i := range ids {
+			ri := routes[i]
+			if rule.match.SrcsContainsIPs(ips[i]...) ||
+				(len(ri.subnet) > 0 && rule.match.SrcsOverlapsPrefixes(ri.subnet...)) {
+				sources[i/wordBits] |= 1 << (i % wordBits)
+			}
+
+			if rule.match.DestsContainsIP(ips[i]...) ||
+				(len(ri.subnet) > 0 && rule.match.DestsOverlapsPrefixes(ri.subnet...)) ||
+				(ri.isExit && internet) {
+				destinations[i/wordBits] |= 1 << (i % wordBits)
+			}
+		}
+
+		for _, owner := range rule.owners {
+			src := sources[owner/wordBits]&(1<<(owner%wordBits)) != 0
+
+			dst := destinations[owner/wordBits]&(1<<(owner%wordBits)) != 0
+			if !src && !dst {
+				continue
+			}
+
+			for w := range sources {
+				var peers uint64
+				if src {
+					peers |= destinations[w]
+				}
+
+				if dst {
+					peers |= sources[w]
+				}
+
+				if w == owner/wordBits {
+					peers &^= 1 << (owner % wordBits)
+				}
+
+				if peers == 0 {
+					continue
+				}
+
+				if adjacency[owner] == nil {
+					adjacency[owner] = make(map[int]uint64)
+				}
+
+				adjacency[owner][w] |= peers
+			}
+		}
+	}
+
+	// Retain symmetric visibility and the original pair traversal order,
+	// including pairs whose views happen to share a NodeID.
+	for i := range ids {
+		for j := i + 1; j < len(ids); j++ {
+			fromI := adjacency[i][j/wordBits]&(1<<(j%wordBits)) != 0
+
+			fromJ := adjacency[j][i/wordBits]&(1<<(i%wordBits)) != 0
+			if fromI || fromJ {
+				ret[ids[i]] = append(ret[ids[i]], ids[j])
+				ret[ids[j]] = append(ret[ids[j]], ids[i])
 			}
 		}
 	}
