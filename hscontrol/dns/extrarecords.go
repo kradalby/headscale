@@ -53,7 +53,7 @@ func NewExtraRecordsManager(path string) (*ExtraRecordsMan, error) {
 		return nil, fmt.Errorf("%w: %s", ErrPathIsDirectory, path)
 	}
 
-	records, hash, err := readExtraRecordsFromPath(path)
+	records, hash, err := readExtraRecordsFromPath(path, nil)
 	if err != nil {
 		closeWatcher()
 		return nil, fmt.Errorf("reading extra records from path: %w", err)
@@ -183,7 +183,11 @@ func (e *ExtraRecordsMan) UpdateCh() <-chan []tailcfg.DNSRecord {
 }
 
 func (e *ExtraRecordsMan) updateRecords() {
-	records, newHash, err := readExtraRecordsFromPath(e.path)
+	e.mu.RLock()
+	previousHash := e.hash
+	e.mu.RUnlock()
+
+	records, newHash, err := readExtraRecordsFromPath(e.path, &previousHash)
 	if err != nil {
 		log.Error().Caller().Err(err).Msgf("reading extra records from path: %s", e.path)
 		return
@@ -224,8 +228,11 @@ func (e *ExtraRecordsMan) updateRecords() {
 
 // readExtraRecordsFromPath reads a file of [tailcfg.DNSRecord] in the format its
 // extension names (see [util.UnmarshalByExt]) and returns the records and the
-// hash of the file.
-func readExtraRecordsFromPath(path string) ([]tailcfg.DNSRecord, [32]byte, error) {
+// hash of the file. A matching previously accepted hash skips decoding and returns nil records.
+func readExtraRecordsFromPath(
+	path string,
+	previousHash *[32]byte,
+) ([]tailcfg.DNSRecord, [32]byte, error) {
 	var zero [32]byte
 
 	b, err := os.ReadFile(path)
@@ -241,6 +248,9 @@ func readExtraRecordsFromPath(path string) ([]tailcfg.DNSRecord, [32]byte, error
 
 	// Hash first: decoding HuJSON may rewrite comments in b.
 	hash := sha256.Sum256(b)
+	if previousHash != nil && hash == *previousHash {
+		return nil, hash, nil
+	}
 
 	records, err := util.UnmarshalByExt[[]tailcfg.DNSRecord](path, b)
 	if err != nil {
