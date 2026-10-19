@@ -453,12 +453,20 @@ func (entry *connectionEntry) send(data *tailcfg.MapResponse) error {
 		return fmt.Errorf("connection %s: %w", entry.id, errConnectionClosed)
 	}
 
+	// Only allocate a timeout when the send needs to wait.
+	select {
+	case entry.c <- data:
+		entry.lastUsed.Store(time.Now().Unix())
+		return nil
+	default:
+	}
+
 	// Use a short timeout to detect stale connections where the client isn't reading the channel.
 	// This is critical for detecting Docker containers that are forcefully terminated
 	// but still have channels that appear open.
 	//
 	// Use a timer rather than time.After so the timeout is explicitly released
-	// on the fast path; both are GC-recoverable since Go 1.23.
+	// after delivery; both are GC-recoverable since Go 1.23.
 	timer := time.NewTimer(50 * time.Millisecond) //nolint:mnd
 	defer timer.Stop()
 

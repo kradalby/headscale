@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -194,6 +195,161 @@ func makeConnectionEntry(id string, ch chan<- *tailcfg.MapResponse) *connectionE
 // ============================================================================
 // connectionEntry.send() Tests
 // ============================================================================
+
+func TestConnectionSendDifferential(t *testing.T) {
+	for _, impl := range connectionSendImplementations {
+		for _, tc := range []struct {
+			name      string
+			capacity  int
+			full      bool
+			closed    bool
+			nilData   bool
+			readAfter time.Duration
+			elapsed   time.Duration
+			wantErr   error
+		}{
+			{name: "buffered", capacity: 1, readAfter: -1},
+			{name: "reader_waiting", readAfter: 0},
+			{name: "nil", nilData: true, readAfter: -1},
+			{name: "closed", capacity: 1, closed: true, readAfter: -1, wantErr: errConnectionClosed},
+			{name: "closed_nil", closed: true, nilData: true, readAfter: -1},
+			{
+				name: "saturated", capacity: 1, full: true, readAfter: -1,
+				elapsed: 50 * time.Millisecond, wantErr: ErrConnectionSendTimeout,
+			},
+			{
+				name: "delayed_reader", capacity: 1, full: true,
+				readAfter: 10 * time.Millisecond, elapsed: 10 * time.Millisecond,
+			},
+		} {
+			t.Run(impl.name+"/"+tc.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					ch := make(chan *tailcfg.MapResponse, tc.capacity)
+					entry := makeConnectionEntry("paired", ch)
+					entry.closed.Store(tc.closed)
+					entry.lastUsed.Store(time.Now().Add(-time.Hour).Unix())
+					before := entry.lastUsed.Load()
+
+					data := testMapResponse()
+					if tc.nilData {
+						data = nil
+					}
+
+					sentinel := &tailcfg.MapResponse{KeepAlive: true}
+					if tc.full {
+						ch <- sentinel
+					}
+
+					received := make(chan *tailcfg.MapResponse, 1)
+
+					if tc.readAfter >= 0 {
+						go func() {
+							//nolint:forbidigo // synctest advances fake time
+							time.Sleep(tc.readAfter)
+
+							if tc.full {
+								assert.Same(t, sentinel, <-ch)
+							}
+
+							received <- <-ch
+						}()
+
+						synctest.Wait()
+					}
+
+					start := time.Now()
+					err := impl.send(entry, data)
+
+					assert.Equal(t, tc.elapsed, time.Since(start))
+
+					if tc.wantErr != nil {
+						require.ErrorIs(t, err, tc.wantErr)
+						require.EqualError(
+							t,
+							err,
+							"connection paired: "+tc.wantErr.Error(),
+						)
+					} else {
+						require.NoError(t, err)
+					}
+
+					if err == nil && data != nil {
+						assert.Equal(t, time.Now().Unix(), entry.lastUsed.Load())
+
+						if tc.readAfter >= 0 {
+							assert.Same(t, data, <-received)
+						} else {
+							assert.Same(t, data, <-ch)
+						}
+					} else {
+						assert.Equal(t, before, entry.lastUsed.Load())
+
+						if tc.full {
+							assert.Same(t, sentinel, <-ch)
+						}
+					}
+
+					assert.Empty(t, ch, "exactly the expected frames were delivered")
+				})
+			})
+		}
+	}
+}
+
+func TestConnectionSendCloseWhileBlocked(t *testing.T) {
+	for _, impl := range connectionSendImplementations {
+		for _, release := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/release=%t", impl.name, release), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					ch := make(chan *tailcfg.MapResponse, 1)
+
+					sentinel := &tailcfg.MapResponse{KeepAlive: true}
+					ch <- sentinel
+
+					entry := makeConnectionEntry("closing", ch)
+					entry.lastUsed.Store(0)
+
+					cancelled := make(chan struct{})
+					entry.stop = func() { close(cancelled) }
+					mc := newMultiChannelNodeConn(1, nil)
+					mc.addConnection(entry)
+
+					data := testMapResponse()
+					result := make(chan error, 1)
+					start := time.Now()
+
+					go func() { result <- impl.send(entry, data) }()
+
+					synctest.Wait()
+
+					mc.close()
+					<-cancelled
+					mc.close() // The owning session must only be stopped once.
+					assert.Empty(
+						t,
+						result,
+						"cancellation does not interrupt an in-progress send",
+					)
+
+					if release {
+						assert.Same(t, sentinel, <-ch)
+						require.NoError(t, <-result)
+						assert.Same(t, data, <-ch)
+						assert.Equal(t, time.Now().Unix(), entry.lastUsed.Load())
+					} else {
+						require.ErrorIs(t, <-result, ErrConnectionSendTimeout)
+						assert.Equal(t, 50*time.Millisecond, time.Since(start))
+						assert.Zero(t, entry.lastUsed.Load())
+						assert.Same(t, sentinel, <-ch)
+					}
+
+					require.ErrorIs(t, impl.send(entry, data), errConnectionClosed)
+					assert.Empty(t, ch)
+				})
+			})
+		}
+	}
+}
 
 func TestConnectionEntry_SendSuccess(t *testing.T) {
 	ch := make(chan *tailcfg.MapResponse, 1)
@@ -1276,4 +1432,209 @@ func TestMultiChannelSend_SSHPolicyPerConnection(t *testing.T) {
 
 	assert.Nil(t, expectReceive(t, chA, "a").SSHPolicy, "a already holds this policy")
 	assert.Same(t, data.SSHPolicy, expectReceive(t, chB, "b").SSHPolicy, "b holds an older policy")
+}
+
+// Frozen from 1096abfc8; keep the body unchanged for differential tests and benchmarks.
+func baselineConnectionSend(entry *connectionEntry, data *tailcfg.MapResponse) error {
+	if data == nil {
+		return nil
+	}
+
+	// Check if the connection has been closed to prevent send on closed channel panic.
+	// This can happen during shutdown when Close() is called while workers are still processing.
+	if entry.closed.Load() {
+		return fmt.Errorf("connection %s: %w", entry.id, errConnectionClosed)
+	}
+
+	// Use a short timeout to detect stale connections where the client isn't reading the channel.
+	// This is critical for detecting Docker containers that are forcefully terminated
+	// but still have channels that appear open.
+	//
+	// Use a timer rather than time.After so the timeout is explicitly released
+	// on the fast path; both are GC-recoverable since Go 1.23.
+	timer := time.NewTimer(50 * time.Millisecond) //nolint:mnd
+	defer timer.Stop()
+
+	select {
+	case entry.c <- data:
+		// Update last used timestamp on successful send
+		entry.lastUsed.Store(time.Now().Unix())
+		return nil
+	case <-timer.C:
+		// Connection is likely stale - client isn't reading from channel
+		// This catches the case where Docker containers are killed but channels remain open
+		return fmt.Errorf("connection %s: %w", entry.id, ErrConnectionSendTimeout)
+	}
+}
+
+var connectionSendImplementations = []struct {
+	name string
+	send func(*connectionEntry, *tailcfg.MapResponse) error
+}{
+	{"baseline", baselineConnectionSend},
+	{"candidate", (*connectionEntry).send},
+}
+
+// BenchmarkConnectionSendPaired includes the bounded receive/handoff in both
+// implementations so every operation finishes with its channel drained.
+func BenchmarkConnectionSendPaired(b *testing.B) {
+	for _, mode := range []string{"buffered", "active_reader"} {
+		for _, impl := range connectionSendImplementations {
+			b.Run(mode+"/"+impl.name, func(b *testing.B) {
+				b.StopTimer()
+
+				capacity := 30
+				if mode == "active_reader" {
+					capacity = 0
+				}
+
+				ch := make(chan *tailcfg.MapResponse, capacity)
+
+				received := ch
+				if mode == "active_reader" {
+					received = make(chan *tailcfg.MapResponse, 1)
+
+					done := make(chan struct{})
+					go func() {
+						defer close(done)
+
+						for data := range ch {
+							received <- data
+						}
+					}()
+
+					b.Cleanup(func() {
+						close(ch)
+						<-done
+					})
+				}
+
+				entry := makeConnectionEntry("paired", ch)
+				entry.lastUsed.Store(0)
+
+				data := testMapResponse()
+				successes, deliveries := 0, 0
+
+				b.ReportAllocs()
+				b.ResetTimer()
+				b.StartTimer()
+
+				for range b.N {
+					err := impl.send(entry, data)
+					if err != nil {
+						b.Fatal(err)
+					}
+
+					successes++
+
+					if got := <-received; got != data {
+						b.Fatal("unexpected response")
+					}
+
+					deliveries++
+				}
+
+				b.StopTimer()
+
+				if successes != b.N || deliveries != b.N || len(ch) != 0 ||
+					len(received) != 0 {
+					b.Fatalf(
+						"sent %d, received %d, want %d",
+						successes,
+						deliveries,
+						b.N,
+					)
+				}
+
+				if entry.lastUsed.Load() == 0 {
+					b.Fatal("successful delivery did not update lastUsed")
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkConnectionSendWaitPaired must use -benchtime=20x or less: a real
+// timeout costs 50ms, so calibration must not turn this control into a long run.
+func BenchmarkConnectionSendWaitPaired(b *testing.B) {
+	for _, mode := range []string{"delayed_reader", "timeout"} {
+		for _, impl := range connectionSendImplementations {
+			b.Run(mode+"/"+impl.name, func(b *testing.B) {
+				if b.N > 20 {
+					b.Skip("bounded wait control: use -benchtime=20x or less")
+				}
+
+				b.StopTimer()
+
+				ch := make(chan *tailcfg.MapResponse, 1)
+				entry := makeConnectionEntry("paired", ch)
+				data := testMapResponse()
+				sentinel := &tailcfg.MapResponse{KeepAlive: true}
+
+				b.ReportAllocs()
+				b.ResetTimer()
+
+				for range b.N {
+					entry.lastUsed.Store(0)
+
+					ch <- sentinel
+
+					var (
+						received chan *tailcfg.MapResponse
+						begin    chan struct{}
+					)
+
+					if mode == "delayed_reader" {
+						received = make(chan *tailcfg.MapResponse, 1)
+						begin = make(chan struct{})
+
+						go func() {
+							<-begin
+							//nolint:forbidigo // controlled delayed receiver
+							time.Sleep(time.Millisecond)
+
+							received <- <-ch
+						}()
+					}
+
+					b.StartTimer()
+
+					if begin != nil {
+						close(begin)
+					}
+
+					err := impl.send(entry, data)
+
+					b.StopTimer()
+
+					if mode == "delayed_reader" {
+						if got := <-received; got != sentinel {
+							b.Fatal("lost queued response")
+						}
+
+						if err != nil {
+							b.Fatal(err)
+						}
+
+						if got := <-ch; got != data || entry.lastUsed.Load() == 0 {
+							b.Fatal("send did not complete correctly")
+						}
+					} else {
+						if !errors.Is(err, ErrConnectionSendTimeout) ||
+							entry.lastUsed.Load() != 0 {
+							b.Fatalf("expected timeout without delivery, got %v", err)
+						}
+
+						if got := <-ch; got != sentinel {
+							b.Fatal("timeout changed the queued response")
+						}
+					}
+
+					if len(ch) != 0 {
+						b.Fatal("unexpected extra delivery")
+					}
+				}
+			})
+		}
+	}
 }
