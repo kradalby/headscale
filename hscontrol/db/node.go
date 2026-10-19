@@ -391,17 +391,15 @@ type EphemeralGarbageCollector struct {
 	cancelCh chan struct{}
 }
 
-// ephemeralTimer pairs a node's pending-deletion timer with a done channel
-// used to reap its watcher goroutine on Cancel or reschedule, plus the
-// generation identifying this particular scheduling. Without the done channel
-// a stopped timer never fires and the goroutine leaks until Close.
+// ephemeralTimer keeps a done channel because Stop does not wait for a running
+// callback, which may still be blocked enqueuing its generation's deletion.
 type ephemeralTimer struct {
 	timer *time.Timer
 	done  chan struct{}
 	gen   uint64
 }
 
-// pendingDeletion is the generation-stamped deletion a watcher enqueues when
+// pendingDeletion is the generation-stamped deletion a callback enqueues when
 // its timer fires. Start drops it if the node's current generation no longer
 // matches, i.e. it was cancelled or rescheduled in the meantime.
 type pendingDeletion struct {
@@ -450,8 +448,7 @@ func (e *EphemeralGarbageCollector) Schedule(nodeID types.NodeID, expiry time.Du
 		// Continue with scheduling
 	}
 
-	// If a timer already exists for this node, stop it and reap its
-	// watcher goroutine before scheduling a fresh one.
+	// Release a superseded callback even if it is blocked on a full queue.
 	if old, exists := e.toBeDeleted[nodeID]; exists {
 		old.timer.Stop()
 		close(old.done)
@@ -459,35 +456,16 @@ func (e *EphemeralGarbageCollector) Schedule(nodeID types.NodeID, expiry time.Du
 
 	e.gen++
 	gen := e.gen
-	timer := time.NewTimer(expiry)
 	done := make(chan struct{})
-	e.toBeDeleted[nodeID] = ephemeralTimer{timer: timer, done: done, gen: gen}
-	// Start a goroutine to handle the timer completion
-	go func() {
+	timer := time.AfterFunc(expiry, func() {
 		select {
-		case <-timer.C:
-			// This is to handle the situation where the GC is shutting down and
-			// we are trying to schedule a new node for deletion at the same time
-			// i.e. We don't want to send to deleteCh if the GC is shutting down
-			// So, we try to send to deleteCh, but also watch for cancelCh
-			select {
-			case e.deleteCh <- pendingDeletion{nodeID: nodeID, gen: gen}:
-				// Successfully sent to deleteCh
-			case <-e.cancelCh:
-				// GC is shutting down, don't send to deleteCh
-				return
-			case <-done:
-				// Cancelled or rescheduled before the send landed.
-				return
-			}
-		case <-done:
-			// Cancelled or rescheduled before the timer fired.
-			return
+		case e.deleteCh <- pendingDeletion{nodeID: nodeID, gen: gen}:
 		case <-e.cancelCh:
-			// If the GC is closed, exit the goroutine
-			return
+		case <-done:
 		}
-	}()
+	})
+	// Start takes mu too, so even a zero-duration callback sees this entry.
+	e.toBeDeleted[nodeID] = ephemeralTimer{timer: timer, done: done, gen: gen}
 }
 
 // Cancel cancels the deletion of a node.
