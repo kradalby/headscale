@@ -10,6 +10,7 @@ import (
 	"path"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -432,32 +433,16 @@ func (m *mapper) filterVisiblePeerPatches(
 		return patches
 	}
 
-	// Key by tailcfg.NodeID so patches are looked up by patch.NodeID
-	// directly, avoiding an unchecked int64->uint64 conversion.
-	peers := m.state.ListPeers(nodeID)
+	visible := m.state.PeerIDsForMembership(nodeID)
 
-	visible := make(map[tailcfg.NodeID]struct{}, peers.Len())
-	for _, peer := range peers.All() {
-		visible[peer.ID().NodeID()] = struct{}{}
-	}
+	var filtered []*tailcfg.PeerChange
 
-	return filterByVisible(visible, patches, func(p *tailcfg.PeerChange) tailcfg.NodeID {
-		return p.NodeID
-	})
-}
+	for _, patch := range patches {
+		id := patch.NodeID
 
-// filterByVisible keeps only the items whose key resolves to a NodeID present
-// in the visible set, preserving input order.
-func filterByVisible[T any](
-	visible map[tailcfg.NodeID]struct{},
-	items []T,
-	key func(T) tailcfg.NodeID,
-) []T {
-	var filtered []T
-
-	for _, it := range items {
-		if _, ok := visible[key(it)]; ok {
-			filtered = append(filtered, it)
+		i := sort.Search(visible.Len(), func(i int) bool { return visible.At(i) >= id })
+		if i < visible.Len() && visible.At(i) == id {
+			filtered = append(filtered, patch)
 		}
 	}
 

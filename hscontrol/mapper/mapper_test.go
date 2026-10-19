@@ -3,7 +3,9 @@ package mapper
 import (
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +26,338 @@ import (
 var iap = func(ipStr string) *netip.Addr {
 	ip := netip.MustParseAddr(ipStr)
 	return &ip
+}
+
+// filterPeerPatchesReference preserves filterVisiblePeerPatches from c083a7a11,
+// before any adjacency membership optimization. Keep its helper frozen too.
+func filterPeerPatchesReference(
+	m *mapper,
+	nodeID types.NodeID,
+	patches []*tailcfg.PeerChange,
+) []*tailcfg.PeerChange {
+	if len(patches) == 0 {
+		return patches
+	}
+
+	// Key by tailcfg.NodeID so patches are looked up by patch.NodeID
+	// directly, avoiding an unchecked int64->uint64 conversion.
+	peers := m.state.ListPeers(nodeID)
+
+	visible := make(map[tailcfg.NodeID]struct{}, peers.Len())
+	for _, peer := range peers.All() {
+		visible[peer.ID().NodeID()] = struct{}{}
+	}
+
+	return filterByVisibleReference(visible, patches, func(p *tailcfg.PeerChange) tailcfg.NodeID {
+		return p.NodeID
+	})
+}
+
+// filterByVisibleReference is the unchanged helper used by the frozen filter.
+func filterByVisibleReference[T any](
+	visible map[tailcfg.NodeID]struct{},
+	items []T,
+	key func(T) tailcfg.NodeID,
+) []T {
+	var filtered []T
+
+	for _, it := range items {
+		if _, ok := visible[key(it)]; ok {
+			filtered = append(filtered, it)
+		}
+	}
+
+	return filtered
+}
+
+func peerPatchFilterFixture(tb testing.TB, users, nodesPerUser int) (*mapper, []types.NodeID) {
+	tb.Helper()
+
+	data, cleanup := setupBatcherWithTestData(tb, NewBatcherAndMapper, users, nodesPerUser, 1)
+	tb.Cleanup(cleanup)
+	// Filtering needs real state, but no batcher workers or ticker traffic.
+	data.Batcher.Close()
+
+	ids := make([]types.NodeID, len(data.Nodes))
+	for i := range data.Nodes {
+		ids[i] = data.Nodes[i].n.ID
+	}
+
+	return data.Batcher.mapper, ids
+}
+
+func checkPeerPatchFilter(
+	t *testing.T,
+	m *mapper,
+	recipient types.NodeID,
+	patches, want []*tailcfg.PeerChange,
+) {
+	t.Helper()
+
+	input := slices.Clone(patches)
+
+	values := make([]tailcfg.PeerChange, len(patches))
+	for i, patch := range patches {
+		values[i] = *patch
+		values[i].Endpoints = slices.Clone(patch.Endpoints)
+	}
+
+	require.Equal(t, want, filterPeerPatchesReference(m, recipient, patches))
+	got := m.filterVisiblePeerPatches(recipient, patches)
+	require.Equal(t, want, got, "nil, empty, order and payload must match exactly")
+
+	for i := range got {
+		require.Same(t, want[i], got[i], "patches must retain input pointer identity") //nolint:gosec // Equal above guarantees matching lengths.
+	}
+
+	require.Equal(t, input, patches, "filtering must not reorder the input")
+
+	for i, patch := range patches {
+		require.Same(t, input[i], patch)
+		require.Equal(t, values[i], *patch, "filtering must not mutate patch payloads")
+	}
+}
+
+func TestFilterVisiblePeerPatchesExactOutput(t *testing.T) {
+	m, ids := peerPatchFilterFixture(t, 2, 3)
+	_, err := m.state.SetPolicy([]byte(`{
+		"acls": [{"action":"accept", "src":["autogroup:member"], "dst":["autogroup:self:*"]}]
+	}`))
+	require.NoError(t, err)
+
+	first := &tailcfg.PeerChange{
+		NodeID:    ids[1].NodeID(),
+		Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1234")},
+	}
+	second := &tailcfg.PeerChange{NodeID: ids[2].NodeID(), DERPRegion: 9}
+	sameID := &tailcfg.PeerChange{NodeID: first.NodeID, DERPRegion: 7}
+	hidden := &tailcfg.PeerChange{NodeID: ids[3].NodeID(), DERPRegion: 8}
+
+	tests := []struct {
+		name      string
+		recipient types.NodeID
+		patches   []*tailcfg.PeerChange
+		want      []*tailcfg.PeerChange
+	}{
+		{name: "nil", recipient: ids[0]},
+		{name: "empty", recipient: ids[0], patches: []*tailcfg.PeerChange{}, want: []*tailcfg.PeerChange{}},
+		{
+			name:      "order_duplicates_and_payload",
+			recipient: ids[0],
+			patches:   []*tailcfg.PeerChange{second, hidden, first, sameID, second},
+			want:      []*tailcfg.PeerChange{second, first, sameID, second},
+		},
+		{name: "all_hidden_returns_nil", recipient: ids[0], patches: []*tailcfg.PeerChange{hidden}},
+		{name: "self_is_not_a_peer", recipient: ids[0], patches: []*tailcfg.PeerChange{{NodeID: ids[0].NodeID()}}},
+		{name: "unknown_recipient", recipient: 999999, patches: []*tailcfg.PeerChange{first}},
+		{
+			name:      "signed_ids_do_not_alias_visible_peers",
+			recipient: ids[0],
+			patches: []*tailcfg.PeerChange{
+				{NodeID: -1},
+				{NodeID: -1 << 63},
+				{NodeID: 0},
+				{NodeID: 1<<63 - 1},
+				{NodeID: 999999},
+				first,
+			},
+			want: []*tailcfg.PeerChange{first},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkPeerPatchFilter(t, m, tt.recipient, tt.patches, tt.want)
+		})
+	}
+
+	t.Run("empty_input_needs_no_state", func(t *testing.T) {
+		checkPeerPatchFilter(t, nil, 0, nil, nil)
+		checkPeerPatchFilter(t, nil, 0, []*tailcfg.PeerChange{}, []*tailcfg.PeerChange{})
+	})
+	t.Run("nil_element_preserves_existing_panic", func(t *testing.T) {
+		patches := []*tailcfg.PeerChange{nil}
+
+		for _, recipient := range []types.NodeID{ids[0], 999999} {
+			require.Panics(t, func() { filterPeerPatchesReference(m, recipient, patches) })
+			require.Panics(t, func() { m.filterVisiblePeerPatches(recipient, patches) })
+		}
+	})
+}
+
+func TestFilterVisiblePeerPatchesMatchesReference(t *testing.T) {
+	m, ids := peerPatchFilterFixture(t, 4, 4)
+	r := rand.New(rand.NewPCG(17, 29)) //nolint:gosec // reproducible differential inputs
+
+	for _, policy := range []struct {
+		name string
+		body string
+	}{
+		{"dense", `{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`},
+		{"sparse", `{"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`},
+		{"deny_all", `{"acls":[]}`},
+		{"dense_after_reload", `{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`},
+	} {
+		t.Run(policy.name, func(t *testing.T) {
+			_, err := m.state.SetPolicy([]byte(policy.body))
+			require.NoError(t, err)
+
+			for iteration := range 128 {
+				recipient := ids[r.IntN(len(ids))]
+				if iteration%17 == 0 {
+					recipient = 999999
+				}
+
+				var patches []*tailcfg.PeerChange
+
+				switch iteration % 5 {
+				case 0:
+				case 1:
+					patches = []*tailcfg.PeerChange{}
+				default:
+					k := []int{1, 8, 64}[iteration%3]
+					for i := range k {
+						if i > 0 && r.IntN(4) == 0 {
+							patches = append(patches, patches[r.IntN(i)])
+							continue
+						}
+
+						id := ids[r.IntN(len(ids))].NodeID()
+						switch r.IntN(8) {
+						case 0:
+							id = -1
+						case 1:
+							id = -1 << 63
+						case 2:
+							id = 0
+						case 3:
+							id = 1<<63 - 1
+						case 4:
+							id = 999999
+						}
+
+						patch := &tailcfg.PeerChange{NodeID: id, DERPRegion: tailcfg.DERPRegionID(r.IntN(10))}
+						switch r.IntN(3) {
+						case 0:
+							patch.Endpoints = []netip.AddrPort{}
+						case 1:
+							patch.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1234")}
+						}
+
+						patches = append(patches, patch)
+					}
+				}
+
+				want := filterPeerPatchesReference(m, recipient, patches)
+				checkPeerPatchFilter(t, m, recipient, patches, want)
+			}
+		})
+	}
+}
+
+var peerPatchFilterBenchmarkSink []*tailcfg.PeerChange
+
+// Each operation filters one raw patch batch for V recipients, including all
+// visibility lookup and allocation work. Preflight warms "current"; the state
+// benchmarks account separately for cold rows and snapshot rebuild/reuse costs.
+func BenchmarkFilterVisiblePeerPatches(b *testing.B) {
+	for _, nodeCount := range []int{128, 1024} {
+		b.Run(fmt.Sprintf("N=%d", nodeCount), func(b *testing.B) {
+			m, ids := peerPatchFilterFixture(b, 16, nodeCount/16)
+			for _, policy := range []struct {
+				name string
+				body string
+			}{
+				{"sparse", `{"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`},
+				{"dense", `{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`},
+			} {
+				b.Run(policy.name, func(b *testing.B) {
+					_, err := m.state.SetPolicy([]byte(policy.body))
+					require.NoError(b, err)
+
+					p := m.state.ListPeers(ids[0]).Len()
+
+					wantPeers := nodeCount - 1
+					if policy.name == "sparse" {
+						wantPeers = nodeCount/16 - 1
+					}
+
+					batches := []struct {
+						name     string
+						k        int
+						nilInput bool
+					}{
+						{"K=0/nil", 0, true},
+						{"K=0/empty", 0, false},
+						{"K=1", 1, false},
+						{"K=8", 8, false},
+						{"K=64", 64, false},
+					}
+
+					require.Equal(b, wantPeers, p)
+
+					for _, v := range []int{1, 16, 128} {
+						for _, batch := range batches {
+							patches := make([]*tailcfg.PeerChange, batch.k)
+							if batch.nilInput {
+								patches = nil
+							}
+
+							for i := range patches {
+								patches[i] = &tailcfg.PeerChange{
+									NodeID: ids[len(ids)-1-(i*17)%len(ids)].NodeID(),
+									Endpoints: []netip.AddrPort{
+										netip.MustParseAddrPort("192.0.2.1:1234"),
+									},
+									DERPRegion: 9,
+								}
+								switch i % 16 {
+								case 4:
+									patches[i].NodeID = -1
+								case 5:
+									patches[i].NodeID = -1 << 63
+								case 6:
+									patches[i].NodeID = 0
+								case 8:
+									patches[i].NodeID = 1<<63 - 1
+								}
+
+								if i%4 == 3 {
+									patches[i] = patches[i-1]
+								}
+							}
+
+							b.Run(fmt.Sprintf("V=%d/P=%d/%s", v, p, batch.name), func(b *testing.B) {
+								for _, implementation := range []struct {
+									name   string
+									filter func(*mapper, types.NodeID, []*tailcfg.PeerChange) []*tailcfg.PeerChange
+								}{
+									{"reference", filterPeerPatchesReference},
+									{"current", (*mapper).filterVisiblePeerPatches},
+								} {
+									b.Run(implementation.name, func(b *testing.B) {
+										for _, recipient := range ids[:v] {
+											require.Equal(b,
+												filterPeerPatchesReference(m, recipient, patches),
+												implementation.filter(m, recipient, patches),
+											)
+										}
+
+										b.ReportAllocs()
+
+										for b.Loop() {
+											for _, recipient := range ids[:v] {
+												peerPatchFilterBenchmarkSink = implementation.filter(m, recipient, patches)
+											}
+										}
+									})
+								}
+							})
+						}
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestDNSConfigMapResponse(t *testing.T) {

@@ -900,6 +900,12 @@ func (s *State) ListPeers(nodeID types.NodeID, peerIDs ...types.NodeID) views.Sl
 	return views.SliceOf(filteredNodes)
 }
 
+// PeerIDsForMembership returns a snapshot-stable, sorted signed-ID view for
+// membership checks without changing the ordering used by ListPeers.
+func (s *State) PeerIDsForMembership(nodeID types.NodeID) views.Slice[tailcfg.NodeID] {
+	return s.nodeStore.PeerIDsForMembership(nodeID)
+}
+
 // ListEphemeralNodes retrieves all ephemeral (temporary) nodes in the system.
 func (s *State) ListEphemeralNodes() views.Slice[types.NodeView] {
 	allNodes := s.nodeStore.ListNodes()

@@ -16,6 +16,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
@@ -165,8 +166,10 @@ type Snapshot struct {
 	// peersByNode stores immutable adjacency as IDs; ListPeers resolves the
 	// corresponding views through nodeViewsByID.
 	peersByNode map[types.NodeID][]types.NodeID
-	nodesByUser map[types.UserID][]types.NodeView
-	allNodes    []types.NodeView
+	// peerMembership lazily caches sorted rows, shared only with reused adjacency.
+	peerMembership *sync.Map // types.NodeID -> *peerMembershipRow
+	nodesByUser    map[types.UserID][]types.NodeView
+	allNodes       []types.NodeView
 
 	// routes maps each prefix to its current primary advertiser. The
 	// previous assignment is carried over when still valid so the
@@ -175,6 +178,11 @@ type Snapshot struct {
 	isPrimaryRoute map[types.NodeID]bool
 	// primaryRoutesByNode is sorted once per election and shared on route reuse.
 	primaryRoutesByNode map[types.NodeID][]netip.Prefix
+}
+
+type peerMembershipRow struct {
+	once sync.Once
+	ids  []tailcfg.NodeID
 }
 
 // PeersFunc is a function that takes a list of nodes and returns a map
@@ -745,15 +753,23 @@ func snapshotFromNodes(
 		}
 	}
 
-	var peerIDsByNode map[types.NodeID][]types.NodeID
+	var (
+		peerIDsByNode  map[types.NodeID][]types.NodeID
+		peerMembership *sync.Map
+	)
 
 	if reusePeers {
 		peerIDsByNode = prev.peersByNode
+		peerMembership = prev.peerMembership
 	} else {
 		peersTimer := prometheus.NewTimer(nodeStorePeersCalculationDuration)
 		peerIDsByNode = peersFunc(allNodes)
 
 		peersTimer.ObserveDuration()
+	}
+
+	if peerMembership == nil {
+		peerMembership = &sync.Map{}
 	}
 
 	newSnap := Snapshot{
@@ -763,6 +779,7 @@ func snapshotFromNodes(
 		nodesByNodeKey:      make(map[key.NodePublic]types.NodeView),
 		nodesByMachineKey:   make(map[key.MachinePublic]map[types.UserID]types.NodeView),
 		peersByNode:         peerIDsByNode,
+		peerMembership:      peerMembership,
 		nodesByUser:         make(map[types.UserID][]types.NodeView),
 		routes:              routes,
 		isPrimaryRoute:      isPrimaryRoute,
@@ -1024,6 +1041,42 @@ func (s *NodeStore) ListPeers(id types.NodeID) views.Slice[types.NodeView] {
 	}
 
 	return views.SliceOf(peers)
+}
+
+// PeerIDsForMembership returns an immutable, sorted signed-ID view from one
+// snapshot. A cold row is resolved once; unqueried rows consume no edge storage.
+func (s *NodeStore) PeerIDsForMembership(id types.NodeID) views.Slice[tailcfg.NodeID] {
+	snapshot := s.data.Load()
+
+	peerIDs := snapshot.peersByNode[id]
+	if len(peerIDs) == 0 {
+		return views.SliceOf[tailcfg.NodeID](nil)
+	}
+
+	cache := snapshot.peerMembership
+	if cache == nil {
+		// Manual/control snapshots can predate the cache; do not mutate them.
+		cache = &sync.Map{}
+	}
+
+	value, ok := cache.Load(id)
+	if !ok {
+		value, _ = cache.LoadOrStore(id, &peerMembershipRow{})
+	}
+
+	row := value.(*peerMembershipRow) //nolint:forcetypeassert // The private cache only stores this type.
+	row.once.Do(func() {
+		row.ids = make([]tailcfg.NodeID, 0, len(peerIDs))
+		for _, peerID := range peerIDs {
+			if _, exists := snapshot.nodeViewsByID[peerID]; exists {
+				row.ids = append(row.ids, peerID.NodeID())
+			}
+		}
+
+		slices.Sort(row.ids)
+	})
+
+	return views.SliceOf(row.ids)
 }
 
 // ListPeerIDs returns the sorted IDs of id's peers as a copy the caller

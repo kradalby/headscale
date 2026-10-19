@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -25,6 +26,475 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
 )
+
+// Frozen before lazy peer membership: includes the sibling's route projection,
+// so snapshot benchmarks isolate membership overhead from route changes.
+func snapshotFromNodesPeerScanReference(
+	nodes map[types.NodeID]types.Node,
+	peersFunc PeersFunc,
+	prev *Snapshot,
+	reusePeers, reuseRoutes bool,
+) Snapshot {
+	timer := prometheus.NewTimer(nodeStoreSnapshotBuildDuration)
+	defer timer.ObserveDuration()
+
+	allNodes := make([]types.NodeView, 0, len(nodes))
+	nodeViewsByID := make(map[types.NodeID]types.NodeView, len(nodes))
+
+	for _, n := range nodes {
+		nv := n.View()
+		allNodes = append(allNodes, nv)
+		nodeViewsByID[n.ID] = nv
+	}
+
+	var (
+		routes              map[netip.Prefix]types.NodeID
+		isPrimaryRoute      map[types.NodeID]bool
+		primaryRoutesByNode map[types.NodeID][]netip.Prefix
+	)
+
+	if reuseRoutes {
+		routes, isPrimaryRoute = prev.routes, prev.isPrimaryRoute
+		primaryRoutesByNode = prev.primaryRoutesByNode
+	} else {
+		// Carrying the previous assignment forward lets a still-valid
+		// primary survive unrelated batches.
+		var prevRoutes map[netip.Prefix]types.NodeID
+		if prev != nil {
+			prevRoutes = prev.routes
+		}
+
+		routes, isPrimaryRoute = electPrimaryRoutes(nodes, prevRoutes)
+		if len(routes) > 0 {
+			primaryRoutesByNode = make(map[types.NodeID][]netip.Prefix, len(isPrimaryRoute))
+			for prefix, id := range routes {
+				primaryRoutesByNode[id] = append(primaryRoutesByNode[id], prefix)
+			}
+
+			for _, prefixes := range primaryRoutesByNode {
+				slices.SortFunc(prefixes, netip.Prefix.Compare)
+			}
+		}
+	}
+
+	var peerIDsByNode map[types.NodeID][]types.NodeID
+
+	if reusePeers {
+		peerIDsByNode = prev.peersByNode
+	} else {
+		peersTimer := prometheus.NewTimer(nodeStorePeersCalculationDuration)
+		peerIDsByNode = peersFunc(allNodes)
+
+		peersTimer.ObserveDuration()
+	}
+
+	newSnap := Snapshot{
+		nodesByID:           nodes,
+		nodeViewsByID:       nodeViewsByID,
+		allNodes:            allNodes,
+		nodesByNodeKey:      make(map[key.NodePublic]types.NodeView),
+		nodesByMachineKey:   make(map[key.MachinePublic]map[types.UserID]types.NodeView),
+		peersByNode:         peerIDsByNode,
+		nodesByUser:         make(map[types.UserID][]types.NodeView),
+		routes:              routes,
+		isPrimaryRoute:      isPrimaryRoute,
+		primaryRoutesByNode: primaryRoutesByNode,
+	}
+
+	for _, n := range nodes {
+		nodeView := nodeViewsByID[n.ID]
+		userID := n.TypedUserID()
+
+		// Tagged nodes are owned by their tags, not a user,
+		// so they are not indexed by user.
+		if !n.IsTagged() {
+			newSnap.nodesByUser[userID] = append(newSnap.nodesByUser[userID], nodeView)
+		}
+
+		newSnap.nodesByNodeKey[n.NodeKey] = nodeView
+
+		if newSnap.nodesByMachineKey[n.MachineKey] == nil {
+			newSnap.nodesByMachineKey[n.MachineKey] = make(map[types.UserID]types.NodeView)
+		}
+
+		newSnap.nodesByMachineKey[n.MachineKey][userID] = nodeView
+	}
+
+	return newSnap
+}
+
+func TestPeerMembershipMatchesListPeers(t *testing.T) {
+	const (
+		high types.NodeID = 1 << 63
+		last types.NodeID = 1<<64 - 1
+	)
+
+	nodes := make(types.Nodes, 0, 5)
+
+	for _, id := range []types.NodeID{1, 2, 3, high, last} {
+		node := createTestNode(id, 1, "user", "node")
+		nodes = append(nodes, &node)
+	}
+
+	ordered := []types.NodeID{3, 999, high, 2, 2, last}
+	store := NewNodeStore(nodes, func([]types.NodeView) map[types.NodeID][]types.NodeID {
+		return map[types.NodeID][]types.NodeID{1: ordered}
+	}, TestBatchSize, TestBatchTimeout)
+	want := []tailcfg.NodeID{-1 << 63, -1, 2, 2, 3}
+	require.Equal(t, want, store.PeerIDsForMembership(1).AsSlice())
+	require.Equal(t, []types.NodeID{3, 999, high, 2, 2, last}, ordered,
+		"sorting membership must not reorder the peer map")
+
+	var listed []types.NodeID
+	for _, peer := range store.ListPeers(1).All() {
+		listed = append(listed, peer.ID())
+	}
+
+	require.Equal(t, []types.NodeID{3, high, 2, 2, last}, listed)
+	require.Zero(t, store.PeerIDsForMembership(999).Len())
+}
+
+func TestPeerMembershipLegacySnapshot(t *testing.T) {
+	nodes := map[types.NodeID]types.Node{
+		1: createTestNode(1, 1, "user", "one"),
+		2: createTestNode(2, 1, "user", "two"),
+	}
+	control := snapshotFromNodesPeerScanReference(nodes, allowAllPeersFunc, nil, false, false)
+
+	var store NodeStore
+	store.data.Store(&control)
+	old := store.PeerIDsForMembership(1)
+	require.Equal(t, []tailcfg.NodeID{2}, old.AsSlice())
+	require.Nil(t, control.peerMembership, "published control snapshot must remain unchanged")
+	reused := snapshotFromNodes(maps.Clone(nodes), allowAllPeersFunc, &control, true, true)
+	require.NotNil(t, reused.peerMembership)
+	store.data.Store(&reused)
+	require.Equal(t, []tailcfg.NodeID{2}, store.PeerIDsForMembership(1).AsSlice())
+	require.Equal(t, []tailcfg.NodeID{2}, old.AsSlice())
+}
+
+func TestPeerMembershipSnapshotStable(t *testing.T) {
+	node1 := createTestNode(1, 1, "user", "one")
+	node2 := createTestNode(2, 1, "user", "two")
+	store := NewNodeStore(types.Nodes{&node1, &node2}, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	old := store.PeerIDsForMembership(1)
+	require.Equal(t, []tailcfg.NodeID{2}, old.AsSlice())
+
+	first := store.data.Load().peerMembership
+	_, ok := store.UpdateNode(2, func(n *types.Node) { n.Unhealthy = true })
+	require.True(t, ok)
+	require.Same(t, first, store.data.Load().peerMembership)
+	require.Equal(t, []tailcfg.NodeID{2}, store.PeerIDsForMembership(1).AsSlice())
+
+	store.DeleteNode(2)
+	require.NotSame(t, first, store.data.Load().peerMembership)
+	require.Zero(t, store.PeerIDsForMembership(1).Len())
+	require.Equal(t, []tailcfg.NodeID{2}, old.AsSlice())
+
+	store.PutNode(node2)
+	require.Equal(t, []tailcfg.NodeID{2}, store.PeerIDsForMembership(1).AsSlice())
+	beforePolicy := store.data.Load().peerMembership
+	store.RebuildPeerMaps()
+	require.NotSame(t, beforePolicy, store.data.Load().peerMembership)
+	require.Equal(t, []tailcfg.NodeID{2}, old.AsSlice())
+}
+
+func TestPeerMembershipLazySparseRows(t *testing.T) {
+	const count = 257
+
+	nodes := make(types.Nodes, 0, count)
+
+	peers := make(map[types.NodeID][]types.NodeID, count)
+	for i := range count {
+		id := types.NodeID(i + 1) //nolint:gosec // bounded fixture ID
+		nodes = append(nodes, &types.Node{ID: id})
+		peers[id] = []types.NodeID{types.NodeID((i+1)%count + 1)} //nolint:gosec // bounded fixture ID
+	}
+
+	store := NewNodeStore(nodes, func([]types.NodeView) map[types.NodeID][]types.NodeID {
+		return peers
+	}, TestBatchSize, TestBatchTimeout)
+	cache := store.data.Load().peerMembership
+	rows := func() (int, int) {
+		var count, capacity int
+
+		cache.Range(func(_, value any) bool {
+			count++
+			row, ok := value.(*peerMembershipRow)
+			require.True(t, ok)
+
+			capacity += cap(row.ids)
+
+			return true
+		})
+
+		return count, capacity
+	}
+	gotRows, capacity := rows()
+	require.Zero(t, gotRows, "snapshot construction must not build membership rows")
+	require.Zero(t, capacity)
+
+	for id := types.NodeID(1000); id < 1100; id++ {
+		require.Zero(t, store.PeerIDsForMembership(id).Len())
+	}
+
+	gotRows, _ = rows()
+	require.Zero(t, gotRows, "unknown recipients must not grow the cache")
+	store.PeerIDsForMembership(1)
+
+	gotRows, capacity = rows()
+	require.Equal(t, 1, gotRows)
+	require.Equal(t, 1, capacity)
+
+	for id := types.NodeID(1); id <= count; id++ {
+		store.PeerIDsForMembership(id)
+	}
+
+	gotRows, capacity = rows()
+	require.Equal(t, count, gotRows)
+	require.Equal(t, count, capacity, "storage must follow actual sparse edges")
+	require.Zero(t, testing.AllocsPerRun(100, func() { store.PeerIDsForMembership(1) }))
+}
+
+func TestPeerMembershipConcurrentColdAndRebuild(t *testing.T) {
+	nodes := types.Nodes{{ID: 1}, {ID: 2}, {ID: 3}}
+	store := NewNodeStore(nodes, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	var readers sync.WaitGroup
+	for range 4 {
+		readers.Go(func() {
+			for range 64 {
+				assert.Equal(t, []tailcfg.NodeID{2, 3}, store.PeerIDsForMembership(1).AsSlice())
+			}
+		})
+	}
+
+	for range 16 {
+		store.RebuildPeerMaps()
+	}
+
+	readers.Wait()
+}
+
+func peerMembershipBenchmarkPeers(nodeCount, degree int) PeersFunc {
+	return func([]types.NodeView) map[types.NodeID][]types.NodeID {
+		peers := make(map[types.NodeID][]types.NodeID, nodeCount)
+		for i := range nodeCount {
+			id := types.NodeID(i + 1) //nolint:gosec // bounded benchmark ID
+
+			row := make([]types.NodeID, degree)
+			for j := range row {
+				row[j] = types.NodeID((i+degree-j)%nodeCount + 1) //nolint:gosec // bounded benchmark ID
+			}
+
+			peers[id] = row
+		}
+
+		return peers
+	}
+}
+
+// Retain the old whole lookup: resolve every peer and rebuild a membership map.
+func peerMembershipScanReference(store *NodeStore, id types.NodeID, patches []tailcfg.NodeID) int {
+	peers := store.ListPeers(id)
+
+	visible := make(map[tailcfg.NodeID]struct{}, peers.Len())
+	for _, peer := range peers.All() {
+		visible[peer.ID().NodeID()] = struct{}{}
+	}
+
+	var count int
+
+	for _, patch := range patches {
+		if _, ok := visible[patch]; ok {
+			count++
+		}
+	}
+
+	return count
+}
+
+func peerMembershipIndexedLookup(store *NodeStore, id types.NodeID, patches []tailcfg.NodeID) int {
+	visible := store.PeerIDsForMembership(id)
+
+	var count int
+
+	for _, patch := range patches {
+		i := sort.Search(visible.Len(), func(i int) bool { return visible.At(i) >= patch })
+		if i < visible.Len() && visible.At(i) == patch {
+			count++
+		}
+	}
+
+	return count
+}
+
+func reportPeerMembershipCache(b *testing.B, store *NodeStore) {
+	b.Helper()
+
+	var rows, capacity int
+
+	if cache := store.data.Load().peerMembership; cache != nil {
+		cache.Range(func(_, value any) bool {
+			rows++
+			row, ok := value.(*peerMembershipRow)
+			require.True(b, ok)
+
+			capacity += cap(row.ids)
+
+			return true
+		})
+	}
+
+	b.ReportMetric(float64(rows), "cached-rows")
+	// ID-array storage only; B/op and allocs/op include cache/map overhead.
+	b.ReportMetric(float64(8*capacity), "index-ID-bytes")
+}
+
+// Cold includes fresh-cache publication plus the first row resolution/sort.
+// Warm includes cache lookup and K binary searches; empty/sparse controls stay in.
+func BenchmarkPeerMembershipLookup(b *testing.B) {
+	for _, n := range []int{128, 1024} {
+		for _, p := range []int{0, 8, n - 1} {
+			b.Run(fmt.Sprintf("N=%d/P=%d", n, p), func(b *testing.B) {
+				nodes := primaryRouteBenchmarkNodes(n, 0, 0)
+				peers := peerMembershipBenchmarkPeers(n, p)
+
+				for _, v := range []int{1, 128} {
+					for _, k := range []int{1, 8, 64} {
+						patches := make([]tailcfg.NodeID, k)
+						for i := range patches {
+							patches[i] = tailcfg.NodeID((i*17+2)%n + 1) //nolint:gosec // bounded benchmark ID
+						}
+
+						b.Run(fmt.Sprintf("V=%d/K=%d", v, k), func(b *testing.B) {
+							for _, mode := range []string{"scan", "cold", "warm"} {
+								b.Run(mode, func(b *testing.B) {
+									snap := snapshotFromNodes(nodes, peers, nil, false, false)
+
+									var store NodeStore
+									store.data.Store(&snap)
+
+									lookup := peerMembershipIndexedLookup
+									if mode == "scan" {
+										lookup = peerMembershipScanReference
+									}
+
+									for id := types.NodeID(1); id <= types.NodeID(v); id++ { //nolint:gosec // bounded benchmark ID
+										require.Equal(b, peerMembershipScanReference(&store, id, patches), lookup(&store, id, patches))
+									}
+
+									var count int
+
+									b.ReportAllocs()
+
+									for b.Loop() {
+										if mode == "cold" {
+											next := snap
+											next.peerMembership = &sync.Map{}
+											store.data.Store(&next)
+										}
+
+										for id := types.NodeID(1); id <= types.NodeID(v); id++ { //nolint:gosec // bounded benchmark ID
+											count += lookup(&store, id, patches)
+										}
+									}
+
+									runtime.KeepAlive(count)
+									reportPeerMembershipCache(b, &store)
+								})
+							}
+						})
+					}
+				}
+			})
+		}
+	}
+}
+
+// Both sides retain the sibling's route projection. Each op copies nodes,
+// builds/reuses the snapshot, and optionally fans out K=8 membership checks.
+func BenchmarkPeerMembershipSnapshotBatch(b *testing.B) {
+	for _, n := range []int{128, 1024} {
+		for _, p := range []int{0, 8, n - 1} {
+			b.Run(fmt.Sprintf("N=%d/P=%d", n, p), func(b *testing.B) {
+				nodes := primaryRouteBenchmarkNodes(n, 0, 0)
+				peers := peerMembershipBenchmarkPeers(n, p)
+				patches := []tailcfg.NodeID{2, 7, 3, 2, -1, 0, 1<<63 - 1, 17}
+
+				for _, mode := range []struct {
+					name                           string
+					reusePeers, reuseRoutes, reads bool
+				}{
+					{"relation", false, false, false},
+					{"relation-and-fanout", false, false, true},
+					{"payload", true, true, false},
+					{"payload-and-fanout", true, true, true},
+					{"route-health", true, false, false},
+				} {
+					for _, indexed := range []bool{false, true} {
+						name := "scan"
+						build := snapshotFromNodesPeerScanReference
+						lookup := peerMembershipScanReference
+
+						if indexed {
+							name = "indexed"
+							build = snapshotFromNodes
+							lookup = peerMembershipIndexedLookup
+						}
+
+						b.Run(mode.name+"/"+name, func(b *testing.B) {
+							initial := build(nodes, peers, nil, false, false)
+
+							var store NodeStore
+							store.data.Store(&initial)
+
+							for id := types.NodeID(1); id <= 128; id++ {
+								require.Equal(b, peerMembershipScanReference(&store, id, patches), lookup(&store, id, patches))
+							}
+
+							var count int
+
+							b.ReportAllocs()
+
+							for b.Loop() {
+								previous := store.data.Load()
+								updated := maps.Clone(previous.nodesByID)
+
+								node := updated[1]
+								if mode.reuseRoutes {
+									node.SessionEpoch++
+								} else {
+									node.Unhealthy = !node.Unhealthy
+								}
+
+								updated[1] = node
+								next := build(updated, peers, previous, mode.reusePeers, mode.reuseRoutes)
+								store.data.Store(&next)
+
+								if mode.reads {
+									for id := types.NodeID(1); id <= 128; id++ {
+										count += lookup(&store, id, patches)
+									}
+								}
+							}
+
+							runtime.KeepAlive(count)
+							reportPeerMembershipCache(b, &store)
+						})
+					}
+				}
+			})
+		}
+	}
+}
 
 func TestSnapshotFromNodes(t *testing.T) {
 	tests := []struct {
@@ -1640,6 +2110,8 @@ func TestUpdateNodeRecomputesPeersOnlyForRelationInputs(t *testing.T) {
 
 			defer store.Stop()
 
+			store.PeerIDsForMembership(1)
+			membership := store.data.Load().peerMembership
 			peersCalls.Store(0)
 
 			_, ok := store.UpdateNode(1, tt.mutate)
@@ -1651,6 +2123,12 @@ func TestUpdateNodeRecomputesPeersOnlyForRelationInputs(t *testing.T) {
 			}
 
 			require.Equal(t, want, peersCalls.Load())
+
+			if tt.wantRecompute {
+				require.NotSame(t, membership, store.data.Load().peerMembership)
+			} else {
+				require.Same(t, membership, store.data.Load().peerMembership)
+			}
 		})
 	}
 }
