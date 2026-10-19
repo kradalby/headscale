@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net/netip"
 	"reflect"
 	"runtime"
@@ -16,6 +17,7 @@ import (
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
@@ -2617,4 +2619,601 @@ func TestNodeStoreNodeKeyIndexMatchesNodes(t *testing.T) {
 	}
 
 	require.Empty(t, nodeKeyIndexMismatch(store.data.Load()))
+}
+
+// Frozen before the primary-route projection change: keep the original snapshot
+// construction and complete scan lookup for differential tests and benchmarks.
+func snapshotFromNodesRouteScanReference(
+	nodes map[types.NodeID]types.Node,
+	peersFunc PeersFunc,
+	prev *Snapshot,
+	reusePeers, reuseRoutes bool,
+) Snapshot {
+	timer := prometheus.NewTimer(nodeStoreSnapshotBuildDuration)
+	defer timer.ObserveDuration()
+
+	allNodes := make([]types.NodeView, 0, len(nodes))
+	nodeViewsByID := make(map[types.NodeID]types.NodeView, len(nodes))
+
+	for _, n := range nodes {
+		nv := n.View()
+		allNodes = append(allNodes, nv)
+		nodeViewsByID[n.ID] = nv
+	}
+
+	var (
+		routes         map[netip.Prefix]types.NodeID
+		isPrimaryRoute map[types.NodeID]bool
+	)
+
+	if reuseRoutes {
+		routes, isPrimaryRoute = prev.routes, prev.isPrimaryRoute
+	} else {
+		// Carrying the previous assignment forward lets a still-valid
+		// primary survive unrelated batches.
+		var prevRoutes map[netip.Prefix]types.NodeID
+		if prev != nil {
+			prevRoutes = prev.routes
+		}
+
+		routes, isPrimaryRoute = electPrimaryRoutes(nodes, prevRoutes)
+	}
+
+	var peerIDsByNode map[types.NodeID][]types.NodeID
+
+	if reusePeers {
+		peerIDsByNode = prev.peersByNode
+	} else {
+		peersTimer := prometheus.NewTimer(nodeStorePeersCalculationDuration)
+		peerIDsByNode = peersFunc(allNodes)
+
+		peersTimer.ObserveDuration()
+	}
+
+	newSnap := Snapshot{
+		nodesByID:         nodes,
+		nodeViewsByID:     nodeViewsByID,
+		allNodes:          allNodes,
+		nodesByNodeKey:    make(map[key.NodePublic]types.NodeView),
+		nodesByMachineKey: make(map[key.MachinePublic]map[types.UserID]types.NodeView),
+		peersByNode:       peerIDsByNode,
+		nodesByUser:       make(map[types.UserID][]types.NodeView),
+		routes:            routes,
+		isPrimaryRoute:    isPrimaryRoute,
+	}
+
+	for _, n := range nodes {
+		nodeView := nodeViewsByID[n.ID]
+		userID := n.TypedUserID()
+
+		// Tagged nodes are owned by their tags, not a user,
+		// so they are not indexed by user.
+		if !n.IsTagged() {
+			newSnap.nodesByUser[userID] = append(newSnap.nodesByUser[userID], nodeView)
+		}
+
+		newSnap.nodesByNodeKey[n.NodeKey] = nodeView
+
+		if newSnap.nodesByMachineKey[n.MachineKey] == nil {
+			newSnap.nodesByMachineKey[n.MachineKey] = make(map[types.UserID]types.NodeView)
+		}
+
+		newSnap.nodesByMachineKey[n.MachineKey][userID] = nodeView
+	}
+
+	return newSnap
+}
+
+func (s *NodeStore) primaryRoutesForNodeScanReference(id types.NodeID) []netip.Prefix {
+	snap := s.data.Load()
+	if !snap.isPrimaryRoute[id] {
+		return nil
+	}
+
+	out := make([]netip.Prefix, 0)
+
+	for prefix, nodeID := range snap.routes {
+		if nodeID == id {
+			out = append(out, prefix)
+		}
+	}
+
+	slices.SortFunc(out, netip.Prefix.Compare)
+
+	return out
+}
+
+func TestPrimaryRoutesForNodeWithoutProjection(t *testing.T) {
+	nodes := primaryRouteBenchmarkNodes(3, 1, 2)
+	initial := snapshotFromNodesRouteScanReference(nodes, allowAllPeersFunc, nil, false, false)
+	reused := snapshotFromNodes(maps.Clone(nodes), allowAllPeersFunc, &initial, true, true)
+
+	var store NodeStore
+	for _, snap := range []*Snapshot{&initial, &reused} {
+		store.data.Store(snap)
+
+		for _, id := range []types.NodeID{1, 2, 99} {
+			require.Equal(t, store.primaryRoutesForNodeScanReference(id), store.PrimaryRoutesForNode(id))
+		}
+
+		got := store.PrimaryRoutesForNode(1)
+		require.NotEmpty(t, got)
+		got[0] = netip.MustParsePrefix("::/0")
+
+		require.Equal(t, store.primaryRoutesForNodeScanReference(1), store.PrimaryRoutesForNode(1))
+	}
+}
+
+func TestPrimaryRoutesForNodeAllocations(t *testing.T) {
+	node := createTestNode(1, 1, "user", "router")
+
+	for i := range 64 {
+		prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(i), 0, 0}), 16)
+		node.ApprovedRoutes = append(node.ApprovedRoutes, prefix)
+	}
+
+	node.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: node.ApprovedRoutes}
+	node.IsOnline = new(true)
+	ordinary := createTestNode(2, 1, "user", "ordinary")
+	store := NewNodeStore(
+		types.Nodes{&node, &ordinary},
+		allowAllPeersFunc,
+		TestBatchSize,
+		TestBatchTimeout,
+	)
+	empty := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	for _, tc := range []struct {
+		name  string
+		store *NodeStore
+		id    types.NodeID
+		count int
+	}{
+		{name: "primary", store: store, id: 1, count: 64},
+		{name: "ordinary", store: store, id: 2},
+		{name: "unknown", store: store, id: 99},
+		{name: "empty", store: empty, id: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []netip.Prefix
+
+			allocs := testing.AllocsPerRun(100, func() {
+				got = tc.store.PrimaryRoutesForNode(tc.id)
+			})
+
+			require.Len(t, got, tc.count)
+
+			if tc.count == 0 {
+				require.Nil(t, got)
+				require.Zero(t, allocs)
+			} else {
+				require.LessOrEqual(
+					t,
+					allocs,
+					float64(1),
+					"only the caller's route copy should allocate",
+				)
+			}
+		})
+	}
+}
+
+func TestPrimaryRoutesForNodeOwnsReturnedSlice(t *testing.T) {
+	prefix := netip.MustParsePrefix("10.77.0.0/24")
+	node := createTestNode(1, 1, "user", "router")
+	node.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{prefix}}
+	node.ApprovedRoutes = []netip.Prefix{prefix}
+	node.IsOnline = new(true)
+	store := NewNodeStore(
+		types.Nodes{&node},
+		allowAllPeersFunc,
+		TestBatchSize,
+		TestBatchTimeout,
+	)
+	first := store.data.Load()
+
+	got := store.PrimaryRoutesForNode(1)
+	got[0] = netip.MustParsePrefix("::/0")
+
+	require.Equal(t, []netip.Prefix{prefix}, store.PrimaryRoutesForNode(1))
+
+	reused := snapshotFromNodes(
+		maps.Clone(first.nodesByID),
+		allowAllPeersFunc,
+		first,
+		true,
+		true,
+	)
+	require.Same(t, &first.primaryRoutesByNode[1][0], &reused.primaryRoutesByNode[1][0],
+		"payload snapshots must reuse the immutable route projection")
+	store.data.Store(&reused)
+	kept := store.PrimaryRoutesForNode(1)
+	require.Equal(t, []netip.Prefix{prefix}, kept)
+
+	nodes := maps.Clone(reused.nodesByID)
+	node = nodes[1]
+	node.IsOnline = new(false)
+	nodes[1] = node
+	withdrawn := snapshotFromNodes(nodes, allowAllPeersFunc, &reused, true, false)
+	store.data.Store(&withdrawn)
+	require.Nil(t, store.PrimaryRoutesForNode(1))
+	require.Equal(t, []netip.Prefix{prefix}, kept)
+
+	for _, old := range []*Snapshot{first, &reused} {
+		store.data.Store(old)
+		require.Equal(t, []netip.Prefix{prefix}, store.PrimaryRoutesForNode(1))
+	}
+}
+
+func TestPrimaryRoutesForNodeMatchesElectionChanges(t *testing.T) {
+	subnets := []netip.Prefix{
+		netip.MustParsePrefix("10.77.0.0/24"),
+		netip.MustParsePrefix("fd00::/64"),
+	}
+	advertised := append(
+		slices.Clone(subnets),
+		netip.MustParsePrefix("0.0.0.0/0"),
+		netip.MustParsePrefix("::/0"),
+	)
+	nodes := make(types.Nodes, 0, 2)
+
+	for id := types.NodeID(1); id <= 2; id++ {
+		n := createTestNode(id, 1, "user", fmt.Sprintf("router-%d", id))
+		n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: advertised}
+		n.ApprovedRoutes = advertised
+		n.IsOnline = new(true)
+		nodes = append(nodes, &n)
+	}
+
+	store := NewNodeStore(nodes, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	for _, step := range []struct {
+		name    string
+		updates map[types.NodeID]UpdateNodeFunc
+		primary types.NodeID
+	}{
+		{name: "initial", primary: 1},
+		{name: "failover", updates: map[types.NodeID]UpdateNodeFunc{1: func(n *types.Node) { n.Unhealthy = true }}, primary: 2},
+		{name: "recovery does not flap", updates: map[types.NodeID]UpdateNodeFunc{1: func(n *types.Node) { n.Unhealthy = false }}, primary: 2},
+		{name: "all unhealthy keeps previous", updates: map[types.NodeID]UpdateNodeFunc{
+			1: func(n *types.Node) { n.Unhealthy = true },
+			2: func(n *types.Node) { n.Unhealthy = true },
+		}, primary: 2},
+		{name: "unhealthy without previous stays unmapped", updates: map[types.NodeID]UpdateNodeFunc{
+			2: func(n *types.Node) { n.ApprovedRoutes = nil },
+		}},
+		{name: "healthy candidate returns", updates: map[types.NodeID]UpdateNodeFunc{1: func(n *types.Node) { n.Unhealthy = false }}, primary: 1},
+		{name: "offline withdraws routes", updates: map[types.NodeID]UpdateNodeFunc{1: func(n *types.Node) { n.IsOnline = new(false) }}},
+	} {
+		t.Run(step.name, func(t *testing.T) {
+			store.UpdateNodes(step.updates)
+
+			for id := types.NodeID(1); id <= 3; id++ {
+				var want []netip.Prefix
+				if id == step.primary {
+					want = subnets
+				}
+
+				require.Equal(t, want, store.primaryRoutesForNodeScanReference(id))
+				require.Equal(t, want, store.PrimaryRoutesForNode(id))
+			}
+		})
+	}
+}
+
+//nolint:gosec // Drawn node IDs are bounded to the fixture's positive IDs.
+func TestPrimaryRoutesForNodeMatchesScanHistory(t *testing.T) {
+	prefixes := []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/24"),
+		netip.MustParsePrefix("10.0.1.0/24"),
+		netip.MustParsePrefix("fd00::/64"),
+		netip.MustParsePrefix("0.0.0.0/0"),
+		netip.MustParsePrefix("::/0"),
+	}
+
+	rapid.Check(t, func(rt *rapid.T) {
+		nodes := make(map[types.NodeID]types.Node, 6)
+
+		for id := types.NodeID(1); id <= 6; id++ {
+			n := createTestNode(id, 1, "user", "router")
+			if id <= 2 {
+				n.ApprovedRoutes = slices.Clone(prefixes)
+				n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: slices.Clone(prefixes)}
+				n.IsOnline = new(true)
+			} else if id == 3 {
+				n.ApprovedRoutes = slices.Clone(prefixes[3:])
+				n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: slices.Clone(prefixes[3:])}
+				n.IsOnline = new(true)
+			}
+
+			nodes[id] = n
+		}
+
+		type snapshots struct{ actual, reference *Snapshot }
+
+		initial := snapshotFromNodes(nodes, allowAllPeersFunc, nil, false, false)
+		original := snapshotFromNodesRouteScanReference(
+			nodes,
+			allowAllPeersFunc,
+			nil,
+			false,
+			false,
+		)
+		steps := rapid.IntRange(10, 60).Draw(rt, "steps")
+		history := make([]snapshots, 1, 1+steps)
+		history[0] = snapshots{&initial, &original}
+		check := func(pair snapshots) {
+			if !reflect.DeepEqual(pair.reference.routes, pair.actual.routes) {
+				rt.Fatalf(
+					"primary assignments changed: scan %v, projection %v",
+					pair.reference.routes,
+					pair.actual.routes,
+				)
+			}
+
+			var actual, reference NodeStore
+			actual.data.Store(pair.actual)
+			reference.data.Store(pair.reference)
+
+			for id := types.NodeID(0); id <= 7; id++ {
+				want := reference.primaryRoutesForNodeScanReference(id)
+
+				got := actual.PrimaryRoutesForNode(id)
+				if !reflect.DeepEqual(want, got) ||
+					!reflect.DeepEqual(
+						actual.primaryRoutesForNodeScanReference(id),
+						got,
+					) {
+					rt.Fatalf(
+						"node %d: scan %v, projection %v (nil: %v/%v)",
+						id,
+						want,
+						got,
+						want == nil,
+						got == nil,
+					)
+				}
+			}
+		}
+		check(history[0])
+
+		for step := range steps {
+			previous := history[len(history)-1]
+			nodes = maps.Clone(previous.actual.nodesByID)
+			id := types.NodeID(
+				rapid.IntRange(1, 6).Draw(rt, "node"),
+			) //nolint:gosec // bounded test ID
+
+			n, exists := nodes[id]
+			if !exists {
+				n = createTestNode(id, 1, "user", "router")
+			}
+
+			op := rapid.IntRange(0, 9).Draw(rt, "operation")
+			drawRoutes := func() []netip.Prefix {
+				return rapid.SliceOfN(rapid.SampledFrom(prefixes), 0, 6).
+					Draw(rt, "routes")
+			}
+
+			switch op {
+			case 0:
+				n.IsOnline = rapid.SampledFrom([]*bool{nil, new(false), new(true)}).
+					Draw(rt, "online")
+			case 1:
+				n.Unhealthy = !n.Unhealthy
+			case 2:
+				n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: drawRoutes()}
+			case 3:
+				n.ApprovedRoutes = drawRoutes()
+			case 4:
+				n.ApprovedRoutes = drawRoutes()
+				n.Hostinfo = &tailcfg.Hostinfo{
+					RoutableIPs: slices.Clone(n.ApprovedRoutes),
+				}
+			case 5:
+				n.Hostinfo = nil
+			case 6:
+				n.ApprovedRoutes = []netip.Prefix{}
+			case 7:
+				n.SessionEpoch++
+			case 8:
+				delete(nodes, id)
+			case 9:
+				for otherID, other := range nodes {
+					other.Unhealthy = !other.Unhealthy
+					other.IsOnline = new(!other.Online())
+					nodes[otherID] = other
+				}
+			}
+
+			if op != 8 && op != 9 {
+				nodes[id] = n
+			}
+
+			reuseRoutes := op == 7 && exists
+			next := snapshotFromNodes(
+				nodes,
+				allowAllPeersFunc,
+				previous.actual,
+				true,
+				reuseRoutes,
+			)
+			baseline := snapshotFromNodesRouteScanReference(
+				nodes,
+				allowAllPeersFunc,
+				previous.reference,
+				true,
+				reuseRoutes,
+			)
+			pair := snapshots{&next, &baseline}
+			history = append(history, pair)
+			check(pair)
+			check(history[step/2])
+		}
+
+		for _, pair := range history {
+			check(pair)
+		}
+	})
+}
+
+// primaryRouteBenchmarkNodes separates the ordinary tailnet size from the
+// number of primary routers and prefixes, which determine projection overhead.
+//
+//nolint:gosec // Benchmark prefix octets come from small bounded fixture counts.
+func primaryRouteBenchmarkNodes(
+	nodeCount, routers, prefixesPerRouter int,
+) map[types.NodeID]types.Node {
+	nodes := make(map[types.NodeID]types.Node, nodeCount)
+	for i := range nodeCount {
+		n := createTestNode(
+			types.NodeID(i+1),
+			1,
+			"user",
+			fmt.Sprintf("node-%d", i+1),
+		) //nolint:gosec // bounded benchmark ID
+		if i < routers {
+			for j := range prefixesPerRouter {
+				index := i*prefixesPerRouter + j
+				prefix := netip.PrefixFrom(
+					netip.AddrFrom4([4]byte{10, byte(index / 256), byte(index), 0}),
+					24,
+				) //nolint:gosec // bounded benchmark prefix
+				n.ApprovedRoutes = append(n.ApprovedRoutes, prefix)
+			}
+
+			n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: n.ApprovedRoutes}
+			n.IsOnline = new(true)
+		}
+
+		nodes[n.ID] = n
+	}
+
+	return nodes
+}
+
+func BenchmarkPrimaryRoutesForNode(b *testing.B) {
+	for _, shape := range []struct{ routers, prefixes int }{{0, 0}, {1, 1}, {32, 8}, {128, 16}} {
+		b.Run(
+			fmt.Sprintf("routers=%d/prefixes=%d", shape.routers, shape.prefixes),
+			func(b *testing.B) {
+				nodes := primaryRouteBenchmarkNodes(617, shape.routers, shape.prefixes)
+				snap := snapshotFromNodes(
+					nodes,
+					func([]types.NodeView) map[types.NodeID][]types.NodeID { return nil },
+					nil,
+					false,
+					false,
+				)
+
+				var store NodeStore
+				store.data.Store(&snap)
+
+				for _, target := range []struct {
+					name string
+					id   types.NodeID
+				}{{"router", 1}, {"ordinary", 617}, {"unknown", 999}} {
+					require.Equal(
+						b,
+						store.primaryRoutesForNodeScanReference(target.id),
+						store.PrimaryRoutesForNode(target.id),
+					)
+
+					for _, impl := range []struct {
+						name   string
+						lookup func(*NodeStore, types.NodeID) []netip.Prefix
+					}{
+						{"scan", (*NodeStore).primaryRoutesForNodeScanReference},
+						{"projection", (*NodeStore).PrimaryRoutesForNode},
+					} {
+						b.Run(target.name+"/"+impl.name, func(b *testing.B) {
+							var routes []netip.Prefix
+
+							b.ReportAllocs()
+
+							for b.Loop() {
+								routes = impl.lookup(&store, target.id)
+							}
+
+							runtime.KeepAlive(routes)
+						})
+					}
+				}
+			},
+		)
+	}
+}
+
+// BenchmarkPrimaryRouteSnapshotBatch includes the full node-map copy and
+// snapshot construction; the read variant also visits every node's routes.
+// Queue delays and policy work are excluded so projection write costs stay visible.
+func BenchmarkPrimaryRouteSnapshotBatch(b *testing.B) {
+	for _, routers := range []int{0, 32, 128} {
+		b.Run(fmt.Sprintf("routers=%d/prefixes=8", routers), func(b *testing.B) {
+			nodes := primaryRouteBenchmarkNodes(617, routers, 8)
+			noPeers := func([]types.NodeView) map[types.NodeID][]types.NodeID { return nil }
+
+			for _, mode := range []struct {
+				name               string
+				reuseRoutes, reads bool
+			}{
+				{name: "payload", reuseRoutes: true},
+				{name: "reelect"},
+				{name: "reelect-and-lookups", reads: true},
+			} {
+				for _, impl := range []struct {
+					name   string
+					build  func(map[types.NodeID]types.Node, PeersFunc, *Snapshot, bool, bool) Snapshot
+					lookup func(*NodeStore, types.NodeID) []netip.Prefix
+				}{
+					{"scan", snapshotFromNodesRouteScanReference, (*NodeStore).primaryRoutesForNodeScanReference},
+					{"projection", snapshotFromNodes, (*NodeStore).PrimaryRoutesForNode},
+				} {
+					b.Run(mode.name+"/"+impl.name, func(b *testing.B) {
+						initial := impl.build(nodes, noPeers, nil, false, false)
+
+						var store NodeStore
+						store.data.Store(&initial)
+
+						var routeCount int
+
+						b.ReportAllocs()
+
+						for b.Loop() {
+							previous := store.data.Load()
+							updated := maps.Clone(previous.nodesByID)
+
+							n := updated[1]
+							if mode.reuseRoutes {
+								n.SessionEpoch++
+							} else {
+								n.IsOnline = new(!n.Online())
+							}
+
+							updated[1] = n
+							next := impl.build(
+								updated,
+								noPeers,
+								previous,
+								true,
+								mode.reuseRoutes,
+							)
+							store.data.Store(&next)
+
+							if mode.reads {
+								for id := types.NodeID(1); id <= 617; id++ {
+									routeCount += len(impl.lookup(&store, id))
+								}
+							}
+						}
+
+						runtime.KeepAlive(routeCount)
+					})
+				}
+			}
+		})
+	}
 }

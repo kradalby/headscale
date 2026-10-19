@@ -173,6 +173,8 @@ type Snapshot struct {
 	// primary does not flap on every unrelated batch.
 	routes         map[netip.Prefix]types.NodeID
 	isPrimaryRoute map[types.NodeID]bool
+	// primaryRoutesByNode is sorted once per election and shared on route reuse.
+	primaryRoutesByNode map[types.NodeID][]netip.Prefix
 }
 
 // PeersFunc is a function that takes a list of nodes and returns a map
@@ -714,12 +716,14 @@ func snapshotFromNodes(
 	}
 
 	var (
-		routes         map[netip.Prefix]types.NodeID
-		isPrimaryRoute map[types.NodeID]bool
+		routes              map[netip.Prefix]types.NodeID
+		isPrimaryRoute      map[types.NodeID]bool
+		primaryRoutesByNode map[types.NodeID][]netip.Prefix
 	)
 
 	if reuseRoutes {
 		routes, isPrimaryRoute = prev.routes, prev.isPrimaryRoute
+		primaryRoutesByNode = prev.primaryRoutesByNode
 	} else {
 		// Carrying the previous assignment forward lets a still-valid
 		// primary survive unrelated batches.
@@ -729,6 +733,16 @@ func snapshotFromNodes(
 		}
 
 		routes, isPrimaryRoute = electPrimaryRoutes(nodes, prevRoutes)
+		if len(routes) > 0 {
+			primaryRoutesByNode = make(map[types.NodeID][]netip.Prefix, len(isPrimaryRoute))
+			for prefix, id := range routes {
+				primaryRoutesByNode[id] = append(primaryRoutesByNode[id], prefix)
+			}
+
+			for _, prefixes := range primaryRoutesByNode {
+				slices.SortFunc(prefixes, netip.Prefix.Compare)
+			}
+		}
 	}
 
 	var peerIDsByNode map[types.NodeID][]types.NodeID
@@ -743,15 +757,16 @@ func snapshotFromNodes(
 	}
 
 	newSnap := Snapshot{
-		nodesByID:         nodes,
-		nodeViewsByID:     nodeViewsByID,
-		allNodes:          allNodes,
-		nodesByNodeKey:    make(map[key.NodePublic]types.NodeView),
-		nodesByMachineKey: make(map[key.MachinePublic]map[types.UserID]types.NodeView),
-		peersByNode:       peerIDsByNode,
-		nodesByUser:       make(map[types.UserID][]types.NodeView),
-		routes:            routes,
-		isPrimaryRoute:    isPrimaryRoute,
+		nodesByID:           nodes,
+		nodeViewsByID:       nodeViewsByID,
+		allNodes:            allNodes,
+		nodesByNodeKey:      make(map[key.NodePublic]types.NodeView),
+		nodesByMachineKey:   make(map[key.MachinePublic]map[types.UserID]types.NodeView),
+		peersByNode:         peerIDsByNode,
+		nodesByUser:         make(map[types.UserID][]types.NodeView),
+		routes:              routes,
+		isPrimaryRoute:      isPrimaryRoute,
+		primaryRoutesByNode: primaryRoutesByNode,
 	}
 
 	for _, n := range nodes {
@@ -1025,14 +1040,19 @@ func (s *NodeStore) PrimaryRouteFor(prefix netip.Prefix) (types.NodeID, bool) {
 
 // PrimaryRoutesForNode returns the prefixes for which id is the current
 // primary advertiser, sorted so an unchanged node renders identically.
+// The returned slice belongs to the caller.
 func (s *NodeStore) PrimaryRoutesForNode(id types.NodeID) []netip.Prefix {
 	snap := s.data.Load()
+	if snap.primaryRoutesByNode != nil {
+		return slices.Clone(snap.primaryRoutesByNode[id])
+	}
+
+	// Snapshots built without a projection retain the original lookup behavior.
 	if !snap.isPrimaryRoute[id] {
 		return nil
 	}
 
 	out := make([]netip.Prefix, 0)
-
 	for prefix, nodeID := range snap.routes {
 		if nodeID == id {
 			out = append(out, prefix)
@@ -1040,7 +1060,6 @@ func (s *NodeStore) PrimaryRoutesForNode(id types.NodeID) []netip.Prefix {
 	}
 
 	slices.SortFunc(out, netip.Prefix.Compare)
-
 	return out
 }
 
