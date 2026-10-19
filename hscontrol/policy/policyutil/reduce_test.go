@@ -3,10 +3,14 @@ package policyutil_test
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"net/netip"
+	"slices"
+	"strconv"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/policy/policyutil"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -15,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/util/must"
 )
 
@@ -1337,5 +1342,616 @@ func TestReduceFilterRulesCapGrant(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+var reductionDestinationInputs = []string{
+	"100.64.0.1",
+	"100.64.0.1/32",
+	"100.64.0.0/10",
+	"100.64.0.1/24",
+	"0.0.0.0",
+	"0.0.0.0/0",
+	"255.255.255.255/32",
+	"100.64.0.0/0",
+	"fd7a:115c:a1e0::1",
+	"fd7a:115c:a1e0::1/128",
+	"fd7a:115c:a1e0::/48",
+	"fd7a:115c:a1e0::1/64",
+	"::",
+	"::1",
+	"::/0",
+	"ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+	"fe80::1%eth0",
+	"fe80::1%eth-0",
+	"fe80::1%eth--0",
+	"fe80::1%1",
+	"fe80::1%eth0/64",
+	"::ffff:100.64.0.1",
+	"::ffff:100.64.0.1/128",
+	"::ffff:100.64.0.0/112",
+	"::ffff:100.64.0.1/120",
+	"100.64.0.0-100.64.0.2",
+	"100.64.0.2-100.64.0.0",
+	"fd7a:115c:a1e0::-fd7a:115c:a1e0::2",
+	"fe80::1%eth0-fe80::2%eth0",
+	"100.64.0.1-fd7a:115c:a1e0::1",
+	"100.64.0.1-100.64.0.1",
+	"10.0.0.0/8",
+	"10.0.0.0/16",
+	"10.0.0.0/25",
+	"10.0.0.128/25",
+	"10.0.1.0/24",
+	"192.0.2.0/24",
+	"fd00::/8",
+	"fd00:1::/48",
+	"fd00:1::/65",
+	"*",
+	"",
+	" ",
+	" 100.64.0.1",
+	"100.64.0.1\n",
+	"[::1]",
+	"100.64.0.1:80",
+	"100.064.0.1",
+	"100.64.0.0/024",
+	"100.64.0.1/",
+	"/0",
+	"bad/24",
+	"0.0.0.0/33",
+	"::/129",
+	"100.64.0.1--100.64.0.2",
+	"not-an-ip",
+}
+
+func assertReductionMatchesReference(
+	t *testing.T,
+	node types.NodeView,
+	rules []tailcfg.FilterRule,
+) {
+	t.Helper()
+
+	before := must.Get(json.Marshal(rules))
+	nodeBefore := node.AsStruct()
+	want := reduceFilterRulesReference(node, rules)
+
+	got := policyutil.ReduceFilterRules(node, rules)
+	if diff := cmp.Diff(
+		want,
+		got,
+		cmpopts.EquateComparable(netip.Prefix{}),
+	); diff != "" {
+		t.Fatalf("reduction differs from frozen reference (-want +got):\n%s", diff)
+	}
+
+	require.Equal(t, before, must.Get(json.Marshal(rules)), "rules must not be mutated")
+	require.Equal(t, nodeBefore, node.AsStruct(), "node must not be mutated")
+}
+
+func TestReduceFilterRulesReference(t *testing.T) {
+	routes := []netip.Prefix{p("10.0.0.128/25"), p("10.0.1.0/24"), p("fd00:1::/64")}
+	tests := []struct {
+		name string
+		node *types.Node
+	}{
+		{name: "invalid-view"},
+		{name: "no-ips", node: &types.Node{}},
+		{
+			name: "invalid-ips",
+			node: &types.Node{IPv4: new(netip.Addr), IPv6: new(netip.Addr)},
+		},
+		{name: "ipv4", node: &types.Node{IPv4: ap("100.64.0.1")}},
+		{name: "ipv6", node: &types.Node{IPv6: ap("fd7a:115c:a1e0::1")}},
+		{
+			name: "dual-stack",
+			node: &types.Node{IPv4: ap("100.64.0.1"), IPv6: ap("fd7a:115c:a1e0::1")},
+		},
+		{name: "link-local", node: &types.Node{IPv6: ap("fe80::1")}},
+		{name: "zoned-node", node: &types.Node{IPv6: ap("fe80::1%eth0")}},
+		{name: "mapped-ipv6", node: &types.Node{IPv6: ap("::ffff:100.64.0.1")}},
+		{name: "mapped-approved-subnet", node: &types.Node{
+			Hostinfo: &tailcfg.Hostinfo{
+				RoutableIPs: []netip.Prefix{p("::ffff:100.64.0.0/120")},
+			},
+			ApprovedRoutes: []netip.Prefix{p("::ffff:100.64.0.0/120")},
+		}},
+		{name: "approved-subnets", node: &types.Node{
+			Hostinfo: &tailcfg.Hostinfo{RoutableIPs: routes}, ApprovedRoutes: routes,
+		}},
+		{name: "partial-approval", node: &types.Node{
+			Hostinfo: &tailcfg.Hostinfo{
+				RoutableIPs: routes,
+			},
+			ApprovedRoutes: routes[:1],
+		}},
+		{
+			name: "unapproved",
+			node: &types.Node{Hostinfo: &tailcfg.Hostinfo{RoutableIPs: routes}},
+		},
+		{name: "not-announced", node: &types.Node{ApprovedRoutes: routes}},
+		{name: "ipv4-exit", node: &types.Node{
+			Hostinfo: &tailcfg.Hostinfo{
+				RoutableIPs: []netip.Prefix{tsaddr.AllIPv4()},
+			},
+			ApprovedRoutes: []netip.Prefix{tsaddr.AllIPv4()},
+		}},
+		{name: "ipv6-exit", node: &types.Node{
+			Hostinfo: &tailcfg.Hostinfo{
+				RoutableIPs: []netip.Prefix{tsaddr.AllIPv6()},
+			},
+			ApprovedRoutes: []netip.Prefix{tsaddr.AllIPv6()},
+		}},
+		{name: "unapproved-exit", node: &types.Node{
+			Hostinfo: &tailcfg.Hostinfo{
+				RoutableIPs: []netip.Prefix{tsaddr.AllIPv4(), tsaddr.AllIPv6()},
+			},
+		}},
+	}
+
+	dests := make([]tailcfg.NetPortRange, 0, len(reductionDestinationInputs)+2)
+	for i, ip := range reductionDestinationInputs {
+		dests = append(dests, tailcfg.NetPortRange{
+			IP:   ip,
+			Bits: new(24),
+			Ports: tailcfg.PortRange{
+				First: uint16(i),
+				Last:  uint16(i + 10),
+			}, //nolint:gosec // bounded fixture
+		})
+	}
+
+	// Repeated destinations retain their original position, ports, and metadata.
+	dests = append(
+		dests,
+		dests[0],
+		tailcfg.NetPortRange{IP: dests[0].IP, Ports: tailcfg.PortRangeAny},
+	)
+	ordinary := tailcfg.FilterRule{
+		SrcIPs: []string{
+			"*",
+			"100.64.0.2",
+		},
+		SrcBits:  []int{0, 32},
+		IPProto:  []int{6, 17, 1},
+		DstPorts: dests,
+		CapGrant: []tailcfg.CapGrant{},
+	}
+	capRule := ordinary
+	capRule.CapGrant = []tailcfg.CapGrant{
+		{
+			Dsts: []netip.Prefix{
+				p("::/0"),
+				p("100.64.0.0/10"),
+				p("10.0.0.0/8"),
+				p("10.0.0.0/8"),
+			},
+			Caps: []peercap.Cap{"test/legacy"},
+			CapMap: tailcfg.PeerCapMap{
+				"test/nil":   nil,
+				"test/empty": {},
+				"test/value": {tailcfg.RawMessage(`{"value":1}`)},
+			},
+		},
+		{Dsts: []netip.Prefix{p("100.64.0.1/32")}, CapMap: tailcfg.PeerCapMap{}},
+	}
+	capOnly := capRule
+	capOnly.DstPorts = nil
+	rules := []tailcfg.FilterRule{
+		ordinary,
+		{},
+		capOnly,
+		capRule,
+		{DstPorts: []tailcfg.NetPortRange{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assertReductionMatchesReference(t, tt.node.View(), nil)
+			assertReductionMatchesReference(t, tt.node.View(), []tailcfg.FilterRule{})
+			assertReductionMatchesReference(t, tt.node.View(), rules)
+		})
+	}
+}
+
+//nolint:gosec // Deterministic, bounded differential-test inputs.
+func TestReduceFilterRulesReferenceRandomized(t *testing.T) {
+	rng := rand.New(rand.NewPCG(0, 0))
+	ips := []string{
+		"100.64.0.1",
+		"100.64.0.2",
+		"0.0.0.0",
+		"fd7a:115c:a1e0::1",
+		"fe80::1",
+		"fe80::1%eth0",
+		"::ffff:100.64.0.1",
+	}
+	prefixes := []netip.Prefix{
+		{},
+		p("10.0.0.1/24"), p("10.0.0.128/25"), p("10.0.1.0/24"), p("100.64.0.0/24"),
+		p("fd7a:115c:a1e0::/48"), p("fd00:1::/64"), tsaddr.AllIPv4(), tsaddr.AllIPv6(),
+	}
+
+	for iteration := range 1000 {
+		t.Run(strconv.Itoa(iteration), func(t *testing.T) {
+			var raw [16]byte
+			for i := range raw {
+				raw[i] = byte(rng.IntN(256))
+			}
+
+			ip4 := netip.AddrFrom4([4]byte{raw[0], raw[1], raw[2], raw[3]})
+			ip6 := netip.AddrFrom16(raw)
+			prefix4 := netip.PrefixFrom(ip4, rng.IntN(33))
+			prefix6 := netip.PrefixFrom(ip6, rng.IntN(129))
+			ipCandidates := append(slices.Clone(ips), ip4.String(), ip6.String())
+			routeCandidates := append(
+				slices.Clone(prefixes),
+				prefix4,
+				prefix4.Masked(),
+				prefix6,
+				prefix6.Masked(),
+			)
+			destCandidates := append(
+				slices.Clone(reductionDestinationInputs),
+				ip4.String(),
+				ip6.String(),
+				prefix4.String(),
+				prefix4.Masked().String(),
+				prefix6.String(),
+				prefix6.Masked().String(),
+			)
+
+			node := &types.Node{}
+			if rng.IntN(4) != 0 {
+				node.IPv4 = ap(ipCandidates[rng.IntN(len(ipCandidates))])
+			}
+
+			if rng.IntN(4) != 0 {
+				node.IPv6 = ap(ipCandidates[rng.IntN(len(ipCandidates))])
+			}
+
+			if rng.IntN(4) != 0 {
+				node.Hostinfo = &tailcfg.Hostinfo{}
+				for range rng.IntN(12) {
+					node.Hostinfo.RoutableIPs = append(
+						node.Hostinfo.RoutableIPs,
+						routeCandidates[rng.IntN(len(routeCandidates))],
+					)
+				}
+			}
+
+			for range rng.IntN(12) {
+				node.ApprovedRoutes = append(
+					node.ApprovedRoutes,
+					routeCandidates[rng.IntN(len(routeCandidates))],
+				)
+			}
+
+			rules := make([]tailcfg.FilterRule, rng.IntN(12))
+			for i := range rules {
+				rule := &rules[i]
+				rule.SrcIPs = [][]string{nil, {}, {"*", "100.64.0.2"}}[rng.IntN(3)]
+				rule.SrcBits = [][]int{nil, {}, {0, 32}}[rng.IntN(3)]
+
+				rule.IPProto = [][]int{nil, {}, {1, 6, 17}, {-1, 300}}[rng.IntN(4)]
+				if rng.IntN(2) == 0 {
+					rule.DstPorts = []tailcfg.NetPortRange{}
+				}
+
+				for range rng.IntN(12) {
+					ip := destCandidates[rng.IntN(len(destCandidates))]
+					if rng.IntN(8) == 0 {
+						ip += string(rune(rng.IntN(128)))
+					}
+
+					dest := tailcfg.NetPortRange{IP: ip, Ports: tailcfg.PortRange{
+						First: uint16(
+							rng.IntN(65536),
+						),
+						Last: uint16(
+							rng.IntN(65536),
+						), //nolint:gosec // bounded generator
+					}}
+					if rng.IntN(2) == 0 {
+						dest.Bits = new(rng.IntN(150) - 10)
+					}
+
+					rule.DstPorts = append(rule.DstPorts, dest)
+				}
+
+				if rng.IntN(2) == 0 {
+					rule.CapGrant = []tailcfg.CapGrant{}
+				}
+
+				if rng.IntN(3) == 0 {
+					for range rng.IntN(4) {
+						cg := tailcfg.CapGrant{Caps: []peercap.Cap{"test/legacy"}}
+						for range rng.IntN(8) {
+							cg.Dsts = append(
+								cg.Dsts,
+								routeCandidates[rng.IntN(len(routeCandidates))],
+							)
+						}
+
+						cg.CapMap = []tailcfg.PeerCapMap{nil, {}, {"test/nil": nil, "test/empty": {}, "test/value": {"true"}}}[rng.IntN(3)]
+						rule.CapGrant = append(rule.CapGrant, cg)
+					}
+				}
+			}
+
+			assertReductionMatchesReference(t, node.View(), rules)
+		})
+	}
+}
+
+func BenchmarkReduceFilterRules(b *testing.B) {
+	plain := &types.Node{IPv4: ap("100.64.0.1"), IPv6: ap("fd7a:115c:a1e0::1")}
+	router := plain.Clone()
+
+	router.Hostinfo = &tailcfg.Hostinfo{}
+	for i := range 64 {
+		router.Hostinfo.RoutableIPs = append(
+			router.Hostinfo.RoutableIPs,
+			p(fmt.Sprintf("10.%d.0.0/16", i)),
+		)
+	}
+
+	router.ApprovedRoutes = router.Hostinfo.RoutableIPs
+	exit := plain.Clone()
+	exit.Hostinfo = &tailcfg.Hostinfo{
+		RoutableIPs: []netip.Prefix{tsaddr.AllIPv4(), tsaddr.AllIPv6()},
+	}
+	exit.ApprovedRoutes = exit.Hostinfo.RoutableIPs
+	matching := []string{
+		"100.64.0.1", "100.64.0.0/10",
+		"fd7a:115c:a1e0::1", "fd7a:115c:a1e0::/48",
+	}
+	fallback := []string{
+		"*", "100.64.0.0-100.64.0.2",
+		"fd7a:115c:a1e0::-fd7a:115c:a1e0::2", "192.0.2.0-192.0.2.255",
+	}
+	capDsts := []netip.Prefix{
+		p("100.64.0.0/10"), p("fd7a:115c:a1e0::/48"), p("192.0.2.0/24"),
+	}
+	capMap := tailcfg.PeerCapMap{"test/cap": nil}
+
+	for _, workload := range []struct {
+		name string
+		node *types.Node
+	}{
+		{"plain", plain},
+		{"route-heavy", router},
+		{"exit", exit},
+		{"matching-dense", plain},
+		{"fallback", plain},
+		{"capgrant-only", plain},
+	} {
+		for _, unique := range []bool{false, true} {
+			if unique && slices.Contains(
+				[]string{"matching-dense", "fallback", "capgrant-only"}, workload.name,
+			) {
+				continue
+			}
+
+			for _, count := range []int{0, 1, 256, 4096} {
+				var rules []tailcfg.FilterRule
+
+				for i := range count {
+					if i%16 == 0 {
+						rules = append(rules, tailcfg.FilterRule{SrcIPs: []string{"*"}})
+					}
+
+					n := i
+					if !unique {
+						n %= 4
+					}
+
+					ip := []string{
+						fmt.Sprintf("100.64.%d.%d", n/256, n%256),
+						fmt.Sprintf("10.%d.%d.0/24", n%64, n/64),
+						fmt.Sprintf("fd00:%x::1", n),
+						fmt.Sprintf("fd00:%x::/64", n),
+					}[i%4]
+					// The one-destination case measures an immediate node-IP match.
+					if count == 1 {
+						ip = "100.64.0.1"
+					}
+
+					switch workload.name {
+					case "matching-dense":
+						ip = matching[i%len(matching)]
+					case "fallback":
+						ip = fallback[i%len(fallback)]
+					}
+
+					last := &rules[len(rules)-1]
+					if workload.name == "capgrant-only" {
+						last.CapGrant = append(last.CapGrant, tailcfg.CapGrant{
+							Dsts: capDsts, CapMap: capMap,
+						})
+					} else {
+						last.DstPorts = append(
+							last.DstPorts,
+							tailcfg.NetPortRange{IP: ip, Ports: tailcfg.PortRangeAny},
+						)
+					}
+				}
+
+				want := reduceFilterRulesReference(workload.node.View(), rules)
+				for _, impl := range []struct {
+					name string
+					run  func(types.NodeView, []tailcfg.FilterRule) []tailcfg.FilterRule
+				}{
+					{"old", reduceFilterRulesReference}, {"new", policyutil.ReduceFilterRules},
+				} {
+					b.Run(
+						fmt.Sprintf(
+							"%s/unique=%t/dests=%d/%s",
+							workload.name,
+							unique,
+							count,
+							impl.name,
+						),
+						func(b *testing.B) {
+							b.ReportAllocs()
+
+							var got []tailcfg.FilterRule
+							for b.Loop() {
+								got = impl.run(workload.node.View(), rules)
+							}
+
+							if diff := cmp.Diff(
+								want,
+								got,
+								cmpopts.EquateComparable(netip.Prefix{}),
+							); diff != "" {
+								b.Fatalf("reduction differs (-want +got):\n%s", diff)
+							}
+						},
+					)
+				}
+			}
+		}
+	}
+}
+
+// Frozen pre-optimization reducers: keep independent for exact comparisons and benchmarks.
+func reduceFilterRulesReference(node types.NodeView, rules []tailcfg.FilterRule) []tailcfg.FilterRule {
+	ret := []tailcfg.FilterRule{}
+	subnetRoutes := node.SubnetRoutes()
+	exitRoutes := node.ExitRoutes()
+
+	for _, rule := range rules {
+		// Handle CapGrant rules separately — they use CapGrant[].Dsts
+		// instead of DstPorts for destination matching.
+		if len(rule.CapGrant) > 0 {
+			reduced := reduceCapGrantRuleReference(node, rule)
+			if reduced != nil {
+				ret = append(ret, *reduced)
+			}
+
+			continue
+		}
+
+		// record if the rule is actually relevant for the given node.
+		var dests []tailcfg.NetPortRange
+
+		for _, dest := range rule.DstPorts {
+			expanded, err := util.ParseIPSet(dest.IP, nil)
+			// Fail closed: unparseable dests are dropped.
+			if err != nil {
+				continue
+			}
+
+			if node.InIPSet(expanded) {
+				dests = append(dests, dest)
+				continue
+			}
+
+			// If the node has approved subnet routes, preserve
+			// filter rules targeting those routes.
+			// [types.NodeView.SubnetRoutes] returns only approved,
+			// non-exit routes — matching Tailscale SaaS behavior,
+			// which does not generate filter rules for
+			// advertised-but-unapproved routes.
+			if slices.ContainsFunc(subnetRoutes, expanded.OverlapsPrefix) {
+				dests = append(dests, dest)
+				continue
+			}
+
+			// Approved exit routes count like subnet routes. They
+			// contain every destination, so Tailscale SaaS sends an
+			// exit node every rule, not only internet ones.
+			if slices.ContainsFunc(exitRoutes, expanded.OverlapsPrefix) {
+				dests = append(dests, dest)
+			}
+		}
+
+		if len(dests) > 0 {
+			// Struct-copy preserves any unknown future FilterRule
+			// fields.
+			out := rule
+			out.DstPorts = dests
+			ret = append(ret, out)
+		}
+	}
+
+	return ret
+}
+
+// reduceCapGrantRuleReference filters a [tailcfg.CapGrant] rule to only include
+// [tailcfg.CapGrant] entries whose Dsts match the given node's IPs. When a
+// broad prefix (e.g. 100.64.0.0/10 from dst:*) contains a node's IP, it is
+// narrowed to the node's specific /32 or /128 prefix. Returns nil if
+// no [tailcfg.CapGrant] entries are relevant to this node.
+func reduceCapGrantRuleReference(
+	node types.NodeView,
+	rule tailcfg.FilterRule,
+) *tailcfg.FilterRule {
+	var capGrants []tailcfg.CapGrant
+
+	nodeIPs := node.IPs()
+	subnetRoutes := node.SubnetRoutes()
+
+	for _, cg := range rule.CapGrant {
+		// Collect the node's IPs that fall within any of this
+		// CapGrant's Dsts. Broad prefixes are narrowed to specific
+		// /32 and /128 entries for the node.
+		var matchingDsts []netip.Prefix
+
+		for _, dst := range cg.Dsts {
+			if dst.IsSingleIP() {
+				// Already a specific IP — keep it if it matches
+				// any of the node's IPs.
+				if slices.Contains(nodeIPs, dst.Addr()) {
+					matchingDsts = append(matchingDsts, dst)
+				}
+			} else {
+				// Broad prefix — narrow to node's specific IPs.
+				for _, ip := range nodeIPs {
+					if dst.Contains(ip) {
+						matchingDsts = append(matchingDsts, netip.PrefixFrom(ip, ip.BitLen()))
+					}
+				}
+			}
+		}
+
+		// Asymmetric on purpose: the IP-match loop above narrows broad
+		// prefixes to node-specific /32 or /128 so peers receive only
+		// the minimum routing surface. The route-match loop below
+		// preserves the original prefix so the subnet-serving node
+		// receives the full CapGrant scope. [types.NodeView.SubnetRoutes]
+		// excludes both unapproved and exit routes, matching Tailscale
+		// SaaS behavior.
+		for _, dst := range cg.Dsts {
+			for _, subnetRoute := range subnetRoutes {
+				if dst.Overlaps(subnetRoute) {
+					// For route overlaps, keep the original prefix.
+					matchingDsts = append(matchingDsts, dst)
+				}
+			}
+		}
+
+		if len(matchingDsts) > 0 {
+			// A Dst can be appended twice when a broad prefix both
+			// contains a node IP and overlaps one of its approved
+			// subnet routes. Sort + Compact dedups; [netip.Prefix] is
+			// comparable so Compact works with ==.
+			slices.SortFunc(matchingDsts, netip.Prefix.Compare)
+			matchingDsts = slices.Compact(matchingDsts)
+
+			capGrants = append(capGrants, tailcfg.CapGrant{
+				Dsts:   matchingDsts,
+				CapMap: cg.CapMap,
+			})
+		}
+	}
+
+	if len(capGrants) == 0 {
+		return nil
+	}
+
+	return &tailcfg.FilterRule{
+		SrcIPs:   rule.SrcIPs,
+		CapGrant: capGrants,
 	}
 }
