@@ -130,18 +130,21 @@ func (u *User) TypedID() *UserID {
 // should be used throughout headscale, in information returned to the
 // user and the Policy engine.
 func (u *User) Username() string {
-	return cmp.Or(
-		u.Email,
-		u.Name,
-		u.ProviderIdentifier.String,
-		u.StringID(),
-	)
+	if name := cmp.Or(u.Email, u.Name, u.ProviderIdentifier.String); name != "" {
+		return name
+	}
+
+	return u.StringID()
 }
 
 // Display returns the [User.DisplayName] if it exists, otherwise
 // it will return the [User.Username].
 func (u *User) Display() string {
-	return cmp.Or(u.DisplayName, u.Username())
+	if u.DisplayName != "" {
+		return u.DisplayName
+	}
+
+	return u.Username()
 }
 
 // Username returns the user's login name via the view; see [User.Username].

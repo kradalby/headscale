@@ -1,13 +1,17 @@
 package types
 
 import (
+	stdcmp "cmp"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
+	"tailscale.com/tailcfg"
 )
 
 func TestUnmarshallOIDCClaims(t *testing.T) {
@@ -550,5 +554,200 @@ func TestOIDCClaimsJSONToUser(t *testing.T) {
 				t.Errorf("TestOIDCClaimsJSONToUser() mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// userOriginal freezes the user profile helpers from 1096abfc8.
+// Keep these bodies unchanged so comparisons include the eager fallback work.
+type userOriginal User
+
+func (u *userOriginal) StringID() string {
+	if u == nil {
+		return ""
+	}
+
+	return strconv.FormatUint(uint64(u.ID), 10)
+}
+
+func (u *userOriginal) Username() string {
+	return stdcmp.Or(
+		u.Email,
+		u.Name,
+		u.ProviderIdentifier.String,
+		u.StringID(),
+	)
+}
+
+func (u *userOriginal) Display() string {
+	return stdcmp.Or(u.DisplayName, u.Username())
+}
+
+func (u *userOriginal) TailscaleUserProfile() tailcfg.UserProfile {
+	return tailcfg.UserProfile{
+		ID:            tailcfg.UserID(u.ID), //nolint:gosec // UserID is bounded
+		LoginName:     u.Username(),
+		DisplayName:   u.Display(),
+		ProfilePicURL: u.ProfilePicURL,
+	}
+}
+
+func userViewUsernameOriginal(v UserView) string {
+	if !v.Valid() {
+		return ""
+	}
+
+	return (*userOriginal)(v.ж).Username()
+}
+
+func userViewDisplayOriginal(v UserView) string {
+	if !v.Valid() {
+		return ""
+	}
+
+	return (*userOriginal)(v.ж).Display()
+}
+
+func userViewTailscaleUserProfileOriginal(u UserView) tailcfg.UserProfile {
+	return (*userOriginal)(u.ж).TailscaleUserProfile()
+}
+
+func TestUserProfileHelpersMatchOriginal(t *testing.T) {
+	for _, id := range []uint{0, 1, 99, 100, 101, ^uint(0)} {
+		for mask := range 32 {
+			t.Run(fmt.Sprintf("ID=%d/fields=%02d", id, mask), func(t *testing.T) {
+				u := User{
+					ID:            id,
+					ProfilePicURL: "https://example.com/avatar",
+				}
+
+				if mask&1 != 0 {
+					u.Email = "email@example.com"
+				}
+
+				if mask&2 != 0 {
+					u.Name = "username"
+				}
+
+				if mask&4 != 0 {
+					u.ProviderIdentifier.String = "https://issuer.example.com/subject"
+				}
+
+				u.ProviderIdentifier.Valid = mask&8 != 0
+
+				if mask&16 != 0 {
+					u.DisplayName = "Display Name"
+				}
+
+				original := (*userOriginal)(&u)
+				view := u.View()
+				assert.Equal(t, original.Username(), u.Username())
+				assert.Equal(t, original.Display(), u.Display())
+				assert.Equal(
+					t,
+					original.TailscaleUserProfile(),
+					u.TailscaleUserProfile(),
+				)
+				assert.Equal(t, userViewUsernameOriginal(view), view.Username())
+				assert.Equal(t, userViewDisplayOriginal(view), view.Display())
+				assert.Equal(
+					t,
+					userViewTailscaleUserProfileOriginal(view),
+					view.TailscaleUserProfile(),
+				)
+			})
+		}
+	}
+
+	for _, u := range []User{TaggedDevices, {Name: " ", DisplayName: "\t"}} {
+		original := (*userOriginal)(&u)
+		assert.Equal(t, original.Username(), u.Username())
+		assert.Equal(t, original.Display(), u.Display())
+		assert.Equal(t, original.TailscaleUserProfile(), u.TailscaleUserProfile())
+		assert.Equal(
+			t,
+			original.TailscaleUserProfile(),
+			u.View().TailscaleUserProfile(),
+		)
+	}
+}
+
+func TestUserProfileHelpersInvalidMatchOriginal(t *testing.T) {
+	var u *User
+
+	original := (*userOriginal)(u)
+
+	assert.Panics(t, func() { original.Username() })
+	assert.Panics(t, func() { u.Username() })
+	assert.Panics(t, func() { original.Display() })
+	assert.Panics(t, func() { u.Display() })
+	assert.Panics(t, func() { original.TailscaleUserProfile() })
+	assert.Panics(t, func() { u.TailscaleUserProfile() })
+
+	var view UserView
+	assert.Equal(t, userViewUsernameOriginal(view), view.Username())
+	assert.Empty(t, view.Username())
+	assert.Equal(t, userViewDisplayOriginal(view), view.Display())
+	assert.Empty(t, view.Display())
+	assert.Panics(t, func() { userViewTailscaleUserProfileOriginal(view) })
+	assert.Panics(t, func() { view.TailscaleUserProfile() })
+}
+
+func BenchmarkUserProfileHelpers(b *testing.B) {
+	for _, id := range []uint{99, 100, 1000} {
+		for _, names := range []string{"named", "numeric"} {
+			b.Run(fmt.Sprintf("ID=%d/%s", id, names), func(b *testing.B) {
+				u := User{ID: id}
+				if names == "named" {
+					u.Name = "username"
+					u.Email = "email@example.com"
+					u.DisplayName = "Display Name"
+				}
+
+				original := (*userOriginal)(&u)
+
+				b.Run("Username/original", func(b *testing.B) {
+					b.ReportAllocs()
+
+					for b.Loop() {
+						_ = original.Username()
+					}
+				})
+				b.Run("Username/current", func(b *testing.B) {
+					b.ReportAllocs()
+
+					for b.Loop() {
+						_ = u.Username()
+					}
+				})
+				b.Run("Display/original", func(b *testing.B) {
+					b.ReportAllocs()
+
+					for b.Loop() {
+						_ = original.Display()
+					}
+				})
+				b.Run("Display/current", func(b *testing.B) {
+					b.ReportAllocs()
+
+					for b.Loop() {
+						_ = u.Display()
+					}
+				})
+				b.Run("Profile/original", func(b *testing.B) {
+					b.ReportAllocs()
+
+					for b.Loop() {
+						_ = original.TailscaleUserProfile()
+					}
+				})
+				b.Run("Profile/current", func(b *testing.B) {
+					b.ReportAllocs()
+
+					for b.Loop() {
+						_ = u.TailscaleUserProfile()
+					}
+				})
+			})
+		}
 	}
 }
