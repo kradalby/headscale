@@ -424,6 +424,8 @@ func (hsdb *HSDatabase) DestroyRevokedPreAuthKeysBefore(cutoff time.Time) (int, 
 			return err
 		}
 
+		// Any failure rolls back the whole batch, so per-key savepoints are redundant.
+		tx = tx.Session(&gorm.Session{DisableNestedTransaction: true})
 		for _, id := range ids {
 			err := DestroyPreAuthKey(tx, id)
 			if err != nil {
