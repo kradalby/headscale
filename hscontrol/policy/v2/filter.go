@@ -271,6 +271,16 @@ func (pol *Policy) compileSSHPolicy(
 
 	rules := []*tailcfg.SSHRule{}
 
+	type sourceResolution struct {
+		ips              ResolvedAddresses
+		err              error
+		userIDs          []uint
+		principalsByUser map[uint][]*tailcfg.SSHPrincipal
+		taggedPrincipals []*tailcfg.SSHPrincipal
+	}
+
+	sources := make(map[string]sourceResolution)
+
 	for index, rule := range pol.SSHs {
 		var autogroupSelfDests, otherDests []Alias
 
@@ -282,7 +292,19 @@ func (pol *Policy) compileSSHPolicy(
 			}
 		}
 
-		srcIPs, err := rule.Sources.Resolve(pol, users, nodes)
+		var sourceKey string
+
+		cacheable := len(pol.SSHs) > 1
+		if cacheable {
+			sourceKey, cacheable = sshSourcesKey(rule.Sources)
+		}
+
+		resolved, reused := sources[sourceKey]
+		if !cacheable || !reused {
+			resolved.ips, resolved.err = rule.Sources.Resolve(pol, users, nodes)
+		}
+
+		srcIPs, err := resolved.ips, resolved.err
 		if err != nil {
 			log.Trace().Caller().Err(err).Msgf(
 				"ssh policy compilation failed resolving source ips for rule %+v", rule,
@@ -336,9 +358,33 @@ func (pol *Policy) compileSSHPolicy(
 			)
 		}
 
-		userIDs, principalsByUser, taggedPrincipals := groupSourcesByUser(
-			nodes, srcIPs,
-		)
+		var principalsByUser map[uint][]*tailcfg.SSHPrincipal
+
+		userIDs := resolved.userIDs
+		taggedPrincipals := resolved.taggedPrincipals
+
+		if cacheable && reused {
+			// Separate input rules own their principals; sharing is only within a rule.
+			principalsByUser = make(map[uint][]*tailcfg.SSHPrincipal, len(userIDs))
+			for _, uid := range userIDs {
+				principalsByUser[uid] = cloneSSHPrincipals(
+					resolved.principalsByUser[uid],
+				)
+			}
+
+			taggedPrincipals = cloneSSHPrincipals(taggedPrincipals)
+		} else {
+			userIDs, principalsByUser, taggedPrincipals = groupSourcesByUser(
+				nodes,
+				srcIPs,
+			)
+			if cacheable {
+				resolved.userIDs = userIDs
+				resolved.principalsByUser = principalsByUser
+				resolved.taggedPrincipals = taggedPrincipals
+				sources[sourceKey] = resolved
+			}
+		}
 
 		// appendRules emits a common rule and, if the user has a
 		// localpart match, a per-user localpart rule.
@@ -469,6 +515,31 @@ func (pol *Policy) compileSSHPolicy(
 	return &tailcfg.SSHPolicy{
 		Rules: rules,
 	}, nil
+}
+
+// sshSourcesKey preserves alias types, order and duplicates, including soft errors.
+func sshSourcesKey(sources SSHSrcAliases) (string, bool) {
+	var key strings.Builder
+
+	for _, src := range sources {
+		switch src.(type) {
+		case *Username, *Group, *Tag, *AutoGroup:
+			fmt.Fprintf(&key, "%T:%q;", src, src.String())
+		default:
+			return "", false
+		}
+	}
+
+	return key.String(), true
+}
+
+func cloneSSHPrincipals(principals []*tailcfg.SSHPrincipal) []*tailcfg.SSHPrincipal {
+	cloned := slices.Clone(principals)
+	for i, principal := range cloned {
+		cloned[i] = principal.Clone()
+	}
+
+	return cloned
 }
 
 // ipSetToPrincipals converts an [netipx.IPSet] into SSH principals, one per address.

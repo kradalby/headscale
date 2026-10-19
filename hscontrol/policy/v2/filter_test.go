@@ -2,8 +2,12 @@ package v2
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/netip"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -12,11 +16,14 @@ import (
 	"github.com/juanfont/headscale/hscontrol/policy/policyutil"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go4.org/netipx"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/peercap"
+	"tailscale.com/types/views"
 )
 
 // aliasWithPorts creates an AliasWithPorts structure from an alias and ports.
@@ -4256,6 +4263,881 @@ func TestDestinationsToNetPortRange_AutogroupInternet(t *testing.T) {
 
 			if !tt.wantStar && tt.wantLen > 0 && len(got) > 0 {
 				assert.NotEqual(t, "*", got[0].IP)
+			}
+		})
+	}
+}
+
+// Frozen from d00f135bf filter.go before invocation-local SSH reuse.
+// Only names change; preserve these bodies for differential tests and benchmarks.
+//
+//nolint:gocyclo // Preserve the original compiler for differential testing.
+func (pol *Policy) compileSSHPolicyReference(
+	baseURL string,
+	users types.Users,
+	node types.NodeView,
+	nodes views.Slice[types.NodeView],
+) (*tailcfg.SSHPolicy, error) {
+	// Never nil: clients read a nil SSHPolicy as "keep the previous
+	// rules", so revoked access would stay. SaaS sends "rules":[].
+	if pol == nil || len(pol.SSHs) == 0 {
+		return &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}}, nil
+	}
+
+	log.Trace().Caller().Msgf("compiling SSH policy for node %q", node.Hostname())
+
+	rules := []*tailcfg.SSHRule{}
+
+	for index, rule := range pol.SSHs {
+		var autogroupSelfDests, otherDests []Alias
+
+		for _, dst := range rule.Destinations {
+			if ag, ok := dst.(*AutoGroup); ok && ag.Is(AutoGroupSelf) {
+				autogroupSelfDests = append(autogroupSelfDests, dst)
+			} else {
+				otherDests = append(otherDests, dst)
+			}
+		}
+
+		srcIPs, err := rule.Sources.Resolve(pol, users, nodes)
+		if err != nil {
+			log.Trace().Caller().Err(err).Msgf(
+				"ssh policy compilation failed resolving source ips for rule %+v", rule,
+			)
+		}
+
+		if srcIPs == nil || len(srcIPs.Prefixes()) == 0 {
+			continue
+		}
+
+		var action tailcfg.SSHAction
+
+		switch rule.Action {
+		case SSHActionAccept:
+			action = sshAccept
+		case SSHActionCheck:
+			action = sshCheckReference(baseURL)
+		default:
+			return nil, fmt.Errorf(
+				"parsing SSH policy, unknown action %q, index: %d: %w",
+				rule.Action, index, err,
+			)
+		}
+
+		acceptEnv := rule.AcceptEnv
+
+		// Build the common userMap (always has at least a root entry).
+		const rootUser = "root"
+
+		baseUserMap := make(map[string]string, len(rule.Users))
+		if rule.Users.ContainsNonRoot() {
+			baseUserMap["*"] = "="
+		}
+
+		if rule.Users.ContainsRoot() {
+			baseUserMap[rootUser] = rootUser
+		} else {
+			baseUserMap[rootUser] = ""
+		}
+
+		for _, u := range rule.Users.NormalUsers() {
+			baseUserMap[u.String()] = u.String()
+		}
+
+		hasLocalpart := rule.Users.ContainsLocalpart()
+
+		var localpartByUser map[uint]string
+		if hasLocalpart {
+			localpartByUser = resolveLocalpartsReference(
+				rule.Users.LocalpartEntries(), users,
+			)
+		}
+
+		userIDs, principalsByUser, taggedPrincipals := groupSourcesByUserReference(
+			nodes, srcIPs,
+		)
+
+		// appendRules emits a common rule and, if the user has a
+		// localpart match, a per-user localpart rule.
+		appendRules := func(principals []*tailcfg.SSHPrincipal, uid uint, hasUID bool) {
+			rules = append(rules, &tailcfg.SSHRule{
+				Principals: principals,
+				SSHUsers:   baseUserMap,
+				Action:     &action,
+				AcceptEnv:  acceptEnv,
+			})
+
+			if hasUID {
+				if lp, ok := localpartByUser[uid]; ok {
+					rules = append(rules, &tailcfg.SSHRule{
+						Principals: principals,
+						SSHUsers:   map[string]string{lp: lp},
+						Action:     &action,
+						AcceptEnv:  acceptEnv,
+					})
+				}
+			}
+		}
+
+		// Handle autogroup:self destinations.
+		// Tagged nodes can't match autogroup:self.
+		if len(autogroupSelfDests) > 0 &&
+			!node.IsTagged() && node.User().Valid() {
+			uid := node.User().ID()
+
+			if principals := principalsByUser[uid]; len(principals) > 0 {
+				appendRules(principals, uid, true)
+			}
+		}
+
+		// Handle other destinations.
+		if len(otherDests) > 0 {
+			var dest netipx.IPSetBuilder
+
+			for _, dst := range otherDests {
+				ips, err := dst.Resolve(pol, users, nodes)
+				if err != nil {
+					log.Trace().Caller().Err(err).
+						Msgf("resolving destination ips")
+				}
+
+				if ips != nil {
+					for _, pref := range ips.Prefixes() {
+						dest.AddPrefix(pref)
+					}
+				}
+			}
+
+			destSet, err := dest.IPSet()
+			if err != nil {
+				return nil, err
+			}
+
+			if node.InIPSet(destSet) {
+				// Node is a destination — emit rules.
+				// When localpart entries exist, interleave common
+				// and localpart rules per source user to match
+				// Tailscale SaaS first-match-wins ordering.
+				if hasLocalpart {
+					for _, uid := range userIDs {
+						appendRules(principalsByUser[uid], uid, true)
+					}
+
+					if len(taggedPrincipals) > 0 {
+						appendRules(taggedPrincipals, 0, false)
+					}
+				} else {
+					// Merge user and tagged principals into a
+					// single list. Tagged principals preserve
+					// per-tag duplication (a node with N tags
+					// appears N times, matching SaaS behavior).
+					var allPrincipals []*tailcfg.SSHPrincipal
+					for _, uid := range userIDs {
+						allPrincipals = append(allPrincipals, principalsByUser[uid]...)
+					}
+
+					allPrincipals = append(allPrincipals, taggedPrincipals...)
+
+					if len(allPrincipals) > 0 {
+						appendRules(allPrincipals, 0, false)
+					}
+				}
+			} else if hasLocalpart && slices.ContainsFunc(node.IPs(), srcIPs.Contains) {
+				// Self-access: source node not in destination set
+				// receives rules scoped to its own user.
+				if node.IsTagged() {
+					var builder netipx.IPSetBuilder
+
+					node.AppendToIPSet(&builder)
+
+					ipSet, err := builder.IPSet()
+					if err == nil && ipSet != nil {
+						if principals := ipSetToPrincipalsReference(
+							ipSet,
+						); len(
+							principals,
+						) > 0 {
+							appendRules(principals, 0, false)
+						}
+					}
+				} else if node.User().Valid() {
+					uid := node.User().ID()
+					if principals := principalsByUser[uid]; len(principals) > 0 {
+						appendRules(principals, uid, true)
+					}
+				}
+			}
+		}
+	}
+
+	// Sort rules: check (HoldAndDelegate) before accept, per Tailscale
+	// evaluation order (most-restrictive first).
+	slices.SortStableFunc(rules, func(a, b *tailcfg.SSHRule) int {
+		aIsCheck := a.Action != nil && a.Action.HoldAndDelegate != ""
+
+		bIsCheck := b.Action != nil && b.Action.HoldAndDelegate != ""
+		if aIsCheck == bIsCheck {
+			return 0
+		}
+
+		if aIsCheck {
+			return -1
+		}
+
+		return 1
+	})
+
+	return &tailcfg.SSHPolicy{
+		Rules: rules,
+	}, nil
+}
+
+func ipSetToPrincipalsReference(ipSet *netipx.IPSet) []*tailcfg.SSHPrincipal {
+	if ipSet == nil {
+		return nil
+	}
+
+	var principals []*tailcfg.SSHPrincipal
+
+	for addr := range util.IPSetAddrIter(ipSet) {
+		principals = append(principals, &tailcfg.SSHPrincipal{
+			NodeIP: addr.String(),
+		})
+	}
+
+	return principals
+}
+
+func resolveLocalpartsReference(
+	entries []SSHUser,
+	users types.Users,
+) map[uint]string {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	result := make(map[uint]string)
+
+	for _, entry := range entries {
+		domain, err := entry.ParseLocalpart()
+		if err != nil {
+			log.Warn().Err(err).Msgf(
+				"skipping invalid localpart entry %q during SSH compilation",
+				entry,
+			)
+
+			continue
+		}
+
+		for _, user := range users {
+			if user.Email == "" {
+				continue
+			}
+
+			localpart, emailDomain, found := strings.CutLast(user.Email, "@")
+			if !found {
+				continue
+			}
+
+			if !strings.EqualFold(emailDomain, domain) {
+				continue
+			}
+
+			result[user.ID] = localpart
+		}
+	}
+
+	return result
+}
+
+func groupSourcesByUserReference(
+	nodes views.Slice[types.NodeView],
+	srcIPs ResolvedAddresses,
+) ([]uint, map[uint][]*tailcfg.SSHPrincipal, []*tailcfg.SSHPrincipal) {
+	userIPSets := make(map[uint]*netipx.IPSetBuilder)
+
+	var taggedPrincipals []*tailcfg.SSHPrincipal
+
+	for _, n := range nodes.All() {
+		if !slices.ContainsFunc(n.IPs(), srcIPs.Contains) {
+			continue
+		}
+
+		if n.IsTagged() {
+			// Tailscale SaaS resolves autogroup:tagged by
+			// iterating tag membership lists. A node with N
+			// tags produces N copies of its IPs in the
+			// principal list. Match that behavior so the SSH
+			// wire format is identical.
+			for range n.Tags().Len() {
+				for _, ip := range n.IPs() {
+					taggedPrincipals = append(taggedPrincipals,
+						&tailcfg.SSHPrincipal{NodeIP: ip.String()})
+				}
+			}
+
+			continue
+		}
+
+		if !n.User().Valid() {
+			continue
+		}
+
+		uid := n.User().ID()
+
+		if _, ok := userIPSets[uid]; !ok {
+			userIPSets[uid] = &netipx.IPSetBuilder{}
+		}
+
+		n.AppendToIPSet(userIPSets[uid])
+	}
+
+	var userIDs []uint
+
+	principalsByUser := make(map[uint][]*tailcfg.SSHPrincipal, len(userIPSets))
+
+	for uid, builder := range userIPSets {
+		ipSet, err := builder.IPSet()
+		if err != nil || ipSet == nil {
+			continue
+		}
+
+		if principals := ipSetToPrincipalsReference(ipSet); len(principals) > 0 {
+			principalsByUser[uid] = principals
+			userIDs = append(userIDs, uid)
+		}
+	}
+
+	slices.Sort(userIDs)
+
+	return userIDs, principalsByUser, taggedPrincipals
+}
+
+func sshCheckReference(baseURL string) tailcfg.SSHAction {
+	holdURL := baseURL + "/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID?local_user=$LOCAL_USER"
+
+	return tailcfg.SSHAction{
+		Reject:          false,
+		Accept:          false,
+		SessionDuration: 0,
+		// Replaced in the client:
+		//   * $SRC_NODE_IP (URL escaped)
+		//   * $SRC_NODE_ID (Node.ID as int64 string)
+		//   * $DST_NODE_IP (URL escaped)
+		//   * $DST_NODE_ID (Node.ID as int64 string)
+		//   * $SSH_USER (URL escaped, ssh user requested)
+		//   * $LOCAL_USER (URL escaped, local user mapped)
+		HoldAndDelegate:           holdURL,
+		AllowAgentForwarding:      false,
+		AllowLocalPortForwarding:  false,
+		AllowRemotePortForwarding: false,
+	}
+}
+
+func sshReuseFixture() (*Policy, types.Users, types.Nodes) {
+	users := types.Users{
+		{ID: 9, Name: "alice", Email: "alice@EXAMPLE.com"},
+		{ID: 2, Name: "bob", Email: "bob@example.org"},
+		{ID: 3, Name: "ambiguous", Email: "first@example.com"},
+		{ID: 4, Name: "ambiguous", Email: "second@example.com"},
+		{ID: 9, Name: "duplicate-id", Email: "last@example.com"},
+	}
+	//nolint:prealloc // Append the same node pointers to exercise duplicate input.
+	nodes := types.Nodes{
+		{ID: 1, User: &users[0], IPv4: ap("100.64.0.1"), IPv6: ap("fd7a:115c:a1e0::1")},
+		{ID: 2, User: &users[1], IPv4: ap("100.64.0.2")},
+		{
+			ID: 3, User: &users[0], UserID: &users[0].ID, IPv4: ap("100.64.0.3"),
+			IPv6: ap("fd7a:115c:a1e0::3"), Tags: []string{"tag:server", "tag:other"},
+		},
+		{ID: 4, IPv4: ap("100.64.0.4")},
+		{ID: 5, User: &users[0], IPv6: ap("fd7a:115c:a1e0::5")},
+		{ID: 6, User: &users[1]},
+	}
+	// A duplicate node must retain per-tag duplication but deduplicate user IPs.
+	nodes = append(nodes, nodes[0], nodes[2])
+	pol := &Policy{Groups: Groups{
+		"group:team":    {"alice@", "bob@", "missing@", "alice@"},
+		"group:partial": {"alice@", "ambiguous@"},
+	}}
+
+	for i := range 4 {
+		rule := SSH{
+			Action:  SSHActionAccept,
+			Sources: SSHSrcAliases{gp("group:team"), agp("autogroup:tagged")},
+			Destinations: SSHDstAliases{
+				agp("autogroup:self"), agp("autogroup:self"),
+				tp("tag:server"), tp("tag:server"),
+			},
+			Users: SSHUsers{
+				"root",
+				"root",
+				"deploy",
+				"deploy",
+				"autogroup:nonroot",
+			},
+			AcceptEnv: []string{"LANG", "LC_*", "LANG"},
+		}
+		if i%2 == 1 {
+			rule.Action = SSHActionCheck
+			rule.CheckPeriod = &SSHCheckPeriod{Always: true}
+			rule.Users = append(
+				rule.Users,
+				"localpart:*@example.com",
+				"localpart:*@example.org",
+			)
+		}
+
+		pol.SSHs = append(pol.SSHs, rule)
+	}
+
+	return pol, users, nodes
+}
+
+func TestCompileSSHPolicyReuseDifferential(t *testing.T) {
+	cases := []struct {
+		name string
+		edit func(*Policy)
+	}{
+		{"repeated", func(*Policy) {}},
+		{"single", func(p *Policy) { p.SSHs = p.SSHs[:1] }},
+		{"empty", func(p *Policy) { p.SSHs = []SSH{} }},
+		{"nil-rules", func(p *Policy) { p.SSHs = nil }},
+		{"no-sources", func(p *Policy) {
+			for i := range p.SSHs {
+				p.SSHs[i].Sources = nil
+			}
+		}},
+		{"no-destinations", func(p *Policy) {
+			for i := range p.SSHs {
+				p.SSHs[i].Destinations = nil
+			}
+		}},
+		{"partial-errors", func(p *Policy) {
+			for i := range p.SSHs {
+				p.SSHs[i].Sources = SSHSrcAliases{
+					gp("group:partial"),
+					agp("autogroup:self"),
+				}
+				p.SSHs[i].Destinations = SSHDstAliases{
+					agp("autogroup:unknown"),
+					agp("autogroup:member"),
+				}
+			}
+		}},
+		{"unknown-action-nonmatching-destination", func(p *Policy) {
+			p.SSHs[1].Action = "unknown"
+			p.SSHs[1].Destinations = SSHDstAliases{tp("tag:absent")}
+		}},
+		{"unknown-action-partial-errors", func(p *Policy) {
+			for i := range p.SSHs {
+				p.SSHs[i].Sources = SSHSrcAliases{gp("group:partial")}
+			}
+
+			p.SSHs[1].Action = "unknown"
+		}},
+		{"unknown-action-empty-sources", func(p *Policy) {
+			for i := range p.SSHs {
+				p.SSHs[i].Sources = SSHSrcAliases{gp("group:missing")}
+				p.SSHs[i].Action = "unknown"
+			}
+		}},
+		{"members", func(p *Policy) {
+			for i := range p.SSHs {
+				p.SSHs[i].Sources = SSHSrcAliases{agp("autogroup:member")}
+				p.SSHs[i].Destinations = SSHDstAliases{agp("autogroup:member")}
+			}
+		}},
+		{"username", func(p *Policy) {
+			for i := range p.SSHs {
+				p.SSHs[i].Sources = SSHSrcAliases{up("alice@")}
+			}
+		}},
+		{"uncached-source-kind", func(p *Policy) {
+			for i := range p.SSHs {
+				p.SSHs[i].Sources = SSHSrcAliases{Asterix(0)}
+			}
+		}},
+		{"localpart-self-access", func(p *Policy) {
+			for i := range p.SSHs {
+				p.SSHs[i].Destinations = SSHDstAliases{tp("tag:absent")}
+				p.SSHs[i].Users = SSHUsers{
+					"localpart:*@example.com",
+					"localpart:*@EXAMPLE.com",
+					"localpart:*@example.org",
+					"localpart:invalid",
+					"localpart:*@absent.org",
+				}
+			}
+		}},
+		{"nil-empty-users-env", func(p *Policy) {
+			p.SSHs[0].Users, p.SSHs[0].AcceptEnv = nil, nil
+			p.SSHs[1].Users, p.SSHs[1].AcceptEnv = SSHUsers{}, []string{}
+		}},
+		{"source-order-duplicates", func(p *Policy) {
+			p.SSHs[1].Sources = SSHSrcAliases{agp("autogroup:tagged"), gp("group:team")}
+			p.SSHs[2].Sources = SSHSrcAliases{
+				gp("group:team"),
+				gp("group:team"),
+				agp("autogroup:tagged"),
+			}
+		}},
+		{"source-type-collision", func(p *Policy) {
+			p.SSHs[0].Sources = SSHSrcAliases{gp("group:team")}
+			p.SSHs[1].Sources = SSHSrcAliases{tp("group:team")}
+		}},
+		{"quoted-source-names", func(p *Policy) {
+			p.Groups[`group:a";*v2.Group:"group:b`] = []Username{"alice@"}
+			p.Groups["group:a"] = []Username{"bob@"}
+			p.SSHs[0].Sources = SSHSrcAliases{gp(`group:a";*v2.Group:"group:b`)}
+			p.SSHs[1].Sources = SSHSrcAliases{gp("group:a"), gp("group:b")}
+			p.SSHs[2].Sources = SSHSrcAliases{gp(`group:a";*v2.Group:"group:b`)}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pol, users, nodes := sshReuseFixture()
+			tc.edit(pol)
+
+			for _, node := range nodes {
+				want, wantErr := pol.compileSSHPolicyReference(
+					"https://headscale.example",
+					users,
+					node.View(),
+					nodes.ViewSlice(),
+				)
+				got, gotErr := pol.compileSSHPolicy(
+					"https://headscale.example",
+					users,
+					node.View(),
+					nodes.ViewSlice(),
+				)
+				require.Equal(t, fmt.Sprint(wantErr), fmt.Sprint(gotErr))
+				require.Equal(
+					t,
+					errors.Is(wantErr, ErrMultipleUsersFound),
+					errors.Is(gotErr, ErrMultipleUsersFound),
+				)
+				require.Empty(t, cmp.Diff(want, got), "node %d", node.ID)
+				wantJSON, err := json.Marshal(want)
+				require.NoError(t, err)
+				gotJSON, err := json.Marshal(got)
+				require.NoError(t, err)
+				require.JSONEq(t, string(wantJSON), string(gotJSON))
+			}
+		})
+	}
+
+	var pol *Policy
+
+	want, wantErr := pol.compileSSHPolicyReference(
+		"",
+		nil,
+		types.NodeView{},
+		views.Slice[types.NodeView]{},
+	)
+	got, gotErr := pol.compileSSHPolicy(
+		"",
+		nil,
+		types.NodeView{},
+		views.Slice[types.NodeView]{},
+	)
+	require.Equal(t, wantErr, gotErr)
+	require.Equal(t, want, got)
+
+	pol, users, nodes := sshReuseFixture()
+	want, wantErr = pol.compileSSHPolicyReference(
+		"",
+		users,
+		nodes[0].View(),
+		views.Slice[types.NodeView]{},
+	)
+	got, gotErr = pol.compileSSHPolicy(
+		"",
+		users,
+		nodes[0].View(),
+		views.Slice[types.NodeView]{},
+	)
+	require.Equal(t, wantErr, gotErr)
+	require.Equal(t, want, got)
+}
+
+func TestCompileSSHPolicyReuseOwnership(t *testing.T) {
+	mutations := []struct {
+		name  string
+		apply func(*tailcfg.SSHRule)
+	}{
+		{
+			"principal-value",
+			func(r *tailcfg.SSHRule) { r.Principals[0].NodeIP = "changed" },
+		},
+		{
+			"principal-slice",
+			func(r *tailcfg.SSHRule) { r.Principals[0] = &tailcfg.SSHPrincipal{Any: true} },
+		},
+		{"users", func(r *tailcfg.SSHRule) { r.SSHUsers["changed"] = "changed" }},
+		{"action", func(r *tailcfg.SSHRule) { r.Action.HoldAndDelegate = "changed" }},
+		{"env", func(r *tailcfg.SSHRule) { r.AcceptEnv[0] = "changed" }},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			for _, nodeIndex := range []int{0, 2} {
+				for ruleIndex := 0; ; ruleIndex++ {
+					oldPol, oldUsers, oldNodes := sshReuseFixture()
+					pol, users, nodes := sshReuseFixture()
+					want, err := oldPol.compileSSHPolicyReference(
+						"https://headscale.example",
+						oldUsers,
+						oldNodes[nodeIndex].View(),
+						oldNodes.ViewSlice(),
+					)
+					require.NoError(t, err)
+					got, err := pol.compileSSHPolicy(
+						"https://headscale.example",
+						users,
+						nodes[nodeIndex].View(),
+						nodes.ViewSlice(),
+					)
+					require.NoError(t, err)
+					require.Equal(t, want, got)
+
+					if ruleIndex == len(want.Rules) {
+						break
+					}
+
+					mutation.apply(want.Rules[ruleIndex])
+					mutation.apply(got.Rules[ruleIndex])
+					require.Empty(
+						t,
+						cmp.Diff(want, got),
+						"node %d rule %d",
+						nodeIndex,
+						ruleIndex,
+					)
+
+					for i := range pol.SSHs {
+						require.Equal(
+							t,
+							oldPol.SSHs[i].AcceptEnv,
+							pol.SSHs[i].AcceptEnv,
+						)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestCompileSSHPolicyReuseLifetime(t *testing.T) {
+	t.Parallel()
+
+	pol, users, nodes := sshReuseFixture()
+	first, err := pol.compileSSHPolicy(
+		"first",
+		users,
+		nodes[2].View(),
+		nodes.ViewSlice(),
+	)
+	require.NoError(t, err)
+
+	first.Rules[0].Principals[0].NodeIP = "mutated-output"
+	first.Rules[0].SSHUsers["mutated-output"] = "mutated-output"
+	nodes[0].IPv4 = ap("100.64.0.99")
+	users[0].Email = "changed@example.com"
+	pol.Groups["group:team"] = []Username{"bob@"}
+	want, err := pol.compileSSHPolicyReference(
+		"second",
+		users,
+		nodes[2].View(),
+		nodes.ViewSlice(),
+	)
+	require.NoError(t, err)
+
+	for i := range 8 {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			t.Parallel()
+
+			got, err := pol.compileSSHPolicy(
+				"second",
+				users,
+				nodes[2].View(),
+				nodes.ViewSlice(),
+			)
+			require.NoError(t, err)
+			require.Equal(t, want, got)
+		})
+	}
+}
+
+func TestCompileSSHPolicyReuseCaptures(t *testing.T) {
+	files, err := filepath.Glob("testdata/ssh_results/ssh-*.hujson")
+	require.NoError(t, err)
+	require.NotEmpty(t, files)
+
+	users := setupSSHDataCompatUsers()
+
+	for _, file := range files {
+		capture := loadSSHTestFile(t, file)
+		if capture.Input.APIResponseCode != 200 {
+			continue
+		}
+
+		t.Run(capture.TestID, func(t *testing.T) {
+			if reason, skip := sshSkipReasons[capture.TestID]; skip {
+				t.Skip(reason)
+			}
+
+			pol, err := unmarshalPolicy([]byte(capture.Input.FullPolicy))
+			require.NoError(t, err)
+
+			nodes := buildGrantsNodesFromCapture(users, capture)
+			for _, node := range nodes {
+				want, wantErr := pol.compileSSHPolicyReference(
+					"https://headscale.example",
+					users,
+					node.View(),
+					nodes.ViewSlice(),
+				)
+				got, gotErr := pol.compileSSHPolicy(
+					"https://headscale.example",
+					users,
+					node.View(),
+					nodes.ViewSlice(),
+				)
+				require.Equal(t, fmt.Sprint(wantErr), fmt.Sprint(gotErr))
+				require.Empty(t, cmp.Diff(want, got), "node %d", node.ID)
+			}
+		})
+	}
+}
+
+var sshReuseBenchmarkSink *tailcfg.SSHPolicy
+
+func BenchmarkCompileSSHPolicyReuse(b *testing.B) {
+	level := zerolog.GlobalLevel()
+
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	defer zerolog.SetGlobalLevel(level)
+
+	for _, tc := range []struct {
+		name                         string
+		nodes, rules, sourceUsers    int
+		unique, localpart, unmatched bool
+	}{
+		{name: "single-small", nodes: 8, rules: 1, sourceUsers: 2},
+		{name: "single-dense", nodes: 256, rules: 1, sourceUsers: 16},
+		{name: "repeated-small", nodes: 8, rules: 16, sourceUsers: 2},
+		{name: "repeated-sparse", nodes: 256, rules: 32, sourceUsers: 1},
+		{name: "repeated-dense", nodes: 256, rules: 32, sourceUsers: 16},
+		{name: "repeated-localpart", nodes: 256, rules: 32, sourceUsers: 16, localpart: true},
+		{name: "unique-small", nodes: 8, rules: 16, sourceUsers: 2, unique: true},
+		{name: "unique-dense", nodes: 256, rules: 32, sourceUsers: 16, unique: true},
+		{name: "unmatched-destination", nodes: 256, rules: 32, sourceUsers: 16, unmatched: true},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			users := make(types.Users, 0, 16)
+			for i := range 16 {
+				users = append(
+					users,
+					types.User{
+						ID:    uint(i + 1),
+						Name:  fmt.Sprintf("user%d", i),
+						Email: fmt.Sprintf("user%d@example.com", i),
+					},
+				)
+			}
+
+			var nodes types.Nodes
+			for i := range tc.nodes {
+				nodes = append(nodes, &types.Node{
+					ID: types.NodeID(i + 1), User: &users[i%len(users)],
+					IPv4: ap(fmt.Sprintf("100.64.%d.%d", i/256, i%256)),
+					IPv6: ap(fmt.Sprintf("fd7a:115c:a1e0::%x", i+1)),
+				})
+			}
+
+			pol := &Policy{Groups: make(Groups)}
+
+			for i := range tc.rules {
+				group := Group("group:team")
+				if tc.unique {
+					group = Group(fmt.Sprintf("group:team%d", i))
+				}
+
+				if _, exists := pol.Groups[group]; !exists {
+					for j := range tc.sourceUsers {
+						pol.Groups[group] = append(
+							pol.Groups[group],
+							Username(fmt.Sprintf("user%d@", (i+j)%len(users))),
+						)
+					}
+				}
+
+				rule := SSH{
+					Action:  SSHActionAccept,
+					Sources: SSHSrcAliases{new(group)},
+					Destinations: SSHDstAliases{
+						agp("autogroup:member"),
+					},
+					Users: SSHUsers{"root", "deploy"},
+				}
+				if i%2 == 1 {
+					rule.Action = SSHActionCheck
+				}
+
+				if tc.localpart {
+					rule.Users = append(rule.Users, "localpart:*@example.com")
+				}
+
+				if tc.unmatched {
+					rule.Destinations = SSHDstAliases{tp("tag:absent")}
+				}
+
+				pol.SSHs = append(pol.SSHs, rule)
+			}
+
+			nodeViews := nodes.ViewSlice()
+			want, err := pol.compileSSHPolicyReference(
+				"https://headscale.example",
+				users,
+				nodeViews.At(0),
+				nodeViews,
+			)
+			require.NoError(b, err)
+			got, err := pol.compileSSHPolicy(
+				"https://headscale.example",
+				users,
+				nodeViews.At(0),
+				nodeViews,
+			)
+			require.NoError(b, err)
+			require.Equal(b, want, got)
+
+			for _, candidate := range []bool{false, true} {
+				name := "reference"
+
+				compile := pol.compileSSHPolicyReference
+				if candidate {
+					name, compile = "candidate", pol.compileSSHPolicy
+				}
+
+				b.Run(name, func(b *testing.B) {
+					b.ReportAllocs()
+
+					for b.Loop() {
+						var err error
+
+						sshReuseBenchmarkSink, err = compile(
+							"https://headscale.example",
+							users,
+							nodeViews.At(0),
+							nodeViews,
+						)
+						if err != nil {
+							b.Fatal(err)
+						}
+					}
+				})
 			}
 		})
 	}
