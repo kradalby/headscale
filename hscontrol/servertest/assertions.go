@@ -2,6 +2,8 @@ package servertest
 
 import (
 	"testing"
+
+	"tailscale.com/types/netmap"
 )
 
 // AssertMeshComplete verifies that every client in the slice sees
@@ -30,15 +32,77 @@ func AssertMeshComplete(tb testing.TB, clients []*TestClient) {
 func AssertSymmetricVisibility(tb testing.TB, clients []*TestClient) {
 	tb.Helper()
 
+	const scanLimit = 8
+
+	type peerNames struct {
+		nm      *netmap.NetworkMap
+		names   map[string]bool
+		indexed int
+		updates int
+	}
+
+	indexes := make(map[*TestClient]*peerNames)
+	hasPeer := func(c *TestClient, hostname string) bool {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+
+		if c.netmap == nil || len(c.netmap.Peers) == 0 {
+			return false
+		}
+
+		// Small meshes and short peer lists cost less to scan than to index.
+		if len(clients) <= scanLimit || len(c.netmap.Peers) <= scanLimit {
+			for _, peer := range c.netmap.Peers {
+				hi := peer.Hostinfo()
+				if hi.Valid() && hi.Hostname() == hostname {
+					return true
+				}
+			}
+
+			return false
+		}
+
+		index := indexes[c]
+		if index == nil || index.nm != c.netmap || index.updates != len(c.history) {
+			index = &peerNames{nm: c.netmap, updates: len(c.history)}
+			indexes[c] = index
+		}
+
+		if index.names[hostname] {
+			return true
+		}
+
+		// Index only the scanned prefix, preserving early matches and invalid-view panics.
+		for index.indexed < len(c.netmap.Peers) {
+			hi := c.netmap.Peers[index.indexed].Hostinfo()
+			index.indexed++
+
+			if hi.Valid() {
+				name := hi.Hostname()
+
+				if index.names == nil {
+					index.names = make(map[string]bool, min(len(c.netmap.Peers), len(clients)))
+				}
+
+				index.names[name] = true
+				if name == hostname {
+					return true
+				}
+			}
+		}
+
+		return false
+	}
+
 	for _, a := range clients {
 		for _, b := range clients {
 			if a == b {
 				continue
 			}
 
-			_, aSeesB := a.PeerByName(b.Name)
+			aSeesB := hasPeer(a, b.Name)
 
-			_, bSeesA := b.PeerByName(a.Name)
+			bSeesA := hasPeer(b, a.Name)
 			if aSeesB != bSeesA {
 				tb.Errorf("AssertSymmetricVisibility: %s sees %s = %v, but %s sees %s = %v",
 					a.Name, b.Name, aSeesB, b.Name, a.Name, bSeesA)
