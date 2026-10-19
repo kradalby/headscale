@@ -46,7 +46,10 @@ type IPAllocator struct {
 	// but it is more conservative. If saves to the
 	// database fails, the IP will be allocated here
 	// until the next restart of Headscale.
-	usedIPs netipx.IPSetBuilder
+	usedIPs map[netip.Addr]struct{}
+
+	// Preserve netipx's deferred errors for invalid FreeIPs inputs.
+	invalidIPs *netipx.IPSetBuilder
 }
 
 // NewIPAllocator returns a new [IPAllocator] singleton which
@@ -64,6 +67,7 @@ func NewIPAllocator(
 		prefix6: prefix6,
 
 		strategy: strategy,
+		usedIPs:  make(map[netip.Addr]struct{}),
 	}
 
 	var (
@@ -96,6 +100,9 @@ func NewIPAllocator(
 		ips.Add(network4)
 		ips.Add(broadcast4)
 
+		ret.usedIPs[network4.WithZone("")] = struct{}{}
+		ret.usedIPs[broadcast4.WithZone("")] = struct{}{}
+
 		// Use network as starting point, it will be used to call .Next()
 		// TODO(kradalby): Could potentially take all the IPs loaded from
 		// the database into account to start at a more "educated" location.
@@ -106,6 +113,9 @@ func NewIPAllocator(
 		network6, broadcast6 := util.GetIPPrefixEndpoints(*prefix6)
 		ips.Add(network6)
 		ips.Add(broadcast6)
+
+		ret.usedIPs[network6.WithZone("")] = struct{}{}
+		ret.usedIPs[broadcast6.WithZone("")] = struct{}{}
 
 		ret.prev6 = network6
 	}
@@ -120,6 +130,7 @@ func NewIPAllocator(
 			}
 
 			ips.Add(addr)
+			ret.usedIPs[addr.WithZone("")] = struct{}{}
 		}
 	}
 
@@ -131,8 +142,6 @@ func NewIPAllocator(
 			err,
 		)
 	}
-
-	ret.usedIPs = ips
 
 	return &ret, nil
 }
@@ -198,10 +207,13 @@ func (i *IPAllocator) next(prev netip.Addr, prefix *netip.Prefix) (*netip.Addr, 
 		}
 	}
 
-	// TODO(kradalby): maybe this can be done less often.
-	set, err := i.usedIPs.IPSet()
-	if err != nil {
-		return nil, err
+	if i.invalidIPs != nil {
+		_, err := i.invalidIPs.IPSet()
+		i.invalidIPs = nil
+
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Walk forward from the starting address until a free, non-reserved
@@ -211,8 +223,9 @@ func (i *IPAllocator) next(prev netip.Addr, prefix *netip.Prefix) (*netip.Addr, 
 	// instead of re-drawing in-prefix addresses forever under i.mu.
 	start := ip
 	for {
-		if prefix.Contains(ip) && !set.Contains(ip) && !isTailscaleReservedIP(ip) {
-			i.usedIPs.Add(ip)
+		_, used := i.usedIPs[ip]
+		if prefix.Contains(ip) && !used && !isTailscaleReservedIP(ip) {
+			i.usedIPs[ip.WithZone("")] = struct{}{}
 
 			return &ip, nil
 		}
@@ -387,6 +400,16 @@ func (i *IPAllocator) FreeIPs(ips []netip.Addr) {
 	defer i.mu.Unlock()
 
 	for _, ip := range ips {
-		i.usedIPs.Remove(ip)
+		if !ip.IsValid() {
+			if i.invalidIPs == nil {
+				i.invalidIPs = new(netipx.IPSetBuilder)
+			}
+
+			i.invalidIPs.Remove(ip)
+
+			continue
+		}
+
+		delete(i.usedIPs, ip.WithZone(""))
 	}
 }
