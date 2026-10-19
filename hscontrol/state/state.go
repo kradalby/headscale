@@ -2755,7 +2755,7 @@ func (s *State) HandleNodeFromPreAuthKey(
 	}
 
 	// Ensure we have valid hostinfo
-	validHostinfo := cmp.Or(regReq.Hostinfo, &tailcfg.Hostinfo{})
+	validHostinfo := cmp.Or(regReq.Hostinfo.Clone(), &tailcfg.Hostinfo{})
 	validHostinfo.Hostname = hostname
 
 	log.Debug().
