@@ -2,7 +2,13 @@ package hscontrol
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,11 +19,169 @@ import (
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
+	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/util/zstdframe"
 )
+
+type mapFrameWriter struct {
+	body   []byte
+	writes int
+	err    error
+	short  bool
+}
+
+func (*mapFrameWriter) Header() http.Header { return nil }
+func (*mapFrameWriter) WriteHeader(int)     {}
+func (w *mapFrameWriter) Write(p []byte) (int, error) {
+	w.writes++
+
+	w.body = p
+	if w.err != nil {
+		return 0, w.err
+	}
+
+	if w.short {
+		return len(p) / 2, nil
+	}
+
+	return len(p), nil
+}
+
+type flushingMapFrameWriter struct {
+	mapFrameWriter
+
+	flushes int
+}
+
+func (w *flushingMapFrameWriter) Flush() { w.flushes++ }
+
+//nolint:gosec // Fixture sizes are bounded to 8192 peers, so each IPv4 octet fits in a byte.
+func mapFrameFixture(peers int) *tailcfg.MapResponse {
+	msg := &tailcfg.MapResponse{Domain: "bench.example"}
+
+	for i := range peers {
+		addr := netip.AddrFrom4([4]byte{100, 64, byte(i / 256), byte(i % 256)})
+		prefix := netip.PrefixFrom(addr, 32)
+		msg.Peers = append(msg.Peers, &tailcfg.Node{
+			ID: tailcfg.NodeID(i + 1), Name: fmt.Sprintf("node-%d.bench.example", i),
+			Key: key.NewNode().Public(), Machine: key.NewMachine().Public(),
+			Addresses: []netip.Prefix{prefix}, AllowedIPs: []netip.Prefix{prefix},
+			Endpoints: []netip.AddrPort{netip.AddrPortFrom(addr, 41641)},
+		})
+	}
+
+	return msg
+}
+
+func TestWriteMapResponseReference(t *testing.T) {
+	invalidTime := time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC)
+
+	messages := []*tailcfg.MapResponse{
+		nil,
+		{},
+		&keepAlive, mapFrameFixture(1), mapFrameFixture(128),
+		mapFrameFixture(8192), repetitiveMapFrameFixture(8192),
+		{ControlTime: &invalidTime},
+		{Node: &tailcfg.Node{CapMap: tailcfg.NodeCapMap{
+			"invalid-json": []tailcfg.RawMessage{"{"},
+		}}},
+	}
+	for i, msg := range messages {
+		for _, compression := range []string{"", "unknown", util.ZstdCompression} {
+			for _, flush := range []bool{false, true} {
+				for _, failure := range []string{"none", "error", "short"} {
+					t.Run(fmt.Sprintf("message%d/%s/flush%t/%s", i, compression, flush, failure), func(t *testing.T) {
+						var got, want flushingMapFrameWriter
+						if failure == "error" {
+							got.err, want.err = io.ErrClosedPipe, io.ErrClosedPipe
+						}
+
+						got.short, want.short = failure == "short", failure == "short"
+						wantErr := writeMapResponseReference(&want, compression, flush, msg)
+
+						gotErr := writeMapResponse(&got, compression, flush, msg)
+						if wantErr != nil {
+							require.EqualError(t, gotErr, wantErr.Error())
+
+							if failure == "error" && want.writes != 0 {
+								require.ErrorIs(t, gotErr, io.ErrClosedPipe)
+							}
+						} else {
+							require.NoError(t, gotErr)
+						}
+
+						require.Equal(t, want.body, got.body)
+						require.Equal(t, want.writes, got.writes)
+						require.Equal(t, want.flushes, got.flushes)
+					})
+				}
+			}
+		}
+	}
+
+	// A non-flushing writer must still receive the same complete frame.
+	var got, want mapFrameWriter
+	require.NoError(t, writeMapResponseReference(&want, util.ZstdCompression, true, &keepAlive))
+	require.NoError(t, writeMapResponse(&got, util.ZstdCompression, true, &keepAlive))
+	require.Equal(t, want.body, got.body)
+}
+
+func BenchmarkWriteMapResponse(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		msg  *tailcfg.MapResponse
+	}{
+		{"KeepAlive", &keepAlive},
+		{"Full1", mapFrameFixture(1)},
+		{"Full128", mapFrameFixture(128)},
+		{"Full1024", mapFrameFixture(1024)},
+		{"Full8192", mapFrameFixture(8192)},
+		{"Repetitive8192", repetitiveMapFrameFixture(8192)},
+		{"Patch1", &tailcfg.MapResponse{PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 128, Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")}}}}},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			for _, compression := range []string{"none", util.ZstdCompression} {
+				b.Run(compression, func(b *testing.B) {
+					for _, impl := range []struct {
+						name string
+						fn   func(http.ResponseWriter, string, bool, *tailcfg.MapResponse) error
+					}{
+						{"Original", writeMapResponseReference},
+						{"Current", writeMapResponse},
+					} {
+						b.Run(impl.name, func(b *testing.B) {
+							var w flushingMapFrameWriter
+
+							b.ReportAllocs()
+							b.ResetTimer()
+
+							for b.Loop() {
+								err := impl.fn(&w, compression, true, tc.msg)
+								if err != nil {
+									b.Fatal(err)
+								}
+							}
+
+							b.ReportMetric(float64(len(w.body)), "wire-B")
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
+func repetitiveMapFrameFixture(peers int) *tailcfg.MapResponse {
+	msg := mapFrameFixture(1)
+	msg.Peers = slices.Repeat(msg.Peers, peers)
+
+	return msg
+}
 
 type delayedSuccessResponseWriter struct {
 	header http.Header
@@ -686,4 +850,36 @@ func TestDeletedNodeInterruptsBlockedWrite(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("deleting a node must interrupt its blocked map response write")
 	}
+}
+
+// Frozen from 1096abfc8 for behavior and allocation comparisons.
+func writeMapResponseReference(w http.ResponseWriter, compress string, flush bool, msg *tailcfg.MapResponse) error {
+	jsonBody, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshalling map response: %w", err)
+	}
+
+	if compress == util.ZstdCompression {
+		jsonBody = zstdframe.AppendEncode(nil, jsonBody, zstdframe.FastestCompression)
+	}
+
+	data := make([]byte, reservedResponseHeaderSize, reservedResponseHeaderSize+len(jsonBody))
+	//nolint:gosec // G115: JSON response size will not exceed uint32 max
+	binary.LittleEndian.PutUint32(data, uint32(len(jsonBody)))
+	data = append(data, jsonBody...)
+
+	_, err = w.Write(data)
+	if err != nil {
+		return err
+	}
+
+	if flush {
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		} else {
+			log.Error().Caller().Msg("responseWriter does not implement http.Flusher, cannot flush")
+		}
+	}
+
+	return nil
 }

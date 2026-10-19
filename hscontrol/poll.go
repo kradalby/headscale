@@ -384,14 +384,18 @@ func writeMapResponse(w http.ResponseWriter, compress string, flush bool, msg *t
 		return fmt.Errorf("marshalling map response: %w", err)
 	}
 
+	var data []byte
 	if compress == util.ZstdCompression {
-		jsonBody = zstdframe.AppendEncode(nil, jsonBody, zstdframe.FastestCompression)
+		// Small updates fit without reserving the full uncompressed size of large maps.
+		data = make([]byte, reservedResponseHeaderSize, reservedResponseHeaderSize+min(len(jsonBody), 1024))
+		data = zstdframe.AppendEncode(data, jsonBody, zstdframe.FastestCompression)
+	} else {
+		data = make([]byte, reservedResponseHeaderSize, reservedResponseHeaderSize+len(jsonBody))
+		data = append(data, jsonBody...)
 	}
 
-	data := make([]byte, reservedResponseHeaderSize, reservedResponseHeaderSize+len(jsonBody))
 	//nolint:gosec // G115: JSON response size will not exceed uint32 max
-	binary.LittleEndian.PutUint32(data, uint32(len(jsonBody)))
-	data = append(data, jsonBody...)
+	binary.LittleEndian.PutUint32(data, uint32(len(data)-reservedResponseHeaderSize))
 
 	_, err = w.Write(data)
 	if err != nil {
