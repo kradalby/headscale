@@ -40,10 +40,6 @@ var reauthSkipReasons = map[string]string{
 	"owner-routes/r-expired-retag/expire/served": expiredRouterUnserved,
 	"owner-routes/r-expired-retag/expire/online": expiredPeerOffline,
 
-	"owner-routes/r-admin/owner/enabled":     adminRetagNoApproval,
-	"owner-routes/r-admin/owner/served":      adminRetagNoApproval,
-	"owner-routes/r-admin/owner/self-routes": adminRetagNoApproval,
-
 	"identity/w-tagreq-relogin-tags/w-tagreq/owner":        keyLoginTagsRefused,
 	"identity/w-tagreq-relogin-tags/w-tagreq/outcome":      keyLoginTagsRefused,
 	"identity/w-tagreq-relogin-tags/w-tagreq/node-key":     keyLoginTagsRefused,
@@ -81,10 +77,6 @@ var reauthSkipReasons = map[string]string{
 	"ephemeral-lifecycle/late-expired/late-exp/text":        refusalText,
 	"ephemeral-lifecycle/late-expired/late-exp/legacy-text": refusalText,
 }
-
-const (
-	adminRetagNoApproval = "ADMIN_RETAG_NO_APPROVAL: an admin tag change does not auto-approve the routes the new tags may approve; SaaS approves them at once"
-)
 
 const (
 	keyLoginTagsRefused      = "KEY_LOGIN_TAGS_REFUSED: headscale refuses a user's key login that requests tags the user owns; SaaS tags the device, converting it in place or creating it tagged"
