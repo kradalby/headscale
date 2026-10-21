@@ -107,6 +107,7 @@ var nodeUpdateColumns = []string{
 	"UserID",
 	"RegisterMethod",
 	"Tags",
+	"Ephemeral",
 	"Expiry",
 	"LastSeen",
 	"ApprovedRoutes",
@@ -928,8 +929,7 @@ func (s *State) ListEphemeralNodes() views.Slice[types.NodeView] {
 	var ephemeralNodes []types.NodeView
 
 	for _, node := range allNodes.All() {
-		// Check if node is ephemeral by checking its AuthKey
-		if node.AuthKey().Valid() && node.AuthKey().Ephemeral() {
+		if node.IsEphemeral() {
 			ephemeralNodes = append(ephemeralNodes, node)
 		}
 	}
@@ -2077,8 +2077,8 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 	// AuthKeyID is excluded from nodeUpdateColumns (#2862: never persist a
 	// possibly-deleted key's stale reference on the shared update path). But
 	// when a re-auth untags a node it clears AuthKeyID to nil (above), and that
-	// must persist or the node reloads as tagged/ephemeral after a restart and
-	// is garbage-collected. Writing NULL can never cause an FK error, so include
+	// must persist or the node reloads bound to the tagged key after a
+	// restart. Writing NULL can never cause an FK error, so include
 	// the column only in that clearing case; the other transitions keep the
 	// #2862-safe column set untouched.
 	updateColumns := nodeUpdateColumns
@@ -2170,6 +2170,7 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 
 		nodeToRegister.AuthKey = params.PreAuthKey.AsCredential()
 		nodeToRegister.AuthKeyID = &params.PreAuthKey.ID
+		nodeToRegister.Ephemeral = params.PreAuthKey.Ephemeral
 	} else {
 		// Non-PreAuthKey registration (OIDC, CLI) - always user-owned
 		nodeToRegister.UserID = &params.User.ID
@@ -2366,14 +2367,13 @@ func (s *State) processReauthTags(
 			node.User = user
 
 			// The node is no longer tagged, so it must not keep a reference to
-			// the tagged auth key. Leaving AuthKey set means a node created by a
-			// tagged+ephemeral key stays IsEphemeral() after converting to
-			// user-owned and is garbage-collected on its next disconnect,
-			// silently deleting the user's just-claimed device. Clearing the
-			// reference is persisted via the AuthKeyID column added to this
-			// path's write below.
+			// the tagged auth key, nor its ephemeral flag: an ephemeral node is
+			// garbage-collected on its next disconnect, silently deleting the
+			// user's just-claimed device. Clearing the reference is persisted
+			// via the AuthKeyID column added to this path's write below.
 			node.AuthKey = nil
 			node.AuthKeyID = nil
+			node.Ephemeral = false
 		}
 
 		return nil
@@ -3098,7 +3098,7 @@ func (s *State) reregisterNodeWithPAK(
 		// so a deleted key's stale reference is not persisted, but
 		// re-registration presents a key just loaded from the database, so
 		// its ID must be persisted here — otherwise a restart reloads the old
-		// key and any key-scoped property (e.g. Ephemeral) silently reverts.
+		// key and any key-scoped property (e.g. its tags) silently reverts.
 		reregColumns := append(slices.Clone(nodeUpdateColumns), "AuthKeyID")
 
 		err := tx.Select(reregColumns).Updates(updatedNodeView.AsStruct()).Error

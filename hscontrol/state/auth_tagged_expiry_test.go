@@ -728,6 +728,7 @@ func TestTaggedReauthUntagClearsEphemeralAuthKey(t *testing.T) {
 	seeded, ok := n.s.nodeStore.UpdateNode(n.id, func(nd *types.Node) {
 		nd.AuthKey = pak.AsCredential()
 		nd.AuthKeyID = &pak.ID
+		nd.Ephemeral = pak.Ephemeral
 	})
 	require.True(t, ok)
 	require.True(t, seeded.IsEphemeral(), "precondition: node is ephemeral (tagged ephemeral key)")
@@ -1467,17 +1468,15 @@ func newRetagTestState(t *testing.T) *State {
 	return s
 }
 
-// TestPreAuthKeyReauthPersistsAuthKeyID pins the root cause behind the
-// ephemeral-flag revert bug found while auditing #3370: on re-registration
-// with a *different* key, HandleNodeFromPreAuthKey updates node.AuthKeyID in
-// the NodeStore (state.go, in the in-place closure) but AuthKeyID is excluded
-// from nodeUpdateColumns (added for #2862 to avoid persisting a *deleted* key's
-// stale reference on MapRequest). The exclusion is correct for MapRequest, but
-// on the re-registration path the presented key is freshly loaded and valid, so
-// the new auth_key_id must be persisted. Otherwise a control-plane restart
-// reloads the OLD key, and any key-scoped property (notably Ephemeral) silently
-// reverts — an ephemeral->non-ephemeral re-auth leaves a node that looks
-// persistent in memory but is ephemeral again after restart and can be GC'd.
+// TestPreAuthKeyReauthPersistsAuthKeyID pins a bug found while working on #3370:
+// on re-registration with a *different* key, HandleNodeFromPreAuthKey updates
+// node.AuthKeyID in the NodeStore (state.go, in the in-place closure) but
+// AuthKeyID is excluded from nodeUpdateColumns (added for #2862 to avoid
+// persisting a *deleted* key's stale reference on MapRequest). The exclusion is
+// correct for MapRequest, but on the re-registration path the presented key is
+// freshly loaded and valid, so the new auth_key_id must be persisted. Otherwise
+// a control-plane restart reloads the OLD key. The ephemeral flag is the node's
+// own and stays as the node was created, before and after the restart.
 //
 // Drives the real handler twice, then reopens the DB to prove the association
 // survives the reload.
@@ -1525,8 +1524,8 @@ func TestPreAuthKeyReauthPersistsAuthKeyID(t *testing.T) {
 	require.NotNil(t, second.AuthKeyID().Get())
 	require.Equal(t, keyB.ID, second.AuthKeyID().Get(),
 		"NodeStore must reference the key just used to re-authenticate")
-	require.False(t, second.IsEphemeral(),
-		"re-auth with a non-ephemeral key must make the node non-ephemeral")
+	require.True(t, second.IsEphemeral(),
+		"re-auth with another key keeps the ephemeral flag the node was created with")
 
 	// Restart the control plane: reload state from the database only.
 	require.NoError(t, s.Close())
@@ -1538,14 +1537,11 @@ func TestPreAuthKeyReauthPersistsAuthKeyID(t *testing.T) {
 	reloaded, ok := s2.GetNodeByID(nodeID)
 	require.True(t, ok, "node must reload from DB after restart")
 
-	// This is the assertion that fails today: auth_key_id was never persisted on
-	// re-registration, so the reload resurrects KEY A and the node is ephemeral
-	// again — at risk of GC on the next disconnect.
 	require.NotNil(t, reloaded.AuthKeyID().Get())
 	require.Equal(t, keyB.ID, reloaded.AuthKeyID().Get(),
 		"auth_key_id must persist across restart, not revert to the old key")
-	require.False(t, reloaded.IsEphemeral(),
-		"ephemerality must not silently revert after a control-plane restart")
+	require.True(t, reloaded.IsEphemeral(),
+		"the ephemeral flag must survive a control-plane restart")
 }
 
 // TestTaggedNodeCanHaveKeyExpiry matches Tailscale: a tagged node has key
