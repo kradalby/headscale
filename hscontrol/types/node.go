@@ -175,6 +175,11 @@ type Node struct {
 	AuthKeyID *uint64 `sql:"DEFAULT:NULL"`
 	AuthKey   *Credential
 
+	// Ephemeral is taken from the key the node was created with. Logging in
+	// again with another key keeps it, as Tailscale does; a user claiming a
+	// tagged node clears it.
+	Ephemeral bool `gorm:"default:false"`
+
 	Expiry *time.Time
 
 	// LastSeen is when the node was last in contact with
@@ -273,7 +278,7 @@ func (node *Node) ShouldBeOnline() bool {
 // IsEphemeral returns if the node is registered as an Ephemeral node.
 // https://tailscale.com/docs/features/ephemeral-nodes
 func (node *Node) IsEphemeral() bool {
-	return node.AuthKey != nil && node.AuthKey.Ephemeral
+	return node.Ephemeral
 }
 
 // IPs returns the node's allocated Tailscale addresses. Order is
