@@ -47,16 +47,11 @@ var expirySkipReasons = map[string]string{
 	"expiry/C4-expire-r2/r2/paths-r1":        expiredPeerPaths,
 	"expiry/C4-expire-r2/r2/self":            selfExpiredFlags,
 
-	"expiry/D2-set-expire/subject/key-expiry": clientExpiryRefused,
-	"expiry/D2-set-expire/subject/outcome":    clientExpiryRefused,
-
-	"expiry/D3-past-expiry/subject/expired-observer": clientExpiryRefused,
-	"expiry/D3-past-expiry/subject/key-expiry":       clientExpiryRefused,
-	"expiry/D3-past-expiry/subject/paths-observer":   clientExpiryRefused,
-	"expiry/D3-past-expiry/subject/self":             clientExpiryRefused,
-
-	"expiry/D5-logout-tagged/tagged/key-expiry": taggedLogoutNotExpired,
-	"expiry/D5-logout-tagged/tagged/outcome":    taggedLogoutNotExpired,
+	// A client asked for this expiry; once it passes the node is expired
+	// like any other.
+	"expiry/D3-past-expiry/subject/online-observer": expiredPeerOffline,
+	"expiry/D3-past-expiry/subject/paths-observer":  expiredPeerPaths,
+	"expiry/D3-past-expiry/subject/self":            selfExpiredFlags,
 
 	"expiry/A2-expire/laptop/online-observer": expiredPeerOffline,
 	"expiry/A2-expire/laptop/online-peer1":    expiredPeerOffline,
@@ -126,7 +121,6 @@ var expirySkipReasons = map[string]string{
 const (
 	selfExpiredFlags         = "SELF_EXPIRED_FLAGS: headscale sends an expired node its own entry with MachineAuthorized false and Expired set; SaaS keeps MachineAuthorized true and leaves Expired out"
 	expiredPeerPaths         = "EXPIRED_PEER_PATHS: headscale sends peers an expired node's endpoints and home DERP; SaaS leaves both out"
-	clientExpiryRefused      = "CLIENT_EXPIRY_REFUSED: headscale refuses a client's request for an earlier key expiry; SaaS stores it, and the node expires then"
 	nameserversFromConfig    = "NAMESERVERS_FROM_CONFIG: headscale reads nameservers from its config and cannot change them while running; SaaS pushes a change to every node, an expired one too"
 	restoredRouterTakesRoute = "RESTORED_ROUTER_TAKES_ROUTE: SaaS hands a route back to a router whose key expiry is lifted, taking it from the standby that served it meanwhile; headscale keeps the standby"
 )
@@ -168,6 +162,27 @@ func runNodeExpiryCompat(t *testing.T, id, observer string) {
 
 	r := newStepReplay(t, c, opts...)
 	r.paths = true
+
+	// The test server runs no scheduled tasks. Run headscale's expiry pass on
+	// a short timer, so peers learn when an expiry a client asked for passes.
+	go func() {
+		tick := time.NewTicker(250 * time.Millisecond)
+		defer tick.Stop()
+
+		last := time.Unix(0, 0)
+
+		for {
+			select {
+			case <-t.Context().Done():
+				return
+			case <-tick.C:
+				next, changes, _ := r.srv.State().ExpireExpiredNodes(last)
+				last = next
+
+				r.srv.App.Change(changes...)
+			}
+		}
+	}()
 
 	// A change is judged against the step before only, so both sides
 	// compare the same span.
