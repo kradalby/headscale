@@ -106,6 +106,11 @@ func (b *MapResponseBuilder) WithSelfNode() *MapResponseBuilder {
 		return b
 	}
 
+	// As on Tailscale SaaS, an expired node's own entry stays authorised and
+	// unmarked; the client reads its expiry from the past KeyExpiry.
+	tailnode.MachineAuthorized = true
+	tailnode.Expired = false
+
 	b.resp.Node = tailnode
 
 	return b
