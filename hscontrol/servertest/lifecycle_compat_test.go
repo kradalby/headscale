@@ -36,10 +36,6 @@ import (
 // the step of what killed nodes leave behind. A listed check that matches
 // fails, so a fix must delete its entry.
 var lifecycleSkipReasons = map[string]string{
-	"route-approval/b9/enabled":     approvalOnSameKeyReauth,
-	"route-approval/b9/served":      approvalOnSameKeyReauth,
-	"route-approval/b9/self-routes": approvalOnSameKeyReauth,
-
 	"route-approval/r1/served": loggedOutRouterUnserved,
 
 	"ephemeral-lifecycle/E1-logout/eph-logout/outcome":      logoutAnswerUnauthorized,
@@ -63,7 +59,6 @@ var lifecycleSkipReasons = map[string]string{
 // SaaS runs auto-approval when a router's announced routes change and on a
 // re-auth that rotates its node key, over every announced route.
 const (
-	approvalOnSameKeyReauth = "APPROVAL_ON_SAME_KEY_REAUTH: headscale auto-approves on a re-auth that keeps the node key; SaaS does not"
 	loggedOutRouterUnserved = "LOGGED_OUT_ROUTER_UNSERVED: headscale stops serving a logged-out router's routes; SaaS keeps them on the expired, offline peer"
 )
 
