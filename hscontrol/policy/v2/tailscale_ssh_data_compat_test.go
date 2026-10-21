@@ -76,8 +76,6 @@ var sshRejectSkipReasons = map[string]string{
 	"ssh-e1": "headscale has no associated-tailnet-domains config; user:*@domain / localpart:*@domain are not domain-validated",
 	"ssh-e2": "headscale has no associated-tailnet-domains config; user:*@domain / localpart:*@domain are not domain-validated",
 	"ssh-malformed-user-localpart-multi-glob": "headscale has no associated-tailnet-domains config; user:*@domain / localpart:*@domain are not domain-validated",
-
-	"ssh-check-tag-src/refused": "SSH_CHECK_TAG_SRC: SaaS refuses a check rule with a tag source; headscale accepts it",
 }
 
 // TestSSHDataCompat loads every ssh-*.hujson capture, parses the policy
