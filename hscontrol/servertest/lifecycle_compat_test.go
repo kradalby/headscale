@@ -53,9 +53,8 @@ var lifecycleSkipReasons = map[string]string{
 
 	"route-approval/r1/served": loggedOutRouterUnserved,
 
-	"ephemeral-lifecycle/E3-key-delete/2/keys":   deletedKeyListed,
-	"ephemeral-lifecycle/E3-key-delete/3/keys":   deletedKeyListed,
-	"ephemeral-lifecycle/E3-key-delete/4/status": deletedKeyDeleteNotFound,
+	"ephemeral-lifecycle/E3-key-delete/2/keys": deletedKeyListed,
+	"ephemeral-lifecycle/E3-key-delete/3/keys": deletedKeyListed,
 
 	"ephemeral-lifecycle/E5-mem-shutdown/mem/expiry":        taggedLogoutNotExpired,
 	"ephemeral-lifecycle/E5-mem-shutdown/mem/outcome":       taggedLogoutNotExpired,
@@ -72,8 +71,7 @@ const (
 )
 
 const (
-	deletedKeyListed         = "DELETED_KEY_LISTED: headscale lists a deleted auth key; SaaS leaves it out of both key lists, while a read by ID still answers"
-	deletedKeyDeleteNotFound = "DELETED_KEY_DELETE_NOT_FOUND: headscale answers 404 to a second delete of an auth key; SaaS answers 200"
+	deletedKeyListed = "DELETED_KEY_LISTED: headscale lists a deleted auth key; SaaS leaves it out of both key lists, while a read by ID still answers"
 )
 
 // Used by reauthSkipReasons.
