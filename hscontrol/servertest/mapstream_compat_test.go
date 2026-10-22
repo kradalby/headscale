@@ -186,9 +186,6 @@ var mapStreamSkipReasons = map[string]string{
 	"user-role/S1-reconnect/tag-b/frames": hiddenPeerChangeSent,
 	"user-role/S2-reconnect/own-b/frames": hiddenPeerChangeSent,
 	"user-role/S2-reconnect/tag-b/frames": hiddenPeerChangeSent,
-
-	"user-role/S0/tag-a/device-user": taggedDeviceUser,
-	"user-role/S0/tag-b/device-user": taggedDeviceUser,
 }
 
 const (
@@ -204,7 +201,6 @@ const (
 	removalSentToAll          = "REMOVAL_SENT_TO_ALL: headscale tells every connected node that a deleted node is gone; SaaS tells only the nodes that had it as a peer"
 	announcePolicyResend      = "ANNOUNCE_POLICY_RESEND: under an autogroup:self or via policy, headscale sends every connected node a policy response when a router changes only routes nobody approved; SaaS sends nothing to nodes that cannot see the router"
 	withdrawnRouteEnabled     = "WITHDRAWN_ROUTE_ENABLED: headscale's routes API keeps a route the device stopped advertising in enabledRoutes; SaaS lists only advertised routes as enabled"
-	taggedDeviceUser          = "TAGGED_DEVICE_USER: SaaS shows a tagged device's user as the login that made its key; headscale shows tagged-devices"
 )
 
 // mapStreamNotCompared lists, by key prefix, checks left out: SaaS's answer
