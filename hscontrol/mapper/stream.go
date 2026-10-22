@@ -259,8 +259,8 @@ func Route(old, cur *state.Snapshot, c state.Change) (bool, map[types.NodeID]str
 
 	for _, ids := range [][]types.NodeID{c.Nodes, c.Primaries} {
 		for _, id := range ids {
-			add(old.PeerIDs(id))
-			add(cur.PeerIDs(id))
+			add(old.PeerView(id))
+			add(cur.PeerView(id))
 		}
 	}
 

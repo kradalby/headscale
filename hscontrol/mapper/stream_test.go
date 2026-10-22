@@ -1067,7 +1067,7 @@ func TestRouteWakesNewPrimary(t *testing.T) {
 		gens[id] = s.Connect(id)
 	}
 
-	require.NotContains(t, s.Snapshot().PeerIDs(r1), r2, "the routers must not see each other")
+	require.NotContains(t, s.Snapshot().ListPeerIDs(r1), r2, "the routers must not see each other")
 
 	before := s.Snapshot()
 	primary, _ := before.PrimaryRouteFor(route)

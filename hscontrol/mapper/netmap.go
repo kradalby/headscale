@@ -73,7 +73,7 @@ type renderer struct {
 	// telling which peers a later snapshot can have changed.
 	lastNodes   state.NodesVersion
 	lastKey     renderKey
-	lastPeerIDs []types.NodeID // shared with the snapshot
+	lastPeerIDs []types.NodeID // the snapshot's shared view, see [state.Snapshot.PeerView]
 	lastSelf    types.NodeView
 
 	// dns is reused while its inputs, the node and the policy's capability
@@ -347,10 +347,13 @@ func (r *renderer) renderChangedPeers(pr *peerRendering, nm *netMap) (bool, erro
 	peers := base.peers.Edit()
 	defer func() { nm.peers = peers.Done() }()
 
-	ids := pr.snap.PeerIDs(r.nodeID)
-	added, gone := mergeDiff(r.lastPeerIDs, ids)
+	added, gone := mergeDiff(r.lastPeerIDs, pr.snap.PeerView(r.nodeID))
 
 	for _, id := range gone {
+		if id == r.nodeID {
+			continue
+		}
+
 		delete(r.peers, id)
 
 		if _, sent := peers.Get(id.NodeID()); sent {
@@ -361,7 +364,7 @@ func (r *renderer) renderChangedPeers(pr *peerRendering, nm *netMap) (bool, erro
 
 	for _, id := range slices.Concat(added, pr.snap.NodesChangedSince(r.lastNodes)) {
 		prev, isPeer := r.peers[id]
-		if !isPeer && !slices.Contains(added, id) {
+		if id == r.nodeID || !isPeer && !slices.Contains(added, id) {
 			continue
 		}
 
@@ -403,7 +406,7 @@ func (r *renderer) renderChangedPeers(pr *peerRendering, nm *netMap) (bool, erro
 
 // renderAllPeers checks every peer, rendering those whose inputs moved.
 func (r *renderer) renderAllPeers(pr *peerRendering, nm *netMap) error {
-	ids := pr.snap.PeerIDs(r.nodeID)
+	ids := pr.snap.PeerView(r.nodeID)
 
 	// A fast path that gave up may have rendered some peers already; they
 	// are in r.peers and are compared like any other below.
@@ -420,7 +423,7 @@ func (r *renderer) renderAllPeers(pr *peerRendering, nm *netMap) error {
 
 	for _, id := range ids {
 		peer, ok := pr.snap.GetNode(id)
-		if !ok {
+		if id == r.nodeID || !ok {
 			continue
 		}
 
@@ -477,7 +480,7 @@ func (r *renderer) renderAllPeers(pr *peerRendering, nm *netMap) error {
 
 func (r *renderer) markRendered(pr *peerRendering) {
 	r.lastNodes, r.lastKey = pr.snap.NodesVersion(), pr.key
-	r.lastPeerIDs, r.lastSelf = pr.snap.PeerIDs(r.nodeID), pr.self
+	r.lastPeerIDs, r.lastSelf = pr.snap.PeerView(r.nodeID), pr.self
 }
 
 // sameRouteFacts reports whether a and b are the same viewer to the routes

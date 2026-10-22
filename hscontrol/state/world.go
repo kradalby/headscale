@@ -113,7 +113,7 @@ type world struct {
 	// peerPolicy counts the compiled policies that render nodes as peers
 	// differently; see [policyv2.PolicyManager.SameForPeers].
 	peerPolicy graph.Derived[peerPolicy]
-	peers      graph.Derived[map[types.NodeID][]types.NodeID]
+	peers      graph.Derived[*policyv2.PeerClasses]
 	primaries  graph.Derived[primaryRoutes]
 }
 
@@ -232,17 +232,9 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 			return peerPolicy{pm: cur.pm, gen: prev.gen + 1}
 		})
 
-	w.peers = graph.NewDerived(g, "peers", samePeerMap,
-		func(s *graph.Snapshot, _ map[types.NodeID][]types.NodeID) map[types.NodeID][]types.NodeID {
-			pm := graph.Get(s, w.policy).pm
-			peers := pm.BuildPeerMap(graph.Get(s, w.policyNodes).list)
-
-			// Sorted once here, so readers can share the slices.
-			for _, ids := range peers {
-				slices.Sort(ids)
-			}
-
-			return peers
+	w.peers = graph.NewDerived(g, "peers", (*policyv2.PeerClasses).Same,
+		func(s *graph.Snapshot, _ *policyv2.PeerClasses) *policyv2.PeerClasses {
+			return graph.Get(s, w.policy).pm.BuildPeerClasses(graph.Get(s, w.policyNodes).list)
 		})
 
 	w.primaries = graph.NewDerived(g, "primaries", samePrimaries,
@@ -442,10 +434,6 @@ func electionPrefixes(from, to *nodeMap) map[netip.Prefix]struct{} {
 	}
 
 	return touched
-}
-
-func samePeerMap(a, b map[types.NodeID][]types.NodeID) bool {
-	return maps.EqualFunc(a, b, slices.Equal[[]types.NodeID])
 }
 
 // snapshot returns the latest consistent view of the world.
@@ -932,18 +920,19 @@ func (s *Snapshot) ListNodesByUser(uid types.UserID) views.Slice[types.NodeView]
 // ListPeerIDs returns the sorted IDs of the nodes id can see, as a copy
 // the caller may keep and modify.
 func (s *Snapshot) ListPeerIDs(id types.NodeID) []types.NodeID {
-	return slices.Clone(s.PeerIDs(id))
+	return graph.Get(s.s, s.w.peers).Peers(id)
 }
 
-// PeerIDs returns the sorted IDs of the nodes id can see. The slice is
-// shared with the snapshot and must not be modified.
-func (s *Snapshot) PeerIDs(id types.NodeID) []types.NodeID {
-	return graph.Get(s.s, s.w.peers)[id]
+// PeerView returns the sorted IDs of the nodes id can see, possibly
+// including id itself: nodes that see the same nodes share one view. It
+// is shared with the snapshot and must not be modified.
+func (s *Snapshot) PeerView(id types.NodeID) []types.NodeID {
+	return graph.Get(s.s, s.w.peers).View(id)
 }
 
 // ListPeers returns the nodes id can see, sorted by ID.
 func (s *Snapshot) ListPeers(id types.NodeID) views.Slice[types.NodeView] {
-	return views.SliceOf(s.gather(s.PeerIDs(id)))
+	return views.SliceOf(s.gather(s.ListPeerIDs(id)))
 }
 
 // Policy returns the compiled policy.
@@ -1106,7 +1095,7 @@ func (s *Snapshot) Since(old *Snapshot) Change {
 	}
 
 	if s.PeersRev() != old.PeersRev() {
-		c.PeerSets = changedKeys(graph.Get(old.s, old.w.peers), graph.Get(s.s, s.w.peers), slices.Equal[[]types.NodeID])
+		c.PeerSets = graph.Get(s.s, s.w.peers).Changed(graph.Get(old.s, old.w.peers))
 	}
 
 	return c
