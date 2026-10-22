@@ -72,6 +72,7 @@ type renderer struct {
 	// The nodes, peer inputs and peer set of the previous render, for
 	// telling which peers a later snapshot can have changed.
 	lastNodes   state.NodesVersion
+	lastCaps    state.CapsVersion
 	lastKey     renderKey
 	lastPeerIDs []types.NodeID // the snapshot's shared view, see [state.Snapshot.PeerView]
 	lastSelf    types.NodeView
@@ -334,26 +335,43 @@ type peerRendering struct {
 	matchersLoaded bool
 }
 
-// renderChangedPeers is the fast path for a write that moved no policy,
-// route or visibility input: only the nodes the snapshot's change log
-// names since the previous render can differ, so only they are looked at.
-// It reports false when that does not hold and every peer must be checked.
+// renderChangedPeers renders, after the first render, only the peers that
+// can differ from the base: those added to the view, those whose node
+// changed, and those whose render reads something that moved without
+// their node changing (their policy caps, or their routes, which come from
+// the policy, the primary routes and the viewer's own routes). It reports
+// false when there is no base to start from.
 func (r *renderer) renderChangedPeers(pr *peerRendering, nm *netMap) (bool, error) {
 	base := nm.base
-	if base == nil || pr.key != r.lastKey || !sameRouteFacts(r.lastSelf, pr.self) {
+	if base == nil {
 		return false, nil
+	}
+
+	view := pr.snap.PeerView(r.nodeID)
+	inView := func(id types.NodeID) bool {
+		_, found := slices.BinarySearch(view, id)
+
+		return found
+	}
+
+	forced := map[types.NodeID]struct{}{}
+
+	if pr.key.policy != r.lastKey.policy {
+		for _, id := range pr.snap.CapsChangedSince(r.lastCaps) {
+			forced[id] = struct{}{}
+		}
+	}
+
+	if pr.key != r.lastKey || !sameRouteFacts(r.lastSelf, pr.self) {
+		for _, id := range pr.snap.RoutedNodes() {
+			forced[id] = struct{}{}
+		}
 	}
 
 	peers := base.peers.Edit()
 	defer func() { nm.peers = peers.Done() }()
 
-	added, gone := mergeDiff(r.lastPeerIDs, pr.snap.PeerView(r.nodeID))
-
-	for _, id := range gone {
-		if id == r.nodeID {
-			continue
-		}
-
+	drop := func(id types.NodeID) {
 		delete(r.peers, id)
 
 		if _, sent := peers.Get(id.NodeID()); sent {
@@ -362,14 +380,30 @@ func (r *renderer) renderChangedPeers(pr *peerRendering, nm *netMap) (bool, erro
 		}
 	}
 
-	for _, id := range slices.Concat(added, pr.snap.NodesChangedSince(r.lastNodes)) {
-		prev, isPeer := r.peers[id]
-		if id == r.nodeID || !isPeer && !slices.Contains(added, id) {
+	added, gone := mergeDiff(r.lastPeerIDs, view)
+	for _, id := range gone {
+		if id != r.nodeID {
+			drop(id)
+		}
+	}
+
+	candidates := slices.Concat(added, pr.snap.NodesChangedSince(r.lastNodes), slices.Collect(maps.Keys(forced)))
+	seen := make(map[types.NodeID]struct{}, len(candidates))
+
+	for _, id := range candidates {
+		if _, dup := seen[id]; dup || id == r.nodeID || !inView(id) {
 			continue
 		}
 
+		seen[id] = struct{}{}
+
 		peer, exists := pr.snap.GetNode(id)
-		if !exists || isPeer && prev.node == peer {
+		if !exists {
+			continue
+		}
+
+		_, force := forced[id]
+		if prev, isPeer := r.peers[id]; isPeer && prev.node == peer && !force {
 			continue
 		}
 
@@ -380,24 +414,19 @@ func (r *renderer) renderChangedPeers(pr *peerRendering, nm *netMap) (bool, erro
 
 		if ptn == nil {
 			// Dropped as invalid; the client must not keep an old copy.
-			delete(r.peers, id)
-
-			if _, sent := peers.Get(id.NodeID()); sent {
-				peers.Delete(id.NodeID())
-				nm.removed = append(nm.removed, id.NodeID())
-			}
+			drop(id)
 
 			continue
 		}
 
-		peers.Set(ptn.ID, ptn)
-		nm.changed = append(nm.changed, ptn.ID)
+		if have, _ := peers.Get(ptn.ID); have != ptn {
+			peers.Set(ptn.ID, ptn)
+			nm.changed = append(nm.changed, ptn.ID)
+		}
 	}
 
 	slices.Sort(nm.removed)
-
 	slices.Sort(nm.changed)
-	nm.changed = slices.Compact(nm.changed)
 
 	r.markRendered(pr)
 
@@ -479,7 +508,7 @@ func (r *renderer) renderAllPeers(pr *peerRendering, nm *netMap) error {
 }
 
 func (r *renderer) markRendered(pr *peerRendering) {
-	r.lastNodes, r.lastKey = pr.snap.NodesVersion(), pr.key
+	r.lastNodes, r.lastKey, r.lastCaps = pr.snap.NodesVersion(), pr.key, pr.snap.CapsVersion()
 	r.lastPeerIDs, r.lastSelf = pr.snap.PeerView(r.nodeID), pr.self
 }
 

@@ -113,8 +113,11 @@ type world struct {
 	// peerPolicy counts the compiled policies that render nodes as peers
 	// differently; see [policyv2.PolicyManager.SameForPeers].
 	peerPolicy graph.Derived[peerPolicy]
-	peers      graph.Derived[*policyv2.PeerClasses]
-	primaries  graph.Derived[primaryRoutes]
+	// nodeCaps is the policy's capability map per node, kept as a Map so
+	// a reader finds whose caps a recompile changed.
+	nodeCaps  graph.Derived[*capsMap]
+	peers     graph.Derived[*policyv2.PeerClasses]
+	primaries graph.Derived[primaryRoutes]
 }
 
 // nodeIndex holds the lookups every reader needs. Each part moves only
@@ -129,6 +132,8 @@ type nodeIndex struct {
 	// advertisers holds, per non-exit prefix, the online nodes approving
 	// it: the candidates of its primary-route election.
 	advertisers graph.Grouped[types.NodeID, *types.Node, netip.Prefix]
+	// routed holds, under true, the nodes serving any approved route.
+	routed graph.Grouped[types.NodeID, *types.Node, bool]
 }
 
 // policyNodes is the node list as the policy reads it. It changes only
@@ -141,6 +146,11 @@ type policyNodes struct {
 	from *nodeMap
 	gen  uint64
 }
+
+// capsMap holds each node's policy capabilities.
+type capsMap = graph.Map[types.NodeID, tailcfg.NodeCapMap]
+
+func sameCaps(a, b tailcfg.NodeCapMap) bool { return reflect.DeepEqual(a, b) }
 
 // peerPolicy is a generation number that moves only when a compiled
 // policy renders peers differently, with the policy it was taken at.
@@ -232,6 +242,29 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 			return peerPolicy{pm: cur.pm, gen: prev.gen + 1}
 		})
 
+	w.nodeCaps = graph.NewDerived(g, "node-caps", graph.Same[*capsMap],
+		func(s *graph.Snapshot, prev *capsMap) *capsMap {
+			caps := graph.Get(s, w.policy).pm.NodeCapMaps()
+			if prev == nil {
+				return graph.NewMap(sameCaps, caps)
+			}
+
+			e := prev.Edit()
+			for id, c := range caps {
+				if old, ok := prev.Get(id); !ok || !sameCaps(old, c) {
+					e.Set(id, c)
+				}
+			}
+
+			for id := range prev.All() {
+				if _, ok := caps[id]; !ok {
+					e.Delete(id)
+				}
+			}
+
+			return e.Done()
+		})
+
 	w.peers = graph.NewDerived(g, "peers", (*policyv2.PeerClasses).Same,
 		func(s *graph.Snapshot, _ *policyv2.PeerClasses) *policyv2.PeerClasses {
 			return graph.Get(s, w.policy).pm.BuildPeerClasses(graph.Get(s, w.policyNodes).list)
@@ -302,6 +335,13 @@ func updateIndex(prev *nodeIndex, nodes *nodeMap) *nodeIndex {
 			}
 
 			return []types.UserID{n.TypedUserID()}
+		}),
+		routed: graph.GroupBy(p.routed, nodes, func(_ types.NodeID, n *types.Node) []bool {
+			if len(n.AllApprovedRoutes()) == 0 {
+				return nil
+			}
+
+			return []bool{true}
 		}),
 		advertisers: graph.GroupBy(p.advertisers, nodes, func(_ types.NodeID, n *types.Node) []netip.Prefix {
 			if !n.Online() {
@@ -1118,6 +1158,27 @@ func changedKeys[K comparable, V any](a, b map[K]V, eq func(x, y V) bool) []K {
 	}
 
 	return keys
+}
+
+// RoutedNodes returns the nodes serving an approved route, sorted. It is
+// shared and must not be modified.
+func (s *Snapshot) RoutedNodes() []types.NodeID {
+	ids, _ := s.index().routed.Groups.Get(true)
+
+	return ids
+}
+
+// CapsVersion is the policy's node capabilities in a snapshot, which a
+// reader keeps to ask a later snapshot whose caps changed.
+type CapsVersion struct{ m *capsMap }
+
+// CapsVersion returns the node capabilities of s.
+func (s *Snapshot) CapsVersion() CapsVersion { return CapsVersion{m: graph.Get(s.s, s.w.nodeCaps)} }
+
+// CapsChangedSince returns the nodes whose policy capabilities differ
+// between v and s.
+func (s *Snapshot) CapsChangedSince(v CapsVersion) []types.NodeID {
+	return graph.Changes(v.m, graph.Get(s.s, s.w.nodeCaps))
 }
 
 // NodesVersion is the nodes of a snapshot, which a reader keeps to ask a

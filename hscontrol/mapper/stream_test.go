@@ -719,6 +719,8 @@ func testStreamsConverge(t *testing.T, r *rand.Rand) {
 		          {"action":"accept","src":["u1@"],"dst":["u1@:*","10.0.0.0/24:*"]}],
 		  "ssh":[{"action":"accept","src":["u1@"],"dst":["tag:b"],"users":["root"]}]}`,
 		`{"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`,
+		`{"nodeAttrs":[{"target":["u1@"],"attr":["disable-ipv4"]}],
+		  "acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`,
 	}
 
 	sessions := map[types.NodeID]*oracleSession{}
