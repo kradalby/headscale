@@ -1,11 +1,9 @@
 package state
 
 import (
-	"sync/atomic"
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/db"
-	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/require"
 )
 
@@ -14,6 +12,9 @@ import (
 // store it and then call [State.ReloadPolicy]; the O(n^2) rebuild must run
 // once for that, not once per step. A reload that is the first to see a new
 // policy (SIGHUP, a policy stored by another path) must still rebuild.
+//
+// The graph recomputes each derived cell at most once per commit, so the
+// commits a write makes bound its rebuilds.
 func TestReloadPolicyRebuildsPeerMapOnChangeOnly(t *testing.T) {
 	const (
 		denyAll  = `{"grants": []}`
@@ -32,57 +33,60 @@ func TestReloadPolicyRebuildsPeerMapOnChangeOnly(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 
-	// Count the peer-map builds. The writer goroutine reads peersFunc only
-	// while applying a batch, and none has been queued yet.
-	var builds atomic.Int32
+	// rebuilds reports how many commits fn made and whether the last one
+	// recompiled the policy.
+	rebuilds := func(fn func()) (uint64, bool) {
+		t.Helper()
 
-	peersFunc := s.nodeStore.peersFunc
-	s.nodeStore.peersFunc = func(n []types.NodeView) map[types.NodeID][]types.NodeID {
-		builds.Add(1)
+		before := s.Snapshot().Rev()
 
-		return peersFunc(n)
+		fn()
+
+		after := s.Snapshot()
+
+		return after.Rev() - before, after.PolicyRev() == after.Rev() && after.Rev() != before
 	}
 
 	// write is the sequence of the SetPolicy API handlers.
-	write := func(pol string) {
-		t.Helper()
+	write := func(pol string) func() {
+		return func() {
+			_, err := s.SetPolicy([]byte(pol))
+			require.NoError(t, err)
 
-		_, err := s.SetPolicy([]byte(pol))
-		require.NoError(t, err)
+			_, err = s.SetPolicyInDB(pol)
+			require.NoError(t, err)
 
-		_, err = s.SetPolicyInDB(pol)
-		require.NoError(t, err)
-
-		cs, err := s.ReloadPolicy()
-		require.NoError(t, err)
-		require.NotEmpty(t, cs, "a reload always reports a policy change to distribute")
+			require.NoError(t, s.ReloadPolicy())
+		}
 	}
+	reload := func() { require.NoError(t, s.ReloadPolicy()) }
 	peers := func() int { return s.ListPeers(nodes[0].ID).Len() }
 
 	require.Equal(t, 1, peers(), "no policy: allow all")
 
-	write(denyAll)
-	require.EqualValues(t, 1, builds.Swap(0), "a changed policy is rebuilt once per write")
+	commits, compiled := rebuilds(write(denyAll))
+	require.EqualValues(t, 1, commits, "a changed policy is rebuilt once per write")
+	require.True(t, compiled)
 	require.Zero(t, peers())
 
-	write(denyAll)
-	require.Zero(t, builds.Swap(0), "the same policy again needs no rebuild")
+	commits, _ = rebuilds(write(denyAll))
+	require.Zero(t, commits, "the same policy again needs no rebuild")
 	require.Zero(t, peers())
 
-	write(allowAll)
-	require.EqualValues(t, 1, builds.Swap(0))
+	commits, compiled = rebuilds(write(allowAll))
+	require.EqualValues(t, 1, commits)
+	require.True(t, compiled)
 	require.Equal(t, 1, peers())
 
-	// A reload that finds a policy the manager has not seen yet.
+	// A reload that finds a policy the world has not seen yet.
 	_, err = s.SetPolicyInDB(denyAll)
 	require.NoError(t, err)
 
-	_, err = s.ReloadPolicy()
-	require.NoError(t, err)
-	require.EqualValues(t, 1, builds.Swap(0), "a reload that changes the policy rebuilds")
+	commits, compiled = rebuilds(reload)
+	require.EqualValues(t, 1, commits, "a reload that changes the policy rebuilds")
+	require.True(t, compiled)
 	require.Zero(t, peers())
 
-	_, err = s.ReloadPolicy()
-	require.NoError(t, err)
-	require.Zero(t, builds.Swap(0), "a reload of the current policy does not")
+	commits, _ = rebuilds(reload)
+	require.Zero(t, commits, "a reload of the current policy does not")
 }
