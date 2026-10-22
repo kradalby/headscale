@@ -14,6 +14,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/rs/zerolog/log"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/views"
 )
 
 // ErrNodeGone is returned when the node a map is rendered for is no
@@ -174,6 +175,12 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 			ptn.Hostinfo = hi.View()
 		}
 
+		// Hostinfo is not patchable, so any change resends the whole peer.
+		// Keep what the client holds while the fields it reads are equal.
+		if prev, ok := r.peers[peer.ID()]; ok && peerHostinfoEqual(prev.tn.Hostinfo, ptn.Hostinfo) {
+			ptn.Hostinfo = prev.tn.Hostinfo
+		}
+
 		r.peers[peer.ID()] = renderedPeer{node: peer, key: key, tn: ptn}
 		nm.peers[ptn.ID] = ptn
 	}
@@ -199,4 +206,55 @@ func sortedProfiles(profiles map[tailcfg.UserID]tailcfg.UserProfile) []tailcfg.U
 	slices.SortFunc(out, func(a, b tailcfg.UserProfile) int { return cmp.Compare(a.ID, b.ID) })
 
 	return out
+}
+
+// peerHostinfoEqual reports whether a and b agree on the Hostinfo fields a
+// client reads from a peer: what tailscale status shows, PeerAPI services,
+// SSH known hosts, exit-node location, app-connector eligibility and the
+// announced routes.
+func peerHostinfoEqual(a, b tailcfg.HostinfoView) bool {
+	if !a.Valid() || !b.Valid() {
+		return a.Valid() == b.Valid()
+	}
+
+	return a.Hostname() == b.Hostname() &&
+		a.OS() == b.OS() &&
+		servicesEqual(a.Services(), b.Services()) &&
+		views.SliceEqual(a.SSH_HostKeys(), b.SSH_HostKeys()) &&
+		locationEqual(a.Location(), b.Location()) &&
+		a.AppConnector() == b.AppConnector() &&
+		views.SliceEqual(a.RoutableIPs(), b.RoutableIPs())
+}
+
+// servicesEqual compares field by field, as [tailcfg.Service] is
+// incomparable.
+func servicesEqual(a, b views.Slice[tailcfg.Service]) bool {
+	if a.Len() != b.Len() {
+		return false
+	}
+
+	for i := range a.Len() {
+		x, y := a.At(i), b.At(i)
+		if x.Proto != y.Proto || x.Port != y.Port || x.Description != y.Description {
+			return false
+		}
+	}
+
+	return true
+}
+
+// locationEqual compares field by field, as [tailcfg.LocationView] has no
+// Equal.
+func locationEqual(a, b tailcfg.LocationView) bool {
+	if !a.Valid() || !b.Valid() {
+		return a.Valid() == b.Valid()
+	}
+
+	return a.Country() == b.Country() &&
+		a.CountryCode() == b.CountryCode() &&
+		a.City() == b.City() &&
+		a.CityCode() == b.CityCode() &&
+		a.Latitude() == b.Latitude() &&
+		a.Longitude() == b.Longitude() &&
+		a.Priority() == b.Priority()
 }
