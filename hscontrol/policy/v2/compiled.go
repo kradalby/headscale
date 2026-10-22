@@ -382,7 +382,19 @@ func (c *nodeChange) reaches(grant Grant) bool {
 				return true
 			}
 		case *AutoGroup:
-			if c.membership || len(c.users) > 0 || len(c.tags) > 0 {
+			// member and self are untagged nodes, recorded by owner;
+			// tagged ones by tag; internet and danger-all are fixed.
+			switch *a {
+			case AutoGroupMember, AutoGroupSelf:
+				if len(c.users) > 0 {
+					return true
+				}
+			case AutoGroupTagged:
+				if len(c.tags) > 0 {
+					return true
+				}
+			case AutoGroupInternet, AutoGroupDangerAll, AutoGroupNonRoot:
+			default:
 				return true
 			}
 		case Asterix:
