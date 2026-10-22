@@ -237,7 +237,7 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 	})
 
 	// Start subsystems.
-	app.StartBatcherForTest(tb)
+	tb.Cleanup(app.MapHub().Close)
 	app.StartEphemeralGCForTest(tb)
 
 	// Start the HTTP server. By default it binds an in-memory network so all
@@ -312,7 +312,7 @@ func (s *TestServer) MemNet() *memnet.Network {
 func (s *TestServer) CreateUser(tb testing.TB, name string) *types.User {
 	tb.Helper()
 
-	u, _, err := s.st.CreateUser(types.User{Name: name})
+	u, err := s.st.CreateUser(types.User{Name: name})
 	if err != nil {
 		tb.Fatalf("servertest: CreateUser(%q): %v", name, err)
 	}

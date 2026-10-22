@@ -17,7 +17,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/templates"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/oauth2"
@@ -333,7 +332,7 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		return
 	}
 
-	user, _, err := a.createOrUpdateUserFromClaim(&claims)
+	user, err := a.createOrUpdateUserFromClaim(&claims)
 	if err != nil {
 		httpUserError(writer, NewHTTPError(
 			http.StatusInternalServerError,
@@ -632,45 +631,40 @@ func (a *AuthProviderOIDC) getAuthInfoFromState(state string) *AuthInfo {
 
 func (a *AuthProviderOIDC) createOrUpdateUserFromClaim(
 	claims *types.OIDCClaims,
-) (*types.User, change.Change, error) {
-	var (
-		user    *types.User
-		err     error
-		newUser bool
-		c       change.Change
-	)
-
-	user, err = a.h.state.GetUserByOIDCIdentifier(claims.Identifier())
+) (*types.User, error) {
+	user, err := a.h.state.GetUserByOIDCIdentifier(claims.Identifier())
 	if err != nil && !errors.Is(err, db.ErrUserNotFound) {
-		return nil, change.Change{}, fmt.Errorf("creating or updating user: %w", err)
+		return nil, fmt.Errorf("creating or updating user: %w", err)
 	}
 
 	// if the user is still not found, create a new empty user.
 	// TODO(kradalby): This context is not inherited from the request, which is probably not ideal.
 	// However, we need a context to use the OIDC provider.
-	if user == nil {
-		newUser = true
+	newUser := user == nil
+	if newUser {
 		user = &types.User{}
 	}
 
 	user.FromClaim(claims, a.cfg.EmailVerifiedRequired)
 
 	if newUser {
-		user, c, err = a.h.state.CreateUser(*user)
+		user, err = a.h.state.CreateUser(*user)
 		if err != nil {
-			return nil, change.Change{}, fmt.Errorf("creating user: %w", err)
+			return nil, fmt.Errorf("creating user: %w", err)
 		}
-	} else {
-		_, c, err = a.h.state.UpdateUser(types.UserID(user.ID), func(u *types.User) error {
-			*u = *user
-			return nil
-		})
-		if err != nil {
-			return nil, change.Change{}, fmt.Errorf("updating user: %w", err)
-		}
+
+		return user, nil
 	}
 
-	return user, c, nil
+	_, err = a.h.state.UpdateUser(types.UserID(user.ID), func(u *types.User) error {
+		*u = *user
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("updating user: %w", err)
+	}
+
+	return user, nil
 }
 
 // registerConfirmCSRFCookie is the cookie name used to bind the
@@ -986,15 +980,13 @@ func (a *AuthProviderOIDC) handleRegistration(
 	registrationID types.AuthID,
 	expiry *time.Time,
 ) (bool, error) {
-	node, nodeChange, err := a.h.state.HandleNodeFromAuthPath(
+	node, err := a.h.state.HandleNodeFromAuthPath(
 		registrationID,
 		types.UserID(user.ID),
 		expiry,
 		util.RegisterMethodOIDC,
 	)
 	if err != nil {
-		a.h.Change(nodeChange)
-
 		return false, fmt.Errorf("registering node: %w", err)
 	}
 
@@ -1009,16 +1001,14 @@ func (a *AuthProviderOIDC) handleRegistration(
 	// ensure we send an update.
 	// This works, but might be another good candidate for doing some sort of
 	// eventbus.
-	routesChange, err := a.h.state.AutoApproveRoutes(node)
-
-	// Send both changes. Empty changes are ignored by Change().
-	a.h.Change(nodeChange, routesChange)
-
+	err = a.h.state.AutoApproveRoutes(node)
 	if err != nil {
 		return false, fmt.Errorf("auto approving routes: %w", err)
 	}
 
-	return !nodeChange.IsEmpty(), nil
+	// Every registration that gets here registered or re-authenticated a
+	// node the client is waiting on.
+	return true, nil
 }
 
 func renderRegistrationSuccessTemplate(

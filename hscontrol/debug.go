@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/arl/statsviz"
+	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/templates"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsweb"
@@ -153,7 +153,7 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 	}))
 
 	debug.Handle("mapresponses", "Map responses for all nodes", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		res, err := h.mapBatcher.DebugMapResponses()
+		res, err := mapper.DebugMapResponses()
 		if err != nil {
 			httpError(w, err)
 			return
@@ -247,20 +247,17 @@ func (h *Headscale) debugBatcher() string {
 		activeConnections int
 	}
 
-	debugInfo := h.mapBatcher.Debug()
-	nodes := make([]nodeStatus, 0, len(debugInfo))
+	connected := h.mapHub.Connected()
+	nodes := make([]nodeStatus, 0, len(connected))
 
-	for nodeID, info := range debugInfo {
+	for nodeID, sessions := range connected {
 		nodes = append(nodes, nodeStatus{
 			id:                nodeID,
-			connected:         info.Connected,
-			activeConnections: info.ActiveConnections,
+			connected:         sessions > 0,
+			activeConnections: sessions,
 		})
 		totalNodes++
-
-		if info.Connected {
-			connectedCount++
-		}
+		connectedCount++
 	}
 
 	// Sort by node ID
@@ -306,11 +303,10 @@ func (h *Headscale) debugBatcherJSON() DebugBatcherInfo {
 		TotalNodes:     0,
 	}
 
-	debugInfo := h.mapBatcher.Debug()
-	for nodeID, debugData := range debugInfo {
+	for nodeID, sessions := range h.mapHub.Connected() {
 		info.ConnectedNodes[fmt.Sprintf("%d", nodeID)] = DebugBatcherNodeInfo{
-			Connected:         debugData.Connected,
-			ActiveConnections: debugData.ActiveConnections,
+			Connected:         sessions > 0,
+			ActiveConnections: sessions,
 		}
 		info.TotalNodes++
 	}
@@ -320,15 +316,9 @@ func (h *Headscale) debugBatcherJSON() DebugBatcherInfo {
 
 // connectedNodesList returns a list of connected nodes for the ping page.
 func (h *Headscale) connectedNodesList() []templates.ConnectedNode {
-	debugInfo := h.mapBatcher.Debug()
-
 	var nodes []templates.ConnectedNode
 
-	for nodeID, info := range debugInfo {
-		if !info.Connected {
-			continue
-		}
-
+	for nodeID := range h.mapHub.Connected() {
 		nv, ok := h.state.GetNodeByID(nodeID)
 		if !ok {
 			continue
@@ -370,7 +360,7 @@ func (h *Headscale) doPing(ctx context.Context, query string) *templates.PingRes
 
 	nodeID := node.ID()
 
-	if !h.mapBatcher.IsConnected(nodeID) {
+	if !h.mapHub.IsConnected(nodeID) {
 		return &templates.PingResult{
 			Status:  "error",
 			NodeID:  nodeID,
@@ -385,10 +375,10 @@ func (h *Headscale) doPing(ctx context.Context, query string) *templates.PingRes
 	// not the noise chain, so URLIsNoise stays false. Operators running
 	// server_url over plain HTTP are on their own — don't do that.
 	callbackURL := h.cfg.ServerURL + "/machine/ping-response?id=" + pingID
-	h.Change(change.PingNode(nodeID, &tailcfg.PingRequest{
+	h.mapHub.Ping(nodeID, &tailcfg.PingRequest{
 		URL: callbackURL,
 		Log: true,
-	}))
+	})
 
 	select {
 	case latency := <-responseCh:
