@@ -13,6 +13,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/require"
+	"go4.org/netipx"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/must"
@@ -778,7 +779,7 @@ func TestReduceFilterRules(t *testing.T) {
 
 				got, _ := pm.Filter()
 				t.Logf("full filter:\n%s", must.Get(json.MarshalIndent(got, "", "  ")))
-				got = policyutil.ReduceFilterRules(tt.node.View(), got)
+				got = policyutil.ReduceFilterRules(tt.node.View(), got, nil)
 
 				if diff := cmp.Diff(tt.want, got); diff != "" {
 					log.Trace().Interface("got", got).Msg("result")
@@ -951,7 +952,7 @@ func TestReduceFilterRulesPartialApproval(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := policyutil.ReduceFilterRules(
-				tt.node.View(), tt.rules,
+				tt.node.View(), tt.rules, nil,
 			)
 			require.Len(t, got, tt.wantCount,
 				"rule count mismatch")
@@ -1315,7 +1316,7 @@ func TestReduceFilterRulesCapGrant(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := policyutil.ReduceFilterRules(tt.node.View(), tt.rules)
+			got := policyutil.ReduceFilterRules(tt.node.View(), tt.rules, nil)
 
 			require.Len(t, got, len(tt.want),
 				"rule count mismatch")
@@ -1338,4 +1339,43 @@ func TestReduceFilterRulesCapGrant(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestReduceFilterRulesMergedNodeDests checks that a destination merged from
+// node addresses shrinks to the node's own addresses, while a written prefix,
+// and any destination a router serves, stays whole.
+func TestReduceFilterRulesMergedNodeDests(t *testing.T) {
+	node := &types.Node{IPv4: ap("100.64.0.6"), IPv6: ap("fd7a:115c:a1e0::6")}
+	neighbour := &types.Node{IPv4: ap("100.64.0.7"), IPv6: ap("fd7a:115c:a1e0::7")}
+
+	var b netipx.IPSetBuilder
+
+	node.AppendToIPSet(&b)
+	neighbour.AppendToIPSet(&b)
+
+	nodeAddrs, err := b.IPSet()
+	require.NoError(t, err)
+
+	rules := []tailcfg.FilterRule{{
+		SrcIPs: []string{"100.64.0.1"},
+		DstPorts: []tailcfg.NetPortRange{
+			{IP: "100.64.0.6/31", Ports: tailcfg.PortRange{First: 22, Last: 22}},
+			{IP: "fd7a:115c:a1e0::6/127", Ports: tailcfg.PortRange{First: 22, Last: 22}},
+			{IP: "100.64.0.0/12", Ports: tailcfg.PortRangeAny},
+		},
+	}}
+
+	got := policyutil.ReduceFilterRules(node.View(), rules, nodeAddrs)
+	require.Equal(t, []tailcfg.NetPortRange{
+		{IP: "100.64.0.6", Ports: tailcfg.PortRange{First: 22, Last: 22}},
+		{IP: "fd7a:115c:a1e0::6", Ports: tailcfg.PortRange{First: 22, Last: 22}},
+		{IP: "100.64.0.0/12", Ports: tailcfg.PortRangeAny},
+	}, got[0].DstPorts)
+
+	// An exit node forwards to every destination, so it keeps them whole.
+	node.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: tsaddr.ExitRoutes()}
+	node.ApprovedRoutes = tsaddr.ExitRoutes()
+
+	got = policyutil.ReduceFilterRules(node.View(), rules, nodeAddrs)
+	require.Equal(t, rules[0].DstPorts, got[0].DstPorts)
 }

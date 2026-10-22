@@ -387,6 +387,7 @@ func testACLSuccess(
 					gotRules := policyutil.ReduceFilterRules(
 						node.View(),
 						pol.compileFilterRulesForNode(users, node.View(), nodes.ViewSlice()),
+						nodeAddrSet(nodes.ViewSlice()),
 					)
 
 					if diff := cmp.Diff(wantRules, gotRules, opts...); diff != "" {
