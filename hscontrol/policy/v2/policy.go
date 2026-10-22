@@ -15,7 +15,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/policy/policyutil"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/puzpuzpuz/xsync/v4"
-	"github.com/rs/zerolog/log"
 	"go4.org/netipx"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
@@ -215,20 +214,6 @@ func NewPolicyManager(b []byte, users []types.User, nodes views.Slice[types.Node
 		sshPolicyMap:       xsync.NewMap[types.NodeID, *tailcfg.SSHPolicy](),
 		filterRulesMap:     xsync.NewMap[types.NodeID, []tailcfg.FilterRule](),
 		matchersForNodeMap: xsync.NewMap[types.NodeID, []matcher.Match](),
-	}
-
-	// Boot path: log a warning if the stored policy's tests would
-	// fail against the current users and nodes, but keep the server
-	// running. A stale stored policy (e.g. referencing a user that
-	// was deleted while the server was offline) should not block
-	// boot; the operator finds out via logs and re-runs the write
-	// boundary when they are ready.
-	if testErr := pm.RunTests(); testErr != nil { //nolint:noinlineerr // boot path: warn-and-continue, not return
-		log.Warn().Err(testErr).Msg("policy tests failed at boot; server starting anyway, fix the policy and reload")
-	}
-
-	if testErr := pm.RunSSHTests(); testErr != nil { //nolint:noinlineerr // boot path: warn-and-continue, not return
-		log.Warn().Err(testErr).Msg("policy sshTests failed at boot; server starting anyway, fix the policy and reload")
 	}
 
 	return pm, nil

@@ -251,6 +251,20 @@ func NewState(cfg *types.Config) (*State, error) {
 
 	w.batchSize, w.batchTimeout = cfg.Tuning.NodeStoreBatchSize, cfg.Tuning.NodeStoreBatchTimeout
 
+	// The stored policy's tests are checked once at boot, and on every
+	// write by [State.SetPolicy]; a node change recompiles the policy
+	// without them. A failure here only warns: a stale stored policy (a
+	// user deleted while the server was down) must not block boot.
+	if t, ok := w.snapshot().Policy().(policyTester); ok {
+		if err := t.RunTests(); err != nil { //nolint:noinlineerr // warn and continue
+			log.Warn().Err(err).Msg("policy tests failed at boot; server starting anyway, fix the policy and reload")
+		}
+
+		if err := t.RunSSHTests(); err != nil { //nolint:noinlineerr // warn and continue
+			log.Warn().Err(err).Msg("policy sshTests failed at boot; server starting anyway, fix the policy and reload")
+		}
+	}
+
 	// Last: NewLRU starts the TTL sweeper goroutine, which only Close stops.
 	authCache := expirable.NewLRU[types.AuthID, *types.AuthRequest](
 		cacheMaxEntries,
