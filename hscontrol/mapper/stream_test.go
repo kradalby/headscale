@@ -679,9 +679,8 @@ type oracleSession struct {
 
 // TestStreamsConvergeUnderRandomWrites drives random writes of every kind
 // against a session per node and checks after each write that every
-// session's client equals a fresh session's. Sessions are updated only
-// through wake, so routing may skip sessions: one it skips must already
-// be up to date.
+// session's client equals a fresh session's. Only the sessions [Route]
+// names are updated, so a session it skips must already be up to date.
 func TestStreamsConvergeUnderRandomWrites(t *testing.T) {
 	cfg, s, _ := streamTestState(t, "")
 	hub := NewHub()
@@ -731,15 +730,22 @@ func TestStreamsConvergeUnderRandomWrites(t *testing.T) {
 		open(nv.ID())
 	}
 
-	// wake updates the sessions a write must reach; all of them, until
-	// routing narrows it.
-	wake := func() []types.NodeID {
-		ids := make([]types.NodeID, 0, len(sessions))
+	// wake returns the sessions the write from last to snap reaches, as
+	// the hub routes it.
+	last := s.Snapshot()
+	wake := func(snap *state.Snapshot) []types.NodeID {
+		all, ids := Route(last, snap, snap.Since(last))
+		last = snap
+
+		var out []types.NodeID
+
 		for id := range sessions {
-			ids = append(ids, id)
+			if _, ok := ids[id]; all || ok {
+				out = append(out, id)
+			}
 		}
 
-		return ids
+		return out
 	}
 
 	gens := map[types.NodeID]uint64{}
@@ -809,7 +815,7 @@ func TestStreamsConvergeUnderRandomWrites(t *testing.T) {
 
 		snap := s.Snapshot()
 
-		for _, id := range wake() {
+		for _, id := range wake(snap) {
 			sess := sessions[id]
 
 			resps, err := sess.st.Update(snap)
@@ -971,11 +977,11 @@ var scalingWrites = map[string]func(b *testing.B, s *state.State, i int){
 	},
 }
 
-// BenchmarkScalingWrites measures one write and every session's update
-// after it, across write kinds, policy shapes and tailnet sizes. updates/op
-// counts the sessions with something to send: the work a write needs,
-// against the sessions it woke. peer-renders/op counts the peers sessions
-// rendered.
+// BenchmarkScalingWrites measures one write and the updates of the
+// sessions the hub routes it to, across write kinds, policy shapes and
+// tailnet sizes. woken/op counts the sessions routed, updates/op those
+// with something to send: the work a write needs. peer-renders/op counts
+// the peers they rendered.
 func BenchmarkScalingWrites(b *testing.B) {
 	sizes := []int{100, 400, 1000}
 	if testing.Short() {
@@ -989,15 +995,24 @@ func BenchmarkScalingWrites(b *testing.B) {
 					s, streams := scalingTailnet(b, n, shape)
 					write := scalingWrites[kind]
 
-					var i, updates, rendered int
+					var i, updates, rendered, woken int
+
+					last := s.Snapshot()
 
 					for b.Loop() {
 						write(b, s, i)
 						i++
 
 						snap := s.Snapshot()
+						all, wake := Route(last, snap, snap.Since(last))
+						last = snap
 
 						for _, st := range streams {
+							if _, ok := wake[st.nodeID]; !all && !ok {
+								continue
+							}
+
+							woken++
 							before := st.r.rendered
 
 							out, err := st.Update(snap)
@@ -1013,11 +1028,49 @@ func BenchmarkScalingWrites(b *testing.B) {
 						}
 					}
 
-					b.ReportMetric(float64(len(streams)), "sessions")
+					b.ReportMetric(float64(woken)/float64(i), "woken/op")
 					b.ReportMetric(float64(updates)/float64(i), "updates/op")
 					b.ReportMetric(float64(rendered)/float64(i), "peer-renders/op")
 				})
 			}
 		}
 	}
+}
+
+// TestRouteWakesNewPrimary fails over a route between two routers that
+// cannot see each other: the one taking the route did not change, and no
+// node it sees changed, yet its own map now carries the route.
+func TestRouteWakesNewPrimary(t *testing.T) {
+	_, s, ids := streamTestState(t, `{"acls":[{"action":"accept","src":["u2@"],"dst":["u1@:*","10.0.0.0/24:*"]}]}`)
+	r1, r2 := ids[0], ids[1]
+
+	route := netip.MustParsePrefix("10.0.0.0/24")
+	gens := map[types.NodeID]uint64{}
+
+	for _, id := range []types.NodeID{r1, r2} {
+		n := mustNode(t, s, id).AsStruct()
+		n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+		s.PutNodeInStoreForTest(*n)
+
+		_, err := s.SetApprovedRoutes(id, []netip.Prefix{route})
+		require.NoError(t, err)
+
+		gens[id] = s.Connect(id)
+	}
+
+	require.NotContains(t, s.Snapshot().PeerIDs(r1), r2, "the routers must not see each other")
+
+	before := s.Snapshot()
+	primary, _ := before.PrimaryRouteFor(route)
+	require.Equal(t, r1, primary)
+
+	require.NoError(t, s.Disconnect(r1, gens[r1]))
+
+	after := s.Snapshot()
+	primary, _ = after.PrimaryRouteFor(route)
+	require.Equal(t, r2, primary)
+
+	all, wake := Route(before, after, after.Since(before))
+	require.False(t, all)
+	assert.Contains(t, wake, r2, "the new primary's own map changed")
 }

@@ -246,11 +246,8 @@ func (m *mapSession) serveLongPoll() {
 		return
 	}
 
-	// Subscribe before rendering the initial map, so a change committed
-	// between the two wakes the loop instead of being lost.
-	sub := m.h.state.Subscribe()
-	defer sub.Close()
-
+	// Join before rendering the initial map, so a change committed between
+	// the two wakes the loop instead of being lost.
 	sess = m.h.mapHub.Join(m.node.ID, m.stop)
 	if sess == nil {
 		httpError(m.w, errServerShuttingDown)
@@ -302,7 +299,7 @@ func (m *mapSession) serveLongPoll() {
 
 			return
 
-		case <-sub.C:
+		case <-sess.Wakes():
 			if wait := coalesce - time.Since(lastUpdate); wait > 0 {
 				select {
 				case <-time.After(wait):

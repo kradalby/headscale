@@ -169,11 +169,23 @@ type Session struct {
 	Created time.Time
 
 	pings chan *tailcfg.PingRequest
+	wakes chan struct{}
 	stop  func()
 }
 
 // Pings delivers ping requests for the session's node.
 func (s *Session) Pings() <-chan *tailcfg.PingRequest { return s.pings }
+
+// Wakes receives when a commit may have changed what the session's node
+// is sent; at most one wake-up is pending.
+func (s *Session) Wakes() <-chan struct{} { return s.wakes }
+
+func (s *Session) wake() {
+	select {
+	case s.wakes <- struct{}{}:
+	default:
+	}
+}
 
 // NewHub returns an empty hub.
 func NewHub() *Hub {
@@ -185,14 +197,15 @@ func NewHub() *Hub {
 	}
 }
 
-// Watch follows s until the hub closes and ends the sessions of nodes that
-// are deleted, even a session whose write is blocked, which its own loop
-// cannot notice. It also forgets what the hub kept for a deleted node.
+// Watch follows s until the hub closes. After each commit it wakes the
+// sessions [Route] names, and ends the sessions of nodes that were
+// deleted, even a session whose write is blocked, which its own loop
+// cannot notice.
 func (h *Hub) Watch(s *state.State) {
 	sub := s.Subscribe()
 	defer sub.Close()
 
-	seen := s.Snapshot().NodesVersion()
+	last := s.Snapshot()
 
 	for {
 		select {
@@ -202,13 +215,76 @@ func (h *Hub) Watch(s *state.State) {
 		}
 
 		snap := s.Snapshot()
-		changed := snap.NodesChangedSince(seen)
-		seen = snap.NodesVersion()
+		change := snap.Since(last)
+		all, wake := Route(last, snap, change)
+		last = snap
 
-		for _, id := range changed {
+		for _, id := range change.Nodes {
 			if _, live := snap.GetNode(id); !live {
 				h.forget(id)
 			}
+		}
+
+		h.wake(all, wake)
+	}
+}
+
+// Route returns the nodes whose sessions a change from old to cur can
+// reach: all of them, or those in wake. A node's map holds itself, its
+// peers and what every map reads, so a change reaches
+//   - every node, when something every map reads changed;
+//   - a node, when it changed, gained or lost a primary route, or its
+//     peers changed;
+//   - a node's peers before and after, when it changed or its primary
+//     routes moved.
+//
+// Peer visibility is symmetric, so a node's peers are the nodes that see
+// it.
+func Route(old, cur *state.Snapshot, c state.Change) (bool, map[types.NodeID]struct{}) {
+	if old == nil || c.Global {
+		return true, nil
+	}
+
+	wake := make(map[types.NodeID]struct{})
+
+	add := func(ids []types.NodeID) {
+		for _, id := range ids {
+			wake[id] = struct{}{}
+		}
+	}
+
+	add(c.Nodes)
+	add(c.Primaries)
+	add(c.PeerSets)
+
+	for _, ids := range [][]types.NodeID{c.Nodes, c.Primaries} {
+		for _, id := range ids {
+			add(old.PeerIDs(id))
+			add(cur.PeerIDs(id))
+		}
+	}
+
+	return false, wake
+}
+
+// wake wakes every session, or the sessions of the nodes in ids.
+func (h *Hub) wake(all bool, ids map[types.NodeID]struct{}) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if all {
+		for _, set := range h.sessions {
+			for s := range set {
+				s.wake()
+			}
+		}
+
+		return
+	}
+
+	for id := range ids {
+		for s := range h.sessions[id] {
+			s.wake()
 		}
 	}
 }
@@ -246,6 +322,7 @@ func (h *Hub) Join(nodeID types.NodeID, stop func()) *Session {
 		NodeID:  nodeID,
 		Created: time.Now(),
 		pings:   make(chan *tailcfg.PingRequest, 8), //nolint:mnd
+		wakes:   make(chan struct{}, 1),
 		stop:    stop,
 	}
 
