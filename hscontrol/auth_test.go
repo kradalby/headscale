@@ -1,11 +1,13 @@
 package hscontrol
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -2653,13 +2655,13 @@ func TestAuthenticationFlows(t *testing.T) {
 				responseChan := make(chan *tailcfg.RegisterResponse, 1)
 				errorChan := make(chan error, 1)
 
+				// No Expiry: clients send one only to log out.
 				followupReq := tailcfg.RegisterRequest{
 					NodeKey:  nodeKey1.Public(),
 					Followup: authURL2,
 					Hostinfo: &tailcfg.Hostinfo{
 						Hostname: "pending-node-2",
 					},
-					Expiry: time.Now().Add(24 * time.Hour),
 				}
 
 				go func() {
@@ -2671,6 +2673,7 @@ func TestAuthenticationFlows(t *testing.T) {
 
 					responseChan <- resp
 				}()
+				waitFollowupParked(t)
 
 				// Complete authentication for second registration
 				// The goroutine will receive the node from the buffered channel
@@ -2859,9 +2862,13 @@ func runInteractiveWorkflowTest(t *testing.T, tt struct {
 			if step.callAuthPath {
 				require.NotEmpty(t, registrationID, "registration ID should be available from previous step")
 
-				// Prepare followup request
+				// Prepare followup request. Clients send Expiry only to log
+				// out, so a followup carries none; one copied from the initial
+				// request would read as a key extension if the goroutine below
+				// runs after authentication completes.
 				followupReq := tt.request(dynamicValue)
 				followupReq.Followup = authURL
+				followupReq.Expiry = time.Time{}
 
 				// Start the followup request in a goroutine - it will wait for channel signal
 				responseChan := make(chan *tailcfg.RegisterResponse, 1)
@@ -2876,6 +2883,7 @@ func runInteractiveWorkflowTest(t *testing.T, tt struct {
 
 					responseChan <- resp
 				}()
+				waitFollowupParked(t)
 
 				// Complete the authentication - the goroutine will receive from the buffered channel
 				user := app.state.CreateUserForTest("interactive-test-user")
@@ -4556,4 +4564,17 @@ func TestFollowupWaitPrefersCompletedAuthOverExpiredContext(t *testing.T) {
 		"waitForFollowup must never report a timeout when auth has already completed; got %d/%d timeouts",
 		timeouts, iterations)
 	assert.Equal(t, iterations, authorized, "every completed registration must be returned as authorized")
+}
+
+// waitFollowupParked waits until a followup request is blocked waiting for
+// its registration, so the test completes authentication after the client
+// asked for the result rather than racing it.
+func waitFollowupParked(t *testing.T) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		buf := make([]byte, 1<<20)
+
+		return bytes.Contains(buf[:runtime.Stack(buf, true)], []byte("waitForFollowup"))
+	}, 2*time.Second, time.Millisecond, "followup request never parked")
 }
