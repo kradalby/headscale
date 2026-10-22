@@ -522,19 +522,19 @@ func (s *State) persistNode(node types.NodeView) (types.NodeView, error) {
 // DeleteNode permanently removes a node and cleans up associated resources.
 func (s *State) DeleteNode(node types.NodeView) error {
 	s.persistMu.Lock()
-
 	err := s.db.DeleteNode(node.AsStruct())
-	if err != nil {
-		s.persistMu.Unlock()
+	s.persistMu.Unlock()
 
+	if err != nil {
 		return err
 	}
 
 	// The database is the durable source of truth. Only remove the in-memory
 	// node after its row is gone so a failed database write cannot make a live
-	// node look deleted until the next restart.
+	// node look deleted until the next restart. persistMu stays out of this
+	// write: a persist that still finds the node updates no row, and holding
+	// it would keep concurrent deletes out of one group commit.
 	s.world.DeleteNode(node.ID())
-	s.persistMu.Unlock()
 
 	s.ipAlloc.FreeIPs(node.IPs())
 
