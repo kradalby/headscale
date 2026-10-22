@@ -99,16 +99,24 @@ func (m *Map[K, V]) ChangedSince(old *Map[K, V]) ([]K, bool) {
 		return nil, false
 	}
 
-	var keys []K
-
-	for _, v := range slices.Backward(m.log) {
-		keys = append(keys, v.keys...)
-		if v.from == old.id {
-			return keys, true
-		}
+	// Find old in the log before collecting: a reader too far behind
+	// must not pay for the whole log.
+	from := slices.IndexFunc(m.log, func(e mapEdit[K]) bool { return e.from == old.id })
+	if from < 0 {
+		return nil, false
 	}
 
-	return nil, false
+	n := 0
+	for _, e := range m.log[from:] {
+		n += len(e.keys)
+	}
+
+	keys := make([]K, 0, n)
+	for _, e := range m.log[from:] {
+		keys = append(keys, e.keys...)
+	}
+
+	return keys, true
 }
 
 // Changes returns the keys whose entry differs between old and m, each
@@ -138,20 +146,16 @@ func Changes[K comparable, V any](old, m *Map[K, V]) []K {
 		return keys
 	}
 
-	seen := make(map[K]struct{})
-
 	var keys []K
 
 	for k, v := range m.All() {
-		seen[k] = struct{}{}
-
 		if ov, ok := old.Get(k); !ok || !eq(ov, v) {
 			keys = append(keys, k)
 		}
 	}
 
 	for k := range old.All() {
-		if _, ok := seen[k]; !ok {
+		if _, ok := m.Get(k); !ok {
 			keys = append(keys, k)
 		}
 	}
