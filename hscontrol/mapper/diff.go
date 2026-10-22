@@ -14,6 +14,8 @@ import (
 // fullResponse is the map that opens a stream: everything the node needs,
 // with the whole peer list.
 func fullResponse(cfg *types.Config, nm *netMap) *tailcfg.MapResponse {
+	// A full map can follow a quiet spell; it is per session anyway, so
+	// it carries the current time, not the snapshot's.
 	now := time.Now()
 
 	resp := &tailcfg.MapResponse{
@@ -39,7 +41,7 @@ func fullResponse(cfg *types.Config, nm *netMap) *tailcfg.MapResponse {
 // removals to delta-only IPN watchers (the Android app) only from
 // responses they apply as deltas, and the second response can carry fields
 // that force a full rebuild.
-func diff(sent, next *netMap) []*tailcfg.MapResponse {
+func diff(sent, next *netMap, frames *frameCache) []*tailcfg.MapResponse {
 	resp := &tailcfg.MapResponse{}
 	changed := false
 
@@ -62,7 +64,7 @@ func diff(sent, next *netMap) []*tailcfg.MapResponse {
 		case before == after:
 			continue
 		default:
-			patch, patchable := peerPatch(before, after)
+			patch, patchable := frames.patch(before, after)
 
 			switch {
 			case patchable && patch == nil:
@@ -124,8 +126,8 @@ func diff(sent, next *netMap) []*tailcfg.MapResponse {
 	}
 
 	if changed {
-		now := time.Now()
-		resp.ControlTime = &now
+		at := next.at
+		resp.ControlTime = &at
 		out = append(out, resp)
 	}
 

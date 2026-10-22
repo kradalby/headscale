@@ -59,7 +59,7 @@ func TestDiffUnchangedSendsNothing(t *testing.T) {
 	next := withPeers(sent, cloneNode(p))
 	next.ssh = &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}}
 
-	if got := diff(sent, next); got != nil {
+	if got := diff(sent, next, nil); got != nil {
 		t.Fatalf("diff of equal maps = %+v, want nil", got)
 	}
 }
@@ -71,7 +71,7 @@ func TestDiffEndpointChangeIsPatch(t *testing.T) {
 
 	sent := testNetMap(p)
 
-	got := diff(sent, withPeers(sent, moved))
+	got := diff(sent, withPeers(sent, moved), nil)
 	if len(got) != 1 {
 		t.Fatalf("got %d responses, want 1", len(got))
 	}
@@ -96,7 +96,7 @@ func TestDiffOnlineTransitions(t *testing.T) {
 
 	sent := testNetMap(online)
 
-	got := diff(sent, withPeers(sent, offline))
+	got := diff(sent, withPeers(sent, offline), nil)
 	if len(got) != 1 || len(got[0].PeersChangedPatch) != 1 {
 		t.Fatalf("offline: want one patch, got %+v", got)
 	}
@@ -107,7 +107,7 @@ func TestDiffOnlineTransitions(t *testing.T) {
 
 	// Coming back online drops LastSeen, which a patch cannot clear; the
 	// Online patch is still sent rather than a full peer.
-	got = diff(withPeers(sent, offline), withPeers(sent, cloneNode(online)))
+	got = diff(withPeers(sent, offline), withPeers(sent, cloneNode(online)), nil)
 	if len(got) != 1 || len(got[0].PeersChangedPatch) != 1 || len(got[0].PeersChanged) != 0 {
 		t.Fatalf("online: want one patch, got %+v", got)
 	}
@@ -124,7 +124,7 @@ func TestDiffUnpatchableFieldSendsWholePeer(t *testing.T) {
 
 	sent := testNetMap(p)
 
-	got := diff(sent, withPeers(sent, expired))
+	got := diff(sent, withPeers(sent, expired), nil)
 	if len(got) != 1 || len(got[0].PeersChanged) != 1 || len(got[0].PeersChangedPatch) != 0 {
 		t.Fatalf("want one whole peer, got %+v", got)
 	}
@@ -137,7 +137,7 @@ func TestDiffDERPClearSendsPeerList(t *testing.T) {
 
 	sent := testNetMap(p, q)
 
-	got := diff(sent, withPeers(sent, cleared, q))
+	got := diff(sent, withPeers(sent, cleared, q), nil)
 	if len(got) != 1 || len(got[0].Peers) != 2 {
 		t.Fatalf("want the whole peer list, got %+v", got)
 	}
@@ -152,7 +152,7 @@ func TestDiffRemovalLeadsOnItsOwn(t *testing.T) {
 
 	sent := testNetMap(p, q)
 
-	got := diff(sent, withPeers(sent, q))
+	got := diff(sent, withPeers(sent, q), nil)
 	if len(got) != 1 || len(got[0].PeersRemoved) != 1 || got[0].PeersRemoved[0] != 2 {
 		t.Fatalf("removal only: got %+v", got)
 	}
@@ -160,7 +160,7 @@ func TestDiffRemovalLeadsOnItsOwn(t *testing.T) {
 	next := withPeers(sent, q)
 	next.ssh = &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{{Principals: []*tailcfg.SSHPrincipal{{Any: true}}}}}
 
-	got = diff(sent, next)
+	got = diff(sent, next, nil)
 	if len(got) != 2 {
 		t.Fatalf("want removal then update, got %d responses", len(got))
 	}
@@ -183,7 +183,7 @@ func TestDiffSendsOnlyChangedSections(t *testing.T) {
 	next.self = self
 	next.filter = []tailcfg.FilterRule{{SrcIPs: []string{"100.64.0.2/32"}}}
 
-	got := diff(sent, &next)
+	got := diff(sent, &next, nil)
 	if len(got) != 1 {
 		t.Fatalf("got %d responses, want 1", len(got))
 	}
@@ -208,7 +208,7 @@ func TestDiffNewPeerCarriesItsProfile(t *testing.T) {
 		2: {ID: 2, LoginName: "b"},
 	}
 
-	got := diff(sent, next)
+	got := diff(sent, next, nil)
 	if len(got) != 1 || len(got[0].PeersChanged) != 1 {
 		t.Fatalf("want the new peer, got %+v", got)
 	}

@@ -399,7 +399,12 @@ func (m *mapSession) writeMap(msg *tailcfg.MapResponse) error {
 
 	startWrite := time.Now()
 
-	err := writeMapResponse(m.w, m.req.Compress, m.isStreaming(), msg)
+	// Sessions sending the same update share its encoding.
+	encode := func(msg *tailcfg.MapResponse, compress bool) ([]byte, error) {
+		return m.h.mapHub.Encode(msg, compress, encodeMapResponse)
+	}
+
+	err := writeMapFrame(m.w, m.isStreaming(), msg, m.req.Compress == util.ZstdCompression, encode)
 	if err != nil {
 		return err
 	}
@@ -422,13 +427,34 @@ func (m *mapSession) writeMap(msg *tailcfg.MapResponse) error {
 // It is shared with the deleted-node path in [noiseServer.PollNetMapHandler],
 // which has no [mapSession] to write through.
 func writeMapResponse(w http.ResponseWriter, compress string, flush bool, msg *tailcfg.MapResponse) error {
+	return writeMapFrame(w, flush, msg, compress == util.ZstdCompression, encodeMapResponse)
+}
+
+// encodeMapResponse marshals msg and, when compress, zstd compresses it.
+func encodeMapResponse(msg *tailcfg.MapResponse, compress bool) ([]byte, error) {
 	jsonBody, err := json.Marshal(msg)
 	if err != nil {
-		return fmt.Errorf("marshalling map response: %w", err)
+		return nil, fmt.Errorf("marshalling map response: %w", err)
 	}
 
-	if compress == util.ZstdCompression {
+	if compress {
 		jsonBody = zstdframe.AppendEncode(nil, jsonBody, zstdframe.FastestCompression)
+	}
+
+	return jsonBody, nil
+}
+
+// writeMapFrame writes msg encoded by encode, length prefixed.
+func writeMapFrame(
+	w http.ResponseWriter,
+	flush bool,
+	msg *tailcfg.MapResponse,
+	compress bool,
+	encode func(*tailcfg.MapResponse, bool) ([]byte, error),
+) error {
+	jsonBody, err := encode(msg, compress)
+	if err != nil {
+		return err
 	}
 
 	data := make([]byte, reservedResponseHeaderSize, reservedResponseHeaderSize+len(jsonBody))

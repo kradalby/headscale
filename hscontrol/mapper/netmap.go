@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/juanfont/headscale/hscontrol/graph"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
@@ -60,6 +61,11 @@ var ErrNodeGone = errors.New("node no longer exists")
 // [state.Snapshot]. A client holds exactly the last netMap it was sent;
 // what to send next is the difference to a fresh one, see [diff].
 type netMap struct {
+	// at is when the snapshot rendered was committed: the ControlTime of
+	// the updates it is diffed into, the same for every session rendering
+	// it, so their identical updates encode to identical bytes. Sessions
+	// render on commits, so it is recent.
+	at   time.Time
 	self *tailcfg.Node
 	// peers is usually the map its class shares (see [classMaps]), which
 	// holds the node itself when it sees its own class; read it through
@@ -298,6 +304,7 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 	}
 
 	nm := &netMap{
+		at:      snap.Time(),
 		self:    tn,
 		filter:  filter,
 		ssh:     ssh,

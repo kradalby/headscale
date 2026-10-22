@@ -1,6 +1,7 @@
 package mapper
 
 import (
+	"reflect"
 	"slices"
 	"sync"
 	"time"
@@ -73,7 +74,11 @@ func (st *Stream) Update(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) {
 		return nil, err
 	}
 
-	out := diff(st.sent, nm)
+	out := diff(st.sent, nm, &st.hub.frames)
+	for i, resp := range out {
+		out[i] = st.hub.frames.share(resp)
+	}
+
 	peersMoved := peerSetChanged(nm)
 	st.sent = nm
 
@@ -155,9 +160,11 @@ type Hub struct {
 	// sessions so a reconnect can announce peers removed in between.
 	sentPeers map[types.NodeID][]tailcfg.NodeID
 
-	// renders and classes are shared by every session's renderer.
+	// renders and classes are shared by every session's renderer, and
+	// frames by every session's encoder.
 	renders *peerRenders
 	classes classMaps
+	frames  frameCache
 
 	closed bool
 	// done ends [Hub.Watch].
@@ -429,4 +436,131 @@ func (h *Hub) setLastPeers(nodeID types.NodeID, ids []tailcfg.NodeID) {
 	defer h.mu.Unlock()
 
 	h.sentPeers[nodeID] = ids
+}
+
+// frameCache lets sessions that send the same update share one response
+// and one encoding of it. Under endpoint churn every viewer of a node is
+// sent the same single patch at the same commit time; encoding it once
+// instead of once per viewer is most of what sending it costs.
+type frameCache struct {
+	mu sync.Mutex
+
+	// patches holds the patch between two shared renders, so sessions
+	// sending it hold the same one.
+	patches map[[2]*tailcfg.Node]patchResult
+
+	at     time.Time // the commit time frames are for
+	frames map[*tailcfg.PeerChange]*sharedFrame
+	byResp map[*tailcfg.MapResponse]*sharedFrame
+}
+
+type patchResult struct {
+	patch     *tailcfg.PeerChange
+	patchable bool
+}
+
+// maxSharedPatches bounds the patch cache; it starts over when full.
+const maxSharedPatches = 1 << 14
+
+type sharedFrame struct {
+	resp    *tailcfg.MapResponse
+	once    [2]sync.Once // per compression
+	encoded [2][]byte
+	err     [2]error
+}
+
+// patch is [peerPatch], shared between sessions for the same renders.
+func (fc *frameCache) patch(before, after *tailcfg.Node) (*tailcfg.PeerChange, bool) {
+	if fc == nil {
+		return peerPatch(before, after)
+	}
+
+	key := [2]*tailcfg.Node{before, after}
+
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
+	if r, ok := fc.patches[key]; ok {
+		return r.patch, r.patchable
+	}
+
+	if fc.patches == nil || len(fc.patches) >= maxSharedPatches {
+		fc.patches = map[[2]*tailcfg.Node]patchResult{}
+	}
+
+	p, ok := peerPatch(before, after)
+	fc.patches[key] = patchResult{patch: p, patchable: ok}
+
+	return p, ok
+}
+
+// share returns the response all sessions with resp's content send: one
+// holding just a single shared patch and a ControlTime is shared, any
+// other is returned as is.
+func (fc *frameCache) share(resp *tailcfg.MapResponse) *tailcfg.MapResponse {
+	if !patchOnly(resp) {
+		return resp
+	}
+
+	p, at := resp.PeersChangedPatch[0], *resp.ControlTime
+
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
+	if !at.Equal(fc.at) {
+		if at.Before(fc.at) {
+			return resp
+		}
+
+		fc.at = at
+		fc.frames = map[*tailcfg.PeerChange]*sharedFrame{}
+		fc.byResp = map[*tailcfg.MapResponse]*sharedFrame{}
+	}
+
+	if f, ok := fc.frames[p]; ok {
+		return f.resp
+	}
+
+	f := &sharedFrame{resp: resp}
+	fc.frames[p] = f
+	fc.byResp[resp] = f
+
+	return resp
+}
+
+// patchOnly reports whether resp holds a single patch and its time and
+// nothing else.
+func patchOnly(resp *tailcfg.MapResponse) bool {
+	if resp.ControlTime == nil || len(resp.PeersChangedPatch) != 1 {
+		return false
+	}
+
+	only := tailcfg.MapResponse{PeersChangedPatch: resp.PeersChangedPatch, ControlTime: resp.ControlTime}
+
+	return reflect.DeepEqual(*resp, only)
+}
+
+// Encode returns resp encoded by encode: once for a response sessions
+// share, per compression.
+func (h *Hub) Encode(
+	resp *tailcfg.MapResponse,
+	compress bool,
+	encode func(*tailcfg.MapResponse, bool) ([]byte, error),
+) ([]byte, error) {
+	h.frames.mu.Lock()
+	f := h.frames.byResp[resp]
+	h.frames.mu.Unlock()
+
+	if f == nil {
+		return encode(resp, compress)
+	}
+
+	i := 0
+	if compress {
+		i = 1
+	}
+
+	f.once[i].Do(func() { f.encoded[i], f.err[i] = encode(resp, compress) })
+
+	return f.encoded[i], f.err[i]
 }

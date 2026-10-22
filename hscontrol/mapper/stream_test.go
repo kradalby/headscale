@@ -1,6 +1,7 @@
 package mapper
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -19,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
+	"tailscale.com/util/zstdframe"
 )
 
 const capVer = tailcfg.CurrentCapabilityVersion
@@ -994,8 +996,8 @@ var scalingWrites = map[string]func(b *testing.B, s *state.State, i int){
 	},
 }
 
-// BenchmarkScalingWrites measures one write and the updates of the
-// sessions the hub routes it to, across write kinds, policy shapes and
+// BenchmarkScalingWrites measures one write and the updates, encoded, of
+// the sessions the hub routes it to, across write kinds, policy shapes and
 // tailnet sizes. woken/op counts the sessions routed, updates/op those
 // with something to send: the work a write needs. peer-renders/op counts
 // the peers they rendered.
@@ -1039,6 +1041,13 @@ func BenchmarkScalingWrites(b *testing.B) {
 
 							if len(out) > 0 {
 								updates++
+							}
+
+							for _, resp := range out {
+								_, err := st.hub.Encode(resp, true, benchEncode)
+								if err != nil {
+									b.Fatal(err)
+								}
 							}
 
 							rendered += st.r.rendered - before
@@ -1090,4 +1099,68 @@ func TestRouteWakesNewPrimary(t *testing.T) {
 	all, wake := Route(before, after, after.Since(before))
 	require.False(t, all)
 	assert.Contains(t, wake, r2, "the new primary's own map changed")
+}
+
+// TestSharedFramesEncodeOnceAndIdentically has every session of an
+// allow-all tailnet take one endpoint write, and checks the sessions send
+// the same response, encoded once, to the bytes a direct encode gives.
+func TestSharedFramesEncodeOnceAndIdentically(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	hub := NewHub()
+
+	streams := map[types.NodeID]*Stream{}
+
+	for _, id := range ids {
+		st := NewStream(cfg, hub, id, capVer)
+		_, err := st.Initial(s.Snapshot())
+		require.NoError(t, err)
+
+		streams[id] = st
+	}
+
+	_ = s.Connect(ids[2])
+	snap := s.Snapshot()
+
+	var shared *tailcfg.MapResponse
+
+	for _, id := range ids[:2] {
+		resps, err := streams[id].Update(snap)
+		require.NoError(t, err)
+		require.Len(t, resps, 1)
+
+		if shared == nil {
+			shared = resps[0]
+		}
+
+		assert.Same(t, shared, resps[0], "viewers of one patch share the response")
+	}
+
+	encodes := 0
+	encode := func(resp *tailcfg.MapResponse, compress bool) ([]byte, error) {
+		encodes++
+
+		return json.Marshal(resp)
+	}
+
+	first, err := hub.Encode(shared, false, encode)
+	require.NoError(t, err)
+	second, err := hub.Encode(shared, false, encode)
+	require.NoError(t, err)
+
+	want, err := json.Marshal(shared)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, encodes, "a shared response encodes once")
+	assert.Equal(t, want, first)
+	assert.Equal(t, want, second)
+}
+
+// benchEncode encodes a response as the poll loop sends it.
+func benchEncode(resp *tailcfg.MapResponse, compress bool) ([]byte, error) {
+	b, err := json.Marshal(resp)
+	if err != nil || !compress {
+		return b, err
+	}
+
+	return zstdframe.AppendEncode(nil, b, zstdframe.FastestCompression), nil
 }
