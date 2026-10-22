@@ -69,6 +69,9 @@ type renderer struct {
 	// map and the extra records, are unchanged.
 	dns    *tailcfg.DNSConfig
 	dnsKey dnsKey
+
+	// rendered counts peer renders, for tests that bound per-write work.
+	rendered int
 }
 
 type renderedPeer struct {
@@ -444,6 +447,7 @@ func (pr *peerRendering) render(peer types.NodeView) (*tailcfg.Node, error) {
 	}
 
 	ptn := withRoutes(base, pr.snap.RoutesForPeer(pr.self, peer, pr.matchers))
+	r.rendered++
 
 	r.peers[peer.ID()] = renderedPeer{node: peer, key: pr.key, tn: ptn}
 

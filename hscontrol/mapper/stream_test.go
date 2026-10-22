@@ -1,11 +1,15 @@
 package mapper
 
 import (
+	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"net/netip"
 	"reflect"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -260,18 +264,48 @@ func mustNode(t *testing.T, s *state.State, id types.NodeID) types.NodeView {
 // modelClient applies map responses the way a client does, for the
 // fields these tests compare.
 type modelClient struct {
-	peers  map[tailcfg.NodeID]*tailcfg.Node
-	filter []tailcfg.FilterRule
+	self     *tailcfg.Node
+	peers    map[tailcfg.NodeID]*tailcfg.Node
+	filter   []tailcfg.FilterRule
+	ssh      *tailcfg.SSHPolicy
+	dns      *tailcfg.DNSConfig
+	derp     *tailcfg.DERPMap
+	profiles map[tailcfg.UserID]tailcfg.UserProfile
 }
 
 func newModelClient(full *tailcfg.MapResponse) *modelClient {
-	c := &modelClient{peers: make(map[tailcfg.NodeID]*tailcfg.Node)}
+	c := &modelClient{
+		peers:    make(map[tailcfg.NodeID]*tailcfg.Node),
+		profiles: make(map[tailcfg.UserID]tailcfg.UserProfile),
+	}
 	c.apply(full)
 
 	return c
 }
 
 func (c *modelClient) apply(r *tailcfg.MapResponse) {
+	if r.Node != nil {
+		c.self = r.Node.Clone()
+	}
+
+	if r.SSHPolicy != nil {
+		c.ssh = r.SSHPolicy
+	}
+
+	if r.DNSConfig != nil {
+		c.dns = r.DNSConfig
+	}
+
+	if r.DERPMap != nil {
+		c.derp = r.DERPMap
+	}
+
+	// Clients keep every profile they were sent; the protocol has no
+	// removal.
+	for _, p := range r.UserProfiles {
+		c.profiles[p.ID] = p
+	}
+
 	if len(r.Peers) > 0 {
 		c.peers = make(map[tailcfg.NodeID]*tailcfg.Node)
 		for _, p := range r.Peers {
@@ -334,6 +368,33 @@ func (c *modelClient) apply(r *tailcfg.MapResponse) {
 	if f, ok := r.PacketFilters["base"]; ok {
 		c.filter = f
 	}
+}
+
+// sameAs reports how c differs from fresh, a client that only saw a new
+// session's full map, or "" when it does not. Profiles may be a superset.
+func (c *modelClient) sameAs(fresh *modelClient) string {
+	switch {
+	case !reflect.DeepEqual(fresh.self, c.self):
+		return "self"
+	case !reflect.DeepEqual(fresh.peers, c.peers):
+		return fmt.Sprintf("peers: have %v, want %v", keys(c.peers), keys(fresh.peers))
+	case !reflect.DeepEqual(fresh.filter, c.filter):
+		return "filter"
+	case !reflect.DeepEqual(fresh.ssh, c.ssh):
+		return "ssh"
+	case !reflect.DeepEqual(fresh.dns, c.dns):
+		return "dns"
+	case !reflect.DeepEqual(fresh.derp, c.derp):
+		return "derp"
+	}
+
+	for id, p := range fresh.profiles {
+		if have, ok := c.profiles[id]; !ok || !reflect.DeepEqual(have, p) {
+			return fmt.Sprintf("profile %d", id)
+		}
+	}
+
+	return ""
 }
 
 func keys(m map[tailcfg.NodeID]*tailcfg.Node) []tailcfg.NodeID {
@@ -581,10 +642,12 @@ func BenchmarkScalingOneEndpointWrite(b *testing.B) {
 			hub := NewHub()
 
 			streams := make([]*Stream, 0, n)
+
 			for _, nv := range ids.All() {
 				st := NewStream(cfg, hub, nv.ID(), capVer)
 				_, err := st.Initial(s.Snapshot())
 				require.NoError(b, err)
+
 				streams = append(streams, st)
 			}
 
@@ -593,6 +656,7 @@ func BenchmarkScalingOneEndpointWrite(b *testing.B) {
 				node := ids.At(int(port) % n).AsStruct()
 				node.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), port)}
 				s.PutNodeInStoreForTest(*node)
+
 				port++
 
 				snap := s.Snapshot()
@@ -604,5 +668,356 @@ func BenchmarkScalingOneEndpointWrite(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// oracleSession is one long-lived session and the client it feeds.
+type oracleSession struct {
+	st     *Stream
+	client *modelClient
+}
+
+// TestStreamsConvergeUnderRandomWrites drives random writes of every kind
+// against a session per node and checks after each write that every
+// session's client equals a fresh session's. Sessions are updated only
+// through wake, so routing may skip sessions: one it skips must already
+// be up to date.
+func TestStreamsConvergeUnderRandomWrites(t *testing.T) {
+	cfg, s, _ := streamTestState(t, "")
+	hub := NewHub()
+	r := rand.New(rand.NewPCG(5, 6)) //nolint:gosec // deterministic test input
+
+	u1, err := s.GetUserByName("u1")
+	require.NoError(t, err)
+
+	// addNode registers a node in the database and in memory.
+	addNode := func(name string) types.NodeID {
+		n := s.CreateRegisteredNodeForTest(u1, name)
+		s.PutNodeInStoreForTest(*n)
+
+		return n.ID
+	}
+
+	for i := range 3 {
+		addNode(fmt.Sprintf("extra-%d", i))
+	}
+
+	route := netip.MustParsePrefix("10.0.0.0/24")
+	policies := []string{
+		"",
+		ownUserOnly,
+		`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
+		  "acls":[{"action":"accept","src":["tag:a"],"dst":["tag:b:*"]},
+		          {"action":"accept","src":["u1@"],"dst":["u1@:*","10.0.0.0/24:*"]}],
+		  "ssh":[{"action":"accept","src":["u1@"],"dst":["tag:b"],"users":["root"]}]}`,
+		`{"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`,
+	}
+
+	sessions := map[types.NodeID]*oracleSession{}
+	open := func(id types.NodeID) {
+		st := NewStream(cfg, hub, id, capVer)
+		resps, err := st.Initial(s.Snapshot())
+		require.NoError(t, err)
+
+		c := newModelClient(resps[0])
+		for _, resp := range resps[1:] {
+			c.apply(resp)
+		}
+
+		sessions[id] = &oracleSession{st: st, client: c}
+	}
+
+	for _, nv := range s.ListNodes().All() {
+		open(nv.ID())
+	}
+
+	// wake updates the sessions a write must reach; all of them, until
+	// routing narrows it.
+	wake := func() []types.NodeID {
+		ids := make([]types.NodeID, 0, len(sessions))
+		for id := range sessions {
+			ids = append(ids, id)
+		}
+
+		return ids
+	}
+
+	gens := map[types.NodeID]uint64{}
+
+	for step := range 400 {
+		nodes := s.ListNodes()
+		nv := nodes.At(r.IntN(nodes.Len()))
+		id := nv.ID()
+
+		switch op := r.IntN(16); op {
+		case 0, 1, 2:
+			n := nv.AsStruct()
+			n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(step))} //nolint:gosec // small
+			s.PutNodeInStoreForTest(*n)
+		case 3, 4:
+			if gen, ok := gens[id]; ok {
+				_ = s.Disconnect(id, gen)
+				delete(gens, id)
+			} else {
+				gens[id] = s.Connect(id)
+			}
+		case 5:
+			_, _ = s.RenameNode(id, fmt.Sprintf("r%d", step))
+		case 6:
+			_, _ = s.SetNodeTags(id, [][]string{nil, {"tag:a"}, {"tag:b"}, {"tag:a", "tag:b"}}[r.IntN(4)])
+		case 7:
+			n := nv.AsStruct()
+
+			n.Hostinfo = n.Hostinfo.Clone()
+			if n.Hostinfo == nil {
+				n.Hostinfo = &tailcfg.Hostinfo{}
+			}
+
+			n.Hostinfo.RoutableIPs = []netip.Prefix{route}
+			s.PutNodeInStoreForTest(*n)
+			_, _ = s.SetApprovedRoutes(id, []netip.Prefix{route})
+		case 8:
+			_, _ = s.SetApprovedRoutes(id, nil)
+		case 9:
+			_ = s.SetNodeHealth(id, r.IntN(2) == 0)
+		case 10:
+			_, _ = s.SetPolicy([]byte(policies[r.IntN(len(policies))]))
+		case 11:
+			s.SetDERPMap(&tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
+				tailcfg.DERPRegionID(900 + r.IntN(3)): {RegionID: tailcfg.DERPRegionID(900 + r.IntN(3))},
+			}})
+		case 12:
+			s.SetExtraRecords([]tailcfg.DNSRecord{{Name: fmt.Sprintf("x%d.headscale.test", r.IntN(3)), Value: "100.64.0.99"}})
+		case 13:
+			expiry := time.Now().Add([]time.Duration{-time.Hour, time.Hour}[r.IntN(2)])
+			_, _ = s.SetNodeExpiry(id, &expiry)
+		case 14:
+			users, err := s.ListAllUsers()
+			require.NoError(t, err)
+
+			u := users[r.IntN(len(users))]
+			_, err = s.RenameUser(types.UserID(u.ID), fmt.Sprintf("user-%d", step))
+			require.NoError(t, err)
+		case 15:
+			if nodes.Len() > 3 {
+				require.NoError(t, s.DeleteNode(nv))
+				delete(gens, id)
+			} else {
+				open(addNode(fmt.Sprintf("new-%d", step)))
+			}
+		}
+
+		snap := s.Snapshot()
+
+		for _, id := range wake() {
+			sess := sessions[id]
+
+			resps, err := sess.st.Update(snap)
+			if errors.Is(err, ErrNodeGone) {
+				delete(sessions, id)
+
+				continue
+			}
+
+			require.NoError(t, err)
+
+			for _, resp := range resps {
+				sess.client.apply(resp)
+			}
+		}
+
+		for id, sess := range sessions {
+			fresh, err := NewStream(cfg, NewHub(), id, capVer).Initial(snap)
+			require.NoError(t, err)
+
+			if diff := sess.client.sameAs(newModelClient(fresh[0])); diff != "" {
+				t.Fatalf("step %d: session %d differs from a fresh one: %s", step, id, diff)
+			}
+		}
+	}
+}
+
+// scalingPolicies are the policy shapes the scaling benchmarks run under,
+// for a tailnet of 10 users whose nodes, for "tags", carry one of 20 tags.
+var scalingPolicies = map[string]string{
+	"allow-all": "",
+	"users": func() string {
+		acls := make([]string, 0, 10)
+		for u := range 10 {
+			acls = append(acls, fmt.Sprintf(`{"action":"accept","src":["u%d@"],"dst":["u%d@:*"]}`, u, u))
+		}
+
+		return `{"acls":[` + strings.Join(acls, ",") + `]}`
+	}(),
+	"tags": func() string {
+		owners, acls := make([]string, 0, 20), make([]string, 0, 20)
+		for t := range 20 {
+			owners = append(owners, fmt.Sprintf(`"tag:t%d":["u0@"]`, t))
+			acls = append(acls, fmt.Sprintf(`{"action":"accept","src":["tag:t%d"],"dst":["tag:t%d:*"]}`, t, (t+1)%20))
+		}
+
+		return `{"tagOwners":{` + strings.Join(owners, ",") + `},"acls":[` + strings.Join(acls, ",") + `]}`
+	}(),
+	"self": `{"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`,
+}
+
+// scalingTailnet returns a tailnet of n nodes spread over 10 users under
+// the named policy shape, with a session for every node.
+func scalingTailnet(b *testing.B, n int, shape string) (*state.State, []*Stream) {
+	b.Helper()
+
+	p4 := netip.MustParsePrefix("100.64.0.0/10")
+	p6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+	cfg := &types.Config{
+		Database: types.DatabaseConfig{
+			Type:   types.DatabaseSqlite,
+			Sqlite: types.SqliteConfig{Path: b.TempDir() + "/h.db"},
+		},
+		PrefixV4:     &p4,
+		PrefixV6:     &p6,
+		IPAllocation: types.IPAllocationStrategySequential,
+		BaseDomain:   "headscale.test",
+		ServerURL:    "https://headscale.test",
+		Policy:       types.PolicyConfig{Mode: types.PolicyModeDB},
+	}
+
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(b, err)
+
+	users := database.CreateUsersForTest(10, "u")
+	for i, u := range users {
+		database.CreateRegisteredNodesForTest(u, n/10+min(1, max(0, n%10-i)), u.Name)
+	}
+
+	require.NoError(b, database.Close())
+
+	s, err := state.NewState(cfg)
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = s.Close() })
+
+	// CreateUsersForTest names users "u-0"; the policies say "u0@".
+	for i, u := range users {
+		_, err := s.RenameUser(types.UserID(u.ID), fmt.Sprintf("u%d", i))
+		require.NoError(b, err)
+	}
+
+	if shape == "tags" {
+		for i, nv := range s.ListNodes().All() {
+			node := nv.AsStruct()
+			node.Tags = []string{fmt.Sprintf("tag:t%d", i%20)}
+			s.PutNodeInStoreForTest(*node)
+		}
+	}
+
+	_, err = s.SetPolicy([]byte(scalingPolicies[shape]))
+	require.NoError(b, err)
+
+	hub := NewHub()
+	streams := make([]*Stream, 0, n)
+
+	for _, nv := range s.ListNodes().All() {
+		st := NewStream(cfg, hub, nv.ID(), capVer)
+		_, err := st.Initial(s.Snapshot())
+		require.NoError(b, err)
+
+		streams = append(streams, st)
+	}
+
+	return s, streams
+}
+
+// scalingWrites are the writes the scaling benchmarks measure; each makes
+// one change through State, given the iteration number.
+var scalingWrites = map[string]func(b *testing.B, s *state.State, i int){
+	"endpoint": func(_ *testing.B, s *state.State, i int) {
+		nodes := s.ListNodes()
+		node := nodes.At(i % nodes.Len()).AsStruct()
+		node.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(i))} //nolint:gosec // small
+		s.PutNodeInStoreForTest(*node)
+	},
+	"online": func(_ *testing.B, s *state.State, i int) {
+		nodes := s.ListNodes()
+		nv := nodes.At(i % nodes.Len())
+
+		if nv.IsOnline().Valid() && nv.IsOnline().Get() {
+			_ = s.Disconnect(nv.ID(), nv.SessionEpoch())
+		} else {
+			_ = s.Connect(nv.ID())
+		}
+	},
+	"rejoin": func(_ *testing.B, s *state.State, i int) {
+		nodes := s.ListNodes()
+		node := nodes.At(i % nodes.Len()).AsStruct()
+		s.DeleteNodeFromStoreForTest(node.ID)
+		s.PutNodeInStoreForTest(*node)
+	},
+	"rename": func(b *testing.B, s *state.State, i int) {
+		b.Helper()
+
+		nodes := s.ListNodes()
+		_, err := s.RenameNode(nodes.At(i%nodes.Len()).ID(), fmt.Sprintf("renamed-%d", i))
+		require.NoError(b, err)
+	},
+	"policy": func(b *testing.B, s *state.State, i int) {
+		b.Helper()
+
+		_, err := s.SetPolicy([]byte(fmt.Sprintf(`{"acls":[{"action":"accept","src":["*"],"dst":["*:%d"]}]}`, 1+i%2)))
+		require.NoError(b, err)
+	},
+	"derp": func(_ *testing.B, s *state.State, i int) {
+		s.SetDERPMap(&tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
+			tailcfg.DERPRegionID(900 + i%2): {RegionID: tailcfg.DERPRegionID(900 + i%2)},
+		}})
+	},
+}
+
+// BenchmarkScalingWrites measures one write and every session's update
+// after it, across write kinds, policy shapes and tailnet sizes. updates/op
+// counts the sessions with something to send: the work a write needs,
+// against the sessions it woke. peer-renders/op counts the peers sessions
+// rendered.
+func BenchmarkScalingWrites(b *testing.B) {
+	sizes := []int{100, 400, 1000}
+	if testing.Short() {
+		sizes = []int{100}
+	}
+
+	for _, kind := range slices.Sorted(maps.Keys(scalingWrites)) {
+		for _, shape := range slices.Sorted(maps.Keys(scalingPolicies)) {
+			for _, n := range sizes {
+				b.Run(fmt.Sprintf("%s/%s/nodes=%d", kind, shape, n), func(b *testing.B) {
+					s, streams := scalingTailnet(b, n, shape)
+					write := scalingWrites[kind]
+
+					var i, updates, rendered int
+
+					for b.Loop() {
+						write(b, s, i)
+						i++
+
+						snap := s.Snapshot()
+
+						for _, st := range streams {
+							before := st.r.rendered
+
+							out, err := st.Update(snap)
+							if err != nil {
+								b.Fatal(err)
+							}
+
+							if len(out) > 0 {
+								updates++
+							}
+
+							rendered += st.r.rendered - before
+						}
+					}
+
+					b.ReportMetric(float64(len(streams)), "sessions")
+					b.ReportMetric(float64(updates)/float64(i), "updates/op")
+					b.ReportMetric(float64(rendered)/float64(i), "peer-renders/op")
+				})
+			}
+		}
 	}
 }
