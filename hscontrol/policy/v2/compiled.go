@@ -233,32 +233,169 @@ func (pol *Policy) compileGrants(
 	users types.Users,
 	nodes views.Slice[types.NodeView],
 ) []compiledGrant {
+	compiled, _ := pol.compileGrantsFrom(nil, nil, users, nodes)
+
+	return compiled
+}
+
+// compiledGrantResult is one grant's compile, kept for the next compile:
+// cg is nil for a grant that compiled to nothing or failed.
+type compiledGrantResult struct {
+	cg *compiledGrant
+}
+
+// compileGrantsFrom compiles every grant, reusing prev, the results of a
+// compile of the same policy and users, for each grant the change since
+// cannot reach. prev and change are nil for a compile from scratch.
+func (pol *Policy) compileGrantsFrom(
+	prev []compiledGrantResult,
+	change *nodeChange,
+	users types.Users,
+	nodes views.Slice[types.NodeView],
+) ([]compiledGrant, []compiledGrantResult) {
 	if pol == nil || (pol.ACLs == nil && pol.Grants == nil) {
-		return nil
+		return nil, nil
 	}
 
-	grants := pol.Grants
+	grants := slices.Clip(pol.Grants)
 	for _, acl := range pol.ACLs {
 		grants = append(grants, aclToGrants(acl)...)
 	}
 
+	if len(prev) != len(grants) {
+		prev, change = nil, nil
+	}
+
+	results := make([]compiledGrantResult, len(grants))
 	compiled := make([]compiledGrant, 0, len(grants))
 	srcs := sourceCache{}
 
-	for _, grant := range grants {
-		cg, err := pol.compileOneGrant(grant, users, nodes, srcs)
-		if err != nil {
-			log.Trace().Err(err).Msg("compiling grant")
+	for i, grant := range grants {
+		if change != nil && !change.reaches(grant) {
+			results[i] = prev[i]
+		} else {
+			cg, err := pol.compileOneGrant(grant, users, nodes, srcs)
+			if err != nil {
+				log.Trace().Err(err).Msg("compiling grant")
+			}
+
+			results[i] = compiledGrantResult{cg: cg}
+		}
+
+		if results[i].cg != nil {
+			compiled = append(compiled, *results[i].cg)
+		}
+	}
+
+	return compiled, results
+}
+
+// nodeChange summarises what changed in the nodes between two compiles,
+// as grant compilation reads them: which tags and users gained or lost a
+// node or one of its addresses or routes, whether any node joined, left
+// or moved between owners, and whether approved routes changed.
+type nodeChange struct {
+	tags       map[Tag]struct{}
+	users      map[uint]struct{}
+	membership bool // a node joined, left or changed its tags or owner
+	routes     bool // a node's approved routes changed
+}
+
+func diffNodes(prev map[types.NodeID]types.NodeView, nodes views.Slice[types.NodeView]) *nodeChange {
+	c := &nodeChange{tags: map[Tag]struct{}{}, users: map[uint]struct{}{}}
+
+	note := func(n types.NodeView) {
+		for _, t := range n.Tags().All() {
+			c.tags[Tag(t)] = struct{}{}
+		}
+
+		if !n.IsTagged() && n.User().Valid() {
+			c.users[n.User().ID()] = struct{}{}
+		}
+	}
+
+	seen := make(map[types.NodeID]struct{}, nodes.Len())
+
+	for _, n := range nodes.All() {
+		seen[n.ID()] = struct{}{}
+
+		old, ok := prev[n.ID()]
+		if ok && old == n {
+			continue
+		}
+
+		note(n)
+
+		if !ok {
+			c.membership = true
+			c.routes = c.routes || len(n.AllApprovedRoutes()) > 0
 
 			continue
 		}
 
-		if cg != nil {
-			compiled = append(compiled, *cg)
+		note(old)
+
+		if old.IsTagged() != n.IsTagged() || !views.SliceEqual(old.Tags(), n.Tags()) ||
+			old.TypedUserID() != n.TypedUserID() {
+			c.membership = true
+		}
+
+		if !slices.Equal(old.AllApprovedRoutes(), n.AllApprovedRoutes()) {
+			c.routes = true
 		}
 	}
 
-	return compiled
+	for id, old := range prev {
+		if _, ok := seen[id]; !ok {
+			note(old)
+
+			c.membership = true
+			c.routes = c.routes || len(old.AllApprovedRoutes()) > 0
+		}
+	}
+
+	return c
+}
+
+// reaches reports whether the change can alter grant's compile: a tag or
+// user it names gained or lost a node or address, its autogroups' members
+// moved, or, for a wildcard, which carries every approved subnet, routes
+// changed. Groups and users are checked against any user-owned change;
+// addresses and hosts never change with nodes.
+func (c *nodeChange) reaches(grant Grant) bool {
+	aliases := slices.Concat(grant.Sources, grant.Destinations)
+
+	for _, t := range grant.Via {
+		if _, ok := c.tags[t]; ok {
+			return true
+		}
+	}
+
+	for _, a := range aliases {
+		switch a := a.(type) {
+		case *Tag:
+			if _, ok := c.tags[*a]; ok {
+				return true
+			}
+		case *Username, *Group:
+			if len(c.users) > 0 {
+				return true
+			}
+		case *AutoGroup:
+			if c.membership || len(c.users) > 0 || len(c.tags) > 0 {
+				return true
+			}
+		case Asterix:
+			if c.routes {
+				return true
+			}
+		case *Host, *Prefix:
+		default:
+			return true
+		}
+	}
+
+	return false
 }
 
 // compileOneGrant resolves a single grant into a [compiledGrant].

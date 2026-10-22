@@ -73,6 +73,19 @@ type PolicyManager interface {
 }
 
 // NewPolicyManager returns a new [PolicyManager].
+// NewPolicyManagerFrom is [NewPolicyManager] reusing what prev compiled
+// that the change of nodes since cannot have moved.
+func NewPolicyManagerFrom(prev PolicyManager, pol []byte, users []types.User, nodes views.Slice[types.NodeView]) (PolicyManager, error) {
+	last, _ := prev.(*policyv2.PolicyManager)
+
+	pm, err := policyv2.NewPolicyManagerFrom(last, pol, users, nodes)
+	if err != nil {
+		return nil, err
+	}
+
+	return pm, nil
+}
+
 func NewPolicyManager(pol []byte, users []types.User, nodes views.Slice[types.NodeView]) (PolicyManager, error) {
 	var (
 		polMan PolicyManager

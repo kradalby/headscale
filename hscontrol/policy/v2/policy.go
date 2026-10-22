@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"bytes"
 	"cmp"
 	"encoding/binary"
 	"encoding/json"
@@ -34,7 +35,12 @@ var ErrInvalidTagOwner = errors.New("tag owner is not an Alias")
 type PolicyManager struct {
 	pol   *Policy
 	users []types.User
-	nodes views.Slice[types.NodeView]
+
+	// src is the document compiled, and grantResults each grant's compile,
+	// for [NewPolicyManagerFrom].
+	src          []byte
+	grantResults []compiledGrantResult
+	nodes        views.Slice[types.NodeView]
 	// nodesByID indexes nodes; see [PolicyManager.cacheable].
 	nodesByID map[types.NodeID]types.NodeView
 
@@ -168,6 +174,13 @@ func validateUserReferences(pol *Policy, users types.Users) error {
 // NewPolicyManager compiles the policy in b against users and nodes. It
 // returns an error if the policy is invalid or does not compile.
 func NewPolicyManager(b []byte, users []types.User, nodes views.Slice[types.NodeView]) (*PolicyManager, error) {
+	return NewPolicyManagerFrom(nil, b, users, nodes)
+}
+
+// NewPolicyManagerFrom is [NewPolicyManager] reusing, from prev, a compile
+// of the same document and users, each grant the node changes since cannot
+// reach. prev may be nil.
+func NewPolicyManagerFrom(prev *PolicyManager, b []byte, users []types.User, nodes views.Slice[types.NodeView]) (*PolicyManager, error) {
 	pol, err := unmarshalPolicy(b)
 	if err != nil {
 		return nil, fmt.Errorf("parsing policy: %w", err)
@@ -183,7 +196,16 @@ func NewPolicyManager(b []byte, users []types.User, nodes views.Slice[types.Node
 
 	// Compile all grants once. Both global and per-node filter
 	// rules are derived from these compiled grants.
-	grants := indexed.compileGrants(users, nodes)
+	var (
+		prevGrants []compiledGrantResult
+		change     *nodeChange
+	)
+
+	if prev != nil && bytes.Equal(prev.src, b) && samePolicyUsers(prev.users, users) {
+		prevGrants, change = prev.grantResults, diffNodes(prev.nodesByID, nodes)
+	}
+
+	grants, grantResults := indexed.compileGrantsFrom(prevGrants, change, users, nodes)
 
 	// Order matters, tags might be used in autoapprovers, so we need to ensure
 	// that the map for tag owners is resolved before resolving autoapprovers.
@@ -209,6 +231,8 @@ func NewPolicyManager(b []byte, users []types.User, nodes views.Slice[types.Node
 	}
 
 	pm := &PolicyManager{
+		src:                b,
+		grantResults:       grantResults,
 		pol:                pol,
 		users:              users,
 		nodes:              nodes,
@@ -394,6 +418,11 @@ func (pm *PolicyManager) sshRuleAllowsUser(rule SSH, srcNode types.NodeView, loc
 	lp, ok := resolveLocalparts(rule.Users.LocalpartEntries(), pm.users)[srcNode.User().ID()]
 
 	return ok && lp == localUser
+}
+
+// samePolicyUsers reports whether the policy resolves a and b the same.
+func samePolicyUsers(a, b []types.User) bool {
+	return slices.EqualFunc(a, b, func(x, y types.User) bool { return x.PolicyEqual(&y) })
 }
 
 // SameForPeers reports whether pm and prev render every node as a peer

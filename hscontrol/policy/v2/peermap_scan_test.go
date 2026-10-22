@@ -903,3 +903,81 @@ func TestBuildPeerClassesReuseMatchesFresh(t *testing.T) {
 		}
 	}
 }
+
+// TestNewPolicyManagerFromMatchesFresh compiles a policy after each of a
+// series of node changes both from the previous compile and from scratch,
+// and checks they agree on every grant, the global filter, each node's
+// filter and peer visibility.
+func TestNewPolicyManagerFromMatchesFresh(t *testing.T) {
+	r := rand.New(rand.NewPCG(9, 10)) //nolint:gosec // reproducible test input
+
+	reused := 0
+
+	for it := range 300 {
+		nodes := scanRandomNodes(r, 2+r.IntN(30))
+		polB := scanRandomPolicy(r)
+		nextID := len(nodes) + 1
+
+		var prev *PolicyManager
+
+		for step := range 8 {
+			fresh, err := NewPolicyManager(polB, scanUsers, nodes.ViewSlice())
+			if err != nil {
+				break
+			}
+
+			inc, err := NewPolicyManagerFrom(prev, polB, scanUsers, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			msg := fmt.Sprintf("iteration %d step %d, policy %s", it, step, polB)
+			require.Equal(t, fresh.compiledGrants, inc.compiledGrants, msg)
+			require.Equal(t, fresh.filter, inc.filter, msg)
+			require.Equal(t, fresh.BuildPeerMap(nodes.ViewSlice()), inc.BuildPeerMap(nodes.ViewSlice()), msg)
+
+			for _, n := range nodes {
+				want, err := fresh.FilterForNode(n.View())
+				require.NoError(t, err)
+
+				got, err := inc.FilterForNode(n.View())
+				require.NoError(t, err)
+				require.Equal(t, want, got, "%s, node %d", msg, n.ID)
+			}
+
+			if prev != nil {
+				for i := range inc.grantResults {
+					if i < len(prev.grantResults) && inc.grantResults[i].cg == prev.grantResults[i].cg && inc.grantResults[i].cg != nil {
+						reused++
+					}
+				}
+			}
+
+			prev = inc
+
+			switch r.IntN(4) {
+			case 0:
+				i := r.IntN(len(nodes))
+				c := nodes[i].Clone()
+				c.Tags = []string{scanTags[r.IntN(len(scanTags))]}
+				c.User, c.UserID = nil, nil
+				nodes[i] = c
+			case 1:
+				extra := scanRandomNodes(r, nextID)
+				nodes = append(slices.Clone(nodes), extra[nextID-1])
+				nextID++
+			case 2:
+				if len(nodes) > 2 {
+					i := r.IntN(len(nodes))
+					nodes = slices.Delete(slices.Clone(nodes), i, i+1)
+				}
+			default:
+				i := r.IntN(len(nodes))
+				c := nodes[i].Clone()
+				c.ApprovedRoutes = nil
+				nodes[i] = c
+			}
+		}
+	}
+
+	// The comparison is only worth something if grants were reused.
+	require.Greater(t, reused, 100, "grants reused")
+}

@@ -211,15 +211,15 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 			users := graph.Get(s, w.users)
 			nodes := graph.Get(s, w.policyNodes).list
 
-			pm, err := policy.NewPolicyManager(src, users, nodes)
+			var last policy.PolicyManager
+			if prev != nil {
+				last = prev.pm
+			}
+
+			pm, err := policy.NewPolicyManagerFrom(last, src, users, nodes)
 			if err != nil {
 				policyCompiles.WithLabelValues("error").Inc()
 				log.Error().Err(err).Msg("compiling policy; keeping the last good policy")
-
-				var last policy.PolicyManager
-				if prev != nil {
-					last = prev.pm
-				}
 
 				return &compiledPolicy{pm: last, err: err}
 			}
