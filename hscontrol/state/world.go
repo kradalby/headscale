@@ -1045,6 +1045,68 @@ func (s *Snapshot) SelfRoutes(node types.NodeView) []netip.Prefix {
 // Revisions report the commit at which a part of the world last changed,
 // so a renderer can skip work whose inputs are unchanged.
 
+// Change is what differs between two snapshots, for telling which map
+// sessions an update can reach.
+type Change struct {
+	// Global is set when something every map reads changed: the compiled
+	// policy, the DERP map or the extra DNS records.
+	Global bool
+	// Nodes are the nodes whose stored node differs, added and deleted
+	// ones included.
+	Nodes []types.NodeID
+	// Primaries are the nodes that gained or lost a primary route.
+	Primaries []types.NodeID
+	// PeerSets are the nodes whose set of peers differs.
+	PeerSets []types.NodeID
+}
+
+// Since returns what changed from old to s. A nil old is everything.
+func (s *Snapshot) Since(old *Snapshot) Change {
+	if old == nil {
+		return Change{Global: true}
+	}
+
+	c := Change{
+		Global: s.PolicyRev() != old.PolicyRev() ||
+			graph.ChangedAt(s.s, s.w.derpMap) != graph.ChangedAt(old.s, old.w.derpMap) ||
+			s.DNSRev() != old.DNSRev(),
+		Nodes: graph.Changes(old.nodes(), s.nodes()),
+	}
+
+	if s.PrimariesRev() != old.PrimariesRev() {
+		c.Primaries = changedKeys(
+			graph.Get(old.s, old.w.primaries).byNode,
+			graph.Get(s.s, s.w.primaries).byNode,
+			slices.Equal[[]netip.Prefix],
+		)
+	}
+
+	if s.PeersRev() != old.PeersRev() {
+		c.PeerSets = changedKeys(graph.Get(old.s, old.w.peers), graph.Get(s.s, s.w.peers), slices.Equal[[]types.NodeID])
+	}
+
+	return c
+}
+
+// changedKeys returns the keys whose value differs between a and b.
+func changedKeys[K comparable, V any](a, b map[K]V, eq func(x, y V) bool) []K {
+	var keys []K
+
+	for k, v := range b {
+		if old, ok := a[k]; !ok || !eq(old, v) {
+			keys = append(keys, k)
+		}
+	}
+
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			keys = append(keys, k)
+		}
+	}
+
+	return keys
+}
+
 // NodesVersion is the nodes of a snapshot, which a reader keeps to ask a
 // later snapshot what changed since. Holding one costs only what later
 // writes replaced.
