@@ -899,7 +899,7 @@ func TestWorldGroupCommitsQueuedWrites(t *testing.T) {
 
 	for i := range burst {
 		wg.Go(func() {
-			w.PutNode(*worldNode(types.NodeID(i+2), alice, fmt.Sprintf("100.64.0.%d", i+2)))
+			w.PutNode(*worldNode(types.NodeID(i+2), alice, fmt.Sprintf("100.64.0.%d", i+2))) //nolint:gosec // small test IDs
 		})
 	}
 
@@ -973,7 +973,7 @@ func TestWorldIndexMatchesFullBuild(t *testing.T) {
 	r := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // deterministic test input
 
 	for step := range 400 {
-		id := types.NodeID(r.IntN(10) + 1)
+		id := types.NodeID(r.IntN(10) + 1) //nolint:gosec // small test IDs
 
 		switch r.IntN(6) {
 		case 0:

@@ -174,6 +174,15 @@ func Set[T any](tx *Tx, in Input[T], v T) {
 	tx.sets[in.idx] = v
 }
 
+// Rev is the revision this transaction publishes if it changes anything.
+func (tx *Tx) Rev() uint64 {
+	if tx.base == nil {
+		return 1
+	}
+
+	return tx.base.rev + 1
+}
+
 // Peek returns the value of n as the transaction sees it: the staged
 // value of an input set earlier in tx, otherwise its value in the latest
 // snapshot.

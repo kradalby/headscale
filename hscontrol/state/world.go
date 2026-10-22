@@ -66,6 +66,55 @@ var (
 // valid and two snapshots holding the same pointer hold the same node.
 type nodeTable struct {
 	byID map[types.NodeID]*types.Node
+
+	// changes lists the nodes each recent commit changed, oldest first,
+	// covering every node change after revision floor. A reader finds what
+	// moved since a revision it saw without comparing every node.
+	changes []tableChange
+	floor   uint64
+}
+
+type tableChange struct {
+	rev uint64
+	ids []types.NodeID
+}
+
+// tableChangeLog bounds the change log; a reader further behind compares
+// every node instead.
+const tableChangeLog = 256
+
+// with returns the table holding byID after the commit at rev changed ids.
+func (t *nodeTable) with(byID map[types.NodeID]*types.Node, rev uint64, ids []types.NodeID) *nodeTable {
+	changes, floor := t.changes, t.floor
+	if len(changes) >= tableChangeLog {
+		floor = changes[0].rev
+		changes = changes[1:]
+	}
+
+	next := make([]tableChange, len(changes), len(changes)+1)
+	copy(next, changes)
+
+	return &nodeTable{
+		byID:    byID,
+		changes: append(next, tableChange{rev: rev, ids: ids}),
+		floor:   floor,
+	}
+}
+
+// changedSince returns the nodes changed after revision rev, possibly with
+// repeats, and false when the log no longer reaches back that far.
+func (t *nodeTable) changedSince(rev uint64) ([]types.NodeID, bool) {
+	if rev < t.floor {
+		return nil, false
+	}
+
+	var out []types.NodeID
+
+	for i := len(t.changes) - 1; i >= 0 && t.changes[i].rev > rev; i-- {
+		out = append(out, t.changes[i].ids...)
+	}
+
+	return out, true
 }
 
 // world is the control plane as a dataflow graph. Its inputs are what the
@@ -135,7 +184,8 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 	g := graph.New()
 	w := &world{g: g}
 
-	table := &nodeTable{byID: make(map[types.NodeID]*types.Node, len(nodes))}
+	// The first commit, revision 1, publishes these nodes.
+	table := &nodeTable{byID: make(map[types.NodeID]*types.Node, len(nodes)), floor: 1}
 	for _, n := range nodes {
 		table.byID[n.ID] = n
 	}
@@ -401,19 +451,19 @@ func (w *world) snapshot() *Snapshot {
 
 // nodeWrite is one queued change to the node table; see [world.update].
 type nodeWrite struct {
-	fn   func(nodes map[types.NodeID]*types.Node) bool
+	fn   func(nodes map[types.NodeID]*types.Node) []types.NodeID
 	done chan *Snapshot
 }
 
 // update commits fn applied to a copy of the node table and returns the
-// snapshot holding it. fn reports whether it changed anything and must not
-// modify nodes when it reports false.
+// snapshot holding it. fn returns the IDs it changed and must not modify
+// nodes when it returns none.
 //
 // Writes that arrive while a commit runs share the next one (group
 // commit): a burst of joins, deletes or endpoint updates costs one policy
 // compile and one peer rebuild instead of one each, and an idle write pays
 // no wait.
-func (w *world) update(fn func(nodes map[types.NodeID]*types.Node) bool) *Snapshot {
+func (w *world) update(fn func(nodes map[types.NodeID]*types.Node) []types.NodeID) *Snapshot {
 	nw := &nodeWrite{fn: fn, done: make(chan *Snapshot, 1)}
 
 	w.writeMu.Lock()
@@ -442,16 +492,16 @@ func (w *world) commitWrites() {
 		cur := graph.Peek(tx, w.nodes)
 		next := maps.Clone(cur.byID)
 
-		changed := false
+		var changed []types.NodeID
 		for _, nw := range batch {
-			changed = nw.fn(next) || changed
+			changed = append(changed, nw.fn(next)...)
 		}
 
-		if !changed {
+		if len(changed) == 0 {
 			return nil
 		}
 
-		graph.Set(tx, w.nodes, &nodeTable{byID: next})
+		graph.Set(tx, w.nodes, cur.with(next, tx.Rev(), changed))
 		worldNodes.Set(float64(len(next)))
 		worldCommits.Inc()
 
@@ -484,12 +534,12 @@ type UpdateNodeFunc func(n *types.Node)
 // PutNode stores n, replacing any node with its ID. Its GivenName is made
 // unique first. It returns the stored node.
 func (w *world) PutNode(n types.Node) types.NodeView {
-	snap := w.update(func(nodes map[types.NodeID]*types.Node) bool {
+	snap := w.update(func(nodes map[types.NodeID]*types.Node) []types.NodeID {
 		stored := n
 		stored.GivenName = uniqueGivenName(nodes, n.ID, n.GivenName)
 		nodes[n.ID] = &stored
 
-		return true
+		return []types.NodeID{n.ID}
 	})
 
 	nv, _ := snap.GetNode(n.ID)
@@ -529,8 +579,8 @@ func (w *world) updateNodes(
 		return w.snapshot()
 	}
 
-	return w.update(func(nodes map[types.NodeID]*types.Node) bool {
-		changed := false
+	return w.update(func(nodes map[types.NodeID]*types.Node) []types.NodeID {
+		var changed []types.NodeID
 
 		for id, fn := range updates {
 			cur, ok := nodes[id]
@@ -550,7 +600,7 @@ func (w *world) updateNodes(
 			}
 
 			nodes[id] = next
-			changed = true
+			changed = append(changed, id)
 		}
 
 		return changed
@@ -559,14 +609,14 @@ func (w *world) updateNodes(
 
 // DeleteNode removes the node with id.
 func (w *world) DeleteNode(id types.NodeID) {
-	w.update(func(nodes map[types.NodeID]*types.Node) bool {
+	w.update(func(nodes map[types.NodeID]*types.Node) []types.NodeID {
 		if _, ok := nodes[id]; !ok {
-			return false
+			return nil
 		}
 
 		delete(nodes, id)
 
-		return true
+		return []types.NodeID{id}
 	})
 }
 
@@ -575,25 +625,25 @@ func (w *world) DeleteNode(id types.NodeID) {
 func (w *world) SetGivenName(id types.NodeID, name string) (types.NodeView, error) {
 	var err error
 
-	snap := w.update(func(nodes map[types.NodeID]*types.Node) bool {
+	snap := w.update(func(nodes map[types.NodeID]*types.Node) []types.NodeID {
 		cur, ok := nodes[id]
 		if !ok {
 			err = ErrNodeNotFound
 
-			return false
+			return nil
 		}
 
 		if dnsname.ValidLabel(name) != nil {
 			err = ErrGivenNameInvalid
 
-			return false
+			return nil
 		}
 
 		for oid, other := range nodes {
 			if oid != id && strings.EqualFold(other.GivenName, name) {
 				err = ErrGivenNameTaken
 
-				return false
+				return nil
 			}
 		}
 
@@ -601,7 +651,7 @@ func (w *world) SetGivenName(id types.NodeID, name string) (types.NodeView, erro
 		next.GivenName = name
 		nodes[id] = next
 
-		return true
+		return []types.NodeID{id}
 	})
 
 	if err != nil {
@@ -626,7 +676,10 @@ func (w *world) SetUsers(users []types.User) {
 
 		cur := graph.Peek(tx, w.nodes)
 
-		var next map[types.NodeID]*types.Node
+		var (
+			next    map[types.NodeID]*types.Node
+			changed []types.NodeID
+		)
 
 		for id, n := range cur.byID {
 			if n.User == nil {
@@ -646,10 +699,11 @@ func (w *world) SetUsers(users []types.User) {
 			uc := *u
 			c.User = &uc
 			next[id] = c
+			changed = append(changed, id)
 		}
 
 		if next != nil {
-			graph.Set(tx, w.nodes, &nodeTable{byID: next})
+			graph.Set(tx, w.nodes, cur.with(next, tx.Rev(), changed))
 		}
 
 		worldCommits.Inc()
@@ -974,6 +1028,12 @@ func (s *Snapshot) SelfRoutes(node types.NodeView) []netip.Prefix {
 
 // Revisions report the commit at which a part of the world last changed,
 // so a renderer can skip work whose inputs are unchanged.
+
+// NodesChangedSince returns the nodes changed after revision rev, possibly
+// with repeats, and false when that is too far back to tell.
+func (s *Snapshot) NodesChangedSince(rev uint64) ([]types.NodeID, bool) {
+	return graph.Get(s.s, s.w.nodes).changedSince(rev)
+}
 
 // NodesRev is the revision of the latest node change.
 func (s *Snapshot) NodesRev() uint64 { return graph.ChangedAt(s.s, s.w.nodes) }
