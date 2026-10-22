@@ -122,6 +122,9 @@ type nodeIndex struct {
 	byMachineKey graph.Grouped[types.NodeID, *types.Node, key.MachinePublic]
 	// byUser holds user-owned nodes; tagged nodes are owned by their tags.
 	byUser graph.Grouped[types.NodeID, *types.Node, types.UserID]
+	// advertisers holds, per non-exit prefix, the online nodes approving
+	// it: the candidates of its primary-route election.
+	advertisers graph.Grouped[types.NodeID, *types.Node, netip.Prefix]
 }
 
 // policyNodes is the node list as the policy reads it. It changes only
@@ -220,14 +223,30 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 
 	w.primaries = graph.NewDerived(g, "primaries", samePrimaries,
 		func(s *graph.Snapshot, prev primaryRoutes) primaryRoutes {
-			t := graph.Get(s, w.nodes)
-
-			// A write that touched no election input keeps the election.
-			if prev.from != nil && !electionInputsChanged(prev.from, t) {
-				return primaryRoutes{routes: prev.routes, byNode: prev.byNode, from: t}
+			nodes := graph.Get(s, w.nodes)
+			if prev.from == nil {
+				return newPrimaryRoutes(electPrimaryRoutes(nodes, nil), nodes)
 			}
 
-			return newPrimaryRoutes(electPrimaryRoutes(t, prev.routes), t)
+			// Only the prefixes a changed router names can elect anew.
+			touched := electionPrefixes(prev.from, nodes)
+			if len(touched) == 0 {
+				return primaryRoutes{routes: prev.routes, byNode: prev.byNode, from: nodes}
+			}
+
+			groups := graph.Get(s, w.index).advertisers.Groups
+			routes := maps.Clone(prev.routes)
+
+			for p := range touched {
+				candidates, _ := groups.Get(p)
+				if primary, ok := electPrimary(nodes, candidates, prev.routes, p); ok {
+					routes[p] = primary
+				} else {
+					delete(routes, p)
+				}
+			}
+
+			return newPrimaryRoutes(routes, nodes)
 		})
 
 	snap, err := g.Update(func(*graph.Tx) error { return nil })
@@ -268,7 +287,20 @@ func updateIndex(prev *nodeIndex, nodes *nodeMap) *nodeIndex {
 
 			return []types.UserID{n.TypedUserID()}
 		}),
+		advertisers: graph.GroupBy(p.advertisers, nodes, func(_ types.NodeID, n *types.Node) []netip.Prefix {
+			if !n.Online() {
+				return nil
+			}
+
+			return electionRoutes(n)
+		}),
 	}
+}
+
+// electionRoutes are the prefixes a node is a primary-route candidate for
+// when online: its approved, announced routes, exits aside.
+func electionRoutes(n *types.Node) []netip.Prefix {
+	return slices.DeleteFunc(n.AllApprovedRoutes(), tsaddr.IsExitRoute)
 }
 
 // patchSorted returns the views of to sorted by ID, given all, the sorted
@@ -359,26 +391,33 @@ func newPrimaryRoutes(routes map[netip.Prefix]types.NodeID, from *nodeMap) prima
 
 func samePrimaries(a, b primaryRoutes) bool { return maps.Equal(a.routes, b.routes) }
 
-// electionInputsChanged reports whether a node changed what the election
-// reads: online and health state and the approved, announced routes. A
-// node that joins or leaves matters only if it approves routes.
-func electionInputsChanged(from, to *nodeMap) bool {
+// electionPrefixes returns the prefixes whose election a change between
+// from and to can move: those a node approves before or after a change to
+// its online state, health or routes.
+func electionPrefixes(from, to *nodeMap) map[netip.Prefix]struct{} {
+	touched := map[netip.Prefix]struct{}{}
+
 	for _, id := range graph.Changes(from, to) {
 		old, wasOK := from.Get(id)
 		n, isOK := to.Get(id)
 
-		switch {
-		case wasOK && isOK:
-			if old.Online() != n.Online() || old.Unhealthy != n.Unhealthy ||
-				!slices.Equal(old.AllApprovedRoutes(), n.AllApprovedRoutes()) {
-				return true
+		if wasOK && isOK && old.Online() == n.Online() && old.Unhealthy == n.Unhealthy &&
+			slices.Equal(old.AllApprovedRoutes(), n.AllApprovedRoutes()) {
+			continue
+		}
+
+		for _, side := range []*types.Node{old, n} {
+			if side == nil {
+				continue
 			}
-		case wasOK && len(old.AllApprovedRoutes()) > 0, isOK && len(n.AllApprovedRoutes()) > 0:
-			return true
+
+			for _, p := range electionRoutes(side) {
+				touched[p] = struct{}{}
+			}
 		}
 	}
 
-	return false
+	return touched
 }
 
 func samePeerMap(a, b map[types.NodeID][]types.NodeID) bool {
@@ -725,69 +764,67 @@ func uniqueGivenName(nodes *nodeEdit, self types.NodeID, base string) string {
 func onlineAdvertisers(nodes *nodeMap) map[netip.Prefix][]types.NodeID {
 	advertisers := make(map[netip.Prefix][]types.NodeID)
 
-	var ids []types.NodeID
-	for id := range nodes.All() {
-		ids = append(ids, id)
+	for id, n := range nodes.All() {
+		if n.Online() {
+			for _, p := range electionRoutes(n) {
+				advertisers[p] = append(advertisers[p], id)
+			}
+		}
 	}
 
-	slices.Sort(ids)
-
-	for _, id := range ids {
-		n, _ := nodes.Get(id)
-		if n.IsOnline == nil || !*n.IsOnline {
-			continue
-		}
-
-		for _, p := range n.AllApprovedRoutes() {
-			if tsaddr.IsExitRoute(p) {
-				continue
-			}
-
-			advertisers[p] = append(advertisers[p], id)
-		}
+	for _, ids := range advertisers {
+		slices.Sort(ids)
 	}
 
 	return advertisers
 }
 
-// electPrimaryRoutes picks the primary advertiser for each non-exit
-// prefix among online nodes approving it. A previous primary that is still
-// a healthy candidate keeps the prefix (no flapping); otherwise the lowest
-// healthy NodeID wins. When every candidate is unhealthy, only a previous
-// primary that is still a candidate keeps it: pointing peers at another
-// node the prober declared unreachable is worse than leaving it unmapped.
+// electPrimaryRoutes elects every prefix from scratch, keeping prev's
+// primaries where they still hold.
 func electPrimaryRoutes(
 	nodes *nodeMap,
 	prev map[netip.Prefix]types.NodeID,
 ) map[netip.Prefix]types.NodeID {
 	advertisers := onlineAdvertisers(nodes)
 	routes := make(map[netip.Prefix]types.NodeID, len(advertisers))
+
+	for prefix, candidates := range advertisers {
+		if primary, ok := electPrimary(nodes, candidates, prev, prefix); ok {
+			routes[prefix] = primary
+		}
+	}
+
+	return routes
+}
+
+// electPrimary picks the primary for prefix among candidates, its online
+// advertisers in ID order: a healthy incumbent keeps it, otherwise the
+// lowest healthy candidate takes it; when none is healthy, the incumbent
+// keeps it rather than flap.
+func electPrimary(
+	nodes *nodeMap,
+	candidates []types.NodeID,
+	prev map[netip.Prefix]types.NodeID,
+	prefix netip.Prefix,
+) (types.NodeID, bool) {
 	healthy := func(id types.NodeID) bool {
 		n, _ := nodes.Get(id)
 
 		return !n.Unhealthy
 	}
 
-	for prefix, candidates := range advertisers {
-		cur, hadPrimary := prev[prefix]
-		incumbent := hadPrimary && slices.Contains(candidates, cur)
+	cur, hadPrimary := prev[prefix]
+	incumbent := hadPrimary && slices.Contains(candidates, cur)
 
-		if incumbent && healthy(cur) {
-			routes[prefix] = cur
-			continue
-		}
-
-		idx := slices.IndexFunc(candidates, healthy)
-
-		switch {
-		case idx >= 0:
-			routes[prefix] = candidates[idx]
-		case incumbent:
-			routes[prefix] = cur
-		}
+	if incumbent && healthy(cur) {
+		return cur, true
 	}
 
-	return routes
+	if i := slices.IndexFunc(candidates, healthy); i >= 0 {
+		return candidates[i], true
+	}
+
+	return cur, incumbent
 }
 
 // Snapshot is one consistent view of the control plane: nodes, users,
@@ -924,9 +961,9 @@ func (s *Snapshot) PrimaryRoutesForNode(id types.NodeID) []netip.Prefix {
 func (s *Snapshot) HANodes() map[netip.Prefix][]types.NodeID {
 	out := make(map[netip.Prefix][]types.NodeID)
 
-	for p, ids := range onlineAdvertisers(graph.Get(s.s, s.w.nodes)) {
+	for p, ids := range s.index().advertisers.Groups.All() {
 		if len(ids) >= 2 {
-			out[p] = ids
+			out[p] = slices.Clone(ids)
 		}
 	}
 

@@ -972,11 +972,12 @@ func TestWorldIndexMatchesFullBuild(t *testing.T) {
 	require.NoError(t, err)
 
 	r := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // deterministic test input
+	prevRoutes := w.snapshot().PrimaryRoutes()
 
 	for step := range 400 {
 		id := types.NodeID(r.IntN(10) + 1) //nolint:gosec // small test IDs
 
-		switch r.IntN(6) {
+		switch r.IntN(8) {
 		case 0:
 			w.UpdateNode(id, func(n *types.Node) { n.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1")} })
 		case 1:
@@ -989,6 +990,13 @@ func TestWorldIndexMatchesFullBuild(t *testing.T) {
 			w.DeleteNode(id)
 		case 5:
 			w.PutNode(*worldNode(id, bob, fmt.Sprintf("100.64.1.%d", id)))
+		case 6:
+			w.UpdateNode(id, func(n *types.Node) { n.Unhealthy = !n.Unhealthy })
+		case 7:
+			w.UpdateNode(id, func(n *types.Node) {
+				n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+				n.ApprovedRoutes = []netip.Prefix{route}
+			})
 		}
 
 		snap := w.snapshot()
@@ -999,15 +1007,14 @@ func TestWorldIndexMatchesFullBuild(t *testing.T) {
 		require.Equal(t, groups(want.byMachineKey), groups(got.byMachineKey), "step %d", step)
 		require.Equal(t, groups(want.byUser), groups(got.byUser), "step %d", step)
 
-		fresh := electPrimaryRoutes(snap.nodes(), nil)
-		for p, primary := range snap.PrimaryRoutes() {
-			require.Contains(t, fresh, p, "step %d: stale prefix", step)
+		// Electing only the touched prefixes equals electing all of them.
+		require.Equal(t, electPrimaryRoutes(snap.nodes(), prevRoutes), snap.PrimaryRoutes(), "step %d", step)
+		prevRoutes = snap.PrimaryRoutes()
 
+		for _, primary := range snap.PrimaryRoutes() {
 			n, _ := snap.GetNode(primary)
 			require.True(t, n.Online(), "step %d: offline primary %d", step, primary)
 		}
-
-		require.Len(t, snap.PrimaryRoutes(), len(fresh), "step %d", step)
 	}
 }
 
