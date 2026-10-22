@@ -1414,3 +1414,36 @@ func TestReduceFilterRulesAllocsIndependentOfDests(t *testing.T) {
 	require.Equal(t, allocs(10), allocs(1000),
 		"reducing a filter must not allocate per DstPorts entry")
 }
+
+// BenchmarkReduceFilterRules compares reducing a 400-rule filter for one
+// node with parsing it each time against a Reducer built once, the way a
+// compile serves every node.
+func BenchmarkReduceFilterRules(b *testing.B) {
+	rules := make([]tailcfg.FilterRule, 400)
+	for i := range rules {
+		rules[i] = tailcfg.FilterRule{
+			SrcIPs: []string{"100.64.0.0/10"},
+			DstPorts: []tailcfg.NetPortRange{
+				{IP: fmt.Sprintf("100.64.%d.%d/32", i/250, i%250), Ports: tailcfg.PortRangeAny},
+				{IP: fmt.Sprintf("10.%d.0.0/16", i%250), Ports: tailcfg.PortRangeAny},
+			},
+		}
+	}
+
+	ip := netip.MustParseAddr("100.64.0.7")
+	node := (&types.Node{IPv4: &ip}).View()
+
+	b.Run("parse-each", func(b *testing.B) {
+		for b.Loop() {
+			policyutil.ReduceFilterRules(node, rules)
+		}
+	})
+
+	b.Run("reducer", func(b *testing.B) {
+		red := policyutil.NewReducer(rules)
+
+		for b.Loop() {
+			red.Reduce(node)
+		}
+	})
+}

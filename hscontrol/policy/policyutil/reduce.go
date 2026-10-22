@@ -18,12 +18,61 @@ import (
 // to this function. Use [policy.PolicyManager.FilterForNode] instead, which handles
 // both cases.
 func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcfg.FilterRule {
+	return NewReducer(rules).Reduce(node)
+}
+
+// Reducer reduces one set of filter rules for many nodes. It parses every
+// destination once: every node reduces every rule on every policy compile,
+// and parsing the same strings for each node was most of that work.
+type Reducer struct {
+	rules []tailcfg.FilterRule
+	dsts  [][]parsedDst // per rule, per DstPorts entry
+}
+
+// parsedDst is a DstPorts entry's IP as a range. "*" spans both families,
+// so it is the one form that is not a range; unparseable entries match
+// nothing (fail closed).
+type parsedDst struct {
+	any, valid bool
+	r          netipx.IPRange
+}
+
+// NewReducer parses rules for [Reducer.Reduce]. rules must not change
+// afterwards.
+func NewReducer(rules []tailcfg.FilterRule) *Reducer {
+	red := &Reducer{rules: rules, dsts: make([][]parsedDst, len(rules))}
+
+	for i, rule := range rules {
+		if len(rule.CapGrant) > 0 {
+			continue
+		}
+
+		dsts := make([]parsedDst, len(rule.DstPorts))
+		for j, dest := range rule.DstPorts {
+			if dest.IP == "*" {
+				dsts[j].any = true
+
+				continue
+			}
+
+			r, err := util.ParseIPRange(dest.IP)
+			dsts[j] = parsedDst{r: r, valid: err == nil}
+		}
+
+		red.dsts[i] = dsts
+	}
+
+	return red
+}
+
+// Reduce returns the rules and destinations relevant to node.
+func (red *Reducer) Reduce(node types.NodeView) []tailcfg.FilterRule {
 	ret := []tailcfg.FilterRule{}
 	nodeIPs := node.IPs()
 	subnetRoutes := node.SubnetRoutes()
 	exitRoutes := node.ExitRoutes()
 
-	for _, rule := range rules {
+	for i, rule := range red.rules {
 		// Handle CapGrant rules separately — they use CapGrant[].Dsts
 		// instead of DstPorts for destination matching.
 		if len(rule.CapGrant) > 0 {
@@ -38,8 +87,8 @@ func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcf
 		// record if the rule is actually relevant for the given node.
 		var dests []tailcfg.NetPortRange
 
-		for _, dest := range rule.DstPorts {
-			if destReachesNode(dest.IP, nodeIPs, subnetRoutes, exitRoutes) {
+		for j, dest := range rule.DstPorts {
+			if red.dsts[i][j].reaches(nodeIPs, subnetRoutes, exitRoutes) {
 				dests = append(dests, dest)
 			}
 		}
@@ -56,29 +105,25 @@ func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcf
 	return ret
 }
 
-// destReachesNode reports whether a DstPorts entry targets the node: one of
-// its addresses, or a route it serves. Every node reduces every entry on
-// every policy change, so the entry is parsed as one range rather than an
-// IPSet. Unparseable entries fail closed.
-func destReachesNode(dst string, nodeIPs []netip.Addr, subnetRoutes, exitRoutes []netip.Prefix) bool {
-	// Spans both families, so it is the one form that is not a range.
-	if dst == "*" {
+// reaches reports whether the destination targets the node: one of its
+// addresses, or a route it serves.
+func (d parsedDst) reaches(nodeIPs []netip.Addr, subnetRoutes, exitRoutes []netip.Prefix) bool {
+	if d.any {
 		return len(nodeIPs) > 0 || len(subnetRoutes) > 0 || len(exitRoutes) > 0
 	}
 
-	r, err := util.ParseIPRange(dst)
-	if err != nil {
+	if !d.valid {
 		return false
 	}
 
-	overlaps := func(p netip.Prefix) bool { return r.Overlaps(netipx.RangeOfPrefix(p)) }
+	overlaps := func(p netip.Prefix) bool { return d.r.Overlaps(netipx.RangeOfPrefix(p)) }
 
 	// [types.NodeView.SubnetRoutes] holds only approved, non-exit routes:
 	// Tailscale SaaS generates no rules for advertised-but-unapproved
 	// routes. Approved exit routes count like subnet routes. They contain
 	// every destination, so SaaS sends an exit node every rule, not only
 	// internet ones.
-	return slices.ContainsFunc(nodeIPs, r.Contains) ||
+	return slices.ContainsFunc(nodeIPs, d.r.Contains) ||
 		slices.ContainsFunc(subnetRoutes, overlaps) ||
 		slices.ContainsFunc(exitRoutes, overlaps)
 }

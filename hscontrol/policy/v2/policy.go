@@ -36,7 +36,9 @@ type PolicyManager struct {
 	// nodesByID indexes nodes; see [PolicyManager.cacheable].
 	nodesByID map[types.NodeID]types.NodeView
 
-	filter   []tailcfg.FilterRule
+	filter []tailcfg.FilterRule
+	// reducer reduces filter for each node, parsing it once.
+	reducer  *policyutil.Reducer
 	matchers []matcher.Match
 
 	tagOwnerMap    map[Tag]*netipx.IPSet
@@ -201,6 +203,7 @@ func NewPolicyManager(b []byte, users []types.User, nodes views.Slice[types.Node
 		nodes:              nodes,
 		nodesByID:          nodeIDViewMap(nodes),
 		filter:             filter,
+		reducer:            policyutil.NewReducer(filter),
 		matchers:           matcher.MatchesFromFilterRules(filter),
 		tagOwnerMap:        tagMap,
 		exitSet:            exitSet,
@@ -582,17 +585,17 @@ func (pm *PolicyManager) FilterForNode(node types.NodeView) ([]tailcfg.FilterRul
 		return rules, nil
 	}
 
-	var unreduced []tailcfg.FilterRule
+	var reduced []tailcfg.FilterRule
 	if !pm.needsPerNodeFilter {
-		unreduced = pm.filter
+		reduced = pm.reducer.Reduce(node)
 	} else {
-		unreduced = append(
+		unreduced := append(
 			pm.unreducedRules(node),
 			exitNodeSelfRules(pm.compiledGrants, node, pm.userNodeIdx)...,
 		)
+		reduced = policyutil.ReduceFilterRules(node, unreduced)
 	}
 
-	reduced := policyutil.ReduceFilterRules(node, unreduced)
 	if pm.cacheable(node) {
 		pm.filterRulesMap.Store(node.ID(), reduced)
 	}
