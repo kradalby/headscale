@@ -378,6 +378,13 @@ func TestAPIv2OAuth_TaggedDeviceUser(t *testing.T) {
 		require.NoError(t, json.Unmarshal(body, &dev))
 		assert.Equal(t, want, dev.User)
 		assert.Equal(t, []string{"tag:ci"}, dev.Tags)
+
+		// oauthClientId names the join key, unless a token made it.
+		if bearer == tok {
+			assert.Empty(t, dev.OAuthClientID)
+		} else {
+			assert.Equal(t, key.ID, dev.OAuthClientID)
+		}
 	}
 }
 
