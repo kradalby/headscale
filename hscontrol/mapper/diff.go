@@ -43,7 +43,7 @@ func diff(sent, next *netMap) []*tailcfg.MapResponse {
 	resp := &tailcfg.MapResponse{}
 	changed := false
 
-	if !reflect.DeepEqual(sent.self, next.self) {
+	if sent.self != next.self && !reflect.DeepEqual(sent.self, next.self) {
 		resp.Node = next.self
 		changed = true
 	}
@@ -53,8 +53,8 @@ func diff(sent, next *netMap) []*tailcfg.MapResponse {
 	refresh := false
 
 	for _, id := range changedIDs {
-		after := next.peers[id]
-		before, ok := sent.peers[id]
+		after, _ := next.peers.Get(id)
+		before, ok := sent.peers.Get(id)
 
 		switch {
 		case !ok:
@@ -88,17 +88,17 @@ func diff(sent, next *netMap) []*tailcfg.MapResponse {
 		changed = true
 	}
 
-	if !reflect.DeepEqual(sent.filter, next.filter) {
+	if !sameRules(sent.filter, next.filter) && !reflect.DeepEqual(sent.filter, next.filter) {
 		resp.PacketFilters = map[string][]tailcfg.FilterRule{"base": next.filter}
 		changed = true
 	}
 
-	if !reflect.DeepEqual(sent.ssh, next.ssh) {
+	if sent.ssh != next.ssh && !reflect.DeepEqual(sent.ssh, next.ssh) {
 		resp.SSHPolicy = next.ssh
 		changed = true
 	}
 
-	if !reflect.DeepEqual(sent.dns, next.dns) {
+	if sent.dns != next.dns && !reflect.DeepEqual(sent.dns, next.dns) {
 		resp.DNSConfig = next.dns
 		changed = true
 	}
@@ -257,15 +257,15 @@ func peerChanges(sent, next *netMap) ([]tailcfg.NodeID, []tailcfg.NodeID) {
 
 	var removed []tailcfg.NodeID
 
-	for id := range sent.peers {
-		if _, ok := next.peers[id]; !ok {
+	for id := range sent.peers.All() {
+		if _, ok := next.peers.Get(id); !ok {
 			removed = append(removed, id)
 		}
 	}
 
 	slices.Sort(removed)
 
-	return slices.Sorted(maps.Keys(next.peers)), removed
+	return peerIDs(next), removed
 }
 
 // needsPeerListRefresh reports a change only a whole peer list can apply:
@@ -275,6 +275,12 @@ func needsPeerListRefresh(before, after *tailcfg.Node) bool {
 	return before.HomeDERP != 0 && after.HomeDERP == 0 ||
 		before.Cap != 0 && after.Cap == 0 ||
 		before.Online != nil && after.Online == nil
+}
+
+// sameRules reports whether a and b are the same slice, as the policy's
+// cached filters are from one render to the next.
+func sameRules(a, b []tailcfg.FilterRule) bool {
+	return len(a) > 0 && len(a) == len(b) && &a[0] == &b[0]
 }
 
 func equalPtr[T comparable](a, b *T) bool {
@@ -287,8 +293,8 @@ func equalTimePtr(a, b *time.Time) bool {
 
 // peerIDs returns the IDs of the peers in nm.
 func peerIDs(nm *netMap) []tailcfg.NodeID {
-	ids := make([]tailcfg.NodeID, 0, len(nm.peers))
-	for id := range nm.peers {
+	ids := make([]tailcfg.NodeID, 0, nm.peers.Len())
+	for id := range nm.peers.All() {
 		ids = append(ids, id)
 	}
 

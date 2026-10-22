@@ -25,28 +25,28 @@ func testPeer(id tailcfg.NodeID) *tailcfg.Node {
 func cloneNode(n *tailcfg.Node) *tailcfg.Node { return n.Clone() }
 
 func testNetMap(peers ...*tailcfg.Node) *netMap {
-	nm := &netMap{
+	return &netMap{
 		self:     testPeer(1),
-		peers:    make(map[tailcfg.NodeID]*tailcfg.Node),
+		peers:    peerMapOf(peers...),
 		profiles: map[tailcfg.UserID]tailcfg.UserProfile{1: {ID: 1, LoginName: "a"}},
 		filter:   []tailcfg.FilterRule{{SrcIPs: []string{"*"}}},
 		ssh:      &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}},
 	}
+}
+
+func peerMapOf(peers ...*tailcfg.Node) *peerMap {
+	e := newPeerMap().Edit()
 	for _, p := range peers {
-		nm.peers[p.ID] = p
+		e.Set(p.ID, p)
 	}
 
-	return nm
+	return e.Done()
 }
 
 // withPeers returns a copy of nm with its peers replaced.
 func withPeers(nm *netMap, peers ...*tailcfg.Node) *netMap {
 	c := *nm
-	c.peers = make(map[tailcfg.NodeID]*tailcfg.Node)
-
-	for _, p := range peers {
-		c.peers[p.ID] = p
-	}
+	c.peers = peerMapOf(peers...)
 
 	return &c
 }

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/state"
@@ -20,6 +21,13 @@ import (
 	"tailscale.com/types/views"
 )
 
+// peerMap holds the rendered peers of a netMap by ID.
+type peerMap = graph.Map[tailcfg.NodeID, *tailcfg.Node]
+
+func newPeerMap() *peerMap {
+	return graph.NewMap[tailcfg.NodeID, *tailcfg.Node](graph.Same[*tailcfg.Node], nil)
+}
+
 // ErrNodeGone is returned when the node a map is rendered for is no
 // longer in the world.
 var ErrNodeGone = errors.New("node no longer exists")
@@ -28,8 +36,10 @@ var ErrNodeGone = errors.New("node no longer exists")
 // [state.Snapshot]. A client holds exactly the last netMap it was sent;
 // what to send next is the difference to a fresh one, see [diff].
 type netMap struct {
-	self     *tailcfg.Node
-	peers    map[tailcfg.NodeID]*tailcfg.Node
+	self *tailcfg.Node
+	// peers shares structure with the base's, so a render that changed k
+	// peers costs k entries, not a copy of them all.
+	peers    *peerMap
 	profiles map[tailcfg.UserID]tailcfg.UserProfile
 	filter   []tailcfg.FilterRule
 	ssh      *tailcfg.SSHPolicy
@@ -70,6 +80,11 @@ type renderer struct {
 	dns    *tailcfg.DNSConfig
 	dnsKey dnsKey
 
+	// self is reused while the node, the policy and the primary routes,
+	// which its own routes come from, are unchanged.
+	self    *tailcfg.Node
+	selfKey selfKey
+
 	// rendered counts peer renders, for tests that bound per-write work.
 	rendered int
 }
@@ -88,6 +103,11 @@ type renderKey struct {
 type dnsKey struct {
 	self        types.NodeView
 	policy, dns uint64
+}
+
+type selfKey struct {
+	self              types.NodeView
+	policy, primaries uint64
 }
 
 func newRenderer(cfg *types.Config, shared *peerRenders, nodeID types.NodeID, capVer tailcfg.CapabilityVersion) *renderer {
@@ -214,12 +234,18 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 	pm := snap.Policy()
 	capMaps := pm.NodeCapMaps()
 
-	tn, err := self.TailNode(r.capVer, func(types.NodeID) []netip.Prefix {
-		return snap.SelfRoutes(self)
-	}, r.cfg, capMaps[self.ID()])
-	if err != nil {
-		return nil, err
+	if k := (selfKey{self: self, policy: snap.PolicyRev(), primaries: snap.PrimariesRev()}); r.self == nil || k != r.selfKey {
+		tn, err := self.TailNode(r.capVer, func(types.NodeID) []netip.Prefix {
+			return snap.SelfRoutes(self)
+		}, r.cfg, capMaps[self.ID()])
+		if err != nil {
+			return nil, err
+		}
+
+		r.self, r.selfKey = tn, k
 	}
+
+	tn := r.self
 
 	filter, err := pm.FilterForNode(self)
 	if err != nil {
@@ -308,7 +334,8 @@ func (r *renderer) renderChangedPeers(pr *peerRendering, nm *netMap) (bool, erro
 
 	ids := pr.snap.NodesChangedSince(r.lastNodes)
 
-	nm.peers = maps.Clone(base.peers)
+	peers := base.peers.Edit()
+	defer func() { nm.peers = peers.Done() }()
 
 	for _, id := range ids {
 		prev, isPeer := r.peers[id]
@@ -335,7 +362,7 @@ func (r *renderer) renderChangedPeers(pr *peerRendering, nm *netMap) (bool, erro
 			return false, nil
 		}
 
-		nm.peers[ptn.ID] = ptn
+		peers.Set(ptn.ID, ptn)
 		nm.changed = append(nm.changed, ptn.ID)
 	}
 
@@ -355,11 +382,12 @@ func (r *renderer) renderAllPeers(pr *peerRendering, nm *netMap) error {
 	// are in r.peers and are compared like any other below.
 	nm.changed = nil
 
+	start := newPeerMap()
 	if nm.base != nil {
-		nm.peers = maps.Clone(nm.base.peers)
-	} else {
-		nm.peers = make(map[tailcfg.NodeID]*tailcfg.Node, len(ids))
+		start = nm.base.peers
 	}
+
+	peers := start.Edit()
 
 	current := make(map[types.NodeID]struct{}, len(ids))
 
@@ -373,8 +401,8 @@ func (r *renderer) renderAllPeers(pr *peerRendering, nm *netMap) error {
 
 		prev, cached := r.peers[id]
 		if cached && prev.node == peer && prev.key == pr.key {
-			if nm.peers[prev.tn.ID] != prev.tn {
-				nm.peers[prev.tn.ID] = prev.tn
+			if have, _ := peers.Get(prev.tn.ID); have != prev.tn {
+				peers.Set(prev.tn.ID, prev.tn)
 				nm.changed = append(nm.changed, prev.tn.ID)
 			}
 
@@ -392,7 +420,7 @@ func (r *renderer) renderAllPeers(pr *peerRendering, nm *netMap) error {
 			continue
 		}
 
-		nm.peers[ptn.ID] = ptn
+		peers.Set(ptn.ID, ptn)
 		nm.changed = append(nm.changed, ptn.ID)
 	}
 
@@ -402,12 +430,14 @@ func (r *renderer) renderAllPeers(pr *peerRendering, nm *netMap) error {
 		}
 	}
 
-	for id := range nm.peers {
+	for id := range start.All() {
 		if _, ok := current[types.NodeID(id)]; !ok { //nolint:gosec // NodeID types are the same value
-			delete(nm.peers, id)
+			peers.Delete(id)
 			nm.removed = append(nm.removed, id)
 		}
 	}
+
+	nm.peers = peers.Done()
 
 	slices.Sort(nm.changed)
 	slices.Sort(nm.removed)
@@ -468,7 +498,7 @@ func (r *renderer) renderProfiles(snap *state.Snapshot, self types.NodeView, nm 
 
 		for _, id := range nm.changed {
 			peer, ok := snap.GetNode(types.NodeID(id)) //nolint:gosec // NodeID types are the same value
-			if _, existed := base.peers[id]; !existed || !ok || !ownerProfileUnchanged(base, peer) {
+			if _, existed := base.peers.Get(id); !existed || !ok || !ownerProfileUnchanged(base, peer) {
 				same = false
 
 				break
@@ -502,8 +532,12 @@ func ownerProfileUnchanged(base *netMap, node types.NodeView) bool {
 	return ok && reflect.DeepEqual(old, p)
 }
 
-func sortedPeers(peers map[tailcfg.NodeID]*tailcfg.Node) []*tailcfg.Node {
-	out := slices.Collect(maps.Values(peers))
+func sortedPeers(peers *peerMap) []*tailcfg.Node {
+	out := make([]*tailcfg.Node, 0, peers.Len())
+	for _, p := range peers.All() {
+		out = append(out, p)
+	}
+
 	slices.SortFunc(out, func(a, b *tailcfg.Node) int { return cmp.Compare(a.ID, b.ID) })
 
 	return out
