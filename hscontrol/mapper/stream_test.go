@@ -569,3 +569,40 @@ func BenchmarkStreamsRetainedHeap(b *testing.B) {
 		runtime.KeepAlive(streams)
 	}
 }
+
+// BenchmarkScalingOneEndpointWrite measures the total cost of one node
+// moving its endpoint, every connected session included, across tailnet
+// sizes: how the common write scales with N.
+func BenchmarkScalingOneEndpointWrite(b *testing.B) {
+	for _, n := range []int{100, 200, 400, 800} {
+		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) {
+			cfg, s := benchState(b, n)
+			ids := s.ListNodes()
+			hub := NewHub()
+
+			streams := make([]*Stream, 0, n)
+			for _, nv := range ids.All() {
+				st := NewStream(cfg, hub, nv.ID(), capVer)
+				_, err := st.Initial(s.Snapshot())
+				require.NoError(b, err)
+				streams = append(streams, st)
+			}
+
+			port := uint16(1)
+			for b.Loop() {
+				node := ids.At(int(port) % n).AsStruct()
+				node.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), port)}
+				s.PutNodeInStoreForTest(*node)
+				port++
+
+				snap := s.Snapshot()
+				for _, st := range streams {
+					_, err := st.Update(snap)
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		})
+	}
+}

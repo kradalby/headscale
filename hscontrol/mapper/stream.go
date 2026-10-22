@@ -74,6 +74,7 @@ func (st *Stream) Update(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) {
 	}
 
 	out := diff(st.sent, nm)
+	peersMoved := peerSetChanged(nm)
 	st.sent = nm
 
 	// base was only for this diff; keeping it would chain every render
@@ -81,7 +82,7 @@ func (st *Stream) Update(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) {
 	nm.base = nil
 
 	if len(out) > 0 {
-		if peerSetChanged(nm) {
+		if peersMoved {
 			st.hub.setLastPeers(st.nodeID, peerIDs(nm))
 		}
 
