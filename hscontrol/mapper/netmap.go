@@ -104,11 +104,19 @@ func newRenderer(cfg *types.Config, shared *peerRenders, nodeID types.NodeID, ca
 // does not depend on who views it: everything but its routes. Each stored
 // node is rendered once per capability version and policy, not once per
 // viewer.
-//
-// ponytail: one entry per node ID and capability version ever rendered;
-// bounded by nodes.
 type peerRenders struct {
 	m sync.Map // peerRenderID -> *peerRender
+}
+
+// forget drops the renders of a deleted node.
+func (pr *peerRenders) forget(id types.NodeID) {
+	pr.m.Range(func(k, _ any) bool {
+		if k.(peerRenderID).node == id { //nolint:forcetypeassert // only peerRenderID is stored
+			pr.m.Delete(k)
+		}
+
+		return true
+	})
 }
 
 type peerRenderID struct {

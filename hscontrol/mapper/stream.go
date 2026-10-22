@@ -1,6 +1,7 @@
 package mapper
 
 import (
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -153,13 +154,14 @@ type Hub struct {
 
 	// sentPeers is the peer set each node was last sent, kept across its
 	// sessions so a reconnect can announce peers removed in between.
-	// ponytail: one ID slice per node ever connected; bounded by nodes.
 	sentPeers map[types.NodeID][]tailcfg.NodeID
 
 	// renders is shared by every session's renderer.
 	renders *peerRenders
 
 	closed bool
+	// done ends [Hub.Watch].
+	done chan struct{}
 }
 
 // Session is one live map stream of a node.
@@ -180,6 +182,58 @@ func NewHub() *Hub {
 		sessions:  make(map[types.NodeID]map[*Session]struct{}),
 		sentPeers: make(map[types.NodeID][]tailcfg.NodeID),
 		renders:   &peerRenders{},
+		done:      make(chan struct{}),
+	}
+}
+
+// Watch follows s until the hub closes and ends the sessions of nodes that
+// are deleted, even a session whose write is blocked, which its own loop
+// cannot notice. It also forgets what the hub kept for a deleted node.
+func (h *Hub) Watch(s *state.State) {
+	sub := s.Subscribe()
+	defer sub.Close()
+
+	rev := s.Snapshot().Rev()
+
+	for {
+		select {
+		case <-h.done:
+			return
+		case <-sub.C:
+		}
+
+		snap := s.Snapshot()
+		changed, ok := snap.NodesChangedSince(rev)
+		rev = snap.Rev()
+
+		if !ok {
+			changed = slices.Collect(maps.Keys(h.Connected()))
+		}
+
+		for _, id := range changed {
+			if _, live := snap.GetNode(id); !live {
+				h.forget(id)
+			}
+		}
+	}
+}
+
+// forget ends the sessions of a deleted node and drops its hub state.
+func (h *Hub) forget(id types.NodeID) {
+	h.mu.Lock()
+
+	stops := make([]func(), 0, len(h.sessions[id]))
+	for s := range h.sessions[id] {
+		stops = append(stops, s.stop)
+	}
+
+	delete(h.sentPeers, id)
+	h.mu.Unlock()
+
+	h.renders.forget(id)
+
+	for _, stop := range stops {
+		stop()
 	}
 }
 
@@ -270,6 +324,10 @@ func (h *Hub) Ping(nodeID types.NodeID, pr *tailcfg.PingRequest) bool {
 // Close ends every session and refuses new ones.
 func (h *Hub) Close() {
 	h.mu.Lock()
+	if !h.closed {
+		close(h.done)
+	}
+
 	h.closed = true
 
 	var stops []func()

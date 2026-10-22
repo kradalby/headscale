@@ -142,6 +142,9 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		mapHub:            mapper.NewHub(),
 	}
 
+	// The hub ends a deleted node's sessions; Close stops it.
+	go app.mapHub.Watch(s)
+
 	if cfg.DNSConfig.Certificates.Enabled {
 		app.challenges = dns.NewChallenges(
 			cfg.DNSChallenge.Provider,

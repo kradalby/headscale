@@ -268,10 +268,6 @@ func (m *mapSession) serveLongPoll() {
 
 	m.log.Info().Caller().Msg("node has connected")
 
-	// A deleted node's session must end even while a write to it is
-	// blocked, which the loop below cannot notice.
-	go m.stopWhenNodeGone(ctx)
-
 	stream := mapper.NewStream(m.h.cfg, m.h.mapHub, m.node.ID, m.capVer)
 
 	initial, err := stream.Initial(m.h.state.Snapshot())
@@ -360,25 +356,6 @@ func (m *mapSession) serveLongPoll() {
 
 			mapResponseSent.WithLabelValues("ok", "keepalive").Inc()
 			m.resetKeepAlive()
-		}
-	}
-}
-
-// stopWhenNodeGone stops the session once its node is deleted.
-func (m *mapSession) stopWhenNodeGone(ctx context.Context) {
-	sub := m.h.state.Subscribe()
-	defer sub.Close()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-sub.C:
-			if _, ok := m.h.state.GetNodeByID(m.node.ID); !ok {
-				m.stop()
-
-				return
-			}
 		}
 	}
 }
