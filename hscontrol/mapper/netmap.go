@@ -56,16 +56,15 @@ type netMap struct {
 	sameProfiles bool
 }
 
-// renderer renders one node's netMap. It keeps every peer it rendered and
-// renders a peer again only when the peer or what its rendering reads
-// (policy, policy-relevant node facts, primary routes) changed; other
-// writes, the common endpoint and online updates, cost one peer each.
+// renderer renders one node's netMap. After the first render it renders a
+// peer again only when the peer or what its rendering reads (its policy
+// caps, its routes) changed; the common endpoint and online updates cost
+// one peer each.
 type renderer struct {
 	cfg    *types.Config
 	nodeID types.NodeID
 	capVer tailcfg.CapabilityVersion
 
-	peers  map[types.NodeID]renderedPeer
 	last   *netMap
 	shared *peerRenders
 
@@ -91,12 +90,6 @@ type renderer struct {
 	rendered int
 }
 
-type renderedPeer struct {
-	node types.NodeView // the stored node; stored nodes are immutable
-	key  renderKey
-	tn   *tailcfg.Node
-}
-
 // renderKey is what a peer's rendering reads besides the peer and the
 // viewer: how the policy renders peers, and the primary routes.
 type renderKey struct {
@@ -118,7 +111,6 @@ func newRenderer(cfg *types.Config, shared *peerRenders, nodeID types.NodeID, ca
 		cfg:    cfg,
 		nodeID: nodeID,
 		capVer: capVer,
-		peers:  make(map[types.NodeID]renderedPeer),
 		shared: shared,
 	}
 }
@@ -372,8 +364,6 @@ func (r *renderer) renderChangedPeers(pr *peerRendering, nm *netMap) (bool, erro
 	defer func() { nm.peers = peers.Done() }()
 
 	drop := func(id types.NodeID) {
-		delete(r.peers, id)
-
 		if _, sent := peers.Get(id.NodeID()); sent {
 			peers.Delete(id.NodeID())
 			nm.removed = append(nm.removed, id.NodeID())
@@ -399,11 +389,6 @@ func (r *renderer) renderChangedPeers(pr *peerRendering, nm *netMap) (bool, erro
 
 		peer, exists := pr.snap.GetNode(id)
 		if !exists {
-			continue
-		}
-
-		_, force := forced[id]
-		if prev, isPeer := r.peers[id]; isPeer && prev.node == peer && !force {
 			continue
 		}
 
@@ -433,38 +418,13 @@ func (r *renderer) renderChangedPeers(pr *peerRendering, nm *netMap) (bool, erro
 	return true, nil
 }
 
-// renderAllPeers checks every peer, rendering those whose inputs moved.
+// renderAllPeers renders every peer, for a session's first render.
 func (r *renderer) renderAllPeers(pr *peerRendering, nm *netMap) error {
-	ids := pr.snap.PeerView(r.nodeID)
+	peers := newPeerMap().Edit()
 
-	// A fast path that gave up may have rendered some peers already; they
-	// are in r.peers and are compared like any other below.
-	nm.changed = nil
-
-	start := newPeerMap()
-	if nm.base != nil {
-		start = nm.base.peers
-	}
-
-	peers := start.Edit()
-
-	current := make(map[types.NodeID]struct{}, len(ids))
-
-	for _, id := range ids {
+	for _, id := range pr.snap.PeerView(r.nodeID) {
 		peer, ok := pr.snap.GetNode(id)
 		if id == r.nodeID || !ok {
-			continue
-		}
-
-		current[id] = struct{}{}
-
-		prev, cached := r.peers[id]
-		if cached && prev.node == peer && prev.key == pr.key {
-			if have, _ := peers.Get(prev.tn.ID); have != prev.tn {
-				peers.Set(prev.tn.ID, prev.tn)
-				nm.changed = append(nm.changed, prev.tn.ID)
-			}
-
 			continue
 		}
 
@@ -473,35 +433,14 @@ func (r *renderer) renderAllPeers(pr *peerRendering, nm *netMap) error {
 			return err
 		}
 
-		if ptn == nil {
-			delete(current, id)
-
-			continue
-		}
-
-		if have, _ := peers.Get(ptn.ID); have != ptn {
+		if ptn != nil {
 			peers.Set(ptn.ID, ptn)
 			nm.changed = append(nm.changed, ptn.ID)
 		}
 	}
 
-	for id := range r.peers {
-		if _, ok := current[id]; !ok {
-			delete(r.peers, id)
-		}
-	}
-
-	for id := range start.All() {
-		if _, ok := current[types.NodeID(id)]; !ok { //nolint:gosec // NodeID types are the same value
-			peers.Delete(id)
-			nm.removed = append(nm.removed, id)
-		}
-	}
-
 	nm.peers = peers.Done()
 
-	slices.Sort(nm.changed)
-	slices.Sort(nm.removed)
 	r.markRendered(pr)
 
 	return nil
@@ -576,8 +515,6 @@ func (pr *peerRendering) render(peer types.NodeView) (*tailcfg.Node, error) {
 
 	ptn := withRoutes(base, pr.snap.RoutesForPeer(pr.self, peer, pr.matchers))
 	r.rendered++
-
-	r.peers[peer.ID()] = renderedPeer{node: peer, key: pr.key, tn: ptn}
 
 	return ptn, nil
 }
