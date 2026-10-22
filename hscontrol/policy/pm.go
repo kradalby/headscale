@@ -60,9 +60,9 @@ type PolicyManager interface {
 	// not a per-viewer view.
 	NodeCapMap(id types.NodeID) tailcfg.NodeCapMap
 
-	// NodeCapMaps returns the per-node policy CapMap. The outer map is
-	// a fresh container; the inner [tailcfg.NodeCapMap] values are
-	// shared with the manager and read-only.
+	// NodeCapMaps returns the per-node policy CapMap. It is shared with
+	// the manager, which never changes it, and must not be modified:
+	// every map render reads it.
 	NodeCapMaps() map[types.NodeID]tailcfg.NodeCapMap
 
 	Version() int

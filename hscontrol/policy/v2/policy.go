@@ -1364,8 +1364,5 @@ func (pm *PolicyManager) NodeCapMaps() map[types.NodeID]tailcfg.NodeCapMap {
 		return nil
 	}
 
-	out := make(map[types.NodeID]tailcfg.NodeCapMap, len(pm.nodeAttrsMap))
-	maps.Copy(out, pm.nodeAttrsMap)
-
-	return out
+	return pm.nodeAttrsMap
 }

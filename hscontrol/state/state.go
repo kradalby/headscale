@@ -1050,12 +1050,6 @@ func (s *State) NodeCapMap(id types.NodeID) tailcfg.NodeCapMap {
 	return s.Snapshot().Policy().NodeCapMap(id)
 }
 
-// NodeCapMaps returns a snapshot of every node's policy CapMap so
-// callers can amortise lock acquisition over a peer loop.
-func (s *State) NodeCapMaps() map[types.NodeID]tailcfg.NodeCapMap {
-	return s.Snapshot().Policy().NodeCapMaps()
-}
-
 // NodeCanHaveTag checks if a node is allowed to have a specific tag.
 func (s *State) NodeCanHaveTag(node types.NodeView, tag string) bool {
 	return s.Snapshot().Policy().NodeCanHaveTag(node, tag)
