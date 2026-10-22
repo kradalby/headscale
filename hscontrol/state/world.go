@@ -1216,6 +1216,14 @@ type NodesVersion struct{ m *nodeMap }
 // NodesVersion returns the nodes of s.
 func (s *Snapshot) NodesVersion() NodesVersion { return NodesVersion{m: s.nodes()} }
 
+// NodesTouchedSince returns the nodes the writes from v to s touched,
+// possibly with repeats and nodes that changed back, while v is within
+// the nodes' edit log; otherwise false, and the caller should not compare
+// every node when a smaller set covers what it needs.
+func (s *Snapshot) NodesTouchedSince(v NodesVersion) ([]types.NodeID, bool) {
+	return s.nodes().ChangedSince(v.m)
+}
+
 // NodesChangedSince returns the nodes that differ between v and s, each
 // once; added and deleted nodes included.
 func (s *Snapshot) NodesChangedSince(v NodesVersion) []types.NodeID {

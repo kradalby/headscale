@@ -1164,3 +1164,37 @@ func benchEncode(resp *tailcfg.MapResponse, compress bool) ([]byte, error) {
 
 	return zstdframe.AppendEncode(nil, b, zstdframe.FastestCompression), nil
 }
+
+// TestStreamCatchesUpFromBeyondTheEditLog lets more writes go by than the
+// edit log holds before a session updates, so it and its class's shared
+// map rebuild from the view, and checks the client then equals a fresh
+// session's.
+func TestStreamCatchesUpFromBeyondTheEditLog(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+
+	st := NewStream(cfg, NewHub(), ids[0], capVer)
+	initial, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	client := newModelClient(initial[0])
+
+	for i := range 300 {
+		n := mustNode(t, s, ids[1+i%2]).AsStruct()
+		n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(i+1))} //nolint:gosec // small
+		s.PutNodeInStoreForTest(*n)
+	}
+
+	_, ok := s.Snapshot().NodesTouchedSince(st.r.lastNodes)
+	require.False(t, ok, "the session must be beyond the edit log")
+
+	resps, err := st.Update(s.Snapshot())
+	require.NoError(t, err)
+
+	for _, r := range resps {
+		client.apply(r)
+	}
+
+	fresh, err := NewStream(cfg, NewHub(), ids[0], capVer).Initial(s.Snapshot())
+	require.NoError(t, err)
+	require.Empty(t, client.sameAs(newModelClient(fresh[0])))
+}

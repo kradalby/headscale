@@ -404,7 +404,14 @@ func (r *renderer) renderPeers(
 		added, gone = mergeDiff(r.lastPeerIDs, view)
 	}
 
-	candidates := slices.Concat(added, gone, snap.NodesChangedSince(r.lastNodes))
+	// A session further behind than the edit log compares its whole view,
+	// not every node.
+	touched, ok := snap.NodesTouchedSince(r.lastNodes)
+	if !ok {
+		touched = view
+	}
+
+	candidates := slices.Concat(added, gone, touched)
 
 	if key.policy != r.lastKey.policy {
 		candidates = append(candidates, snap.CapsChangedSince(r.lastCaps)...)
@@ -480,7 +487,14 @@ func (r *renderer) markRendered(snap *state.Snapshot, key renderKey, self types.
 // costs its own edits, not a copy of every peer.
 type classMaps struct {
 	mu sync.Mutex
-	m  map[classKey]*classPeers
+	m  map[classKey]*classEntry
+}
+
+// classEntry is one class's latest map; mu serialises its update, so
+// classes update in parallel.
+type classEntry struct {
+	mu  sync.Mutex
+	cur *classPeers
 }
 
 // classKey names a class by its view, which the snapshot shares and never
@@ -501,7 +515,8 @@ type classPeers struct {
 
 // get returns the peer map of view at snap: every node of view rendered
 // for capVer without routes, but those that cannot be rendered. It updates
-// the class's latest map by the nodes and caps changed since.
+// the class's latest map by the nodes and caps changed since, or rebuilds
+// it from the view when that is too far back to tell.
 func (cm *classMaps) get(
 	cfg *types.Config,
 	renders *peerRenders,
@@ -518,13 +533,23 @@ func (cm *classMaps) get(
 	key := classKey{view: &view[0], n: len(view), capVer: capVer}
 
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
 	if cm.m == nil {
-		cm.m = make(map[classKey]*classPeers)
+		cm.m = make(map[classKey]*classEntry)
 	}
 
-	cur := cm.m[key]
+	entry, ok := cm.m[key]
+	if !ok {
+		cm.prune(snap)
+
+		entry = &classEntry{}
+		cm.m[key] = entry
+	}
+	cm.mu.Unlock()
+
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	cur := entry.cur
 	if cur != nil && cur.rev == snap.Rev() {
 		return cur.peers
 	}
@@ -535,16 +560,12 @@ func (cm *classMaps) get(
 		return found
 	}
 
-	var (
-		e       *graph.MapEdit[tailcfg.NodeID, *tailcfg.Node]
-		changed []types.NodeID
-	)
+	e, changed := newPeerMap().Edit(), view
 
-	if cur == nil {
-		e, changed = newPeerMap().Edit(), view
-	} else {
-		e = cur.peers.Edit()
-		changed = slices.Concat(snap.NodesChangedSince(cur.nodes), snap.CapsChangedSince(cur.caps))
+	if cur != nil {
+		if touched, ok := snap.NodesTouchedSince(cur.nodes); ok {
+			e, changed = cur.peers.Edit(), slices.Concat(touched, snap.CapsChangedSince(cur.caps))
+		}
 	}
 
 	for _, id := range changed {
@@ -576,11 +597,7 @@ func (cm *classMaps) get(
 	// A session rendering an older snapshot than the class's latest keeps
 	// its map to itself.
 	if cur == nil || cur.rev < snap.Rev() {
-		if cur == nil {
-			cm.prune(snap)
-		}
-
-		cm.m[key] = next
+		entry.cur = next
 	}
 
 	return next.peers
