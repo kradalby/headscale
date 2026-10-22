@@ -941,9 +941,9 @@ func TestUpdateHostnameFromClient(t *testing.T) {
 	}, time.Second, 50*time.Millisecond, "hostname updates should be reflected in node list with new suffix")
 }
 
-// peersMapResponseType is the [change.Change.Type] label that
-// headscale_mapresponse_generated_total carries for a whole-peer resend,
-// which is what [change.NodeAdded] produces.
+// peersMapResponseType is the response_type label that
+// headscale_mapresponse_generated_total carries for a response resending
+// whole peers.
 const peersMapResponseType = "peers"
 
 // mapResponseCountsByType reads headscale_mapresponse_generated_total keyed by
@@ -1033,9 +1033,9 @@ func quiescedMapResponseCounts(
 // never read should cost their peers nothing, while a field they do render has
 // to arrive. Shields-up and hostname sit on either side of that line.
 //
-// The observable is headscale_mapresponse_generated_total{response_type="peers"}:
-// [change.NodeAdded] is the whole-peer broadcast the map request path emits for
-// a Hostinfo edit peers read, and [change.Change.Type] labels it "peers".
+// The observable is headscale_mapresponse_generated_total{response_type="peers"},
+// counting responses that resend whole peers: a Hostinfo edit peers read is
+// one, an edit they never read sends nothing.
 func TestHostinfoChangeReachesPeersOnlyWhenPeerVisible(t *testing.T) {
 	IntegrationSkip(t)
 

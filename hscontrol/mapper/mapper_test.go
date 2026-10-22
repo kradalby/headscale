@@ -243,10 +243,6 @@ func TestFullMapResponseSurvivesPeerWithInvalidName(t *testing.T) {
 						Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
 					},
 				},
-				Tuning: types.Tuning{
-					NodeStoreBatchSize:    state.TestBatchSize,
-					NodeStoreBatchTimeout: state.TestBatchTimeout,
-				},
 			}
 
 			database, err := db.NewHeadscaleDatabase(cfg)
@@ -372,9 +368,9 @@ func assertSelfNotAPeer(t *testing.T, nodeID types.NodeID, resp *tailcfg.MapResp
 	}
 }
 
-// TestMapResponseNeverContainsSelfAsPeer drives the [change.Change] shapes the
-// server emits through the response builder for every node, under each policy
-// shape, and asserts the recipient is never present in its own peer fields.
+// TestMapResponseNeverContainsSelfAsPeer streams every node's map through
+// connects, renames, expiry and policy changes under each policy shape, and
+// asserts the recipient is never present in its own peer fields.
 func TestMapResponseNeverContainsSelfAsPeer(t *testing.T) {
 	for _, tt := range policyShapes {
 		t.Run(tt.name, func(t *testing.T) {
@@ -441,10 +437,6 @@ func TestBackfillNodeIPsReachesBackfilledNode(t *testing.T) {
 			DERPMap: &tailcfg.DERPMap{
 				Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
 			},
-		},
-		Tuning: types.Tuning{
-			NodeStoreBatchSize:    state.TestBatchSize,
-			NodeStoreBatchTimeout: state.TestBatchTimeout,
 		},
 	}
 
@@ -515,10 +507,6 @@ func TestFailedExpiryOfPrimaryAnnouncesBackup(t *testing.T) {
 			DERPMap: &tailcfg.DERPMap{
 				Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
 			},
-		},
-		Tuning: types.Tuning{
-			NodeStoreBatchSize:    state.TestBatchSize,
-			NodeStoreBatchTimeout: state.TestBatchTimeout,
 		},
 	}
 

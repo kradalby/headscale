@@ -41,10 +41,8 @@ type ServerOption func(*serverConfig)
 
 type serverConfig struct {
 	batchDelay            time.Duration
-	bufferedChanSize      int
 	ephemeralTimeout      time.Duration
 	nodeExpiry            time.Duration
-	batcherWorkers        int
 	nodeStoreBatchTimeout time.Duration
 	taildropEnabled       bool
 	logTailEnabled        bool
@@ -57,28 +55,15 @@ type serverConfig struct {
 func defaultServerConfig() *serverConfig {
 	return &serverConfig{
 		batchDelay:       50 * time.Millisecond,
-		bufferedChanSize: 30,
-		batcherWorkers:   1,
 		ephemeralTimeout: 30 * time.Second,
 		taildropEnabled:  true,
 	}
 }
 
-// WithBatchDelay sets the batcher's change coalescing delay.
+// WithBatchDelay sets how long a map session coalesces a burst of
+// changes into one update.
 func WithBatchDelay(d time.Duration) ServerOption {
 	return func(c *serverConfig) { c.batchDelay = d }
-}
-
-// WithBufferedChanSize sets the per-node map session channel buffer.
-func WithBufferedChanSize(n int) ServerOption {
-	return func(c *serverConfig) { c.bufferedChanSize = n }
-}
-
-// WithBatcherWorkers sets the number of batcher worker goroutines.
-// Defaults to 1 for deterministic tests; pass
-// [types.DefaultBatcherWorkers] to match production concurrency.
-func WithBatcherWorkers(n int) ServerOption {
-	return func(c *serverConfig) { c.batcherWorkers = n }
 }
 
 // WithNodeStoreBatchTimeout overrides the server's default write-batch wait.
@@ -179,10 +164,8 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 		Taildrop: types.TaildropConfig{Enabled: sc.taildropEnabled},
 		LogTail:  types.LogTailConfig{Enabled: sc.logTailEnabled},
 		Tuning: types.Tuning{
-			BatchChangeDelay:               sc.batchDelay,
-			BatcherWorkers:                 sc.batcherWorkers,
-			NodeMapSessionBufferedChanSize: sc.bufferedChanSize,
-			NodeStoreBatchTimeout:          sc.nodeStoreBatchTimeout,
+			BatchChangeDelay:      sc.batchDelay,
+			NodeStoreBatchTimeout: sc.nodeStoreBatchTimeout,
 		},
 	}
 
