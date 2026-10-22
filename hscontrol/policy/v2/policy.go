@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -387,6 +388,18 @@ func (pm *PolicyManager) sshRuleAllowsUser(rule SSH, srcNode types.NodeView, loc
 	lp, ok := resolveLocalparts(rule.Users.LocalpartEntries(), pm.users)[srcNode.User().ID()]
 
 	return ok && lp == localUser
+}
+
+// SameForPeers reports whether pm and prev render every node as a peer
+// the same: neither has per-node rules (autogroup:self, via), so peer
+// visibility and routes read only the global filter, and both hold the
+// same filter and node capabilities. A recompile after a join usually
+// does, and then no session needs to look at its peers again.
+func (pm *PolicyManager) SameForPeers(prev *PolicyManager) bool {
+	return pm != nil && prev != nil &&
+		!pm.needsPerNodeFilter && !prev.needsPerNodeFilter &&
+		reflect.DeepEqual(pm.filter, prev.filter) &&
+		reflect.DeepEqual(pm.nodeAttrsMap, prev.nodeAttrsMap)
 }
 
 // Filter returns the current filter rules for the entire tailnet and the associated matchers.

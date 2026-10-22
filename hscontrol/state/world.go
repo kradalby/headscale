@@ -16,6 +16,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -109,8 +110,11 @@ type world struct {
 	index       graph.Derived[*nodeIndex]
 	policyNodes graph.Derived[policyNodes]
 	policy      graph.Derived[*compiledPolicy]
-	peers       graph.Derived[map[types.NodeID][]types.NodeID]
-	primaries   graph.Derived[primaryRoutes]
+	// peerPolicy counts the compiled policies that render nodes as peers
+	// differently; see [policyv2.PolicyManager.SameForPeers].
+	peerPolicy graph.Derived[peerPolicy]
+	peers      graph.Derived[map[types.NodeID][]types.NodeID]
+	primaries  graph.Derived[primaryRoutes]
 }
 
 // nodeIndex holds the lookups every reader needs. Each part moves only
@@ -136,6 +140,13 @@ type policyNodes struct {
 	list views.Slice[types.NodeView]
 	from *nodeMap
 	gen  uint64
+}
+
+// peerPolicy is a generation number that moves only when a compiled
+// policy renders peers differently, with the policy it was taken at.
+type peerPolicy struct {
+	pm  policy.PolicyManager
+	gen uint64
 }
 
 // compiledPolicy is the policy compiled against the users and nodes of a
@@ -206,6 +217,19 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 			policyCompiles.WithLabelValues("ok").Inc()
 
 			return &compiledPolicy{pm: pm}
+		})
+
+	w.peerPolicy = graph.NewDerived(g, "peer-policy", func(a, b peerPolicy) bool { return a.gen == b.gen },
+		func(s *graph.Snapshot, prev peerPolicy) peerPolicy {
+			cur := graph.Get(s, w.policy)
+			next, _ := cur.pm.(*policyv2.PolicyManager)
+			last, _ := prev.pm.(*policyv2.PolicyManager)
+
+			if next != nil && next.SameForPeers(last) {
+				return peerPolicy{pm: cur.pm, gen: prev.gen}
+			}
+
+			return peerPolicy{pm: cur.pm, gen: prev.gen + 1}
 		})
 
 	w.peers = graph.NewDerived(g, "peers", samePeerMap,
@@ -1123,6 +1147,10 @@ func (s *Snapshot) NodesChangedSince(v NodesVersion) []types.NodeID {
 
 // NodesRev is the revision of the latest node change.
 func (s *Snapshot) NodesRev() uint64 { return graph.ChangedAt(s.s, s.w.nodes) }
+
+// PeerPolicyRev is the revision of the latest policy compile that
+// renders nodes as peers differently.
+func (s *Snapshot) PeerPolicyRev() uint64 { return graph.ChangedAt(s.s, s.w.peerPolicy) }
 
 // PolicyRev is the revision of the latest policy compile.
 func (s *Snapshot) PolicyRev() uint64 { return graph.ChangedAt(s.s, s.w.policy) }
