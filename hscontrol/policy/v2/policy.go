@@ -11,8 +11,10 @@ import (
 	"net/netip"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
@@ -44,7 +46,16 @@ type PolicyManager struct {
 	aliases      aliasCache
 	// matcherCache holds the matcher of each global rule, by content.
 	matcherCache map[string]matcher.Match
-	nodes        views.Slice[types.NodeView]
+
+	// id identifies this compile. change is [PolicyManager.FilterChangedNodes]
+	// from the compile with id changeFrom, the one this one was made from;
+	// an id, so a compile does not keep the one before it alive. Set
+	// before pm is shared.
+	id         uint64
+	changeFrom uint64
+	change     []types.NodeID
+	changeAll  bool
+	nodes      views.Slice[types.NodeView]
 	// nodesByID indexes nodes; see [PolicyManager.cacheable].
 	nodesByID map[types.NodeID]types.NodeView
 
@@ -258,6 +269,7 @@ func NewPolicyManagerFrom(prev *PolicyManager, b []byte, users []types.User, nod
 	matchers, matcherCache := cachedMatches(filter, prevMatchers)
 
 	pm := &PolicyManager{
+		id:                 compileIDs.Add(1),
 		src:                b,
 		grantResults:       grantResults,
 		aliases:            indexed.aliasesOrNil(),
@@ -508,6 +520,12 @@ func matchKey(rule tailcfg.FilterRule) string {
 // every node reduce its filter again.
 func (pm *PolicyManager) inheritFilters(prev *PolicyManager) {
 	changed, all := pm.FilterChangedNodes(prev)
+
+	// The hub asks the same of the commit's two compiles.
+	if prev != nil {
+		pm.changeFrom, pm.change, pm.changeAll = prev.id, changed, all
+	}
+
 	if all {
 		return
 	}
@@ -532,6 +550,10 @@ func (pm *PolicyManager) inheritFilters(prev *PolicyManager) {
 // it cannot narrow it: a document or users change, per-node rules or SSH
 // rules, which this does not track.
 func (pm *PolicyManager) FilterChangedNodes(prev *PolicyManager) ([]types.NodeID, bool) {
+	if pm != nil && prev != nil && pm.changeFrom == prev.id {
+		return pm.change, pm.changeAll
+	}
+
 	if pm == nil || prev == nil || !bytes.Equal(pm.src, prev.src) || !samePolicyUsers(pm.users, prev.users) ||
 		pm.needsPerNodeFilter || prev.needsPerNodeFilter || pm.pol == nil ||
 		len(pm.pol.SSHs) > 0 {
@@ -619,16 +641,57 @@ func changedRules(a, b []tailcfg.FilterRule) []tailcfg.FilterRule {
 	return out
 }
 
-// ruleKey is a rule's content, in full. A rule that does not encode gets
-// a key of its own, so it counts as changed.
+// ruleKey is a rule's content, in full.
 func ruleKey(r tailcfg.FilterRule) string {
-	b, err := json.Marshal(r)
-	if err != nil {
-		return fmt.Sprintf("unencodable %p", &r)
+	var b strings.Builder
+
+	for _, s := range r.SrcIPs {
+		b.WriteString(s)
+		b.WriteByte(',')
 	}
 
-	return string(b)
+	b.WriteByte('|')
+
+	for _, p := range r.IPProto {
+		b.WriteString(strconv.Itoa(p))
+		b.WriteByte(',')
+	}
+
+	b.WriteByte('|')
+
+	for _, d := range r.DstPorts {
+		b.WriteString(d.IP)
+		b.WriteByte(':')
+		b.WriteString(strconv.Itoa(int(d.Ports.First)))
+		b.WriteByte('-')
+		b.WriteString(strconv.Itoa(int(d.Ports.Last)))
+		b.WriteByte(',')
+	}
+
+	for _, cg := range r.CapGrant {
+		b.WriteByte('|')
+
+		for _, p := range cg.Dsts {
+			b.WriteString(p.String())
+			b.WriteByte(',')
+		}
+
+		for _, c := range slices.Sorted(maps.Keys(cg.CapMap)) {
+			b.WriteString(string(c))
+			b.WriteByte('=')
+
+			for _, v := range cg.CapMap[c] {
+				b.WriteString(string(v))
+				b.WriteByte(';')
+			}
+		}
+	}
+
+	return b.String()
 }
+
+// compileIDs numbers compiles; see [PolicyManager.id].
+var compileIDs atomic.Uint64
 
 // samePolicyUsers reports whether the policy resolves a and b the same.
 func samePolicyUsers(a, b []types.User) bool {
