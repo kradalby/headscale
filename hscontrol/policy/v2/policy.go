@@ -68,6 +68,10 @@ type PolicyManager struct {
 
 	viaOnce sync.Once
 	via     *viaPrep
+
+	// selfRules holds the compiled autogroup:self rules per grant and
+	// user; see [PolicyManager.grantRulesFor].
+	selfRules *xsync.Map[selfRulesKey, []tailcfg.FilterRule]
 	// filterRulesMap holds reduced rules, for packet filters.
 	filterRulesMap *xsync.Map[types.NodeID, []tailcfg.FilterRule]
 	// matchersForNodeMap holds matchers from UNREDUCED rules. Only the
@@ -221,6 +225,7 @@ func NewPolicyManager(b []byte, users []types.User, nodes views.Slice[types.Node
 		nodeAttrsMap:       nodeAttrs,
 		sshPolicyMap:       xsync.NewMap[types.NodeID, *tailcfg.SSHPolicy](),
 		sshPreps:           xsync.NewMap[string, *sshPrep](),
+		selfRules:          xsync.NewMap[selfRulesKey, []tailcfg.FilterRule](),
 		filterRulesMap:     xsync.NewMap[types.NodeID, []tailcfg.FilterRule](),
 		matchersForNodeMap: xsync.NewMap[types.NodeID, []matcher.Match](),
 	}
@@ -512,20 +517,15 @@ func (pm *PolicyManager) BuildPeerClasses(nodes views.Slice[types.NodeView]) *Pe
 		return c
 	}
 
+	matchers := pm.matchers
 	if pm.needsPerNodeFilter {
-		peers := pm.BuildPeerMap(nodes)
-		for _, n := range nodes.All() {
-			ids := peers[n.ID()]
-			slices.Sort(ids)
-
-			c.classOf[n.ID()] = len(c.views)
-			c.views = append(c.views, ids)
-		}
-
-		return c
+		// Every node reads the grants' shared rules and its own
+		// (autogroup:self, via); a node's peers are those the shared rules
+		// give its class, plus those its own rules link it to.
+		matchers = matcher.MatchesFromFilterRules(sharedRules(pm.compiledGrants))
 	}
 
-	srcOf, dstOf := pm.matcherSides(nodes)
+	srcOf, dstOf := matcherSides(matchers, nodes)
 
 	// A class is a pair of sides; nodes come in ID order, so members do.
 	byKey := map[string]int{}
@@ -565,14 +565,194 @@ func (pm *PolicyManager) BuildPeerClasses(nodes views.Slice[types.NodeView]) *Pe
 		c.views = append(c.views, view)
 	}
 
+	if pm.needsPerNodeFilter {
+		pm.addNodeOnlyPeers(c, nodes)
+	}
+
 	return c
 }
 
-// matcherSides evaluates, per node, which of pm.matchers it is a source
-// and a destination of, as bitsets: bit k of a set stands for
-// pm.matchers[k]. nil is the side of no matcher.
-func (pm *PolicyManager) matcherSides(nodes views.Slice[types.NodeView]) ([][]uint64, [][]uint64) {
-	words := (len(pm.matchers) + 63) / 64 //nolint:mnd
+// addNodeOnlyPeers adds to c the peers each node's own rules link it to:
+// a node is linked to every node on the other side of one of its own
+// rules. Nodes are found by address range, not by trying every node.
+func (pm *PolicyManager) addNodeOnlyPeers(c *PeerClasses, nodes views.Slice[types.NodeView]) {
+	idx := newSideIndex(nodes)
+	extra := map[types.NodeID]map[types.NodeID]struct{}{}
+
+	link := func(a, b types.NodeID) {
+		if a == b {
+			return
+		}
+
+		for _, p := range [][2]types.NodeID{{a, b}, {b, a}} {
+			if extra[p[0]] == nil {
+				extra[p[0]] = map[types.NodeID]struct{}{}
+			}
+
+			extra[p[0]][p[1]] = struct{}{}
+		}
+	}
+
+	// Without via grants a node's own rules are its user's self rules,
+	// the same for every untagged node of the user: compile them once.
+	hasVia := slices.ContainsFunc(pm.compiledGrants, func(g compiledGrant) bool { return g.category == grantCategoryVia })
+	byUser := map[uint][]matcher.Match{}
+
+	for _, n := range nodes.All() {
+		var own []matcher.Match
+
+		if uid := n.User(); !hasVia && !n.IsTagged() && uid.Valid() {
+			var ok bool
+			if own, ok = byUser[uid.ID()]; !ok {
+				own = matcher.MatchesFromFilterRules(pm.nodeOnlyRules(n))
+				byUser[uid.ID()] = own
+			}
+		} else {
+			own = matcher.MatchesFromFilterRules(pm.nodeOnlyRules(n))
+		}
+
+		for _, m := range own {
+			srcs, dsts := idx.srcs(&m), idx.dsts(&m)
+
+			if slices.Contains(srcs, n.ID()) {
+				for _, d := range dsts {
+					link(n.ID(), d)
+				}
+			}
+
+			if slices.Contains(dsts, n.ID()) {
+				for _, s := range srcs {
+					link(s, n.ID())
+				}
+			}
+		}
+	}
+
+	for id, peers := range extra {
+		ci := c.classOf[id]
+		shared := c.views[ci]
+
+		outside := false
+
+		for p := range peers {
+			if _, found := slices.BinarySearch(shared, p); !found {
+				outside = true
+
+				break
+			}
+		}
+
+		if !outside {
+			continue
+		}
+
+		view := slices.Clone(shared)
+		for p := range peers {
+			view = append(view, p)
+		}
+
+		slices.Sort(view)
+
+		c.classOf[id] = len(c.views)
+		c.views = append(c.views, slices.Compact(view))
+	}
+}
+
+// sideIndex finds the nodes on one side of a matcher, as
+// [types.NodeView.CanAccessWithRoutes] tests them: by address, by an
+// overlapping subnet route, and, as a destination, exit nodes for an
+// internet destination.
+type sideIndex struct {
+	byIP    []ipNode // sorted by address
+	routers []types.NodeView
+	exits   []types.NodeID
+}
+
+type ipNode struct {
+	ip netip.Addr
+	id types.NodeID
+}
+
+func newSideIndex(nodes views.Slice[types.NodeView]) *sideIndex {
+	idx := &sideIndex{}
+
+	for _, n := range nodes.All() {
+		if !n.Valid() {
+			continue
+		}
+
+		for _, ip := range n.IPs() {
+			idx.byIP = append(idx.byIP, ipNode{ip: ip, id: n.ID()})
+		}
+
+		if len(n.SubnetRoutes()) > 0 {
+			idx.routers = append(idx.routers, n)
+		}
+
+		if n.IsExitNode() {
+			idx.exits = append(idx.exits, n.ID())
+		}
+	}
+
+	slices.SortFunc(idx.byIP, func(a, b ipNode) int { return a.ip.Compare(b.ip) })
+
+	return idx
+}
+
+func (idx *sideIndex) inSet(set *netipx.IPSet) []types.NodeID {
+	var out []types.NodeID
+
+	if set == nil {
+		return nil
+	}
+
+	for _, r := range set.Ranges() {
+		i, _ := slices.BinarySearchFunc(idx.byIP, r.From(), func(e ipNode, ip netip.Addr) int { return e.ip.Compare(ip) })
+		for ; i < len(idx.byIP) && idx.byIP[i].ip.Compare(r.To()) <= 0; i++ {
+			out = append(out, idx.byIP[i].id)
+		}
+	}
+
+	return out
+}
+
+func (idx *sideIndex) srcs(m *matcher.Match) []types.NodeID {
+	out := idx.inSet(m.Srcs())
+
+	for _, r := range idx.routers {
+		if m.SrcsOverlapsPrefixes(r.SubnetRoutes()...) {
+			out = append(out, r.ID())
+		}
+	}
+
+	slices.Sort(out)
+
+	return slices.Compact(out)
+}
+
+func (idx *sideIndex) dsts(m *matcher.Match) []types.NodeID {
+	out := idx.inSet(m.Dests())
+
+	for _, r := range idx.routers {
+		if m.DestsOverlapsPrefixes(r.SubnetRoutes()...) {
+			out = append(out, r.ID())
+		}
+	}
+
+	if m.DestsIsTheInternet() {
+		out = append(out, idx.exits...)
+	}
+
+	slices.Sort(out)
+
+	return slices.Compact(out)
+}
+
+// matcherSides evaluates, per node, which of matchers it is a source and
+// a destination of, as bitsets: bit k of a set stands for matchers[k].
+// nil is the side of no matcher.
+func matcherSides(matchers []matcher.Match, nodes views.Slice[types.NodeView]) ([][]uint64, [][]uint64) {
+	words := (len(matchers) + 63) / 64 //nolint:mnd
 	srcOf := make([][]uint64, nodes.Len())
 	dstOf := make([][]uint64, nodes.Len())
 
@@ -584,8 +764,8 @@ func (pm *PolicyManager) matcherSides(nodes views.Slice[types.NodeView]) ([][]ui
 		ips, subnet, isExit := n.IPs(), n.SubnetRoutes(), n.IsExitNode()
 		routed := len(subnet) > 0
 
-		for k := range pm.matchers {
-			m := &pm.matchers[k]
+		for k := range matchers {
+			m := &matchers[k]
 
 			if m.SrcsContainsIPs(ips...) || (routed && m.SrcsOverlapsPrefixes(subnet...)) {
 				if srcOf[i] == nil {
@@ -675,7 +855,7 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 			ids[i] = n.ID()
 		}
 
-		srcOf, dstOf := pm.matcherSides(nodes)
+		srcOf, dstOf := matcherSides(pm.matchers, nodes)
 		canAccess := canAccessSides
 
 		// Build the map of all peers according to the matchers.
@@ -764,7 +944,43 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 // for a node, combining pre-compiled global rules with per-node self
 // and via rules from the stored compiled grants.
 func (pm *PolicyManager) unreducedRules(node types.NodeView) []tailcfg.FilterRule {
-	return filterRulesForNode(pm.compiledGrants, node, pm.userNodeIdx)
+	var rules []tailcfg.FilterRule
+
+	for i := range pm.compiledGrants {
+		rules = append(rules, pm.compiledGrants[i].rules...)
+		rules = append(rules, pm.grantRulesFor(i, node)...)
+	}
+
+	return mergeFilterRules(rules)
+}
+
+// grantRulesFor is [grantRulesForNode] for pm's grant i. A self grant's
+// rules depend only on the node's user, so they are compiled once per
+// user, not once per node.
+func (pm *PolicyManager) grantRulesFor(i int, node types.NodeView) []tailcfg.FilterRule {
+	cg := &pm.compiledGrants[i]
+	if cg.category != grantCategorySelf {
+		return grantRulesForNode(cg, node, pm.userNodeIdx)
+	}
+
+	if node.IsTagged() || cg.self == nil || !node.User().Valid() {
+		return nil
+	}
+
+	key := selfRulesKey{grant: i, user: node.User().ID()}
+	if rules, ok := pm.selfRules.Load(key); ok {
+		return rules
+	}
+
+	rules := compileSelfForUser(cg, pm.userNodeIdx[key.user])
+	pm.selfRules.Store(key, rules)
+
+	return rules
+}
+
+type selfRulesKey struct {
+	grant int
+	user  uint
 }
 
 // FilterForNode returns the filter rules for a specific node, already reduced

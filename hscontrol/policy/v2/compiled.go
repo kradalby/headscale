@@ -719,31 +719,50 @@ func filterRulesForNode(
 	var rules []tailcfg.FilterRule
 
 	for i := range grants {
-		cg := &grants[i]
-
 		// Pre-compiled rules apply to all grant categories
 		// (empty for via-only grants).
-		rules = append(rules, cg.rules...)
-
-		switch cg.category {
-		case grantCategoryRegular:
-			// Nothing more to do.
-
-		case grantCategorySelf:
-			rules = append(
-				rules,
-				compileAutogroupSelf(cg, node, userIdx)...,
-			)
-
-		case grantCategoryVia:
-			rules = append(
-				rules,
-				compileViaForNode(cg, node)...,
-			)
-		}
+		rules = append(rules, grants[i].rules...)
+		rules = append(rules, grantRulesForNode(&grants[i], node, userIdx)...)
 	}
 
 	return mergeFilterRules(rules)
+}
+
+// sharedRules returns the pre-compiled rules of every grant: what
+// [filterRulesForNode] gives every node before its own rules.
+func sharedRules(grants []compiledGrant) []tailcfg.FilterRule {
+	var rules []tailcfg.FilterRule
+	for i := range grants {
+		rules = append(rules, grants[i].rules...)
+	}
+
+	return mergeFilterRules(rules)
+}
+
+// nodeOnlyRules returns the rules [filterRulesForNode] adds for node alone
+// (autogroup:self, via), unmerged.
+func (pm *PolicyManager) nodeOnlyRules(node types.NodeView) []tailcfg.FilterRule {
+	rules := make([]tailcfg.FilterRule, 0, len(pm.compiledGrants))
+	for i := range pm.compiledGrants {
+		rules = append(rules, pm.grantRulesFor(i, node)...)
+	}
+
+	return rules
+}
+
+// grantRulesForNode returns the rules a per-node grant category adds for
+// node.
+func grantRulesForNode(cg *compiledGrant, node types.NodeView, userIdx userNodeIndex) []tailcfg.FilterRule {
+	switch cg.category {
+	case grantCategorySelf:
+		return compileAutogroupSelf(cg, node, userIdx)
+	case grantCategoryVia:
+		return compileViaForNode(cg, node)
+	case grantCategoryRegular:
+		return nil
+	}
+
+	return nil
 }
 
 // compileAutogroupSelf produces filter rules for autogroup:self
