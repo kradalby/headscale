@@ -938,3 +938,64 @@ func TestDeletedNodeInterruptsBlockedWrite(t *testing.T) {
 		t.Fatal("deleting a node must interrupt its blocked map response write")
 	}
 }
+
+// TestDeletedNodeEndsStreamCleanly serves a long poll over HTTP/2, as the
+// Noise server does, and deletes the node while the session is idle. Nothing
+// is left to interrupt, so the stream must end with END_STREAM: an expired
+// write deadline resets it with INTERNAL_ERROR, which the client reports as a
+// server error.
+func TestDeletedNodeEndsStreamCleanly(t *testing.T) {
+	t.Parallel()
+
+	app := createTestApp(t)
+
+	user := app.state.CreateUserForTest("poll-delete-clean-user")
+	pak, err := app.state.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
+	require.NoError(t, err)
+
+	nodeKey := key.NewNode()
+
+	_, err = app.handleRegister(context.Background(), tailcfg.RegisterRequest{
+		Auth:     &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
+		NodeKey:  nodeKey.Public(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "poll-delete-clean-node"},
+		Expiry:   time.Now().Add(24 * time.Hour),
+	}, key.NewMachine().Public())
+	require.NoError(t, err)
+
+	nodeView, ok := app.state.GetNodeByNodeKey(nodeKey.Public())
+	require.True(t, ok)
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		app.newMapSession(r.Context(), tailcfg.MapRequest{
+			Stream:  true,
+			Version: tailcfg.CapabilityVersion(100),
+		}, w, nodeView.AsStruct()).serveLongPoll() //nolint:contextcheck // the session carries r.Context()
+	}))
+	srv.Config.Protocols = new(http.Protocols)
+	srv.Config.Protocols.SetUnencryptedHTTP2(true)
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	h2c := new(http.Protocols)
+	h2c.SetUnencryptedHTTP2(true)
+	client := &http.Client{Transport: &http.Transport{Protocols: h2c}}
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL, nil)
+	require.NoError(t, err)
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+
+	defer resp.Body.Close()
+
+	var size [4]byte
+
+	_, err = io.ReadFull(resp.Body, size[:])
+	require.NoError(t, err, "expected the initial map")
+
+	require.NoError(t, app.state.DeleteNode(nodeView))
+
+	_, err = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, err, "stopping an idle session must end the stream, not reset it")
+}

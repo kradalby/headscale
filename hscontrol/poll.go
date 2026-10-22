@@ -30,8 +30,8 @@ const (
 	stopWriteGrace = 5 * time.Second
 )
 
-// errMapSessionStopped is a write refused because the batcher stopped the
-// session; the poll loop ends as if it had seen cancelCh.
+// errMapSessionStopped is a write refused because the session was stopped;
+// the poll loop ends as if it had seen cancelCh.
 var errMapSessionStopped = errors.New("map session stopped")
 
 type contextKey string
@@ -50,7 +50,7 @@ type mapSession struct {
 	cancelChClosed atomic.Bool
 
 	// writing is set while [mapSession.writeMap] runs, so
-	// [mapSession.stopFromBatcher] interrupts only a write that may be stuck.
+	// [mapSession.stop] interrupts only a write that may be stuck.
 	writing atomic.Bool
 
 	keepAlive       time.Duration
@@ -111,13 +111,12 @@ func (m *mapSession) stop() {
 
 		// A channel signal cannot interrupt a response write that is blocked on
 		// HTTP/2 flow control, so a client that stopped reading would keep the
-		// map session, and therefore server shutdown, alive indefinitely.
-		// An expired write deadline resets the stream with INTERNAL_ERROR,
-		// which the client reports as a server error, so it is only a bound:
-		// an idle session sees cancelCh, and a write the client keeps reading
-		// finishes first, both ending the stream cleanly. writeMap checks
-		// cancelChClosed after raising writing, so one side always sees the
-		// other.
+		// map session, and therefore server shutdown, alive indefinitely. An
+		// expired write deadline resets the stream with INTERNAL_ERROR, which
+		// the client reports as a server error, so it is only a bound: an idle
+		// session sees cancelCh, and a write the client keeps reading finishes
+		// first, both ending the stream cleanly. writeMap checks cancelChClosed
+		// after raising writing, so one side always sees the other.
 		if !m.writing.Load() {
 			return
 		}
@@ -389,6 +388,12 @@ func (m *mapSession) stopWhenNodeGone(ctx context.Context) {
 func (m *mapSession) writeAll(resps []*tailcfg.MapResponse) bool {
 	for _, resp := range resps {
 		err := m.writeMap(resp)
+		if errors.Is(err, errMapSessionStopped) {
+			mapResponseEnded.WithLabelValues("cancelled").Inc()
+
+			return false
+		}
+
 		if err != nil {
 			m.log.Error().Caller().Err(err).Msg("cannot write update to client")
 			mapResponseSent.WithLabelValues("error", "update").Inc()
