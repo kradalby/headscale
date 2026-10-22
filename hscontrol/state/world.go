@@ -898,6 +898,9 @@ func (s *Snapshot) index() *nodeIndex { return graph.Get(s.s, s.w.index) }
 // Rev identifies the commit this snapshot shows.
 func (s *Snapshot) Rev() uint64 { return s.s.Rev() }
 
+// Time is when the commit this snapshot shows was made.
+func (s *Snapshot) Time() time.Time { return s.s.Time() }
+
 func (s *Snapshot) nodes() *nodeMap { return graph.Get(s.s, s.w.nodes) }
 
 // GetNode returns the node with id.

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Graph holds cells and publishes snapshots of their values.
@@ -123,6 +124,7 @@ func (g *Graph) register(c cellDef) int {
 // and [Get] are safe for concurrent use once it is published.
 type Snapshot struct {
 	rev     uint64
+	at      time.Time
 	values  []any
 	changed []uint64 // revision at which each value last changed
 	deps    [][]int  // derived cells: the cells read by their last computation
@@ -135,6 +137,9 @@ type Snapshot struct {
 
 // Rev is the snapshot's revision. Revisions increase by one per commit.
 func (s *Snapshot) Rev() uint64 { return s.rev }
+
+// Time is when the snapshot was committed.
+func (s *Snapshot) Time() time.Time { return s.at }
 
 // Get returns the value of n in s.
 func Get[T any](s *Snapshot, n Node[T]) T {
@@ -245,6 +250,7 @@ func (g *Graph) Update(fn func(tx *Tx) error) (*Snapshot, error) {
 func (g *Graph) commit(prev *Snapshot, sets map[int]any) (*Snapshot, bool) {
 	n := len(g.cells)
 	next := &Snapshot{
+		at:      time.Now(),
 		values:  make([]any, n),
 		changed: make([]uint64, n),
 		deps:    make([][]int, n),
