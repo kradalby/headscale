@@ -59,9 +59,9 @@ type renderer struct {
 	last   *netMap
 	shared *peerRenders
 
-	// The revision, peer inputs and peer set of the previous render, for
+	// The nodes, peer inputs and peer set of the previous render, for
 	// telling which peers a later snapshot can have changed.
-	lastRev      uint64
+	lastNodes    state.NodesVersion
 	lastKey      renderKey
 	lastPeersRev uint64
 
@@ -306,10 +306,7 @@ func (r *renderer) renderChangedPeers(pr *peerRendering, nm *netMap) (bool, erro
 		return false, nil
 	}
 
-	ids, ok := pr.snap.NodesChangedSince(r.lastRev)
-	if !ok {
-		return false, nil
-	}
+	ids := pr.snap.NodesChangedSince(r.lastNodes)
 
 	nm.peers = maps.Clone(base.peers)
 
@@ -420,7 +417,7 @@ func (r *renderer) renderAllPeers(pr *peerRendering, nm *netMap) error {
 }
 
 func (r *renderer) markRendered(pr *peerRendering) {
-	r.lastRev, r.lastKey, r.lastPeersRev = pr.snap.Rev(), pr.key, pr.snap.PeersRev()
+	r.lastNodes, r.lastKey, r.lastPeersRev = pr.snap.NodesVersion(), pr.key, pr.snap.PeersRev()
 }
 
 // render renders peer for this viewer and records it. It returns nil, with

@@ -2,6 +2,7 @@ package state
 
 import (
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"net/netip"
 	"slices"
@@ -438,12 +439,12 @@ func TestGetNodesByMachineKeyAllUsers(t *testing.T) {
 // indexed.
 func nodeKeyIndexMismatch(snap *Snapshot) string {
 	idx := snap.index()
-	if len(idx.byNodeKey) != len(idx.all) {
-		return fmt.Sprintf("index holds %d keys, list holds %d nodes", len(idx.byNodeKey), len(idx.all))
+	if keys := idx.byNodeKey.Groups.Len(); keys != len(idx.all) {
+		return fmt.Sprintf("index holds %d keys, list holds %d nodes", keys, len(idx.all))
 	}
 
 	for _, nv := range idx.all {
-		got, ok := idx.byNodeKey[nv.NodeKey()]
+		got, ok := snap.GetNodeByNodeKey(nv.NodeKey())
 		if !ok {
 			return fmt.Sprintf("node %d: key not indexed", nv.ID())
 		}
@@ -922,7 +923,7 @@ func TestWorldGroupCommitsQueuedWrites(t *testing.T) {
 // BenchmarkWorldEndpointWrite measures one endpoint update, the most common
 // write: it must not recompile the policy or rebuild peers.
 func BenchmarkWorldEndpointWrite(b *testing.B) {
-	for _, n := range []int{500, 2000} {
+	for _, n := range []int{500, 2000, 10000} {
 		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) {
 			alice := &types.User{Name: "alice"}
 			alice.ID = 1
@@ -991,15 +992,14 @@ func TestWorldIndexMatchesFullBuild(t *testing.T) {
 		}
 
 		snap := w.snapshot()
-		got, want := snap.index(), buildIndex(graph.Get(snap.s, w.nodes))
+		got, want := snap.index(), updateIndex(nil, snap.nodes())
 
 		require.Equal(t, want.all, got.all, "step %d", step)
-		require.Equal(t, want.byID, got.byID, "step %d", step)
-		require.Equal(t, want.byNodeKey, got.byNodeKey, "step %d", step)
-		require.Equal(t, want.byMachineKey, got.byMachineKey, "step %d", step)
-		require.Equal(t, want.byUser, got.byUser, "step %d", step)
+		require.Equal(t, groups(want.byNodeKey), groups(got.byNodeKey), "step %d", step)
+		require.Equal(t, groups(want.byMachineKey), groups(got.byMachineKey), "step %d", step)
+		require.Equal(t, groups(want.byUser), groups(got.byUser), "step %d", step)
 
-		fresh := electPrimaryRoutes(graph.Get(snap.s, w.nodes).byID, nil)
+		fresh := electPrimaryRoutes(snap.nodes(), nil)
 		for p, primary := range snap.PrimaryRoutes() {
 			require.Contains(t, fresh, p, "step %d: stale prefix", step)
 
@@ -1055,4 +1055,11 @@ func TestWorldBatchTimeoutElectsTogether(t *testing.T) {
 
 	primary, _ = w.snapshot().PrimaryRouteFor(route)
 	assert.Equal(t, types.NodeID(2), primary, "the incumbent keeps the route")
+}
+
+// groups returns an index's groups as a native map, for comparing.
+func groups[G comparable](g graph.Grouped[types.NodeID, *types.Node, G]) map[G][]types.NodeID {
+	out := maps.Collect(g.Groups.All())
+
+	return out
 }

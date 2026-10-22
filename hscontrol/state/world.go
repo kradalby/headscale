@@ -1,6 +1,7 @@
 package state
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"maps"
@@ -63,61 +64,13 @@ var (
 	}, []string{"result"})
 )
 
-// nodeTable is the set of nodes. A stored node is never mutated: a write
+// nodeMap is the set of nodes. A stored node is never mutated: a write
 // stores a modified copy, so a [types.NodeView] taken from a snapshot stays
 // valid and two snapshots holding the same pointer hold the same node.
-type nodeTable struct {
-	byID map[types.NodeID]*types.Node
+type nodeMap = graph.Map[types.NodeID, *types.Node]
 
-	// changes lists the nodes each recent commit changed, oldest first,
-	// covering every node change after revision floor. A reader finds what
-	// moved since a revision it saw without comparing every node.
-	changes []tableChange
-	floor   uint64
-}
-
-type tableChange struct {
-	rev uint64
-	ids []types.NodeID
-}
-
-// tableChangeLog bounds the change log; a reader further behind compares
-// every node instead.
-const tableChangeLog = 256
-
-// with returns the table holding byID after the commit at rev changed ids.
-func (t *nodeTable) with(byID map[types.NodeID]*types.Node, rev uint64, ids []types.NodeID) *nodeTable {
-	changes, floor := t.changes, t.floor
-	if len(changes) >= tableChangeLog {
-		floor = changes[0].rev
-		changes = changes[1:]
-	}
-
-	next := make([]tableChange, len(changes), len(changes)+1)
-	copy(next, changes)
-
-	return &nodeTable{
-		byID:    byID,
-		changes: append(next, tableChange{rev: rev, ids: ids}),
-		floor:   floor,
-	}
-}
-
-// changedSince returns the nodes changed after revision rev, possibly with
-// repeats, and false when the log no longer reaches back that far.
-func (t *nodeTable) changedSince(rev uint64) ([]types.NodeID, bool) {
-	if rev < t.floor {
-		return nil, false
-	}
-
-	var out []types.NodeID
-
-	for i := len(t.changes) - 1; i >= 0 && t.changes[i].rev > rev; i-- {
-		out = append(out, t.changes[i].ids...)
-	}
-
-	return out, true
-}
+// nodeEdit stages a write to the nodes.
+type nodeEdit = graph.MapEdit[types.NodeID, *types.Node]
 
 // world is the control plane as a dataflow graph. Its inputs are what the
 // server is told: nodes, users, the policy document, the DERP map and the
@@ -147,7 +100,7 @@ type world struct {
 	batchTimeout time.Duration
 	full         chan struct{}
 
-	nodes        graph.Input[*nodeTable]
+	nodes        graph.Input[*nodeMap]
 	users        graph.Input[[]types.User]
 	policySrc    graph.Input[[]byte]
 	derpMap      graph.Input[*tailcfg.DERPMap]
@@ -160,24 +113,26 @@ type world struct {
 	primaries   graph.Derived[primaryRoutes]
 }
 
-// nodeIndex holds the lookups every reader needs, rebuilt when a node
-// changes.
+// nodeIndex holds the lookups every reader needs. Each part moves only
+// the nodes a commit changed.
 type nodeIndex struct {
-	from         *nodeTable           // the table this indexes
-	pos          map[types.NodeID]int // position in all
-	all          []types.NodeView     // sorted by ID
-	byID         map[types.NodeID]types.NodeView
-	byNodeKey    map[key.NodePublic]types.NodeView
-	byMachineKey map[key.MachinePublic]map[types.UserID]types.NodeView
-	byUser       map[types.UserID][]types.NodeView
+	from         *nodeMap         // the nodes this indexes
+	all          []types.NodeView // sorted by ID
+	byNodeKey    graph.Grouped[types.NodeID, *types.Node, key.NodePublic]
+	byMachineKey graph.Grouped[types.NodeID, *types.Node, key.MachinePublic]
+	// byUser holds user-owned nodes; tagged nodes are owned by their tags.
+	byUser graph.Grouped[types.NodeID, *types.Node, types.UserID]
 }
 
 // policyNodes is the node list as the policy reads it. It changes only
 // when a node joins, leaves or changes a field the policy reads
 // ([types.NodeView.HasPolicyChange]); keeping the older views otherwise is
-// what spares an endpoint update a policy compile.
+// what spares an endpoint update a policy compile. gen counts the lists,
+// from the nodes it was last checked against.
 type policyNodes struct {
 	list views.Slice[types.NodeView]
+	from *nodeMap
+	gen  uint64
 }
 
 // compiledPolicy is the policy compiled against the users and nodes of a
@@ -194,13 +149,14 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 	g := graph.New()
 	w := &world{g: g, full: make(chan struct{}, 1)}
 
-	// The first commit, revision 1, publishes these nodes.
-	table := &nodeTable{byID: make(map[types.NodeID]*types.Node, len(nodes)), floor: 1}
+	byID := make(map[types.NodeID]*types.Node, len(nodes))
 	for _, n := range nodes {
-		table.byID[n.ID] = n
+		byID[n.ID] = n
 	}
 
-	w.nodes = graph.NewInput(g, "nodes", table, graph.Same[*nodeTable])
+	table := graph.NewMap(graph.Same[*types.Node], byID)
+
+	w.nodes = graph.NewInput(g, "nodes", table, graph.Same[*nodeMap])
 	// Users are refreshed on every registration; an unchanged list must not
 	// recompile the policy.
 	w.users = graph.NewInput(g, "users", users, samePolicyUsers)
@@ -216,8 +172,13 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 		})
 
 	w.policyNodes = graph.NewDerived(g, "policy-nodes", samePolicyNodes,
-		func(s *graph.Snapshot, _ policyNodes) policyNodes {
-			return policyNodes{list: views.SliceOf(graph.Get(s, w.index).all)}
+		func(s *graph.Snapshot, prev policyNodes) policyNodes {
+			nodes := graph.Get(s, w.nodes)
+			if prev.from != nil && !policyFactsChanged(prev.from, nodes) {
+				return policyNodes{list: prev.list, from: nodes, gen: prev.gen}
+			}
+
+			return policyNodes{list: views.SliceOf(graph.Get(s, w.index).all), from: nodes, gen: prev.gen + 1}
 		})
 
 	w.policy = graph.NewDerived(g, "policy", graph.Same[*compiledPolicy],
@@ -266,7 +227,7 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 				return primaryRoutes{routes: prev.routes, byNode: prev.byNode, from: t}
 			}
 
-			return newPrimaryRoutes(electPrimaryRoutes(t.byID, prev.routes), t)
+			return newPrimaryRoutes(electPrimaryRoutes(t, prev.routes), t)
 		})
 
 	snap, err := g.Update(func(*graph.Tx) error { return nil })
@@ -278,142 +239,93 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 		return nil, fmt.Errorf("compiling policy: %w", cp.err)
 	}
 
-	worldNodes.Set(float64(len(table.byID)))
+	worldNodes.Set(float64(table.Len()))
 
 	return w, nil
 }
 
-// changedNodes returns the IDs whose stored node differs between from and
-// to, or ok false when a node joined or left. Stored nodes are immutable,
-// so a pointer comparison finds them.
-func changedNodes(from, to *nodeTable) ([]types.NodeID, bool) {
-	if len(from.byID) != len(to.byID) {
-		return nil, false
+// updateIndex returns the index of nodes, moving only the nodes changed
+// since prev was built.
+func updateIndex(prev *nodeIndex, nodes *nodeMap) *nodeIndex {
+	var p nodeIndex
+	if prev != nil {
+		p = *prev
 	}
 
-	var changed []types.NodeID
-
-	for id, n := range to.byID {
-		old, ok := from.byID[id]
-		if !ok {
-			return nil, false
-		}
-
-		if old != n {
-			changed = append(changed, id)
-		}
-	}
-
-	return changed, true
-}
-
-// updateIndex returns the index of t, patching prev in place of a rebuild
-// when only node payloads changed.
-func updateIndex(prev *nodeIndex, t *nodeTable) *nodeIndex {
-	if prev == nil {
-		return buildIndex(t)
-	}
-
-	changed, ok := changedNodes(prev.from, t)
-	if !ok {
-		return buildIndex(t)
-	}
-
-	for _, id := range changed {
-		old, n := prev.from.byID[id], t.byID[id]
-		if old.NodeKey != n.NodeKey || old.MachineKey != n.MachineKey ||
-			old.TypedUserID() != n.TypedUserID() || old.IsTagged() != n.IsTagged() {
-			return buildIndex(t)
-		}
-	}
-
-	idx := &nodeIndex{
-		from:         t,
-		pos:          prev.pos,
-		all:          slices.Clone(prev.all),
-		byID:         maps.Clone(prev.byID),
-		byNodeKey:    maps.Clone(prev.byNodeKey),
-		byMachineKey: maps.Clone(prev.byMachineKey),
-		byUser:       maps.Clone(prev.byUser),
-	}
-
-	for _, id := range changed {
-		n := t.byID[id]
-		nv := n.View()
-		uid := n.TypedUserID()
-
-		idx.all[idx.pos[id]] = nv
-		idx.byID[id] = nv
-		idx.byNodeKey[n.NodeKey] = nv
-
-		byUser := maps.Clone(idx.byMachineKey[n.MachineKey])
-		byUser[uid] = nv
-		idx.byMachineKey[n.MachineKey] = byUser
-
-		if !n.IsTagged() {
-			nodes := slices.Clone(idx.byUser[uid])
-			for i := range nodes {
-				if nodes[i].ID() == id {
-					nodes[i] = nv
-				}
+	return &nodeIndex{
+		from: nodes,
+		all:  patchSorted(p.from, p.all, nodes),
+		byNodeKey: graph.GroupBy(p.byNodeKey, nodes, func(_ types.NodeID, n *types.Node) []key.NodePublic {
+			return []key.NodePublic{n.NodeKey}
+		}),
+		byMachineKey: graph.GroupBy(p.byMachineKey, nodes, func(_ types.NodeID, n *types.Node) []key.MachinePublic {
+			return []key.MachinePublic{n.MachineKey}
+		}),
+		byUser: graph.GroupBy(p.byUser, nodes, func(_ types.NodeID, n *types.Node) []types.UserID {
+			if n.IsTagged() {
+				return nil
 			}
 
-			idx.byUser[uid] = nodes
-		}
+			return []types.UserID{n.TypedUserID()}
+		}),
 	}
-
-	return idx
 }
 
-func buildIndex(t *nodeTable) *nodeIndex {
-	idx := &nodeIndex{
-		from:         t,
-		pos:          make(map[types.NodeID]int, len(t.byID)),
-		all:          make([]types.NodeView, 0, len(t.byID)),
-		byID:         make(map[types.NodeID]types.NodeView, len(t.byID)),
-		byNodeKey:    make(map[key.NodePublic]types.NodeView, len(t.byID)),
-		byMachineKey: make(map[key.MachinePublic]map[types.UserID]types.NodeView),
-		byUser:       make(map[types.UserID][]types.NodeView),
-	}
+// patchSorted returns the views of to sorted by ID, given all, the sorted
+// views of from.
+func patchSorted(from *nodeMap, all []types.NodeView, to *nodeMap) []types.NodeView {
+	byID := func(nv types.NodeView, id types.NodeID) int { return cmp.Compare(nv.ID(), id) }
 
-	for _, id := range slices.Sorted(maps.Keys(t.byID)) {
-		n := t.byID[id]
-		nv := n.View()
-		idx.pos[id] = len(idx.all)
-		idx.all = append(idx.all, nv)
-		idx.byID[id] = nv
-		idx.byNodeKey[n.NodeKey] = nv
-
-		uid := n.TypedUserID()
-		// Tagged nodes are owned by their tags, not a user.
-		if !n.IsTagged() {
-			idx.byUser[uid] = append(idx.byUser[uid], nv)
+	if from == nil {
+		out := make([]types.NodeView, 0, to.Len())
+		for _, n := range to.All() {
+			out = append(out, n.View())
 		}
 
-		if idx.byMachineKey[n.MachineKey] == nil {
-			idx.byMachineKey[n.MachineKey] = make(map[types.UserID]types.NodeView)
-		}
+		slices.SortFunc(out, func(a, b types.NodeView) int { return cmp.Compare(a.ID(), b.ID()) })
 
-		idx.byMachineKey[n.MachineKey][uid] = nv
+		return out
 	}
 
-	return idx
+	changed := graph.Changes(from, to)
+	if len(changed) == 0 {
+		return all
+	}
+
+	out := slices.Clone(all)
+
+	for _, id := range changed {
+		i, found := slices.BinarySearchFunc(out, id, byID)
+		n, ok := to.Get(id)
+
+		switch {
+		case found && ok:
+			out[i] = n.View()
+		case found:
+			out = slices.Delete(out, i, i+1)
+		case ok:
+			out = slices.Insert(out, i, n.View())
+		}
+	}
+
+	return out
 }
 
-func samePolicyNodes(a, b policyNodes) bool {
-	if a.list.Len() != b.list.Len() {
-		return false
-	}
+func samePolicyNodes(a, b policyNodes) bool { return a.gen == b.gen }
 
-	for i := range a.list.Len() {
-		// Stored nodes are immutable: the same view is the same node.
-		x, y := a.list.At(i), b.list.At(i)
-		if x != y && (x.ID() != y.ID() || x.HasPolicyChange(y)) {
-			return false
+// policyFactsChanged reports whether a node joined, left or changed a
+// field the policy reads between from and to.
+func policyFactsChanged(from, to *nodeMap) bool {
+	for _, id := range graph.Changes(from, to) {
+		old, wasOK := from.Get(id)
+		n, isOK := to.Get(id)
+
+		if wasOK != isOK || old.View().HasPolicyChange(n.View()) {
+			return true
 		}
 	}
 
-	return true
+	return false
 }
 
 // samePolicyUsers reports whether the policy resolves both user lists the
@@ -423,16 +335,16 @@ func samePolicyUsers(a, b []types.User) bool {
 	return slices.EqualFunc(a, b, func(x, y types.User) bool { return x.PolicyEqual(&y) })
 }
 
-// primaryRoutes is the prefix→primary election and the node table it was
-// held against.
+// primaryRoutes is the prefix→primary election and the nodes it was held
+// against.
 type primaryRoutes struct {
 	routes map[netip.Prefix]types.NodeID
 	// byNode is routes inverted, each node's prefixes sorted.
 	byNode map[types.NodeID][]netip.Prefix
-	from   *nodeTable
+	from   *nodeMap
 }
 
-func newPrimaryRoutes(routes map[netip.Prefix]types.NodeID, from *nodeTable) primaryRoutes {
+func newPrimaryRoutes(routes map[netip.Prefix]types.NodeID, from *nodeMap) primaryRoutes {
 	byNode := make(map[types.NodeID][]netip.Prefix)
 	for p, id := range routes {
 		byNode[id] = append(byNode[id], p)
@@ -447,19 +359,21 @@ func newPrimaryRoutes(routes map[netip.Prefix]types.NodeID, from *nodeTable) pri
 
 func samePrimaries(a, b primaryRoutes) bool { return maps.Equal(a.routes, b.routes) }
 
-// electionInputsChanged reports whether a node joined or left or a stored
-// node changed what the election reads: online and health state and the
-// approved, announced routes.
-func electionInputsChanged(from, to *nodeTable) bool {
-	changed, ok := changedNodes(from, to)
-	if !ok {
-		return true
-	}
+// electionInputsChanged reports whether a node changed what the election
+// reads: online and health state and the approved, announced routes. A
+// node that joins or leaves matters only if it approves routes.
+func electionInputsChanged(from, to *nodeMap) bool {
+	for _, id := range graph.Changes(from, to) {
+		old, wasOK := from.Get(id)
+		n, isOK := to.Get(id)
 
-	for _, id := range changed {
-		old, n := from.byID[id], to.byID[id]
-		if old.Online() != n.Online() || old.Unhealthy != n.Unhealthy ||
-			!slices.Equal(old.AllApprovedRoutes(), n.AllApprovedRoutes()) {
+		switch {
+		case wasOK && isOK:
+			if old.Online() != n.Online() || old.Unhealthy != n.Unhealthy ||
+				!slices.Equal(old.AllApprovedRoutes(), n.AllApprovedRoutes()) {
+				return true
+			}
+		case wasOK && len(old.AllApprovedRoutes()) > 0, isOK && len(n.AllApprovedRoutes()) > 0:
 			return true
 		}
 	}
@@ -478,19 +392,18 @@ func (w *world) snapshot() *Snapshot {
 
 // nodeWrite is one queued change to the node table; see [world.update].
 type nodeWrite struct {
-	fn   func(nodes map[types.NodeID]*types.Node) []types.NodeID
+	fn   func(nodes *nodeEdit)
 	done chan *Snapshot
 }
 
-// update commits fn applied to a copy of the node table and returns the
-// snapshot holding it. fn returns the IDs it changed and must not modify
-// nodes when it returns none.
+// update commits fn's edit of the nodes and returns the snapshot holding
+// it.
 //
 // Writes that arrive while a commit runs share the next one (group
 // commit): a burst of joins, deletes or endpoint updates costs one policy
 // compile and one peer rebuild instead of one each, and an idle write pays
 // no wait.
-func (w *world) update(fn func(nodes map[types.NodeID]*types.Node) []types.NodeID) *Snapshot {
+func (w *world) update(fn func(nodes *nodeEdit)) *Snapshot {
 	nw := &nodeWrite{fn: fn, done: make(chan *Snapshot, 1)}
 
 	w.writeMu.Lock()
@@ -550,19 +463,19 @@ func (w *world) commitWrites() {
 
 	snap, _ := w.g.Update(func(tx *graph.Tx) error {
 		cur := graph.Peek(tx, w.nodes)
-		next := maps.Clone(cur.byID)
+		e := cur.Edit()
 
-		var changed []types.NodeID
 		for _, nw := range batch {
-			changed = append(changed, nw.fn(next)...)
+			nw.fn(e)
 		}
 
-		if len(changed) == 0 {
+		next := e.Done()
+		if next == cur {
 			return nil
 		}
 
-		graph.Set(tx, w.nodes, cur.with(next, tx.Rev(), changed))
-		worldNodes.Set(float64(len(next)))
+		graph.Set(tx, w.nodes, next)
+		worldNodes.Set(float64(next.Len()))
 		worldCommits.Inc()
 
 		return nil
@@ -594,12 +507,10 @@ type UpdateNodeFunc func(n *types.Node)
 // PutNode stores n, replacing any node with its ID. Its GivenName is made
 // unique first. It returns the stored node.
 func (w *world) PutNode(n types.Node) types.NodeView {
-	snap := w.update(func(nodes map[types.NodeID]*types.Node) []types.NodeID {
+	snap := w.update(func(nodes *nodeEdit) {
 		stored := n
 		stored.GivenName = uniqueGivenName(nodes, n.ID, n.GivenName)
-		nodes[n.ID] = &stored
-
-		return []types.NodeID{n.ID}
+		nodes.Set(n.ID, &stored)
 	})
 
 	nv, _ := snap.GetNode(n.ID)
@@ -639,11 +550,9 @@ func (w *world) updateNodes(
 		return w.snapshot()
 	}
 
-	return w.update(func(nodes map[types.NodeID]*types.Node) []types.NodeID {
-		var changed []types.NodeID
-
+	return w.update(func(nodes *nodeEdit) {
 		for id, fn := range updates {
-			cur, ok := nodes[id]
+			cur, ok := nodes.Get(id)
 			if !ok {
 				continue
 			}
@@ -659,25 +568,14 @@ func (w *world) updateNodes(
 				next.GivenName = uniqueGivenName(nodes, id, next.GivenName)
 			}
 
-			nodes[id] = next
-			changed = append(changed, id)
+			nodes.Set(id, next)
 		}
-
-		return changed
 	})
 }
 
 // DeleteNode removes the node with id.
 func (w *world) DeleteNode(id types.NodeID) {
-	w.update(func(nodes map[types.NodeID]*types.Node) []types.NodeID {
-		if _, ok := nodes[id]; !ok {
-			return nil
-		}
-
-		delete(nodes, id)
-
-		return []types.NodeID{id}
-	})
+	w.update(func(nodes *nodeEdit) { nodes.Delete(id) })
 }
 
 // SetGivenName renames a node to exactly name, rejecting an invalid label
@@ -685,33 +583,31 @@ func (w *world) DeleteNode(id types.NodeID) {
 func (w *world) SetGivenName(id types.NodeID, name string) (types.NodeView, error) {
 	var err error
 
-	snap := w.update(func(nodes map[types.NodeID]*types.Node) []types.NodeID {
-		cur, ok := nodes[id]
+	snap := w.update(func(nodes *nodeEdit) {
+		cur, ok := nodes.Get(id)
 		if !ok {
 			err = ErrNodeNotFound
 
-			return nil
+			return
 		}
 
 		if dnsname.ValidLabel(name) != nil {
 			err = ErrGivenNameInvalid
 
-			return nil
+			return
 		}
 
-		for oid, other := range nodes {
+		for oid, other := range nodes.All() {
 			if oid != id && strings.EqualFold(other.GivenName, name) {
 				err = ErrGivenNameTaken
 
-				return nil
+				return
 			}
 		}
 
 		next := cur.Clone()
 		next.GivenName = name
-		nodes[id] = next
-
-		return []types.NodeID{id}
+		nodes.Set(id, next)
 	})
 
 	if err != nil {
@@ -735,13 +631,9 @@ func (w *world) SetUsers(users []types.User) {
 		graph.Set(tx, w.users, users)
 
 		cur := graph.Peek(tx, w.nodes)
+		e := cur.Edit()
 
-		var (
-			next    map[types.NodeID]*types.Node
-			changed []types.NodeID
-		)
-
-		for id, n := range cur.byID {
+		for id, n := range cur.All() {
 			if n.User == nil {
 				continue
 			}
@@ -751,19 +643,14 @@ func (w *world) SetUsers(users []types.User) {
 				continue
 			}
 
-			if next == nil {
-				next = maps.Clone(cur.byID)
-			}
-
 			c := n.Clone()
 			uc := *u
 			c.User = &uc
-			next[id] = c
-			changed = append(changed, id)
+			e.Set(id, c)
 		}
 
-		if next != nil {
-			graph.Set(tx, w.nodes, cur.with(next, tx.Rev(), changed))
+		if next := e.Done(); next != cur {
+			graph.Set(tx, w.nodes, next)
 		}
 
 		worldCommits.Inc()
@@ -810,14 +697,14 @@ func (w *world) SetExtraRecords(records []tailcfg.DNSRecord) {
 // uniqueGivenName returns a DNS label for self based on base that no other
 // node holds: base, base-1, base-2, … An empty base becomes
 // [fallbackGivenName]. DNS is case-insensitive, so "Laptop" holds "laptop".
-func uniqueGivenName(nodes map[types.NodeID]*types.Node, self types.NodeID, base string) string {
+func uniqueGivenName(nodes *nodeEdit, self types.NodeID, base string) string {
 	if base == "" {
 		base = fallbackGivenName
 	}
 
-	taken := make(map[string]struct{}, len(nodes))
+	taken := make(map[string]struct{}, nodes.Len())
 
-	for id, n := range nodes {
+	for id, n := range nodes.All() {
 		if id != self {
 			taken[strings.ToLower(n.GivenName)] = struct{}{}
 		}
@@ -835,11 +722,18 @@ func uniqueGivenName(nodes map[types.NodeID]*types.Node, self types.NodeID, base
 
 // onlineAdvertisers maps each non-exit prefix to the IDs of online nodes
 // that approve it, in ID order.
-func onlineAdvertisers(nodes map[types.NodeID]*types.Node) map[netip.Prefix][]types.NodeID {
+func onlineAdvertisers(nodes *nodeMap) map[netip.Prefix][]types.NodeID {
 	advertisers := make(map[netip.Prefix][]types.NodeID)
 
-	for _, id := range slices.Sorted(maps.Keys(nodes)) {
-		n := nodes[id]
+	var ids []types.NodeID
+	for id := range nodes.All() {
+		ids = append(ids, id)
+	}
+
+	slices.Sort(ids)
+
+	for _, id := range ids {
+		n, _ := nodes.Get(id)
 		if n.IsOnline == nil || !*n.IsOnline {
 			continue
 		}
@@ -863,22 +757,27 @@ func onlineAdvertisers(nodes map[types.NodeID]*types.Node) map[netip.Prefix][]ty
 // primary that is still a candidate keeps it: pointing peers at another
 // node the prober declared unreachable is worse than leaving it unmapped.
 func electPrimaryRoutes(
-	nodes map[types.NodeID]*types.Node,
+	nodes *nodeMap,
 	prev map[netip.Prefix]types.NodeID,
 ) map[netip.Prefix]types.NodeID {
 	advertisers := onlineAdvertisers(nodes)
 	routes := make(map[netip.Prefix]types.NodeID, len(advertisers))
+	healthy := func(id types.NodeID) bool {
+		n, _ := nodes.Get(id)
+
+		return !n.Unhealthy
+	}
 
 	for prefix, candidates := range advertisers {
 		cur, hadPrimary := prev[prefix]
 		incumbent := hadPrimary && slices.Contains(candidates, cur)
 
-		if incumbent && !nodes[cur].Unhealthy {
+		if incumbent && healthy(cur) {
 			routes[prefix] = cur
 			continue
 		}
 
-		idx := slices.IndexFunc(candidates, func(c types.NodeID) bool { return !nodes[c].Unhealthy })
+		idx := slices.IndexFunc(candidates, healthy)
 
 		switch {
 		case idx >= 0:
@@ -905,24 +804,56 @@ func (s *Snapshot) index() *nodeIndex { return graph.Get(s.s, s.w.index) }
 // Rev identifies the commit this snapshot shows.
 func (s *Snapshot) Rev() uint64 { return s.s.Rev() }
 
+func (s *Snapshot) nodes() *nodeMap { return graph.Get(s.s, s.w.nodes) }
+
 // GetNode returns the node with id.
 func (s *Snapshot) GetNode(id types.NodeID) (types.NodeView, bool) {
-	nv, ok := s.index().byID[id]
+	n, ok := s.nodes().Get(id)
+	if !ok {
+		return types.NodeView{}, false
+	}
 
-	return nv, ok
+	return n.View(), true
 }
 
 // GetNodeByNodeKey returns the node holding nodeKey.
 func (s *Snapshot) GetNodeByNodeKey(nodeKey key.NodePublic) (types.NodeView, bool) {
-	nv, ok := s.index().byNodeKey[nodeKey]
+	ids, _ := s.index().byNodeKey.Groups.Get(nodeKey)
+	if len(ids) == 0 {
+		return types.NodeView{}, false
+	}
 
-	return nv, ok
+	return s.GetNode(ids[0])
 }
 
 // GetNodesByMachineKeyAllUsers returns every node sharing machineKey,
 // keyed by owning UserID; tagged nodes are under UserID(0).
 func (s *Snapshot) GetNodesByMachineKeyAllUsers(machineKey key.MachinePublic) map[types.UserID]types.NodeView {
-	return maps.Clone(s.index().byMachineKey[machineKey])
+	ids, _ := s.index().byMachineKey.Groups.Get(machineKey)
+	if len(ids) == 0 {
+		return nil
+	}
+
+	out := make(map[types.UserID]types.NodeView, len(ids))
+	for _, nv := range s.gather(ids) {
+		out[nv.TypedUserID()] = nv
+	}
+
+	return out
+}
+
+// gather returns the views of ids, skipping any no longer stored.
+func (s *Snapshot) gather(ids []types.NodeID) []types.NodeView {
+	nodes := s.nodes()
+	out := make([]types.NodeView, 0, len(ids))
+
+	for _, id := range ids {
+		if n, ok := nodes.Get(id); ok {
+			out = append(out, n.View())
+		}
+	}
+
+	return out
 }
 
 // ListNodes returns every node, sorted by ID.
@@ -932,7 +863,9 @@ func (s *Snapshot) ListNodes() views.Slice[types.NodeView] {
 
 // ListNodesByUser returns the user-owned nodes of uid.
 func (s *Snapshot) ListNodesByUser(uid types.UserID) views.Slice[types.NodeView] {
-	return views.SliceOf(s.index().byUser[uid])
+	ids, _ := s.index().byUser.Groups.Get(uid)
+
+	return views.SliceOf(s.gather(ids))
 }
 
 // ListPeerIDs returns the sorted IDs of the nodes id can see, as a copy
@@ -949,17 +882,7 @@ func (s *Snapshot) PeerIDs(id types.NodeID) []types.NodeID {
 
 // ListPeers returns the nodes id can see, sorted by ID.
 func (s *Snapshot) ListPeers(id types.NodeID) views.Slice[types.NodeView] {
-	byID := s.index().byID
-	ids := s.PeerIDs(id)
-	peers := make([]types.NodeView, 0, len(ids))
-
-	for _, pid := range ids {
-		if nv, ok := byID[pid]; ok {
-			peers = append(peers, nv)
-		}
-	}
-
-	return views.SliceOf(peers)
+	return views.SliceOf(s.gather(s.PeerIDs(id)))
 }
 
 // Policy returns the compiled policy.
@@ -1001,7 +924,7 @@ func (s *Snapshot) PrimaryRoutesForNode(id types.NodeID) []netip.Prefix {
 func (s *Snapshot) HANodes() map[netip.Prefix][]types.NodeID {
 	out := make(map[netip.Prefix][]types.NodeID)
 
-	for p, ids := range onlineAdvertisers(graph.Get(s.s, s.w.nodes).byID) {
+	for p, ids := range onlineAdvertisers(graph.Get(s.s, s.w.nodes)) {
 		if len(ids) >= 2 {
 			out[p] = ids
 		}
@@ -1013,7 +936,7 @@ func (s *Snapshot) HANodes() map[netip.Prefix][]types.NodeID {
 // IsNodeHealthy reports the HA prober's view of id; unknown nodes are
 // healthy.
 func (s *Snapshot) IsNodeHealthy(id types.NodeID) bool {
-	n, ok := graph.Get(s.s, s.w.nodes).byID[id]
+	n, ok := graph.Get(s.s, s.w.nodes).Get(id)
 
 	return !ok || !n.Unhealthy
 }
@@ -1085,10 +1008,18 @@ func (s *Snapshot) SelfRoutes(node types.NodeView) []netip.Prefix {
 // Revisions report the commit at which a part of the world last changed,
 // so a renderer can skip work whose inputs are unchanged.
 
-// NodesChangedSince returns the nodes changed after revision rev, possibly
-// with repeats, and false when that is too far back to tell.
-func (s *Snapshot) NodesChangedSince(rev uint64) ([]types.NodeID, bool) {
-	return graph.Get(s.s, s.w.nodes).changedSince(rev)
+// NodesVersion is the nodes of a snapshot, which a reader keeps to ask a
+// later snapshot what changed since. Holding one costs only what later
+// writes replaced.
+type NodesVersion struct{ m *nodeMap }
+
+// NodesVersion returns the nodes of s.
+func (s *Snapshot) NodesVersion() NodesVersion { return NodesVersion{m: s.nodes()} }
+
+// NodesChangedSince returns the nodes that differ between v and s, each
+// once; added and deleted nodes included.
+func (s *Snapshot) NodesChangedSince(v NodesVersion) []types.NodeID {
+	return graph.Changes(v.m, s.nodes())
 }
 
 // NodesRev is the revision of the latest node change.

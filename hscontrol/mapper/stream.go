@@ -1,7 +1,6 @@
 package mapper
 
 import (
-	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -193,7 +192,7 @@ func (h *Hub) Watch(s *state.State) {
 	sub := s.Subscribe()
 	defer sub.Close()
 
-	rev := s.Snapshot().Rev()
+	seen := s.Snapshot().NodesVersion()
 
 	for {
 		select {
@@ -203,12 +202,8 @@ func (h *Hub) Watch(s *state.State) {
 		}
 
 		snap := s.Snapshot()
-		changed, ok := snap.NodesChangedSince(rev)
-		rev = snap.Rev()
-
-		if !ok {
-			changed = slices.Collect(maps.Keys(h.Connected()))
-		}
+		changed := snap.NodesChangedSince(seen)
+		seen = snap.NodesVersion()
 
 		for _, id := range changed {
 			if _, live := snap.GetNode(id); !live {
