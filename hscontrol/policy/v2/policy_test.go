@@ -3056,3 +3056,67 @@ func BenchmarkNewPolicyManagerManyTags(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkNewPolicyManagerAfterTagJoin compiles a CI-shaped policy, 400
+// rules each naming 30 of 1000 tags as sources, after one tagged node
+// joins: from scratch, and from the compile before the join.
+func BenchmarkNewPolicyManagerAfterTagJoin(b *testing.B) {
+	const (
+		tags  = 1000
+		rules = 400
+		nodes = 2500
+	)
+
+	r := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // reproducible benchmark input
+	tag := func(i int) string { return fmt.Sprintf("tag:ci-app%d", i) }
+
+	owners := make(map[string][]string, tags)
+	for i := range tags {
+		owners[tag(i)] = []string{}
+	}
+
+	acls := make([]map[string]any, 0, rules)
+	for range rules {
+		src := make([]string, 30)
+		for j := range src {
+			src[j] = tag(r.IntN(tags))
+		}
+
+		acls = append(acls, map[string]any{"action": "accept", "src": src, "dst": []string{tag(r.IntN(tags)) + ":443"}})
+	}
+
+	pol := must(json.Marshal(map[string]any{"tagOwners": owners, "acls": acls}))
+
+	node := func(i int) *types.Node {
+		v4 := netip.AddrFrom4([4]byte{100, 64, byte(i >> 8), byte(i)}) //nolint:gosec
+
+		return &types.Node{
+			ID: types.NodeID(i + 1), Hostname: fmt.Sprintf("n%d", i), //nolint:gosec
+			IPv4: &v4, Tags: []string{tag(r.IntN(tags))},
+		}
+	}
+
+	before := make(types.Nodes, nodes)
+	for i := range before {
+		before[i] = node(i)
+	}
+
+	after := append(slices.Clone(before), node(nodes))
+
+	prev, err := NewPolicyManager(pol, nil, before.ViewSlice())
+	require.NoError(b, err)
+
+	b.Run("fresh", func(b *testing.B) {
+		for b.Loop() {
+			_, err := NewPolicyManager(pol, nil, after.ViewSlice())
+			require.NoError(b, err)
+		}
+	})
+
+	b.Run("from-previous", func(b *testing.B) {
+		for b.Loop() {
+			_, err := NewPolicyManagerFrom(prev, pol, nil, after.ViewSlice())
+			require.NoError(b, err)
+		}
+	})
+}

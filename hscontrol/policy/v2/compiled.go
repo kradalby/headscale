@@ -106,7 +106,7 @@ func resolveViaDestinations(
 			continue
 		}
 
-		ips, err := d.Resolve(pol, users, nodes)
+		ips, err := pol.resolveAlias(d, users, nodes)
 		if err != nil || ips == nil {
 			continue
 		}
@@ -357,57 +357,110 @@ func diffNodes(prev map[types.NodeID]types.NodeView, nodes views.Slice[types.Nod
 	return c
 }
 
-// reaches reports whether the change can alter grant's compile: a tag or
-// user it names gained or lost a node or address, its autogroups' members
-// moved, or, for a wildcard, which carries every approved subnet, routes
-// changed. Groups and users are checked against any user-owned change;
-// addresses and hosts never change with nodes.
+// reaches reports whether the change can alter grant's compile: one of
+// its aliases resolves differently, see [nodeChange.moves], or a via tag
+// gained or lost a node.
 func (c *nodeChange) reaches(grant Grant) bool {
-	aliases := slices.Concat(grant.Sources, grant.Destinations)
-
 	for _, t := range grant.Via {
 		if _, ok := c.tags[t]; ok {
 			return true
 		}
 	}
 
-	for _, a := range aliases {
-		switch a := a.(type) {
-		case *Tag:
-			if _, ok := c.tags[*a]; ok {
-				return true
-			}
-		case *Username, *Group:
-			if len(c.users) > 0 {
-				return true
-			}
-		case *AutoGroup:
-			// member and self are untagged nodes, recorded by owner;
-			// tagged ones by tag; internet and danger-all are fixed.
-			switch *a {
-			case AutoGroupMember, AutoGroupSelf:
-				if len(c.users) > 0 {
-					return true
-				}
-			case AutoGroupTagged:
-				if len(c.tags) > 0 {
-					return true
-				}
-			case AutoGroupInternet, AutoGroupDangerAll, AutoGroupNonRoot:
-			default:
-				return true
-			}
-		case Asterix:
-			if c.routes {
-				return true
-			}
-		case *Host, *Prefix:
-		default:
-			return true
+	return slices.ContainsFunc(slices.Concat(grant.Sources, grant.Destinations), c.moves)
+}
+
+// moves reports whether the change can alter what a resolves to: a tag or
+// user it names gained or lost a node or address, its autogroup's members
+// moved, or, for a wildcard, which carries every approved subnet, routes
+// changed. Groups and users are checked against any user-owned change;
+// addresses and hosts never change with nodes.
+func (c *nodeChange) moves(a Alias) bool {
+	switch a := a.(type) {
+	case *Tag:
+		_, ok := c.tags[*a]
+
+		return ok
+	case *Username, *Group:
+		return len(c.users) > 0
+	case *AutoGroup:
+		// member and self are untagged nodes, recorded by owner; tagged
+		// ones by tag; internet and danger-all are fixed.
+		switch *a {
+		case AutoGroupMember, AutoGroupSelf:
+			return len(c.users) > 0
+		case AutoGroupTagged:
+			return len(c.tags) > 0
+		case AutoGroupInternet, AutoGroupDangerAll, AutoGroupNonRoot:
+			return false
+		}
+
+		return true
+	case Asterix:
+		return c.routes
+	case *Host, *Prefix:
+		return false
+	default:
+		return true
+	}
+}
+
+// aliasCache holds what aliases resolved to in a compile, for the grants
+// naming them and for the next compile: a CI join recompiles every grant
+// listing the joiner's tag, and each lists dozens of tags that did not
+// change.
+type aliasCache map[aliasKey]aliasResult
+
+type aliasKey struct {
+	kind string
+	name string
+}
+
+type aliasResult struct {
+	alias Alias
+	ips   ResolvedAddresses
+	err   error
+}
+
+func keyOf(a Alias) aliasKey { return aliasKey{kind: fmt.Sprintf("%T", a), name: a.String()} }
+
+// resolveAlias is a.Resolve, once per alias in a compile.
+func (pol *Policy) resolveAlias(a Alias, users types.Users, nodes views.Slice[types.NodeView]) (ResolvedAddresses, error) {
+	if pol == nil || pol.aliases == nil {
+		return a.Resolve(pol, users, nodes)
+	}
+
+	key := keyOf(a)
+	if r, ok := pol.aliases[key]; ok {
+		return r.ips, r.err
+	}
+
+	ips, err := a.Resolve(pol, users, nodes)
+	pol.aliases[key] = aliasResult{alias: a, ips: ips, err: err}
+
+	return ips, err
+}
+
+// aliasesOrNil returns pol's alias cache; pol may be nil.
+func (pol *Policy) aliasesOrNil() aliasCache {
+	if pol == nil {
+		return nil
+	}
+
+	return pol.aliases
+}
+
+// carry returns the entries of c the change cannot have moved.
+func (c aliasCache) carry(change *nodeChange) aliasCache {
+	next := make(aliasCache, len(c))
+
+	for k, r := range c {
+		if !change.moves(r.alias) {
+			next[k] = r
 		}
 	}
 
-	return false
+	return next
 }
 
 // compileOneGrant resolves a single grant into a [compiledGrant].
@@ -641,7 +694,7 @@ func resolveSources(
 			return nil, nil, errSelfInSources
 		}
 
-		ips, err := src.Resolve(pol, users, nodes)
+		ips, err := pol.resolveAlias(src, users, nodes)
 		if err != nil {
 			log.Trace().Caller().Err(err).
 				Msg("resolving source ips")
@@ -779,7 +832,7 @@ func (pol *Policy) compileOtherDests(
 		)
 
 		for _, dst := range otherDests {
-			ips, err := dst.Resolve(pol, users, nodes)
+			ips, err := pol.resolveAlias(dst, users, nodes)
 			if err != nil {
 				continue
 			}

@@ -159,7 +159,7 @@ func (pol *Policy) destinationsToNetPortRange(
 			continue
 		}
 
-		ips, err := dest.Resolve(pol, users, nodes)
+		ips, err := pol.resolveAlias(dest, users, nodes)
 		if err != nil {
 			log.Trace().Caller().Err(err).Msgf("resolving destination ips")
 		}

@@ -40,6 +40,9 @@ type PolicyManager struct {
 	// for [NewPolicyManagerFrom].
 	src          []byte
 	grantResults []compiledGrantResult
+	aliases      aliasCache
+	// matcherCache holds the matcher of each global rule, by content.
+	matcherCache map[string]matcher.Match
 	nodes        views.Slice[types.NodeView]
 	// nodesByID indexes nodes; see [PolicyManager.cacheable].
 	nodesByID map[types.NodeID]types.NodeView
@@ -181,9 +184,19 @@ func NewPolicyManager(b []byte, users []types.User, nodes views.Slice[types.Node
 // of the same document and users, each grant the node changes since cannot
 // reach. prev may be nil.
 func NewPolicyManagerFrom(prev *PolicyManager, b []byte, users []types.User, nodes views.Slice[types.NodeView]) (*PolicyManager, error) {
-	pol, err := unmarshalPolicy(b)
-	if err != nil {
-		return nil, fmt.Errorf("parsing policy: %w", err)
+	var (
+		pol *Policy
+		err error
+	)
+
+	// The same document parses to the same policy, which is only read.
+	if prev != nil && bytes.Equal(prev.src, b) {
+		pol = prev.pol
+	} else {
+		pol, err = unmarshalPolicy(b)
+		if err != nil {
+			return nil, fmt.Errorf("parsing policy: %w", err)
+		}
 	}
 
 	err = validateUserReferences(pol, users)
@@ -193,6 +206,9 @@ func NewPolicyManagerFrom(prev *PolicyManager, b []byte, users []types.User, nod
 
 	// One tag index serves every resolution in this compile.
 	indexed := pol.withNodesByTag(nodes)
+	if indexed != nil {
+		indexed.aliases = aliasCache{}
+	}
 
 	// Compile all grants once. Both global and per-node filter
 	// rules are derived from these compiled grants.
@@ -203,6 +219,9 @@ func NewPolicyManagerFrom(prev *PolicyManager, b []byte, users []types.User, nod
 
 	if prev != nil && bytes.Equal(prev.src, b) && samePolicyUsers(prev.users, users) {
 		prevGrants, change = prev.grantResults, diffNodes(prev.nodesByID, nodes)
+		if indexed != nil {
+			indexed.aliases = prev.aliases.carry(change)
+		}
 	}
 
 	grants, grantResults := indexed.compileGrantsFrom(prevGrants, change, users, nodes)
@@ -230,16 +249,25 @@ func NewPolicyManagerFrom(prev *PolicyManager, b []byte, users []types.User, nod
 		filter = globalFilterRules(grants)
 	}
 
+	var prevMatchers map[string]matcher.Match
+	if prev != nil {
+		prevMatchers = prev.matcherCache
+	}
+
+	matchers, matcherCache := cachedMatches(filter, prevMatchers)
+
 	pm := &PolicyManager{
 		src:                b,
 		grantResults:       grantResults,
+		aliases:            indexed.aliasesOrNil(),
 		pol:                pol,
 		users:              users,
 		nodes:              nodes,
 		nodesByID:          nodeIDViewMap(nodes),
 		filter:             filter,
 		reducer:            policyutil.NewReducer(filter),
-		matchers:           matcher.MatchesFromFilterRules(filter),
+		matchers:           matchers,
+		matcherCache:       matcherCache,
 		tagOwnerMap:        tagMap,
 		exitSet:            exitSet,
 		autoApproveMap:     autoMap,
@@ -418,6 +446,57 @@ func (pm *PolicyManager) sshRuleAllowsUser(rule SSH, srcNode types.NodeView, loc
 	lp, ok := resolveLocalparts(rule.Users.LocalpartEntries(), pm.users)[srcNode.User().ID()]
 
 	return ok && lp == localUser
+}
+
+// cachedMatches is [matcher.MatchesFromFilterRules] reusing, from prev,
+// the matcher of each rule that did not change: building one parses every
+// address the rule names, and a recompile after a join changes few rules.
+func cachedMatches(rules []tailcfg.FilterRule, prev map[string]matcher.Match) ([]matcher.Match, map[string]matcher.Match) {
+	matches := make([]matcher.Match, len(rules))
+	next := make(map[string]matcher.Match, len(rules))
+
+	for i, rule := range rules {
+		key := matchKey(rule)
+
+		m, ok := prev[key]
+		if !ok {
+			m, ok = next[key]
+		}
+
+		if !ok {
+			m = matcher.MatchFromFilterRule(rule)
+		}
+
+		matches[i], next[key] = m, m
+	}
+
+	return matches, next
+}
+
+// matchKey identifies a rule by what its matcher reads.
+func matchKey(rule tailcfg.FilterRule) string {
+	var b strings.Builder
+
+	for _, s := range rule.SrcIPs {
+		b.WriteString(s)
+		b.WriteByte(',')
+	}
+
+	b.WriteByte('>')
+
+	for _, d := range rule.DstPorts {
+		b.WriteString(d.IP)
+		b.WriteByte(',')
+	}
+
+	for _, cg := range rule.CapGrant {
+		for _, p := range cg.Dsts {
+			b.WriteString(p.String())
+			b.WriteByte(',')
+		}
+	}
+
+	return b.String()
 }
 
 // samePolicyUsers reports whether the policy resolves a and b the same.

@@ -1973,6 +1973,10 @@ type Policy struct {
 	// nodesByTag is set only on the copy [Policy.withNodesByTag] makes for
 	// one compile, and indexes the nodes that compile resolves against.
 	nodesByTag map[string][]types.NodeView
+
+	// aliases, also only on that copy, holds what each alias resolved to
+	// in this compile; see [Policy.resolveAlias].
+	aliases aliasCache
 }
 
 // withNodesByTag returns a copy of pol to resolve against nodes, and only
