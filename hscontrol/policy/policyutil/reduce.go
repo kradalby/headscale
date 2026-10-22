@@ -6,17 +6,26 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"go4.org/netipx"
 	"tailscale.com/tailcfg"
 )
 
 // ReduceFilterRules takes a node and a set of global filter rules and removes all rules
 // and destinations that are not relevant to that particular node.
 //
+// nodeAddrs holds every node's addresses. A destination prefix made only of
+// them merges several nodes' addresses, and the node keeps just its own, as
+// Tailscale lists them; any other prefix stays whole. nil keeps all whole.
+//
 // IMPORTANT: This function is designed for global filters only. Per-node filters
 // (from autogroup:self policies) are already node-specific and should not be passed
 // to this function. Use [policy.PolicyManager.FilterForNode] instead, which handles
 // both cases.
-func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcfg.FilterRule {
+func ReduceFilterRules(
+	node types.NodeView,
+	rules []tailcfg.FilterRule,
+	nodeAddrs *netipx.IPSet,
+) []tailcfg.FilterRule {
 	ret := []tailcfg.FilterRule{}
 	subnetRoutes := node.SubnetRoutes()
 	exitRoutes := node.ExitRoutes()
@@ -43,11 +52,6 @@ func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcf
 				continue
 			}
 
-			if node.InIPSet(expanded) {
-				dests = append(dests, dest)
-				continue
-			}
-
 			// If the node has approved subnet routes, preserve
 			// filter rules targeting those routes.
 			// [types.NodeView.SubnetRoutes] returns only approved,
@@ -64,6 +68,25 @@ func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcf
 			// exit node every rule, not only internet ones.
 			if slices.ContainsFunc(exitRoutes, expanded.OverlapsPrefix) {
 				dests = append(dests, dest)
+				continue
+			}
+
+			if !node.InIPSet(expanded) {
+				continue
+			}
+
+			pfx, err := netip.ParsePrefix(dest.IP)
+			if err != nil || pfx.IsSingleIP() || nodeAddrs == nil || !nodeAddrs.ContainsPrefix(pfx) {
+				dests = append(dests, dest)
+				continue
+			}
+
+			for _, ip := range node.IPs() {
+				if pfx.Contains(ip) {
+					own := dest
+					own.IP = ip.String()
+					dests = append(dests, own)
+				}
 			}
 		}
 
