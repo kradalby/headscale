@@ -665,9 +665,16 @@ func (s *State) Connect(id types.NodeID) ([]change.Change, uint64) {
 
 	// Reconnecting clears Unhealthy: the node just proved basic
 	// connectivity by completing the Noise handshake.
-	var epoch uint64
+	var (
+		epoch     uint64
+		wasOnline bool
+	)
 
 	node, ok := s.nodeStore.UpdateNode(id, func(n *types.Node) {
+		// A stream that comes back within the reconnect grace finds the
+		// node still online: peers saw no change, as on Tailscale SaaS.
+		wasOnline = n.IsOnline != nil && *n.IsOnline
+
 		n.SessionEpoch++
 		epoch = n.SessionEpoch
 		n.ActiveSessions++
@@ -678,17 +685,22 @@ func (s *State) Connect(id types.NodeID) ([]change.Change, uint64) {
 		return nil, 0
 	}
 
+	log.Info().EmbedObject(node).Msg("node connected")
+
 	// A node coming online sends a lightweight online peer patch. Subnet
 	// routers, relay targets, and via targets get their full peer recompute
 	// from the gated PolicyChange below, so no full update is needed here.
-	c := []change.Change{change.NodeOnline(node.ID())}
-	if !node.Online() {
-		c[0] = change.NodeAdded(node.ID())
+	var c []change.Change
+
+	switch {
+	case !node.Online():
+		c = append(c, change.NodeAdded(node.ID()))
+	case !wasOnline:
+		c = append(c, change.NodeOnline(node.ID()))
 	}
 
-	log.Info().EmbedObject(node).Msg("node connected")
-
-	if !maps.Equal(prevRoutes, s.nodeStore.PrimaryRoutes()) {
+	routesMoved := !maps.Equal(prevRoutes, s.nodeStore.PrimaryRoutes())
+	if routesMoved {
 		c = append(c, change.NodeAdded(id))
 	}
 
@@ -697,7 +709,7 @@ func (s *State) Connect(id types.NodeID) ([]change.Change, uint64) {
 	// An ordinary node coming online just sends the lightweight online
 	// patch above; emitting a PolicyChange for it would force every peer
 	// to rebuild its netmap on every reconnect.
-	if s.polMan.NodeNeedsPeerRecompute(node) {
+	if (!wasOnline || routesMoved) && s.polMan.NodeNeedsPeerRecompute(node) {
 		c = append(c, change.PolicyChange())
 	}
 
@@ -1880,10 +1892,9 @@ type authNodeUpdateParams struct {
 
 // applyAuthNodeUpdate applies common update logic for re-authenticating or converting
 // an existing node. It updates the node in [NodeStore], processes RequestTags, and
-// persists changes to the database. The bool reports whether peers read the
-// node it replaced and the update the same, apart from its keys; see
-// [onlyKeysChanged].
-func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView, bool, error) {
+// persists changes to the database. The [relogin] says what peers must be
+// sent for it.
+func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView, relogin, error) {
 	regData := params.RegData
 	// Log the operation type
 	if params.IsConvertFromTag {
@@ -1924,7 +1935,7 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 
 	rejectedTags := s.validateRequestTagsForReauth(params.ExistingNode, authUser, requestTags)
 	if len(rejectedTags) > 0 {
-		return types.NodeView{}, false, fmt.Errorf(
+		return types.NodeView{}, reloginWhole, fmt.Errorf(
 			"%w %v are invalid or not permitted",
 			ErrRequestedTagsInvalidOrNotPermitted,
 			rejectedTags,
@@ -1939,7 +1950,7 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 	// the NodeStore NodeKey index (denying the victim service).
 	if existing, ok := s.nodeStore.GetNodeByNodeKey(regData.NodeKey); ok &&
 		existing.MachineKey() != regData.MachineKey {
-		return types.NodeView{}, false, ErrNodeKeyInUse
+		return types.NodeView{}, reloginWhole, ErrNodeKeyInUse
 	}
 
 	// Update existing node in [NodeStore] - validation passed, safe to mutate
@@ -2034,10 +2045,10 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 	})
 
 	if !ok {
-		return types.NodeView{}, false, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, params.ExistingNode.ID())
+		return types.NodeView{}, reloginWhole, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, params.ExistingNode.ID())
 	}
 
-	keysOnly := onlyKeysChanged(before, updatedNodeView, time.Now())
+	changed := reloginChanged(before, updatedNodeView, time.Now())
 
 	// Persist to database.
 	// Explicitly select all node columns so GORM includes nil/zero-value fields
@@ -2064,7 +2075,7 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 		return nil, nil //nolint:nilnil // side-effect only write
 	})
 	if err != nil {
-		return types.NodeView{}, false, err
+		return types.NodeView{}, reloginWhole, err
 	}
 
 	// Log completion
@@ -2078,7 +2089,7 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 			Msg("Node re-authorized")
 	}
 
-	return updatedNodeView, keysOnly, nil
+	return updatedNodeView, changed, nil
 }
 
 // createAndSaveNewNode creates a new node, allocates IPs, saves to DB, and adds to [NodeStore].
@@ -2487,13 +2498,13 @@ func (s *State) HandleNodeFromAuthPath(
 
 	var (
 		finalNode types.NodeView
-		keysOnly  bool
+		changed   relogin
 	)
 
 	if nodeExistsForSameUser {
 		updateParams.ExistingNode = existingNodeSameUser
 
-		finalNode, keysOnly, err = s.applyAuthNodeUpdate(updateParams)
+		finalNode, changed, err = s.applyAuthNodeUpdate(updateParams)
 		if err != nil {
 			return types.NodeView{}, s.policyChangeSince(genBefore), err
 		}
@@ -2555,10 +2566,10 @@ func (s *State) HandleNodeFromAuthPath(
 
 	policyChanged := !usersChange.IsEmpty() || !nodesChange.IsEmpty()
 
-	// keysOnly is set only for a same-user relogin; a tag->user conversion is
+	// changed is set only for a same-user relogin; a tag->user conversion is
 	// excluded, as it changes the peer's User — a structural change peers must
 	// see in full, not a key-rotation patch.
-	return finalNode, reauthChange(finalNode, keysOnly, policyChanged), nil
+	return finalNode, reauthChange(finalNode, changed, policyChanged), nil
 }
 
 // createNewNodeFromAuth creates a new node during auth callback.
@@ -2783,7 +2794,7 @@ func (s *State) HandleNodeFromPreAuthKey(
 
 	var (
 		finalNode types.NodeView
-		keysOnly  bool
+		changed   relogin
 	)
 
 	// If this node exists for this user, update the node in place. For a
@@ -2791,7 +2802,7 @@ func (s *State) HandleNodeFromPreAuthKey(
 	// a tagged node (findExistingNodeForPAK matches it under UserID 0); for a
 	// user-owned key it is true when the same user already has the node.
 	if existsSameUser && existingNodeSameUser.Valid() {
-		finalNode, keysOnly, err = s.reregisterNodeWithPAK(existingNodeSameUser, pak, regReq, machineKey, hostname, validHostinfo)
+		finalNode, changed, err = s.reregisterNodeWithPAK(existingNodeSameUser, pak, regReq, machineKey, hostname, validHostinfo)
 		if err != nil {
 			return types.NodeView{}, s.policyChangeSince(genBefore), err
 		}
@@ -2888,7 +2899,7 @@ func (s *State) HandleNodeFromPreAuthKey(
 
 	policyChanged := !usersChange.IsEmpty() || !nodesChange.IsEmpty()
 
-	return finalNode, reauthChange(finalNode, keysOnly, policyChanged), nil
+	return finalNode, reauthChange(finalNode, changed, policyChanged), nil
 }
 
 // reregisterNodeWithPAK updates an existing node in place for a pre-auth key
@@ -2899,8 +2910,8 @@ func (s *State) HandleNodeFromPreAuthKey(
 // in between, and the key or the node can expire. So the writer decides
 // whether the key must be valid on the node it replaces, at its own clock, and
 // leaves the node untouched when it is not. existingNodeSameUser is used only
-// for its ID and for logging. The bool reports whether peers read the node it
-// replaced and the update the same, apart from its keys; see [onlyKeysChanged].
+// for its ID and for logging. The [relogin] says what peers must be sent for
+// it.
 func (s *State) reregisterNodeWithPAK(
 	existingNodeSameUser types.NodeView,
 	pak *types.PreAuthKey,
@@ -2908,7 +2919,7 @@ func (s *State) reregisterNodeWithPAK(
 	machineKey key.MachinePublic,
 	hostname string,
 	validHostinfo *tailcfg.Hostinfo,
-) (types.NodeView, bool, error) {
+) (types.NodeView, relogin, error) {
 	log.Trace().
 		Caller().
 		Str(zf.NodeName, existingNodeSameUser.Hostname()).
@@ -2926,7 +2937,7 @@ func (s *State) reregisterNodeWithPAK(
 	// NodeStore NodeKey index, denying the victim service.
 	if existing, ok := s.nodeStore.GetNodeByNodeKey(regReq.NodeKey); ok &&
 		existing.MachineKey() != machineKey {
-		return types.NodeView{}, false, ErrNodeKeyInUse
+		return types.NodeView{}, reloginWhole, ErrNodeKeyInUse
 	}
 
 	// prior is the node the writer replaced: the NetInfo source and the
@@ -3030,7 +3041,7 @@ func (s *State) reregisterNodeWithPAK(
 	// A nil prior means the writer never saw the node (deleted, or the store
 	// stopped), so nothing was decided and nothing may be persisted.
 	if !ok || prior == nil {
-		return types.NodeView{}, false, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, existingNodeSameUser.ID())
+		return types.NodeView{}, reloginWhole, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, existingNodeSameUser.ID())
 	}
 
 	if authErr != nil {
@@ -3042,7 +3053,7 @@ func (s *State) reregisterNodeWithPAK(
 			Err(authErr).
 			Msg("Re-registration needs a valid auth key when it applies, rejecting")
 
-		return types.NodeView{}, false, authErr
+		return types.NodeView{}, reloginWhole, authErr
 	}
 
 	_, err := hsdb.Write(s.db.DB, func(tx *gorm.DB) (*types.Node, error) {
@@ -3090,7 +3101,7 @@ func (s *State) reregisterNodeWithPAK(
 			n.AuthKeyID = prior.AuthKeyID
 		})
 
-		return types.NodeView{}, false, fmt.Errorf("writing node to database: %w", err)
+		return types.NodeView{}, reloginWhole, fmt.Errorf("writing node to database: %w", err)
 	}
 
 	log.Trace().
@@ -3102,35 +3113,64 @@ func (s *State) reregisterNodeWithPAK(
 		Str(zf.UserName, pak.Username()).
 		Msg("Node re-authorized")
 
-	return updatedNodeView, onlyKeysChanged(before, updatedNodeView, time.Now()), nil
+	return updatedNodeView, reloginChanged(before, updatedNodeView, time.Now()), nil
 }
 
+// relogin is what a same-user relogin changed that its peers read.
+type relogin int
+
+const (
+	// reloginWhole: something [change.NodeKeyRotated] cannot patch.
+	reloginWhole relogin = iota
+	// reloginKeys: only what [change.NodeKeyRotated] patches.
+	reloginKeys
+	// reloginNone: nothing, as when a client logs in again on its node key;
+	// Tailscale SaaS sends its peers nothing then.
+	reloginNone
+)
+
 // reauthChange returns the [change.Change] to broadcast after an authentication
-// that updated or created a node. keysOnly marks a same-user relogin that
-// changed nothing peers read besides its keys; see [onlyKeysChanged].
+// that updated or created a node; r is [reloginWhole] for any but a same-user
+// relogin.
 //
-// Such a relogin is sent as the minimal peer patch [change.NodeKeyRotated].
-// Anything else is a whole-node add, and a policy change forces a full
-// recompute.
-func reauthChange(node types.NodeView, keysOnly, policyChanged bool) change.Change {
+// A keys-only relogin is sent as the minimal peer patch
+// [change.NodeKeyRotated]. Anything else is a whole-node add, and a policy
+// change forces a full recompute.
+func reauthChange(node types.NodeView, r relogin, policyChanged bool) change.Change {
 	switch {
 	case policyChanged:
 		return change.PolicyChange()
-	case keysOnly:
+	case r == reloginNone:
+		return change.Change{}
+	case r == reloginKeys:
 		return change.NodeKeyRotated(node)
 	default:
 		return change.NodeAdded(node.ID())
 	}
 }
 
-// onlyKeysChanged reports whether peers read before and after the same, apart
-// from what [change.NodeKeyRotated] patches. [tailcfg.PeerChange] carries
-// neither [tailcfg.Node.Expired] nor Hostinfo: peers left holding an expired
-// node drop its WireGuard handshakes, and the relogin stored the Hostinfo, so
-// no later MapRequest shows the change.
-func onlyKeysChanged(before, after types.NodeView, now time.Time) bool {
-	return before.IsExpiredAt(now) == after.IsExpiredAt(now) &&
-		peerHostinfoEqual(before.Hostinfo(), after.Hostinfo())
+// reloginChanged compares what peers read before and after a relogin.
+// [tailcfg.PeerChange] carries neither [tailcfg.Node.Expired] nor Hostinfo:
+// peers left holding an expired node drop its WireGuard handshakes, and the
+// relogin stored the Hostinfo, so no later MapRequest shows the change.
+func reloginChanged(before, after types.NodeView, now time.Time) relogin {
+	expiry := func(n types.NodeView) time.Time {
+		e, _ := n.Expiry().GetOk()
+
+		return e
+	}
+
+	switch {
+	case before.IsExpiredAt(now) != after.IsExpiredAt(now) ||
+		!peerHostinfoEqual(before.Hostinfo(), after.Hostinfo()):
+		return reloginWhole
+	case before.NodeKey() == after.NodeKey() && before.DiscoKey() == after.DiscoKey() &&
+		expiry(before).Equal(expiry(after)) &&
+		views.SliceEqual(before.Endpoints(), after.Endpoints()):
+		return reloginNone
+	default:
+		return reloginKeys
+	}
 }
 
 // updatePolicyManagerUsers pushes the current user list into the policy
