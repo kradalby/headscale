@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -204,8 +205,10 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 	// recompile the policy.
 	w.users = graph.NewInput(g, "users", users, samePolicyUsers)
 	w.policySrc = graph.NewInput(g, "policy-source", polSrc, graph.Never[[]byte])
-	w.derpMap = graph.NewInput(g, "derp-map", (*tailcfg.DERPMap)(nil), graph.Same[*tailcfg.DERPMap])
-	w.extraRecords = graph.NewInput(g, "extra-records", []tailcfg.DNSRecord(nil), graph.Never[[]tailcfg.DNSRecord])
+	// Both are refreshed on a timer; an unchanged value must not wake
+	// every session.
+	w.derpMap = graph.NewInput(g, "derp-map", (*tailcfg.DERPMap)(nil), sameDERPMap)
+	w.extraRecords = graph.NewInput(g, "extra-records", []tailcfg.DNSRecord(nil), slices.Equal[[]tailcfg.DNSRecord])
 
 	w.index = graph.NewDerived(g, "index", graph.Same[*nodeIndex],
 		func(s *graph.Snapshot, prev *nodeIndex) *nodeIndex {
@@ -772,6 +775,12 @@ func (w *world) SetDERPMap(dm *tailcfg.DERPMap) {
 
 		return nil
 	})
+}
+
+// sameDERPMap compares DERP maps by content; a fetch returns a new map
+// even when nothing changed.
+func sameDERPMap(a, b *tailcfg.DERPMap) bool {
+	return reflect.DeepEqual(a, b)
 }
 
 // SetExtraRecords replaces the extra DNS records.
