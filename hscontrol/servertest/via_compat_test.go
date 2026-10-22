@@ -112,9 +112,6 @@ var viaCompatSkipReasons = map[string]string{
 	"via-grant-v67/rename/blastoise/packet-filter": viaSourceLossNotSent,
 	"via-grant-v67/rename/ivysaur/peers":           viaSourceLossNotSent,
 
-	"routes-m1-wildcard-src-multi-range/srv/peer-allowed-ips":         exitRoutesOnOverlap,
-	"routes-m6-subnet-to-subnet-multi-route/r-multi/peer-allowed-ips": exitRoutesOnOverlap,
-
 	"routes-m1-wildcard-src-multi-range/m-odin1/peers":     sameUserPeers,
 	"routes-m1-wildcard-src-multi-range/m-odin2/peers":     sameUserPeers,
 	"routes-m2-member-partial-subnet/m-odin1/peers":        sameUserPeers,
@@ -126,8 +123,6 @@ var viaCompatSkipReasons = map[string]string{
 }
 
 const viaSourceLossNotSent = "VIA_SOURCE_LOSS_NOT_SENT: a user change that leaves a via grant without sources does not reach open streams"
-
-const exitRoutesOnOverlap = "EXIT_ROUTES_ON_OVERLAP: headscale offers a peer's exit routes to a viewer whose rules reach only nodes or subnets; SaaS leaves them out"
 
 const sameUserPeers = "SAME_USER_PEERS: SaaS lists a user's own devices as each other's peers with no rule linking them; headscale peers only what the policy links"
 
