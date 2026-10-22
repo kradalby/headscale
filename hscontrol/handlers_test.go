@@ -153,7 +153,7 @@ func TestHandleVerifyRequest_AdmitsByNodeKey(t *testing.T) {
 	deletedView, ok := app.state.GetNodeByID(deleted.ID)
 	require.True(t, ok)
 
-	_, err := app.state.DeleteNode(deletedView)
+	err := app.state.DeleteNode(deletedView)
 	require.NoError(t, err)
 
 	nv, ok := app.state.GetNodeByID(tagged.ID)

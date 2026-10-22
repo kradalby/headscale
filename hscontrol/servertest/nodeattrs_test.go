@@ -28,9 +28,8 @@ func reloadPolicy(t *testing.T, srv *servertest.TestServer, pol string) {
 		return
 	}
 
-	changes, err := srv.State().ReloadPolicy()
+	err = srv.State().ReloadPolicy()
 	require.NoError(t, err)
-	srv.App.Change(changes...)
 }
 
 // hasCap reports whether the given netmap's self CapMap contains want.
@@ -336,9 +335,8 @@ func TestNodeAttrsSuggestExitNodeOnPeerCapMap(t *testing.T) {
 	// Approve the routes on the control plane and fan the resulting
 	// change out so peers re-render.
 	exitID := findNodeID(t, srv, "see-exit")
-	_, ch, err := srv.State().SetApprovedRoutes(exitID, exitRoutes)
+	_, err := srv.State().SetApprovedRoutes(exitID, exitRoutes)
 	require.NoError(t, err)
-	srv.App.Change(ch)
 
 	// Stamp suggest-exit-node on every node — the peer-cap rule then
 	// gates the actual peer-view emission on whether the peer is an
@@ -446,9 +444,8 @@ func TestSuggestExitNodeDefaultOnPeerCapMap(t *testing.T) {
 	}
 
 	exitID := findNodeID(t, srv, "sed-exit")
-	_, ch, err := srv.State().SetApprovedRoutes(exitID, exitRoutes)
+	_, err := srv.State().SetApprovedRoutes(exitID, exitRoutes)
 	require.NoError(t, err)
-	srv.App.Change(ch)
 
 	viewer.WaitForCondition(t, "peer suggest-exit-node without nodeAttrs",
 		10*time.Second, peerHasCap(true))
@@ -457,9 +454,8 @@ func TestSuggestExitNodeDefaultOnPeerCapMap(t *testing.T) {
 	require.False(t, hasCap(exit.Netmap(), nodecap.SuggestExitNode),
 		"suggest-exit-node must not appear on SelfNode by default")
 
-	_, ch, err = srv.State().SetApprovedRoutes(exitID, nil)
+	_, err = srv.State().SetApprovedRoutes(exitID, nil)
 	require.NoError(t, err)
-	srv.App.Change(ch)
 
 	viewer.WaitForCondition(t, "peer suggest-exit-node gone after unapprove",
 		10*time.Second, peerHasCap(false))
@@ -529,9 +525,8 @@ func TestNodeAttrsNextDNS(t *testing.T) {
 			"nodeAttrs": [{"target": ["tag:dns"], "attr": ["nextdns:tagprof"]}]
 		}`)
 
-		_, tagChange, err := srv.State().SetNodeTags(findNodeID(t, srv, "nd-node"), []string{"tag:dns"})
+		_, err := srv.State().SetNodeTags(findNodeID(t, srv, "nd-node"), []string{"tag:dns"})
 		require.NoError(t, err)
-		srv.App.Change(tagChange)
 
 		waitResolver(t, c, "https://dns.nextdns.io/tagprof?")
 	})

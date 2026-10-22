@@ -9,7 +9,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/servertest"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
@@ -38,9 +37,8 @@ func advertiseAndApproveRoute(
 
 	nodeID := findNodeID(t, srv, c.Name)
 
-	_, rc, err := srv.State().SetApprovedRoutes(nodeID, []netip.Prefix{route})
+	_, err := srv.State().SetApprovedRoutes(nodeID, []netip.Prefix{route})
 	require.NoError(t, err)
-	srv.App.Change(rc)
 
 	return nodeID
 }
@@ -71,13 +69,14 @@ func TestHAHealthProbe_HealthyNodes(t *testing.T) {
 			ProbeTimeout:  5 * time.Second,
 		},
 		srv.URL,
-		srv.App.MapBatcher().IsConnected,
+		srv.App.MapHub().IsConnected,
+		srv.App.MapHub().Ping,
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	prober.ProbeOnce(ctx, srv.App.Change)
+	prober.ProbeOnce(ctx)
 
 	// Both nodes should be healthy, primary unchanged (node 1).
 	assert.True(t, srv.State().IsNodeHealthy(nodeID1))
@@ -211,7 +210,7 @@ func TestHAHealthProbe_SetApprovedRoutesEmptyClearsUnhealthy(t *testing.T) {
 	srv.State().SetNodeHealth(nodeID1, false)
 	require.False(t, srv.State().IsNodeHealthy(nodeID1))
 
-	_, _, err := srv.State().SetApprovedRoutes(nodeID1, nil)
+	_, err := srv.State().SetApprovedRoutes(nodeID1, nil)
 	require.NoError(t, err)
 
 	assert.True(t, srv.State().IsNodeHealthy(nodeID1),
@@ -274,7 +273,7 @@ func TestHAHealthProbe_SetUnhealthyNoRoutesIsNoOp(t *testing.T) {
 	nodeID1 := advertiseAndApproveRoute(t, srv, c1, route)
 	advertiseAndApproveRoute(t, srv, c2, route)
 
-	_, _, err := srv.State().SetApprovedRoutes(nodeID1, nil)
+	_, err := srv.State().SetApprovedRoutes(nodeID1, nil)
 	require.NoError(t, err)
 
 	srv.State().SetNodeHealth(nodeID1, false)
@@ -322,7 +321,8 @@ func TestHAHealthProbe_ReconnectDuringProbeKeepsHealthy(t *testing.T) {
 			ProbeTimeout:  2 * time.Second,
 		},
 		srv.URL,
-		srv.App.MapBatcher().IsConnected,
+		srv.App.MapHub().IsConnected,
+		srv.App.MapHub().Ping,
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -338,7 +338,7 @@ func TestHAHealthProbe_ReconnectDuringProbeKeepsHealthy(t *testing.T) {
 	go func() {
 		defer close(done)
 
-		prober.ProbeOnce(ctx, srv.App.Change)
+		prober.ProbeOnce(ctx)
 	}()
 
 	c1.Disconnect(t)
@@ -372,6 +372,8 @@ func TestHAHealthProbe_NoHARoutes(t *testing.T) {
 	advertiseAndApproveRoute(t, srv, c1, netip.MustParsePrefix("10.90.0.0/24"))
 	advertiseAndApproveRoute(t, srv, c2, netip.MustParsePrefix("10.91.0.0/24"))
 
+	var pinged bool
+
 	prober := state.NewHAHealthProber(
 		srv.State(),
 		types.HARouteConfig{
@@ -379,16 +381,17 @@ func TestHAHealthProbe_NoHARoutes(t *testing.T) {
 			ProbeTimeout:  5 * time.Second,
 		},
 		srv.URL,
-		srv.App.MapBatcher().IsConnected,
+		srv.App.MapHub().IsConnected,
+		func(id types.NodeID, pr *tailcfg.PingRequest) bool {
+			pinged = true
+
+			return srv.App.MapHub().Ping(id, pr)
+		},
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	var dispatched bool
-
-	prober.ProbeOnce(ctx, func(_ ...change.Change) {
-		dispatched = true
-	})
-	assert.False(t, dispatched, "no HA routes should produce no changes")
+	prober.ProbeOnce(ctx)
+	assert.False(t, pinged, "no HA routes should probe no node")
 }

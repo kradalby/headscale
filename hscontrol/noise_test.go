@@ -899,10 +899,8 @@ func newSSHVerdictFixture(t *testing.T) *sshVerdictFixture {
 		// autogroup:self compares hydrated users.
 		node.User = user
 
-		// SaveNode refreshes the policy manager's nodes, which
-		// SSHCheckParams resolves against.
-		_, _, err := app.state.SaveNode(node.View())
-		require.NoError(t, err)
+		// SSHCheckParams resolves against the nodes in memory.
+		app.state.PutNodeInStoreForTest(*node)
 
 		ids[i] = node.ID
 	}
@@ -1297,7 +1295,7 @@ func TestPollNetMapHandler_DeletedNodeGetsExpiredSelf(t *testing.T) {
 			nodeView, ok := app.state.GetNodeByID(node.ID)
 			require.True(t, ok)
 
-			_, err := app.state.DeleteNode(nodeView)
+			err := app.state.DeleteNode(nodeView)
 			require.NoError(t, err)
 
 			ns := &noiseServer{headscale: app, machineKey: node.MachineKey}

@@ -26,7 +26,7 @@ type haPropClient struct {
 	id    types.NodeID
 	name  string
 	route netip.Prefix
-	// connected mirrors the prober's view (mapBatcher.IsConnected).
+	// connected mirrors the prober's view (Hub.IsConnected).
 	// Tracked alongside the runtime read so anti-flap invariants can
 	// reason about the candidate set the prober actually evaluates.
 	connected bool
@@ -98,9 +98,8 @@ func haReadvertise(
 
 	_ = c.tc.Direct().SendUpdate(ctx)
 
-	_, ch, err := srv.State().SetApprovedRoutes(c.id, []netip.Prefix{c.route})
+	_, err := srv.State().SetApprovedRoutes(c.id, []netip.Prefix{c.route})
 	require.NoError(tb, err)
-	srv.App.Change(ch)
 }
 
 // readPrimaries builds the prefix→owner map by inverting
@@ -161,10 +160,10 @@ func checkHAInvariants(
 		prefixSet[c.route] = struct{}{}
 	}
 
-	// Build the candidate set per prefix from the NodeStore: a node is a
+	// Build the candidate set per prefix from state: a node is a
 	// candidate when it is IsOnline=true and AllApprovedRoutes contains
 	// the prefix. This is exactly the input to electPrimaryRoutes; the
-	// prober's mapBatcher.IsConnected view is a separate gate the
+	// prober's Hub.IsConnected view is a separate gate the
 	// prober consults before dispatching a probe, not part of the
 	// election input.
 	advertisersByPrefix := make(map[netip.Prefix][]types.NodeID)
@@ -353,15 +352,15 @@ func snapshotPrimaries(
 // asserts that the live PrimaryRoutes() snapshot honours every HA
 // invariant after each step.
 //
-// Coverage versus the unit-level NodeStore property test:
+// Coverage versus the unit-level primaries property test:
 //
-//   - This test exercises the FULL seam: real prober → real PingNode
+//   - This test exercises the FULL seam: real prober → real Hub.Ping
 //     dispatch → real responseCh handling → State.BatchSetNodeHealth
-//     → NodeStore election → mapper batcher updates. The unit test
+//     → graph election → map stream updates. The unit test
 //     bypasses the prober entirely.
 //
 //   - Disconnect/Reconnect goes through the real poll-session
-//     lifecycle: mapBatcher.RemoveNode flips IsConnected, the 10s
+//     lifecycle: Hub.Leave flips IsConnected, the 10s
 //     grace period defers state.Disconnect, and state.Connect bumps
 //     SessionEpoch on rejoin. The prober defers fresh-session probes
 //     so a reconnect mid-cycle does not install a stale Unhealthy.
@@ -472,7 +471,8 @@ func TestHAProberProperty(t *testing.T) {
 				ProbeTimeout:  50 * time.Millisecond,
 			},
 			srv.URL,
-			srv.App.MapBatcher().IsConnected,
+			srv.App.MapHub().IsConnected,
+			srv.App.MapHub().Ping,
 		)
 
 		// Sanity: every client should now be an advertiser of route,
@@ -545,19 +545,19 @@ func TestHAProberProperty(t *testing.T) {
 					c.tc.Reconnect(tb)
 
 					// Wait for the new poll session to register with
-					// the batcher so the prober's IsConnected gate
+					// the hub so the prober's IsConnected gate
 					// reflects the reconnect on the next ProberTick.
-					// WaitForUpdate adds ~1s per call; polling
-					// IsConnected directly converges in <100ms.
+					// Polling IsConnected converges faster than
+					// waiting for a netmap update.
 					require.Eventually(
 						tb,
 						func() bool {
-							return srv.App.MapBatcher().
+							return srv.App.MapHub().
 								IsConnected(c.id)
 						},
 						10*time.Second,
 						5*time.Millisecond,
-						"reconnect: batcher should see %s online",
+						"reconnect: hub should see %s online",
 						c.name,
 					)
 
@@ -586,11 +586,10 @@ func TestHAProberProperty(t *testing.T) {
 					5*time.Second,
 				)
 
-				// Use App.Change as the dispatcher — the prober batches
-				// its results through BatchSetNodeHealth and emits a
-				// single PolicyChange. The real wiring is what we want
-				// to test.
-				prober.ProbeOnce(ctx, srv.App.Change)
+				// The prober applies the cycle's results in one
+				// BatchSetNodeHealth write, so the election sees a
+				// single transition.
+				prober.ProbeOnce(ctx)
 				cancel()
 
 				// Session-stability rule: the first probe against a

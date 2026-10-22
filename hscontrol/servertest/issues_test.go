@@ -9,7 +9,6 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/net/tsaddr"
@@ -156,7 +155,6 @@ func TestIssuesMapContent(t *testing.T) {
 		node2.User = user2
 		srv.State().PutNodeInStoreForTest(*node2)
 
-		srv.App.Change(change.PolicyChange())
 		c1.WaitForPeers(t, 1, 5*time.Second)
 
 		nm := c1.Netmap()
@@ -196,10 +194,9 @@ func TestIssuesRoutes(t *testing.T) {
 
 		// The API should accept the approval without error — the route
 		// is stored but dormant because the node is not advertising it.
-		_, routeChange, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			nodeID, []netip.Prefix{route})
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 
 		// Wait for any updates triggered by the route change to propagate,
 		// then verify the route does NOT appear in AllowedIPs.
@@ -242,10 +239,9 @@ func TestIssuesRoutes(t *testing.T) {
 		exit.WaitForPeers(t, 1, 10*time.Second)
 		advertiseRoutes(t, exit, obs, tsaddr.ExitRoutes())
 
-		_, c, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			findNodeID(t, srv, "selfexit-node"), tsaddr.ExitRoutes())
 		require.NoError(t, err)
-		srv.App.Change(c)
 
 		obs.WaitForCondition(t, "peer offers exit node", 10*time.Second,
 			peerOffersExit("selfexit-node"))
@@ -269,10 +265,9 @@ func TestIssuesRoutes(t *testing.T) {
 
 		exit.WaitForPeers(t, 1, 10*time.Second)
 
-		_, c, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			findNodeID(t, srv, "preexit-node"), tsaddr.ExitRoutes())
 		require.NoError(t, err)
-		srv.App.Change(c)
 
 		advertiseRoutes(t, exit, obs, tsaddr.ExitRoutes())
 
@@ -304,9 +299,8 @@ func TestIssuesRoutes(t *testing.T) {
 		}`)
 		require.NoError(t, err)
 
-		changes, err := srv.State().ReloadPolicy()
+		err = srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 
 		obs.WaitForCondition(t, "peer offers exit node", 10*time.Second,
 			peerOffersExit("reloadexit-node"))
@@ -328,9 +322,8 @@ func TestIssuesRoutes(t *testing.T) {
 		}`)
 		require.NoError(t, err)
 
-		changes, err := srv.State().ReloadPolicy()
+		err = srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 
 		exit := servertest.NewClient(t, srv, "advexit-node",
 			servertest.WithUser(user))
@@ -426,9 +419,8 @@ func TestIssuesRoutes(t *testing.T) {
 		require.NoError(t, err)
 
 		if changed {
-			changes, err := srv.State().ReloadPolicy()
+			err := srv.State().ReloadPolicy()
 			require.NoError(t, err)
-			srv.App.Change(changes...)
 		}
 
 		adminNode := servertest.NewClient(t, srv, "via3408-admin-node",
@@ -451,10 +443,9 @@ func TestIssuesRoutes(t *testing.T) {
 		require.NoError(t, exitNode.Direct().SendUpdate(ctx))
 
 		exitID := findNodeID(t, srv, "via3408-exit")
-		_, routeChange, err := srv.State().SetApprovedRoutes(
+		_, err = srv.State().SetApprovedRoutes(
 			exitID, tsaddr.ExitRoutes())
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 
 		seesExitNode := func(nm *netmap.NetworkMap) bool {
 			for _, p := range nm.Peers {
@@ -610,9 +601,8 @@ func TestIssuesServerMutations(t *testing.T) {
 
 		nodeID := findNodeID(t, srv, "rename-node1")
 
-		_, renameChange, err := srv.State().RenameNode(nodeID, "renamed-node1")
+		_, err := srv.State().RenameNode(nodeID, "renamed-node1")
 		require.NoError(t, err)
-		srv.App.Change(renameChange)
 
 		c2.WaitForCondition(t, "renamed peer visible", 10*time.Second,
 			func(nm *netmap.NetworkMap) bool {
@@ -646,9 +636,8 @@ func TestIssuesServerMutations(t *testing.T) {
 		node2View, ok := srv.State().GetNodeByID(nodeID2)
 		require.True(t, ok)
 
-		deleteChange, err := srv.State().DeleteNode(node2View)
+		err := srv.State().DeleteNode(node2View)
 		require.NoError(t, err)
-		srv.App.Change(deleteChange...)
 
 		c1.WaitForCondition(t, "deleted peer gone", 10*time.Second,
 			func(nm *netmap.NetworkMap) bool {
@@ -738,10 +727,9 @@ func TestIssuesNodeStoreConsistency(t *testing.T) {
 		nodeID1 := findNodeID(t, srv, "consist-node1")
 
 		route := netip.MustParsePrefix("10.50.0.0/24")
-		_, routeChange, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			nodeID1, []netip.Prefix{route})
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 
 		nsView, ok := srv.State().GetNodeByID(nodeID1)
 		require.True(t, ok, "node should be in NodeStore")
@@ -1067,9 +1055,8 @@ func TestIssuesIdentity(t *testing.T) {
 		require.NoError(t, err)
 
 		if changed {
-			changes, err := srv.State().ReloadPolicy()
+			err := srv.State().ReloadPolicy()
 			require.NoError(t, err)
-			srv.App.Change(changes...)
 		}
 
 		c2 := servertest.NewClient(t, srv, "polcon-node2",
@@ -1131,9 +1118,8 @@ func TestPeerRemovedAsDelta(t *testing.T) {
 		node2, ok := srv.State().GetNodeByID(nodeID2)
 		require.True(t, ok)
 
-		changes, err := srv.State().DeleteNode(node2)
+		err := srv.State().DeleteNode(node2)
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 
 		assertRemovedAsDelta(t, c1, nodeID2)
 	})
@@ -1150,9 +1136,8 @@ func TestPeerRemovedAsDelta(t *testing.T) {
 
 		c1.Disconnect(t)
 
-		changes, err := srv.State().DeleteNode(node2)
+		err := srv.State().DeleteNode(node2)
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 
 		c1.Reconnect(t)
 
@@ -1173,9 +1158,8 @@ func TestPeerRemovedAsDelta(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, changed)
 
-		changes, err := srv.State().ReloadPolicy()
+		err = srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 
 		assertRemovedAsDelta(t, c1, nodeID2)
 	})

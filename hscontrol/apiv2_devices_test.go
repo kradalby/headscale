@@ -17,13 +17,13 @@ import (
 
 // registerAPIV2 builds a humatest API with the v2 operations registered over the
 // app's state, with no auth middleware (the contract tests exercise wire shapes;
-// auth is covered by TestAPIv2). The full Backend (Change + Cfg) is wired so the
+// auth is covered by TestAPIv2). The full Backend (State + Cfg) is wired so the
 // device/acl write handlers work.
 func registerAPIV2(t *testing.T, app *Headscale) humatest.TestAPI {
 	t.Helper()
 
 	_, api := humatest.New(t, apiv2.Config())
-	apiv2.Register(api, apiv2.Backend{State: app.state, Change: app.Change, Cfg: app.cfg})
+	apiv2.Register(api, apiv2.Backend{State: app.state, Cfg: app.cfg})
 
 	return api
 }
@@ -79,7 +79,7 @@ func (e deviceTestEnv) srvNode(t *testing.T) types.NodeView {
 func (e deviceTestEnv) seedExpiry(t *testing.T, at time.Time) {
 	t.Helper()
 
-	_, _, err := e.app.state.SetNodeExpiry(e.nodeID, &at)
+	_, err := e.app.state.SetNodeExpiry(e.nodeID, &at)
 	require.NoError(t, err)
 }
 

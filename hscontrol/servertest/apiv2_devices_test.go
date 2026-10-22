@@ -36,7 +36,7 @@ func setBaselinePolicy(t *testing.T, srv *servertest.TestServer) {
 	_, err = st.SetPolicyInDB(baselinePolicy)
 	require.NoError(t, err)
 
-	_, err = st.ReloadPolicy()
+	err = st.ReloadPolicy()
 	require.NoError(t, err)
 }
 
@@ -133,7 +133,7 @@ func apiv2DevicesGoClient(t *testing.T, srv *servertest.TestServer, baseURL, api
 
 	// SetKey — seed a real expiry first so disabling it is a state transition.
 	future := time.Now().Add(24 * time.Hour)
-	_, _, err = srv.State().SetNodeExpiry(id, &future)
+	_, err = srv.State().SetNodeExpiry(id, &future)
 	require.NoError(t, err)
 	require.True(t, srvNodeView(t, srv, id).Expiry().Valid())
 
@@ -301,7 +301,7 @@ func apiv2DevicesTSCLI(t *testing.T, srv *servertest.TestServer, baseURL, apiKey
 
 	// Key — seed a real expiry first so disabling it is a transition.
 	future := time.Now().Add(24 * time.Hour)
-	_, _, err := srv.State().SetNodeExpiry(id, &future)
+	_, err := srv.State().SetNodeExpiry(id, &future)
 	require.NoError(t, err)
 
 	run("set", "device", "key", "--device", deviceID, "--disable-expiry")

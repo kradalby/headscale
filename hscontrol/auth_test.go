@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -589,7 +590,7 @@ func TestAuthenticationFlows(t *testing.T) {
 
 				// Expire the node
 				expiredTime := time.Now().Add(-1 * time.Hour)
-				_, _, err = app.state.SetNodeExpiry(node.ID(), &expiredTime)
+				_, err = app.state.SetNodeExpiry(node.ID(), &expiredTime)
 
 				return "", err
 			},
@@ -1216,7 +1217,7 @@ func TestAuthenticationFlows(t *testing.T) {
 					assert.True(c, found)
 				}, 1*time.Second, 50*time.Millisecond)
 
-				_, _, err = app.state.SetNodeTags(node.ID(), []string{"tag:admin"})
+				_, err = app.state.SetNodeTags(node.ID(), []string{"tag:admin"})
 				require.NoError(t, err)
 
 				spent, err := app.state.GetPreAuthKey(pak.Key)
@@ -2344,7 +2345,7 @@ func TestAuthenticationFlows(t *testing.T) {
 				require.NoError(t, err)
 
 				user := app.state.CreateUserForTest("concurrent-test-user")
-				_, _, err = app.state.HandleNodeFromAuthPath(
+				_, err = app.state.HandleNodeFromAuthPath(
 					registrationID,
 					types.UserID(user.ID),
 					nil,
@@ -2518,7 +2519,7 @@ func TestAuthenticationFlows(t *testing.T) {
 
 				// Try to complete authentication with invalid user ID (should cause error)
 				invalidUserID := types.UserID(99999) // Non-existent user
-				_, _, err = app.state.HandleNodeFromAuthPath(
+				_, err = app.state.HandleNodeFromAuthPath(
 					registrationID,
 					invalidUserID,
 					nil,
@@ -2673,7 +2674,7 @@ func TestAuthenticationFlows(t *testing.T) {
 
 				// Complete authentication for second registration
 				// The goroutine will receive the node from the buffered channel
-				_, _, err = app.state.HandleNodeFromAuthPath(
+				_, err = app.state.HandleNodeFromAuthPath(
 					regID2,
 					types.UserID(user.ID),
 					nil,
@@ -2878,7 +2879,7 @@ func runInteractiveWorkflowTest(t *testing.T, tt struct {
 
 				// Complete the authentication - the goroutine will receive from the buffered channel
 				user := app.state.CreateUserForTest("interactive-test-user")
-				_, _, err = app.state.HandleNodeFromAuthPath(
+				_, err = app.state.HandleNodeFromAuthPath(
 					registrationID,
 					types.UserID(user.ID),
 					nil, // no custom expiry
@@ -3256,7 +3257,7 @@ func TestWebFlowReauthDifferentUser(t *testing.T) {
 
 	// Step 4: Admin completes authentication via CLI
 	// This simulates: headscale auth register --auth-id <id> --user user2
-	node, _, err := app.state.HandleNodeFromAuthPath(
+	node, err := app.state.HandleNodeFromAuthPath(
 		regID,
 		types.UserID(user2.ID), // Register to user2, not user1!
 		nil,                    // No custom expiry
@@ -3370,17 +3371,6 @@ func createTestApp(t *testing.T) *Headscale {
 
 	app, err := NewHeadscale(&cfg)
 	require.NoError(t, err)
-
-	// Initialize and start the mapBatcher to handle Change() calls
-	app.mapBatcher = mapper.NewBatcherAndMapper(&cfg, app.state)
-	app.mapBatcher.Start()
-
-	// Clean up the batcher when the test finishes
-	t.Cleanup(func() {
-		if app.mapBatcher != nil {
-			app.mapBatcher.Close()
-		}
-	})
 
 	return app
 }
@@ -3810,7 +3800,7 @@ func TestWebAuthRejectsUnauthorizedRequestTags(t *testing.T) {
 	app.state.SetAuthCacheEntry(registrationID, regEntry)
 
 	// Complete the web auth - should fail because tag is unauthorized
-	_, _, err := app.state.HandleNodeFromAuthPath(
+	_, err := app.state.HandleNodeFromAuthPath(
 		registrationID,
 		types.UserID(user.ID),
 		nil, // no expiry
@@ -3873,7 +3863,7 @@ func TestWebAuthReauthWithEmptyTagsRemovesAllTags(t *testing.T) {
 	app.state.SetAuthCacheEntry(registrationID1, regEntry1)
 
 	// Complete initial registration with tags
-	node, _, err := app.state.HandleNodeFromAuthPath(
+	node, err := app.state.HandleNodeFromAuthPath(
 		registrationID1,
 		types.UserID(user.ID),
 		nil,
@@ -3900,7 +3890,7 @@ func TestWebAuthReauthWithEmptyTagsRemovesAllTags(t *testing.T) {
 	app.state.SetAuthCacheEntry(registrationID2, regEntry2)
 
 	// Complete reauth with empty tags
-	nodeAfterReauth, _, err := app.state.HandleNodeFromAuthPath(
+	nodeAfterReauth, err := app.state.HandleNodeFromAuthPath(
 		registrationID2,
 		types.UserID(user.ID),
 		nil,
@@ -3986,7 +3976,7 @@ func TestAuthKeyTaggedToUserOwnedViaReauth(t *testing.T) {
 	app.state.SetAuthCacheEntry(registrationID, regEntry)
 
 	// Complete reauth with empty tags
-	nodeAfterReauth, _, err := app.state.HandleNodeFromAuthPath(
+	nodeAfterReauth, err := app.state.HandleNodeFromAuthPath(
 		registrationID,
 		types.UserID(user.ID),
 		nil,
@@ -4107,7 +4097,7 @@ func TestDeletedPreAuthKeyNotRecreatedOnNodeUpdate(t *testing.T) {
 
 	// Process the [tailcfg.MapRequest]-like update
 	// This calls [state.State.UpdateNodeFromMapRequest] which eventually calls [state.State.persistNodeAndRefreshPolicy]
-	_, err = app.state.UpdateNodeFromMapRequest(node.ID(), mapReq)
+	err = app.state.UpdateNodeFromMapRequest(node.ID(), mapReq)
 	require.NoError(t, err, "UpdateNodeFromMapRequest should succeed")
 	t.Log("Simulated MapRequest update completed")
 
@@ -4187,7 +4177,7 @@ func TestTaggedNodeWithoutUserToDifferentUser(t *testing.T) {
 	// This should NOT panic - before the fix, this would panic with:
 	// panic: runtime error: invalid memory address or nil pointer dereference
 	// at [types.UserView.Name] because the existing node has no User
-	nodeAfterReauth, _, err := app.state.HandleNodeFromAuthPath(
+	nodeAfterReauth, err := app.state.HandleNodeFromAuthPath(
 		registrationID,
 		types.UserID(alice.ID),
 		nil,
@@ -4316,7 +4306,7 @@ func TestHandleNodeFromAuthPath_OldUserNil_NoPanic(t *testing.T) {
 	})
 	app.state.SetAuthCacheEntry(authID, regEntry)
 
-	node, _, err := app.state.HandleNodeFromAuthPath(
+	node, err := app.state.HandleNodeFromAuthPath(
 		authID,
 		types.UserID(userB.ID),
 		nil,
@@ -4329,10 +4319,11 @@ func TestHandleNodeFromAuthPath_OldUserNil_NoPanic(t *testing.T) {
 }
 
 // TestHandleNodeFromAuthPath_ReloginWholeNode covers an interactive (web or
-// OIDC) relogin that rotates the node key. A [tailcfg.PeerChange] patch can
-// neither clear a peer's Expired flag nor carry Hostinfo, so a relogin that
-// un-expires the node or changes Hostinfo peers read must be sent as a whole
-// node. A relogin that only rotates keys keeps the key-rotation patch.
+// OIDC) relogin that rotates the node key, as a peer's map stream sees it. A
+// [tailcfg.PeerChange] patch can neither clear a peer's Expired flag nor
+// carry Hostinfo, so a relogin that un-expires the node or changes Hostinfo
+// peers read must reach the peer as a whole node. A relogin that only
+// rotates keys stays a patch.
 func TestHandleNodeFromAuthPath_ReloginWholeNode(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -4362,6 +4353,13 @@ func TestHandleNodeFromAuthPath_ReloginWholeNode(t *testing.T) {
 
 			app.state.PutNodeInStoreForTest(*node)
 
+			peer := app.state.CreateRegisteredNodeForTest(user, "authpath-relogin-peer")
+			app.state.PutNodeInStoreForTest(*peer)
+
+			stream := mapper.NewStream(app.cfg, app.MapHub(), peer.ID, tailcfg.CurrentCapabilityVersion)
+			_, err := stream.Initial(app.state.Snapshot())
+			require.NoError(t, err)
+
 			newNodeKey := key.NewNode()
 			authID := types.MustAuthID()
 			app.state.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
@@ -4374,7 +4372,7 @@ func TestHandleNodeFromAuthPath_ReloginWholeNode(t *testing.T) {
 				},
 			}))
 
-			relogged, c, err := app.state.HandleNodeFromAuthPath(
+			relogged, err := app.state.HandleNodeFromAuthPath(
 				authID,
 				types.UserID(user.ID),
 				nil,
@@ -4384,12 +4382,30 @@ func TestHandleNodeFromAuthPath_ReloginWholeNode(t *testing.T) {
 			require.Equal(t, node.ID, relogged.ID(), "relogin must update the existing node")
 			require.Equal(t, newNodeKey.Public(), relogged.NodeKey())
 
+			resps, err := stream.Update(app.state.Snapshot())
+			require.NoError(t, err)
+
+			var (
+				patches []tailcfg.NodeID
+				whole   []tailcfg.NodeID
+			)
+
+			for _, r := range resps {
+				for _, p := range r.PeersChangedPatch {
+					patches = append(patches, p.NodeID)
+				}
+
+				for _, p := range slices.Concat(r.Peers, r.PeersChanged) {
+					whole = append(whole, p.ID)
+				}
+			}
+
 			if tt.wantPatch {
-				assert.Empty(t, c.PeersChanged, "relogin must not be a whole-node add")
-				assert.Len(t, c.PeerPatches, 1, "relogin must be a peer patch")
+				assert.Empty(t, whole, "relogin must not be a whole-node update")
+				assert.Equal(t, []tailcfg.NodeID{node.ID.NodeID()}, patches, "relogin must be a peer patch")
 			} else {
-				assert.Empty(t, c.PeerPatches, "relogin must not be a peer patch")
-				assert.Contains(t, c.PeersChanged, node.ID, "relogin must be a whole-node add")
+				assert.Empty(t, patches, "relogin must not be a peer patch")
+				assert.Contains(t, whole, node.ID.NodeID(), "relogin must be a whole-node update")
 			}
 		})
 	}
