@@ -900,7 +900,7 @@ func TestCoalescePeerUpdates(t *testing.T) {
 			newer := &tailcfg.PeerChange{NodeID: 2, DiscoKey: &disco2, Online: &online}
 
 			got := CoalescePeerUpdates(1, []Change{
-				EndpointOrDERPUpdate(2, older), EndpointOrDERPUpdate(2, newer),
+				EndpointOrDERPUpdate(older), EndpointOrDERPUpdate(newer),
 			})
 			require.Len(t, got, 1)
 			assert.Equal(t,

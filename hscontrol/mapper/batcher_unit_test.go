@@ -1351,7 +1351,7 @@ func TestPending_RepeatedChangesDoNotGrow(t *testing.T) {
 		// A policy recompute between two patches must not keep them apart:
 		// same-tick repeats of it are dropped before the patches are folded.
 		b.AddWork(
-			change.EndpointOrDERPUpdate(2,
+			change.EndpointOrDERPUpdate(
 				&tailcfg.PeerChange{NodeID: 2, DiscoKey: &last}),
 			change.PolicyChange(),
 		)
