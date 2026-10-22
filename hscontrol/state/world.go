@@ -129,7 +129,7 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 	w.nodes = graph.NewInput(g, "nodes", table, graph.Same[*nodeTable])
 	// Users are refreshed on every registration; an unchanged list must not
 	// recompile the policy.
-	w.users = graph.NewInput(g, "users", users, slices.Equal[[]types.User])
+	w.users = graph.NewInput(g, "users", users, samePolicyUsers)
 	w.policySrc = graph.NewInput(g, "policy-source", polSrc, graph.Never[[]byte])
 	w.derpMap = graph.NewInput(g, "derp-map", (*tailcfg.DERPMap)(nil), graph.Same[*tailcfg.DERPMap])
 	w.extraRecords = graph.NewInput(g, "extra-records", []tailcfg.DNSRecord(nil), graph.Never[[]tailcfg.DNSRecord])
@@ -239,6 +239,13 @@ func samePolicyNodes(a, b policyNodes) bool {
 	}
 
 	return true
+}
+
+// samePolicyUsers reports whether the policy resolves both user lists the
+// same way, so an unrelated user field (a login's UpdatedAt) costs no
+// compile.
+func samePolicyUsers(a, b []types.User) bool {
+	return slices.EqualFunc(a, b, func(x, y types.User) bool { return x.PolicyEqual(&y) })
 }
 
 func samePrimaries(a, b map[netip.Prefix]types.NodeID) bool { return maps.Equal(a, b) }
