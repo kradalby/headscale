@@ -2,6 +2,7 @@ package mapper
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"net/netip"
 	"reflect"
 	"testing"
@@ -412,4 +413,109 @@ func benchState(b *testing.B, n int) (*types.Config, *state.State) {
 	b.Cleanup(func() { _ = s.Close() })
 
 	return cfg, s
+}
+
+// BenchmarkStreamsUpdateEndpointChurn measures every session's update after
+// a tenth of the nodes moved endpoints: the cost of one write burst across
+// the tailnet.
+func BenchmarkStreamsUpdateEndpointChurn(b *testing.B) {
+	const n = 200
+
+	cfg, s := benchState(b, n)
+	ids := s.ListNodes()
+	hub := NewHub()
+
+	streams := make([]*Stream, 0, ids.Len())
+	for _, nv := range ids.All() {
+		st := NewStream(cfg, hub, nv.ID(), capVer)
+		_, err := st.Initial(s.Snapshot())
+		require.NoError(b, err)
+
+		streams = append(streams, st)
+	}
+
+	port := uint16(1)
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		b.StopTimer()
+
+		for i := 0; i < ids.Len(); i += 10 {
+			n := ids.At(i).AsStruct()
+			n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), port)}
+			s.PutNodeInStoreForTest(*n)
+		}
+
+		port++
+		snap := s.Snapshot()
+
+		b.StartTimer()
+
+		for _, st := range streams {
+			_, err := st.Update(snap)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
+
+// TestStreamConvergesUnderRandomWrites drives random writes, most of them
+// payload-only so renders take the change-log fast path, and checks after
+// each that a long-lived stream's client equals a fresh stream's.
+func TestStreamConvergesUnderRandomWrites(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+
+	long := NewStream(cfg, NewHub(), ids[0], capVer)
+	initial, err := long.Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	client := newModelClient(initial[0])
+	r := rand.New(rand.NewPCG(3, 4)) //nolint:gosec // deterministic test input
+	gens := map[types.NodeID]uint64{}
+
+	for step := range 300 {
+		id := ids[1+r.IntN(2)]
+		nv, ok := s.GetNodeByID(id)
+
+		switch op := r.IntN(10); {
+		case !ok:
+			// Deleted earlier; bring it back as a fresh node.
+			u := s.CreateUserForTest(fmt.Sprintf("u-%d", step))
+			ids[1] = s.CreateRegisteredNodeForTest(u, fmt.Sprintf("back-%d", step)).ID
+		case op < 5:
+			n := nv.AsStruct()
+			n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(step))} //nolint:gosec // small
+			s.PutNodeInStoreForTest(*n)
+		case op < 7:
+			if gen, ok := gens[id]; ok {
+				_ = s.Disconnect(id, gen)
+				delete(gens, id)
+			} else {
+				gens[id] = s.Connect(id)
+			}
+		case op < 8:
+			_, _ = s.RenameNode(id, fmt.Sprintf("r%d", step))
+		case op < 9:
+			_, _ = s.SetPolicy([]byte(fmt.Sprintf(`{"acls":[{"action":"accept","src":["*"],"dst":["*:%d"]}]}`, 1+step%3)))
+		default:
+			require.NoError(t, s.DeleteNode(nv))
+		}
+
+		resps, err := long.Update(s.Snapshot())
+		require.NoError(t, err)
+
+		for _, resp := range resps {
+			client.apply(resp)
+		}
+
+		fresh, err := NewStream(cfg, NewHub(), ids[0], capVer).Initial(s.Snapshot())
+		require.NoError(t, err)
+
+		want := newModelClient(fresh[0])
+		require.True(t, reflect.DeepEqual(want.peers, client.peers),
+			"step %d: long-lived peers %v, fresh %v", step, keys(client.peers), keys(want.peers))
+		require.True(t, reflect.DeepEqual(want.filter, client.filter), "step %d: filter differs", step)
+	}
 }

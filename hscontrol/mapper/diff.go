@@ -227,13 +227,13 @@ func peerRestEqual(a, b *tailcfg.Node) bool {
 		a.Machine == b.Machine &&
 		slices.Equal(a.Addresses, b.Addresses) &&
 		slices.Equal(a.AllowedIPs, b.AllowedIPs) &&
-		a.LegacyDERPString == b.LegacyDERPString &&
+		a.LegacyDERPString == b.LegacyDERPString && //nolint:staticcheck // deprecated fields are still on the wire
 		(a.Hostinfo == b.Hostinfo || a.Hostinfo.Equal(b.Hostinfo)) &&
 		a.Created.Equal(b.Created) &&
 		slices.Equal(a.Tags, b.Tags) &&
 		slices.Equal(a.PrimaryRoutes, b.PrimaryRoutes) &&
 		a.MachineAuthorized == b.MachineAuthorized &&
-		slices.Equal(a.Capabilities, b.Capabilities) &&
+		slices.Equal(a.Capabilities, b.Capabilities) && //nolint:staticcheck // deprecated fields are still on the wire
 		a.UnsignedPeerAPIOnly == b.UnsignedPeerAPIOnly &&
 		a.ComputedName == b.ComputedName &&
 		a.ComputedNameWithHost == b.ComputedNameWithHost &&

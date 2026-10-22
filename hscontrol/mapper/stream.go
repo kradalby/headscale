@@ -30,7 +30,7 @@ func NewStream(cfg *types.Config, hub *Hub, nodeID types.NodeID, capVer tailcfg.
 		cfg:    cfg,
 		hub:    hub,
 		nodeID: nodeID,
-		r:      newRenderer(cfg, nodeID, capVer),
+		r:      newRenderer(cfg, hub.renders, nodeID, capVer),
 	}
 }
 
@@ -76,7 +76,7 @@ func (st *Stream) Update(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) {
 	st.sent = nm
 
 	if len(out) > 0 {
-		if len(nm.changed) > 0 || len(nm.removed) > 0 {
+		if peerSetChanged(nm) {
 			st.hub.setLastPeers(st.nodeID, peerIDs(nm))
 		}
 
@@ -84,6 +84,21 @@ func (st *Stream) Update(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) {
 	}
 
 	return out, nil
+}
+
+// peerSetChanged reports whether nm sees other peers than its base.
+func peerSetChanged(nm *netMap) bool {
+	if nm.base == nil || len(nm.removed) > 0 {
+		return true
+	}
+
+	for _, id := range nm.changed {
+		if _, ok := nm.base.peers[id]; !ok {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (st *Stream) dump(resps []*tailcfg.MapResponse) {
@@ -135,6 +150,9 @@ type Hub struct {
 	// ponytail: one ID slice per node ever connected; bounded by nodes.
 	sentPeers map[types.NodeID][]tailcfg.NodeID
 
+	// renders is shared by every session's renderer.
+	renders *peerRenders
+
 	closed bool
 }
 
@@ -155,6 +173,7 @@ func NewHub() *Hub {
 	return &Hub{
 		sessions:  make(map[types.NodeID]map[*Session]struct{}),
 		sentPeers: make(map[types.NodeID][]tailcfg.NodeID),
+		renders:   &peerRenders{},
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"reflect"
 	"slices"
+	"sync"
 
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
@@ -14,6 +15,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/rs/zerolog/log"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/views"
 )
@@ -53,8 +55,15 @@ type renderer struct {
 	nodeID types.NodeID
 	capVer tailcfg.CapabilityVersion
 
-	peers map[types.NodeID]renderedPeer
-	last  *netMap
+	peers  map[types.NodeID]renderedPeer
+	last   *netMap
+	shared *peerRenders
+
+	// The revision, peer inputs and peer set of the previous render, for
+	// telling which peers a later snapshot can have changed.
+	lastRev      uint64
+	lastKey      renderKey
+	lastPeersRev uint64
 
 	// dns is reused while its inputs, the node and the policy's capability
 	// map and the extra records, are unchanged.
@@ -78,13 +87,94 @@ type dnsKey struct {
 	policy, dns uint64
 }
 
-func newRenderer(cfg *types.Config, nodeID types.NodeID, capVer tailcfg.CapabilityVersion) *renderer {
+func newRenderer(cfg *types.Config, shared *peerRenders, nodeID types.NodeID, capVer tailcfg.CapabilityVersion) *renderer {
 	return &renderer{
 		cfg:    cfg,
 		nodeID: nodeID,
 		capVer: capVer,
 		peers:  make(map[types.NodeID]renderedPeer),
+		shared: shared,
 	}
+}
+
+// peerRenders shares, across sessions, the part of a peer's rendering that
+// does not depend on who views it: everything but its routes. Each stored
+// node is rendered once per capability version and policy, not once per
+// viewer.
+//
+// ponytail: one entry per node ID and capability version ever rendered;
+// bounded by nodes.
+type peerRenders struct {
+	m sync.Map // peerRenderID -> *peerRender
+}
+
+type peerRenderID struct {
+	node   types.NodeID
+	capVer tailcfg.CapabilityVersion
+}
+
+type peerRender struct {
+	node   types.NodeView
+	policy uint64
+	tn     *tailcfg.Node
+}
+
+// render returns peer rendered without routes. The result is shared and
+// must not be modified; see [withRoutes].
+func (pr *peerRenders) render(
+	cfg *types.Config,
+	capVer tailcfg.CapabilityVersion,
+	policy uint64,
+	peer types.NodeView,
+	capMaps map[types.NodeID]tailcfg.NodeCapMap,
+) (*tailcfg.Node, error) {
+	id := peerRenderID{node: peer.ID(), capVer: capVer}
+
+	if v, ok := pr.m.Load(id); ok {
+		if e := v.(*peerRender); e.node == peer && e.policy == policy { //nolint:forcetypeassert // only peerRender is stored
+			return e.tn, nil
+		}
+	}
+
+	tn, err := peer.TailNode(capVer, func(types.NodeID) []netip.Prefix { return nil }, cfg, capMaps[peer.ID()])
+	if err != nil {
+		return nil, err
+	}
+
+	// A peer's CapMap carries only the caps clients read from the peer
+	// view; see [policyv2.PeerCapMap].
+	tn.CapMap = policyv2.PeerCapMap(peer, capMaps[peer.ID()])
+
+	// Clients never read a peer's NetInfo, and its home DERP reaches them
+	// as HomeDERP; leaving it in would turn every DERP move into a
+	// whole-peer update.
+	if tn.Hostinfo.Valid() && tn.Hostinfo.NetInfo().Valid() {
+		hi := tn.Hostinfo.AsStruct()
+		hi.NetInfo = nil
+		tn.Hostinfo = hi.View()
+	}
+
+	pr.m.Store(id, &peerRender{node: peer, policy: policy, tn: tn})
+
+	return tn, nil
+}
+
+// withRoutes returns a copy of the shared render base carrying the routes
+// one viewer sees, as [types.NodeView.TailNode] would have rendered them.
+func withRoutes(base *tailcfg.Node, routes []netip.Prefix) *tailcfg.Node {
+	tn := *base
+	tn.AllowedIPs = slices.Concat(base.Addresses, routes)
+	slices.SortFunc(tn.AllowedIPs, netip.Prefix.Compare)
+
+	tn.PrimaryRoutes = nil
+
+	for _, r := range routes {
+		if !tsaddr.IsExitRoute(r) {
+			tn.PrimaryRoutes = append(tn.PrimaryRoutes, r)
+		}
+	}
+
+	return &tn
 }
 
 // render renders the node's netMap from snap.
@@ -151,12 +241,95 @@ func (r *renderer) renderPeers(
 	capMaps map[types.NodeID]tailcfg.NodeCapMap,
 	nm *netMap,
 ) error {
-	ids := snap.PeerIDs(r.nodeID)
 	key := renderKey{
 		policy:      snap.PolicyRev(),
 		policyNodes: snap.PolicyNodesRev(),
 		primaries:   snap.PrimariesRev(),
 	}
+
+	pr := &peerRendering{r: r, snap: snap, self: self, capMaps: capMaps, key: key}
+
+	done, err := r.renderChangedPeers(pr, nm)
+	if err != nil || done {
+		return err
+	}
+
+	return r.renderAllPeers(pr, nm)
+}
+
+// peerRendering holds what rendering one render's peers needs.
+type peerRendering struct {
+	r       *renderer
+	snap    *state.Snapshot
+	self    types.NodeView
+	capMaps map[types.NodeID]tailcfg.NodeCapMap
+	key     renderKey
+
+	matchers       []matcher.Match
+	matchersLoaded bool
+}
+
+// renderChangedPeers is the fast path for a write that moved no policy,
+// route or visibility input: only the nodes the snapshot's change log
+// names since the previous render can differ, so only they are looked at.
+// It reports false when that does not hold and every peer must be checked.
+func (r *renderer) renderChangedPeers(pr *peerRendering, nm *netMap) (bool, error) {
+	base := nm.base
+	if base == nil || pr.key != r.lastKey || pr.snap.PeersRev() != r.lastPeersRev {
+		return false, nil
+	}
+
+	ids, ok := pr.snap.NodesChangedSince(r.lastRev)
+	if !ok {
+		return false, nil
+	}
+
+	nm.peers = maps.Clone(base.peers)
+
+	for _, id := range ids {
+		prev, isPeer := r.peers[id]
+		if !isPeer {
+			continue
+		}
+
+		peer, exists := pr.snap.GetNode(id)
+		if !exists {
+			// A peer left; the slow path also drops it from the peer set.
+			return false, nil
+		}
+
+		if prev.node == peer {
+			continue
+		}
+
+		ptn, err := pr.render(peer, prev, true)
+		if err != nil {
+			return false, err
+		}
+
+		if ptn == nil {
+			return false, nil
+		}
+
+		nm.peers[ptn.ID] = ptn
+		nm.changed = append(nm.changed, ptn.ID)
+	}
+
+	slices.Sort(nm.changed)
+	nm.changed = slices.Compact(nm.changed)
+
+	r.markRendered(pr)
+
+	return true, nil
+}
+
+// renderAllPeers checks every peer, rendering those whose inputs moved.
+func (r *renderer) renderAllPeers(pr *peerRendering, nm *netMap) error {
+	ids := pr.snap.PeerIDs(r.nodeID)
+
+	// A fast path that gave up may have rendered some peers already; they
+	// are in r.peers and are compared like any other below.
+	nm.changed = nil
 
 	if nm.base != nil {
 		nm.peers = maps.Clone(nm.base.peers)
@@ -164,14 +337,10 @@ func (r *renderer) renderPeers(
 		nm.peers = make(map[tailcfg.NodeID]*tailcfg.Node, len(ids))
 	}
 
-	var (
-		matchers       []matcher.Match
-		matchersLoaded bool
-		current        = make(map[types.NodeID]struct{}, len(ids))
-	)
+	current := make(map[types.NodeID]struct{}, len(ids))
 
 	for _, id := range ids {
-		peer, ok := snap.GetNode(id)
+		peer, ok := pr.snap.GetNode(id)
 		if !ok {
 			continue
 		}
@@ -179,8 +348,8 @@ func (r *renderer) renderPeers(
 		current[id] = struct{}{}
 
 		prev, cached := r.peers[id]
-		if cached && prev.node == peer && prev.key == key {
-			if _, ok := nm.peers[prev.tn.ID]; !ok {
+		if cached && prev.node == peer && prev.key == pr.key {
+			if nm.peers[prev.tn.ID] != prev.tn {
 				nm.peers[prev.tn.ID] = prev.tn
 				nm.changed = append(nm.changed, prev.tn.ID)
 			}
@@ -188,55 +357,17 @@ func (r *renderer) renderPeers(
 			continue
 		}
 
-		// RoutesForPeer needs the unreduced matchers: every rule where
-		// the node is source or destination.
-		if !matchersLoaded {
-			var err error
-
-			matchers, err = snap.Policy().MatchersForNode(self)
-			if err != nil {
-				return err
-			}
-
-			matchersLoaded = true
+		ptn, err := pr.render(peer, prev, cached)
+		if err != nil {
+			return err
 		}
 
-		ptn, err := peer.TailNode(r.capVer, func(types.NodeID) []netip.Prefix {
-			return snap.RoutesForPeer(self, peer, matchers)
-		}, r.cfg, capMaps[peer.ID()])
-		if err != nil {
-			// One peer with invalid data must not blank out the map for
-			// every node that can see it.
-			log.Warn().Caller().Err(err).
-				Uint64(zf.NodeID, peer.ID().Uint64()).
-				Str(zf.NodeHostname, peer.Hostname()).
-				Uint64("map.viewer.node.id", r.nodeID.Uint64()).
-				Msgf("dropping peer %d from map response: invalid node data; fix with `headscale nodes rename %d <name>`", peer.ID(), peer.ID())
+		if ptn == nil {
 			delete(current, id)
 
 			continue
 		}
 
-		// A peer's CapMap carries only the caps clients read from the
-		// peer view; see [policyv2.PeerCapMap].
-		ptn.CapMap = policyv2.PeerCapMap(peer, capMaps[peer.ID()])
-
-		// Clients never read a peer's NetInfo, and its home DERP reaches
-		// them as HomeDERP; leaving it in would turn every DERP move into
-		// a whole-peer update.
-		if ptn.Hostinfo.Valid() && ptn.Hostinfo.NetInfo().Valid() {
-			hi := ptn.Hostinfo.AsStruct()
-			hi.NetInfo = nil
-			ptn.Hostinfo = hi.View()
-		}
-
-		// Hostinfo is not patchable, so any change resends the whole peer.
-		// Keep what the client holds while the fields it reads are equal.
-		if cached && peerHostinfoEqual(prev.tn.Hostinfo, ptn.Hostinfo) {
-			ptn.Hostinfo = prev.tn.Hostinfo
-		}
-
-		r.peers[id] = renderedPeer{node: peer, key: key, tn: ptn}
 		nm.peers[ptn.ID] = ptn
 		nm.changed = append(nm.changed, ptn.ID)
 	}
@@ -256,8 +387,57 @@ func (r *renderer) renderPeers(
 
 	slices.Sort(nm.changed)
 	slices.Sort(nm.removed)
+	r.markRendered(pr)
 
 	return nil
+}
+
+func (r *renderer) markRendered(pr *peerRendering) {
+	r.lastRev, r.lastKey, r.lastPeersRev = pr.snap.Rev(), pr.key, pr.snap.PeersRev()
+}
+
+// render renders peer for this viewer and records it. It returns nil, with
+// a warning logged, for a peer whose data cannot be rendered.
+func (pr *peerRendering) render(peer types.NodeView, prev renderedPeer, cached bool) (*tailcfg.Node, error) {
+	r := pr.r
+
+	// RoutesForPeer needs the unreduced matchers: every rule where the node
+	// is source or destination.
+	if !pr.matchersLoaded {
+		var err error
+
+		pr.matchers, err = pr.snap.Policy().MatchersForNode(pr.self)
+		if err != nil {
+			return nil, err
+		}
+
+		pr.matchersLoaded = true
+	}
+
+	base, err := r.shared.render(r.cfg, r.capVer, pr.key.policy, peer, pr.capMaps)
+	if err != nil {
+		// One peer with invalid data must not blank out the map for every
+		// node that can see it.
+		log.Warn().Caller().Err(err).
+			Uint64(zf.NodeID, peer.ID().Uint64()).
+			Str(zf.NodeHostname, peer.Hostname()).
+			Uint64("map.viewer.node.id", r.nodeID.Uint64()).
+			Msgf("dropping peer %d from map response: invalid node data; fix with `headscale nodes rename %d <name>`", peer.ID(), peer.ID())
+
+		return nil, nil //nolint:nilnil // a dropped peer is not an error for the map
+	}
+
+	ptn := withRoutes(base, pr.snap.RoutesForPeer(pr.self, peer, pr.matchers))
+
+	// Hostinfo is not patchable, so any change resends the whole peer.
+	// Keep what the client holds while the fields it reads are equal.
+	if cached && peerHostinfoEqual(prev.tn.Hostinfo, ptn.Hostinfo) {
+		ptn.Hostinfo = prev.tn.Hostinfo
+	}
+
+	r.peers[peer.ID()] = renderedPeer{node: peer, key: pr.key, tn: ptn}
+
+	return ptn, nil
 }
 
 // renderProfiles fills nm.profiles. They only move when a peer joins or

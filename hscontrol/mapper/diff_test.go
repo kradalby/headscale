@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -270,7 +271,7 @@ func setDifferent(v reflect.Value) bool {
 		return true
 	}
 
-	switch v.Kind() {
+	switch v.Kind() { //nolint:exhaustive // other kinds fail the test below
 	case reflect.String:
 		v.SetString(v.String() + "x")
 	case reflect.Bool:
@@ -292,4 +293,55 @@ func setDifferent(v reflect.Value) bool {
 	}
 
 	return true
+}
+
+// TestWithRoutesMatchesTailNode checks that a shared render plus one
+// viewer's routes is exactly what rendering the peer with those routes
+// gives.
+func TestWithRoutesMatchesTailNode(t *testing.T) {
+	uid := uint(1)
+	v4 := netip.MustParseAddr("100.64.0.9")
+	v6 := netip.MustParseAddr("fd7a:115c:a1e0::9")
+	routes := []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/24"),
+		netip.MustParsePrefix("0.0.0.0/0"),
+		netip.MustParsePrefix("::/0"),
+	}
+
+	peer := (&types.Node{
+		ID:         9,
+		GivenName:  "peer",
+		Hostname:   "peer",
+		MachineKey: key.NewMachine().Public(),
+		NodeKey:    key.NewNode().Public(),
+		IPv4:       &v4,
+		IPv6:       &v6,
+		UserID:     &uid,
+		User:       &types.User{Name: "u"},
+		Hostinfo:   &tailcfg.Hostinfo{Hostname: "peer"},
+	}).View()
+
+	cfg := &types.Config{BaseDomain: "example.com"}
+
+	want, err := peer.TailNode(capVer, func(types.NodeID) []netip.Prefix { return routes }, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base, err := (&peerRenders{}).render(cfg, capVer, 1, peer, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := withRoutes(base, routes)
+
+	// render sets the peer-view CapMap and strips NetInfo; align those.
+	want.CapMap = got.CapMap
+	if !reflect.DeepEqual(want, got) {
+		t.Fatalf("shared render differs:\nwant %+v\ngot  %+v", want, got)
+	}
+
+	if len(base.PrimaryRoutes) != 0 || len(base.AllowedIPs) != 2 {
+		t.Fatalf("withRoutes modified the shared base: %+v", base)
+	}
 }
