@@ -426,6 +426,22 @@ func (pm *PolicyManager) Filter() ([]tailcfg.FilterRule, []matcher.Match) {
 type PeerClasses struct {
 	classOf map[types.NodeID]int
 	views   [][]types.NodeID
+
+	// sides keeps what the build learnt of each node, for the next.
+	sides *sideCache
+}
+
+// sideCache holds each node's matcher sides by matcher content: a
+// recompile after a join changes few rules, and a node that did not
+// change keeps its side of every rule that did not.
+type sideCache struct {
+	keys  []string // content of each matcher, by index
+	nodes map[types.NodeID]cachedSides
+}
+
+type cachedSides struct {
+	node     types.NodeView
+	src, dst []uint64
 }
 
 // View returns the nodes id sees, sorted, possibly including id itself.
@@ -548,8 +564,9 @@ func (c *PeerClasses) Changed(old *PeerClasses) []types.NodeID {
 }
 
 // BuildPeerClasses works out who sees whom among nodes; see [PeerClasses].
-// It agrees with [PolicyManager.BuildPeerMap].
-func (pm *PolicyManager) BuildPeerClasses(nodes views.Slice[types.NodeView]) *PeerClasses {
+// It agrees with [PolicyManager.BuildPeerMap]. prev, the previous build,
+// may be nil; what it learnt of unchanged nodes is reused.
+func (pm *PolicyManager) BuildPeerClasses(nodes views.Slice[types.NodeView], prev *PeerClasses) *PeerClasses {
 	c := &PeerClasses{classOf: make(map[types.NodeID]int, nodes.Len())}
 	if pm == nil {
 		return c
@@ -563,7 +580,13 @@ func (pm *PolicyManager) BuildPeerClasses(nodes views.Slice[types.NodeView]) *Pe
 		matchers = matcher.MatchesFromFilterRules(sharedRules(pm.compiledGrants))
 	}
 
-	srcOf, dstOf := matcherSides(matchers, nodes)
+	var cache *sideCache
+	if prev != nil {
+		cache = prev.sides
+	}
+
+	srcOf, dstOf, sides := cachedMatcherSides(matchers, nodes, cache)
+	c.sides = sides
 
 	// A class is a pair of sides; nodes come in ID order, so members do.
 	byKey := map[string]int{}
@@ -784,6 +807,145 @@ func (idx *sideIndex) dsts(m *matcher.Match) []types.NodeID {
 	slices.Sort(out)
 
 	return slices.Compact(out)
+}
+
+// cachedMatcherSides is [matcherSides] that reuses, for a node unchanged
+// since prev, its sides of the matchers prev also had.
+func cachedMatcherSides(
+	matchers []matcher.Match,
+	nodes views.Slice[types.NodeView],
+	prev *sideCache,
+) ([][]uint64, [][]uint64, *sideCache) {
+	next := &sideCache{
+		keys:  make([]string, len(matchers)),
+		nodes: make(map[types.NodeID]cachedSides, nodes.Len()),
+	}
+
+	oldIdx := map[string]int{}
+
+	for k := range matchers {
+		next.keys[k] = matcherKey(&matchers[k])
+	}
+
+	if prev != nil {
+		for k, key := range prev.keys {
+			if _, dup := oldIdx[key]; !dup {
+				oldIdx[key] = k
+			}
+		}
+	}
+
+	// Which new matchers prev knew, and where.
+	from := make([]int, len(matchers))
+	fresh := make([]int, 0, len(matchers))
+
+	for k, key := range next.keys {
+		if old, ok := oldIdx[key]; ok {
+			from[k] = old
+		} else {
+			from[k] = -1
+			fresh = append(fresh, k)
+		}
+	}
+
+	all := make([]int, len(matchers))
+	for k := range all {
+		all[k] = k
+	}
+
+	words := (len(matchers) + 63) / 64 //nolint:mnd
+	srcOf := make([][]uint64, nodes.Len())
+	dstOf := make([][]uint64, nodes.Len())
+
+	for i, n := range nodes.All() {
+		if !n.Valid() {
+			continue
+		}
+
+		evaluate := all
+
+		if old, ok := prev.lookup(n); ok {
+			evaluate = fresh
+
+			for k, o := range from {
+				if o < 0 {
+					continue
+				}
+
+				if bitSet(old.src, o) {
+					srcOf[i] = setBit(srcOf[i], words, k)
+				}
+
+				if bitSet(old.dst, o) {
+					dstOf[i] = setBit(dstOf[i], words, k)
+				}
+			}
+		}
+
+		ips, subnet, isExit := n.IPs(), n.SubnetRoutes(), n.IsExitNode()
+		routed := len(subnet) > 0
+
+		for _, k := range evaluate {
+			m := &matchers[k]
+
+			if m.SrcsContainsIPs(ips...) || (routed && m.SrcsOverlapsPrefixes(subnet...)) {
+				srcOf[i] = setBit(srcOf[i], words, k)
+			}
+
+			if m.DestsContainsIP(ips...) || (routed && m.DestsOverlapsPrefixes(subnet...)) ||
+				(isExit && m.DestsIsTheInternet()) {
+				dstOf[i] = setBit(dstOf[i], words, k)
+			}
+		}
+
+		next.nodes[n.ID()] = cachedSides{node: n, src: srcOf[i], dst: dstOf[i]}
+	}
+
+	return srcOf, dstOf, next
+}
+
+// lookup returns what c knows of n, when n is the same stored node.
+func (c *sideCache) lookup(n types.NodeView) (cachedSides, bool) {
+	if c == nil {
+		return cachedSides{}, false
+	}
+
+	old, ok := c.nodes[n.ID()]
+
+	return old, ok && old.node == n
+}
+
+// matcherKey identifies a matcher by what it matches.
+func matcherKey(m *matcher.Match) string {
+	var b strings.Builder
+
+	for _, p := range m.Srcs().Prefixes() {
+		b.WriteString(p.String())
+		b.WriteByte(',')
+	}
+
+	b.WriteByte('>')
+
+	for _, p := range m.Dests().Prefixes() {
+		b.WriteString(p.String())
+		b.WriteByte(',')
+	}
+
+	return b.String()
+}
+
+func bitSet(side []uint64, k int) bool {
+	return side != nil && side[k/64]&(1<<(k%64)) != 0 //nolint:mnd
+}
+
+func setBit(side []uint64, words, k int) []uint64 {
+	if side == nil {
+		side = make([]uint64, words)
+	}
+
+	side[k/64] |= 1 << (k % 64) //nolint:mnd
+
+	return side
 }
 
 // matcherSides evaluates, per node, which of matchers it is a source and

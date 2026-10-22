@@ -267,7 +267,7 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 
 	w.peers = graph.NewDerived(g, "peers", (*policyv2.PeerClasses).Same,
 		func(s *graph.Snapshot, prev *policyv2.PeerClasses) *policyv2.PeerClasses {
-			next := graph.Get(s, w.policy).pm.BuildPeerClasses(graph.Get(s, w.policyNodes).list)
+			next := graph.Get(s, w.policy).pm.BuildPeerClasses(graph.Get(s, w.policyNodes).list, prev)
 			// Views that did not change keep their identity, so sessions
 			// and shared peer maps keyed on them carry over.
 			next.Reuse(prev)

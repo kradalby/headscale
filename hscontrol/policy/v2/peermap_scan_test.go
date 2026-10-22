@@ -298,7 +298,7 @@ func TestBuildPeerMapMatchesPairScan(t *testing.T) {
 			require.Equalf(t, want, buildPeerMapSliceMap(pm, in),
 				"slice + map: iteration %d, policy %s", it, polB)
 
-			classes := pm.BuildPeerClasses(in)
+			classes := pm.BuildPeerClasses(in, nil)
 			for _, n := range in.All() {
 				sorted := slices.Sorted(slices.Values(want[n.ID()]))
 				require.Equalf(t, sorted, nilIfEmpty(classes.Peers(n.ID())),
@@ -847,4 +847,59 @@ func nilIfEmpty[T any](s []T) []T {
 	}
 
 	return s
+}
+
+// TestBuildPeerClassesReuseMatchesFresh rebuilds peer classes from the
+// previous build after a node changes, joins or leaves, or the policy
+// changes, and checks the result equals the pair scan every time.
+func TestBuildPeerClassesReuseMatchesFresh(t *testing.T) {
+	r := rand.New(rand.NewPCG(7, 8)) //nolint:gosec // reproducible test input
+
+	for it := range 300 {
+		nodes := scanRandomNodes(r, 2+r.IntN(30))
+		polB := scanRandomPolicy(r)
+		nextID := len(nodes) + 1
+
+		var prev *PeerClasses
+
+		for step := range 8 {
+			pm, err := NewPolicyManager(polB, scanUsers, nodes.ViewSlice())
+			if err != nil {
+				break
+			}
+
+			classes := pm.BuildPeerClasses(nodes.ViewSlice(), prev)
+			want := buildPeerMapPairScan(pm, nodes.ViewSlice())
+
+			for _, n := range nodes {
+				require.Equalf(t, nilIfEmpty(slices.Sorted(slices.Values(want[n.ID]))), nilIfEmpty(classes.Peers(n.ID)),
+					"iteration %d step %d node %d, policy %s", it, step, n.ID, polB)
+			}
+
+			prev = classes
+
+			// Change the tailnet: one node's tags or user, a join, a
+			// leave, or the policy.
+			switch r.IntN(4) {
+			case 0:
+				i := r.IntN(len(nodes))
+				c := nodes[i].Clone()
+				c.Tags = []string{scanTags[r.IntN(len(scanTags))]}
+				c.User, c.UserID = nil, nil
+				nodes[i] = c
+			case 1:
+				// A fresh ID and so fresh addresses.
+				extra := scanRandomNodes(r, nextID)
+				nodes = append(slices.Clone(nodes), extra[nextID-1])
+				nextID++
+			case 2:
+				if len(nodes) > 2 {
+					i := r.IntN(len(nodes))
+					nodes = slices.Delete(slices.Clone(nodes), i, i+1)
+				}
+			default:
+				polB = scanRandomPolicy(r)
+			}
+		}
+	}
 }
