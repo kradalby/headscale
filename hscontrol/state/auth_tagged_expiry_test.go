@@ -1811,9 +1811,9 @@ func (c pakReregCase) fields(t *testing.T) (pakNodeFields, pakNodeFields) {
 	return pakFieldsOf(ns.AsStruct()), pakFieldsOf(dbNode)
 }
 
-// waitParkedOnWriter waits until a goroutine running fn is blocked waiting
-// for the graph's writer lock, which proves that everything fn does before
-// its node write has already run.
+// waitParkedOnWriter waits until a goroutine running fn is blocked on its
+// node write, which proves that everything fn does before the write has
+// already run.
 func waitParkedOnWriter(t *testing.T, fn string) {
 	t.Helper()
 
@@ -1822,9 +1822,12 @@ func waitParkedOnWriter(t *testing.T, fn string) {
 	require.Eventually(t, func() bool {
 		stacks := string(buf[:runtime.Stack(buf, true)])
 		for g := range strings.SplitSeq(stacks, "\n\n") {
-			if strings.Contains(g, "[sync.Mutex.Lock") &&
-				strings.Contains(g, "(*Graph).Update(") &&
-				strings.Contains(g, "."+fn+"(") {
+			// A queued write waits for its group commit; one that leads
+			// the next commit waits for the graph's lock.
+			queued := strings.Contains(g, "[chan receive") && strings.Contains(g, "(*world).update(")
+			locked := strings.Contains(g, "[sync.Mutex.Lock") && strings.Contains(g, "(*Graph).Update(")
+
+			if (queued || locked) && strings.Contains(g, "."+fn+"(") {
 				return true
 			}
 		}

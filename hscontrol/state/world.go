@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/policy"
@@ -47,6 +48,12 @@ var (
 		Name:      "world_nodes",
 		Help:      "Nodes in the control-plane graph.",
 	})
+	worldBatchSize = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: prometheusNamespace,
+		Name:      "world_write_batch_size",
+		Help:      "Node writes committed together.",
+		Buckets:   []float64{1, 2, 5, 10, 20, 50, 100, 200},
+	})
 	policyCompiles = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: prometheusNamespace,
 		Name:      "policy_compiles_total",
@@ -75,6 +82,11 @@ type nodeTable struct {
 // methods below, which serialise on the graph.
 type world struct {
 	g *graph.Graph
+
+	// writeMu guards the group-commit queue of node writes.
+	writeMu    sync.Mutex
+	writes     []*nodeWrite
+	committing bool
 
 	nodes        graph.Input[*nodeTable]
 	users        graph.Input[[]types.User]
@@ -259,15 +271,55 @@ func (w *world) snapshot() *Snapshot {
 	return &Snapshot{s: w.g.Snapshot(), w: w}
 }
 
-// update commits the result of fn applied to a copy of the node table.
-// fn reports whether it changed anything; an unchanged table publishes
-// nothing.
+// nodeWrite is one queued change to the node table; see [world.update].
+type nodeWrite struct {
+	fn   func(nodes map[types.NodeID]*types.Node) bool
+	done chan *Snapshot
+}
+
+// update commits fn applied to a copy of the node table and returns the
+// snapshot holding it. fn reports whether it changed anything and must not
+// modify nodes when it reports false.
+//
+// Writes that arrive while a commit runs share the next one (group
+// commit): a burst of joins, deletes or endpoint updates costs one policy
+// compile and one peer rebuild instead of one each, and an idle write pays
+// no wait.
 func (w *world) update(fn func(nodes map[types.NodeID]*types.Node) bool) *Snapshot {
+	nw := &nodeWrite{fn: fn, done: make(chan *Snapshot, 1)}
+
+	w.writeMu.Lock()
+	w.writes = append(w.writes, nw)
+	lead := !w.committing
+	w.committing = true
+	w.writeMu.Unlock()
+
+	if lead {
+		w.commitWrites()
+	}
+
+	return <-nw.done
+}
+
+// commitWrites commits every queued write in one transaction, then hands
+// any writes queued meanwhile to a new leader so no caller waits on others'
+// batches.
+func (w *world) commitWrites() {
+	w.writeMu.Lock()
+	batch := w.writes
+	w.writes = nil
+	w.writeMu.Unlock()
+
 	snap, _ := w.g.Update(func(tx *graph.Tx) error {
 		cur := graph.Peek(tx, w.nodes)
-
 		next := maps.Clone(cur.byID)
-		if !fn(next) {
+
+		changed := false
+		for _, nw := range batch {
+			changed = nw.fn(next) || changed
+		}
+
+		if !changed {
 			return nil
 		}
 
@@ -278,7 +330,23 @@ func (w *world) update(fn func(nodes map[types.NodeID]*types.Node) bool) *Snapsh
 		return nil
 	})
 
-	return &Snapshot{s: snap, w: w}
+	worldBatchSize.Observe(float64(len(batch)))
+
+	out := &Snapshot{s: snap, w: w}
+	for _, nw := range batch {
+		nw.done <- out
+	}
+
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+
+	if len(w.writes) == 0 {
+		w.committing = false
+
+		return
+	}
+
+	go w.commitWrites()
 }
 
 // UpdateNodeFunc modifies a node in place. It runs on a copy of the stored

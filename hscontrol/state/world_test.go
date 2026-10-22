@@ -871,3 +871,48 @@ func TestPolicyCachesSurviveStaleView(t *testing.T) {
 		})
 	}
 }
+
+// TestWorldGroupCommitsQueuedWrites queues writes behind a stalled commit
+// and checks they land together: one more commit, so one policy compile,
+// for the whole burst.
+func TestWorldGroupCommitsQueuedWrites(t *testing.T) {
+	alice := &types.User{Name: "alice"}
+	alice.ID = 1
+
+	w, _ := testWorld(t, worldNode(1, alice, "100.64.0.1"))
+	before := w.snapshot().Rev()
+
+	entered, release := make(chan struct{}), make(chan struct{})
+
+	go w.UpdateNode(1, func(*types.Node) {
+		close(entered)
+		<-release
+	})
+
+	<-entered
+
+	const burst = 10
+
+	var wg sync.WaitGroup
+
+	for i := range burst {
+		wg.Go(func() {
+			w.PutNode(*worldNode(types.NodeID(i+2), alice, fmt.Sprintf("100.64.0.%d", i+2)))
+		})
+	}
+
+	require.Eventually(t, func() bool {
+		w.writeMu.Lock()
+		defer w.writeMu.Unlock()
+
+		return len(w.writes) == burst
+	}, 5*time.Second, time.Millisecond)
+
+	close(release)
+	wg.Wait()
+
+	after := w.snapshot()
+	assert.Equal(t, before+2, after.Rev(), "the stalled write and the burst commit once each")
+	assert.Equal(t, burst+1, after.ListNodes().Len())
+	assert.Len(t, after.ListPeerIDs(1), burst)
+}
