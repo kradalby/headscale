@@ -363,7 +363,11 @@ func (r *renderer) renderPeers(
 		return nil
 	}
 
-	added, gone := mergeDiff(r.lastPeerIDs, view)
+	var added, gone []types.NodeID
+	if len(view) != len(r.lastPeerIDs) || len(view) > 0 && &view[0] != &r.lastPeerIDs[0] {
+		added, gone = mergeDiff(r.lastPeerIDs, view)
+	}
+
 	candidates := slices.Concat(added, gone, snap.NodesChangedSince(r.lastNodes))
 
 	if key.policy != r.lastKey.policy {

@@ -463,6 +463,34 @@ func (c *PeerClasses) Peers(id types.NodeID) []types.NodeID {
 	return slices.Clone(view)
 }
 
+// Reuse replaces each view of c that equals one of prev by prev's, so
+// readers that kept a view see it unchanged by identity.
+func (c *PeerClasses) Reuse(prev *PeerClasses) {
+	if c == nil || prev == nil {
+		return
+	}
+
+	// Each class is compared once, with the previous view of one member.
+	done := make([]bool, len(c.views))
+
+	for id, ci := range c.classOf {
+		pi, ok := prev.classOf[id]
+		if !ok || done[ci] {
+			continue
+		}
+
+		done[ci] = true
+
+		if v, pv := c.views[ci], prev.views[pi]; !sameSlice(v, pv) && slices.Equal(v, pv) {
+			c.views[ci] = pv
+		}
+	}
+}
+
+func sameSlice(a, b []types.NodeID) bool {
+	return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0])
+}
+
 // Same reports whether every node sees the same nodes in c and o.
 func (c *PeerClasses) Same(o *PeerClasses) bool {
 	if c == o {
