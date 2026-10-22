@@ -3034,5 +3034,25 @@ func BenchmarkCompileWideACL(b *testing.B) {
 			require.NoError(b, err)
 		}
 	})
+}
 
+// BenchmarkNewPolicyManagerManyTags measures the compile a join or delete
+// costs when every node carries its own tag and grants reference them, a CI
+// fleet shape where resolving tags dominated the compile.
+func BenchmarkNewPolicyManagerManyTags(b *testing.B) {
+	for _, n := range []int{1000, 4000} {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			nodes := scanManyRulesNodes(n)
+			pol := []byte(scanManyRulesPolicy(n, 400))
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				_, err := NewPolicyManager(pol, nil, nodes.ViewSlice())
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }

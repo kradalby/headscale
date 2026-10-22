@@ -165,24 +165,27 @@ func NewPolicyManager(b []byte, users []types.User, nodes views.Slice[types.Node
 		return nil, fmt.Errorf("validating policy user references: %w", err)
 	}
 
+	// One tag index serves every resolution in this compile.
+	indexed := pol.withNodesByTag(nodes)
+
 	// Compile all grants once. Both global and per-node filter
 	// rules are derived from these compiled grants.
-	grants := pol.compileGrants(users, nodes)
+	grants := indexed.compileGrants(users, nodes)
 
 	// Order matters, tags might be used in autoapprovers, so we need to ensure
 	// that the map for tag owners is resolved before resolving autoapprovers.
 	// TODO(kradalby): Order might not matter after #2417
-	tagMap, err := resolveTagOwners(pol, users, nodes)
+	tagMap, err := resolveTagOwners(indexed, users, nodes)
 	if err != nil {
 		return nil, fmt.Errorf("resolving tag owners map: %w", err)
 	}
 
-	autoMap, exitSet, err := resolveAutoApprovers(pol, users, nodes)
+	autoMap, exitSet, err := resolveAutoApprovers(indexed, users, nodes)
 	if err != nil {
 		return nil, fmt.Errorf("resolving auto approvers map: %w", err)
 	}
 
-	nodeAttrs, err := pol.compileNodeAttrs(users, nodes)
+	nodeAttrs, err := indexed.compileNodeAttrs(users, nodes)
 	if err != nil {
 		return nil, fmt.Errorf("compiling nodeAttrs: %w", err)
 	}
