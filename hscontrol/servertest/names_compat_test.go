@@ -44,30 +44,6 @@ var nameSkipReasons = map[string]string{
 	"names/N10/n63b/label": labelSuffixOverflow,
 	"names/N11/n63b/label": labelSuffixOverflow,
 
-	"names/N1/domain":     v2NameBare,
-	"names/N2/domain":     v2NameBare,
-	"names/N3/domain":     v2NameBare,
-	"names/N4/domain":     v2NameBare,
-	"names/N5/domain":     v2NameBare,
-	"names/N6/domain":     v2NameBare,
-	"names/N7/domain":     v2NameBare,
-	"names/N8/domain":     v2NameBare,
-	"names/N9a/domain":    v2NameBare,
-	"names/N9b/domain":    v2NameBare,
-	"names/N10/domain":    v2NameBare,
-	"names/N11/domain":    v2NameBare,
-	"names/N11b/domain":   v2NameBare,
-	"names/N12a/domain":   v2NameBare,
-	"names/N12b/domain":   v2NameBare,
-	"names/N13/domain":    v2NameBare,
-	"names-svc/S1/domain": v2NameBare,
-	"names-svc/S2/domain": v2NameBare,
-	"names-svc/S3/domain": v2NameBare,
-	"names-svc/S4/domain": v2NameBare,
-	"names-svc/S5/domain": v2NameBare,
-	"names-svc/S6/domain": v2NameBare,
-	"names-svc/S7/domain": v2NameBare,
-
 	"names/N11/pdb/label":  adminNameFollowsHostname,
 	"names/N11b/pdb/label": adminNameFollowsHostname,
 	"names/N12a/pdb/label": adminNameFollowsHostname,
@@ -96,7 +72,6 @@ const (
 	extraRecordNotTaken      = "EXTRA_RECORD_NOT_TAKEN: headscale gives a device the label an extra DNS record holds and accepts a rename to it; SaaS bumps a device past a Service's name and refuses the rename with 400"
 	caseTwinTakenText        = "NAME_TAKEN_TEXT: headscale refuses a rename to a case twin saying the node name is not unique, where SaaS says the name is already taken"
 	recordNameTakenText      = "EXTRA_RECORD_NOT_TAKEN+NAME_TAKEN_TEXT: headscale accepts a rename to an extra record's name; refused, its text says the node name is not unique, where SaaS says the name is already taken"
-	v2NameBare               = "V2_NAME_BARE: headscale's v2 device name is the bare label; SaaS's is the FQDN under the tailnet domain"
 )
 
 // nameViewer is the node whose netmap every step captured.
