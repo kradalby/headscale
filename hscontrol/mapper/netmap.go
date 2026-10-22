@@ -130,9 +130,12 @@ func (pr *peerRenders) render(
 ) (*tailcfg.Node, error) {
 	id := peerRenderID{node: peer.ID(), capVer: capVer}
 
+	var prev *peerRender
+
 	if v, ok := pr.m.Load(id); ok {
-		if e := v.(*peerRender); e.node == peer && e.policy == policy { //nolint:forcetypeassert // only peerRender is stored
-			return e.tn, nil
+		prev = v.(*peerRender) //nolint:forcetypeassert // only peerRender is stored
+		if prev.node == peer && prev.policy == policy {
+			return prev.tn, nil
 		}
 	}
 
@@ -154,14 +157,27 @@ func (pr *peerRenders) render(
 		tn.Hostinfo = hi.View()
 	}
 
+	// Hostinfo is not patchable, so any change resends the whole peer.
+	// Keep the Hostinfo clients hold while the fields they read are equal;
+	// doing it here, once, keeps the render shared.
+	if prev != nil && peerHostinfoEqual(prev.tn.Hostinfo, tn.Hostinfo) {
+		tn.Hostinfo = prev.tn.Hostinfo
+	}
+
 	pr.m.Store(id, &peerRender{node: peer, policy: policy, tn: tn})
 
 	return tn, nil
 }
 
-// withRoutes returns a copy of the shared render base carrying the routes
-// one viewer sees, as [types.NodeView.TailNode] would have rendered them.
+// withRoutes returns the shared render base carrying the routes one viewer
+// sees, as [types.NodeView.TailNode] would have rendered them. A peer with
+// no routes for the viewer, most of them, is the shared base itself, so a
+// viewer holds a copy only of the peers that route for it.
 func withRoutes(base *tailcfg.Node, routes []netip.Prefix) *tailcfg.Node {
+	if len(routes) == 0 {
+		return base
+	}
+
 	tn := *base
 	tn.AllowedIPs = slices.Concat(base.Addresses, routes)
 	slices.SortFunc(tn.AllowedIPs, netip.Prefix.Compare)
@@ -302,7 +318,7 @@ func (r *renderer) renderChangedPeers(pr *peerRendering, nm *netMap) (bool, erro
 			continue
 		}
 
-		ptn, err := pr.render(peer, prev, true)
+		ptn, err := pr.render(peer)
 		if err != nil {
 			return false, err
 		}
@@ -357,7 +373,7 @@ func (r *renderer) renderAllPeers(pr *peerRendering, nm *netMap) error {
 			continue
 		}
 
-		ptn, err := pr.render(peer, prev, cached)
+		ptn, err := pr.render(peer)
 		if err != nil {
 			return err
 		}
@@ -398,7 +414,7 @@ func (r *renderer) markRendered(pr *peerRendering) {
 
 // render renders peer for this viewer and records it. It returns nil, with
 // a warning logged, for a peer whose data cannot be rendered.
-func (pr *peerRendering) render(peer types.NodeView, prev renderedPeer, cached bool) (*tailcfg.Node, error) {
+func (pr *peerRendering) render(peer types.NodeView) (*tailcfg.Node, error) {
 	r := pr.r
 
 	// RoutesForPeer needs the unreduced matchers: every rule where the node
@@ -428,12 +444,6 @@ func (pr *peerRendering) render(peer types.NodeView, prev renderedPeer, cached b
 	}
 
 	ptn := withRoutes(base, pr.snap.RoutesForPeer(pr.self, peer, pr.matchers))
-
-	// Hostinfo is not patchable, so any change resends the whole peer.
-	// Keep what the client holds while the fields it reads are equal.
-	if cached && peerHostinfoEqual(prev.tn.Hostinfo, ptn.Hostinfo) {
-		ptn.Hostinfo = prev.tn.Hostinfo
-	}
 
 	r.peers[peer.ID()] = renderedPeer{node: peer, key: pr.key, tn: ptn}
 

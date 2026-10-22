@@ -5,6 +5,7 @@ import (
 	"math/rand/v2"
 	"net/netip"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 
@@ -517,5 +518,54 @@ func TestStreamConvergesUnderRandomWrites(t *testing.T) {
 		require.True(t, reflect.DeepEqual(want.peers, client.peers),
 			"step %d: long-lived peers %v, fresh %v", step, keys(client.peers), keys(want.peers))
 		require.True(t, reflect.DeepEqual(want.filter, client.filter), "step %d: filter differs", step)
+	}
+}
+
+// BenchmarkStreamsRetainedHeap reports the heap every session keeps per
+// peer after a few updates: per-viewer state must stay a small constant
+// per pair, and nothing may accumulate across renders.
+func BenchmarkStreamsRetainedHeap(b *testing.B) {
+	const n = 200
+
+	cfg, s := benchState(b, n)
+	ids := s.ListNodes()
+
+	for b.Loop() {
+		hub := NewHub()
+
+		runtime.GC()
+
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+
+		streams := make([]*Stream, 0, ids.Len())
+		for _, nv := range ids.All() {
+			st := NewStream(cfg, hub, nv.ID(), capVer)
+			_, err := st.Initial(s.Snapshot())
+			require.NoError(b, err)
+
+			streams = append(streams, st)
+		}
+
+		for round := range 10 {
+			for i := round; i < ids.Len(); i += 10 {
+				n := ids.At(i).AsStruct()
+				n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(round))} //nolint:gosec // small
+				s.PutNodeInStoreForTest(*n)
+			}
+
+			for _, st := range streams {
+				_, err := st.Update(s.Snapshot())
+				require.NoError(b, err)
+			}
+		}
+
+		runtime.GC()
+
+		var after runtime.MemStats
+		runtime.ReadMemStats(&after)
+
+		b.ReportMetric(float64(after.HeapAlloc-before.HeapAlloc)/float64(n*n), "B/pair")
+		runtime.KeepAlive(streams)
 	}
 }
