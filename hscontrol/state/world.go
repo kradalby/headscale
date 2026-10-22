@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/policy"
@@ -137,6 +138,14 @@ type world struct {
 	writes     []*nodeWrite
 	committing bool
 
+	// batchSize and batchTimeout are [types.Tuning.NodeStoreBatchSize] and
+	// [types.Tuning.NodeStoreBatchTimeout]: a commit waits up to the timeout
+	// for writes to batch, or until batchSize are queued. Zero waits for
+	// nothing. full wakes a waiting commit once the batch is full.
+	batchSize    int
+	batchTimeout time.Duration
+	full         chan struct{}
+
 	nodes        graph.Input[*nodeTable]
 	users        graph.Input[[]types.User]
 	policySrc    graph.Input[[]byte]
@@ -182,7 +191,7 @@ type compiledPolicy struct {
 // when the policy does not compile against users and nodes.
 func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, error) {
 	g := graph.New()
-	w := &world{g: g}
+	w := &world{g: g, full: make(chan struct{}, 1)}
 
 	// The first commit, revision 1, publishes these nodes.
 	table := &nodeTable{byID: make(map[types.NodeID]*types.Node, len(nodes)), floor: 1}
@@ -470,13 +479,39 @@ func (w *world) update(fn func(nodes map[types.NodeID]*types.Node) []types.NodeI
 	w.writes = append(w.writes, nw)
 	lead := !w.committing
 	w.committing = true
+
+	if w.batchSize > 0 && len(w.writes) >= w.batchSize {
+		select {
+		case w.full <- struct{}{}:
+		default:
+		}
+	}
 	w.writeMu.Unlock()
 
 	if lead {
+		w.lingerForBatch()
 		w.commitWrites()
 	}
 
 	return <-nw.done
+}
+
+// lingerForBatch waits for writes to batch, as the tuning asks. Writes
+// that land together are also elected together: two HA routers coming back
+// at once keep their healthy primary instead of handing the route to
+// whichever reconnected first.
+func (w *world) lingerForBatch() {
+	if w.batchTimeout <= 0 {
+		return
+	}
+
+	timer := time.NewTimer(w.batchTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+	case <-w.full:
+	}
 }
 
 // commitWrites commits every queued write in one transaction, then hands
@@ -486,6 +521,13 @@ func (w *world) commitWrites() {
 	w.writeMu.Lock()
 	batch := w.writes
 	w.writes = nil
+
+	// A full signal for the writes taken here must not cut the next
+	// batch's wait short.
+	select {
+	case <-w.full:
+	default:
+	}
 	w.writeMu.Unlock()
 
 	snap, _ := w.g.Update(func(tx *graph.Tx) error {

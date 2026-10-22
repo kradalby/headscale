@@ -249,6 +249,8 @@ func NewState(cfg *types.Config) (*State, error) {
 		return nil, fmt.Errorf("initializing policy manager: %w", err)
 	}
 
+	w.batchSize, w.batchTimeout = cfg.Tuning.NodeStoreBatchSize, cfg.Tuning.NodeStoreBatchTimeout
+
 	// Last: NewLRU starts the TTL sweeper goroutine, which only Close stops.
 	authCache := expirable.NewLRU[types.AuthID, *types.AuthRequest](
 		cacheMaxEntries,

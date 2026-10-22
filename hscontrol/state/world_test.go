@@ -1010,3 +1010,49 @@ func TestWorldIndexMatchesFullBuild(t *testing.T) {
 		require.Len(t, snap.PrimaryRoutes(), len(fresh), "step %d", step)
 	}
 }
+
+// TestWorldBatchTimeoutElectsTogether lets two HA routers come back within
+// the batch window, the healthy-incumbent case: they must land in one
+// commit, so the election sees both and keeps the incumbent.
+func TestWorldBatchTimeoutElectsTogether(t *testing.T) {
+	alice := &types.User{Name: "alice"}
+	alice.ID = 1
+
+	route := netip.MustParsePrefix("10.0.0.0/24")
+	router := func(id types.NodeID, ip string) *types.Node {
+		n := worldNode(id, alice, ip)
+		n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+		n.ApprovedRoutes = []netip.Prefix{route}
+
+		return n
+	}
+
+	w, _ := testWorld(t, router(1, "100.64.0.1"), router(2, "100.64.0.2"))
+
+	// Move the route to 2, then lose both: the all-unhealthy rule keeps 2.
+	w.UpdateNode(1, func(n *types.Node) { n.IsOnline = new(false) })
+	w.UpdateNode(1, func(n *types.Node) { n.IsOnline = new(true) })
+	w.UpdateNodes(map[types.NodeID]UpdateNodeFunc{
+		1: func(n *types.Node) { n.Unhealthy = true },
+		2: func(n *types.Node) { n.Unhealthy = true },
+	})
+
+	primary, _ := w.snapshot().PrimaryRouteFor(route)
+	require.Equal(t, types.NodeID(2), primary)
+
+	w.batchTimeout = 200 * time.Millisecond
+	before := w.snapshot().Rev()
+
+	var wg sync.WaitGroup
+
+	for _, id := range []types.NodeID{1, 2} {
+		wg.Go(func() { w.UpdateNode(id, func(n *types.Node) { n.Unhealthy = false }) })
+	}
+
+	wg.Wait()
+
+	assert.Equal(t, before+1, w.snapshot().Rev(), "both recoveries commit together")
+
+	primary, _ = w.snapshot().PrimaryRouteFor(route)
+	assert.Equal(t, types.NodeID(2), primary, "the incumbent keeps the route")
+}
