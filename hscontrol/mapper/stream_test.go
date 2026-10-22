@@ -586,7 +586,13 @@ func TestStreamConvergesUnderRandomWrites(t *testing.T) {
 // peer after a few updates: per-viewer state must stay a small constant
 // per pair, and nothing may accumulate across renders.
 func BenchmarkStreamsRetainedHeap(b *testing.B) {
-	const n = 200
+	for _, n := range []int{200, 1000} {
+		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) { benchRetainedHeap(b, n) })
+	}
+}
+
+func benchRetainedHeap(b *testing.B, n int) {
+	b.Helper()
 
 	cfg, s := benchState(b, n)
 	ids := s.ListNodes()

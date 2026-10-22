@@ -970,6 +970,9 @@ func (s *Snapshot) PeerView(id types.NodeID) []types.NodeID {
 	return graph.Get(s.s, s.w.peers).View(id)
 }
 
+// PeerViews returns every distinct view; see [Snapshot.PeerView].
+func (s *Snapshot) PeerViews() [][]types.NodeID { return graph.Get(s.s, s.w.peers).Views() }
+
 // ListPeers returns the nodes id can see, sorted by ID.
 func (s *Snapshot) ListPeers(id types.NodeID) views.Slice[types.NodeView] {
 	return views.SliceOf(s.gather(s.ListPeerIDs(id)))

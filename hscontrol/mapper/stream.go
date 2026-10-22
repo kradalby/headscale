@@ -30,7 +30,7 @@ func NewStream(cfg *types.Config, hub *Hub, nodeID types.NodeID, capVer tailcfg.
 		cfg:    cfg,
 		hub:    hub,
 		nodeID: nodeID,
-		r:      newRenderer(cfg, hub.renders, nodeID, capVer),
+		r:      newRenderer(cfg, hub, nodeID, capVer),
 	}
 }
 
@@ -155,8 +155,9 @@ type Hub struct {
 	// sessions so a reconnect can announce peers removed in between.
 	sentPeers map[types.NodeID][]tailcfg.NodeID
 
-	// renders is shared by every session's renderer.
+	// renders and classes are shared by every session's renderer.
 	renders *peerRenders
+	classes classMaps
 
 	closed bool
 	// done ends [Hub.Watch].

@@ -442,6 +442,16 @@ func (c *PeerClasses) View(id types.NodeID) []types.NodeID {
 	return nil
 }
 
+// Views returns every class's view. They are shared and must not be
+// modified.
+func (c *PeerClasses) Views() [][]types.NodeID {
+	if c == nil {
+		return nil
+	}
+
+	return c.views
+}
+
 // Peers returns the nodes id sees, sorted, without id.
 func (c *PeerClasses) Peers(id types.NodeID) []types.NodeID {
 	view := c.View(id)

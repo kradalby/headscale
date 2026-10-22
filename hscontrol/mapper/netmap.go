@@ -10,7 +10,6 @@ import (
 	"sync"
 
 	"github.com/juanfont/headscale/hscontrol/graph"
-	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -65,8 +64,8 @@ type renderer struct {
 	nodeID types.NodeID
 	capVer tailcfg.CapabilityVersion
 
-	last   *netMap
-	shared *peerRenders
+	last *netMap
+	hub  *Hub
 
 	// The nodes, peer inputs and peer set of the previous render, for
 	// telling which peers a later snapshot can have changed.
@@ -106,12 +105,12 @@ type selfKey struct {
 	policy, primaries uint64
 }
 
-func newRenderer(cfg *types.Config, shared *peerRenders, nodeID types.NodeID, capVer tailcfg.CapabilityVersion) *renderer {
+func newRenderer(cfg *types.Config, hub *Hub, nodeID types.NodeID, capVer tailcfg.CapabilityVersion) *renderer {
 	return &renderer{
 		cfg:    cfg,
 		nodeID: nodeID,
 		capVer: capVer,
-		shared: shared,
+		hub:    hub,
 	}
 }
 
@@ -292,8 +291,14 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 	return nm, nil
 }
 
-// renderPeers fills nm.peers, rendering only the peers whose inputs moved
-// since the previous render and recording which they are.
+// renderPeers fills nm.peers: the shared peer map of the node's class (see
+// [classMaps]) without the node itself and with its own routes on the
+// routed peers. After the first render it records in nm.changed and
+// nm.removed the peers that can differ from the base, so a diff looks at
+// only them: those added to or gone from the view, those whose node
+// changed, and those whose render reads something that moved without
+// their node changing (their policy caps, or their routes, which come from
+// the policy, the primary routes and the node's own routes).
 func (r *renderer) renderPeers(
 	snap *state.Snapshot,
 	self types.NodeView,
@@ -305,150 +310,91 @@ func (r *renderer) renderPeers(
 		primaries: snap.PrimariesRev(),
 	}
 
-	pr := &peerRendering{r: r, snap: snap, self: self, capMaps: capMaps, key: key}
-
-	done, err := r.renderChangedPeers(pr, nm)
-	if err != nil || done {
-		return err
-	}
-
-	return r.renderAllPeers(pr, nm)
-}
-
-// peerRendering holds what rendering one render's peers needs.
-type peerRendering struct {
-	r       *renderer
-	snap    *state.Snapshot
-	self    types.NodeView
-	capMaps map[types.NodeID]tailcfg.NodeCapMap
-	key     renderKey
-
-	matchers       []matcher.Match
-	matchersLoaded bool
-}
-
-// renderChangedPeers renders, after the first render, only the peers that
-// can differ from the base: those added to the view, those whose node
-// changed, and those whose render reads something that moved without
-// their node changing (their policy caps, or their routes, which come from
-// the policy, the primary routes and the viewer's own routes). It reports
-// false when there is no base to start from.
-func (r *renderer) renderChangedPeers(pr *peerRendering, nm *netMap) (bool, error) {
-	base := nm.base
-	if base == nil {
-		return false, nil
-	}
-
-	view := pr.snap.PeerView(r.nodeID)
+	view := snap.PeerView(r.nodeID)
 	inView := func(id types.NodeID) bool {
 		_, found := slices.BinarySearch(view, id)
 
 		return found
 	}
 
-	forced := map[types.NodeID]struct{}{}
+	class := r.hub.classes.get(r.cfg, r.hub.renders, snap, view, r.capVer, key.policy, capMaps)
+	peers := class.Edit()
+	peers.Delete(r.nodeID.NodeID())
 
-	if pr.key.policy != r.lastKey.policy {
-		for _, id := range pr.snap.CapsChangedSince(r.lastCaps) {
-			forced[id] = struct{}{}
+	var routed []types.NodeID
+
+	for _, id := range snap.RoutedNodes() {
+		if id != r.nodeID && inView(id) {
+			routed = append(routed, id)
 		}
 	}
 
-	if pr.key != r.lastKey || !sameRouteFacts(r.lastSelf, pr.self) {
-		for _, id := range pr.snap.RoutedNodes() {
-			forced[id] = struct{}{}
-		}
-	}
-
-	peers := base.peers.Edit()
-	defer func() { nm.peers = peers.Done() }()
-
-	drop := func(id types.NodeID) {
-		if _, sent := peers.Get(id.NodeID()); sent {
-			peers.Delete(id.NodeID())
-			nm.removed = append(nm.removed, id.NodeID())
-		}
-	}
-
-	added, gone := mergeDiff(r.lastPeerIDs, view)
-	for _, id := range gone {
-		if id != r.nodeID {
-			drop(id)
-		}
-	}
-
-	candidates := slices.Concat(added, pr.snap.NodesChangedSince(r.lastNodes), slices.Collect(maps.Keys(forced)))
-	seen := make(map[types.NodeID]struct{}, len(candidates))
-
-	for _, id := range candidates {
-		if _, dup := seen[id]; dup || id == r.nodeID || !inView(id) {
-			continue
-		}
-
-		seen[id] = struct{}{}
-
-		peer, exists := pr.snap.GetNode(id)
-		if !exists {
-			continue
-		}
-
-		ptn, err := pr.render(peer)
-		if err != nil {
-			return false, err
-		}
-
-		if ptn == nil {
-			// Dropped as invalid; the client must not keep an old copy.
-			drop(id)
-
-			continue
-		}
-
-		if have, _ := peers.Get(ptn.ID); have != ptn {
-			peers.Set(ptn.ID, ptn)
-			nm.changed = append(nm.changed, ptn.ID)
-		}
-	}
-
-	slices.Sort(nm.removed)
-	slices.Sort(nm.changed)
-
-	r.markRendered(pr)
-
-	return true, nil
-}
-
-// renderAllPeers renders every peer, for a session's first render.
-func (r *renderer) renderAllPeers(pr *peerRendering, nm *netMap) error {
-	peers := newPeerMap().Edit()
-
-	for _, id := range pr.snap.PeerView(r.nodeID) {
-		peer, ok := pr.snap.GetNode(id)
-		if id == r.nodeID || !ok {
-			continue
-		}
-
-		ptn, err := pr.render(peer)
+	if len(routed) > 0 {
+		// RoutesForPeer needs the unreduced matchers: every rule where
+		// the node is source or destination.
+		matchers, err := snap.Policy().MatchersForNode(self)
 		if err != nil {
 			return err
 		}
 
-		if ptn != nil {
-			peers.Set(ptn.ID, ptn)
-			nm.changed = append(nm.changed, ptn.ID)
+		for _, id := range routed {
+			base, ok := class.Get(id.NodeID())
+			peer, _ := snap.GetNode(id)
+
+			if ok {
+				peers.Set(id.NodeID(), withRoutes(base, snap.RoutesForPeer(self, peer, matchers)))
+			}
 		}
 	}
 
 	nm.peers = peers.Done()
 
-	r.markRendered(pr)
+	defer r.markRendered(snap, key, self)
+
+	base := nm.base
+	if base == nil {
+		for id := range nm.peers.All() {
+			nm.changed = append(nm.changed, id)
+		}
+
+		slices.Sort(nm.changed)
+		r.rendered += len(nm.changed)
+
+		return nil
+	}
+
+	added, gone := mergeDiff(r.lastPeerIDs, view)
+	candidates := slices.Concat(added, gone, snap.NodesChangedSince(r.lastNodes))
+
+	if key.policy != r.lastKey.policy {
+		candidates = append(candidates, snap.CapsChangedSince(r.lastCaps)...)
+	}
+
+	if key != r.lastKey || !sameRouteFacts(r.lastSelf, self) {
+		candidates = append(candidates, snap.RoutedNodes()...)
+	}
+
+	slices.Sort(candidates)
+
+	for _, id := range slices.Compact(candidates) {
+		if id == r.nodeID {
+			continue
+		}
+
+		was, sent := base.peers.Get(id.NodeID())
+		is, ok := nm.peers.Get(id.NodeID())
+
+		switch {
+		case ok && (!sent || was != is):
+			nm.changed = append(nm.changed, id.NodeID())
+		case sent && !ok:
+			nm.removed = append(nm.removed, id.NodeID())
+		}
+	}
+
+	r.rendered += len(nm.changed)
 
 	return nil
-}
-
-func (r *renderer) markRendered(pr *peerRendering) {
-	r.lastNodes, r.lastKey, r.lastCaps = pr.snap.NodesVersion(), pr.key, pr.snap.CapsVersion()
-	r.lastPeerIDs, r.lastSelf = pr.snap.PeerView(r.nodeID), pr.self
 }
 
 // sameRouteFacts reports whether a and b are the same viewer to the routes
@@ -482,41 +428,139 @@ func mergeDiff(a, b []types.NodeID) ([]types.NodeID, []types.NodeID) {
 	return added, gone
 }
 
-// render renders peer for this viewer and records it. It returns nil, with
-// a warning logged, for a peer whose data cannot be rendered.
-func (pr *peerRendering) render(peer types.NodeView) (*tailcfg.Node, error) {
-	r := pr.r
+func (r *renderer) markRendered(snap *state.Snapshot, key renderKey, self types.NodeView) {
+	r.lastNodes, r.lastKey, r.lastCaps = snap.NodesVersion(), key, snap.CapsVersion()
+	r.lastPeerIDs, r.lastSelf = snap.PeerView(r.nodeID), self
+}
 
-	// RoutesForPeer needs the unreduced matchers: every rule where the node
-	// is source or destination.
-	if !pr.matchersLoaded {
-		var err error
+// classMaps holds the peer maps shared by the sessions of a class: nodes
+// that see the same nodes are sent the same peers but for themselves and
+// their own routes, so the class's view is rendered once, without routes,
+// and each session edits in only what is its own. A session's map then
+// costs its own edits, not a copy of every peer.
+type classMaps struct {
+	mu sync.Mutex
+	m  map[classKey]*classPeers
+}
 
-		pr.matchers, err = pr.snap.Policy().MatchersForNode(pr.self)
-		if err != nil {
-			return nil, err
+// classKey names a class by its view, which the snapshot shares and never
+// changes, and the capability version the peers are rendered for.
+type classKey struct {
+	view   *types.NodeID
+	n      int
+	capVer tailcfg.CapabilityVersion
+}
+
+// classPeers is the peer map of a class's view at one snapshot.
+type classPeers struct {
+	rev   uint64
+	nodes state.NodesVersion
+	caps  state.CapsVersion
+	peers *peerMap
+}
+
+// get returns the peer map of view at snap: every node of view rendered
+// for capVer without routes, but those that cannot be rendered. It updates
+// the class's latest map by the nodes and caps changed since.
+func (cm *classMaps) get(
+	cfg *types.Config,
+	renders *peerRenders,
+	snap *state.Snapshot,
+	view []types.NodeID,
+	capVer tailcfg.CapabilityVersion,
+	policy uint64,
+	capMaps map[types.NodeID]tailcfg.NodeCapMap,
+) *peerMap {
+	if len(view) == 0 {
+		return newPeerMap()
+	}
+
+	key := classKey{view: &view[0], n: len(view), capVer: capVer}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.m == nil {
+		cm.m = make(map[classKey]*classPeers)
+	}
+
+	cur := cm.m[key]
+	if cur != nil && cur.rev == snap.Rev() {
+		return cur.peers
+	}
+
+	inView := func(id types.NodeID) bool {
+		_, found := slices.BinarySearch(view, id)
+
+		return found
+	}
+
+	var (
+		e       *graph.MapEdit[tailcfg.NodeID, *tailcfg.Node]
+		changed []types.NodeID
+	)
+
+	if cur == nil {
+		e, changed = newPeerMap().Edit(), view
+	} else {
+		e = cur.peers.Edit()
+		changed = slices.Concat(snap.NodesChangedSince(cur.nodes), snap.CapsChangedSince(cur.caps))
+	}
+
+	for _, id := range changed {
+		peer, ok := snap.GetNode(id)
+		if !ok || !inView(id) {
+			e.Delete(id.NodeID())
+
+			continue
 		}
 
-		pr.matchersLoaded = true
+		tn, err := renders.render(cfg, capVer, policy, peer, capMaps)
+		if err != nil {
+			// One peer with invalid data must not blank out the map for
+			// every node that can see it.
+			log.Warn().Caller().Err(err).
+				Uint64(zf.NodeID, peer.ID().Uint64()).
+				Str(zf.NodeHostname, peer.Hostname()).
+				Msgf("dropping peer %d from map responses: invalid node data; fix with `headscale nodes rename %d <name>`", peer.ID(), peer.ID())
+			e.Delete(id.NodeID())
+
+			continue
+		}
+
+		e.Set(id.NodeID(), tn)
 	}
 
-	base, err := r.shared.render(r.cfg, r.capVer, pr.key.policy, peer, pr.capMaps)
-	if err != nil {
-		// One peer with invalid data must not blank out the map for every
-		// node that can see it.
-		log.Warn().Caller().Err(err).
-			Uint64(zf.NodeID, peer.ID().Uint64()).
-			Str(zf.NodeHostname, peer.Hostname()).
-			Uint64("map.viewer.node.id", r.nodeID.Uint64()).
-			Msgf("dropping peer %d from map response: invalid node data; fix with `headscale nodes rename %d <name>`", peer.ID(), peer.ID())
+	next := &classPeers{rev: snap.Rev(), nodes: snap.NodesVersion(), caps: snap.CapsVersion(), peers: e.Done()}
 
-		return nil, nil //nolint:nilnil // a dropped peer is not an error for the map
+	// A session rendering an older snapshot than the class's latest keeps
+	// its map to itself.
+	if cur == nil || cur.rev < snap.Rev() {
+		if cur == nil {
+			cm.prune(snap)
+		}
+
+		cm.m[key] = next
 	}
 
-	ptn := withRoutes(base, pr.snap.RoutesForPeer(pr.self, peer, pr.matchers))
-	r.rendered++
+	return next.peers
+}
 
-	return ptn, nil
+// prune drops the maps of views snap no longer holds.
+func (cm *classMaps) prune(snap *state.Snapshot) {
+	current := map[*types.NodeID]struct{}{}
+
+	for _, v := range snap.PeerViews() {
+		if len(v) > 0 {
+			current[&v[0]] = struct{}{}
+		}
+	}
+
+	for k := range cm.m {
+		if _, ok := current[k.view]; !ok {
+			delete(cm.m, k)
+		}
+	}
 }
 
 // renderProfiles fills nm.profiles. A client keeps every profile it was
