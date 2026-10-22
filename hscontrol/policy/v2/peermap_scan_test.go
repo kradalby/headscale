@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
+	"slices"
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
@@ -296,6 +297,13 @@ func TestBuildPeerMapMatchesPairScan(t *testing.T) {
 				"sorted slice: iteration %d, policy %s", it, polB)
 			require.Equalf(t, want, buildPeerMapSliceMap(pm, in),
 				"slice + map: iteration %d, policy %s", it, polB)
+
+			classes := pm.BuildPeerClasses(in)
+			for _, n := range in.All() {
+				sorted := slices.Sorted(slices.Values(want[n.ID()]))
+				require.Equalf(t, sorted, nilIfEmpty(classes.Peers(n.ID())),
+					"classes: iteration %d, node %d, policy %s", it, n.ID(), polB)
+			}
 		}
 
 		if pm.needsPerNodeFilter {
@@ -831,4 +839,12 @@ func benchmarkPeerMapBuilders(b *testing.B, pm *PolicyManager, nodes types.Nodes
 			}
 		})
 	}
+}
+
+func nilIfEmpty[T any](s []T) []T {
+	if len(s) == 0 {
+		return nil
+	}
+
+	return s
 }

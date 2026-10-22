@@ -2,6 +2,7 @@ package v2
 
 import (
 	"cmp"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -411,6 +412,233 @@ func (pm *PolicyManager) Filter() ([]tailcfg.FilterRule, []matcher.Match) {
 	return pm.filter, pm.matchers
 }
 
+// PeerClasses holds who sees whom. Nodes that see the same nodes share a
+// class, and each class holds one sorted view: every node its members
+// see, which includes the members themselves when the class sees itself.
+// Under a global filter nodes fall into a few classes by which rules they
+// match, so the views cost O(nodes × classes), not O(nodes²); under
+// per-node rules each node is its own class.
+type PeerClasses struct {
+	classOf map[types.NodeID]int
+	views   [][]types.NodeID
+}
+
+// View returns the nodes id sees, sorted, possibly including id itself.
+// It is shared and must not be modified.
+func (c *PeerClasses) View(id types.NodeID) []types.NodeID {
+	if c == nil {
+		return nil
+	}
+
+	if i, ok := c.classOf[id]; ok {
+		return c.views[i]
+	}
+
+	return nil
+}
+
+// Peers returns the nodes id sees, sorted, without id.
+func (c *PeerClasses) Peers(id types.NodeID) []types.NodeID {
+	view := c.View(id)
+
+	if i, found := slices.BinarySearch(view, id); found {
+		return slices.Delete(slices.Clone(view), i, i+1)
+	}
+
+	return slices.Clone(view)
+}
+
+// Same reports whether every node sees the same nodes in c and o.
+func (c *PeerClasses) Same(o *PeerClasses) bool {
+	if c == o {
+		return true
+	}
+
+	if c == nil || o == nil || len(c.classOf) != len(o.classOf) {
+		return false
+	}
+
+	return len(c.Changed(o)) == 0
+}
+
+// Changed returns the nodes whose peers differ between old and c, as
+// compared once per pair of classes.
+func (c *PeerClasses) Changed(old *PeerClasses) []types.NodeID {
+	if old == nil {
+		return slices.Collect(maps.Keys(c.classOf))
+	}
+
+	type pair struct{ a, b int }
+
+	same := map[pair]bool{}
+
+	var out []types.NodeID
+
+	for id, b := range c.classOf {
+		a, ok := old.classOf[id]
+		if !ok {
+			out = append(out, id)
+
+			continue
+		}
+
+		p := pair{a, b}
+
+		eq, seen := same[p]
+		if !seen {
+			eq = slices.Equal(old.views[a], c.views[b])
+			same[p] = eq
+		}
+
+		if !eq {
+			out = append(out, id)
+		}
+	}
+
+	for id := range old.classOf {
+		if _, ok := c.classOf[id]; !ok {
+			out = append(out, id)
+		}
+	}
+
+	return out
+}
+
+// BuildPeerClasses works out who sees whom among nodes; see [PeerClasses].
+// It agrees with [PolicyManager.BuildPeerMap].
+func (pm *PolicyManager) BuildPeerClasses(nodes views.Slice[types.NodeView]) *PeerClasses {
+	c := &PeerClasses{classOf: make(map[types.NodeID]int, nodes.Len())}
+	if pm == nil {
+		return c
+	}
+
+	if pm.needsPerNodeFilter {
+		peers := pm.BuildPeerMap(nodes)
+		for _, n := range nodes.All() {
+			ids := peers[n.ID()]
+			slices.Sort(ids)
+
+			c.classOf[n.ID()] = len(c.views)
+			c.views = append(c.views, ids)
+		}
+
+		return c
+	}
+
+	srcOf, dstOf := pm.matcherSides(nodes)
+
+	// A class is a pair of sides; nodes come in ID order, so members do.
+	byKey := map[string]int{}
+
+	var (
+		members    [][]types.NodeID
+		srcs, dsts [][]uint64
+	)
+
+	for i, n := range nodes.All() {
+		k := sideKey(srcOf[i]) + "|" + sideKey(dstOf[i])
+
+		ci, ok := byKey[k]
+		if !ok {
+			ci = len(members)
+			byKey[k] = ci
+
+			members = append(members, nil)
+			srcs, dsts = append(srcs, srcOf[i]), append(dsts, dstOf[i])
+		}
+
+		members[ci] = append(members[ci], n.ID())
+		c.classOf[n.ID()] = ci
+	}
+
+	for a := range members {
+		var seen [][]types.NodeID
+
+		for b := range members {
+			if canAccessSides(srcs[a], dsts[b]) || canAccessSides(srcs[b], dsts[a]) {
+				seen = append(seen, members[b])
+			}
+		}
+
+		view := slices.Concat(seen...)
+		slices.Sort(view)
+		c.views = append(c.views, view)
+	}
+
+	return c
+}
+
+// matcherSides evaluates, per node, which of pm.matchers it is a source
+// and a destination of, as bitsets: bit k of a set stands for
+// pm.matchers[k]. nil is the side of no matcher.
+func (pm *PolicyManager) matcherSides(nodes views.Slice[types.NodeView]) ([][]uint64, [][]uint64) {
+	words := (len(pm.matchers) + 63) / 64 //nolint:mnd
+	srcOf := make([][]uint64, nodes.Len())
+	dstOf := make([][]uint64, nodes.Len())
+
+	for i, n := range nodes.All() {
+		if !n.Valid() {
+			continue
+		}
+
+		ips, subnet, isExit := n.IPs(), n.SubnetRoutes(), n.IsExitNode()
+		routed := len(subnet) > 0
+
+		for k := range pm.matchers {
+			m := &pm.matchers[k]
+
+			if m.SrcsContainsIPs(ips...) || (routed && m.SrcsOverlapsPrefixes(subnet...)) {
+				if srcOf[i] == nil {
+					srcOf[i] = make([]uint64, words)
+				}
+
+				srcOf[i][k/64] |= 1 << (k % 64) //nolint:mnd
+			}
+
+			if m.DestsContainsIP(ips...) || (routed && m.DestsOverlapsPrefixes(subnet...)) ||
+				(isExit && m.DestsIsTheInternet()) {
+				if dstOf[i] == nil {
+					dstOf[i] = make([]uint64, words)
+				}
+
+				dstOf[i][k/64] |= 1 << (k % 64) //nolint:mnd
+			}
+		}
+	}
+
+	return srcOf, dstOf
+}
+
+// sideKey renders a matcher side for use as a map key.
+func sideKey(side []uint64) string {
+	if side == nil {
+		return "-"
+	}
+
+	b := make([]byte, 0, 8*len(side))
+	for _, w := range side {
+		b = binary.LittleEndian.AppendUint64(b, w)
+	}
+
+	return string(b)
+}
+
+// canAccessSides reports whether a source side reaches a destination
+// side: they share a matcher.
+func canAccessSides(src, dst []uint64) bool {
+	if src == nil || dst == nil {
+		return false
+	}
+
+	for w := range src {
+		if src[w]&dst[w] != 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
 // BuildPeerMap constructs peer relationship maps for the given nodes.
 // For global filters, it uses the global filter matchers for all nodes.
 // For autogroup:self policies (empty global filter), it builds per-node
@@ -425,18 +653,6 @@ func (pm *PolicyManager) Filter() ([]tailcfg.FilterRule, []matcher.Match) {
 func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[types.NodeID][]types.NodeID {
 	if pm == nil {
 		return nil
-	}
-
-	// Precompute each node's subnet routes and exit-node status once; the
-	// O(n^2) pair scans below would otherwise recompute them for every pair.
-	type nodeRoutes struct {
-		subnet []netip.Prefix
-		isExit bool
-	}
-
-	routeInfo := make(map[types.NodeID]nodeRoutes, nodes.Len())
-	for _, n := range nodes.All() {
-		routeInfo[n.ID()] = nodeRoutes{subnet: n.SubnetRoutes(), isExit: n.IsExitNode()}
 	}
 
 	// If we have a global filter, use it for all nodes (normal case).
@@ -454,55 +670,13 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 		// scan into O(n * matchers) set lookups plus O(n^2) word ANDs.
 		// Bit k of a set stands for pm.matchers[k]: it lives in word k/64
 		// at position k%64, so 64 matchers fit in one uint64.
-		words := (len(pm.matchers) + 63) / 64 //nolint:mnd
 		ids := make([]types.NodeID, nodes.Len())
-		srcOf := make([][]uint64, nodes.Len()) // nil: source of no matcher
-		dstOf := make([][]uint64, nodes.Len()) // nil: destination of no matcher
-
 		for i, n := range nodes.All() {
 			ids[i] = n.ID()
-			if !n.Valid() {
-				continue
-			}
-
-			ips, ri := n.IPs(), routeInfo[n.ID()]
-			routed := len(ri.subnet) > 0
-
-			for k := range pm.matchers {
-				m := &pm.matchers[k]
-
-				if m.SrcsContainsIPs(ips...) || (routed && m.SrcsOverlapsPrefixes(ri.subnet...)) {
-					if srcOf[i] == nil {
-						srcOf[i] = make([]uint64, words)
-					}
-
-					srcOf[i][k/64] |= 1 << (k % 64) //nolint:mnd
-				}
-
-				if m.DestsContainsIP(ips...) || (routed && m.DestsOverlapsPrefixes(ri.subnet...)) ||
-					(ri.isExit && m.DestsIsTheInternet()) {
-					if dstOf[i] == nil {
-						dstOf[i] = make([]uint64, words)
-					}
-
-					dstOf[i][k/64] |= 1 << (k % 64) //nolint:mnd
-				}
-			}
 		}
 
-		canAccess := func(src, dst []uint64) bool {
-			if src == nil || dst == nil {
-				return false
-			}
-
-			for w := range src {
-				if src[w]&dst[w] != 0 {
-					return true
-				}
-			}
-
-			return false
-		}
+		srcOf, dstOf := pm.matcherSides(nodes)
+		canAccess := canAccessSides
 
 		// Build the map of all peers according to the matchers.
 		for i := range ids {
@@ -519,6 +693,18 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 		}
 
 		return ret
+	}
+
+	// Precompute each node's subnet routes and exit-node status once; the
+	// O(n^2) pair scans below would otherwise recompute them for every pair.
+	type nodeRoutes struct {
+		subnet []netip.Prefix
+		isExit bool
+	}
+
+	routeInfo := make(map[types.NodeID]nodeRoutes, nodes.Len())
+	for _, n := range nodes.All() {
+		routeInfo[n.ID()] = nodeRoutes{subnet: n.SubnetRoutes(), isExit: n.IsExitNode()}
 	}
 
 	// For autogroup:self or via grants, build per-node peer relationships
