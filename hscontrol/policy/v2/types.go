@@ -2727,7 +2727,12 @@ func (p *Policy) validate() error {
 		errs = append(errs, err)
 	}
 
-	for _, approvers := range p.AutoApprovers.Routes {
+	for prefix, approvers := range p.AutoApprovers.Routes {
+		err := util.CheckRouteMasked(prefix)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("autoApprovers.routes[%q]: %w", prefix.String(), err))
+		}
+
 		for _, approver := range approvers {
 			switch approver := approver.(type) {
 			case *Group:

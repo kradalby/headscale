@@ -316,9 +316,6 @@ var rejectedPolicySkipReasons = map[string]string{
 	"ssh-e2/refused": noTailnetDomains,
 	"ssh-malformed-user-localpart-multi-glob/refused": noTailnetDomains,
 
-	"acl-err10/refused": "ROUTE_HOST_BITS: headscale accepts an autoApprovers route with host bits",
-	"acl-err11/refused": "ROUTE_HOST_BITS: headscale accepts an autoApprovers route with host bits",
-
 	"ssh-check-tag-src/refused": "SSH_CHECK_TAG_SRC: headscale accepts a check rule with a tag source",
 
 	"grant-dxp-comma-ports/refused": "GRANT_PORT_LIST: headscale accepts a comma port list in a grant ip entry",
