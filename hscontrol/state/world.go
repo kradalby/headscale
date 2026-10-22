@@ -263,10 +263,10 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 
 			// A write that touched no election input keeps the election.
 			if prev.from != nil && !electionInputsChanged(prev.from, t) {
-				return primaryRoutes{routes: prev.routes, from: t}
+				return primaryRoutes{routes: prev.routes, byNode: prev.byNode, from: t}
 			}
 
-			return primaryRoutes{routes: electPrimaryRoutes(t.byID, prev.routes), from: t}
+			return newPrimaryRoutes(electPrimaryRoutes(t.byID, prev.routes), t)
 		})
 
 	snap, err := g.Update(func(*graph.Tx) error { return nil })
@@ -427,7 +427,22 @@ func samePolicyUsers(a, b []types.User) bool {
 // held against.
 type primaryRoutes struct {
 	routes map[netip.Prefix]types.NodeID
+	// byNode is routes inverted, each node's prefixes sorted.
+	byNode map[types.NodeID][]netip.Prefix
 	from   *nodeTable
+}
+
+func newPrimaryRoutes(routes map[netip.Prefix]types.NodeID, from *nodeTable) primaryRoutes {
+	byNode := make(map[types.NodeID][]netip.Prefix)
+	for p, id := range routes {
+		byNode[id] = append(byNode[id], p)
+	}
+
+	for _, ps := range byNode {
+		slices.SortFunc(ps, netip.Prefix.Compare)
+	}
+
+	return primaryRoutes{routes: routes, byNode: byNode, from: from}
 }
 
 func samePrimaries(a, b primaryRoutes) bool { return maps.Equal(a.routes, b.routes) }
@@ -979,17 +994,7 @@ func (s *Snapshot) PrimaryRouteFor(prefix netip.Prefix) (types.NodeID, bool) {
 
 // PrimaryRoutesForNode returns the prefixes id is primary for, sorted.
 func (s *Snapshot) PrimaryRoutesForNode(id types.NodeID) []netip.Prefix {
-	var out []netip.Prefix
-
-	for p, nid := range s.PrimaryRoutes() {
-		if nid == id {
-			out = append(out, p)
-		}
-	}
-
-	slices.SortFunc(out, netip.Prefix.Compare)
-
-	return out
+	return slices.Clone(graph.Get(s.s, s.w.primaries).byNode[id])
 }
 
 // HANodes returns the prefixes with two or more online advertisers.
