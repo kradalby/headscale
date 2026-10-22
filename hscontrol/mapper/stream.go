@@ -241,10 +241,13 @@ func (h *Hub) Watch(s *state.State) {
 // reach: all of them, or those in wake. A node's map holds itself, its
 // peers and what every map reads, so a change reaches
 //   - every node, when something every map reads changed;
-//   - a node, when it changed, gained or lost a primary route, or its
-//     peers changed;
-//   - a node's peers before and after, when it changed or its primary
-//     routes moved.
+//   - a node, when it changed, gained or lost a primary route, its peers
+//     or its policy capabilities changed, or a recompile can have changed
+//     its filter;
+//   - a node's peers before and after, when it changed, its primary
+//     routes moved or its capabilities changed;
+//   - after a recompile, the peers of every node serving routes, as the
+//     routes a viewer is sent come from the policy.
 //
 // Peer visibility is symmetric, so a node's peers are the nodes that see
 // it.
@@ -264,8 +267,19 @@ func Route(old, cur *state.Snapshot, c state.Change) (bool, map[types.NodeID]str
 	add(c.Nodes)
 	add(c.Primaries)
 	add(c.PeerSets)
+	add(c.Filters)
+	add(c.Caps)
 
-	for _, ids := range [][]types.NodeID{c.Nodes, c.Primaries} {
+	viewed := [][]types.NodeID{c.Nodes, c.Primaries, c.Caps}
+
+	if old.PolicyRev() != cur.PolicyRev() {
+		add(old.RoutedNodes())
+		add(cur.RoutedNodes())
+
+		viewed = append(viewed, old.RoutedNodes(), cur.RoutedNodes())
+	}
+
+	for _, ids := range viewed {
 		for _, id := range ids {
 			add(old.PeerView(id))
 			add(cur.PeerView(id))

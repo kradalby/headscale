@@ -911,7 +911,7 @@ func TestBuildPeerClassesReuseMatchesFresh(t *testing.T) {
 func TestNewPolicyManagerFromMatchesFresh(t *testing.T) {
 	r := rand.New(rand.NewPCG(9, 10)) //nolint:gosec // reproducible test input
 
-	reused := 0
+	reused, narrowed := 0, 0
 
 	for it := range 300 {
 		nodes := scanRandomNodes(r, 2+r.IntN(30))
@@ -941,6 +941,26 @@ func TestNewPolicyManagerFromMatchesFresh(t *testing.T) {
 				got, err := inc.FilterForNode(n.View())
 				require.NoError(t, err)
 				require.Equal(t, want, got, "%s, node %d", msg, n.ID)
+			}
+
+			// Outside FilterChangedNodes, a node that did not change keeps
+			// its filter.
+			if changed, all := inc.FilterChangedNodes(prev); prev != nil && !all {
+				narrowed++
+
+				for _, n := range nodes {
+					old, ok := prev.nodesByID[n.ID]
+					if !ok || old != n.View() || slices.Contains(changed, n.ID) {
+						continue
+					}
+
+					was, err := prev.FilterForNode(old)
+					require.NoError(t, err)
+
+					is, err := inc.FilterForNode(n.View())
+					require.NoError(t, err)
+					require.Equal(t, was, is, "%s, unchanged node %d", msg, n.ID)
+				}
 			}
 
 			if prev != nil {
@@ -978,6 +998,8 @@ func TestNewPolicyManagerFromMatchesFresh(t *testing.T) {
 		}
 	}
 
-	// The comparison is only worth something if grants were reused.
+	// The comparison is only worth something if grants were reused and
+	// recompiles narrowed.
 	require.Greater(t, reused, 100, "grants reused")
+	require.Greater(t, narrowed, 100, "recompiles narrowed")
 }

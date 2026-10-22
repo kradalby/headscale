@@ -1122,6 +1122,10 @@ type Change struct {
 	Primaries []types.NodeID
 	// PeerSets are the nodes whose set of peers differs.
 	PeerSets []types.NodeID
+	// Filters are the nodes whose packet filter a recompile of the
+	// policy after a node change can have changed; Caps those whose
+	// policy capabilities changed, which their viewers render too.
+	Filters, Caps []types.NodeID
 }
 
 // Since returns what changed from old to s. A nil old is everything.
@@ -1131,10 +1135,22 @@ func (s *Snapshot) Since(old *Snapshot) Change {
 	}
 
 	c := Change{
-		Global: s.PolicyRev() != old.PolicyRev() ||
-			graph.ChangedAt(s.s, s.w.derpMap) != graph.ChangedAt(old.s, old.w.derpMap) ||
+		Global: graph.ChangedAt(s.s, s.w.derpMap) != graph.ChangedAt(old.s, old.w.derpMap) ||
 			s.DNSRev() != old.DNSRev(),
 		Nodes: graph.Changes(old.nodes(), s.nodes()),
+	}
+
+	if s.PolicyRev() != old.PolicyRev() {
+		next, _ := s.Policy().(*policyv2.PolicyManager)
+		last, _ := old.Policy().(*policyv2.PolicyManager)
+
+		filters, all := next.FilterChangedNodes(last)
+		if all {
+			c.Global = true
+		} else {
+			c.Filters = filters
+			c.Caps = graph.Changes(graph.Get(old.s, old.w.nodeCaps), graph.Get(s.s, s.w.nodeCaps))
+		}
 	}
 
 	if s.PrimariesRev() != old.PrimariesRev() {

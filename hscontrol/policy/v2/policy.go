@@ -18,6 +18,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/policy/policyutil"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/puzpuzpuz/xsync/v4"
 	"go4.org/netipx"
 	"tailscale.com/net/tsaddr"
@@ -282,6 +283,8 @@ func NewPolicyManagerFrom(prev *PolicyManager, b []byte, users []types.User, nod
 		matchersForNodeMap: xsync.NewMap[types.NodeID, []matcher.Match](),
 	}
 
+	pm.inheritFilters(prev)
+
 	return pm, nil
 }
 
@@ -497,6 +500,134 @@ func matchKey(rule tailcfg.FilterRule) string {
 	}
 
 	return b.String()
+}
+
+// inheritFilters carries prev's reduced filters over for the nodes whose
+// filter [PolicyManager.FilterChangedNodes] says cannot have changed and
+// whose own record did not: a recompile after a join would otherwise have
+// every node reduce its filter again.
+func (pm *PolicyManager) inheritFilters(prev *PolicyManager) {
+	changed, all := pm.FilterChangedNodes(prev)
+	if all {
+		return
+	}
+
+	prev.filterRulesMap.Range(func(id types.NodeID, rules []tailcfg.FilterRule) bool {
+		if _, hit := slices.BinarySearch(changed, id); hit {
+			return true
+		}
+
+		if n, ok := pm.nodesByID[id]; ok && n == prev.nodesByID[id] {
+			pm.filterRulesMap.Store(id, rules)
+		}
+
+		return true
+	})
+}
+
+// FilterChangedNodes returns the nodes whose packet filter can differ
+// between prev and pm, compiles of the same document and users after a
+// node change: the destinations of every rule that changed, and every
+// node serving routes, which a rule can reach by overlap. all is set when
+// it cannot narrow it: a document or users change, per-node rules or SSH
+// rules, which this does not track.
+func (pm *PolicyManager) FilterChangedNodes(prev *PolicyManager) ([]types.NodeID, bool) {
+	if pm == nil || prev == nil || !bytes.Equal(pm.src, prev.src) || !samePolicyUsers(pm.users, prev.users) ||
+		pm.needsPerNodeFilter || prev.needsPerNodeFilter || pm.pol == nil ||
+		len(pm.pol.SSHs) > 0 {
+		return nil, true
+	}
+
+	changed := changedRules(prev.filter, pm.filter)
+	if len(changed) == 0 {
+		return nil, false
+	}
+
+	var (
+		out    []types.NodeID
+		ranges []netipx.IPRange
+	)
+
+	for _, rule := range changed {
+		for _, d := range rule.DstPorts {
+			if d.IP == "*" {
+				return nil, true
+			}
+
+			r, err := util.ParseIPRange(d.IP)
+			if err != nil {
+				return nil, true
+			}
+
+			ranges = append(ranges, r)
+		}
+
+		for _, cg := range rule.CapGrant {
+			for _, p := range cg.Dsts {
+				ranges = append(ranges, netipx.RangeOfPrefix(p))
+			}
+		}
+	}
+
+	for _, set := range []views.Slice[types.NodeView]{prev.nodes, pm.nodes} {
+		idx := newSideIndex(set)
+
+		for _, r := range idx.routers {
+			out = append(out, r.ID())
+		}
+
+		// Exit nodes serve routes too: every destination reaches them.
+		out = append(out, idx.exits...)
+
+		for _, r := range ranges {
+			out = append(out, idx.inRange(r)...)
+		}
+	}
+
+	slices.Sort(out)
+
+	return slices.Compact(out), false
+}
+
+// changedRules returns the rules in only one of a and b.
+func changedRules(a, b []tailcfg.FilterRule) []tailcfg.FilterRule {
+	count := func(rules []tailcfg.FilterRule) map[string]int {
+		m := make(map[string]int, len(rules))
+		for _, r := range rules {
+			m[ruleKey(r)]++
+		}
+
+		return m
+	}
+
+	inA, inB := count(a), count(b)
+
+	var out []tailcfg.FilterRule
+
+	for _, r := range a {
+		if inB[ruleKey(r)] == 0 {
+			out = append(out, r)
+		}
+	}
+
+	for _, r := range b {
+		if inA[ruleKey(r)] == 0 {
+			out = append(out, r)
+		}
+	}
+
+	return out
+}
+
+// ruleKey is a rule's content, in full. A rule that does not encode gets
+// a key of its own, so it counts as changed.
+func ruleKey(r tailcfg.FilterRule) string {
+	b, err := json.Marshal(r)
+	if err != nil {
+		return fmt.Sprintf("unencodable %p", &r)
+	}
+
+	return string(b)
 }
 
 // samePolicyUsers reports whether the policy resolves a and b the same.
@@ -869,17 +1000,25 @@ func newSideIndex(nodes views.Slice[types.NodeView]) *sideIndex {
 }
 
 func (idx *sideIndex) inSet(set *netipx.IPSet) []types.NodeID {
-	var out []types.NodeID
-
 	if set == nil {
 		return nil
 	}
 
+	var out []types.NodeID
 	for _, r := range set.Ranges() {
-		i, _ := slices.BinarySearchFunc(idx.byIP, r.From(), func(e ipNode, ip netip.Addr) int { return e.ip.Compare(ip) })
-		for ; i < len(idx.byIP) && idx.byIP[i].ip.Compare(r.To()) <= 0; i++ {
-			out = append(out, idx.byIP[i].id)
-		}
+		out = append(out, idx.inRange(r)...)
+	}
+
+	return out
+}
+
+// inRange returns the nodes with an address in r.
+func (idx *sideIndex) inRange(r netipx.IPRange) []types.NodeID {
+	var out []types.NodeID
+
+	i, _ := slices.BinarySearchFunc(idx.byIP, r.From(), func(e ipNode, ip netip.Addr) int { return e.ip.Compare(ip) })
+	for ; i < len(idx.byIP) && idx.byIP[i].ip.Compare(r.To()) <= 0; i++ {
+		out = append(out, idx.byIP[i].id)
 	}
 
 	return out
