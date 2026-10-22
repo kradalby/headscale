@@ -183,7 +183,7 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 	w.nodes = graph.NewInput(g, "nodes", table, graph.Same[*nodeMap])
 	// Users are refreshed on every registration; an unchanged list must not
 	// recompile the policy.
-	w.users = graph.NewInput(g, "users", users, samePolicyUsers)
+	w.users = graph.NewInput(g, "users", slices.Clone(users), samePolicyUsers)
 	w.policySrc = graph.NewInput(g, "policy-source", polSrc, graph.Never[[]byte])
 	// Both are refreshed on a timer; an unchanged value must not wake
 	// every session.
@@ -718,13 +718,19 @@ func (w *world) SetGivenName(id types.NodeID, name string) (types.NodeView, erro
 // SetUsers replaces the user list and refreshes the user every node
 // carries, so a renamed user is shown renamed.
 func (w *world) SetUsers(users []types.User) {
+	// Most refreshes, one per registration, change nothing; they must not
+	// queue behind a commit.
+	if slices.Equal(graph.Get(w.g.Snapshot(), w.users), users) {
+		return
+	}
+
 	byID := make(map[uint]*types.User, len(users))
 	for i := range users {
 		byID[users[i].ID] = &users[i]
 	}
 
 	_, _ = w.g.Update(func(tx *graph.Tx) error {
-		graph.Set(tx, w.users, users)
+		graph.Set(tx, w.users, slices.Clone(users))
 
 		cur := graph.Peek(tx, w.nodes)
 		e := cur.Edit()

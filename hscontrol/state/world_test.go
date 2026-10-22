@@ -1070,3 +1070,42 @@ func groups[G comparable](g graph.Grouped[types.NodeID, *types.Node, G]) map[G][
 
 	return out
 }
+
+// TestWorldSetUsersUnchangedDoesNotWait pins that a refresh with the same
+// users, one per registration, does not wait for a commit: every join
+// would otherwise queue behind the commit in flight.
+func TestWorldSetUsersUnchangedDoesNotWait(t *testing.T) {
+	alice := &types.User{Name: "alice"}
+	alice.ID = 1
+
+	w, users := testWorld(t, worldNode(1, alice, "100.64.0.1"))
+
+	// Hold a commit open; an unchanged refresh must not wait for it.
+	inCommit, release := make(chan struct{}), make(chan struct{})
+
+	go func() {
+		_, _ = w.g.Update(func(*graph.Tx) error {
+			close(inCommit)
+			<-release
+
+			return nil
+		})
+	}()
+
+	<-inCommit
+
+	defer close(release)
+
+	done := make(chan struct{})
+
+	go func() {
+		w.SetUsers(slices.Clone(users))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an unchanged user refresh waited for a commit")
+	}
+}
