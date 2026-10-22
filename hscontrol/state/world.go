@@ -407,6 +407,7 @@ func (w *world) SetGivenName(id types.NodeID, name string) (types.NodeView, erro
 
 		return true
 	})
+
 	if err != nil {
 		return types.NodeView{}, err
 	}

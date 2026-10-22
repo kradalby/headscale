@@ -2673,6 +2673,7 @@ func TestAuthenticationFlows(t *testing.T) {
 
 					responseChan <- resp
 				}()
+
 				waitFollowupParked(t)
 
 				// Complete authentication for second registration
@@ -2883,6 +2884,7 @@ func runInteractiveWorkflowTest(t *testing.T, tt struct {
 
 					responseChan <- resp
 				}()
+
 				waitFollowupParked(t)
 
 				// Complete the authentication - the goroutine will receive from the buffered channel

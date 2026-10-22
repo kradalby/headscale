@@ -245,7 +245,7 @@ func writeDebugMapResponse(resp *tailcfg.MapResponse, nodeID types.NodeID) {
 
 	mapResponsePath := path.Join(
 		mPath,
-		fmt.Sprintf("%s.json", now),
+		now+".json",
 	)
 
 	log.Trace().Msgf("writing MapResponse to %s", mapResponsePath)

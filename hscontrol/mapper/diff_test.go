@@ -67,6 +67,7 @@ func TestDiffEndpointChangeIsPatch(t *testing.T) {
 	moved.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("198.51.100.7:41641")}
 
 	sent := testNetMap(p)
+
 	got := diff(sent, withPeers(sent, moved))
 	if len(got) != 1 {
 		t.Fatalf("got %d responses, want 1", len(got))
@@ -91,6 +92,7 @@ func TestDiffOnlineTransitions(t *testing.T) {
 	offline.LastSeen = &seen
 
 	sent := testNetMap(online)
+
 	got := diff(sent, withPeers(sent, offline))
 	if len(got) != 1 || len(got[0].PeersChangedPatch) != 1 {
 		t.Fatalf("offline: want one patch, got %+v", got)
@@ -118,6 +120,7 @@ func TestDiffUnpatchableFieldSendsWholePeer(t *testing.T) {
 	expired.Expired = true
 
 	sent := testNetMap(p)
+
 	got := diff(sent, withPeers(sent, expired))
 	if len(got) != 1 || len(got[0].PeersChanged) != 1 || len(got[0].PeersChangedPatch) != 0 {
 		t.Fatalf("want one whole peer, got %+v", got)
@@ -130,6 +133,7 @@ func TestDiffDERPClearSendsPeerList(t *testing.T) {
 	cleared.HomeDERP = 0
 
 	sent := testNetMap(p, q)
+
 	got := diff(sent, withPeers(sent, cleared, q))
 	if len(got) != 1 || len(got[0].Peers) != 2 {
 		t.Fatalf("want the whole peer list, got %+v", got)

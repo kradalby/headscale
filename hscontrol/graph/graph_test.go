@@ -71,7 +71,7 @@ func TestSnapshotsAreImmutable(t *testing.T) {
 func TestDerivedSeesPrevious(t *testing.T) {
 	g := New()
 	a := NewInput(g, "a", 1, Same[int])
-	max := NewDerived(g, "max", Same[int], func(s *Snapshot, prev int) int {
+	highest := NewDerived(g, "highest", Same[int], func(s *Snapshot, prev int) int {
 		return max(prev, Get(s, a))
 	})
 
@@ -79,7 +79,7 @@ func TestDerivedSeesPrevious(t *testing.T) {
 		_, _ = g.Update(func(tx *Tx) error { Set(tx, a, v); return nil })
 	}
 
-	if got := Get(g.Snapshot(), max); got != 7 {
+	if got := Get(g.Snapshot(), highest); got != 7 {
 		t.Fatalf("max=%d, want 7", got)
 	}
 }
@@ -93,6 +93,7 @@ func TestDynamicDependencies(t *testing.T) {
 	runs := 0
 	pick := NewDerived(g, "pick", Same[int], func(s *Snapshot, _ int) int {
 		runs++
+
 		if Get(s, useB) {
 			return Get(s, b)
 		}
@@ -114,22 +115,23 @@ func TestDynamicDependencies(t *testing.T) {
 	}
 }
 
+var errBoom = errors.New("boom")
+
 func TestAbortedUpdatePublishesNothing(t *testing.T) {
 	g := New()
 	a := NewInput(g, "a", 1, Same[int])
 	_, _ = g.Update(func(*Tx) error { return nil })
 
-	boom := errors.New("boom")
-
 	_, err := g.Update(func(tx *Tx) error {
 		Set(tx, a, 2)
+
 		if Peek(tx, a) != 2 {
 			t.Fatal("peek misses staged value")
 		}
 
-		return boom
+		return errBoom
 	})
-	if !errors.Is(err, boom) || Get(g.Snapshot(), a) != 1 {
+	if !errors.Is(err, errBoom) || Get(g.Snapshot(), a) != 1 {
 		t.Fatalf("err=%v a=%d", err, Get(g.Snapshot(), a))
 	}
 }
@@ -137,6 +139,7 @@ func TestAbortedUpdatePublishesNothing(t *testing.T) {
 func TestSubscriptionCoalesces(t *testing.T) {
 	g := New()
 	a := NewInput(g, "a", 0, Same[int])
+
 	sub := g.Subscribe()
 	defer sub.Close()
 

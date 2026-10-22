@@ -270,6 +270,7 @@ func TestFullMapResponseSurvivesPeerWithInvalidName(t *testing.T) {
 
 			resps, err := NewStream(cfg, NewHub(), n1.ID, capVer).Initial(s.Snapshot())
 			require.NoError(t, err, "n1's map must build despite a peer with an invalid name")
+
 			resp := resps[0]
 			require.NotNil(t, resp.Node, "n1 must receive its own self node")
 
