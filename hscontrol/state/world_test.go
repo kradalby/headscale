@@ -2,6 +2,7 @@ package state
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"net/netip"
 	"slices"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
@@ -915,4 +917,96 @@ func TestWorldGroupCommitsQueuedWrites(t *testing.T) {
 	assert.Equal(t, before+2, after.Rev(), "the stalled write and the burst commit once each")
 	assert.Equal(t, burst+1, after.ListNodes().Len())
 	assert.Len(t, after.ListPeerIDs(1), burst)
+}
+
+// BenchmarkWorldEndpointWrite measures one endpoint update, the most common
+// write: it must not recompile the policy or rebuild peers.
+func BenchmarkWorldEndpointWrite(b *testing.B) {
+	for _, n := range []int{500, 2000} {
+		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) {
+			alice := &types.User{Name: "alice"}
+			alice.ID = 1
+
+			nodes := make(types.Nodes, n)
+			for i := range nodes {
+				nodes[i] = worldNode(types.NodeID(i+1), alice, netip.AddrFrom4([4]byte{100, 64, byte(i >> 8), byte(i)}).String())
+			}
+
+			users := []types.User{*alice}
+
+			w, err := newWorld(nodes, users, []byte(ownUserPolicy))
+			require.NoError(b, err)
+
+			port := uint16(0)
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				port++
+
+				w.UpdateNode(1, func(n *types.Node) {
+					n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), port)}
+				})
+			}
+		})
+	}
+}
+
+// TestWorldIndexMatchesFullBuild applies random writes and checks the
+// patched index, and the reused election, against building them afresh.
+func TestWorldIndexMatchesFullBuild(t *testing.T) {
+	alice, bob := &types.User{Name: "alice"}, &types.User{Name: "bob"}
+	alice.ID, bob.ID = 1, 2
+
+	route := netip.MustParsePrefix("10.0.0.0/24")
+
+	nodes := make(types.Nodes, 8)
+	for i := range nodes {
+		nodes[i] = worldNode(types.NodeID(i+1), alice, fmt.Sprintf("100.64.0.%d", i+1))
+		nodes[i].Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+		nodes[i].ApprovedRoutes = []netip.Prefix{route}
+	}
+
+	w, err := newWorld(nodes, []types.User{*alice, *bob}, nil)
+	require.NoError(t, err)
+
+	r := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // deterministic test input
+
+	for step := range 400 {
+		id := types.NodeID(r.IntN(10) + 1)
+
+		switch r.IntN(6) {
+		case 0:
+			w.UpdateNode(id, func(n *types.Node) { n.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1")} })
+		case 1:
+			w.UpdateNode(id, func(n *types.Node) { n.IsOnline = new(!n.Online()) })
+		case 2:
+			w.UpdateNode(id, func(n *types.Node) { n.NodeKey = key.NewNode().Public() })
+		case 3:
+			w.UpdateNode(id, func(n *types.Node) { n.Tags = []string{"tag:x"}; n.UserID, n.User = nil, nil })
+		case 4:
+			w.DeleteNode(id)
+		case 5:
+			w.PutNode(*worldNode(id, bob, fmt.Sprintf("100.64.1.%d", id)))
+		}
+
+		snap := w.snapshot()
+		got, want := snap.index(), buildIndex(graph.Get(snap.s, w.nodes))
+
+		require.Equal(t, want.all, got.all, "step %d", step)
+		require.Equal(t, want.byID, got.byID, "step %d", step)
+		require.Equal(t, want.byNodeKey, got.byNodeKey, "step %d", step)
+		require.Equal(t, want.byMachineKey, got.byMachineKey, "step %d", step)
+		require.Equal(t, want.byUser, got.byUser, "step %d", step)
+
+		fresh := electPrimaryRoutes(graph.Get(snap.s, w.nodes).byID, nil)
+		for p, primary := range snap.PrimaryRoutes() {
+			require.Contains(t, fresh, p, "step %d: stale prefix", step)
+
+			n, _ := snap.GetNode(primary)
+			require.True(t, n.Online(), "step %d: offline primary %d", step, primary)
+		}
+
+		require.Len(t, snap.PrimaryRoutes(), len(fresh), "step %d", step)
+	}
 }

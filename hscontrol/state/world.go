@@ -98,13 +98,15 @@ type world struct {
 	policyNodes graph.Derived[policyNodes]
 	policy      graph.Derived[*compiledPolicy]
 	peers       graph.Derived[map[types.NodeID][]types.NodeID]
-	primaries   graph.Derived[map[netip.Prefix]types.NodeID]
+	primaries   graph.Derived[primaryRoutes]
 }
 
 // nodeIndex holds the lookups every reader needs, rebuilt when a node
 // changes.
 type nodeIndex struct {
-	all          []types.NodeView // sorted by ID
+	from         *nodeTable           // the table this indexes
+	pos          map[types.NodeID]int // position in all
+	all          []types.NodeView     // sorted by ID
 	byID         map[types.NodeID]types.NodeView
 	byNodeKey    map[key.NodePublic]types.NodeView
 	byMachineKey map[key.MachinePublic]map[types.UserID]types.NodeView
@@ -147,8 +149,8 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 	w.extraRecords = graph.NewInput(g, "extra-records", []tailcfg.DNSRecord(nil), graph.Never[[]tailcfg.DNSRecord])
 
 	w.index = graph.NewDerived(g, "index", graph.Same[*nodeIndex],
-		func(s *graph.Snapshot, _ *nodeIndex) *nodeIndex {
-			return buildIndex(graph.Get(s, w.nodes))
+		func(s *graph.Snapshot, prev *nodeIndex) *nodeIndex {
+			return updateIndex(prev, graph.Get(s, w.nodes))
 		})
 
 	w.policyNodes = graph.NewDerived(g, "policy-nodes", samePolicyNodes,
@@ -194,8 +196,15 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 		})
 
 	w.primaries = graph.NewDerived(g, "primaries", samePrimaries,
-		func(s *graph.Snapshot, prev map[netip.Prefix]types.NodeID) map[netip.Prefix]types.NodeID {
-			return electPrimaryRoutes(graph.Get(s, w.nodes).byID, prev)
+		func(s *graph.Snapshot, prev primaryRoutes) primaryRoutes {
+			t := graph.Get(s, w.nodes)
+
+			// A write that touched no election input keeps the election.
+			if prev.from != nil && !electionInputsChanged(prev.from, t) {
+				return primaryRoutes{routes: prev.routes, from: t}
+			}
+
+			return primaryRoutes{routes: electPrimaryRoutes(t.byID, prev.routes), from: t}
 		})
 
 	snap, err := g.Update(func(*graph.Tx) error { return nil })
@@ -212,8 +221,92 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 	return w, nil
 }
 
+// changedNodes returns the IDs whose stored node differs between from and
+// to, or ok false when a node joined or left. Stored nodes are immutable,
+// so a pointer comparison finds them.
+func changedNodes(from, to *nodeTable) ([]types.NodeID, bool) {
+	if len(from.byID) != len(to.byID) {
+		return nil, false
+	}
+
+	var changed []types.NodeID
+
+	for id, n := range to.byID {
+		old, ok := from.byID[id]
+		if !ok {
+			return nil, false
+		}
+
+		if old != n {
+			changed = append(changed, id)
+		}
+	}
+
+	return changed, true
+}
+
+// updateIndex returns the index of t, patching prev in place of a rebuild
+// when only node payloads changed.
+func updateIndex(prev *nodeIndex, t *nodeTable) *nodeIndex {
+	if prev == nil {
+		return buildIndex(t)
+	}
+
+	changed, ok := changedNodes(prev.from, t)
+	if !ok {
+		return buildIndex(t)
+	}
+
+	for _, id := range changed {
+		old, n := prev.from.byID[id], t.byID[id]
+		if old.NodeKey != n.NodeKey || old.MachineKey != n.MachineKey ||
+			old.TypedUserID() != n.TypedUserID() || old.IsTagged() != n.IsTagged() {
+			return buildIndex(t)
+		}
+	}
+
+	idx := &nodeIndex{
+		from:         t,
+		pos:          prev.pos,
+		all:          slices.Clone(prev.all),
+		byID:         maps.Clone(prev.byID),
+		byNodeKey:    maps.Clone(prev.byNodeKey),
+		byMachineKey: maps.Clone(prev.byMachineKey),
+		byUser:       maps.Clone(prev.byUser),
+	}
+
+	for _, id := range changed {
+		n := t.byID[id]
+		nv := n.View()
+		uid := n.TypedUserID()
+
+		idx.all[idx.pos[id]] = nv
+		idx.byID[id] = nv
+		idx.byNodeKey[n.NodeKey] = nv
+
+		byUser := maps.Clone(idx.byMachineKey[n.MachineKey])
+		byUser[uid] = nv
+		idx.byMachineKey[n.MachineKey] = byUser
+
+		if !n.IsTagged() {
+			nodes := slices.Clone(idx.byUser[uid])
+			for i := range nodes {
+				if nodes[i].ID() == id {
+					nodes[i] = nv
+				}
+			}
+
+			idx.byUser[uid] = nodes
+		}
+	}
+
+	return idx
+}
+
 func buildIndex(t *nodeTable) *nodeIndex {
 	idx := &nodeIndex{
+		from:         t,
+		pos:          make(map[types.NodeID]int, len(t.byID)),
 		all:          make([]types.NodeView, 0, len(t.byID)),
 		byID:         make(map[types.NodeID]types.NodeView, len(t.byID)),
 		byNodeKey:    make(map[key.NodePublic]types.NodeView, len(t.byID)),
@@ -224,6 +317,7 @@ func buildIndex(t *nodeTable) *nodeIndex {
 	for _, id := range slices.Sorted(maps.Keys(t.byID)) {
 		n := t.byID[id]
 		nv := n.View()
+		idx.pos[id] = len(idx.all)
 		idx.all = append(idx.all, nv)
 		idx.byID[id] = nv
 		idx.byNodeKey[n.NodeKey] = nv
@@ -250,8 +344,9 @@ func samePolicyNodes(a, b policyNodes) bool {
 	}
 
 	for i := range a.list.Len() {
+		// Stored nodes are immutable: the same view is the same node.
 		x, y := a.list.At(i), b.list.At(i)
-		if x.ID() != y.ID() || x.HasPolicyChange(y) {
+		if x != y && (x.ID() != y.ID() || x.HasPolicyChange(y)) {
 			return false
 		}
 	}
@@ -266,7 +361,34 @@ func samePolicyUsers(a, b []types.User) bool {
 	return slices.EqualFunc(a, b, func(x, y types.User) bool { return x.PolicyEqual(&y) })
 }
 
-func samePrimaries(a, b map[netip.Prefix]types.NodeID) bool { return maps.Equal(a, b) }
+// primaryRoutes is the prefix→primary election and the node table it was
+// held against.
+type primaryRoutes struct {
+	routes map[netip.Prefix]types.NodeID
+	from   *nodeTable
+}
+
+func samePrimaries(a, b primaryRoutes) bool { return maps.Equal(a.routes, b.routes) }
+
+// electionInputsChanged reports whether a node joined or left or a stored
+// node changed what the election reads: online and health state and the
+// approved, announced routes.
+func electionInputsChanged(from, to *nodeTable) bool {
+	changed, ok := changedNodes(from, to)
+	if !ok {
+		return true
+	}
+
+	for _, id := range changed {
+		old, n := from.byID[id], to.byID[id]
+		if old.Online() != n.Online() || old.Unhealthy != n.Unhealthy ||
+			!slices.Equal(old.AllApprovedRoutes(), n.AllApprovedRoutes()) {
+			return true
+		}
+	}
+
+	return false
+}
 
 func samePeerMap(a, b map[types.NodeID][]types.NodeID) bool {
 	return maps.EqualFunc(a, b, slices.Equal[[]types.NodeID])
@@ -740,7 +862,7 @@ func (s *Snapshot) DERPMap() *tailcfg.DERPMap { return graph.Get(s.s, s.w.derpMa
 // PrimaryRoutes returns the prefix→primary assignment. It is shared and
 // must not be modified.
 func (s *Snapshot) PrimaryRoutes() map[netip.Prefix]types.NodeID {
-	return graph.Get(s.s, s.w.primaries)
+	return graph.Get(s.s, s.w.primaries).routes
 }
 
 // PrimaryRouteFor returns the primary advertiser of prefix.
