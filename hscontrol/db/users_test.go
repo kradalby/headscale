@@ -64,6 +64,27 @@ func TestDestroyUserErrors(t *testing.T) {
 			},
 		},
 		{
+			// A tagged key belongs to its tags, so it outlives the user that
+			// made it and only loses the reference.
+			name: "success_keeps_tagged_preauthkeys",
+			test: func(t *testing.T, db *HSDatabase) {
+				t.Helper()
+
+				user := db.CreateUserForTest("test")
+
+				tagged, err := db.CreatePreAuthKey(user.TypedID(), true, false, nil, []string{"tag:ci"})
+				require.NoError(t, err)
+
+				err = db.DestroyUser(types.UserID(user.ID))
+				require.NoError(t, err)
+
+				got, err := db.GetPreAuthKeyByID(tagged.ID)
+				require.NoError(t, err)
+				assert.Nil(t, got.UserID)
+				assert.Equal(t, []string{"tag:ci"}, got.Tags)
+			},
+		},
+		{
 			name: "error_user_has_nodes",
 			test: func(t *testing.T, db *HSDatabase) {
 				t.Helper()
