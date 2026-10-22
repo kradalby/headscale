@@ -110,7 +110,7 @@ func diff(sent, next *netMap) []*tailcfg.MapResponse {
 
 	if next.base != sent || !next.sameProfiles {
 		for _, p := range sortedProfiles(next.profiles) {
-			if old, ok := sent.profiles[p.ID]; !ok || !reflect.DeepEqual(old, p) {
+			if old, ok := sent.profiles[p.ID]; !ok || !sameProfile(old, p) {
 				resp.UserProfiles = append(resp.UserProfiles, p)
 				changed = true
 			}

@@ -619,7 +619,7 @@ func (r *renderer) renderProfiles(snap *state.Snapshot, self types.NodeView, nm 
 		}
 
 		p := owner.TailscaleUserProfile()
-		if old, ok := profiles[p.ID]; ok && reflect.DeepEqual(old, p) {
+		if old, ok := profiles[p.ID]; ok && sameProfile(old, p) {
 			return
 		}
 
@@ -650,6 +650,13 @@ func sortedPeers(nm *netMap) []*tailcfg.Node {
 	slices.SortFunc(out, func(a, b *tailcfg.Node) int { return cmp.Compare(a.ID, b.ID) })
 
 	return out
+}
+
+// sameProfile compares field by field; [tailcfg.UserProfile] holds a
+// slice, and this runs for every update.
+func sameProfile(a, b tailcfg.UserProfile) bool {
+	return a.ID == b.ID && a.LoginName == b.LoginName && a.DisplayName == b.DisplayName &&
+		a.ProfilePicURL == b.ProfilePicURL && slices.Equal(a.Groups, b.Groups)
 }
 
 func sortedProfiles(profiles map[tailcfg.UserID]tailcfg.UserProfile) []tailcfg.UserProfile {

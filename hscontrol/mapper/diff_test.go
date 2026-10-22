@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -343,5 +344,33 @@ func TestWithRoutesMatchesTailNode(t *testing.T) {
 
 	if len(base.PrimaryRoutes) != 0 || len(base.AllowedIPs) != 2 {
 		t.Fatalf("withRoutes modified the shared base: %+v", base)
+	}
+}
+
+// TestSameProfileCoversEveryField fails when tailcfg.UserProfile gains a
+// field sameProfile does not compare.
+func TestSameProfileCoversEveryField(t *testing.T) {
+	typ := reflect.TypeFor[tailcfg.UserProfile]()
+	require.Equal(t, 5, typ.NumField(), "compare the new UserProfile field in sameProfile")
+
+	base := tailcfg.UserProfile{ID: 1, LoginName: "a", DisplayName: "A", ProfilePicURL: "p", Groups: []string{"g"}}
+	require.True(t, sameProfile(base, base))
+
+	for i := range typ.NumField() {
+		changed := base
+		v := reflect.ValueOf(&changed).Elem().Field(i)
+
+		switch v.Kind() { //nolint:exhaustive // other kinds fail the test
+		case reflect.String:
+			v.SetString("other")
+		case reflect.Int64:
+			v.SetInt(2)
+		case reflect.Slice:
+			v.Set(reflect.ValueOf([]string{"h"}))
+		default:
+			t.Fatalf("field %s: unhandled kind %s", typ.Field(i).Name, v.Kind())
+		}
+
+		require.False(t, sameProfile(base, changed), "field %s", typ.Field(i).Name)
 	}
 }
