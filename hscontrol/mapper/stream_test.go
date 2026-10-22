@@ -682,9 +682,18 @@ type oracleSession struct {
 // session's client equals a fresh session's. Only the sessions [Route]
 // names are updated, so a session it skips must already be up to date.
 func TestStreamsConvergeUnderRandomWrites(t *testing.T) {
+	for seed := range uint64(6) {
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+			testStreamsConverge(t, rand.New(rand.NewPCG(seed, 6))) //nolint:gosec // deterministic test input
+		})
+	}
+}
+
+func testStreamsConverge(t *testing.T, r *rand.Rand) {
+	t.Helper()
+
 	cfg, s, _ := streamTestState(t, "")
 	hub := NewHub()
-	r := rand.New(rand.NewPCG(5, 6)) //nolint:gosec // deterministic test input
 
 	u1, err := s.GetUserByName("u1")
 	require.NoError(t, err)
