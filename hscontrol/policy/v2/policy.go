@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
@@ -60,6 +61,11 @@ type PolicyManager struct {
 	// Per-node answers, filled on first read. xsync.Maps so concurrent
 	// readers can fill them.
 	sshPolicyMap *xsync.Map[types.NodeID, *tailcfg.SSHPolicy]
+	// sshPreps holds the node-independent SSH compile, by server URL.
+	sshPreps *xsync.Map[string, *sshPrep]
+
+	viaOnce sync.Once
+	via     *viaPrep
 	// filterRulesMap holds reduced rules, for packet filters.
 	filterRulesMap *xsync.Map[types.NodeID, []tailcfg.FilterRule]
 	// matchersForNodeMap holds matchers from UNREDUCED rules. Only the
@@ -212,6 +218,7 @@ func NewPolicyManager(b []byte, users []types.User, nodes views.Slice[types.Node
 		needsPerNodeFilter: hasPerNodeGrants(grants),
 		nodeAttrsMap:       nodeAttrs,
 		sshPolicyMap:       xsync.NewMap[types.NodeID, *tailcfg.SSHPolicy](),
+		sshPreps:           xsync.NewMap[string, *sshPrep](),
 		filterRulesMap:     xsync.NewMap[types.NodeID, []tailcfg.FilterRule](),
 		matchersForNodeMap: xsync.NewMap[types.NodeID, []matcher.Match](),
 	}
@@ -229,10 +236,19 @@ func (pm *PolicyManager) SSHPolicy(baseURL string, node types.NodeView) (*tailcf
 		return sshPol, nil
 	}
 
-	sshPol, err := pm.pol.compileSSHPolicy(baseURL, pm.users, node, pm.nodes)
-	if err != nil {
-		return nil, fmt.Errorf("compiling SSH policy: %w", err)
+	prep, ok := pm.sshPreps.Load(baseURL)
+	if !ok {
+		var err error
+
+		prep, err = pm.pol.prepareSSH(baseURL, pm.users, pm.nodes)
+		if err != nil {
+			return nil, fmt.Errorf("compiling SSH policy: %w", err)
+		}
+
+		pm.sshPreps.Store(baseURL, prep)
 	}
+
+	sshPol := prep.forNode(node)
 
 	if pm.cacheable(node) {
 		pm.sshPolicyMap.Store(node.ID(), sshPol)
@@ -883,6 +899,80 @@ func (pm *PolicyManager) NodeCanApproveRoute(node types.NodeView, route netip.Pr
 	return false
 }
 
+// viaPrep is the part of [PolicyManager.ViaRoutesForPeer] that is the same
+// for every viewer and peer: the grants, what each one's sources and
+// destinations resolve to, and each via grant's elected router per route.
+type viaPrep struct {
+	grants   []Grant
+	srcs     []*netipx.IPSet
+	dsts     [][]netip.Prefix
+	internet []bool
+	// primary holds, per via grant, the lowest-ID node carrying one of
+	// its via tags for each approved subnet route: the via-scoped HA
+	// election, which ignores online state.
+	primary []map[netip.Prefix]types.NodeID
+}
+
+// viaPrep returns the policy's via preparation, building it on first use.
+func (pm *PolicyManager) viaPrep() *viaPrep {
+	pm.viaOnce.Do(func() {
+		grants := slices.Clone(pm.pol.Grants)
+		for _, acl := range pm.pol.ACLs {
+			grants = append(grants, aclToGrants(acl)...)
+		}
+
+		prep := &viaPrep{
+			grants:   grants,
+			srcs:     make([]*netipx.IPSet, len(grants)),
+			dsts:     make([][]netip.Prefix, len(grants)),
+			internet: make([]bool, len(grants)),
+			primary:  make([]map[netip.Prefix]types.NodeID, len(grants)),
+		}
+
+		for i, grant := range grants {
+			var b netipx.IPSetBuilder
+
+			for _, src := range grant.Sources {
+				ips, err := src.Resolve(pm.pol, pm.users, pm.nodes)
+				if err != nil || ips == nil {
+					continue
+				}
+
+				for _, p := range ips.Prefixes() {
+					b.AddPrefix(p)
+				}
+			}
+
+			prep.srcs[i], _ = b.IPSet()
+			prep.dsts[i], prep.internet[i] = resolveViaDestinations(pm.pol, pm.users, pm.nodes, grant.Destinations)
+
+			if !grant.HasVia() {
+				continue
+			}
+
+			primary := make(map[netip.Prefix]types.NodeID)
+
+			for _, node := range pm.nodes.All() {
+				if !slices.ContainsFunc(grant.Via, func(t Tag) bool { return node.HasTag(string(t)) }) {
+					continue
+				}
+
+				for _, route := range node.SubnetRoutes() {
+					if id, ok := primary[route]; !ok || node.ID() < id {
+						primary[route] = node.ID()
+					}
+				}
+			}
+
+			prep.primary[i] = primary
+		}
+
+		pm.via = prep
+	})
+
+	return pm.via
+}
+
 // ViaRoutesForPeer computes via grant effects for a viewer-peer pair.
 // For each via grant where the viewer matches the source, it checks whether the
 // peer advertises any of the grant's destination prefixes. If the peer has the
@@ -914,50 +1004,14 @@ func (pm *PolicyManager) ViaRoutesForPeer(viewer, peer types.NodeView) types.Via
 		return result
 	}
 
-	// Clip so the appends below allocate: concurrent callers share pm.pol,
-	// and writing into its spare capacity races between them.
-	grants := slices.Clip(pm.pol.Grants)
-	for _, acl := range pm.pol.ACLs {
-		grants = append(grants, aclToGrants(acl)...)
-	}
-
-	// matchViewer resolves a grant lazily and at most once: non-via
-	// grants are only needed once a via grant has matched, and
-	// destinations only for grants that match the viewer.
+	prep := pm.viaPrep()
+	grants := prep.grants
 	viewerIPs := viewer.IPs()
-	resolved := make([]bool, len(grants))
-	viewerMatchesGrant := make([]bool, len(grants))
-	resolvedDstPrefixes := make([][]netip.Prefix, len(grants))
-	grantHasAutoGroupInternet := make([]bool, len(grants))
 
 	matchViewer := func(i int) bool {
-		if resolved[i] {
-			return viewerMatchesGrant[i]
-		}
-
-		resolved[i] = true
-
-		for _, src := range grants[i].Sources {
-			ips, err := src.Resolve(pm.pol, pm.users, pm.nodes)
-			if err != nil {
-				continue
-			}
-
-			if ips != nil && slices.ContainsFunc(viewerIPs, ips.Contains) {
-				viewerMatchesGrant[i] = true
-
-				break
-			}
-		}
-
-		if viewerMatchesGrant[i] {
-			resolvedDstPrefixes[i], grantHasAutoGroupInternet[i] = resolveViaDestinations(
-				pm.pol, pm.users, pm.nodes, grants[i].Destinations,
-			)
-		}
-
-		return viewerMatchesGrant[i]
+		return prep.srcs[i] != nil && slices.ContainsFunc(viewerIPs, prep.srcs[i].Contains)
 	}
+	resolvedDstPrefixes, grantHasAutoGroupInternet := prep.dsts, prep.internet
 
 	for i, grant := range grants {
 		if !grant.HasVia() {
@@ -1060,18 +1114,7 @@ func (pm *PolicyManager) ViaRoutesForPeer(viewer, peer types.NodeView) types.Via
 						continue
 					}
 
-					var viaPrimaryID types.NodeID
-
-					for _, viaTag := range grant.Via {
-						for _, node := range pm.nodes.All() {
-							if node.HasTag(string(viaTag)) &&
-								slices.Contains(node.SubnetRoutes(), included) {
-								if viaPrimaryID == 0 || node.ID() < viaPrimaryID {
-									viaPrimaryID = node.ID()
-								}
-							}
-						}
-					}
+					viaPrimaryID := prep.primary[i][included]
 
 					if viaPrimaryID != 0 && peer.ID() != viaPrimaryID {
 						result.Include = slices.DeleteFunc(result.Include, func(p netip.Prefix) bool {
