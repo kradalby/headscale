@@ -8,7 +8,8 @@
 //
 // Derived cells are recomputed only when a cell they read during their last
 // computation changed. A recomputed value equal to the previous one is not
-// a change (equality cutoff), so the cells reading it are skipped as well.
+// a change (equality cutoff), so the cells reading it are skipped as well;
+// it is still stored, so the next computation receives it as prev.
 // A derived cell receives its previous value, which lets it carry state from
 // one snapshot to the next, such as an election that keeps its incumbent.
 //
@@ -298,10 +299,13 @@ func (g *Graph) commit(prev *Snapshot, sets map[int]any) (*Snapshot, bool) {
 		next.reads = nil
 		next.deps[i] = reads
 
+		// An equal value is still stored, so the next computation sees
+		// the latest state it carried, but is not a change.
 		if first || !c.equal(next.values[i], v) {
-			next.values[i] = v
 			next.changed[i] = next.rev
 		}
+
+		next.values[i] = v
 	}
 
 	return next, true
