@@ -26,7 +26,7 @@ func fullResponse(cfg *types.Config, nm *netMap) *tailcfg.MapResponse {
 		DNSConfig:     nm.dns,
 		UserProfiles:  sortedProfiles(nm.profiles),
 		PacketFilters: map[string][]tailcfg.FilterRule{"base": nm.filter},
-		Peers:         sortedPeers(nm.peers),
+		Peers:         sortedPeers(nm),
 	}
 	resp.CollectServices.Set(false)
 
@@ -53,8 +53,8 @@ func diff(sent, next *netMap) []*tailcfg.MapResponse {
 	refresh := false
 
 	for _, id := range changedIDs {
-		after, _ := next.peers.Get(id)
-		before, ok := sent.peers.Get(id)
+		after, _ := next.peer(id)
+		before, ok := sent.peer(id)
 
 		switch {
 		case !ok:
@@ -80,7 +80,7 @@ func diff(sent, next *netMap) []*tailcfg.MapResponse {
 	if refresh {
 		// The client turns a PeersChanged entry back into a patch, which
 		// cannot express this clear; only a whole peer list applies it.
-		resp.Peers = sortedPeers(next.peers)
+		resp.Peers = sortedPeers(next)
 		resp.PeersChanged, resp.PeersChangedPatch = nil, nil
 	}
 
@@ -257,8 +257,8 @@ func peerChanges(sent, next *netMap) ([]tailcfg.NodeID, []tailcfg.NodeID) {
 
 	var removed []tailcfg.NodeID
 
-	for id := range sent.peers.All() {
-		if _, ok := next.peers.Get(id); !ok {
+	for id := range sent.allPeers() {
+		if _, ok := next.peer(id); !ok {
 			removed = append(removed, id)
 		}
 	}
@@ -294,7 +294,7 @@ func equalTimePtr(a, b *time.Time) bool {
 // peerIDs returns the IDs of the peers in nm.
 func peerIDs(nm *netMap) []tailcfg.NodeID {
 	ids := make([]tailcfg.NodeID, 0, nm.peers.Len())
-	for id := range nm.peers.All() {
+	for id := range nm.allPeers() {
 		ids = append(ids, id)
 	}
 

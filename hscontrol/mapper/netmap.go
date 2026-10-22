@@ -3,6 +3,7 @@ package mapper
 import (
 	"cmp"
 	"errors"
+	"iter"
 	"maps"
 	"net/netip"
 	"reflect"
@@ -20,6 +21,30 @@ import (
 	"tailscale.com/types/views"
 )
 
+// peer returns the peer with id; the node itself is not its own peer.
+func (nm *netMap) peer(id tailcfg.NodeID) (*tailcfg.Node, bool) {
+	if nm.self != nil && id == nm.self.ID {
+		return nil, false
+	}
+
+	return nm.peers.Get(id)
+}
+
+// allPeers returns the peers, the node itself left out.
+func (nm *netMap) allPeers() iter.Seq2[tailcfg.NodeID, *tailcfg.Node] {
+	return func(yield func(tailcfg.NodeID, *tailcfg.Node) bool) {
+		for id, p := range nm.peers.All() {
+			if nm.self != nil && id == nm.self.ID {
+				continue
+			}
+
+			if !yield(id, p) {
+				return
+			}
+		}
+	}
+}
+
 // peerMap holds the rendered peers of a netMap by ID.
 type peerMap = graph.Map[tailcfg.NodeID, *tailcfg.Node]
 
@@ -36,8 +61,9 @@ var ErrNodeGone = errors.New("node no longer exists")
 // what to send next is the difference to a fresh one, see [diff].
 type netMap struct {
 	self *tailcfg.Node
-	// peers shares structure with the base's, so a render that changed k
-	// peers costs k entries, not a copy of them all.
+	// peers is usually the map its class shares (see [classMaps]), which
+	// holds the node itself when it sees its own class; read it through
+	// [netMap.peer] and [netMap.allPeers], which leave the node out.
 	peers    *peerMap
 	profiles map[tailcfg.UserID]tailcfg.UserProfile
 	filter   []tailcfg.FilterRule
@@ -318,8 +344,7 @@ func (r *renderer) renderPeers(
 	}
 
 	class := r.hub.classes.get(r.cfg, r.hub.renders, snap, view, r.capVer, key.policy, capMaps)
-	peers := class.Edit()
-	peers.Delete(r.nodeID.NodeID())
+	nm.peers = class
 
 	var routed []types.NodeID
 
@@ -337,6 +362,10 @@ func (r *renderer) renderPeers(
 			return err
 		}
 
+		// Only routed peers differ per viewer; a session without them
+		// shares its class's map outright.
+		peers := class.Edit()
+
 		for _, id := range routed {
 			base, ok := class.Get(id.NodeID())
 			peer, _ := snap.GetNode(id)
@@ -345,15 +374,15 @@ func (r *renderer) renderPeers(
 				peers.Set(id.NodeID(), withRoutes(base, snap.RoutesForPeer(self, peer, matchers)))
 			}
 		}
-	}
 
-	nm.peers = peers.Done()
+		nm.peers = peers.Done()
+	}
 
 	defer r.markRendered(snap, key, self)
 
 	base := nm.base
 	if base == nil {
-		for id := range nm.peers.All() {
+		for id := range nm.allPeers() {
 			nm.changed = append(nm.changed, id)
 		}
 
@@ -385,8 +414,8 @@ func (r *renderer) renderPeers(
 			continue
 		}
 
-		was, sent := base.peers.Get(id.NodeID())
-		is, ok := nm.peers.Get(id.NodeID())
+		was, sent := base.peer(id.NodeID())
+		is, ok := nm.peer(id.NodeID())
 
 		switch {
 		case ok && (!sent || was != is):
@@ -612,9 +641,9 @@ func (r *renderer) renderProfiles(snap *state.Snapshot, self types.NodeView, nm 
 	nm.profiles, nm.sameProfiles = profiles, !cloned
 }
 
-func sortedPeers(peers *peerMap) []*tailcfg.Node {
-	out := make([]*tailcfg.Node, 0, peers.Len())
-	for _, p := range peers.All() {
+func sortedPeers(nm *netMap) []*tailcfg.Node {
+	out := make([]*tailcfg.Node, 0, nm.peers.Len())
+	for _, p := range nm.allPeers() {
 		out = append(out, p)
 	}
 

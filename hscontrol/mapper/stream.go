@@ -48,7 +48,7 @@ func (st *Stream) Initial(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) 
 	var removed []tailcfg.NodeID
 
 	for _, id := range st.hub.lastPeers(st.nodeID) {
-		if _, ok := nm.peers.Get(id); !ok {
+		if _, ok := nm.peer(id); !ok {
 			removed = append(removed, id)
 		}
 	}
@@ -99,7 +99,7 @@ func peerSetChanged(nm *netMap) bool {
 	}
 
 	for _, id := range nm.changed {
-		if _, ok := nm.base.peers.Get(id); !ok {
+		if _, ok := nm.base.peer(id); !ok {
 			return true
 		}
 	}
