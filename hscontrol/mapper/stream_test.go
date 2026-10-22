@@ -1,0 +1,343 @@
+package mapper
+
+import (
+	"net/netip"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/state"
+	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"tailscale.com/tailcfg"
+)
+
+const capVer = tailcfg.CurrentCapabilityVersion
+
+// streamTestState returns a State with users u1, u2 and nodes n1, n1b
+// (u1) and n2 (u2), under policy (allow-all when empty).
+func streamTestState(t *testing.T, policy string) (*types.Config, *state.State, [3]types.NodeID) {
+	t.Helper()
+
+	p4 := netip.MustParsePrefix("100.64.0.0/10")
+	p6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+	cfg := &types.Config{
+		Database: types.DatabaseConfig{
+			Type:   types.DatabaseSqlite,
+			Sqlite: types.SqliteConfig{Path: t.TempDir() + "/h.db"},
+		},
+		PrefixV4:     &p4,
+		PrefixV6:     &p6,
+		IPAllocation: types.IPAllocationStrategySequential,
+		BaseDomain:   "headscale.test",
+		ServerURL:    "https://headscale.test",
+		Policy:       types.PolicyConfig{Mode: types.PolicyModeDB},
+	}
+
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(t, err)
+
+	u1 := database.CreateUserForTest("u1")
+	u2 := database.CreateUserForTest("u2")
+	n1 := database.CreateRegisteredNodeForTest(u1, "n1")
+	n1b := database.CreateRegisteredNodeForTest(u1, "n1b")
+	n2 := database.CreateRegisteredNodeForTest(u2, "n2")
+	require.NoError(t, database.Close())
+
+	s, err := state.NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	s.SetDERPMap(&tailcfg.DERPMap{
+		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
+	})
+
+	if policy != "" {
+		_, err = s.SetPolicy([]byte(policy))
+		require.NoError(t, err)
+	}
+
+	return cfg, s, [3]types.NodeID{n1.ID, n1b.ID, n2.ID}
+}
+
+const ownUserOnly = `{"acls":[
+	{"action":"accept","src":["u1@"],"dst":["u1@:*"]},
+	{"action":"accept","src":["u2@"],"dst":["u2@:*"]}
+]}`
+
+func peerSet(resp *tailcfg.MapResponse) map[tailcfg.NodeID]bool {
+	out := make(map[tailcfg.NodeID]bool)
+	for _, p := range resp.Peers {
+		out[p.ID] = true
+	}
+
+	return out
+}
+
+// mentions reports whether any response names peer id.
+func mentions(resps []*tailcfg.MapResponse, id types.NodeID) bool {
+	for _, r := range resps {
+		for _, p := range r.Peers {
+			if p.ID == id.NodeID() {
+				return true
+			}
+		}
+
+		for _, p := range r.PeersChanged {
+			if p.ID == id.NodeID() {
+				return true
+			}
+		}
+
+		for _, p := range r.PeersChangedPatch {
+			if p.NodeID == id.NodeID() {
+				return true
+			}
+		}
+
+		for _, p := range r.PeersRemoved {
+			if p == id.NodeID() {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func TestStreamInitialIsFullAndThenQuiet(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+
+	st := NewStream(cfg, NewHub(), ids[0], capVer)
+
+	initial, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+	require.Len(t, initial, 1)
+
+	full := initial[0]
+	require.NotNil(t, full.Node)
+	assert.NotNil(t, full.SSHPolicy, "a full map always carries an SSH policy")
+	assert.NotNil(t, full.DERPMap)
+	assert.Equal(t, map[tailcfg.NodeID]bool{ids[1].NodeID(): true, ids[2].NodeID(): true}, peerSet(full))
+
+	again, err := st.Update(s.Snapshot())
+	require.NoError(t, err)
+	assert.Empty(t, again, "nothing changed")
+}
+
+func TestStreamPeerChangesAreDeltas(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+
+	st := NewStream(cfg, NewHub(), ids[0], capVer)
+	_, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	gen := s.Connect(ids[1])
+	require.NotZero(t, gen)
+
+	resps, err := st.Update(s.Snapshot())
+	require.NoError(t, err)
+	require.Len(t, resps, 1)
+	require.Len(t, resps[0].PeersChangedPatch, 1, "coming online is a patch")
+	assert.Equal(t, ids[1].NodeID(), resps[0].PeersChangedPatch[0].NodeID)
+	assert.Nil(t, resps[0].Node, "the viewer itself did not change")
+
+	require.NoError(t, s.DeleteNode(mustNode(t, s, ids[1])))
+
+	resps, err = st.Update(s.Snapshot())
+	require.NoError(t, err)
+	require.Len(t, resps, 1)
+	assert.Equal(t, []tailcfg.NodeID{ids[1].NodeID()}, resps[0].PeersRemoved)
+}
+
+func TestStreamNeverMentionsInvisiblePeers(t *testing.T) {
+	cfg, s, ids := streamTestState(t, ownUserOnly)
+
+	st := NewStream(cfg, NewHub(), ids[0], capVer)
+	initial, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+	assert.False(t, mentions(initial, ids[2]), "n2 is another user's node")
+
+	_ = s.Connect(ids[2])
+	_ = s.Connect(ids[1])
+	_, err = s.RenameNode(ids[2], "renamed")
+	require.NoError(t, err)
+
+	resps, err := st.Update(s.Snapshot())
+	require.NoError(t, err)
+	assert.False(t, mentions(resps, ids[2]), "changes to an invisible node must not leak")
+	assert.True(t, mentions(resps, ids[1]), "changes to a visible node are delivered")
+}
+
+// TestStreamConvergesOnFreshMap applies the deltas a long-lived stream
+// sends and checks they arrive at what a new stream is sent.
+func TestStreamConvergesOnFreshMap(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+
+	long := NewStream(cfg, NewHub(), ids[0], capVer)
+	initial, err := long.Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	client := newModelClient(initial[0])
+
+	steps := []func(){
+		func() { _ = s.Connect(ids[1]) },
+		func() { _, _ = s.RenameNode(ids[2], "n2-renamed") },
+		func() {
+			expiry := time.Now().Add(-time.Minute)
+			_, _ = s.SetNodeExpiry(ids[1], &expiry)
+		},
+		func() { _, _ = s.SetPolicy([]byte(ownUserOnly)) },
+		func() { _, _ = s.SetPolicy([]byte(`{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`)) },
+		func() { require.NoError(t, s.DeleteNode(mustNode(t, s, ids[2]))) },
+	}
+
+	for i, step := range steps {
+		step()
+
+		resps, err := long.Update(s.Snapshot())
+		require.NoError(t, err)
+
+		for _, r := range resps {
+			client.apply(r)
+		}
+
+		fresh, err := NewStream(cfg, NewHub(), ids[0], capVer).Initial(s.Snapshot())
+		require.NoError(t, err)
+
+		want := newModelClient(fresh[0])
+		if !reflect.DeepEqual(want.peers, client.peers) {
+			t.Fatalf("step %d: long-lived peers %v, fresh %v", i, keys(client.peers), keys(want.peers))
+		}
+
+		assert.True(t, reflect.DeepEqual(want.filter, client.filter), "step %d: filter differs", i)
+	}
+}
+
+func TestStreamReconnectAnnouncesMissedRemoval(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	hub := NewHub()
+
+	_, err := NewStream(cfg, hub, ids[0], capVer).Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	// n1 is offline while n1b is deleted.
+	require.NoError(t, s.DeleteNode(mustNode(t, s, ids[1])))
+
+	resps, err := NewStream(cfg, hub, ids[0], capVer).Initial(s.Snapshot())
+	require.NoError(t, err)
+	require.Len(t, resps, 2, "full map, then the removal it missed")
+	assert.Equal(t, []tailcfg.NodeID{ids[1].NodeID()}, resps[1].PeersRemoved)
+}
+
+func TestStreamEndsWhenNodeDeleted(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+
+	st := NewStream(cfg, NewHub(), ids[0], capVer)
+	_, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	require.NoError(t, s.DeleteNode(mustNode(t, s, ids[0])))
+
+	_, err = st.Update(s.Snapshot())
+	require.ErrorIs(t, err, ErrNodeGone)
+}
+
+func mustNode(t *testing.T, s *state.State, id types.NodeID) types.NodeView {
+	t.Helper()
+
+	nv, ok := s.GetNodeByID(id)
+	require.True(t, ok)
+
+	return nv
+}
+
+// modelClient applies map responses the way a client does, for the
+// fields these tests compare.
+type modelClient struct {
+	peers  map[tailcfg.NodeID]*tailcfg.Node
+	filter []tailcfg.FilterRule
+}
+
+func newModelClient(full *tailcfg.MapResponse) *modelClient {
+	c := &modelClient{peers: make(map[tailcfg.NodeID]*tailcfg.Node)}
+	c.apply(full)
+
+	return c
+}
+
+func (c *modelClient) apply(r *tailcfg.MapResponse) {
+	if len(r.Peers) > 0 {
+		c.peers = make(map[tailcfg.NodeID]*tailcfg.Node)
+		for _, p := range r.Peers {
+			c.peers[p.ID] = p.Clone()
+		}
+	}
+
+	for _, p := range r.PeersChanged {
+		c.peers[p.ID] = p.Clone()
+	}
+
+	for _, id := range r.PeersRemoved {
+		delete(c.peers, id)
+	}
+
+	for _, pc := range r.PeersChangedPatch {
+		p := c.peers[pc.NodeID]
+		if p == nil {
+			continue
+		}
+
+		if pc.DERPRegion != 0 {
+			p.HomeDERP = pc.DERPRegion
+		}
+
+		if pc.Endpoints != nil {
+			p.Endpoints = pc.Endpoints
+		}
+
+		if pc.Key != nil {
+			p.Key = *pc.Key
+		}
+
+		if pc.DiscoKey != nil {
+			p.DiscoKey = *pc.DiscoKey
+		}
+
+		if pc.Online != nil {
+			p.Online = new(*pc.Online)
+			// The client keeps a LastSeen the patch cannot clear; compare
+			// what it acts on.
+			if *pc.Online {
+				p.LastSeen = nil
+			}
+		}
+
+		if pc.LastSeen != nil {
+			p.LastSeen = new(*pc.LastSeen)
+		}
+
+		if pc.KeyExpiry != nil {
+			p.KeyExpiry = *pc.KeyExpiry
+		}
+
+		if pc.CapMap != nil {
+			p.CapMap = pc.CapMap
+		}
+	}
+
+	if f, ok := r.PacketFilters["base"]; ok {
+		c.filter = f
+	}
+}
+
+func keys(m map[tailcfg.NodeID]*tailcfg.Node) []tailcfg.NodeID {
+	out := make([]tailcfg.NodeID, 0, len(m))
+	for id := range m {
+		out = append(out, id)
+	}
+
+	return out
+}
