@@ -18,9 +18,6 @@ import (
 // global-filter path stopped evaluating every matcher for every pair. It is
 // kept as the reference the indexed build must reproduce exactly.
 func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) map[types.NodeID][]types.NodeID {
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
 	type nodeRoutes struct {
 		subnet []netip.Prefix
 		isExit bool
@@ -54,7 +51,7 @@ func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) 
 
 	nodeMatchers := make(map[types.NodeID][]matcher.Match, nodes.Len())
 	for _, node := range nodes.All() {
-		nodeMatchers[node.ID()] = matcher.MatchesFromFilterRules(pm.filterRulesForNodeLocked(node))
+		nodeMatchers[node.ID()] = matcher.MatchesFromFilterRules(pm.unreducedRules(node))
 	}
 
 	for i := range nodes.Len() {
@@ -514,14 +511,9 @@ func buildPeerMapSortedSlice(
 		return nil
 	}
 
-	pm.mu.RLock()
-
 	if pm.needsPerNodeFilter {
-		pm.mu.RUnlock()
-
 		return pm.BuildPeerMap(nodes)
 	}
-	defer pm.mu.RUnlock()
 
 	type nodeRoutes struct {
 		subnet []netip.Prefix
@@ -606,14 +598,9 @@ func buildPeerMapSliceMap(
 		return nil
 	}
 
-	pm.mu.RLock()
-
 	if pm.needsPerNodeFilter {
-		pm.mu.RUnlock()
-
 		return pm.BuildPeerMap(nodes)
 	}
-	defer pm.mu.RUnlock()
 
 	type nodeRoutes struct {
 		subnet []netip.Prefix

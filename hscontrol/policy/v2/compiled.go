@@ -12,7 +12,6 @@ import (
 	"go4.org/netipx"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
-	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/views"
 	"tailscale.com/util/set"
 )
@@ -687,58 +686,6 @@ func hasPerNodeGrants(grants []compiledGrant) bool {
 	}
 
 	return false
-}
-
-// collectRelayTargetIPs returns the set of IPs that are destinations of a
-// tailscale.com/cap/relay grant. A node whose IP is in this set is a relay
-// target: when it goes offline, peers holding a PeerRelay allocation through
-// it must recompute their netmap to drop the now-dead allocation. The relay
-// cap is carried on each grant's [tailcfg.CapGrant] with Dsts set to the
-// resolved relay destinations (see [Policy.compileOtherDests]); the reversed
-// companion rule carries [tailcfg.PeerCapabilityRelayTarget] instead and is
-// intentionally skipped.
-func collectRelayTargetIPs(grants []compiledGrant) (*netipx.IPSet, error) {
-	var b netipx.IPSetBuilder
-
-	for i := range grants {
-		for _, rule := range grants[i].rules {
-			for _, cg := range rule.CapGrant {
-				if _, ok := cg.CapMap[peercap.Relay]; !ok {
-					continue
-				}
-
-				for _, dst := range cg.Dsts {
-					b.AddPrefix(dst)
-				}
-			}
-		}
-	}
-
-	return b.IPSet()
-}
-
-// collectViaTargetTags returns the set of tags used as via targets across all
-// grants. A node carrying any of these tags is a via target: peers steering
-// traffic through it must recompute when it goes offline. Returns nil when no
-// via grants exist.
-func collectViaTargetTags(grants []compiledGrant) map[Tag]struct{} {
-	tags := make(map[Tag]struct{})
-
-	for i := range grants {
-		if grants[i].via == nil {
-			continue
-		}
-
-		for _, t := range grants[i].via.viaTags {
-			tags[t] = struct{}{}
-		}
-	}
-
-	if len(tags) == 0 {
-		return nil
-	}
-
-	return tags
 }
 
 // globalFilterRules extracts global filter rules from [compiledGrant]s.

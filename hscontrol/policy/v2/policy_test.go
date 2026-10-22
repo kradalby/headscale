@@ -3,7 +3,6 @@ package v2
 import (
 	"encoding/json"
 	"fmt"
-	"maps"
 	"math/rand/v2"
 	"net/netip"
 	"slices"
@@ -13,14 +12,10 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/puzpuzpuz/xsync/v4"
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tailcfg/nodecap"
-	"tailscale.com/types/views"
 )
 
 func node(name, ipv4, ipv6 string, user types.User) *types.Node {
@@ -93,195 +88,14 @@ func TestPolicyManager(t *testing.T) {
 	}
 }
 
-// TestSetPolicyRejectedKeepsLiveFilter pins that a policy SetPolicy rejects
-// does not take effect. A nodeAttrs target naming an ambiguous user passes
-// validation but fails to compile after the filter is already compiled; keeping that
-// filter would run the rejected policy while the stored one is unchanged.
-func TestSetPolicyRejectedKeepsLiveFilter(t *testing.T) {
-	// IDs are assigned after construction so the test also builds where
-	// types.User embeds gorm.Model.
-	users := types.Users{{Name: "user1"}, {Name: "user2"}, {Name: "dup"}, {Name: "dup"}}
-	users[0].ID, users[1].ID, users[2].ID, users[3].ID = 1, 2, 3, 4
-	nodes := types.Nodes{
-		node("n1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
-		node("n2", "100.64.0.2", "fd7a:115c:a1e0::2", users[1]),
-	}
-	nodes[0].ID, nodes[1].ID = 1, 2
-
-	pm, err := NewPolicyManager([]byte(`{
-		"acls": [{"action": "accept", "src": ["user1@"], "dst": ["user1@:*"]}]
-	}`), users, nodes.ViewSlice())
-	require.NoError(t, err)
-
-	before, _ := pm.Filter()
-	beforeRules, err := pm.FilterForNode(nodes[1].View())
-	require.NoError(t, err)
-
-	_, err = pm.SetPolicy([]byte(`{
-		"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}],
-		"nodeAttrs": [{"target": ["dup@"], "attr": ["randomize-client-port"]}]
-	}`))
-	require.Error(t, err)
-
-	after, _ := pm.Filter()
-	require.Equal(t, before, after, "a rejected policy must not replace the live filter")
-
-	afterRules, err := pm.FilterForNode(nodes[1].View())
-	require.NoError(t, err)
-	require.Equal(t, beforeRules, afterRules)
-}
-
-func TestInvalidateAutogroupSelfCache(t *testing.T) {
-	users := types.Users{
-		{ID: 1, Name: "user1", Email: "user1@headscale.net"},
-		{ID: 2, Name: "user2", Email: "user2@headscale.net"},
-		{ID: 3, Name: "user3", Email: "user3@headscale.net"},
-	}
-
-	//nolint:goconst // test-specific inline policy for clarity
-	policy := `{
-		"acls": [
-			{
-				"action": "accept",
-				"src": ["autogroup:member"],
-				"dst": ["autogroup:self:*"]
-			}
-		]
-	}`
-
-	initialNodes := types.Nodes{
-		node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
-		node("user1-node2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
-		node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
-		node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2]),
-	}
-
-	for i, n := range initialNodes {
-		n.ID = types.NodeID(i + 1) //nolint:gosec // safe conversion in test
-	}
-
-	pm, err := NewPolicyManager([]byte(policy), users, initialNodes.ViewSlice())
-	require.NoError(t, err)
-
-	// Add to cache by calling FilterForNode for each node
-	for _, n := range initialNodes {
-		_, err := pm.FilterForNode(n.View())
-		require.NoError(t, err)
-	}
-
-	require.Equal(t, len(initialNodes), pm.filterRulesMap.Size())
-
-	tests := []struct {
-		name            string
-		newNodes        types.Nodes
-		expectedCleared int
-		description     string
-	}{
-		{
-			name: "no_changes",
-			newNodes: types.Nodes{
-				node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
-				node("user1-node2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
-				node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
-				node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2]),
-			},
-			expectedCleared: 0,
-			description:     "No changes should clear no cache entries",
-		},
-		{
-			name: "node_added",
-			newNodes: types.Nodes{
-				node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
-				node("user1-node2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
-				node("user1-node3", "100.64.0.5", "fd7a:115c:a1e0::5", users[0]), // New node
-				node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
-				node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2]),
-			},
-			expectedCleared: 2, // user1's existing nodes should be cleared
-			description:     "Adding a node should clear cache for that user's existing nodes",
-		},
-		{
-			name: "node_removed",
-			newNodes: types.Nodes{
-				node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
-				// user1-node2 removed
-				node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
-				node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2]),
-			},
-			expectedCleared: 2, // user1's remaining node + removed node should be cleared
-			description:     "Removing a node should clear cache for that user's remaining nodes",
-		},
-		{
-			name: "user_changed",
-			newNodes: types.Nodes{
-				node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
-				node("user1-node2", "100.64.0.2", "fd7a:115c:a1e0::2", users[2]), // Changed to user3
-				node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
-				node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2]),
-			},
-			expectedCleared: 3, // user1's node + user2's node + user3's nodes should be cleared
-			description:     "Changing a node's user should clear cache for both old and new users",
-		},
-		{
-			name: "ip_changed",
-			newNodes: types.Nodes{
-				node("user1-node1", "100.64.0.10", "fd7a:115c:a1e0::10", users[0]), // IP changed
-				node("user1-node2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
-				node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
-				node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2]),
-			},
-			expectedCleared: 2, // user1's nodes should be cleared
-			description:     "Changing a node's IP should clear cache for that user's nodes",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			for i, n := range tt.newNodes {
-				found := false
-
-				for _, origNode := range initialNodes {
-					if n.Hostname == origNode.Hostname {
-						n.ID = origNode.ID
-						found = true
-
-						break
-					}
-				}
-
-				if !found {
-					n.ID = types.NodeID(len(initialNodes) + i + 1) //nolint:gosec // safe conversion in test
-				}
-			}
-
-			pm.filterRulesMap.Clear()
-
-			for _, n := range initialNodes {
-				_, err := pm.FilterForNode(n.View())
-				require.NoError(t, err)
-			}
-
-			initialCacheSize := pm.filterRulesMap.Size()
-			require.Equal(t, len(initialNodes), initialCacheSize)
-
-			pm.invalidateAutogroupSelfCache(initialNodes.ViewSlice(), tt.newNodes.ViewSlice())
-
-			// Verify the expected number of cache entries were cleared
-			finalCacheSize := pm.filterRulesMap.Size()
-			clearedEntries := initialCacheSize - finalCacheSize
-			require.Equal(t, tt.expectedCleared, clearedEntries, tt.description)
-		})
-	}
-}
-
-// TestSetNodesAutogroupSelfUnhydratedUser reproduces the panic seen on
+// TestAutogroupSelfUnhydratedUser reproduces the panic seen on
 // /machine/map when an autogroup:self policy is active and a non-tagged
 // node reaches the policy manager with its UserID set but the User
 // association left unhydrated (User pointer nil). The NodeStore stores
 // nodes by value with User as a *User; not every write path hydrates the
-// association, so the autogroup:self cache invalidation must derive the
-// owning user from UserID, not from the User view.
-func TestSetNodesAutogroupSelfUnhydratedUser(t *testing.T) {
+// association, so autogroup:self must derive the owning user from UserID,
+// not from the User view.
+func TestAutogroupSelfUnhydratedUser(t *testing.T) {
 	users := types.Users{
 		{ID: 1, Name: "user1", Email: "user1@headscale.net"},
 		{ID: 2, Name: "user2", Email: "user2@headscale.net"},
@@ -310,34 +124,32 @@ func TestSetNodesAutogroupSelfUnhydratedUser(t *testing.T) {
 		}
 	}
 
-	initialNodes := types.Nodes{
-		node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
-		node("user2-node1", "100.64.0.2", "fd7a:115c:a1e0::2", users[1]),
-	}
-	for i, n := range initialNodes {
-		n.ID = types.NodeID(i + 1) //nolint:gosec // safe conversion in test
-	}
-
-	pm, err := NewPolicyManager([]byte(policy), users, initialNodes.ViewSlice())
-	require.NoError(t, err)
-
-	require.False(t, initialNodes[0].IsTagged(), "node must be user-owned for autogroup:self")
-
-	// Simulate a node restarting tailscaled: the same node is pushed back
-	// into the policy manager, but the snapshot version has no hydrated
-	// User association. This is the exact shape that crashed beta.1.
-	updatedNodes := types.Nodes{
+	// Simulate a node restarting tailscaled: the snapshot version of the
+	// node has no hydrated User association. This is the exact shape that
+	// crashed beta.1.
+	nodes := types.Nodes{
 		unhydratedNode("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0].ID),
 		node("user2-node1", "100.64.0.2", "fd7a:115c:a1e0::2", users[1]),
 	}
-	for i, n := range updatedNodes {
+	for i, n := range nodes {
 		n.ID = types.NodeID(i + 1) //nolint:gosec // safe conversion in test
 	}
 
+	require.False(t, nodes[0].IsTagged(), "node must be user-owned for autogroup:self")
+
 	require.NotPanics(t, func() {
-		_, err = pm.SetNodes(updatedNodes.ViewSlice())
-	}, "SetNodes must not panic when a non-tagged node has an unhydrated User")
-	require.NoError(t, err)
+		pm, err := NewPolicyManager([]byte(policy), users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		for _, n := range nodes {
+			_, err = pm.FilterForNode(n.View())
+			require.NoError(t, err)
+			_, err = pm.MatchersForNode(n.View())
+			require.NoError(t, err)
+		}
+
+		pm.BuildPeerMap(nodes.ViewSlice())
+	}, "a compile must not panic when a non-tagged node has an unhydrated User")
 }
 
 // TestSSHCheckParamsUnhydratedUserNoPanic proves that SSHCheckParams does
@@ -365,20 +177,9 @@ func TestSSHCheckParamsUnhydratedUserNoPanic(t *testing.T) {
 		]
 	}`
 
-	initialNodes := types.Nodes{
-		node("user1-src", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
-		node("user1-dst", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
-	}
-	for i, n := range initialNodes {
-		n.ID = types.NodeID(i + 1) //nolint:gosec // safe conversion in test
-	}
-
-	pm, err := NewPolicyManager([]byte(policy), users, initialNodes.ViewSlice())
-	require.NoError(t, err)
-
-	// Simulate a node restarting tailscaled: the destination node is pushed
-	// back into the policy manager with no hydrated User association (UserID
-	// set, User pointer nil), the exact shape that crashed beta.1.
+	// Simulate a node restarting tailscaled: the destination node reaches
+	// the policy manager with no hydrated User association (UserID set,
+	// User pointer nil), the exact shape that crashed beta.1.
 	unhydratedDst := &types.Node{
 		ID:       2,
 		Hostname: "user1-dst",
@@ -389,336 +190,18 @@ func TestSSHCheckParamsUnhydratedUserNoPanic(t *testing.T) {
 	}
 	require.False(t, unhydratedDst.IsTagged(), "dst node must be user-owned for autogroup:self")
 
-	updatedNodes := types.Nodes{
+	nodes := types.Nodes{
 		node("user1-src", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
 		unhydratedDst,
 	}
-	updatedNodes[0].ID = 1
-	_, err = pm.SetNodes(updatedNodes.ViewSlice())
+	nodes[0].ID = 1
+
+	pm, err := NewPolicyManager([]byte(policy), users, nodes.ViewSlice())
 	require.NoError(t, err)
 
 	require.NotPanics(t, func() {
 		pm.SSHCheckParams(types.NodeID(1), types.NodeID(2), "alice")
 	}, "SSHCheckParams must not panic when a non-tagged node has an unhydrated User")
-}
-
-func TestSetUsers(t *testing.T) {
-	const allowAll = `{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`
-
-	const sshCheck = `{
-		"ssh": [
-			{
-				"action": "check",
-				"src": ["user1@headscale.net"],
-				"dst": ["autogroup:self"],
-				"users": ["root"]
-			}
-		]
-	}`
-
-	tests := []struct {
-		name   string
-		policy string
-		mutate func(*types.User)
-
-		wantPolicyChanged  bool
-		wantPeerMapChanged bool
-	}{
-		{
-			name:   "identical users without ssh",
-			policy: allowAll,
-			mutate: func(*types.User) {},
-		},
-		{
-			name:   "identical users with ssh",
-			policy: sshCheck,
-			mutate: func(*types.User) {},
-		},
-		{
-			name:   "timestamp bump only",
-			policy: sshCheck,
-			mutate: func(u *types.User) { u.UpdatedAt = u.UpdatedAt.Add(time.Hour) },
-		},
-		{
-			name:   "display name change without ssh",
-			policy: allowAll,
-			mutate: func(u *types.User) { u.DisplayName = "Renamed" },
-		},
-		{
-			name:   "email change without ssh",
-			policy: allowAll,
-			mutate: func(u *types.User) { u.Email = "other@headscale.net" },
-
-			wantPeerMapChanged: true,
-		},
-		{
-			name:   "rename with ssh",
-			policy: sshCheck,
-			mutate: func(u *types.User) { u.Name = "renamed" },
-
-			wantPolicyChanged:  true,
-			wantPeerMapChanged: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			users := types.Users{{ID: 1, Name: "user1", Email: "user1@headscale.net"}}
-
-			pm, err := NewPolicyManager([]byte(tt.policy), users, types.Nodes{}.ViewSlice())
-			require.NoError(t, err)
-
-			updated := slices.Clone(users)
-			tt.mutate(&updated[0])
-
-			policyChanged, peerMapChanged, err := pm.SetUsers(updated)
-			require.NoError(t, err)
-			require.Equal(t, tt.wantPolicyChanged, policyChanged, "policyChanged")
-			require.Equal(t, tt.wantPeerMapChanged, peerMapChanged, "peerMapChanged")
-		})
-	}
-}
-
-func matcherStrings(ms []matcher.Match) []string {
-	out := make([]string, 0, len(ms))
-	for i := range ms {
-		out = append(out, ms[i].DebugString())
-	}
-
-	return out
-}
-
-// TestSetUsersDropsStaleSelfFilters pins that a user change which moves
-// autogroup:self sources, without touching the global filter, still drops
-// the cached per-node filters and matchers built from the old sources and
-// reports a policy change so clients receive their new filter.
-func TestSetUsersDropsStaleSelfFilters(t *testing.T) {
-	pol := `{
-		"groups": {"group:a": ["u1@", "u3@"]},
-		"acls": [{"action": "accept", "src": ["group:a"], "dst": ["autogroup:self:*"]}]}`
-
-	// ID is set by assignment so this builds where types.User embeds
-	// gorm.Model and promoted-field literals are not allowed.
-	u1, u3, x3 := types.User{Name: "u1"}, types.User{Name: "u3"}, types.User{Name: "x3"}
-	u1.ID, u3.ID, x3.ID = 1, 3, 3
-
-	tests := []struct {
-		name   string
-		before types.Users
-		after  types.Users
-	}{
-		{name: "user-added", before: types.Users{u1}, after: types.Users{u1, u3}},
-		{name: "user-renamed", before: types.Users{u1, x3}, after: types.Users{u1, u3}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			nodes := types.Nodes{
-				node("u1-a", "100.64.0.1", "fd7a:115c:a1e0::1", u1),
-				node("u3-a", "100.64.0.3", "fd7a:115c:a1e0::3", u3),
-				node("u3-b", "100.64.0.4", "fd7a:115c:a1e0::4", u3),
-			}
-			for i, n := range nodes {
-				n.ID = types.NodeID(i + 1) //nolint:gosec // safe conversion in test
-			}
-
-			pm, err := NewPolicyManager([]byte(pol), tt.before, nodes.ViewSlice())
-			require.NoError(t, err)
-
-			for _, n := range nodes {
-				_, err := pm.FilterForNode(n.View())
-				require.NoError(t, err)
-				_, err = pm.MatchersForNode(n.View())
-				require.NoError(t, err)
-			}
-
-			policyChanged, _, err := pm.SetUsers(tt.after)
-			require.NoError(t, err)
-			require.True(t, policyChanged, "moved self sources must reach clients")
-
-			fresh, err := NewPolicyManager([]byte(pol), tt.after, nodes.ViewSlice())
-			require.NoError(t, err)
-
-			for _, n := range nodes {
-				got, err := pm.FilterForNode(n.View())
-				require.NoError(t, err)
-
-				want, err := fresh.FilterForNode(n.View())
-				require.NoError(t, err)
-				require.Empty(t, cmp.Diff(want, got), "node %d FilterForNode (-fresh +cached)", n.ID)
-
-				gotM, err := pm.MatchersForNode(n.View())
-				require.NoError(t, err)
-
-				wantM, err := fresh.MatchersForNode(n.View())
-				require.NoError(t, err)
-				require.Equal(t, matcherStrings(wantM), matcherStrings(gotM), "node %d MatchersForNode", n.ID)
-			}
-		})
-	}
-}
-
-// TestInvalidateGlobalPolicyCache tests the cache invalidation logic for global policies.
-func TestInvalidateGlobalPolicyCache(t *testing.T) {
-	mustIPPtr := func(s string) *netip.Addr {
-		ip := netip.MustParseAddr(s)
-		return &ip
-	}
-
-	tests := []struct {
-		name               string
-		oldNodes           types.Nodes
-		newNodes           types.Nodes
-		initialCache       map[types.NodeID][]tailcfg.FilterRule
-		expectedCacheAfter map[types.NodeID]bool // true = should exist, false = should not exist
-	}{
-		{
-			name: "node property changed - invalidates only that node",
-			oldNodes: types.Nodes{
-				&types.Node{ID: 1, IPv4: mustIPPtr("100.64.0.1")},
-				&types.Node{ID: 2, IPv4: mustIPPtr("100.64.0.2")},
-			},
-			newNodes: types.Nodes{
-				&types.Node{ID: 1, IPv4: mustIPPtr("100.64.0.99")}, // Changed
-				&types.Node{ID: 2, IPv4: mustIPPtr("100.64.0.2")},  // Unchanged
-			},
-			initialCache: map[types.NodeID][]tailcfg.FilterRule{
-				1: {},
-				2: {},
-			},
-			expectedCacheAfter: map[types.NodeID]bool{
-				1: false, // Invalidated
-				2: true,  // Preserved
-			},
-		},
-		{
-			name: "multiple nodes changed",
-			oldNodes: types.Nodes{
-				&types.Node{ID: 1, IPv4: mustIPPtr("100.64.0.1")},
-				&types.Node{ID: 2, IPv4: mustIPPtr("100.64.0.2")},
-				&types.Node{ID: 3, IPv4: mustIPPtr("100.64.0.3")},
-			},
-			newNodes: types.Nodes{
-				&types.Node{ID: 1, IPv4: mustIPPtr("100.64.0.99")}, // Changed
-				&types.Node{ID: 2, IPv4: mustIPPtr("100.64.0.2")},  // Unchanged
-				&types.Node{ID: 3, IPv4: mustIPPtr("100.64.0.88")}, // Changed
-			},
-			initialCache: map[types.NodeID][]tailcfg.FilterRule{
-				1: {},
-				2: {},
-				3: {},
-			},
-			expectedCacheAfter: map[types.NodeID]bool{
-				1: false, // Invalidated
-				2: true,  // Preserved
-				3: false, // Invalidated
-			},
-		},
-		{
-			name: "node deleted - removes from cache",
-			oldNodes: types.Nodes{
-				&types.Node{ID: 1, IPv4: mustIPPtr("100.64.0.1")},
-				&types.Node{ID: 2, IPv4: mustIPPtr("100.64.0.2")},
-			},
-			newNodes: types.Nodes{
-				&types.Node{ID: 2, IPv4: mustIPPtr("100.64.0.2")},
-			},
-			initialCache: map[types.NodeID][]tailcfg.FilterRule{
-				1: {},
-				2: {},
-			},
-			expectedCacheAfter: map[types.NodeID]bool{
-				1: false, // Deleted
-				2: true,  // Preserved
-			},
-		},
-		{
-			name: "node added - no cache invalidation needed",
-			oldNodes: types.Nodes{
-				&types.Node{ID: 1, IPv4: mustIPPtr("100.64.0.1")},
-			},
-			newNodes: types.Nodes{
-				&types.Node{ID: 1, IPv4: mustIPPtr("100.64.0.1")},
-				&types.Node{ID: 2, IPv4: mustIPPtr("100.64.0.2")}, // New
-			},
-			initialCache: map[types.NodeID][]tailcfg.FilterRule{
-				1: {},
-			},
-			expectedCacheAfter: map[types.NodeID]bool{
-				1: true,  // Preserved
-				2: false, // Not in cache (new node)
-			},
-		},
-		{
-			name: "no changes - preserves all cache",
-			oldNodes: types.Nodes{
-				&types.Node{ID: 1, IPv4: mustIPPtr("100.64.0.1")},
-				&types.Node{ID: 2, IPv4: mustIPPtr("100.64.0.2")},
-			},
-			newNodes: types.Nodes{
-				&types.Node{ID: 1, IPv4: mustIPPtr("100.64.0.1")},
-				&types.Node{ID: 2, IPv4: mustIPPtr("100.64.0.2")},
-			},
-			initialCache: map[types.NodeID][]tailcfg.FilterRule{
-				1: {},
-				2: {},
-			},
-			expectedCacheAfter: map[types.NodeID]bool{
-				1: true,
-				2: true,
-			},
-		},
-		{
-			name: "routes changed - invalidates that node only",
-			oldNodes: types.Nodes{
-				&types.Node{
-					ID:             1,
-					IPv4:           mustIPPtr("100.64.0.1"),
-					Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("192.168.0.0/24")}},
-					ApprovedRoutes: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")},
-				},
-				&types.Node{ID: 2, IPv4: mustIPPtr("100.64.0.2")},
-			},
-			newNodes: types.Nodes{
-				&types.Node{
-					ID:             1,
-					IPv4:           mustIPPtr("100.64.0.1"),
-					Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("192.168.0.0/24")}},
-					ApprovedRoutes: []netip.Prefix{netip.MustParsePrefix("192.168.0.0/24")}, // Changed
-				},
-				&types.Node{ID: 2, IPv4: mustIPPtr("100.64.0.2")},
-			},
-			initialCache: map[types.NodeID][]tailcfg.FilterRule{
-				1: {},
-				2: {},
-			},
-			expectedCacheAfter: map[types.NodeID]bool{
-				1: false, // Invalidated
-				2: true,  // Preserved
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			pm := &PolicyManager{
-				nodes:              tt.oldNodes.ViewSlice(),
-				filterRulesMap:     xsync.NewMap[types.NodeID, []tailcfg.FilterRule](),
-				matchersForNodeMap: xsync.NewMap[types.NodeID, []matcher.Match](),
-			}
-			for id, rules := range tt.initialCache {
-				pm.filterRulesMap.Store(id, rules)
-			}
-
-			pm.invalidateGlobalPolicyCache(tt.newNodes.ViewSlice())
-
-			// Verify cache state
-			for nodeID, shouldExist := range tt.expectedCacheAfter {
-				_, exists := pm.filterRulesMap.Load(nodeID)
-				require.Equal(t, shouldExist, exists, "node %d cache existence mismatch", nodeID)
-			}
-		})
-	}
 }
 
 // TestAutogroupSelfReducedVsUnreducedRules verifies that:
@@ -875,92 +358,6 @@ func TestAutogroupSelfWithOtherRules(t *testing.T) {
 	require.NotEmpty(t, rules, "test-1 should have filter rules from both ACL rules")
 }
 
-// TestAutogroupSelfPolicyUpdateTriggersMapResponse verifies that when a policy with
-// autogroup:self is updated, SetPolicy returns true to trigger MapResponse updates,
-// even if the global filter hash didn't change (which is always empty for autogroup:self).
-// This fixes the issue where policy updates would clear caches but not trigger updates,
-// leaving nodes with stale filter rules until reconnect.
-func TestAutogroupSelfPolicyUpdateTriggersMapResponse(t *testing.T) {
-	users := types.Users{
-		{ID: 1, Name: "test-1", Email: "test-1@example.com"},
-		{ID: 2, Name: "test-2", Email: "test-2@example.com"},
-	}
-
-	test1Node := &types.Node{
-		ID:       1,
-		Hostname: "test-1-device",
-		IPv4:     ap("100.64.0.1"),
-		IPv6:     ap("fd7a:115c:a1e0::1"),
-		User:     new(users[0]),
-		UserID:   new(users[0].ID),
-		Hostinfo: &tailcfg.Hostinfo{},
-	}
-
-	test2Node := &types.Node{
-		ID:       2,
-		Hostname: "test-2-device",
-		IPv4:     ap("100.64.0.2"),
-		IPv6:     ap("fd7a:115c:a1e0::2"),
-		User:     new(users[1]),
-		UserID:   new(users[1].ID),
-		Hostinfo: &tailcfg.Hostinfo{},
-	}
-
-	nodes := types.Nodes{test1Node, test2Node}
-
-	// Initial policy with autogroup:self
-	initialPolicy := `{
-		"acls": [
-			{
-				"action": "accept",
-				"src": ["autogroup:member"],
-				"dst": ["autogroup:self:*"]
-			}
-		]
-	}`
-
-	pm, err := NewPolicyManager([]byte(initialPolicy), users, nodes.ViewSlice())
-	require.NoError(t, err)
-	require.True(t, pm.needsPerNodeFilter, "policy should need per-node filter")
-
-	// Get initial filter rules for test-1 (should be cached)
-	rules1, err := pm.FilterForNode(test1Node.View())
-	require.NoError(t, err)
-	require.NotEmpty(t, rules1, "test-1 should have filter rules")
-
-	// Update policy with a different ACL that still results in empty global filter
-	// (only autogroup:self rules, which compile to empty global filter)
-	// We add a comment/description change by adding groups (which don't affect filter compilation)
-	updatedPolicy := `{
-		"groups": {
-			"group:test": ["test-1@example.com"]
-		},
-		"acls": [
-			{
-				"action": "accept",
-				"src": ["autogroup:member"],
-				"dst": ["autogroup:self:*"]
-			}
-		]
-	}`
-
-	// SetPolicy should return true even though global filter hash didn't change
-	policyChanged, err := pm.SetPolicy([]byte(updatedPolicy))
-	require.NoError(t, err)
-	require.True(t, policyChanged, "SetPolicy should return true when policy content changes, even if global filter hash unchanged (autogroup:self)")
-
-	// Verify that caches were cleared and new rules are generated
-	// The cache should be empty, so FilterForNode will recompile
-	rules2, err := pm.FilterForNode(test1Node.View())
-	require.NoError(t, err)
-	require.NotEmpty(t, rules2, "test-1 should have filter rules after policy update")
-
-	// Verify that the policy hash tracking works - a second identical update should return false
-	policyChanged2, err := pm.SetPolicy([]byte(updatedPolicy))
-	require.NoError(t, err)
-	require.False(t, policyChanged2, "SetPolicy should return false when policy content hasn't changed")
-}
-
 // TestSSHPolicyRemovalClearsRules pins that removing every SSH rule
 // yields a non-nil, empty [tailcfg.SSHPolicy]. A nil MapResponse.SSHPolicy
 // tells the client to keep its previous rules, so returning nil leaves
@@ -1002,9 +399,8 @@ func TestSSHPolicyRemovalClearsRules(t *testing.T) {
 			require.NotNil(t, before)
 			require.NotEmpty(t, before.Rules, "precondition: server has SSH rules")
 
-			changed, err := pm.SetPolicy([]byte(without))
+			pm, err = NewPolicyManager([]byte(without), users, nodes.ViewSlice())
 			require.NoError(t, err)
-			require.True(t, changed)
 
 			after, err := pm.SSHPolicy("", nodes[0].View())
 			require.NoError(t, err)
@@ -1102,10 +498,8 @@ func TestTagPropagationToPeerMap(t *testing.T) {
 
 	updatedNodes := types.Nodes{user1NodeUpdated, user2Node}
 
-	// SetNodes should detect the tag change
-	changed, err := pm.SetNodes(updatedNodes.ViewSlice())
+	pm, err = NewPolicyManager([]byte(policy), users, updatedNodes.ViewSlice())
 	require.NoError(t, err)
-	require.True(t, changed, "SetNodes should return true when tags change")
 
 	// After tag change: user2 should NOT see user1 as a peer anymore
 	// (no ACL allows user2 to access tag:internal)
@@ -2830,57 +2224,14 @@ func TestUnregisteredUsersAreNoOp(t *testing.T) {
 			require.NotEmpty(t, diff(want, snapshot(t, load(`"bob@"`, registered, nodes), nodes)),
 				"the site must react to its members")
 
-			// ghost registers, then their node joins.
+			// ghost registers and their node joins.
 			grown := mkNodes(all)
 
-			_, _, err := pm.SetUsers(all)
-			require.NoError(t, err)
-			_, err = pm.SetNodes(grown.ViewSlice())
-			require.NoError(t, err)
-
-			joined := snapshot(t, pm, grown)
-			require.Empty(t, diff(snapshot(t, load(withGhost, all, grown), grown), joined),
-				"after joining, ghost must match a fresh load")
+			joined := snapshot(t, load(withGhost, all, grown), grown)
 			require.NotEmpty(t, diff(snapshot(t, load(alice, all, grown), grown), joined),
 				"after joining, ghost must gain access")
-
-			// ghost's node leaves, then ghost is deleted.
-			_, err = pm.SetNodes(nodes.ViewSlice())
-			require.NoError(t, err)
-			_, _, err = pm.SetUsers(registered)
-			require.NoError(t, err)
-
-			require.Empty(t, diff(want, snapshot(t, pm, nodes)),
-				"after deletion, ghost must leave no trace")
 		})
 	}
-}
-
-// Rejected SetPolicy must keep the previous policy intact.
-func TestSetPolicy_DuplicateUsername(t *testing.T) {
-	users := types.Users{
-		{ID: 2, Name: "yala"},
-		{ID: 7, Name: "yala", Email: "yala@yala.yala"},
-	}
-
-	good := []byte(`{
-  "acls": [{"action":"accept","src":["*"],"dst":["*:*"]}]
-}`)
-
-	pm, err := NewPolicyManager(good, users, types.Nodes{}.ViewSlice())
-	require.NoError(t, err)
-
-	bad := []byte(`{
-  "groups": {"group:admins": ["yala@"]},
-  "acls":   [{"action":"accept","src":["group:admins"],"dst":["*:*"]}]
-}`)
-
-	_, err = pm.SetPolicy(bad)
-	require.Error(t, err)
-	require.ErrorIs(t, err, ErrMultipleUsersFound)
-
-	filter, _ := pm.Filter()
-	require.NotNil(t, filter, "filter must remain populated after rejected SetPolicy")
 }
 
 // Empty users → syntax-only check, used by `headscale policy check`.
@@ -3257,7 +2608,7 @@ func TestTagOwnedByTags(t *testing.T) {
 }
 
 // benchPolicies are the ACL shapes BenchmarkBuildPeerMap and
-// BenchmarkSetNodes measure: a global ACL, autogroup:self, and a via
+// BenchmarkNewPolicyManager measure: a global ACL, autogroup:self, and a via
 // grant. hscontrol/state/node_store_test.go checks the same three
 // shapes for adjacency correctness; this is its own copy since test
 // packages can't share one. Route dsts here are 10.0.0.0/8, wider than
@@ -3285,11 +2636,6 @@ var benchPolicies = []struct {
 		"tagOwners": {"tag:router": ["u1@"]},
 		"grants": [{"src": ["u2@"], "dst": ["10.0.0.0/8"], "ip": ["*"], "via": ["tag:router"]}]}`, routerFiltered: true},
 }
-
-// benchSetNodesPolicies is the subset of benchPolicies BenchmarkSetNodes
-// covers: via's per-node filter cost is close enough to global's that a
-// third axis wouldn't add signal.
-var benchSetNodesPolicies = benchPolicies[:2]
 
 // benchNodes builds n nodes spread across 10 users for the peer-map
 // benchmarks below: ~10% tagged tag:srv, ~5% also tagged tag:router and
@@ -3397,61 +2743,17 @@ func BenchmarkViaRoutesForPeer(b *testing.B) {
 	}
 }
 
-// BenchmarkSetNodes measures PolicyManager.SetNodes when one node's
-// route changes on every call, the same per-write cost
-// BenchmarkNodeStoreWrite drives through a NodeStore.
-func BenchmarkSetNodes(b *testing.B) {
-	for _, pol := range benchSetNodesPolicies {
+// BenchmarkNewPolicyManager measures one compile, the cost paid whenever
+// the policy, the users or a node fact the policy reads changes.
+func BenchmarkNewPolicyManager(b *testing.B) {
+	for _, pol := range benchPolicies {
 		b.Run(fmt.Sprintf("%s/n=%d", pol.name, 617), func(b *testing.B) {
 			users, nodes := benchNodes(617)
-			pm, err := NewPolicyManager([]byte(pol.policy), users, nodes.ViewSlice())
-			require.NoError(b, err)
 
 			b.ReportAllocs()
 
-			i := 0
 			for b.Loop() {
-				i++
-				subnet := netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(200 + i%50), 0, 0}), 24) //nolint:gosec
-				// The policy manager holds views of the previous node; mutating
-				// it in place would change both sides of SetNodes' comparison.
-				nd := nodes[0].Clone()
-				nd.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{subnet}}
-				nd.ApprovedRoutes = []netip.Prefix{subnet}
-				nodes[0] = nd
-
-				changed, err := pm.SetNodes(nodes.ViewSlice())
-				if err != nil {
-					b.Fatal(err)
-				}
-
-				if !changed {
-					b.Fatal("SetNodes must see the route change and recompile")
-				}
-			}
-		})
-	}
-}
-
-// BenchmarkSetNodesManyTags measures the recompile a join or delete costs
-// when every node carries its own tag and grants reference them, a CI fleet
-// shape where resolving tags dominated the compile.
-func BenchmarkSetNodesManyTags(b *testing.B) {
-	for _, n := range []int{1000, 4000} {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			nodes := scanManyRulesNodes(n)
-			pm, err := NewPolicyManager([]byte(scanManyRulesPolicy(n, 400)), nil, nodes.ViewSlice())
-			require.NoError(b, err)
-
-			sets := []views.Slice[types.NodeView]{nodes[:n-1].ViewSlice(), nodes.ViewSlice()}
-
-			b.ReportAllocs()
-
-			i := 0
-			for b.Loop() {
-				i++
-
-				_, err := pm.SetNodes(sets[i%2])
+				_, err := NewPolicyManager([]byte(pol.policy), users, nodes.ViewSlice())
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -3460,80 +2762,21 @@ func BenchmarkSetNodesManyTags(b *testing.B) {
 	}
 }
 
-// TestNodesGenerationCountsChangingSetNodes pins that NodesGeneration
-// moves exactly when SetNodes reports a change, so a caller that did not
-// run the SetNodes itself can still tell its write moved the policy.
-func TestNodesGenerationCountsChangingSetNodes(t *testing.T) {
-	users := types.Users{{ID: 1, Name: "user1"}}
+func matcherStrings(ms []matcher.Match) []string {
+	out := make([]string, 0, len(ms))
+	for i := range ms {
+		out = append(out, ms[i].DebugString())
+	}
 
-	nodes := types.Nodes{node("n1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0])}
-	nodes[0].ID = 1
-
-	pm, err := NewPolicyManager([]byte(`{
-		"acls": [{"action": "accept", "src": ["user1@"], "dst": ["user1@:*"]}]
-	}`), users, nodes.ViewSlice())
-	require.NoError(t, err)
-
-	gen := pm.NodesGeneration()
-
-	changed, err := pm.SetNodes(nodes.ViewSlice())
-	require.NoError(t, err)
-	require.False(t, changed)
-	require.Equal(t, gen, pm.NodesGeneration(), "unchanged nodes must not advance the generation")
-
-	added := node("n2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0])
-	added.ID = 2
-
-	changed, err = pm.SetNodes(append(nodes, added).ViewSlice())
-	require.NoError(t, err)
-	require.True(t, changed)
-	require.Equal(t, gen+1, pm.NodesGeneration(), "a changing SetNodes must advance the generation once")
+	return out
 }
 
-// TestSetNodesRetriesAfterFailedRecompile pins that a SetNodes whose
-// recompile fails keeps the previous node list, like SetUsers. Keeping the
-// new list would make an identical retry look unchanged, so the recompile
-// would never be retried and the caller would never learn the policy moved.
-func TestSetNodesRetriesAfterFailedRecompile(t *testing.T) {
-	users := types.Users{{ID: 1, Name: "user1"}}
-
-	nodes := make(types.Nodes, 0, 2)
-	nodes = append(nodes, node("n1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]))
-	nodes[0].ID = 1
-
-	pm, err := NewPolicyManager([]byte(`{
-		"tagOwners": {"tag:a": ["user1@"]},
-		"acls": [{"action": "accept", "src": ["user1@"], "dst": ["user1@:*"]}]
-	}`), users, nodes.ViewSlice())
-	require.NoError(t, err)
-
-	added := node("n2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0])
-	added.ID = 2
-	grown := append(nodes, added)
-
-	// Break tag owner resolution so the recompile fails.
-	good := pm.pol.TagOwners
-	missing := Tag("tag:missing")
-	pm.pol.TagOwners = TagOwners{"tag:a": Owners{&missing}}
-
-	_, err = pm.SetNodes(grown.ViewSlice())
-	require.Error(t, err)
-
-	pm.pol.TagOwners = good
-	gen := pm.NodesGeneration()
-
-	changed, err := pm.SetNodes(grown.ViewSlice())
-	require.NoError(t, err)
-	require.True(t, changed, "the retry must recompile, not see the failed input as current")
-	require.Equal(t, gen+1, pm.NodesGeneration())
-}
-
-// TestSetNodesCachedResultsMatchFresh drives random node writes through
-// one PolicyManager, reading every node between writes so its caches
-// fill, and checks each read against a PolicyManager built fresh from the
-// same nodes. A cache entry that a write should have dropped shows up as
-// a difference.
-func TestSetNodesCachedResultsMatchFresh(t *testing.T) {
+// TestForeignViewsDoNotPoisonCaches applies random node writes and, around
+// each, reads a PolicyManager compiled from one side through the views of
+// the other, as a caller holding another snapshot's views does. Its answers
+// for its own nodes must then match a PolicyManager never read that way;
+// a foreign answer cached under a node's ID shows up as a difference.
+func TestForeignViewsDoNotPoisonCaches(t *testing.T) {
 	users := types.Users{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}, {ID: 3, Name: "u3"}}
 
 	policies := []struct {
@@ -3602,18 +2845,33 @@ func TestSetNodesCachedResultsMatchFresh(t *testing.T) {
 
 				nextID := types.NodeID(len(nodes) + 1) //nolint:gosec // safe conversion in test
 
-				pm, err := NewPolicyManager([]byte(pc.policy), users, nodes.ViewSlice())
-				if err != nil {
-					rt.Fatalf("new policy manager: %v", err)
-				}
-
-				check := func() {
-					fresh, err := NewPolicyManager([]byte(pc.policy), users, nodes.ViewSlice())
+				compile := func(nodes types.Nodes) *PolicyManager {
+					pm, err := NewPolicyManager([]byte(pc.policy), users, nodes.ViewSlice())
 					if err != nil {
-						rt.Fatalf("fresh policy manager: %v", err)
+						rt.Fatalf("new policy manager: %v", err)
 					}
 
-					for _, n := range nodes {
+					return pm
+				}
+
+				// check compiles own, reads it through foreign's views,
+				// then compares its answers for own against a clean compile.
+				check := func(own, foreign types.Nodes) {
+					pm, fresh := compile(own), compile(own)
+
+					for _, n := range foreign {
+						nv := n.View()
+
+						_, _ = pm.FilterForNode(nv)
+						_, _ = pm.MatchersForNode(nv)
+
+						_, err := pm.SSHPolicy("", nv)
+						if err != nil {
+							rt.Fatalf("node %d SSHPolicy: %v", n.ID, err)
+						}
+					}
+
+					for _, n := range own {
 						nv := n.View()
 
 						got, _ := pm.FilterForNode(nv)
@@ -3642,15 +2900,15 @@ func TestSetNodesCachedResultsMatchFresh(t *testing.T) {
 					}
 				}
 
-				check()
-
 				steps := rapid.IntRange(1, 25).Draw(rt, "steps")
 				for range steps {
-					// Several writes per SetNodes, as a NodeStore batch applies them.
+					prev := nodes
+
+					// Several writes per step, as a NodeStore batch applies them.
 					writes := rapid.IntRange(1, 3).Draw(rt, "writes")
 					for range writes {
 						i := rapid.IntRange(0, len(nodes)-1).Draw(rt, "node")
-						// Mutate a copy: pm still holds views of the old node.
+						// Mutate a copy: prev still holds the old node.
 						n := nodes[i].View().AsStruct()
 
 						switch rapid.IntRange(0, 9).Draw(rt, "op") {
@@ -3700,515 +2958,17 @@ func TestSetNodesCachedResultsMatchFresh(t *testing.T) {
 						}
 					}
 
-					_, err := pm.SetNodes(nodes.ViewSlice())
-					if err != nil {
-						rt.Fatalf("SetNodes: %v", err)
-					}
-
-					check()
+					check(nodes, prev)
+					check(prev, nodes)
 				}
 			})
 		})
-	}
-}
-
-// TestFailedSetUsersKeepsCompiledPolicy renames alice to charlie and adds
-// a second bob, so the recompile resolves charlie's grant and then fails on
-// the ambiguous nodeAttrs target. A failed Set* must leave every compiled result as it was:
-// a partial compile would hand alice's nodes charlie's port 22, and the
-// reverse rename, which SetUsers sees as no change, would not clear it.
-func TestFailedSetUsersKeepsCompiledPolicy(t *testing.T) {
-	users := types.Users{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
-	nodes := types.Nodes{
-		node("a1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
-		node("a2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
-		node("b1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
-	}
-
-	for i, n := range nodes {
-		n.ID = types.NodeID(i + 1) //nolint:gosec
-	}
-
-	pol := []byte(`{
-		"acls": [
-			{"action": "accept", "src": ["charlie@"], "dst": ["autogroup:self:22"]},
-			{"action": "accept", "src": ["bob@"], "dst": ["bob@:*"]}
-		],
-		"ssh": [{"action": "accept", "src": ["charlie@"], "dst": ["autogroup:self"], "users": ["root"]}],
-		"nodeAttrs": [{"target": ["bob@"], "attr": ["randomize-client-port"]}]
-	}`)
-
-	pm, err := NewPolicyManager(pol, users, nodes.ViewSlice())
-	require.NoError(t, err)
-
-	type view struct {
-		filter []tailcfg.FilterRule
-		ssh    *tailcfg.SSHPolicy
-	}
-
-	read := func(pm *PolicyManager, n *types.Node) view {
-		t.Helper()
-
-		f, err := pm.FilterForNode(n.View())
-		require.NoError(t, err)
-
-		ssh, err := pm.SSHPolicy("", n.View())
-		require.NoError(t, err)
-
-		return view{filter: f, ssh: ssh}
-	}
-
-	before := read(pm, nodes[0])
-
-	renamed := slices.Clone(users)
-	renamed[0].Name = "charlie"
-	renamed = append(renamed, types.User{ID: 3, Name: "bob"})
-
-	_, _, err = pm.SetUsers(renamed)
-	require.Error(t, err)
-	require.Equal(t, before, read(pm, nodes[0]), "a failed SetUsers must not change compiled results")
-
-	_, _, err = pm.SetUsers(users)
-	require.NoError(t, err)
-	require.Equal(t, before, read(pm, nodes[0]), "reversing the rename must serve the original results")
-
-	b2 := node("b2", "100.64.0.4", "fd7a:115c:a1e0::4", users[1])
-	b2.ID = 4
-	grown := append(slices.Clone(nodes), b2)
-
-	_, err = pm.SetNodes(grown.ViewSlice())
-	require.NoError(t, err)
-
-	fresh, err := NewPolicyManager(pol, users, grown.ViewSlice())
-	require.NoError(t, err)
-
-	for _, n := range grown {
-		require.Equal(t, read(fresh, n), read(pm, n),
-			"node %s after a later write must match a fresh compile", n.Hostname)
-	}
-}
-
-// TestFailedSetNodesKeepsCompiledPolicy fails a SetNodes that retags a
-// node, then retries it once the failure is gone. The failed write must
-// leave the compiled filter as it was, and the retry must compile the new
-// owners.
-func TestFailedSetNodesKeepsCompiledPolicy(t *testing.T) {
-	users := types.Users{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
-	nodes := types.Nodes{
-		node("a1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
-		node("a2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
-		node("b1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
-	}
-
-	for i, n := range nodes {
-		n.ID = types.NodeID(i + 1) //nolint:gosec
-	}
-
-	pol := []byte(`{
-		"tagOwners": {"tag:srv": ["alice@"]},
-		"acls": [{"action": "accept", "src": ["alice@"], "dst": ["alice@:*"]}],
-		"ssh": [{"action": "accept", "src": ["alice@"], "dst": ["alice@"], "users": ["root"]}]
-	}`)
-
-	pm, err := NewPolicyManager(pol, users, nodes.ViewSlice())
-	require.NoError(t, err)
-
-	read := func(pm *PolicyManager, n *types.Node) ([]tailcfg.FilterRule, *tailcfg.SSHPolicy) {
-		t.Helper()
-
-		f, err := pm.FilterForNode(n.View())
-		require.NoError(t, err)
-
-		ssh, err := pm.SSHPolicy("", n.View())
-		require.NoError(t, err)
-
-		return f, ssh
-	}
-
-	beforeFilter, beforeSSH := read(pm, nodes[0])
-	beforeGlobal, _ := pm.Filter()
-
-	retagged := slices.Clone(nodes)
-	tagged := nodes[1].Clone()
-	tagged.Tags = []string{"tag:srv"}
-	tagged.UserID, tagged.User = nil, nil
-	retagged[1] = tagged
-
-	good := pm.pol.TagOwners
-	missing := Tag("tag:missing")
-	pm.pol.TagOwners = TagOwners{"tag:srv": Owners{&missing}}
-
-	_, err = pm.SetNodes(retagged.ViewSlice())
-	require.Error(t, err)
-
-	pm.pol.TagOwners = good
-
-	gotFilter, gotSSH := read(pm, nodes[0])
-	require.Equal(t, beforeFilter, gotFilter, "a failed SetNodes must not change compiled results")
-	require.Equal(t, beforeSSH, gotSSH, "a failed SetNodes must not change compiled results")
-
-	gotGlobal, _ := pm.Filter()
-	require.Equal(t, beforeGlobal, gotGlobal, "a failed SetNodes must not change compiled results")
-
-	_, err = pm.SetNodes(retagged.ViewSlice())
-	require.NoError(t, err)
-
-	fresh, err := NewPolicyManager(pol, users, retagged.ViewSlice())
-	require.NoError(t, err)
-
-	for _, n := range retagged {
-		wantFilter, wantSSH := read(fresh, n)
-		gotFilter, gotSSH := read(pm, n)
-		require.Equal(t, wantFilter, gotFilter, "node %s filter after the retry", n.Hostname)
-		require.Equal(t, wantSSH, gotSSH, "node %s SSH after the retry", n.Hostname)
-	}
-}
-
-// nodeCapMapsReference is the complete bulk accessor from d00f135bf.
-func (pm *PolicyManager) nodeCapMapsReference() map[types.NodeID]tailcfg.NodeCapMap {
-	if pm == nil {
-		return nil
-	}
-
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
-	out := make(map[types.NodeID]tailcfg.NodeCapMap, len(pm.nodeAttrsMap))
-	maps.Copy(out, pm.nodeAttrsMap)
-
-	return out
-}
-
-func TestNodeCapMapsForPeersReference(t *testing.T) {
-	var nilManager *PolicyManager
-	require.Nil(t, nilManager.NodeCapMaps())
-	require.Nil(t, nilManager.nodeCapMapsReference())
-	require.Nil(t, nilManager.NodeCapMapsForPeers(views.SliceOf([]types.NodeView{(&types.Node{ID: 1}).View()})))
-
-	for _, attrs := range []struct {
-		name string
-		caps map[types.NodeID]tailcfg.NodeCapMap
-	}{
-		{"nil", nil},
-		{"empty", map[types.NodeID]tailcfg.NodeCapMap{}},
-		{"single", map[types.NodeID]tailcfg.NodeCapMap{3: {"disable-ipv4": nil}}},
-		{"partial", map[types.NodeID]tailcfg.NodeCapMap{
-			1: nil,
-			2: {},
-			3: {"disable-ipv4": nil, "value": {`{"a":1}`}},
-			5: {"randomize-client-port": {}},
-		}},
-	} {
-		t.Run(attrs.name, func(t *testing.T) {
-			pm := &PolicyManager{nodeAttrsMap: attrs.caps}
-			all := pm.nodeCapMapsReference()
-			require.NotNil(t, all)
-			require.Equal(t, all, pm.NodeCapMaps())
-
-			for _, selection := range []struct {
-				name string
-				ids  []types.NodeID
-			}{
-				{"nil", nil},
-				{"empty", []types.NodeID{}},
-				{"missing", []types.NodeID{99}},
-				{"one", []types.NodeID{3}},
-				{"below threshold", []types.NodeID{5, 3, 3}},
-				{"threshold missing", []types.NodeID{99, 99, 99, 99}},
-				{"duplicates", []types.NodeID{3, 5, 3, 99, 1, 2}},
-				{"full", []types.NodeID{5, 4, 3, 2, 1}},
-			} {
-				t.Run(selection.name, func(t *testing.T) {
-					var peers []types.NodeView
-					for _, id := range selection.ids {
-						peers = append(peers, (&types.Node{ID: id}).View())
-					}
-
-					if selection.ids != nil && len(peers) == 0 {
-						peers = []types.NodeView{}
-					}
-
-					before := slices.Clone(peers)
-
-					var want map[types.NodeID]tailcfg.NodeCapMap
-					if len(peers) > 0 && len(all) > 0 {
-						want = make(map[types.NodeID]tailcfg.NodeCapMap)
-
-						if len(peers) >= len(all) {
-							maps.Copy(want, all)
-						} else {
-							for _, peer := range peers {
-								if caps, ok := all[peer.ID()]; ok {
-									want[peer.ID()] = caps
-								}
-							}
-						}
-					}
-
-					got := pm.NodeCapMapsForPeers(views.SliceOf(peers))
-					require.Equal(t, want, got)
-					require.Equal(t, before, peers)
-
-					for _, peer := range peers {
-						require.Equal(t, all[peer.ID()], got[peer.ID()], "requested lookups must match the bulk snapshot")
-					}
-
-					if got != nil {
-						clear(got)
-						got[99] = tailcfg.NodeCapMap{"caller-only": nil}
-					}
-
-					require.Equal(t, all, pm.NodeCapMaps(), "outer mutations must not reach the manager")
-				})
-			}
-
-			wantAll := pm.nodeCapMapsReference()
-
-			clear(all)
-			require.Equal(t, wantAll, pm.NodeCapMaps(), "bulk container remains independently owned")
-		})
-	}
-}
-
-func TestNodeCapMapsForPeersSnapshots(t *testing.T) {
-	user := types.User{ID: 1, Name: "capuser"}
-	nodes := types.Nodes{
-		node("one", "100.64.0.1", "fd7a:115c:a1e0::1", user),
-		node("two", "100.64.0.2", "fd7a:115c:a1e0::2", user),
-	}
-	nodes[0].ID, nodes[1].ID = 1, 2
-	pm, err := NewPolicyManager([]byte(`{"nodeAttrs":[{"target":["*"],"attr":["disable-ipv4"]}]}`), []types.User{user}, nodes.ViewSlice())
-	require.NoError(t, err)
-
-	old := pm.NodeCapMapsForPeers(nodes.ViewSlice())
-	all := pm.nodeCapMapsReference()
-
-	require.Len(t, old, 2)
-	require.Equal(t, all, old)
-	// Probe the documented shared-inner contract, then restore before any policy update.
-	old[1]["alias-probe"] = []tailcfg.RawMessage{`{"shared":true}`}
-
-	require.Contains(t, pm.nodeAttrsMap[1], nodecap.Cap("alias-probe"))
-	require.Same(t, &old[1]["alias-probe"][0], &all[1]["alias-probe"][0])
-	delete(old[1], "alias-probe")
-
-	owned := pm.NodeCapMap(1)
-	delete(owned, "disable-ipv4")
-	require.Contains(t, old[1], nodecap.Cap("disable-ipv4"), "single-node accessor still clones its inner map")
-
-	_, err = pm.SetPolicy([]byte(`{"nodeAttrs":[{"target":["100.64.0.2"],"attr":["randomize-client-port"]}]}`))
-	require.NoError(t, err)
-
-	current := pm.NodeCapMapsForPeers(nodes.ViewSlice())
-	require.Equal(t, pm.nodeCapMapsReference(), current)
-	require.NotContains(t, current, types.NodeID(1))
-	require.Contains(t, current[2], nodecap.Cap("randomize-client-port"))
-
-	for _, caps := range old {
-		require.Equal(t, tailcfg.NodeCapMap{"disable-ipv4": nil}, caps, "old snapshot survives policy replacement")
-	}
-
-	_, err = pm.SetPolicy([]byte(`{}`))
-	require.NoError(t, err)
-	require.Nil(t, pm.NodeCapMapsForPeers(nodes.ViewSlice()))
-	require.Contains(t, current[2], nodecap.Cap("randomize-client-port"))
-	require.NotNil(t, pm.NodeCapMaps(), "bulk empty result must remain non-nil")
-}
-
-func TestNodeCapMapsForPeersGlobalRandomizeClientPort(t *testing.T) {
-	users, nodes := benchNodes(2)
-	pm, err := NewPolicyManager([]byte(`{"randomizeClientPort":true}`), users, nodes.ViewSlice())
-	require.NoError(t, err)
-
-	all := pm.nodeCapMapsReference()
-	require.Len(t, all, 2)
-
-	peers := nodes.ViewSlice().Slice(0, 1)
-	got := pm.NodeCapMapsForPeers(peers)
-	require.Equal(t, map[types.NodeID]tailcfg.NodeCapMap{
-		nodes[0].ID: {"randomize-client-port": nil},
-	}, got)
-	require.Equal(t, all, pm.NodeCapMapsForPeers(nodes.ViewSlice()))
-	require.Nil(t, pm.NodeCapMapsForPeers(views.SliceOf([]types.NodeView(nil))))
-}
-
-func TestNodeCapMapsForPeersConcurrentPolicy(t *testing.T) {
-	for _, k := range []int{3, 8} {
-		t.Run(fmt.Sprintf("K%d", k), func(t *testing.T) {
-			users, nodes := benchNodes(8)
-			policies := []string{
-				`{"nodeAttrs":[{"target":["*"],"attr":["disable-ipv4"]}]}`,
-				`{"nodeAttrs":[{"target":["*"],"attr":["randomize-client-port"]}]}`,
-			}
-			pm, err := NewPolicyManager([]byte(policies[0]), users, nodes.ViewSlice())
-			require.NoError(t, err)
-
-			peers := nodes.ViewSlice().Slice(0, k)
-			generations := []tailcfg.NodeCapMap{
-				{"disable-ipv4": nil},
-				{"randomize-client-port": nil},
-			}
-			checkSnapshot := func(generation int) {
-				t.Helper()
-
-				snapshot := pm.NodeCapMapsForPeers(peers)
-				if len(snapshot) != peers.Len() {
-					t.Errorf("snapshot has %d entries, want %d", len(snapshot), peers.Len())
-				}
-
-				first := snapshot[nodes[0].ID]
-				if !maps.EqualFunc(generations[0], first, slices.Equal) &&
-					!maps.EqualFunc(generations[1], first, slices.Equal) {
-					t.Errorf("snapshot has unexpected capabilities: %v", first)
-				}
-
-				for _, caps := range snapshot {
-					if !maps.EqualFunc(first, caps, slices.Equal) {
-						t.Error("snapshot mixed policy generations")
-					}
-
-					if generation >= 0 && !maps.EqualFunc(generations[generation], caps, slices.Equal) {
-						t.Errorf("snapshot did not observe published generation %d: %v", generation, caps)
-					}
-				}
-			}
-			checkSnapshot(0)
-
-			published := make(chan int)
-			acknowledged := make(chan struct{})
-			writerErrors := make(chan error, 1)
-
-			go func() {
-				defer close(published)
-
-				var err error
-				defer func() { writerErrors <- err }()
-
-				for i := range 100 {
-					generation := (i + 1) % 2
-
-					_, err = pm.SetPolicy([]byte(policies[generation]))
-					if err != nil {
-						return
-					}
-
-					published <- generation
-
-					<-acknowledged
-				}
-			}()
-
-			var observed [2]int
-
-			for active := true; active; {
-				checkSnapshot(-1)
-
-				select {
-				case generation, ok := <-published:
-					if !ok {
-						active = false
-						continue
-					}
-
-					checkSnapshot(generation)
-					observed[generation]++
-
-					acknowledged <- struct{}{}
-				default:
-				}
-			}
-
-			require.NoError(t, <-writerErrors)
-			checkSnapshot(0)
-			require.Equal(t, [2]int{50, 50}, observed)
-		})
-	}
-}
-
-var nodeCapMapsBenchmarkSink map[types.NodeID]tailcfg.NodeCapMap
-
-// Each call constructs a fresh outer snapshot; there is no retained selector index.
-// Direct method calls keep interface adapters out of this isolated measurement.
-func BenchmarkNodeCapMapsSelection(b *testing.B) {
-	previousLevel := zerolog.GlobalLevel()
-
-	zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	b.Cleanup(func() { zerolog.SetGlobalLevel(previousLevel) })
-
-	for _, n := range []int{100, 1000, 10000} {
-		_, nodes := benchNodes(n)
-		allPeers := nodes.ViewSlice()
-
-		for _, stride := range []int{0, 10, 1, n} {
-			b.Run(fmt.Sprintf("N%d/attrStride%d", n, stride), func(b *testing.B) {
-				pm := &PolicyManager{nodeAttrsMap: make(map[types.NodeID]tailcfg.NodeCapMap)}
-
-				if stride > 0 {
-					for i := 0; i < n; i += stride {
-						pm.nodeAttrsMap[nodes[i].ID] = tailcfg.NodeCapMap{"disable-ipv4": {}}
-					}
-				}
-
-				for _, k := range []int{0, 1, 8, n} {
-					peers := allPeers.Slice(0, k)
-					b.Run(fmt.Sprintf("K%d/reference", k), func(b *testing.B) {
-						b.ReportAllocs()
-
-						for b.Loop() {
-							nodeCapMapsBenchmarkSink = pm.nodeCapMapsReference()
-						}
-					})
-					b.Run(fmt.Sprintf("K%d/selected", k), func(b *testing.B) {
-						b.ReportAllocs()
-
-						for b.Loop() {
-							nodeCapMapsBenchmarkSink = pm.NodeCapMapsForPeers(peers)
-						}
-					})
-				}
-			})
-		}
-	}
-}
-
-func BenchmarkNodeCapMapsConstruction(b *testing.B) {
-	previousLevel := zerolog.GlobalLevel()
-
-	zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	b.Cleanup(func() { zerolog.SetGlobalLevel(previousLevel) })
-
-	for _, n := range []int{100, 1000, 10000} {
-		users, nodes := benchNodes(n)
-		peers := nodes.ViewSlice().Slice(0, 1)
-
-		for _, attrs := range []string{`[]`, `[{"target":["*"],"attr":["disable-ipv4"]}]`} {
-			pol := []byte(`{"acls":[],"nodeAttrs":` + attrs + `}`)
-			for _, selected := range []bool{false, true} {
-				b.Run(fmt.Sprintf("N%d/attrs%t/selected%t", n, attrs != `[]`, selected), func(b *testing.B) {
-					b.ReportAllocs()
-
-					for b.Loop() {
-						pm, err := NewPolicyManager(pol, users, nodes.ViewSlice())
-						if err != nil {
-							b.Fatal(err)
-						}
-
-						if selected {
-							nodeCapMapsBenchmarkSink = pm.NodeCapMapsForPeers(peers)
-						} else {
-							nodeCapMapsBenchmarkSink = pm.nodeCapMapsReference()
-						}
-					}
-				})
-			}
-		}
 	}
 }
 
 // BenchmarkCompileWideACL compiles a CI-shaped policy: one rule per CI tag
 // to its own service, and one wide rule from every CI tag to the shared
-// services, which compiles to one grant per destination. new compiles from
-// scratch; set-nodes recompiles after a batch of tagged joins.
+// services, which compiles to one grant per destination.
 func BenchmarkCompileWideACL(b *testing.B) {
 	const (
 		ciTags = 300
@@ -4275,19 +3035,4 @@ func BenchmarkCompileWideACL(b *testing.B) {
 		}
 	})
 
-	b.Run("set-nodes", func(b *testing.B) {
-		pm, err := NewPolicyManager(pol, nil, before.ViewSlice())
-		require.NoError(b, err)
-
-		sets := []types.Nodes{after, before}
-
-		i := 0
-		for b.Loop() {
-			changed, err := pm.SetNodes(sets[i%2].ViewSlice())
-			require.NoError(b, err)
-			require.True(b, changed)
-
-			i++
-		}
-	})
 }

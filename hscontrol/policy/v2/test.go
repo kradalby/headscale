@@ -215,32 +215,7 @@ func (pm *PolicyManager) RunTests() error {
 		return nil
 	}
 
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
 	results := runPolicyTests(pm.pol, pm.filter, pm.users, pm.nodes)
-
-	return wrapTestResult(errPolicyTestsFailed, results.AllPassed, results.Errors)
-}
-
-// evaluateTests runs the `tests` block against a fresh compilation of pol.
-// It is the user-write sandbox: the live [PolicyManager] state is left
-// untouched, so a failing test rejects the write without side effects.
-func evaluateTests(pol *Policy, users []types.User, nodes views.Slice[types.NodeView]) error {
-	if pol == nil || len(pol.Tests) == 0 {
-		return nil
-	}
-
-	grants := pol.compileGrants(users, nodes)
-
-	var filter []tailcfg.FilterRule
-	if pol.ACLs == nil && pol.Grants == nil {
-		filter = tailcfg.FilterAllowAll
-	} else {
-		filter = globalFilterRules(grants)
-	}
-
-	results := runPolicyTests(pol, filter, users, nodes)
 
 	return wrapTestResult(errPolicyTestsFailed, results.AllPassed, results.Errors)
 }

@@ -10,9 +10,11 @@ import (
 	clientv1 "github.com/juanfont/headscale/gen/client/v1"
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/policy"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/spf13/cobra"
 	"tailscale.com/types/views"
+	"tailscale.com/util/multierr"
 )
 
 const (
@@ -214,16 +216,14 @@ var checkPolicy = &cobra.Command{
 				return fmt.Errorf("loading nodes: %w", err)
 			}
 
-			// [policy.NewPolicyManager] validates structure and user references
-			// but intentionally skips test evaluation (boot path).
-			// [policy.PolicyManager.SetPolicy] is the user-write boundary and is what runs the
-			// tests and sshTests blocks.
-			pm, err := policy.NewPolicyManager(policyBytes, users, nodes.ViewSlice())
+			// A compile only warns about failing tests, so a stale stored
+			// policy cannot block boot; a check has to fail on them.
+			pm, err := policyv2.NewPolicyManager(policyBytes, users, nodes.ViewSlice())
 			if err != nil {
 				return fmt.Errorf("parsing policy file: %w", err)
 			}
 
-			_, err = pm.SetPolicy(policyBytes)
+			err = multierr.New(pm.RunTests(), pm.RunSSHTests())
 			if err != nil {
 				return err
 			}

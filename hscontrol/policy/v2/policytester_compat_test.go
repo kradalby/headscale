@@ -29,6 +29,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
+	"tailscale.com/util/multierr"
 )
 
 // knownPolicyTesterDivergences lists scenarios where headscale's evaluator
@@ -132,13 +133,13 @@ func TestPolicyTesterCompat(t *testing.T) {
 			// Tailscale validates and runs tests as one POST step:
 			// either failure mode produces the same 400. Headscale
 			// splits structural validation (parse) from test
-			// evaluation (SetPolicy). For the compat assertion, the
+			// evaluation (RunTests). For the compat assertion, the
 			// two are equivalent — whichever surfaces first carries
 			// the captured body.
 			if c.Input.APIResponseCode == 200 {
 				require.NoError(t, parseErr, "tailscale accepted this policy; headscale must parse it")
 
-				_, setErr := pm.SetPolicy(policyJSON)
+				setErr := multierr.New(pm.RunTests(), pm.RunSSHTests())
 				require.NoError(t, setErr, "tailscale accepted this policy; headscale tests should pass")
 
 				return
@@ -150,7 +151,7 @@ func TestPolicyTesterCompat(t *testing.T) {
 			case parseErr != nil:
 				got = parseErr
 			default:
-				_, setErr := pm.SetPolicy(policyJSON)
+				setErr := multierr.New(pm.RunTests(), pm.RunSSHTests())
 				got = setErr
 			}
 

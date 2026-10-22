@@ -456,29 +456,29 @@ func TestGitHubIssue3129_TransientlyBlockedWriteKeepsSessionLive(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-	app.cfg.Tuning.BatchChangeDelay = 20 * time.Millisecond
+			app.cfg.Tuning.BatchChangeDelay = 20 * time.Millisecond
 
-	require.NoError(t, app.state.Close())
+			require.NoError(t, app.state.Close())
 
 			app.mapBatcher.Close()
 			require.NoError(t, app.state.Close())
 
-	app.state = reloadedState
-	t.Cleanup(func() {
-		require.NoError(t, app.state.Close())
-	})
+			app.state = reloadedState
+			t.Cleanup(func() {
+				require.NoError(t, app.state.Close())
+			})
 
-	nodeView, ok := app.state.GetNodeByID(createdNode.ID)
-	require.True(t, ok, "expected node to be present after reload")
+			nodeView, ok := app.state.GetNodeByID(createdNode.ID)
+			require.True(t, ok, "expected node to be present after reload")
 
-	node := nodeView.AsStruct()
+			node := nodeView.AsStruct()
 
-	ctx, cancel := context.WithCancel(t.Context())
-	writer := newDelayedSuccessResponseWriter(250 * time.Millisecond)
-	session := app.newMapSession(ctx, tailcfg.MapRequest{
-		Stream:  true,
-		Version: tailcfg.CapabilityVersion(100),
-	}, writer, node)
+			ctx, cancel := context.WithCancel(t.Context())
+			writer := newDelayedSuccessResponseWriter(250 * time.Millisecond)
+			session := app.newMapSession(ctx, tailcfg.MapRequest{
+				Stream:  true,
+				Version: tailcfg.CapabilityVersion(100),
+			}, writer, node)
 
 			ctx, cancel := context.WithCancel(context.Background())
 			writer := newDelayedSuccessResponseWriter(tt.writeDelay)
@@ -489,22 +489,22 @@ func TestGitHubIssue3129_TransientlyBlockedWriteKeepsSessionLive(t *testing.T) {
 
 			serveDone := make(chan struct{})
 
-	t.Cleanup(func() {
-		// A second live session lets the cleanup skip the reconnect grace.
-		other := app.mapHub.Join(node.ID, func() {})
-
 			t.Cleanup(func() {
-				cancel()
-				app.mapBatcher.Close()
+				// A second live session lets the cleanup skip the reconnect grace.
+				other := app.mapHub.Join(node.ID, func() {})
 
-				select {
-				case <-serveDone:
-				case <-time.After(2 * time.Second):
-				}
+				t.Cleanup(func() {
+					cancel()
+					app.mapBatcher.Close()
+
+					select {
+					case <-serveDone:
+					case <-time.After(2 * time.Second):
+					}
+				})
+
+				app.mapHub.Leave(other)
 			})
-
-		app.mapHub.Leave(other)
-	})
 
 			streamsClosed := make(chan struct{})
 

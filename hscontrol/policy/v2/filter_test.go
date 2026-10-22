@@ -1489,7 +1489,7 @@ func TestTagUserMutualExclusivity(t *testing.T) {
 	// User1's user-owned node should have no rules reaching tagged nodes
 	// since there is no explicit user→tag ACL rule. ReduceFilterRules
 	// filters compiled rules to only those where the node is a destination,
-	// matching the production pipeline in filterForNodeLocked.
+	// matching the production pipeline in FilterForNode.
 	userNode := nodes[0].View()
 
 	compiled := pol.compileFilterRulesForNode(users, userNode, nodes.ViewSlice())
