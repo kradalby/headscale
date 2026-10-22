@@ -5,6 +5,7 @@ import (
 	"errors"
 	"maps"
 	"net/netip"
+	"reflect"
 	"slices"
 
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
@@ -32,6 +33,15 @@ type netMap struct {
 	ssh      *tailcfg.SSHPolicy
 	dns      *tailcfg.DNSConfig
 	derpMap  *tailcfg.DERPMap
+
+	// base is the render this one follows. changed lists the peers added or
+	// rendered again since base and removed the peers gone, so a diff
+	// against base touches only them. sameProfiles reports profiles shared
+	// with base.
+	base         *netMap
+	changed      []tailcfg.NodeID
+	removed      []tailcfg.NodeID
+	sameProfiles bool
 }
 
 // renderer renders one node's netMap. It keeps every peer it rendered and
@@ -44,6 +54,12 @@ type renderer struct {
 	capVer tailcfg.CapabilityVersion
 
 	peers map[types.NodeID]renderedPeer
+	last  *netMap
+
+	// dns is reused while its inputs, the node and the policy's capability
+	// map and the extra records, are unchanged.
+	dns    *tailcfg.DNSConfig
+	dnsKey dnsKey
 }
 
 type renderedPeer struct {
@@ -55,6 +71,11 @@ type renderedPeer struct {
 // renderKey is what a peer's rendering reads besides the peer itself.
 type renderKey struct {
 	policy, policyNodes, primaries uint64
+}
+
+type dnsKey struct {
+	self        types.NodeView
+	policy, dns uint64
 }
 
 func newRenderer(cfg *types.Config, nodeID types.NodeID, capVer tailcfg.CapabilityVersion) *renderer {
@@ -98,49 +119,83 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 		ssh = &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}}
 	}
 
-	peers := snap.ListPeers(r.nodeID)
+	if k := (dnsKey{self: self, policy: snap.PolicyRev(), dns: snap.DNSRev()}); r.dns == nil || k != r.dnsKey {
+		r.dns, r.dnsKey = generateDNSConfig(r.cfg, self, capMaps[self.ID()]), k
+	}
 
 	nm := &netMap{
-		self:     tn,
-		peers:    make(map[tailcfg.NodeID]*tailcfg.Node, peers.Len()),
-		profiles: make(map[tailcfg.UserID]tailcfg.UserProfile),
-		filter:   filter,
-		ssh:      ssh,
-		dns:      generateDNSConfig(r.cfg, self, capMaps[self.ID()]),
-		derpMap:  snap.DERPMap(),
+		self:    tn,
+		filter:  filter,
+		ssh:     ssh,
+		dns:     r.dns,
+		derpMap: snap.DERPMap(),
+		base:    r.last,
 	}
 
-	for _, p := range generateUserProfiles(self, peers) {
-		nm.profiles[p.ID] = p
+	err = r.renderPeers(snap, self, capMaps, nm)
+	if err != nil {
+		return nil, err
 	}
 
+	r.renderProfiles(snap, self, nm)
+	r.last = nm
+
+	return nm, nil
+}
+
+// renderPeers fills nm.peers, rendering only the peers whose inputs moved
+// since the previous render and recording which they are.
+func (r *renderer) renderPeers(
+	snap *state.Snapshot,
+	self types.NodeView,
+	capMaps map[types.NodeID]tailcfg.NodeCapMap,
+	nm *netMap,
+) error {
+	ids := snap.PeerIDs(r.nodeID)
 	key := renderKey{
 		policy:      snap.PolicyRev(),
 		policyNodes: snap.PolicyNodesRev(),
 		primaries:   snap.PrimariesRev(),
 	}
 
+	if nm.base != nil {
+		nm.peers = maps.Clone(nm.base.peers)
+	} else {
+		nm.peers = make(map[tailcfg.NodeID]*tailcfg.Node, len(ids))
+	}
+
 	var (
 		matchers       []matcher.Match
 		matchersLoaded bool
+		current        = make(map[types.NodeID]struct{}, len(ids))
 	)
 
-	seen := make(map[types.NodeID]bool, peers.Len())
+	for _, id := range ids {
+		peer, ok := snap.GetNode(id)
+		if !ok {
+			continue
+		}
 
-	for _, peer := range peers.All() {
-		seen[peer.ID()] = true
+		current[id] = struct{}{}
 
-		if cached, ok := r.peers[peer.ID()]; ok && cached.node == peer && cached.key == key {
-			nm.peers[cached.tn.ID] = cached.tn
+		prev, cached := r.peers[id]
+		if cached && prev.node == peer && prev.key == key {
+			if _, ok := nm.peers[prev.tn.ID]; !ok {
+				nm.peers[prev.tn.ID] = prev.tn
+				nm.changed = append(nm.changed, prev.tn.ID)
+			}
+
 			continue
 		}
 
 		// RoutesForPeer needs the unreduced matchers: every rule where
 		// the node is source or destination.
 		if !matchersLoaded {
-			matchers, err = pm.MatchersForNode(self)
+			var err error
+
+			matchers, err = snap.Policy().MatchersForNode(self)
 			if err != nil {
-				return nil, err
+				return err
 			}
 
 			matchersLoaded = true
@@ -157,7 +212,7 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 				Str(zf.NodeHostname, peer.Hostname()).
 				Uint64("map.viewer.node.id", r.nodeID.Uint64()).
 				Msgf("dropping peer %d from map response: invalid node data; fix with `headscale nodes rename %d <name>`", peer.ID(), peer.ID())
-			delete(r.peers, peer.ID())
+			delete(current, id)
 
 			continue
 		}
@@ -177,21 +232,75 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 
 		// Hostinfo is not patchable, so any change resends the whole peer.
 		// Keep what the client holds while the fields it reads are equal.
-		if prev, ok := r.peers[peer.ID()]; ok && peerHostinfoEqual(prev.tn.Hostinfo, ptn.Hostinfo) {
+		if cached && peerHostinfoEqual(prev.tn.Hostinfo, ptn.Hostinfo) {
 			ptn.Hostinfo = prev.tn.Hostinfo
 		}
 
-		r.peers[peer.ID()] = renderedPeer{node: peer, key: key, tn: ptn}
+		r.peers[id] = renderedPeer{node: peer, key: key, tn: ptn}
 		nm.peers[ptn.ID] = ptn
+		nm.changed = append(nm.changed, ptn.ID)
 	}
 
 	for id := range r.peers {
-		if !seen[id] {
+		if _, ok := current[id]; !ok {
 			delete(r.peers, id)
 		}
 	}
 
-	return nm, nil
+	for id := range nm.peers {
+		if _, ok := current[types.NodeID(id)]; !ok { //nolint:gosec // NodeID types are the same value
+			delete(nm.peers, id)
+			nm.removed = append(nm.removed, id)
+		}
+	}
+
+	slices.Sort(nm.changed)
+	slices.Sort(nm.removed)
+
+	return nil
+}
+
+// renderProfiles fills nm.profiles. They only move when a peer joins or
+// leaves or the owner of a shown node changes, so a render that changed
+// neither shares the previous profiles.
+func (r *renderer) renderProfiles(snap *state.Snapshot, self types.NodeView, nm *netMap) {
+	if base := nm.base; base != nil && len(nm.removed) == 0 && ownerProfileUnchanged(base, self) {
+		same := true
+
+		for _, id := range nm.changed {
+			peer, ok := snap.GetNode(types.NodeID(id)) //nolint:gosec // NodeID types are the same value
+			if _, existed := base.peers[id]; !existed || !ok || !ownerProfileUnchanged(base, peer) {
+				same = false
+
+				break
+			}
+		}
+
+		if same {
+			nm.profiles, nm.sameProfiles = base.profiles, true
+
+			return
+		}
+	}
+
+	nm.profiles = make(map[tailcfg.UserID]tailcfg.UserProfile)
+	for _, p := range generateUserProfiles(self, snap.ListPeers(r.nodeID)) {
+		nm.profiles[p.ID] = p
+	}
+}
+
+// ownerProfileUnchanged reports whether base already shows the profile of
+// node's owner as it is now.
+func ownerProfileUnchanged(base *netMap, node types.NodeView) bool {
+	owner := node.Owner()
+	if !owner.Valid() {
+		return true
+	}
+
+	p := owner.TailscaleUserProfile()
+	old, ok := base.profiles[p.ID]
+
+	return ok && reflect.DeepEqual(old, p)
 }
 
 func sortedPeers(peers map[tailcfg.NodeID]*tailcfg.Node) []*tailcfg.Node {

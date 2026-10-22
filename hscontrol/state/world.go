@@ -183,8 +183,14 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 	w.peers = graph.NewDerived(g, "peers", samePeerMap,
 		func(s *graph.Snapshot, _ map[types.NodeID][]types.NodeID) map[types.NodeID][]types.NodeID {
 			pm := graph.Get(s, w.policy).pm
+			peers := pm.BuildPeerMap(graph.Get(s, w.policyNodes).list)
 
-			return pm.BuildPeerMap(graph.Get(s, w.policyNodes).list)
+			// Sorted once here, so readers can share the slices.
+			for _, ids := range peers {
+				slices.Sort(ids)
+			}
+
+			return peers
 		})
 
 	w.primaries = graph.NewDerived(g, "primaries", samePrimaries,
@@ -687,15 +693,22 @@ func (s *Snapshot) ListNodesByUser(uid types.UserID) views.Slice[types.NodeView]
 	return views.SliceOf(s.index().byUser[uid])
 }
 
-// ListPeerIDs returns the sorted IDs of the nodes id can see.
+// ListPeerIDs returns the sorted IDs of the nodes id can see, as a copy
+// the caller may keep and modify.
 func (s *Snapshot) ListPeerIDs(id types.NodeID) []types.NodeID {
-	return slices.Sorted(slices.Values(graph.Get(s.s, s.w.peers)[id]))
+	return slices.Clone(s.PeerIDs(id))
+}
+
+// PeerIDs returns the sorted IDs of the nodes id can see. The slice is
+// shared with the snapshot and must not be modified.
+func (s *Snapshot) PeerIDs(id types.NodeID) []types.NodeID {
+	return graph.Get(s.s, s.w.peers)[id]
 }
 
 // ListPeers returns the nodes id can see, sorted by ID.
 func (s *Snapshot) ListPeers(id types.NodeID) views.Slice[types.NodeView] {
 	byID := s.index().byID
-	ids := s.ListPeerIDs(id)
+	ids := s.PeerIDs(id)
 	peers := make([]types.NodeView, 0, len(ids))
 
 	for _, pid := range ids {

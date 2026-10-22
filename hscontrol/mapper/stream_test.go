@@ -1,6 +1,7 @@
 package mapper
 
 import (
+	"fmt"
 	"net/netip"
 	"reflect"
 	"testing"
@@ -340,4 +341,75 @@ func keys(m map[tailcfg.NodeID]*tailcfg.Node) []tailcfg.NodeID {
 	}
 
 	return out
+}
+
+// BenchmarkStreamUpdateEndpointChurn measures one session's update after a
+// tenth of its peers moved endpoints, the common write under load.
+func BenchmarkStreamUpdateEndpointChurn(b *testing.B) {
+	for _, n := range []int{100, 500} {
+		b.Run(fmt.Sprintf("peers=%d", n), func(b *testing.B) {
+			cfg, s := benchState(b, n)
+			ids := s.ListNodes()
+			viewer := ids.At(0).ID()
+
+			st := NewStream(cfg, NewHub(), viewer, capVer)
+			_, err := st.Initial(s.Snapshot())
+			require.NoError(b, err)
+
+			port := uint16(1)
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				b.StopTimer()
+
+				for i := 1; i < ids.Len(); i += 10 {
+					n := ids.At(i).AsStruct()
+					n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), port)}
+					s.PutNodeInStoreForTest(*n)
+				}
+
+				port++
+
+				b.StartTimer()
+
+				_, err := st.Update(s.Snapshot())
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func benchState(b *testing.B, n int) (*types.Config, *state.State) {
+	b.Helper()
+
+	p4 := netip.MustParsePrefix("100.64.0.0/10")
+	p6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+	cfg := &types.Config{
+		Database: types.DatabaseConfig{
+			Type:   types.DatabaseSqlite,
+			Sqlite: types.SqliteConfig{Path: b.TempDir() + "/h.db"},
+		},
+		PrefixV4:     &p4,
+		PrefixV6:     &p6,
+		IPAllocation: types.IPAllocationStrategySequential,
+		BaseDomain:   "headscale.test",
+		ServerURL:    "https://headscale.test",
+		Policy:       types.PolicyConfig{Mode: types.PolicyModeDB},
+	}
+
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(b, err)
+
+	u := database.CreateUserForTest("u1")
+	database.CreateRegisteredNodesForTest(u, n, "bench")
+	require.NoError(b, database.Close())
+
+	s, err := state.NewState(cfg)
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = s.Close() })
+
+	return cfg, s
 }

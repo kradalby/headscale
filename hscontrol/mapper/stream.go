@@ -76,7 +76,10 @@ func (st *Stream) Update(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) {
 	st.sent = nm
 
 	if len(out) > 0 {
-		st.hub.setLastPeers(st.nodeID, peerIDs(nm))
+		if len(nm.changed) > 0 || len(nm.removed) > 0 {
+			st.hub.setLastPeers(st.nodeID, peerIDs(nm))
+		}
+
 		st.dump(out)
 	}
 

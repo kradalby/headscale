@@ -2,6 +2,7 @@ package mapper
 
 import (
 	"net/netip"
+	"reflect"
 	"testing"
 	"time"
 
@@ -213,4 +214,82 @@ func TestDiffNewPeerCarriesItsProfile(t *testing.T) {
 	if len(got[0].UserProfiles) != 1 || got[0].UserProfiles[0].ID != 2 {
 		t.Fatalf("profiles = %+v, want only the new user's", got[0].UserProfiles)
 	}
+}
+
+// patchableFields are the [tailcfg.Node] fields [peerPatch] carries in a
+// [tailcfg.PeerChange]; every other field must be compared by
+// [peerRestEqual].
+var patchableFields = map[string]bool{
+	"HomeDERP": true, "Endpoints": true, "Key": true, "DiscoKey": true, "KeyExpiry": true,
+	"Online": true, "LastSeen": true, "KeySignature": true, "Cap": true, "CapMap": true,
+}
+
+// TestPeerRestEqualCoversEveryField changes each non-patchable field of a
+// peer in turn and requires peerRestEqual to see it, so a field added to
+// tailcfg.Node fails here instead of being silently patched away.
+func TestPeerRestEqualCoversEveryField(t *testing.T) {
+	base := testPeer(2)
+
+	typ := reflect.TypeFor[tailcfg.Node]()
+	for i := range typ.NumField() {
+		f := typ.Field(i)
+		// Unexported fields never reach the wire.
+		if patchableFields[f.Name] || !f.IsExported() {
+			continue
+		}
+
+		t.Run(f.Name, func(t *testing.T) {
+			changed := base.Clone()
+			v := reflect.ValueOf(changed).Elem().Field(i)
+
+			if !setDifferent(v) {
+				t.Fatalf("no way to change field %s of kind %s; teach setDifferent and peerRestEqual about it", f.Name, v.Kind())
+			}
+
+			if peerRestEqual(base, changed) {
+				t.Fatalf("peerRestEqual misses a change to %s", f.Name)
+			}
+		})
+	}
+}
+
+// setDifferent sets v to a value different from the testPeer default.
+func setDifferent(v reflect.Value) bool {
+	switch v.Type() {
+	case reflect.TypeFor[time.Time]():
+		v.Set(reflect.ValueOf(time.Unix(1, 0)))
+
+		return true
+	case reflect.TypeFor[tailcfg.HostinfoView]():
+		v.Set(reflect.ValueOf((&tailcfg.Hostinfo{Hostname: "changed"}).View()))
+
+		return true
+	case reflect.TypeFor[key.MachinePublic]():
+		v.Set(reflect.ValueOf(key.NewMachine().Public()))
+
+		return true
+	}
+
+	switch v.Kind() {
+	case reflect.String:
+		v.SetString(v.String() + "x")
+	case reflect.Bool:
+		v.SetBool(!v.Bool())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		v.SetInt(v.Int() + 1)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		v.SetUint(v.Uint() + 1)
+	case reflect.Slice:
+		v.Set(reflect.Append(v, reflect.New(v.Type().Elem()).Elem()))
+	case reflect.Pointer:
+		v.Set(reflect.New(v.Type().Elem()))
+	case reflect.Array:
+		// Keys are fixed-size arrays; flip a byte.
+		b := v.Index(v.Len() - 1)
+		b.SetUint(b.Uint() + 1)
+	default:
+		return false
+	}
+
+	return true
 }

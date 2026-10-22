@@ -48,20 +48,13 @@ func diff(sent, next *netMap) []*tailcfg.MapResponse {
 		changed = true
 	}
 
-	var removed []tailcfg.NodeID
-
-	for id := range sent.peers {
-		if _, ok := next.peers[id]; !ok {
-			removed = append(removed, id)
-		}
-	}
-
-	slices.Sort(removed)
+	changedIDs, removed := peerChanges(sent, next)
 
 	refresh := false
 
-	for _, after := range sortedPeers(next.peers) {
-		before, ok := sent.peers[after.ID]
+	for _, id := range changedIDs {
+		after := next.peers[id]
+		before, ok := sent.peers[id]
 
 		switch {
 		case !ok:
@@ -115,10 +108,12 @@ func diff(sent, next *netMap) []*tailcfg.MapResponse {
 		changed = true
 	}
 
-	for _, p := range sortedProfiles(next.profiles) {
-		if old, ok := sent.profiles[p.ID]; !ok || !reflect.DeepEqual(old, p) {
-			resp.UserProfiles = append(resp.UserProfiles, p)
-			changed = true
+	if next.base != sent || !next.sameProfiles {
+		for _, p := range sortedProfiles(next.profiles) {
+			if old, ok := sent.profiles[p.ID]; !ok || !reflect.DeepEqual(old, p) {
+				resp.UserProfiles = append(resp.UserProfiles, p)
+				changed = true
+			}
 		}
 	}
 
@@ -212,23 +207,65 @@ func peerPatch(before, after *tailcfg.Node) (*tailcfg.PeerChange, bool) {
 		p().CapMap = m
 	}
 
-	rest := *before
-	rest.HomeDERP = after.HomeDERP
-	rest.Endpoints = after.Endpoints
-	rest.Key = after.Key
-	rest.DiscoKey = after.DiscoKey
-	rest.KeyExpiry = after.KeyExpiry
-	rest.Online = after.Online
-	rest.LastSeen = after.LastSeen
-	rest.KeySignature = after.KeySignature
-	rest.Cap = after.Cap
-	rest.CapMap = after.CapMap
-
-	if !reflect.DeepEqual(&rest, after) {
+	if !peerRestEqual(before, after) {
 		return nil, false
 	}
 
 	return patch, true
+}
+
+// peerRestEqual reports whether a and b agree on every field a patch cannot
+// carry. TestPeerRestEqualCoversEveryField fails when [tailcfg.Node] gains
+// a field this does not compare, so an unknown change is never patched
+// away.
+func peerRestEqual(a, b *tailcfg.Node) bool {
+	return a.ID == b.ID &&
+		a.StableID == b.StableID &&
+		a.Name == b.Name &&
+		a.User == b.User &&
+		a.Sharer == b.Sharer &&
+		a.Machine == b.Machine &&
+		slices.Equal(a.Addresses, b.Addresses) &&
+		slices.Equal(a.AllowedIPs, b.AllowedIPs) &&
+		a.LegacyDERPString == b.LegacyDERPString &&
+		(a.Hostinfo == b.Hostinfo || a.Hostinfo.Equal(b.Hostinfo)) &&
+		a.Created.Equal(b.Created) &&
+		slices.Equal(a.Tags, b.Tags) &&
+		slices.Equal(a.PrimaryRoutes, b.PrimaryRoutes) &&
+		a.MachineAuthorized == b.MachineAuthorized &&
+		slices.Equal(a.Capabilities, b.Capabilities) &&
+		a.UnsignedPeerAPIOnly == b.UnsignedPeerAPIOnly &&
+		a.ComputedName == b.ComputedName &&
+		a.ComputedNameWithHost == b.ComputedNameWithHost &&
+		a.DataPlaneAuditLogID == b.DataPlaneAuditLogID &&
+		a.Expired == b.Expired &&
+		equalPtr(a.SelfNodeV4MasqAddrForThisPeer, b.SelfNodeV4MasqAddrForThisPeer) &&
+		equalPtr(a.SelfNodeV6MasqAddrForThisPeer, b.SelfNodeV6MasqAddrForThisPeer) &&
+		a.IsWireGuardOnly == b.IsWireGuardOnly &&
+		a.IsJailed == b.IsJailed &&
+		reflect.DeepEqual(a.ExitNodeDNSResolvers, b.ExitNodeDNSResolvers) &&
+		a.StableTailnetID == b.StableTailnetID
+}
+
+// peerChanges returns the peers to compare and the peers gone between sent
+// and next. When next was rendered right after sent its render already
+// knows; otherwise every peer is compared.
+func peerChanges(sent, next *netMap) ([]tailcfg.NodeID, []tailcfg.NodeID) {
+	if next.base == sent {
+		return next.changed, next.removed
+	}
+
+	var removed []tailcfg.NodeID
+
+	for id := range sent.peers {
+		if _, ok := next.peers[id]; !ok {
+			removed = append(removed, id)
+		}
+	}
+
+	slices.Sort(removed)
+
+	return slices.Sorted(maps.Keys(next.peers)), removed
 }
 
 // needsPeerListRefresh reports a change only a whole peer list can apply:
