@@ -8,9 +8,11 @@ import (
 	"maps"
 	"math/rand/v2"
 	"net/netip"
+	"os"
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1012,6 +1014,12 @@ var scalingWrites = map[string]func(b *testing.B, s *state.State, i int){
 		_, err := s.SetPolicy([]byte(fmt.Sprintf(`{"acls":[{"action":"accept","src":["*"],"dst":["*:%d"]}]}`, 1+i%2)))
 		require.NoError(b, err)
 	},
+	// hidden flips the health of a node without routes, which no client
+	// is sent.
+	"hidden": func(_ *testing.B, s *state.State, i int) {
+		nodes := s.ListNodes()
+		_ = s.SetNodeHealth(nodes.At(i%nodes.Len()).ID(), i%2 == 0)
+	},
 	"derp": func(_ *testing.B, s *state.State, i int) {
 		s.SetDERPMap(&tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
 			tailcfg.DERPRegionID(900 + i%2): {RegionID: tailcfg.DERPRegionID(900 + i%2)},
@@ -1028,6 +1036,14 @@ func BenchmarkScalingWrites(b *testing.B) {
 	sizes := []int{100, 400, 1000}
 	if testing.Short() {
 		sizes = []int{100}
+	}
+
+	// HEADSCALE_SCALE_NODES runs one size instead, such as 10000.
+	if v, ok := os.LookupEnv("HEADSCALE_SCALE_NODES"); ok {
+		n, err := strconv.Atoi(v)
+		require.NoError(b, err)
+
+		sizes = []int{n}
 	}
 
 	for _, kind := range slices.Sorted(maps.Keys(scalingWrites)) {
@@ -1347,5 +1363,34 @@ func TestDERPFramesShared(t *testing.T) {
 		}
 
 		assert.Same(t, shared, resps[0])
+	}
+}
+
+// BenchmarkFirstMap renders and encodes a reconnecting node's first map
+// in a full mesh: the read every node does at once after a restart, which
+// walks every peer.
+func BenchmarkFirstMap(b *testing.B) {
+	for _, n := range []int{1000, 10000} {
+		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) {
+			s, streams := scalingTailnet(b, n, "allow-all")
+			st := streams[len(streams)/2]
+			snap := s.Snapshot()
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				first := NewStream(st.cfg, st.hub, st.nodeID, capVer)
+
+				resps, err := first.Initial(snap)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				_, err = Marshal(resps[0])
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
