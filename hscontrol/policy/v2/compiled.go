@@ -148,6 +148,20 @@ func (pol *Policy) compileNodeAttrs(
 	users types.Users,
 	nodes views.Slice[types.NodeView],
 ) (map[types.NodeID]tailcfg.NodeCapMap, error) {
+	return pol.compileNodeAttrsFrom(nil, nil, users, nodes)
+}
+
+// compileNodeAttrsFrom is [Policy.compileNodeAttrs] reusing prev, the
+// result of a compile of the same document and users over prevNodes, for
+// every node whose record did not change: a node's attributes follow only
+// from itself once the document and users are fixed. prev is nil to
+// compile every node.
+func (pol *Policy) compileNodeAttrsFrom(
+	prev map[types.NodeID]tailcfg.NodeCapMap,
+	prevNodes map[types.NodeID]types.NodeView,
+	users types.Users,
+	nodes views.Slice[types.NodeView],
+) (map[types.NodeID]tailcfg.NodeCapMap, error) {
 	empty := map[types.NodeID]tailcfg.NodeCapMap{}
 
 	if pol == nil {
@@ -158,43 +172,14 @@ func (pol *Policy) compileNodeAttrs(
 		return empty, nil
 	}
 
-	result := make(map[types.NodeID]tailcfg.NodeCapMap)
-	stamp := func(id types.NodeID, attr nodecap.Cap) {
-		capMap, ok := result[id]
-		if !ok {
-			capMap = tailcfg.NodeCapMap{}
-			result[id] = capMap
-		}
-
-		// nil [tailcfg.RawMessage] matches the wire format from a
-		// Tailscale-hosted control plane: capabilities without companion
-		// data marshal as null rather than []. Storing nil keeps the
-		// merge stable and lets the compat test diff cleanly against
-		// captured netmaps.
-		if _, exists := capMap[attr]; !exists {
-			capMap[attr] = nil
-		}
+	type target struct {
+		ips   ResolvedAddresses
+		attrs []nodecap.Cap
 	}
 
-	// Cache each node's IPs once per call. Without the cache, the
-	// node-attr inner loop would call [types.NodeView.IPs] once per attr
-	// per node — O(grants × nodes) allocations of a 2-element slice
-	// for what is invariant per node within a single policy compile.
-	type nodeIPs struct {
-		id  types.NodeID
-		ips []netip.Addr
-	}
-
-	nodeList := make([]nodeIPs, 0, nodes.Len())
-	for _, n := range nodes.All() {
-		nodeList = append(nodeList, nodeIPs{id: n.ID(), ips: n.IPs()})
-	}
-
-	if pol.RandomizeClientPort {
-		for _, ni := range nodeList {
-			stamp(ni.id, nodecap.RandomizeClientPort)
-		}
-	}
+	// Every target resolves, so a compile fails on the same target as one
+	// from scratch.
+	targets := make([]target, 0, len(pol.NodeAttrs))
 
 	for _, na := range pol.NodeAttrs {
 		if len(na.Attrs) == 0 {
@@ -206,18 +191,58 @@ func (pol *Policy) compileNodeAttrs(
 			return nil, fmt.Errorf("nodeAttrs target %s: %w", na.Targets, err)
 		}
 
-		if resolved == nil {
+		if resolved != nil {
+			targets = append(targets, target{ips: resolved, attrs: na.Attrs})
+		}
+	}
+
+	// capsFor stamps n's attributes in policy order. nil
+	// [tailcfg.RawMessage] matches the wire format from a Tailscale-hosted
+	// control plane: capabilities without companion data marshal as null
+	// rather than [].
+	capsFor := func(n types.NodeView) tailcfg.NodeCapMap {
+		var capMap tailcfg.NodeCapMap
+
+		stamp := func(attr nodecap.Cap) {
+			if capMap == nil {
+				capMap = tailcfg.NodeCapMap{}
+			}
+
+			if _, exists := capMap[attr]; !exists {
+				capMap[attr] = nil
+			}
+		}
+
+		if pol.RandomizeClientPort {
+			stamp(nodecap.RandomizeClientPort)
+		}
+
+		ips := n.IPs()
+
+		for _, t := range targets {
+			if slices.ContainsFunc(ips, t.ips.Contains) {
+				for _, attr := range t.attrs {
+					stamp(attr)
+				}
+			}
+		}
+
+		return capMap
+	}
+
+	result := make(map[types.NodeID]tailcfg.NodeCapMap, len(prev))
+
+	for _, n := range nodes.All() {
+		if old, ok := prevNodes[n.ID()]; ok && prev != nil && old == n {
+			if c, ok := prev[n.ID()]; ok {
+				result[n.ID()] = c
+			}
+
 			continue
 		}
 
-		for _, ni := range nodeList {
-			if !slices.ContainsFunc(ni.ips, resolved.Contains) {
-				continue
-			}
-
-			for _, attr := range na.Attrs {
-				stamp(ni.id, attr)
-			}
+		if c := capsFor(n); c != nil {
+			result[n.ID()] = c
 		}
 	}
 

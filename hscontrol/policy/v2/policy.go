@@ -257,7 +257,16 @@ func NewPolicyManagerFrom(prev *PolicyManager, b []byte, users []types.User, nod
 		return nil, fmt.Errorf("resolving auto approvers map: %w", err)
 	}
 
-	nodeAttrs, err := indexed.compileNodeAttrs(users, nodes)
+	var (
+		prevAttrs map[types.NodeID]tailcfg.NodeCapMap
+		prevNodes map[types.NodeID]types.NodeView
+	)
+
+	if change != nil {
+		prevAttrs, prevNodes = prev.nodeAttrsMap, prev.nodesByID
+	}
+
+	nodeAttrs, err := indexed.compileNodeAttrsFrom(prevAttrs, prevNodes, users, nodes)
 	if err != nil {
 		return nil, fmt.Errorf("compiling nodeAttrs: %w", err)
 	}
