@@ -6,6 +6,7 @@ import (
 	jsonv2 "encoding/json/v2"
 	"reflect"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 	"weak"
@@ -293,13 +294,22 @@ func Route(old, cur *state.Snapshot, c state.Change) (bool, map[types.NodeID]str
 		}
 	}
 
-	add(c.Nodes)
+	// A node whose change no map renders wakes nobody; its health reaches
+	// the election, and so Primaries, on its own.
+	nodes := slices.DeleteFunc(slices.Clone(c.Nodes), func(id types.NodeID) bool {
+		was, wasOK := old.GetNode(id)
+		is, isOK := cur.GetNode(id)
+
+		return wasOK && isOK && was.SameRender(is)
+	})
+
+	add(nodes)
 	add(c.Primaries)
 	add(c.PeerSets)
 	add(c.Filters)
 	add(c.Caps)
 
-	viewed := [][]types.NodeID{c.Nodes, c.Primaries, c.Caps}
+	viewed := [][]types.NodeID{nodes, c.Primaries, c.Caps}
 
 	if old.PolicyRev() != cur.PolicyRev() {
 		add(old.RoutedNodes())

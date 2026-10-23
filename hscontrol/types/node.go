@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -1356,4 +1357,23 @@ func (nv NodeView) TailNode(
 	}
 
 	return &tNode, nil
+}
+
+// unrenderedFields are the [Node] fields no map renders: the election
+// reads health, and sessions and the database keep the rest.
+var unrenderedFields = []string{"Unhealthy", "ActiveSessions", "SessionEpoch", "UpdatedAt"}
+
+// SameRender reports whether nv and o differ only in [unrenderedFields],
+// so no map, the node's own or a peer's, can differ between them.
+func (nv NodeView) SameRender(o NodeView) bool {
+	if !nv.Valid() || !o.Valid() {
+		return nv.Valid() == o.Valid()
+	}
+
+	a, b := *nv.ж, *o.ж
+	for _, n := range []*Node{&a, &b} {
+		n.Unhealthy, n.ActiveSessions, n.SessionEpoch, n.UpdatedAt = false, 0, 0, time.Time{}
+	}
+
+	return reflect.DeepEqual(a, b)
 }
