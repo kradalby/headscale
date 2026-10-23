@@ -1520,6 +1520,9 @@ func TestReducerMatchesLinearReduction(t *testing.T) {
 
 		red := policyutil.NewReducer(rules)
 
+		// One cache across the round's nodes, as a compile shares it.
+		var cache policyutil.DstCache
+
 		for range 5 {
 			ip := netip.MustParseAddr(addr())
 			n := &types.Node{IPv4: &ip, Hostinfo: &tailcfg.Hostinfo{}}
@@ -1533,6 +1536,7 @@ func TestReducerMatchesLinearReduction(t *testing.T) {
 			want := policyutil.ReduceFilterRules(n.View(), rules)
 			got := red.Reduce(n.View())
 			require.Equal(t, want, got, "round %d, node %s, routes %v", round, ip, n.ApprovedRoutes)
+			require.Equal(t, want, cache.Reduce(n.View(), rules), "cached, round %d, node %s", round, ip)
 		}
 	}
 }

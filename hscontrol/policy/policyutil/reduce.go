@@ -3,12 +3,53 @@ package policyutil
 import (
 	"net/netip"
 	"slices"
+	"sync"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"go4.org/netipx"
 	"tailscale.com/tailcfg"
 )
+
+// DstCache is [ReduceFilterRules] for rules reduced for many nodes: it
+// parses each rule's destinations once, by the slice holding them, which
+// rules shared between nodes share. The rules must not change.
+type DstCache struct {
+	m sync.Map // dstKey -> []parsedDst
+}
+
+type dstKey struct {
+	first *tailcfg.NetPortRange
+	n     int
+}
+
+// Reduce is [ReduceFilterRules].
+func (c *DstCache) Reduce(node types.NodeView, rules []tailcfg.FilterRule) []tailcfg.FilterRule {
+	parsed := make([][]parsedDst, len(rules))
+
+	for i, rule := range rules {
+		if len(rule.DstPorts) == 0 {
+			continue
+		}
+
+		key := dstKey{first: &rule.DstPorts[0], n: len(rule.DstPorts)}
+		if v, ok := c.m.Load(key); ok {
+			parsed[i] = v.([]parsedDst) //nolint:forcetypeassert // only parsed destinations stored
+
+			continue
+		}
+
+		p := make([]parsedDst, len(rule.DstPorts))
+		for j, d := range rule.DstPorts {
+			p[j] = parseDst(d.IP)
+		}
+
+		c.m.Store(key, p)
+		parsed[i] = p
+	}
+
+	return reduceRules(node, rules, func(i, j int) parsedDst { return parsed[i][j] })
+}
 
 // ReduceFilterRules takes a node and a set of global filter rules and removes all rules
 // and destinations that are not relevant to that particular node.
