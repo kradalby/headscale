@@ -1208,3 +1208,54 @@ func TestStreamCatchesUpFromBeyondTheEditLog(t *testing.T) {
 	require.Empty(t, client.sameAs(newModelClient(fresh[0])))
 }
 
+// TestRouteWakesSSHDestinationOfChangedSource has SSH alone connect u1 to
+// a tag:b node, and moves one of u1's nodes out of u1: the tag:b node is
+// not a peer of the moved node, but its SSH principals changed, so the
+// hub must wake it.
+func TestRouteWakesSSHDestinationOfChangedSource(t *testing.T) {
+	_, s, ids := streamTestState(t, `{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
+		"acls":[{"action":"accept","src":["tag:a"],"dst":["tag:a:*"]}],
+		"ssh":[{"action":"accept","src":["u1@"],"dst":["tag:b"],"users":["root"]}]}`)
+	moved, dest := ids[0], ids[2]
+
+	_, err := s.SetNodeTags(dest, []string{"tag:b"})
+	require.NoError(t, err)
+
+	before := s.Snapshot()
+	destNode := mustNode(t, s, dest)
+
+	// A session renders the destination's SSH policy first.
+	was, err := before.Policy().SSHPolicy("https://headscale.test", destNode)
+	require.NoError(t, err)
+
+	_, err = s.SetNodeTags(moved, []string{"tag:a"})
+	require.NoError(t, err)
+
+	after := s.Snapshot()
+	is, err := after.Policy().SSHPolicy("https://headscale.test", destNode)
+	require.NoError(t, err)
+	require.NotEqual(t, was, is, "the destination's SSH principals must change")
+	require.NotContains(t, after.ListPeerIDs(moved), dest, "SSH alone connects them")
+
+	all, wake := Route(before, after, after.Since(before))
+	require.False(t, all, "a node change under SSH rules must not wake everyone")
+	assert.Contains(t, wake, dest)
+}
+
+// TestRouteWakesAllBeforeSSHIsPrepared changes a node before any session
+// rendered SSH from the compile in effect: a session may still render
+// from it, and nothing tells what its SSH was, so the hub wakes all.
+func TestRouteWakesAllBeforeSSHIsPrepared(t *testing.T) {
+	_, s, ids := streamTestState(t, `{"tagOwners":{"tag:a":["u1@"]},
+		"acls":[{"action":"accept","src":["tag:a"],"dst":["tag:a:*"]}],
+		"ssh":[{"action":"accept","src":["u1@"],"dst":["tag:a"],"users":["root"]}]}`)
+
+	before := s.Snapshot()
+
+	_, err := s.SetNodeTags(ids[0], []string{"tag:a"})
+	require.NoError(t, err)
+
+	after := s.Snapshot()
+	all, _ := Route(before, after, after.Since(before))
+	assert.True(t, all)
+}

@@ -47,6 +47,9 @@ type PolicyManager struct {
 	// matcherCache holds the matcher of each global rule, by content.
 	matcherCache map[string]matcher.Match
 
+	sideOnce sync.Once
+	sides    *sideIndex
+
 	// id identifies this compile. change is [PolicyManager.FilterChangedNodes]
 	// from the compile with id changeFrom, the one this one was made from;
 	// an id, so a compile does not keep the one before it alive. Set
@@ -295,6 +298,23 @@ func NewPolicyManagerFrom(prev *PolicyManager, b []byte, users []types.User, nod
 		matchersForNodeMap: xsync.NewMap[types.NodeID, []matcher.Match](),
 	}
 
+	// Prepare SSH for every server URL prev served, from prev when only
+	// nodes changed, so the change to each node's SSH policy is known.
+	if prev != nil {
+		prev.sshPreps.Range(func(baseURL string, last *sshPrep) bool {
+			if change == nil {
+				last = nil
+			}
+
+			prep, err := indexed.prepareSSHFrom(last, change, baseURL, users, nodes)
+			if err == nil {
+				pm.sshPreps.Store(baseURL, prep)
+			}
+
+			return true
+		})
+	}
+
 	pm.inheritFilters(prev)
 
 	return pm, nil
@@ -530,36 +550,176 @@ func (pm *PolicyManager) inheritFilters(prev *PolicyManager) {
 		return
 	}
 
-	prev.filterRulesMap.Range(func(id types.NodeID, rules []tailcfg.FilterRule) bool {
+	keep := func(id types.NodeID) bool {
 		if _, hit := slices.BinarySearch(changed, id); hit {
-			return true
+			return false
 		}
 
-		if n, ok := pm.nodesByID[id]; ok && n == prev.nodesByID[id] {
+		n, ok := pm.nodesByID[id]
+
+		return ok && n == prev.nodesByID[id]
+	}
+
+	prev.filterRulesMap.Range(func(id types.NodeID, rules []tailcfg.FilterRule) bool {
+		if keep(id) {
 			pm.filterRulesMap.Store(id, rules)
+		}
+
+		return true
+	})
+
+	prev.sshPolicyMap.Range(func(id types.NodeID, ssh *tailcfg.SSHPolicy) bool {
+		if keep(id) {
+			pm.sshPolicyMap.Store(id, ssh)
 		}
 
 		return true
 	})
 }
 
-// FilterChangedNodes returns the nodes whose packet filter can differ
-// between prev and pm, compiles of the same document and users after a
-// node change: the destinations of every rule that changed, and every
-// node serving routes, which a rule can reach by overlap. all is set when
-// it cannot narrow it: a document or users change, per-node rules or SSH
-// rules, which this does not track.
+// FilterChangedNodes returns the nodes whose packet filter or SSH policy
+// can differ between prev and pm, compiles of the same document and
+// users after a node change: the destinations of every rule that
+// changed, every node serving routes, which a rule can reach by overlap,
+// and the nodes a changed SSH rule reaches. all is set when it cannot
+// narrow it: a document or users change, or per-node rules.
 func (pm *PolicyManager) FilterChangedNodes(prev *PolicyManager) ([]types.NodeID, bool) {
 	if pm != nil && prev != nil && pm.changeFrom == prev.id {
 		return pm.change, pm.changeAll
 	}
 
 	if pm == nil || prev == nil || !bytes.Equal(pm.src, prev.src) || !samePolicyUsers(pm.users, prev.users) ||
-		pm.needsPerNodeFilter || prev.needsPerNodeFilter || pm.pol == nil ||
-		len(pm.pol.SSHs) > 0 {
+		pm.needsPerNodeFilter || prev.needsPerNodeFilter || pm.pol == nil {
 		return nil, true
 	}
 
+	filters, all := pm.filterChangedNodes(prev)
+	if all {
+		return nil, true
+	}
+
+	ssh, all := pm.sshChangedNodes(prev)
+	if all {
+		return nil, true
+	}
+
+	out := slices.Concat(filters, ssh)
+	slices.Sort(out)
+
+	return slices.Compact(out), false
+}
+
+// sshChangedNodes returns the nodes whose SSH policy can differ between
+// prev and pm: for every rule that prepared differently, the nodes in its
+// destinations, the users' own nodes for autogroup:self, and its sources
+// when it has localpart users, who get self-access rules.
+func (pm *PolicyManager) sshChangedNodes(prev *PolicyManager) ([]types.NodeID, bool) {
+	// SSH prepares on first use: until a session has asked prev, there is
+	// nothing to compare, and one may still render from it.
+	if len(pm.pol.SSHs) > 0 && prev.sshPreps.Size() == 0 {
+		return nil, true
+	}
+
+	var (
+		ranges []netipx.IPRange
+		users  []uint
+		all    bool
+	)
+
+	addSet := func(set *netipx.IPSet) {
+		if set != nil {
+			ranges = append(ranges, set.Ranges()...)
+		}
+	}
+
+	prev.sshPreps.Range(func(baseURL string, last *sshPrep) bool {
+		next, ok := pm.sshPreps.Load(baseURL)
+		if !ok {
+			all = true
+
+			return false
+		}
+
+		byIndex := map[int][2]*sshRulePrep{}
+		for _, r := range last.rules {
+			pair := byIndex[r.index]
+			pair[0] = r
+			byIndex[r.index] = pair
+		}
+
+		for _, r := range next.rules {
+			pair := byIndex[r.index]
+			pair[1] = r
+			byIndex[r.index] = pair
+		}
+
+		for _, pair := range byIndex {
+			if pair[0] == pair[1] {
+				continue
+			}
+
+			for _, r := range pair {
+				if r == nil {
+					continue
+				}
+
+				addSet(r.dests)
+
+				if r.self {
+					users = append(users, r.userIDs...)
+				}
+
+				if r.localpart {
+					var b netipx.IPSetBuilder
+
+					addResolved(&b, r.srcIPs)
+
+					set, err := b.IPSet()
+					if err != nil {
+						all = true
+
+						return false
+					}
+
+					addSet(set)
+				}
+			}
+		}
+
+		return true
+	})
+
+	if all {
+		return nil, true
+	}
+
+	var out []types.NodeID
+
+	for _, m := range []*PolicyManager{prev, pm} {
+		idx := m.sideIndex()
+		for _, r := range ranges {
+			out = append(out, idx.inRange(r)...)
+		}
+
+		for _, uid := range users {
+			for _, n := range m.userNodeIdx[uid] {
+				out = append(out, n.ID())
+			}
+		}
+	}
+
+	return out, false
+}
+
+// sideIndex is the address index of pm's nodes, built once.
+func (pm *PolicyManager) sideIndex() *sideIndex {
+	pm.sideOnce.Do(func() { pm.sides = newSideIndex(pm.nodes) })
+
+	return pm.sides
+}
+
+// filterChangedNodes is the packet filter half of [FilterChangedNodes].
+func (pm *PolicyManager) filterChangedNodes(prev *PolicyManager) ([]types.NodeID, bool) {
 	changed := changedRules(prev.filter, pm.filter)
 	if len(changed) == 0 {
 		return nil, false
@@ -591,8 +751,8 @@ func (pm *PolicyManager) FilterChangedNodes(prev *PolicyManager) ([]types.NodeID
 		}
 	}
 
-	for _, set := range []views.Slice[types.NodeView]{prev.nodes, pm.nodes} {
-		idx := newSideIndex(set)
+	for _, m := range []*PolicyManager{prev, pm} {
+		idx := m.sideIndex()
 
 		for _, r := range idx.routers {
 			out = append(out, r.ID())

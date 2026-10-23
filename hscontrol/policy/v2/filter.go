@@ -274,11 +274,14 @@ func (pol *Policy) compileSSHPolicy(
 // Compiling it once per policy keeps a node's compile from walking every
 // node again.
 type sshPrep struct {
-	rules []sshRulePrep
+	rules []*sshRulePrep
 }
 
 // sshRulePrep is one SSH rule with live sources, prepared.
 type sshRulePrep struct {
+	// index is the rule's position in the policy's SSH rules.
+	index int
+
 	srcIPs    ResolvedAddresses
 	action    tailcfg.SSHAction
 	acceptEnv []string
@@ -308,108 +311,158 @@ func (pol *Policy) prepareSSH(
 	users types.Users,
 	nodes views.Slice[types.NodeView],
 ) (*sshPrep, error) {
+	return pol.prepareSSHFrom(nil, nil, baseURL, users, nodes)
+}
+
+// prepareSSHFrom is [Policy.prepareSSH] reusing, from prev, a prepare of
+// the same document and users, each rule the change since cannot reach.
+// prev and change are nil to prepare from scratch.
+func (pol *Policy) prepareSSHFrom(
+	prev *sshPrep,
+	change *nodeChange,
+	baseURL string,
+	users types.Users,
+	nodes views.Slice[types.NodeView],
+) (*sshPrep, error) {
 	prep := &sshPrep{}
 	if pol == nil {
 		return prep, nil
 	}
 
+	var last map[int]*sshRulePrep
+
+	if prev != nil && change != nil {
+		last = make(map[int]*sshRulePrep, len(prev.rules))
+		for _, r := range prev.rules {
+			last[r.index] = r
+		}
+	}
+
 	for index, rule := range pol.SSHs {
-		var r sshRulePrep
-
-		var otherDests []Alias
-
-		for _, dst := range rule.Destinations {
-			if ag, ok := dst.(*AutoGroup); ok && ag.Is(AutoGroupSelf) {
-				r.self = true
-			} else {
-				otherDests = append(otherDests, dst)
+		if last != nil && !change.movesSSH(rule) {
+			// A rule prepared to nothing stays that way.
+			if r := last[index]; r != nil {
+				prep.rules = append(prep.rules, r)
 			}
-		}
 
-		srcIPs, err := rule.Sources.Resolve(pol, users, nodes)
-		if err != nil {
-			log.Trace().Caller().Err(err).Msgf(
-				"ssh policy compilation failed resolving source ips for rule %+v", rule,
-			)
-		}
-
-		if srcIPs == nil || len(srcIPs.Prefixes()) == 0 {
 			continue
 		}
 
-		r.srcIPs = srcIPs
-
-		switch rule.Action {
-		case SSHActionAccept:
-			r.action = sshAccept
-		case SSHActionCheck:
-			r.action = sshCheck(baseURL)
-		default:
-			return nil, fmt.Errorf(
-				"parsing SSH policy, unknown action %q, index: %d: %w",
-				rule.Action, index, err,
-			)
+		r, err := pol.prepareSSHRule(index, rule, baseURL, users, nodes)
+		if err != nil {
+			return nil, err
 		}
 
-		r.acceptEnv = rule.AcceptEnv
-
-		const rootUser = "root"
-
-		r.userMap = make(map[string]string, len(rule.Users))
-		if rule.Users.ContainsNonRoot() {
-			r.userMap["*"] = "="
+		if r != nil {
+			prep.rules = append(prep.rules, r)
 		}
-
-		if rule.Users.ContainsRoot() {
-			r.userMap[rootUser] = rootUser
-		} else {
-			r.userMap[rootUser] = ""
-		}
-
-		for _, u := range rule.Users.NormalUsers() {
-			r.userMap[u.String()] = u.String()
-		}
-
-		r.localpart = rule.Users.ContainsLocalpart()
-		if r.localpart {
-			r.localpartByUser = resolveLocalparts(rule.Users.LocalpartEntries(), users)
-		}
-
-		r.userIDs, r.principalsByUser, r.tagged = groupSourcesByUser(nodes, srcIPs)
-
-		for _, uid := range r.userIDs {
-			r.all = append(r.all, r.principalsByUser[uid]...)
-		}
-
-		r.all = append(r.all, r.tagged...)
-
-		if len(otherDests) > 0 {
-			var dest netipx.IPSetBuilder
-
-			for _, dst := range otherDests {
-				ips, err := dst.Resolve(pol, users, nodes)
-				if err != nil {
-					log.Trace().Caller().Err(err).
-						Msgf("resolving destination ips")
-				}
-
-				if ips != nil {
-					for _, pref := range ips.Prefixes() {
-						dest.AddPrefix(pref)
-					}
-				}
-			}
-
-			r.dests, err = dest.IPSet()
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		prep.rules = append(prep.rules, r)
 	}
 
 	return prep, nil
+}
+
+// prepareSSHRule prepares one SSH rule; nil when its sources resolve to
+// nothing.
+func (pol *Policy) prepareSSHRule(
+	index int,
+	rule SSH,
+	baseURL string,
+	users types.Users,
+	nodes views.Slice[types.NodeView],
+) (*sshRulePrep, error) {
+	r := &sshRulePrep{index: index}
+
+	var otherDests []Alias
+
+	for _, dst := range rule.Destinations {
+		if ag, ok := dst.(*AutoGroup); ok && ag.Is(AutoGroupSelf) {
+			r.self = true
+		} else {
+			otherDests = append(otherDests, dst)
+		}
+	}
+
+	srcIPs, err := pol.resolveAliases(Aliases(rule.Sources), users, nodes)
+	if err != nil {
+		log.Trace().Caller().Err(err).Msgf(
+			"ssh policy compilation failed resolving source ips for rule %+v", rule,
+		)
+	}
+
+	if srcIPs == nil || len(srcIPs.Prefixes()) == 0 {
+		return nil, nil //nolint:nilnil // a rule without sources prepares to nothing
+	}
+
+	r.srcIPs = srcIPs
+
+	switch rule.Action {
+	case SSHActionAccept:
+		r.action = sshAccept
+	case SSHActionCheck:
+		r.action = sshCheck(baseURL)
+	default:
+		return nil, fmt.Errorf(
+			"parsing SSH policy, unknown action %q, index: %d: %w",
+			rule.Action, index, err,
+		)
+	}
+
+	r.acceptEnv = rule.AcceptEnv
+
+	const rootUser = "root"
+
+	r.userMap = make(map[string]string, len(rule.Users))
+	if rule.Users.ContainsNonRoot() {
+		r.userMap["*"] = "="
+	}
+
+	if rule.Users.ContainsRoot() {
+		r.userMap[rootUser] = rootUser
+	} else {
+		r.userMap[rootUser] = ""
+	}
+
+	for _, u := range rule.Users.NormalUsers() {
+		r.userMap[u.String()] = u.String()
+	}
+
+	r.localpart = rule.Users.ContainsLocalpart()
+	if r.localpart {
+		r.localpartByUser = resolveLocalparts(rule.Users.LocalpartEntries(), users)
+	}
+
+	r.userIDs, r.principalsByUser, r.tagged = groupSourcesByUser(nodes, srcIPs)
+
+	for _, uid := range r.userIDs {
+		r.all = append(r.all, r.principalsByUser[uid]...)
+	}
+
+	r.all = append(r.all, r.tagged...)
+
+	if len(otherDests) > 0 {
+		var dest netipx.IPSetBuilder
+
+		for _, dst := range otherDests {
+			ips, err := pol.resolveAlias(dst, users, nodes)
+			if err != nil {
+				log.Trace().Caller().Err(err).
+					Msgf("resolving destination ips")
+			}
+
+			if ips != nil {
+				for _, pref := range ips.Prefixes() {
+					dest.AddPrefix(pref)
+				}
+			}
+		}
+
+		r.dests, err = dest.IPSet()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return r, nil
 }
 
 // forNode returns the SSH rules node receives. Never nil: clients read a
@@ -418,9 +471,7 @@ func (pol *Policy) prepareSSH(
 func (prep *sshPrep) forNode(node types.NodeView) *tailcfg.SSHPolicy {
 	rules := []*tailcfg.SSHRule{}
 
-	for i := range prep.rules {
-		r := &prep.rules[i]
-
+	for _, r := range prep.rules {
 		// appendRules emits a common rule and, if the user has a
 		// localpart match, a per-user localpart rule.
 		appendRules := func(principals []*tailcfg.SSHPrincipal, uid uint, hasUID bool) {

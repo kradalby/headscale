@@ -301,6 +301,14 @@ type nodeChange struct {
 	routes     bool // a node's approved routes changed
 }
 
+// movesSSH reports whether the change can alter how rule prepares. SSH
+// sources are identities only, and every changed node moves the
+// identities it belongs to, so a rule listing nodes one by one changes
+// only when one of its aliases moved.
+func (c *nodeChange) movesSSH(rule SSH) bool {
+	return slices.ContainsFunc(rule.Sources, c.moves) || slices.ContainsFunc(rule.Destinations, c.moves)
+}
+
 func diffNodes(prev map[types.NodeID]types.NodeView, nodes views.Slice[types.NodeView]) *nodeChange {
 	c := &nodeChange{tags: map[Tag]struct{}{}, users: map[uint]struct{}{}}
 

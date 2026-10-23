@@ -85,8 +85,10 @@ var (
 		{ID: 3, Name: "u3"},
 		{ID: 4, Name: "u4"},
 	}
-	scanTags   = []string{"tag:srv", "tag:db", "tag:router", "tag:exit"}
-	scanRoutes = []string{"10.1.0.0/24", "10.1.1.0/24", "10.2.0.0/16", "192.168.5.0/24", "fd00:1::/64"}
+	scanTags = []string{"tag:srv", "tag:db", "tag:router", "tag:exit"}
+	// scanServerURL is the server URL SSH check rules point at.
+	scanServerURL = "https://headscale.test"
+	scanRoutes    = []string{"10.1.0.0/24", "10.1.1.0/24", "10.2.0.0/16", "192.168.5.0/24", "fd00:1::/64"}
 	// Aliases usable on either side of a rule.
 	scanAliases = []string{
 		"*", "u1@", "u2@", "u3@", "u4@", "group:a", "group:b",
@@ -189,6 +191,30 @@ func scanRandomPolicy(r *rand.Rand) []byte {
 			"routes":   map[string][]string{"10.1.0.0/24": pick(owners, 1+r.IntN(2)), "0.0.0.0/0": pick(owners, 1)},
 			"exitNode": pick(owners, 1+r.IntN(2)),
 		}
+	}
+
+	if r.IntN(2) == 0 {
+		n := 1 + r.IntN(3)
+		ssh := make([]any, 0, n)
+
+		for range n {
+			rule := map[string]any{
+				"action": []string{"accept", "check"}[r.IntN(2)],
+				"src":    pick([]string{"u1@", "u2@", "group:a", "autogroup:member", "tag:srv"}, 1+r.IntN(2)),
+				"users":  pick([]string{"root", "autogroup:nonroot", "ubuntu", "localpart:*@example.com"}, 1+r.IntN(2)),
+			}
+
+			if r.IntN(3) == 0 {
+				rule["dst"] = []string{"autogroup:self"}
+				rule["src"] = pick([]string{"u1@", "u2@", "group:a", "autogroup:member"}, 1+r.IntN(2))
+			} else {
+				rule["dst"] = pick([]string{"tag:srv", "tag:db", "tag:router", "autogroup:tagged"}, 1+r.IntN(2))
+			}
+
+			ssh = append(ssh, rule)
+		}
+
+		pol["ssh"] = ssh
 	}
 
 	if r.IntN(2) == 0 {
@@ -961,6 +987,13 @@ func TestNewPolicyManagerFromMatchesFresh(t *testing.T) {
 				got, err := inc.FilterForNode(n.View())
 				require.NoError(t, err)
 				require.Equal(t, want, got, "%s, node %d", msg, n.ID)
+
+				wantSSH, err := fresh.SSHPolicy(scanServerURL, n.View())
+				require.NoError(t, err)
+
+				gotSSH, err := inc.SSHPolicy(scanServerURL, n.View())
+				require.NoError(t, err)
+				require.Equal(t, wantSSH, gotSSH, "%s, node %d SSH", msg, n.ID)
 			}
 
 			// Outside FilterChangedNodes, a node that did not change keeps
@@ -980,6 +1013,13 @@ func TestNewPolicyManagerFromMatchesFresh(t *testing.T) {
 					is, err := inc.FilterForNode(n.View())
 					require.NoError(t, err)
 					require.Equal(t, was, is, "%s, unchanged node %d", msg, n.ID)
+
+					wasSSH, err := prev.SSHPolicy(scanServerURL, old)
+					require.NoError(t, err)
+
+					isSSH, err := inc.SSHPolicy(scanServerURL, n.View())
+					require.NoError(t, err)
+					require.Equal(t, wasSSH, isSSH, "%s, unchanged node %d SSH", msg, n.ID)
 				}
 			}
 
