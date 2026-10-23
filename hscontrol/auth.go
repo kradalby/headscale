@@ -69,7 +69,7 @@ func (h *Headscale) handleRegister(
 		} else {
 			log.Warn().
 				Str("node.key", req.NodeKey.ShortString()).
-				Msg("Logout attempt but node not found in NodeStore")
+				Msg("Logout attempt but node not found")
 		}
 	}
 
@@ -439,10 +439,6 @@ func (h *Headscale) handleRegisterWithAuthKey(
 	// nodesChangedHook and then we can auto approve the routes.
 	// As that only approves the struct object, we need to save it again and
 	// ensure we send an update.
-	// This works, but might be another good candidate for doing some sort of
-	// eventbus.
-	// TODO(kradalby): This needs to be ran as part of the batcher maybe?
-	// now since we dont update the node/pol here anymore
 	err = h.state.AutoApproveRoutes(node)
 	if err != nil {
 		return nil, fmt.Errorf("auto approving routes: %w", err)

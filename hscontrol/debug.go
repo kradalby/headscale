@@ -132,7 +132,7 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 		writeDebug(w, r, func() any { return h.state.DebugDERPJSON() }, h.state.DebugDERPMap)
 	}))
 
-	// [state.NodeStore] endpoint
+	// The in-memory nodes; named for the store that held them before.
 	debug.Handle("nodestore", "NodeStore information", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeDebug(w, r, func() any { return h.state.DebugNodeStoreJSON() }, h.state.DebugNodeStore)
 	}))
@@ -169,7 +169,7 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 		writeJSON(w, res)
 	}))
 
-	// [mapper.Batcher] endpoint
+	// Connected map sessions; named for the batcher that held them before.
 	debug.Handle("batcher", "Batcher connected nodes", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeDebug(w, r, func() any { return h.debugBatcherJSON() }, h.debugBatcher)
 	}))
@@ -232,7 +232,7 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 	return debugHTTPServer
 }
 
-// debugBatcher returns debug information about the batcher's connected nodes.
+// debugBatcher returns debug information about the connected map sessions.
 func (h *Headscale) debugBatcher() string {
 	var sb strings.Builder
 	sb.WriteString("=== Batcher Connected Nodes ===\n\n")

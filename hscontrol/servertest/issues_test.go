@@ -706,8 +706,9 @@ func TestIssuesServerMutations(t *testing.T) {
 	})
 }
 
-// TestIssuesNodeStoreConsistency tests [state.NodeStore] + DB consistency.
-func TestIssuesNodeStoreConsistency(t *testing.T) {
+// TestIssuesNodeStateConsistency tests that in-memory nodes and the
+// database agree.
+func TestIssuesNodeStateConsistency(t *testing.T) {
 	t.Parallel()
 
 	// [state.NodeStore] and DB should agree after mutations.

@@ -380,9 +380,9 @@ func TestRaceConnectDuringGracePeriod(t *testing.T) {
 	})
 }
 
-// TestRaceBatcherContention tests race conditions in the [mapper.Batcher]
+// TestRaceMapHubContention tests race conditions in the [mapper.Hub]
 // when many changes arrive simultaneously.
-func TestRaceBatcherContention(t *testing.T) {
+func TestRaceMapHubContention(t *testing.T) {
 	t.Parallel()
 
 	// Many nodes connecting at the same time generates many
@@ -569,8 +569,8 @@ func TestRaceMapResponseDuringDisconnect(t *testing.T) {
 	})
 }
 
-// TestRaceNodeStoreContention tests concurrent access to the [state.NodeStore].
-func TestRaceNodeStoreContention(t *testing.T) {
+// TestRaceNodeWriteContention tests concurrent node writes to the state.
+func TestRaceNodeWriteContention(t *testing.T) {
 	t.Parallel()
 
 	// Many [state.State.GetNodeByID] calls while nodes are connecting and

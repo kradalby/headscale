@@ -2969,7 +2969,7 @@ func validateCompleteRegistrationResponse(t *testing.T, resp *tailcfg.RegisterRe
 }
 
 // Simple test to validate basic node creation and lookup.
-func TestNodeStoreLookup(t *testing.T) {
+func TestNodeLookupAfterCreate(t *testing.T) {
 	app := createTestApp(t)
 
 	machineKey := key.NewMachine()
