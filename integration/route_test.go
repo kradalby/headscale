@@ -4365,9 +4365,12 @@ func TestHASubnetRouterFailoverDockerDisconnect(t *testing.T) {
 	subRouter2 := allClients[1]
 	client := allClients[2]
 
+	// The routers do not route their own subnet via the other: docker
+	// cannot set the gateway of a container that routes the network it
+	// reconnects to through Tailscale, which a standby router would.
 	for _, r := range []TailscaleClient{subRouter1, subRouter2} {
 		_, _, err = r.Execute([]string{
-			"tailscale", "set", "--advertise-routes=" + pref.String(),
+			"tailscale", "set", "--advertise-routes=" + pref.String(), "--accept-routes=false",
 		})
 		require.NoErrorf(t, err, "advertise route on %s", r.Hostname())
 	}
