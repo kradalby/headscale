@@ -578,22 +578,27 @@ func (pm *PolicyManager) inheritFilters(prev *PolicyManager) {
 }
 
 // FilterChangedNodes returns the nodes whose packet filter or SSH policy
-// can differ between prev and pm, compiles of the same document and
-// users after a node change: the destinations of every rule that
-// changed, every node serving routes, which a rule can reach by overlap,
-// and the nodes a changed SSH rule reaches. all is set when it cannot
-// narrow it: a document or users change, or per-node rules.
+// can differ between prev and pm, any two compiles: the destinations of
+// every shared rule that changed, every node serving routes, which a rule
+// can reach by overlap, the nodes a changed SSH rule reaches, and, for
+// autogroup:self and via grants, the nodes whose own rules changed. all
+// is set when it cannot narrow it: per-node rules under a document or
+// users change, or self grants whose sources are not users.
 func (pm *PolicyManager) FilterChangedNodes(prev *PolicyManager) ([]types.NodeID, bool) {
 	if pm != nil && prev != nil && pm.changeFrom == prev.id {
 		return pm.change, pm.changeAll
 	}
 
-	if pm == nil || prev == nil || !bytes.Equal(pm.src, prev.src) || !samePolicyUsers(pm.users, prev.users) ||
-		pm.needsPerNodeFilter || prev.needsPerNodeFilter || pm.pol == nil {
+	if pm == nil || prev == nil || pm.pol == nil {
 		return nil, true
 	}
 
-	filters, all := pm.filterChangedNodes(prev)
+	perNode := pm.needsPerNodeFilter || prev.needsPerNodeFilter
+	if perNode && (!bytes.Equal(pm.src, prev.src) || !samePolicyUsers(pm.users, prev.users)) {
+		return nil, true
+	}
+
+	filters, all := pm.filterChangedNodes(prev, perNode)
 	if all {
 		return nil, true
 	}
@@ -603,10 +608,109 @@ func (pm *PolicyManager) FilterChangedNodes(prev *PolicyManager) ([]types.NodeID
 		return nil, true
 	}
 
-	out := slices.Concat(filters, ssh)
+	var own []types.NodeID
+	if perNode {
+		own, all = pm.ownRulesChangedNodes(prev)
+		if all {
+			return nil, true
+		}
+	}
+
+	out := slices.Concat(filters, ssh, own)
 	slices.Sort(out)
 
 	return slices.Compact(out), false
+}
+
+// ownRulesChangedNodes returns the nodes whose own rules can differ
+// between prev and pm, compiles of the same document and users: for a
+// self grant that compiled differently, the nodes of the users whose
+// nodes changed, and every exit node, which carries every user's self
+// rules; for a via grant, every node with one of its via tags.
+func (pm *PolicyManager) ownRulesChangedNodes(prev *PolicyManager) ([]types.NodeID, bool) {
+	if len(pm.grantResults) != len(prev.grantResults) {
+		return nil, true
+	}
+
+	grants := pm.pol.allGrants()
+	if len(grants) != len(pm.grantResults) {
+		return nil, true
+	}
+
+	var (
+		self    bool
+		viaTags []string
+	)
+
+	for i, g := range grants {
+		was, is := prev.grantResults[i].cg, pm.grantResults[i].cg
+		if was == is {
+			continue
+		}
+
+		for _, cg := range []*compiledGrant{was, is} {
+			switch {
+			case cg == nil:
+			case cg.category == grantCategorySelf:
+				// A user's self rules then follow only their own nodes.
+				if slices.ContainsFunc(g.Sources, notUserSource) {
+					return nil, true
+				}
+
+				self = true
+			case cg.category == grantCategoryVia && cg.via != nil:
+				for _, t := range cg.via.viaTags {
+					viaTags = append(viaTags, string(t))
+				}
+			}
+		}
+	}
+
+	if !self && len(viaTags) == 0 {
+		return nil, false
+	}
+
+	var users map[uint]struct{}
+	if self {
+		users = diffNodes(prev.nodesByID, pm.nodes).users
+	}
+
+	var out []types.NodeID
+
+	for _, m := range []*PolicyManager{prev, pm} {
+		for uid := range users {
+			for _, n := range m.userNodeIdx[uid] {
+				out = append(out, n.ID())
+			}
+		}
+
+		if self {
+			out = append(out, m.sideIndex().exits...)
+		}
+
+		if len(viaTags) > 0 {
+			for _, n := range m.nodes.All() {
+				if slices.ContainsFunc(viaTags, n.HasTag) {
+					out = append(out, n.ID())
+				}
+			}
+		}
+	}
+
+	return out, false
+}
+
+// notUserSource reports whether a is anything but users: a user, a group
+// or autogroup:member.
+func notUserSource(a Alias) bool {
+	switch a := a.(type) {
+	case *Username, *Group:
+		return false
+	case *AutoGroup:
+		return !a.Is(AutoGroupMember)
+	default:
+		return true
+	}
 }
 
 // sshChangedNodes returns the nodes whose SSH policy can differ between
@@ -718,9 +822,16 @@ func (pm *PolicyManager) sideIndex() *sideIndex {
 	return pm.sides
 }
 
-// filterChangedNodes is the packet filter half of [FilterChangedNodes].
-func (pm *PolicyManager) filterChangedNodes(prev *PolicyManager) ([]types.NodeID, bool) {
-	changed := changedRules(prev.filter, pm.filter)
+// filterChangedNodes is the shared packet filter part of
+// [FilterChangedNodes]. Under per-node rules every grant's shared rules
+// make the filter, via grants' too.
+func (pm *PolicyManager) filterChangedNodes(prev *PolicyManager, perNode bool) ([]types.NodeID, bool) {
+	was, is := prev.filter, pm.filter
+	if perNode {
+		was, is = sharedRules(prev.compiledGrants), sharedRules(pm.compiledGrants)
+	}
+
+	changed := changedRules(was, is)
 	if len(changed) == 0 {
 		return nil, false
 	}

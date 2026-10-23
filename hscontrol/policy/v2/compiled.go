@@ -238,6 +238,17 @@ func (pol *Policy) compileGrants(
 	return compiled
 }
 
+// allGrants is the policy's grants and its ACLs as grants, in compile
+// order.
+func (pol *Policy) allGrants() []Grant {
+	grants := slices.Clip(pol.Grants)
+	for _, acl := range pol.ACLs {
+		grants = append(grants, aclToGrants(acl)...)
+	}
+
+	return grants
+}
+
 // compiledGrantResult is one grant's compile, kept for the next compile:
 // cg is nil for a grant that compiled to nothing or failed.
 type compiledGrantResult struct {
@@ -257,10 +268,7 @@ func (pol *Policy) compileGrantsFrom(
 		return nil, nil
 	}
 
-	grants := slices.Clip(pol.Grants)
-	for _, acl := range pol.ACLs {
-		grants = append(grants, aclToGrants(acl)...)
-	}
+	grants := pol.allGrants()
 
 	if len(prev) != len(grants) {
 		prev, change = nil, nil

@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/views"
@@ -953,7 +955,7 @@ func TestBuildPeerClassesReuseMatchesFresh(t *testing.T) {
 func TestNewPolicyManagerFromMatchesFresh(t *testing.T) {
 	r := rand.New(rand.NewPCG(9, 10)) //nolint:gosec // reproducible test input
 
-	reused, narrowed := 0, 0
+	reused, narrowed, narrowedPerNode, narrowedDoc := 0, 0, 0, 0
 
 	for it := range 300 {
 		nodes := scanRandomNodes(r, 2+r.IntN(30))
@@ -1001,6 +1003,14 @@ func TestNewPolicyManagerFromMatchesFresh(t *testing.T) {
 			if changed, all := inc.FilterChangedNodes(prev); prev != nil && !all {
 				narrowed++
 
+				if inc.needsPerNodeFilter {
+					narrowedPerNode++
+				}
+
+				if !bytes.Equal(prev.src, inc.src) {
+					narrowedDoc++
+				}
+
 				for _, n := range nodes {
 					old, ok := prev.nodesByID[n.ID]
 					if !ok || old != n.View() || slices.Contains(changed, n.ID) {
@@ -1033,6 +1043,13 @@ func TestNewPolicyManagerFromMatchesFresh(t *testing.T) {
 
 			prev = inc
 
+			// Now and then the document changes instead of a node.
+			if r.IntN(5) == 0 {
+				polB = scanRandomPolicy(r)
+
+				continue
+			}
+
 			switch r.IntN(4) {
 			case 0:
 				i := r.IntN(len(nodes))
@@ -1062,4 +1079,99 @@ func TestNewPolicyManagerFromMatchesFresh(t *testing.T) {
 	// recompiles narrowed.
 	require.Greater(t, reused, 100, "grants reused")
 	require.Greater(t, narrowed, 100, "recompiles narrowed")
+	require.Greater(t, narrowedPerNode, 50, "per-node recompiles narrowed")
+	require.Greater(t, narrowedDoc, 20, "document changes narrowed")
+}
+
+// ownRulesNode returns node id with addresses 100.64.0.id and fd7a::id,
+// owned by user, or tagged, and announcing and approved for routes.
+func ownRulesNode(id int, user *types.User, tags []string, routes ...string) *types.Node {
+	v4 := netip.AddrFrom4([4]byte{100, 64, 0, byte(id)})                               //nolint:gosec
+	v6 := netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 15: byte(id)}) //nolint:gosec
+
+	n := &types.Node{ID: types.NodeID(id), Hostname: fmt.Sprintf("n%d", id), IPv4: &v4, IPv6: &v6, Tags: tags} //nolint:gosec
+	if user != nil {
+		n.User, n.UserID = user, &user.ID
+	}
+
+	for _, r := range routes {
+		n.ApprovedRoutes = append(n.ApprovedRoutes, netip.MustParsePrefix(r))
+	}
+
+	n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: n.ApprovedRoutes}
+
+	return n
+}
+
+// TestFilterChangedNodesReachesOwnRules changes a node under policies
+// whose rules are per node, where no shared rule reaches the nodes whose
+// own rules change, and checks those nodes are named and their filter
+// equals a fresh compile.
+func TestFilterChangedNodesReachesOwnRules(t *testing.T) {
+	u1, u2 := &scanUsers[0], &scanUsers[1]
+
+	tests := []struct {
+		name          string
+		policy        string
+		before, after types.Nodes
+		want          []types.NodeID
+	}{
+		{
+			// a1 leaving u1 changes a2's self rules, and the exit node
+			// carries every user's.
+			name:   "self",
+			policy: `{"tagOwners":{"tag:x":["u1@"]},"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`,
+			before: types.Nodes{ownRulesNode(1, u1, nil), ownRulesNode(2, u1, nil), ownRulesNode(3, nil, []string{"tag:x"}, "0.0.0.0/0", "::/0")},
+			after:  types.Nodes{ownRulesNode(1, nil, []string{"tag:x"}), ownRulesNode(2, u1, nil), ownRulesNode(3, nil, []string{"tag:x"}, "0.0.0.0/0", "::/0")},
+			want:   []types.NodeID{2, 3},
+		},
+		{
+			// A new u2 node is a new source of the via rules r1 carries.
+			name: "via",
+			policy: `{"tagOwners":{"tag:router":["u1@"]},
+				"grants":[{"src":["u2@"],"dst":["10.1.0.0/24"],"ip":["*"],"via":["tag:router"]}]}`,
+			before: types.Nodes{ownRulesNode(1, nil, []string{"tag:router"}, "10.1.0.0/24"), ownRulesNode(2, u2, nil)},
+			after:  types.Nodes{ownRulesNode(1, nil, []string{"tag:router"}, "10.1.0.0/24"), ownRulesNode(2, u2, nil), ownRulesNode(4, u2, nil)},
+			want:   []types.NodeID{1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prev, err := NewPolicyManager([]byte(tt.policy), scanUsers, tt.before.ViewSlice())
+			require.NoError(t, err)
+
+			for _, n := range tt.before {
+				_, err := prev.FilterForNode(n.View())
+				require.NoError(t, err)
+			}
+
+			inc, err := NewPolicyManagerFrom(prev, []byte(tt.policy), scanUsers, tt.after.ViewSlice())
+			require.NoError(t, err)
+
+			fresh, err := NewPolicyManager([]byte(tt.policy), scanUsers, tt.after.ViewSlice())
+			require.NoError(t, err)
+
+			changed, all := inc.FilterChangedNodes(prev)
+			require.False(t, all)
+
+			for _, id := range tt.want {
+				assert.Contains(t, changed, id)
+
+				n := tt.after[slices.IndexFunc(tt.after, func(n *types.Node) bool { return n.ID == id })]
+
+				was, err := prev.FilterForNode(prev.nodesByID[id])
+				require.NoError(t, err)
+
+				want, err := fresh.FilterForNode(n.View())
+				require.NoError(t, err)
+
+				got, err := inc.FilterForNode(n.View())
+				require.NoError(t, err)
+
+				assert.NotEqual(t, want, was, "node %d's own rules must change", id)
+				assert.Equal(t, want, got, "node %d", id)
+			}
+		})
+	}
 }
