@@ -463,12 +463,13 @@ func TestGitHubIssue3129_TransientlyBlockedWriteKeepsSessionLive(t *testing.T) {
 			app.mapBatcher.Close()
 			require.NoError(t, app.state.Close())
 
-			app.state = reloadedState
-			// The hub watched the state it was built with.
-			go app.mapHub.Watch(reloadedState)
-			t.Cleanup(func() {
-				require.NoError(t, app.state.Close())
-			})
+	app.state = reloadedState
+
+	// The hub watched the state it was built with.
+	app.mapHub.Watch(reloadedState)
+	t.Cleanup(func() {
+		require.NoError(t, app.state.Close())
+	})
 
 			nodeView, ok := app.state.GetNodeByID(createdNode.ID)
 			require.True(t, ok, "expected node to be present after reload")
@@ -617,8 +618,9 @@ func TestDeletedNodeEndsLongPoll(t *testing.T) {
 	require.NoError(t, err)
 
 	app.state = reloadedState
+
 	// The hub watched the state it was built with.
-	go app.mapHub.Watch(reloadedState)
+	app.mapHub.Watch(reloadedState)
 	t.Cleanup(func() {
 		require.NoError(t, app.state.Close())
 	})
@@ -896,8 +898,9 @@ func TestDeletedNodeInterruptsBlockedWrite(t *testing.T) {
 	require.NoError(t, err)
 
 	app.state = reloadedState
+
 	// The hub watched the state it was built with.
-	go app.mapHub.Watch(reloadedState)
+	app.mapHub.Watch(reloadedState)
 	t.Cleanup(func() {
 		require.NoError(t, app.state.Close())
 	})

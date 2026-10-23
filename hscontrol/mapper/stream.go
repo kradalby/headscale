@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/prometheus/client_golang/prometheus"
@@ -208,12 +209,17 @@ func NewHub() *Hub {
 // Watch follows s until the hub closes. After each commit it wakes the
 // sessions [Route] names, and ends the sessions of nodes that were
 // deleted, even a session whose write is blocked, which its own loop
-// cannot notice.
+// cannot notice. It subscribes before returning: a session that renders
+// after Watch returns is woken for every later commit.
 func (h *Hub) Watch(s *state.State) {
 	sub := s.Subscribe()
-	defer sub.Close()
-
 	last := s.Snapshot()
+
+	go h.watch(s, sub, last)
+}
+
+func (h *Hub) watch(s *state.State, sub *graph.Subscription, last *state.Snapshot) {
+	defer sub.Close()
 
 	for {
 		select {
