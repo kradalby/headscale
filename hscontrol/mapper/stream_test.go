@@ -1,6 +1,7 @@
 package mapper
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -754,6 +755,10 @@ func testStreamsConverge(t *testing.T, r *rand.Rand) {
 		resps, err := st.Initial(s.Snapshot())
 		require.NoError(t, err)
 
+		for _, resp := range resps {
+			requireSameEncoding(t, resp)
+		}
+
 		c := newModelClient(resps[0])
 		for _, resp := range resps[1:] {
 			c.apply(resp)
@@ -864,6 +869,7 @@ func testStreamsConverge(t *testing.T, r *rand.Rand) {
 			require.NoError(t, err)
 
 			for _, resp := range resps {
+				requireSameEncoding(t, resp)
 				sess.client.apply(resp)
 			}
 		}
@@ -1266,4 +1272,80 @@ func TestRouteWakesAllBeforeSSHIsPrepared(t *testing.T) {
 	after := s.Snapshot()
 	all, _ := Route(before, after, after.Since(before))
 	assert.True(t, all)
+}
+
+// requireSameEncoding checks [Marshal], which reuses each node render's
+// encoding, gives the bytes [json.Marshal] does, twice: once encoding the
+// renders and once from the cache.
+func requireSameEncoding(t *testing.T, resp *tailcfg.MapResponse) {
+	t.Helper()
+
+	want, err := json.Marshal(resp)
+	require.NoError(t, err)
+
+	for range 2 {
+		got, err := Marshal(resp)
+		require.NoError(t, err)
+		require.Equal(t, string(want), string(got))
+	}
+}
+
+// TestRenderFirstBoundsConcurrentFirstMaps takes every first-map slot and
+// checks the next caller waits until one is released, or its context ends.
+func TestRenderFirstBoundsConcurrentFirstMaps(t *testing.T) {
+	hub := NewHub()
+
+	releases := make([]func(), 0, runtime.GOMAXPROCS(0))
+
+	for range runtime.GOMAXPROCS(0) {
+		release, ok := hub.RenderFirst(t.Context().Done())
+		require.True(t, ok)
+
+		releases = append(releases, release)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	_, ok := hub.RenderFirst(ctx.Done())
+	require.False(t, ok, "every slot is taken")
+
+	releases[0]()
+
+	release, ok := hub.RenderFirst(t.Context().Done())
+	require.True(t, ok, "a released slot is free")
+	release()
+}
+
+// TestDERPFramesShared changes the DERP map and checks every session is
+// sent the same response, so it is encoded once.
+func TestDERPFramesShared(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	hub := NewHub()
+
+	streams := make([]*Stream, 0, len(ids))
+	for _, id := range ids {
+		st := NewStream(cfg, hub, id, capVer)
+		_, err := st.Initial(s.Snapshot())
+		require.NoError(t, err)
+
+		streams = append(streams, st)
+	}
+
+	s.SetDERPMap(&tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{901: {RegionID: 901}}})
+	snap := s.Snapshot()
+
+	var shared *tailcfg.MapResponse
+
+	for _, st := range streams {
+		resps, err := st.Update(snap)
+		require.NoError(t, err)
+		require.Len(t, resps, 1)
+
+		if shared == nil {
+			shared = resps[0]
+		}
+
+		assert.Same(t, shared, resps[0])
+	}
 }

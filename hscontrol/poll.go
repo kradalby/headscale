@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -267,7 +268,15 @@ func (m *mapSession) serveLongPoll() {
 
 	stream := mapper.NewStream(m.h.cfg, m.h.mapHub, m.node.ID, m.capVer)
 
+	release, ok := m.h.mapHub.RenderFirst(ctx.Done())
+	if !ok {
+		return
+	}
+
 	initial, err := stream.Initial(m.h.state.Snapshot())
+
+	release()
+
 	if err != nil {
 		m.log.Error().Caller().Err(err).Msg("failed to render initial map")
 		httpError(m.w, err)
@@ -432,7 +441,11 @@ func writeMapResponse(w http.ResponseWriter, compress string, flush bool, msg *t
 
 // encodeMapResponse marshals msg and, when compress, zstd compresses it.
 func encodeMapResponse(msg *tailcfg.MapResponse, compress bool) ([]byte, error) {
-	jsonBody, err := json.Marshal(msg)
+	if msg == &keepAlive {
+		return keepAliveFrame(compress)
+	}
+
+	jsonBody, err := mapper.Marshal(msg)
 	if err != nil {
 		return nil, fmt.Errorf("marshalling map response: %w", err)
 	}
@@ -476,6 +489,30 @@ func writeMapFrame(
 	}
 
 	return nil
+}
+
+// keepAliveFrame returns keepAlive encoded, which every session sends.
+func keepAliveFrame(compress bool) ([]byte, error) {
+	i := 0
+	if compress {
+		i = 1
+	}
+
+	f := &keepAliveFrames[i]
+	f.once.Do(func() {
+		f.b, f.err = json.Marshal(&keepAlive)
+		if f.err == nil && compress {
+			f.b = zstdframe.AppendEncode(nil, f.b, zstdframe.FastestCompression)
+		}
+	})
+
+	return f.b, f.err
+}
+
+var keepAliveFrames [2]struct {
+	once sync.Once
+	b    []byte
+	err  error
 }
 
 var keepAlive = tailcfg.MapResponse{

@@ -1,10 +1,14 @@
 package mapper
 
 import (
+	jsonv1 "encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"reflect"
-	"slices"
+	"runtime"
 	"sync"
 	"time"
+	"weak"
 
 	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/state"
@@ -50,8 +54,8 @@ func (st *Stream) Initial(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) 
 	var removed []tailcfg.NodeID
 
 	for _, id := range st.hub.lastPeers(st.nodeID) {
-		if _, ok := nm.peer(id); !ok {
-			removed = append(removed, id)
+		if _, ok := nm.peer(id.NodeID()); !ok && id != st.nodeID {
+			removed = append(removed, id.NodeID())
 		}
 	}
 
@@ -61,7 +65,8 @@ func (st *Stream) Initial(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) 
 
 	st.sent = nm
 	nm.base = nil
-	st.hub.setLastPeers(st.nodeID, peerIDs(nm))
+
+	st.hub.setLastPeers(st.nodeID, st.r.lastPeerIDs)
 	st.dump(out)
 
 	return out, nil
@@ -89,7 +94,7 @@ func (st *Stream) Update(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) {
 
 	if len(out) > 0 {
 		if peersMoved {
-			st.hub.setLastPeers(st.nodeID, peerIDs(nm))
+			st.hub.setLastPeers(st.nodeID, st.r.lastPeerIDs)
 		}
 
 		st.dump(out)
@@ -157,9 +162,15 @@ type Hub struct {
 	mu       sync.Mutex
 	sessions map[types.NodeID]map[*Session]struct{}
 
-	// sentPeers is the peer set each node was last sent, kept across its
-	// sessions so a reconnect can announce peers removed in between.
-	sentPeers map[types.NodeID][]tailcfg.NodeID
+	// firstMaps bounds the first maps rendering at once: after a restart
+	// every node reconnects and asks for a full map together.
+	firstMaps chan struct{}
+
+	// sentPeers is the peer view each node was last sent, kept across its
+	// sessions so a reconnect can announce peers removed in between. Views
+	// are the snapshot's, shared by every node seeing the same peers, so
+	// this costs no copy per node.
+	sentPeers map[types.NodeID][]types.NodeID
 
 	// renders and classes are shared by every session's renderer, and
 	// frames by every session's encoder.
@@ -200,9 +211,21 @@ func (s *Session) wake() {
 func NewHub() *Hub {
 	return &Hub{
 		sessions:  make(map[types.NodeID]map[*Session]struct{}),
-		sentPeers: make(map[types.NodeID][]tailcfg.NodeID),
+		sentPeers: make(map[types.NodeID][]types.NodeID),
 		renders:   &peerRenders{},
 		done:      make(chan struct{}),
+		firstMaps: make(chan struct{}, runtime.GOMAXPROCS(0)),
+	}
+}
+
+// RenderFirst waits for a slot to render a session's first map and
+// returns its release, or false when done closes first.
+func (h *Hub) RenderFirst(done <-chan struct{}) (func(), bool) {
+	select {
+	case h.firstMaps <- struct{}{}:
+		return func() { <-h.firstMaps }, true
+	case <-done:
+		return nil, false
 	}
 }
 
@@ -444,14 +467,16 @@ func (h *Hub) Close() {
 	}
 }
 
-func (h *Hub) lastPeers(nodeID types.NodeID) []tailcfg.NodeID {
+// lastPeers returns the peer view nodeID was last sent; it may hold the
+// node itself.
+func (h *Hub) lastPeers(nodeID types.NodeID) []types.NodeID {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	return slices.Clone(h.sentPeers[nodeID])
+	return h.sentPeers[nodeID]
 }
 
-func (h *Hub) setLastPeers(nodeID types.NodeID, ids []tailcfg.NodeID) {
+func (h *Hub) setLastPeers(nodeID types.NodeID, ids []types.NodeID) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -469,8 +494,10 @@ type frameCache struct {
 	// sending it hold the same one.
 	patches map[[2]*tailcfg.Node]patchResult
 
-	at     time.Time // the commit time frames are for
-	frames map[*tailcfg.PeerChange]*sharedFrame
+	at time.Time // the commit time frames are for
+	// frames holds the shared response by what it carries: its one patch
+	// or its DERP map.
+	frames map[any]*sharedFrame
 	byResp map[*tailcfg.MapResponse]*sharedFrame
 }
 
@@ -518,11 +545,18 @@ func (fc *frameCache) patch(before, after *tailcfg.Node) (*tailcfg.PeerChange, b
 // holding just a single shared patch and a ControlTime is shared, any
 // other is returned as is.
 func (fc *frameCache) share(resp *tailcfg.MapResponse) *tailcfg.MapResponse {
-	if !patchOnly(resp) {
+	var p any
+
+	switch {
+	case patchOnly(resp):
+		p = resp.PeersChangedPatch[0]
+	case derpOnly(resp):
+		p = resp.DERPMap
+	default:
 		return resp
 	}
 
-	p, at := resp.PeersChangedPatch[0], *resp.ControlTime
+	at := *resp.ControlTime
 
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
@@ -533,7 +567,7 @@ func (fc *frameCache) share(resp *tailcfg.MapResponse) *tailcfg.MapResponse {
 		}
 
 		fc.at = at
-		fc.frames = map[*tailcfg.PeerChange]*sharedFrame{}
+		fc.frames = map[any]*sharedFrame{}
 		fc.byResp = map[*tailcfg.MapResponse]*sharedFrame{}
 	}
 
@@ -550,6 +584,18 @@ func (fc *frameCache) share(resp *tailcfg.MapResponse) *tailcfg.MapResponse {
 
 // patchOnly reports whether resp holds a single patch and its time and
 // nothing else.
+// derpOnly reports whether resp holds a DERP map and its time and nothing
+// else; every session is sent the snapshot's.
+func derpOnly(resp *tailcfg.MapResponse) bool {
+	if resp.ControlTime == nil || resp.DERPMap == nil {
+		return false
+	}
+
+	only := tailcfg.MapResponse{DERPMap: resp.DERPMap, ControlTime: resp.ControlTime}
+
+	return reflect.DeepEqual(*resp, only)
+}
+
 func patchOnly(resp *tailcfg.MapResponse) bool {
 	if resp.ControlTime == nil || len(resp.PeersChangedPatch) != 1 {
 		return false
@@ -583,4 +629,38 @@ func (h *Hub) Encode(
 	f.once[i].Do(func() { f.encoded[i], f.err[i] = encode(resp, compress) })
 
 	return f.encoded[i], f.err[i]
+}
+
+// Marshal encodes resp as [encoding/json.Marshal] does, writing each node
+// it holds from the encoding cached for that render: a peer's render is
+// shared by every session that sees it and never changes, so its JSON is
+// made once for all the maps that carry it.
+func Marshal(resp *tailcfg.MapResponse) ([]byte, error) {
+	return jsonv2.Marshal(resp, jsonv1.DefaultOptionsV1(), nodeMarshalers)
+}
+
+var (
+	nodeMarshalers = jsonv2.WithMarshalers(jsonv2.MarshalToFunc(marshalNode))
+
+	// nodeJSON holds the encoding of each node render while the render
+	// lives, by a weak pointer to it.
+	nodeJSON sync.Map
+)
+
+func marshalNode(enc *jsontext.Encoder, n *tailcfg.Node) error {
+	key := weak.Make(n)
+	if b, ok := nodeJSON.Load(key); ok {
+		return enc.WriteValue(b.(jsontext.Value)) //nolint:forcetypeassert // only values stored
+	}
+
+	b, err := jsonv2.Marshal(n, jsonv1.DefaultOptionsV1())
+	if err != nil {
+		return err
+	}
+
+	if _, loaded := nodeJSON.LoadOrStore(key, jsontext.Value(b)); !loaded {
+		runtime.AddCleanup(n, func(k weak.Pointer[tailcfg.Node]) { nodeJSON.Delete(k) }, key)
+	}
+
+	return enc.WriteValue(b)
 }
