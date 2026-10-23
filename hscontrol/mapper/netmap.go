@@ -85,6 +85,9 @@ type netMap struct {
 	changed      []tailcfg.NodeID
 	removed      []tailcfg.NodeID
 	sameProfiles bool
+	// ownerless is set when self had no owner, so no profiles were sent
+	// though peers were.
+	ownerless bool
 }
 
 // renderer renders one node's netMap. After the first render it renders a
@@ -626,7 +629,10 @@ func (cm *classMaps) prune(snap *state.Snapshot) {
 // shared until one changes.
 func (r *renderer) renderProfiles(snap *state.Snapshot, self types.NodeView, nm *netMap) {
 	base := nm.base
-	if base == nil || !self.Owner().Valid() {
+	nm.ownerless = !self.Owner().Valid()
+
+	// Without an owner no profiles go out; gaining one sends every peer's.
+	if base == nil || nm.ownerless || base.ownerless {
 		nm.profiles = make(map[tailcfg.UserID]tailcfg.UserProfile)
 		for _, p := range generateUserProfiles(self, snap.ListPeers(r.nodeID)) {
 			nm.profiles[p.ID] = p

@@ -727,6 +727,15 @@ func testStreamsConverge(t *testing.T, r *rand.Rand) {
 		          {"action":"accept","src":["u1@"],"dst":["u1@:*","10.0.0.0/24:*"]}],
 		  "ssh":[{"action":"accept","src":["u1@"],"dst":["tag:b"],"users":["root"]}]}`,
 		`{"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`,
+		`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
+		  "acls":[{"action":"accept","src":["*"],"dst":["*:*"]}],
+		  "ssh":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self"],"users":["root"]},
+		         {"action":"check","src":["tag:a"],"dst":["tag:b"],"users":["autogroup:nonroot"]}]}`,
+		// SSH alone connects u1 to tag:b, so only SSH wakes reach them.
+		`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
+		  "acls":[{"action":"accept","src":["tag:a"],"dst":["tag:a:*"]}],
+		  "ssh":[{"action":"accept","src":["u1@"],"dst":["tag:b"],"users":["root"]},
+		         {"action":"accept","src":["autogroup:member"],"dst":["autogroup:self"],"users":["root"]}]}`,
 		`{"nodeAttrs":[{"target":["u1@"],"attr":["disable-ipv4"]}],
 		  "acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`,
 	}
@@ -1198,3 +1207,4 @@ func TestStreamCatchesUpFromBeyondTheEditLog(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, client.sameAs(newModelClient(fresh[0])))
 }
+
