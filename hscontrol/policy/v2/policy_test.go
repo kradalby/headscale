@@ -2968,7 +2968,9 @@ func TestForeignViewsDoNotPoisonCaches(t *testing.T) {
 
 // BenchmarkCompileWideACL compiles a CI-shaped policy: one rule per CI tag
 // to its own service, and one wide rule from every CI tag to the shared
-// services, which compiles to one grant per destination.
+// services, which compiles to one grant per destination. new compiles from
+// scratch after a batch of tagged joins; from-previous from the compile
+// before them.
 func BenchmarkCompileWideACL(b *testing.B) {
 	const (
 		ciTags = 300
@@ -3031,6 +3033,16 @@ func BenchmarkCompileWideACL(b *testing.B) {
 	b.Run("new", func(b *testing.B) {
 		for b.Loop() {
 			_, err := NewPolicyManager(pol, nil, after.ViewSlice())
+			require.NoError(b, err)
+		}
+	})
+
+	b.Run("from-previous", func(b *testing.B) {
+		prev, err := NewPolicyManager(pol, nil, before.ViewSlice())
+		require.NoError(b, err)
+
+		for b.Loop() {
+			_, err := NewPolicyManagerFrom(prev, pol, nil, after.ViewSlice())
 			require.NoError(b, err)
 		}
 	})
