@@ -546,6 +546,14 @@ func (w *world) update(fn func(nodes *nodeEdit)) *Snapshot {
 // that land together are also elected together: two HA routers coming back
 // at once keep their healthy primary instead of handing the route to
 // whichever reconnected first.
+//
+// TODO(kradalby): let idle writes commit at once. Without the wait, the
+// HA failover and HA prober tests disagree on recovery after a full
+// outage; either:
+//   - hold the route for the previous primary briefly while it is online,
+//     and let the prober test allow that window;
+//   - let the first healthy router back win, and change the failover
+//     test's expectation.
 func (w *world) lingerForBatch() {
 	if w.batchTimeout <= 0 {
 		return
