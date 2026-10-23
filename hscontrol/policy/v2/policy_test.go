@@ -3132,3 +3132,67 @@ func BenchmarkNewPolicyManagerAfterTagJoin(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkCompileNodeAttrs compiles a policy with many nodeAttrs over a
+// tagged fleet after a batch of joins: new from scratch, from-previous
+// from the compile before them.
+func BenchmarkCompileNodeAttrs(b *testing.B) {
+	const (
+		tags  = 50
+		nodes = 10000
+		joins = 50
+	)
+
+	r := rand.New(rand.NewPCG(3, 4)) //nolint:gosec // reproducible benchmark input
+
+	owners := map[string][]string{}
+	attrs := make([]map[string]any, 0, tags)
+
+	for i := range tags {
+		t := fmt.Sprintf("tag:t%d", i)
+		owners[t] = []string{}
+		attrs = append(attrs, map[string]any{"target": []string{t}, "attr": []string{fmt.Sprintf("custom:a%d", i)}})
+	}
+
+	pol := must(json.Marshal(map[string]any{
+		"tagOwners": owners,
+		"acls":      []map[string]any{{"action": "accept", "src": []string{"*"}, "dst": []string{"*:*"}}},
+		"nodeAttrs": attrs,
+	}))
+
+	node := func(i int) *types.Node {
+		v4 := netip.AddrFrom4([4]byte{100, 64 + byte(i>>16), byte(i >> 8), byte(i)}) //nolint:gosec
+
+		return &types.Node{
+			ID: types.NodeID(i + 1), Hostname: fmt.Sprintf("n%d", i), IPv4: &v4, //nolint:gosec
+			Tags: []string{fmt.Sprintf("tag:t%d", r.IntN(tags))},
+		}
+	}
+
+	before := make(types.Nodes, 0, nodes)
+	for i := range nodes {
+		before = append(before, node(i))
+	}
+
+	after := slices.Clone(before)
+	for i := range joins {
+		after = append(after, node(nodes+i))
+	}
+
+	b.Run("new", func(b *testing.B) {
+		for b.Loop() {
+			_, err := NewPolicyManager(pol, nil, after.ViewSlice())
+			require.NoError(b, err)
+		}
+	})
+
+	b.Run("from-previous", func(b *testing.B) {
+		prev, err := NewPolicyManager(pol, nil, before.ViewSlice())
+		require.NoError(b, err)
+
+		for b.Loop() {
+			_, err := NewPolicyManagerFrom(prev, pol, nil, after.ViewSlice())
+			require.NoError(b, err)
+		}
+	})
+}
