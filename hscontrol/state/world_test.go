@@ -1109,3 +1109,26 @@ func TestWorldSetUsersUnchangedDoesNotWait(t *testing.T) {
 		t.Fatal("an unchanged user refresh waited for a commit")
 	}
 }
+
+// TestWorldIdleWriteCommitsAtOnce sets an hour-long batch timeout and
+// checks a write outside an HA outage does not wait for it.
+func TestWorldIdleWriteCommitsAtOnce(t *testing.T) {
+	alice := &types.User{Name: "alice"}
+	alice.ID = 1
+
+	w, _ := testWorld(t, worldNode(1, alice, "100.64.0.1"))
+	w.batchTimeout = time.Hour
+
+	done := make(chan struct{})
+
+	go func() {
+		w.UpdateNode(1, func(n *types.Node) { n.Hostname = "renamed" })
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a write outside an outage waited for the batch timeout")
+	}
+}

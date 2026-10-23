@@ -514,9 +514,10 @@ auto_update:
 #   #
 #   # register_cache_max_entries: 1024
 #
-#   # NodeStore write batching configuration.
-#   # The NodeStore batches write operations before rebuilding peer relationships,
-#   # which is computationally expensive. Batching reduces rebuild frequency.
+#   # Node writes commit at once, and writes arriving during a commit share
+#   # the next one. While an HA subnet route has an unhealthy primary and no
+#   # healthy router, writes instead wait up to the timeout, or until the
+#   # batch size, so routers coming back together are elected together.
 #   #
 #   # node_store_batch_size: 100
 #   # node_store_batch_timeout: 500ms

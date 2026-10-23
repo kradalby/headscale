@@ -468,32 +468,13 @@ type Tuning struct {
 	// A value of 0 falls back to defaultRegisterCacheMaxEntries (1024).
 	RegisterCacheMaxEntries int
 
-	// NodeStoreBatchSize controls how many write operations are accumulated
-	// before rebuilding the in-memory node snapshot.
-	//
-	// The NodeStore batches write operations (add/update/delete nodes) before
-	// rebuilding its in-memory data structures. Rebuilding involves recalculating
-	// peer relationships between all nodes based on the current ACL policy, which
-	// is computationally expensive and scales with the square of the number of nodes.
-	//
-	// By batching writes, Headscale can process N operations but only rebuild once,
-	// rather than rebuilding N times. This significantly reduces CPU usage during
-	// bulk operations like initial sync or policy updates.
-	//
-	// Trade-off: Higher values reduce CPU usage from rebuilds but increase latency
-	// for individual operations waiting for their batch to complete.
-	NodeStoreBatchSize int
-
-	// NodeStoreBatchTimeout is the maximum time to wait before processing a
-	// partial batch of node operations.
-	//
-	// When [Tuning.NodeStoreBatchSize] operations haven't accumulated, this timeout ensures
-	// writes don't wait indefinitely. The batch processes when either the size
-	// threshold is reached OR this timeout expires, whichever comes first.
-	//
-	// Trade-off: Lower values provide faster response for individual operations
-	// but trigger more frequent (expensive) peer map rebuilds. Higher values
-	// optimize for bulk throughput at the cost of individual operation latency.
+	// NodeStoreBatchSize and NodeStoreBatchTimeout bound how node writes
+	// batch during an HA outage, while a subnet route has an unhealthy
+	// primary and no healthy router: a write waits up to the timeout, or
+	// until the size is queued, so routers coming back together are
+	// elected together. Otherwise writes commit at once, and those arriving
+	// during a commit share the next one.
+	NodeStoreBatchSize    int
 	NodeStoreBatchTimeout time.Duration
 }
 

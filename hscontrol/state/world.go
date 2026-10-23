@@ -105,12 +105,14 @@ type world struct {
 	committing bool
 
 	// batchSize and batchTimeout are [types.Tuning.NodeStoreBatchSize] and
-	// [types.Tuning.NodeStoreBatchTimeout]: a commit waits up to the timeout
-	// for writes to batch, or until batchSize are queued. Zero waits for
-	// nothing. full wakes a waiting commit once the batch is full.
+	// [types.Tuning.NodeStoreBatchTimeout]: during an HA outage a commit
+	// waits up to the timeout for writes to batch, or until batchSize are
+	// queued. Zero waits for nothing. full wakes a waiting commit once the
+	// batch is full. inOutage is set after each commit, see [hasOutage].
 	batchSize    int
 	batchTimeout time.Duration
 	full         chan struct{}
+	inOutage     atomic.Bool
 
 	nodes        graph.Input[*nodeMap]
 	users        graph.Input[[]types.User]
@@ -535,25 +537,21 @@ func (w *world) update(fn func(nodes *nodeEdit)) *Snapshot {
 	w.writeMu.Unlock()
 
 	if lead {
-		w.lingerForBatch()
+		if w.inOutage.Load() {
+			w.lingerForBatch()
+		}
+
 		w.commitWrites()
 	}
 
 	return <-nw.done
 }
 
-// lingerForBatch waits for writes to batch, as the tuning asks. Writes
-// that land together are also elected together: two HA routers coming back
-// at once keep their healthy primary instead of handing the route to
-// whichever reconnected first.
-//
-// TODO(kradalby): let idle writes commit at once. Without the wait, the
-// HA failover and HA prober tests disagree on recovery after a full
-// outage; either:
-//   - hold the route for the previous primary briefly while it is online,
-//     and let the prober test allow that window;
-//   - let the first healthy router back win, and change the failover
-//     test's expectation.
+// lingerForBatch waits for writes to batch, as the tuning asks. It runs
+// only during an HA outage: writes that land together are elected
+// together, so two routers coming back at once keep their primary instead
+// of handing the route to whichever reconnected first. Any other write
+// commits at once.
 func (w *world) lingerForBatch() {
 	if w.batchTimeout <= 0 {
 		return
@@ -607,6 +605,8 @@ func (w *world) commitWrites() {
 	worldBatchSize.Observe(float64(len(batch)))
 
 	out := &Snapshot{s: snap, w: w}
+	w.inOutage.Store(hasOutage(out))
+
 	for _, nw := range batch {
 		nw.done <- out
 	}
@@ -867,6 +867,33 @@ func onlineAdvertisers(nodes *nodeMap) map[netip.Prefix][]types.NodeID {
 	}
 
 	return advertisers
+}
+
+// hasOutage reports whether s has an HA outage: a prefix whose primary is
+// unhealthy while no router for it is healthy. The primary keeps the
+// route then, and the routers coming back should be elected together.
+func hasOutage(s *Snapshot) bool {
+	nodes := s.nodes()
+	groups := graph.Get(s.s, s.w.index).advertisers.Groups
+
+	healthy := func(id types.NodeID) bool {
+		n, ok := nodes.Get(id)
+
+		return ok && !n.Unhealthy
+	}
+
+	for p, id := range graph.Get(s.s, s.w.primaries).routes {
+		if healthy(id) {
+			continue
+		}
+
+		candidates, _ := groups.Get(p)
+		if !slices.ContainsFunc(candidates, healthy) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // electPrimaryRoutes elects every prefix from scratch, keeping prev's
