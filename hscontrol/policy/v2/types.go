@@ -1559,8 +1559,8 @@ func resolveAutoApprovers(p *Policy, users types.Users, nodes views.Slice[types.
 				return nil, nil, fmt.Errorf("%w: %v", ErrAutoApproverNotAlias, autoApprover)
 			}
 			// If it does not resolve, that means the autoApprover is not associated with any IP addresses.
-			ips, _ := aa.resolve(p, users, nodes)
-			routes[prefix].AddSet(ips)
+			ips, _ := p.resolveAlias(aa, users, nodes)
+			addResolved(routes[prefix], ips)
 		}
 	}
 
@@ -1574,8 +1574,8 @@ func resolveAutoApprovers(p *Policy, users types.Users, nodes views.Slice[types.
 				return nil, nil, fmt.Errorf("%w: %v", ErrAutoApproverNotAlias, autoApprover)
 			}
 			// If it does not resolve, that means the autoApprover is not associated with any IP addresses.
-			ips, _ := aa.resolve(p, users, nodes)
-			exitNodeSetBuilder.AddSet(ips)
+			ips, _ := p.resolveAlias(aa, users, nodes)
+			addResolved(&exitNodeSetBuilder, ips)
 		}
 	}
 

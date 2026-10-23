@@ -2280,12 +2280,8 @@ func resolveTagOwners(p *Policy, users types.Users, nodes views.Slice[types.Node
 
 			case Alias:
 				// If it does not resolve, that means the tag is not associated with any IP addresses.
-				resolved, _ := o.Resolve(p, users, nodes)
-				if resolved != nil {
-					for _, pref := range resolved.Prefixes() {
-						ips.AddPrefix(pref)
-					}
-				}
+				resolved, _ := p.resolveAlias(o, users, nodes)
+				addResolved(&ips, resolved)
 
 			default:
 				// Should never happen - after flattening, all owners should be Alias types

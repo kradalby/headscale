@@ -201,7 +201,7 @@ func (pol *Policy) compileNodeAttrs(
 			continue
 		}
 
-		resolved, err := na.Targets.Resolve(pol, users, nodes)
+		resolved, err := pol.resolveAliases(na.Targets, users, nodes)
 		if err != nil {
 			return nil, fmt.Errorf("nodeAttrs target %s: %w", na.Targets, err)
 		}
@@ -439,6 +439,38 @@ func (pol *Policy) resolveAlias(a Alias, users types.Users, nodes views.Slice[ty
 	pol.aliases[key] = aliasResult{alias: a, ips: ips, err: err}
 
 	return ips, err
+}
+
+// resolveAliases is [Aliases.Resolve] through [Policy.resolveAlias].
+func (pol *Policy) resolveAliases(as Aliases, users types.Users, nodes views.Slice[types.NodeView]) (ResolvedAddresses, error) {
+	var (
+		ips  netipx.IPSetBuilder
+		errs []error
+	)
+
+	for _, a := range as {
+		r, err := pol.resolveAlias(a, users, nodes)
+		if err != nil {
+			errs = append(errs, err)
+		}
+
+		addResolved(&ips, r)
+	}
+
+	return newResolvedAddresses(buildIPSetMultiErr(&ips, errs))
+}
+
+// addResolved adds r's addresses to b; r may be nil.
+func addResolved(b *netipx.IPSetBuilder, r ResolvedAddresses) {
+	switch r := r.(type) {
+	case nil:
+	case resolved:
+		b.AddSet(&r.ips)
+	default:
+		for _, p := range r.Prefixes() {
+			b.AddPrefix(p)
+		}
+	}
 }
 
 // aliasesOrNil returns pol's alias cache; pol may be nil.
@@ -789,7 +821,7 @@ func (pol *Policy) compileOtherDests(
 				continue
 			}
 
-			addresses, err := dst.Resolve(pol, users, nodes)
+			addresses, err := pol.resolveAlias(dst, users, nodes)
 			resolvedDests[i] = resolvedDestination{
 				Alias:     dst,
 				addresses: addresses,

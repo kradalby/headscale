@@ -181,6 +181,22 @@ func scanRandomPolicy(r *rand.Rand) []byte {
 		"hosts":     map[string]string{"lan": "10.1.0.0/16", "host1": "100.64.0.5/32", "v6net": "fd7a:115c:a1e0::/122"},
 	}
 
+	// Identities that may approve routes or receive attributes.
+	owners := []string{"u1@", "u2@", "group:a", "group:b", "tag:srv", "tag:router", "tag:exit"}
+
+	if r.IntN(2) == 0 {
+		pol["autoApprovers"] = map[string]any{
+			"routes":   map[string][]string{"10.1.0.0/24": pick(owners, 1+r.IntN(2)), "0.0.0.0/0": pick(owners, 1)},
+			"exitNode": pick(owners, 1+r.IntN(2)),
+		}
+	}
+
+	if r.IntN(2) == 0 {
+		pol["nodeAttrs"] = []any{
+			map[string]any{"target": pick(append(owners, "*", "autogroup:member"), 1+r.IntN(2)), "attr": []string{"custom:scan"}},
+		}
+	}
+
 	// Neither section: allow-all. Empty grants: deny-all. Otherwise rules.
 	switch r.IntN(20) {
 	case 0:
@@ -933,6 +949,10 @@ func TestNewPolicyManagerFromMatchesFresh(t *testing.T) {
 			require.Equal(t, fresh.compiledGrants, inc.compiledGrants, msg)
 			require.Equal(t, fresh.filter, inc.filter, msg)
 			require.Equal(t, fresh.BuildPeerMap(nodes.ViewSlice()), inc.BuildPeerMap(nodes.ViewSlice()), msg)
+			require.Equal(t, fresh.tagOwnerMap, inc.tagOwnerMap, msg)
+			require.Equal(t, fresh.autoApproveMap, inc.autoApproveMap, msg)
+			require.Equal(t, fresh.exitSet, inc.exitSet, msg)
+			require.Equal(t, fresh.nodeAttrsMap, inc.nodeAttrsMap, msg)
 
 			for _, n := range nodes {
 				want, err := fresh.FilterForNode(n.View())
