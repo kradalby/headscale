@@ -19,6 +19,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/zstdframe"
 )
@@ -690,11 +691,18 @@ type oracleSession struct {
 // session's client equals a fresh session's. Only the sessions [Route]
 // names are updated, so a session it skips must already be up to date.
 func TestStreamsConvergeUnderRandomWrites(t *testing.T) {
+	// Every recompile is checked against a compile from scratch too.
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+
+	failures := state.PolicyAuditFailures()
+
 	for seed := range uint64(6) {
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			testStreamsConverge(t, rand.New(rand.NewPCG(seed, 6))) //nolint:gosec // deterministic test input
 		})
 	}
+
+	require.Equal(t, failures, state.PolicyAuditFailures(), "incremental compiles must match compiles from scratch")
 }
 
 func testStreamsConverge(t *testing.T, r *rand.Rand) {

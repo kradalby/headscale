@@ -2601,3 +2601,79 @@ func (pm *PolicyManager) NodeCapMaps() map[types.NodeID]tailcfg.NodeCapMap {
 
 	return pm.nodeAttrsMap
 }
+
+// Audit compiles src from scratch and returns how pm, which compiled the
+// same document, users and nodes incrementally, differs from it: in the
+// global filter, tag owners, auto-approvers, node attributes, peers, or
+// any node's filter or SSH policy. It is for debugging and tests; it
+// costs a full compile and a render of every node.
+func (pm *PolicyManager) Audit(src []byte, users []types.User, nodes views.Slice[types.NodeView]) error {
+	fresh, err := NewPolicyManager(src, users, nodes)
+	if err != nil {
+		return fmt.Errorf("compiling from scratch: %w", err)
+	}
+
+	for _, c := range []struct {
+		what     string
+		inc, fsh any
+	}{
+		{"filter", pm.filter, fresh.filter},
+		{"tag owners", pm.tagOwnerMap, fresh.tagOwnerMap},
+		{"auto-approvers", pm.autoApproveMap, fresh.autoApproveMap},
+		{"exit auto-approvers", pm.exitSet, fresh.exitSet},
+		{"node attributes", pm.nodeAttrsMap, fresh.nodeAttrsMap},
+		{"peers", pm.BuildPeerMap(nodes), fresh.BuildPeerMap(nodes)},
+	} {
+		if !reflect.DeepEqual(c.inc, c.fsh) {
+			return fmt.Errorf("%w: %s", errAuditMismatch, c.what)
+		}
+	}
+
+	for _, n := range nodes.All() {
+		inc, err := pm.FilterForNode(n)
+		if err != nil {
+			return err
+		}
+
+		fsh, err := fresh.FilterForNode(n)
+		if err != nil {
+			return err
+		}
+
+		if !reflect.DeepEqual(inc, fsh) {
+			return fmt.Errorf("%w: filter of node %d", errAuditMismatch, n.ID())
+		}
+	}
+
+	var sshErr error
+
+	pm.sshPreps.Range(func(baseURL string, _ *sshPrep) bool {
+		for _, n := range nodes.All() {
+			inc, err := pm.SSHPolicy(baseURL, n)
+			if err != nil {
+				sshErr = err
+
+				return false
+			}
+
+			fsh, err := fresh.SSHPolicy(baseURL, n)
+			if err != nil {
+				sshErr = err
+
+				return false
+			}
+
+			if !reflect.DeepEqual(inc, fsh) {
+				sshErr = fmt.Errorf("%w: SSH policy of node %d", errAuditMismatch, n.ID())
+
+				return false
+			}
+		}
+
+		return true
+	})
+
+	return sshErr
+}
+
+var errAuditMismatch = errors.New("incremental compile differs from a compile from scratch")

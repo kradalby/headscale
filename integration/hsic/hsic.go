@@ -447,6 +447,9 @@ func New(
 		"HEADSCALE_DEBUG_DEADLOCK_TIMEOUT=5s",
 		"HEADSCALE_DEBUG_HIGH_CARDINALITY_METRICS=1",
 		"HEADSCALE_DEBUG_DUMP_CONFIG=1",
+		// Check every incremental policy compile against one from scratch;
+		// a mismatch logs "policy audit".
+		"HEADSCALE_DEBUG_POLICY_AUDIT=1",
 	}
 	if hsic.hasTLS() {
 		hsic.env["HEADSCALE_TLS_CERT_PATH"] = tlsCertPath

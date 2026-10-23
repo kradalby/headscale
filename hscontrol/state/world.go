@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/graph"
@@ -21,6 +22,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog/log"
+	"tailscale.com/envknob"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -63,7 +65,16 @@ var (
 		Name:      "policy_compiles_total",
 		Help:      "Policy compilations by result.",
 	}, []string{"result"})
+
+	// policyAudit compiles every policy from scratch as well and reports
+	// where the incremental compile differs.
+	policyAudit         = envknob.RegisterBool("HEADSCALE_DEBUG_POLICY_AUDIT")
+	policyAuditFailures atomic.Uint64
 )
+
+// PolicyAuditFailures counts the compiles the policy audit found to
+// differ from a compile from scratch.
+func PolicyAuditFailures() uint64 { return policyAuditFailures.Load() }
 
 // nodeMap is the set of nodes. A stored node is never mutated: a write
 // stores a modified copy, so a [types.NodeView] taken from a snapshot stays
@@ -225,6 +236,14 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 			}
 
 			policyCompiles.WithLabelValues("ok").Inc()
+
+			if pmv2, ok := pm.(*policyv2.PolicyManager); ok && last != nil && policyAudit() {
+				err := pmv2.Audit(src, users, nodes)
+				if err != nil {
+					policyAuditFailures.Add(1)
+					log.Error().Err(err).Msg("policy audit")
+				}
+			}
 
 			return &compiledPolicy{pm: pm}
 		})
