@@ -475,6 +475,7 @@ func requireAllClientsOfflineStaged(t *testing.T, headscale ControlServer, expec
 				delete(onlineMap, id)
 			}
 		}
+
 		allMapResponsesOffline := true
 
 		if len(expectedNodes) == 1 {
