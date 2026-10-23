@@ -1055,6 +1055,11 @@ func BenchmarkScalingWrites(b *testing.B) {
 
 					var i, updates, rendered, woken int
 
+					byNode := make(map[types.NodeID]*Stream, len(streams))
+					for _, st := range streams {
+						byNode[st.nodeID] = st
+					}
+
 					last := s.Snapshot()
 
 					for b.Loop() {
@@ -1065,11 +1070,19 @@ func BenchmarkScalingWrites(b *testing.B) {
 						all, wake := Route(last, snap, snap.Since(last))
 						last = snap
 
-						for _, st := range streams {
-							if _, ok := wake[st.nodeID]; !all && !ok {
-								continue
-							}
+						// Visit the woken sessions only, as the hub does.
+						targets := streams
+						if !all {
+							targets = targets[:0:0]
 
+							for id := range wake {
+								if st, ok := byNode[id]; ok {
+									targets = append(targets, st)
+								}
+							}
+						}
+
+						for _, st := range targets {
 							woken++
 							before := st.r.rendered
 
