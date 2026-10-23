@@ -50,6 +50,9 @@ type PolicyManager struct {
 	sideOnce sync.Once
 	sides    *sideIndex
 
+	// dsts parses the destinations of the rules reduced per node, once.
+	dsts policyutil.DstCache
+
 	// id identifies this compile. change is [PolicyManager.FilterChangedNodes]
 	// from the compile with id changeFrom, the one this one was made from;
 	// an id, so a compile does not keep the one before it alive. Set
@@ -1211,85 +1214,150 @@ func (pm *PolicyManager) BuildPeerClasses(nodes views.Slice[types.NodeView], pre
 // rules. Nodes are found by address range, not by trying every node.
 func (pm *PolicyManager) addNodeOnlyPeers(c *PeerClasses, nodes views.Slice[types.NodeView]) {
 	idx := newSideIndex(nodes)
-	extra := map[types.NodeID]map[types.NodeID]struct{}{}
 
-	link := func(a, b types.NodeID) {
-		if a == b {
-			return
+	// A grant gives each node in to the nodes in set as peers. Rules a
+	// user's untagged nodes share make one grant for all of them, so a
+	// self clique costs a grant, not a link per pair.
+	type grant struct{ to, set []types.NodeID }
+
+	var grants []grant
+
+	give := func(to, set []types.NodeID) {
+		if len(to) > 0 && len(set) > 0 {
+			grants = append(grants, grant{to: to, set: set})
+		}
+	}
+
+	// connect adds what rule m, held by owners, connects: an owner on one
+	// side sees the other side, which sees the owner.
+	connect := func(owners []types.NodeID, m *matcher.Match) {
+		srcs, dsts := idx.srcs(m), idx.dsts(m)
+
+		if os := intersectSorted(owners, srcs); len(os) > 0 {
+			give(os, dsts)
+			give(dsts, os)
 		}
 
-		for _, p := range [][2]types.NodeID{{a, b}, {b, a}} {
-			if extra[p[0]] == nil {
-				extra[p[0]] = map[types.NodeID]struct{}{}
-			}
-
-			extra[p[0]][p[1]] = struct{}{}
+		if od := intersectSorted(owners, dsts); len(od) > 0 {
+			give(od, srcs)
+			give(srcs, od)
 		}
 	}
 
 	// Without via grants a node's own rules are its user's self rules,
 	// the same for every untagged node of the user: compile them once.
 	hasVia := slices.ContainsFunc(pm.compiledGrants, func(g compiledGrant) bool { return g.category == grantCategoryVia })
-	byUser := map[uint][]matcher.Match{}
+
+	var (
+		users []uint
+		owned = map[uint][]types.NodeID{}
+		first = map[uint]types.NodeView{}
+	)
 
 	for _, n := range nodes.All() {
-		var own []matcher.Match
-
 		if uid := n.User(); !hasVia && !n.IsTagged() && uid.Valid() {
-			var ok bool
-			if own, ok = byUser[uid.ID()]; !ok {
-				own = matcher.MatchesFromFilterRules(pm.nodeOnlyRules(n))
-				byUser[uid.ID()] = own
-			}
-		} else {
-			own = matcher.MatchesFromFilterRules(pm.nodeOnlyRules(n))
-		}
-
-		for _, m := range own {
-			srcs, dsts := idx.srcs(&m), idx.dsts(&m)
-
-			if slices.Contains(srcs, n.ID()) {
-				for _, d := range dsts {
-					link(n.ID(), d)
-				}
+			if _, seen := owned[uid.ID()]; !seen {
+				users = append(users, uid.ID())
+				first[uid.ID()] = n
 			}
 
-			if slices.Contains(dsts, n.ID()) {
-				for _, s := range srcs {
-					link(s, n.ID())
-				}
-			}
-		}
-	}
+			owned[uid.ID()] = append(owned[uid.ID()], n.ID())
 
-	for id, peers := range extra {
-		ci := c.classOf[id]
-		shared := c.views[ci]
-
-		outside := false
-
-		for p := range peers {
-			if _, found := slices.BinarySearch(shared, p); !found {
-				outside = true
-
-				break
-			}
-		}
-
-		if !outside {
 			continue
 		}
 
-		view := slices.Clone(shared)
-		for p := range peers {
-			view = append(view, p)
+		for _, m := range matcher.MatchesFromFilterRules(pm.nodeOnlyRules(n)) {
+			connect([]types.NodeID{n.ID()}, &m)
+		}
+	}
+
+	for _, uid := range users {
+		slices.Sort(owned[uid])
+
+		for _, m := range matcher.MatchesFromFilterRules(pm.nodeOnlyRules(first[uid])) {
+			connect(owned[uid], &m)
+		}
+	}
+
+	gets := map[types.NodeID][]int{}
+
+	for gi, g := range grants {
+		for _, id := range g.to {
+			gets[id] = append(gets[id], gi)
+		}
+	}
+
+	// Nodes of one class receiving the same grants share one view.
+	shared := map[string]int{}
+
+	var key strings.Builder
+
+	for _, n := range nodes.All() {
+		gs, ok := gets[n.ID()]
+		if !ok {
+			continue
 		}
 
+		ci := c.classOf[n.ID()]
+
+		key.Reset()
+		key.WriteString(strconv.Itoa(ci))
+
+		for _, gi := range gs {
+			key.WriteByte(',')
+			key.WriteString(strconv.Itoa(gi))
+		}
+
+		if vi, ok := shared[key.String()]; ok {
+			c.classOf[n.ID()] = vi
+
+			continue
+		}
+
+		base := c.views[ci]
+
+		var extra []types.NodeID
+
+		for _, gi := range gs {
+			for _, p := range grants[gi].set {
+				if _, found := slices.BinarySearch(base, p); !found {
+					extra = append(extra, p)
+				}
+			}
+		}
+
+		if len(extra) == 0 {
+			shared[key.String()] = ci
+
+			continue
+		}
+
+		view := slices.Concat(base, extra)
 		slices.Sort(view)
 
-		c.classOf[id] = len(c.views)
+		shared[key.String()] = len(c.views)
+		c.classOf[n.ID()] = len(c.views)
 		c.views = append(c.views, slices.Compact(view))
 	}
+}
+
+// intersectSorted returns the IDs in both sorted a and b.
+func intersectSorted(a, b []types.NodeID) []types.NodeID {
+	var out []types.NodeID
+
+	for i, j := 0, 0; i < len(a) && j < len(b); {
+		switch {
+		case a[i] < b[j]:
+			i++
+		case a[i] > b[j]:
+			j++
+		default:
+			out = append(out, a[i])
+			i, j = i+1, j+1
+		}
+	}
+
+	return out
 }
 
 // sideIndex finds the nodes on one side of a matcher, as
@@ -1790,7 +1858,7 @@ func (pm *PolicyManager) FilterForNode(node types.NodeView) ([]tailcfg.FilterRul
 			pm.unreducedRules(node),
 			exitNodeSelfRules(pm.compiledGrants, node, pm.userNodeIdx)...,
 		)
-		reduced = policyutil.ReduceFilterRules(node, unreduced)
+		reduced = pm.dsts.Reduce(node, unreduced)
 	}
 
 	if pm.cacheable(node) {
