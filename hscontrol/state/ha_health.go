@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog/log"
@@ -22,6 +21,7 @@ type HAHealthProber struct {
 	cfg         types.HARouteConfig
 	serverURL   string
 	isConnected func(types.NodeID) bool
+	ping        func(types.NodeID, *tailcfg.PingRequest) bool
 
 	// lastStableSession defers a timeout-driven unhealthy decision
 	// for sessions younger than one probe cycle, giving wgengine
@@ -31,18 +31,22 @@ type HAHealthProber struct {
 
 // NewHAHealthProber creates a prober that uses the given [State] for
 // ping tracking and primary route management.
-// isConnected should return true if a node has an active map session.
+// isConnected should return true if a node has an active map session;
+// ping delivers a ping request to the node's sessions and reports whether
+// one took it.
 func NewHAHealthProber(
 	s *State,
 	cfg types.HARouteConfig,
 	serverURL string,
 	isConnected func(types.NodeID) bool,
+	ping func(types.NodeID, *tailcfg.PingRequest) bool,
 ) *HAHealthProber {
 	return &HAHealthProber{
 		state:             s,
 		cfg:               cfg,
 		serverURL:         serverURL,
 		isConnected:       isConnected,
+		ping:              ping,
 		lastStableSession: xsync.NewMap[types.NodeID, uint64](),
 	}
 }
@@ -68,11 +72,8 @@ func (p *HAHealthProber) forgetSession(id types.NodeID) {
 // session younger than one probe cycle, is dropped so wgengine has
 // time to apply the new netmap before silence is read as
 // unreachability.
-func (p *HAHealthProber) ProbeOnce(
-	ctx context.Context,
-	dispatch func(...change.Change),
-) {
-	haNodes := p.state.nodeStore.HANodes()
+func (p *HAHealthProber) ProbeOnce(ctx context.Context) {
+	haNodes := p.state.Snapshot().HANodes()
 
 	// Build the deduplicated node-ID set and slice in one pass.
 	var nodeIDs []types.NodeID
@@ -136,9 +137,12 @@ func (p *HAHealthProber) ProbeOnce(
 		pingID, responseCh := p.state.RegisterPing(id)
 		callbackURL := p.serverURL + "/machine/ping-response?id=" + pingID
 
-		dispatch(change.PingNode(id, &tailcfg.PingRequest{
-			URL: callbackURL,
-		}))
+		if !p.ping(id, &tailcfg.PingRequest{URL: callbackURL}) {
+			// The timeout below decides, as for a ping lost in flight.
+			log.Debug().
+				Uint64(zf.NodeID, id.Uint64()).
+				Msg("HA probe: no session took the ping")
+		}
 
 		wg.Go(func() {
 			timer := time.NewTimer(p.cfg.ProbeTimeout)
@@ -224,8 +228,6 @@ func (p *HAHealthProber) ProbeOnce(
 	})
 
 	if p.state.BatchSetNodeHealth(healthByNode) {
-		dispatch(change.PolicyChange())
-
 		log.Info().
 			Int("haNodes", len(healthByNode)).
 			Msg("HA probe: health changed, triggering failover/recovery")

@@ -86,9 +86,8 @@ func runViaHACompat(t *testing.T, c *testcapture.Capture) {
 	require.NoError(t, err, "failed to set policy")
 
 	if changed {
-		changes, err := srv.State().ReloadPolicy()
+		err := srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 	}
 
 	// Create nodes in SaaS node ID order so headscale assigns
@@ -151,9 +150,8 @@ func runViaHACompat(t *testing.T, c *testcapture.Capture) {
 
 		nodeID := findNodeID(t, srv, name)
 
-		_, routeChange, err := srv.State().SetApprovedRoutes(nodeID, approved)
+		_, err := srv.State().SetApprovedRoutes(nodeID, approved)
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 	}
 
 	// Wait for peers.

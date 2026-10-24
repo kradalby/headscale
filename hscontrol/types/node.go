@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -244,7 +245,7 @@ func (node *Node) Online() bool {
 // ShouldBeOnline derives what [Node.IsOnline] must hold from its two inputs:
 // a live control session and an unexpired node key. An expired client keeps
 // polling control to receive auth updates, so a session alone is not enough.
-// Call it only from a NodeStore write closure, where ActiveSessions is
+// Call it only from a node write closure, where ActiveSessions is
 // stable; elsewhere read [Node.Online].
 func (node *Node) ShouldBeOnline() bool {
 	return node.ActiveSessions > 0 && !node.IsExpired()
@@ -697,7 +698,7 @@ func (node *Node) ApplyPeerChange(change *tailcfg.PeerChange) {
 	// This might technically not be useful as we replace
 	// the whole hostinfo blob when it has changed.
 	if change.DERPRegion != 0 {
-		// [NodeStore] publishes snapshots that share the *Hostinfo /
+		// Published snapshots share the *Hostinfo /
 		// *NetInfo pointers, so writing PreferredDERP in place would race
 		// readers of an already-published snapshot. Clone to fresh pointers
 		// and assign, leaving the previous snapshot untouched.
@@ -1356,4 +1357,23 @@ func (nv NodeView) TailNode(
 	}
 
 	return &tNode, nil
+}
+
+// unrenderedFields are the [Node] fields no map renders: the election
+// reads health, and sessions and the database keep the rest.
+var unrenderedFields = []string{"Unhealthy", "ActiveSessions", "SessionEpoch", "UpdatedAt"}
+
+// SameRender reports whether nv and o differ only in [unrenderedFields],
+// so no map, the node's own or a peer's, can differ between them.
+func (nv NodeView) SameRender(o NodeView) bool {
+	if !nv.Valid() || !o.Valid() {
+		return nv.Valid() == o.Valid()
+	}
+
+	a, b := *nv.ж, *o.ж
+	for _, n := range []*Node{&a, &b} {
+		n.Unhealthy, n.ActiveSessions, n.SessionEpoch, n.UpdatedAt = false, 0, 0, time.Time{}
+	}
+
+	return reflect.DeepEqual(a, b)
 }

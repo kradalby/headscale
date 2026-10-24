@@ -135,9 +135,8 @@ func TestRaceConcurrentServerMutations(t *testing.T) {
 			for i := range 5 {
 				route := netip.MustParsePrefix(
 					fmt.Sprintf("10.%d.0.0/24", i))
-				_, c, _ := srv.State().SetApprovedRoutes(
+				_, _ = srv.State().SetApprovedRoutes(
 					nodeID1, []netip.Prefix{route})
-				srv.App.Change(c)
 			}
 		})
 
@@ -151,10 +150,7 @@ func TestRaceConcurrentServerMutations(t *testing.T) {
 					]
 				}`))
 				if err == nil && changed {
-					changes, err := srv.State().ReloadPolicy()
-					if err == nil {
-						srv.App.Change(changes...)
-					}
+					_ = srv.State().ReloadPolicy()
 				}
 			}
 		})
@@ -195,10 +191,7 @@ func TestRaceConcurrentServerMutations(t *testing.T) {
 		// Delete node2 and change policy simultaneously.
 
 		wg.Go(func() {
-			delChange, err := srv.State().DeleteNode(nv2)
-			if err == nil {
-				srv.App.Change(delChange...)
-			}
+			_ = srv.State().DeleteNode(nv2)
 		})
 
 		wg.Go(func() {
@@ -208,10 +201,7 @@ func TestRaceConcurrentServerMutations(t *testing.T) {
 				]
 			}`))
 			if err == nil && changed {
-				changes, err := srv.State().ReloadPolicy()
-				if err == nil {
-					srv.App.Change(changes...)
-				}
+				_ = srv.State().ReloadPolicy()
 			}
 		})
 
@@ -385,17 +375,14 @@ func TestRaceConnectDuringGracePeriod(t *testing.T) {
 		surviving := originals[n/2:]
 		allActive := append(surviving, replacements...)
 
-		for _, c := range allActive {
-			c.WaitForPeers(t, len(allActive)-1, 30*time.Second)
-		}
-
+		waitForMutualVisibility(t, allActive, 30*time.Second)
 		servertest.AssertConsistentState(t, allActive)
 	})
 }
 
-// TestRaceBatcherContention tests race conditions in the [mapper.Batcher]
+// TestRaceMapHubContention tests race conditions in the [mapper.Hub]
 // when many changes arrive simultaneously.
-func TestRaceBatcherContention(t *testing.T) {
+func TestRaceMapHubContention(t *testing.T) {
 	t.Parallel()
 
 	// Many nodes connecting at the same time generates many
@@ -489,9 +476,8 @@ func TestRaceBatcherContention(t *testing.T) {
 
 		wg.Go(func() {
 			route := netip.MustParsePrefix("10.88.0.0/24")
-			_, c, _ := srv.State().SetApprovedRoutes(
+			_, _ = srv.State().SetApprovedRoutes(
 				nodeID1, []netip.Prefix{route})
-			srv.App.Change(c)
 		})
 
 		var c2 *servertest.TestClient
@@ -583,8 +569,8 @@ func TestRaceMapResponseDuringDisconnect(t *testing.T) {
 	})
 }
 
-// TestRaceNodeStoreContention tests concurrent access to the [state.NodeStore].
-func TestRaceNodeStoreContention(t *testing.T) {
+// TestRaceNodeWriteContention tests concurrent node writes to the state.
+func TestRaceNodeWriteContention(t *testing.T) {
 	t.Parallel()
 
 	// Many [state.State.GetNodeByID] calls while nodes are connecting and

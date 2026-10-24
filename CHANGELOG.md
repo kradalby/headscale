@@ -84,6 +84,22 @@ clients, and how to run the same setup without Nix.
 the ACME DNS-01 challenge through a built-in DNS provider: `acmedns`,
 `cloudflare`, `gigahost`, `hetzner`, `powerdns` or `rfc2136`. `dns.base_domain` must be a public domain you control. [#3554](https://github.com/juanfont/headscale/pull/3554)
 
+### Control plane scales with what changes, not tailnet size
+
+A change now reaches only the nodes that see it, and costs about what those
+nodes are sent: an endpoint update, a join or a policy edit no longer
+reworks every node's map, and a change no node sees costs almost nothing.
+Policy recompiles reuse what a node change cannot reach, connected nodes
+that see the same peers share one copy of them, and a peer is encoded once
+for every map that carries it. Node writes no longer wait to be batched
+except during an HA subnet route outage, which is what
+`tuning.node_store_batch_timeout` and `tuning.node_store_batch_size` now
+bound. Large tailnets use less CPU and memory, and joins and failovers
+reach clients sooner.
+`HEADSCALE_DEBUG_POLICY_AUDIT=1` checks every policy recompile against a
+compile from scratch and logs any difference.
+[#37](https://github.com/kradalby/headscale/pull/37)
+
 ### BREAKING
 
 #### Database

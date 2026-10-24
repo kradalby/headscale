@@ -348,10 +348,9 @@ func TestPollRace(t *testing.T) {
 
 		// While c1 is disconnected, approve a route for it.
 		route := netip.MustParsePrefix("10.55.0.0/24")
-		_, routeChange, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			nodeID1, []netip.Prefix{route})
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 
 		// Reconnect c1.
 		c1.Reconnect(t)

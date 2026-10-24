@@ -3,6 +3,7 @@ package types
 import (
 	"fmt"
 	"net/netip"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -1072,4 +1074,29 @@ func TestNodeIsExpiredAt(t *testing.T) {
 		require.True(t, NodeView{}.IsExpiredAt(now),
 			"an invalid view counts as expired, like IsExpired")
 	})
+}
+
+// TestSameRenderIgnoresOnlyUnrenderedFields changes each unrendered field
+// and a rendered one, and checks every unrendered name is a Node field, so
+// a rename cannot silently widen what SameRender ignores.
+func TestSameRenderIgnoresOnlyUnrenderedFields(t *testing.T) {
+	typ := reflect.TypeFor[Node]()
+	for _, name := range unrenderedFields {
+		_, ok := typ.FieldByName(name)
+		require.True(t, ok, "Node has no field %s", name)
+	}
+
+	base := &Node{ID: 1, Hostname: "a", Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")}}
+
+	hidden := *base
+	hidden.Unhealthy, hidden.ActiveSessions, hidden.SessionEpoch, hidden.UpdatedAt = true, 2, 7, time.Now()
+	assert.True(t, base.View().SameRender(hidden.View()))
+
+	moved := *base
+	moved.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.2:41641")}
+	assert.False(t, base.View().SameRender(moved.View()))
+
+	online := *base
+	online.IsOnline = new(true)
+	assert.False(t, base.View().SameRender(online.View()))
 }

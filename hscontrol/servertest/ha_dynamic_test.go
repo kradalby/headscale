@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/types/netmap"
@@ -75,8 +74,6 @@ func TestHAFailover_ViewerSeesPrimaryFlip(t *testing.T) {
 	changed := srv.State().SetNodeHealth(id1, false)
 	require.True(t, changed, "marking primary unhealthy should change primaries")
 
-	srv.App.Change(change.PolicyChange())
-
 	assert.Contains(t, srv.State().GetNodePrimaryRoutes(id2), route,
 		"node 2 should be primary after failover")
 	assert.NotContains(t, srv.State().GetNodePrimaryRoutes(id1), route,
@@ -116,10 +113,8 @@ func TestHAFailover_ViewerSeesRouteRevoke(t *testing.T) {
 			return hasPeerPrimaryRoute(nm, "dyn-rev-r1", route)
 		})
 
-	_, rc, err := srv.State().SetApprovedRoutes(id1, nil)
+	_, err := srv.State().SetApprovedRoutes(id1, nil)
 	require.NoError(t, err, "revoking approved routes should succeed")
-
-	srv.App.Change(rc)
 
 	assert.NotContains(t, srv.State().GetNodePrimaryRoutes(id1), route,
 		"node 1 should no longer be primary after revoke")

@@ -2,59 +2,47 @@ package state
 
 import (
 	"testing"
+	"time"
 
+	"github.com/hashicorp/golang-lru/v2/expirable"
+	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 )
 
-func TestNodeStoreDebugString(t *testing.T) {
+func TestDebugNodeStore(t *testing.T) {
 	tests := []struct {
 		name     string
-		setupFn  func() *NodeStore
+		nodes    []types.Node
 		contains []string
 	}{
 		{
-			name: "empty nodestore",
-			setupFn: func() *NodeStore {
-				return NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
-			},
+			name: "empty",
 			contains: []string{
-				"=== NodeStore Debug Information ===",
+				"=== Node State Debug Information ===",
 				"Total Nodes: 0",
 				"Users with Nodes: 0",
-				"NodeKey Index: 0 entries",
 			},
 		},
 		{
-			name: "nodestore with data",
-			setupFn: func() *NodeStore {
-				node1 := createTestNode(1, 1, "user1", "node1")
-				node2 := createTestNode(2, 2, "user2", "node2")
-
-				store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
-				store.Start()
-
-				_ = store.PutNode(node1)
-				_ = store.PutNode(node2)
-
-				return store
+			name: "with data",
+			nodes: []types.Node{
+				createTestNode(1, 1, "user1", "node1"),
+				createTestNode(2, 2, "user2", "node2"),
 			},
 			contains: []string{
 				"Total Nodes: 2",
 				"Users with Nodes: 2",
 				"Peer Relationships:",
-				"NodeKey Index: 2 entries",
+				"Node 1 (node1): 1 peers",
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			store := tt.setupFn()
-			if store.writeQueue != nil {
-				defer store.Stop()
-			}
+			s := &State{world: newTestWorld(t, tt.nodes...)}
 
-			debugStr := store.DebugString()
+			debugStr := s.DebugNodeStore()
 
 			for _, expected := range tt.contains {
 				assert.Contains(t, debugStr, expected,
@@ -65,14 +53,15 @@ func TestNodeStoreDebugString(t *testing.T) {
 }
 
 func TestDebugRegistrationCache(t *testing.T) {
-	// Create a minimal NodeStore for testing debug methods
-	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+	s := &State{
+		authCache: expirable.NewLRU[types.AuthID, *types.AuthRequest](
+			defaultRegisterCacheMaxEntries, nil, time.Minute),
+	}
+	s.SetAuthCacheEntry(types.MustAuthID(), types.NewAuthRequest())
 
-	debugStr := store.DebugString()
+	info := s.DebugRegistrationCache()
 
-	// Should contain basic debug information
-	assert.Contains(t, debugStr, "=== NodeStore Debug Information ===")
-	assert.Contains(t, debugStr, "Total Nodes: 0")
-	assert.Contains(t, debugStr, "Users with Nodes: 0")
-	assert.Contains(t, debugStr, "NodeKey Index: 0 entries")
+	assert.Equal(t, "expirable-lru", info["type"])
+	assert.Equal(t, defaultRegisterCacheMaxEntries, info["max_entries"])
+	assert.Equal(t, 1, info["current_len"])
 }

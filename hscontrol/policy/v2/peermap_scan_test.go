@@ -1,14 +1,17 @@
 package v2
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
+	"slices"
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/views"
@@ -18,9 +21,6 @@ import (
 // global-filter path stopped evaluating every matcher for every pair. It is
 // kept as the reference the indexed build must reproduce exactly.
 func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) map[types.NodeID][]types.NodeID {
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
 	type nodeRoutes struct {
 		subnet []netip.Prefix
 		isExit bool
@@ -54,7 +54,7 @@ func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) 
 
 	nodeMatchers := make(map[types.NodeID][]matcher.Match, nodes.Len())
 	for _, node := range nodes.All() {
-		nodeMatchers[node.ID()] = matcher.MatchesFromFilterRules(pm.filterRulesForNodeLocked(node))
+		nodeMatchers[node.ID()] = matcher.MatchesFromFilterRules(pm.unreducedRules(node))
 	}
 
 	for i := range nodes.Len() {
@@ -87,8 +87,10 @@ var (
 		{ID: 3, Name: "u3"},
 		{ID: 4, Name: "u4"},
 	}
-	scanTags   = []string{"tag:srv", "tag:db", "tag:router", "tag:exit"}
-	scanRoutes = []string{"10.1.0.0/24", "10.1.1.0/24", "10.2.0.0/16", "192.168.5.0/24", "fd00:1::/64"}
+	scanTags = []string{"tag:srv", "tag:db", "tag:router", "tag:exit"}
+	// scanServerURL is the server URL SSH check rules point at.
+	scanServerURL = "https://headscale.test"
+	scanRoutes    = []string{"10.1.0.0/24", "10.1.1.0/24", "10.2.0.0/16", "192.168.5.0/24", "fd00:1::/64"}
 	// Aliases usable on either side of a rule.
 	scanAliases = []string{
 		"*", "u1@", "u2@", "u3@", "u4@", "group:a", "group:b",
@@ -181,6 +183,46 @@ func scanRandomPolicy(r *rand.Rand) []byte {
 		"groups":    map[string][]string{"group:a": {"u1@", "u2@"}, "group:b": {"u3@"}},
 		"tagOwners": map[string][]string{"tag:srv": {"u1@"}, "tag:db": {"u1@"}, "tag:router": {"u1@"}, "tag:exit": {"u1@"}},
 		"hosts":     map[string]string{"lan": "10.1.0.0/16", "host1": "100.64.0.5/32", "v6net": "fd7a:115c:a1e0::/122"},
+	}
+
+	// Identities that may approve routes or receive attributes.
+	owners := []string{"u1@", "u2@", "group:a", "group:b", "tag:srv", "tag:router", "tag:exit"}
+
+	if r.IntN(2) == 0 {
+		pol["autoApprovers"] = map[string]any{
+			"routes":   map[string][]string{"10.1.0.0/24": pick(owners, 1+r.IntN(2)), "0.0.0.0/0": pick(owners, 1)},
+			"exitNode": pick(owners, 1+r.IntN(2)),
+		}
+	}
+
+	if r.IntN(2) == 0 {
+		n := 1 + r.IntN(3)
+		ssh := make([]any, 0, n)
+
+		for range n {
+			rule := map[string]any{
+				"action": []string{"accept", "check"}[r.IntN(2)],
+				"src":    pick([]string{"u1@", "u2@", "group:a", "autogroup:member", "tag:srv"}, 1+r.IntN(2)),
+				"users":  pick([]string{"root", "autogroup:nonroot", "ubuntu", "localpart:*@example.com"}, 1+r.IntN(2)),
+			}
+
+			if r.IntN(3) == 0 {
+				rule["dst"] = []string{"autogroup:self"}
+				rule["src"] = pick([]string{"u1@", "u2@", "group:a", "autogroup:member"}, 1+r.IntN(2))
+			} else {
+				rule["dst"] = pick([]string{"tag:srv", "tag:db", "tag:router", "autogroup:tagged"}, 1+r.IntN(2))
+			}
+
+			ssh = append(ssh, rule)
+		}
+
+		pol["ssh"] = ssh
+	}
+
+	if r.IntN(2) == 0 {
+		pol["nodeAttrs"] = []any{
+			map[string]any{"target": pick(append(owners, "*", "autogroup:member"), 1+r.IntN(2)), "attr": []string{"custom:scan"}},
+		}
 	}
 
 	// Neither section: allow-all. Empty grants: deny-all. Otherwise rules.
@@ -299,6 +341,13 @@ func TestBuildPeerMapMatchesPairScan(t *testing.T) {
 				"sorted slice: iteration %d, policy %s", it, polB)
 			require.Equalf(t, want, buildPeerMapSliceMap(pm, in),
 				"slice + map: iteration %d, policy %s", it, polB)
+
+			classes := pm.BuildPeerClasses(in, nil)
+			for _, n := range in.All() {
+				sorted := slices.Sorted(slices.Values(want[n.ID()]))
+				require.Equalf(t, sorted, nilIfEmpty(classes.Peers(n.ID())),
+					"classes: iteration %d, node %d, policy %s", it, n.ID(), polB)
+			}
 		}
 
 		if pm.needsPerNodeFilter {
@@ -514,14 +563,9 @@ func buildPeerMapSortedSlice(
 		return nil
 	}
 
-	pm.mu.RLock()
-
 	if pm.needsPerNodeFilter {
-		pm.mu.RUnlock()
-
 		return pm.BuildPeerMap(nodes)
 	}
-	defer pm.mu.RUnlock()
 
 	type nodeRoutes struct {
 		subnet []netip.Prefix
@@ -606,14 +650,9 @@ func buildPeerMapSliceMap(
 		return nil
 	}
 
-	pm.mu.RLock()
-
 	if pm.needsPerNodeFilter {
-		pm.mu.RUnlock()
-
 		return pm.BuildPeerMap(nodes)
 	}
-	defer pm.mu.RUnlock()
 
 	type nodeRoutes struct {
 		subnet []netip.Prefix
@@ -841,6 +880,297 @@ func benchmarkPeerMapBuilders(b *testing.B, pm *PolicyManager, nodes types.Nodes
 
 			for b.Loop() {
 				builder.build(pm, nodes.ViewSlice())
+			}
+		})
+	}
+}
+
+func nilIfEmpty[T any](s []T) []T {
+	if len(s) == 0 {
+		return nil
+	}
+
+	return s
+}
+
+// TestBuildPeerClassesReuseMatchesFresh rebuilds peer classes from the
+// previous build after a node changes, joins or leaves, or the policy
+// changes, and checks the result equals the pair scan every time.
+func TestBuildPeerClassesReuseMatchesFresh(t *testing.T) {
+	r := rand.New(rand.NewPCG(7, 8)) //nolint:gosec // reproducible test input
+
+	for it := range 300 {
+		nodes := scanRandomNodes(r, 2+r.IntN(30))
+		polB := scanRandomPolicy(r)
+		nextID := len(nodes) + 1
+
+		var prev *PeerClasses
+
+		for step := range 8 {
+			pm, err := NewPolicyManager(polB, scanUsers, nodes.ViewSlice())
+			if err != nil {
+				break
+			}
+
+			classes := pm.BuildPeerClasses(nodes.ViewSlice(), prev)
+			want := buildPeerMapPairScan(pm, nodes.ViewSlice())
+
+			for _, n := range nodes {
+				require.Equalf(t, nilIfEmpty(slices.Sorted(slices.Values(want[n.ID]))), nilIfEmpty(classes.Peers(n.ID)),
+					"iteration %d step %d node %d, policy %s", it, step, n.ID, polB)
+			}
+
+			prev = classes
+
+			// Change the tailnet: one node's tags or user, a join, a
+			// leave, or the policy.
+			switch r.IntN(4) {
+			case 0:
+				i := r.IntN(len(nodes))
+				c := nodes[i].Clone()
+				c.Tags = []string{scanTags[r.IntN(len(scanTags))]}
+				c.User, c.UserID = nil, nil
+				nodes[i] = c
+			case 1:
+				// A fresh ID and so fresh addresses.
+				extra := scanRandomNodes(r, nextID)
+				nodes = append(slices.Clone(nodes), extra[nextID-1])
+				nextID++
+			case 2:
+				if len(nodes) > 2 {
+					i := r.IntN(len(nodes))
+					nodes = slices.Delete(slices.Clone(nodes), i, i+1)
+				}
+			default:
+				polB = scanRandomPolicy(r)
+			}
+		}
+	}
+}
+
+// TestNewPolicyManagerFromMatchesFresh compiles a policy after each of a
+// series of node changes both from the previous compile and from scratch,
+// and checks they agree on every grant, the global filter, each node's
+// filter and peer visibility.
+func TestNewPolicyManagerFromMatchesFresh(t *testing.T) {
+	r := rand.New(rand.NewPCG(9, 10)) //nolint:gosec // reproducible test input
+
+	reused, narrowed, narrowedPerNode, narrowedDoc := 0, 0, 0, 0
+
+	for it := range 300 {
+		nodes := scanRandomNodes(r, 2+r.IntN(30))
+		polB := scanRandomPolicy(r)
+		nextID := len(nodes) + 1
+
+		var prev *PolicyManager
+
+		for step := range 8 {
+			fresh, err := NewPolicyManager(polB, scanUsers, nodes.ViewSlice())
+			if err != nil {
+				break
+			}
+
+			inc, err := NewPolicyManagerFrom(prev, polB, scanUsers, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			msg := fmt.Sprintf("iteration %d step %d, policy %s", it, step, polB)
+			require.Equal(t, fresh.compiledGrants, inc.compiledGrants, msg)
+			require.Equal(t, fresh.filter, inc.filter, msg)
+			require.Equal(t, fresh.BuildPeerMap(nodes.ViewSlice()), inc.BuildPeerMap(nodes.ViewSlice()), msg)
+			require.Equal(t, fresh.tagOwnerMap, inc.tagOwnerMap, msg)
+			require.Equal(t, fresh.autoApproveMap, inc.autoApproveMap, msg)
+			require.Equal(t, fresh.exitSet, inc.exitSet, msg)
+			require.Equal(t, fresh.nodeAttrsMap, inc.nodeAttrsMap, msg)
+
+			for _, n := range nodes {
+				want, err := fresh.FilterForNode(n.View())
+				require.NoError(t, err)
+
+				got, err := inc.FilterForNode(n.View())
+				require.NoError(t, err)
+				require.Equal(t, want, got, "%s, node %d", msg, n.ID)
+
+				wantSSH, err := fresh.SSHPolicy(scanServerURL, n.View())
+				require.NoError(t, err)
+
+				gotSSH, err := inc.SSHPolicy(scanServerURL, n.View())
+				require.NoError(t, err)
+				require.Equal(t, wantSSH, gotSSH, "%s, node %d SSH", msg, n.ID)
+			}
+
+			// Outside FilterChangedNodes, a node that did not change keeps
+			// its filter.
+			if changed, all := inc.FilterChangedNodes(prev); prev != nil && !all {
+				narrowed++
+
+				if inc.needsPerNodeFilter {
+					narrowedPerNode++
+				}
+
+				if !bytes.Equal(prev.src, inc.src) {
+					narrowedDoc++
+				}
+
+				for _, n := range nodes {
+					old, ok := prev.nodesByID[n.ID]
+					if !ok || old != n.View() || slices.Contains(changed, n.ID) {
+						continue
+					}
+
+					was, err := prev.FilterForNode(old)
+					require.NoError(t, err)
+
+					is, err := inc.FilterForNode(n.View())
+					require.NoError(t, err)
+					require.Equal(t, was, is, "%s, unchanged node %d", msg, n.ID)
+
+					wasSSH, err := prev.SSHPolicy(scanServerURL, old)
+					require.NoError(t, err)
+
+					isSSH, err := inc.SSHPolicy(scanServerURL, n.View())
+					require.NoError(t, err)
+					require.Equal(t, wasSSH, isSSH, "%s, unchanged node %d SSH", msg, n.ID)
+				}
+			}
+
+			if prev != nil {
+				for i := range inc.grantResults {
+					if i < len(prev.grantResults) && inc.grantResults[i].cg == prev.grantResults[i].cg && inc.grantResults[i].cg != nil {
+						reused++
+					}
+				}
+			}
+
+			prev = inc
+
+			// Now and then the document changes instead of a node.
+			if r.IntN(5) == 0 {
+				polB = scanRandomPolicy(r)
+
+				continue
+			}
+
+			switch r.IntN(4) {
+			case 0:
+				i := r.IntN(len(nodes))
+				c := nodes[i].Clone()
+				c.Tags = []string{scanTags[r.IntN(len(scanTags))]}
+				c.User, c.UserID = nil, nil
+				nodes[i] = c
+			case 1:
+				extra := scanRandomNodes(r, nextID)
+				nodes = append(slices.Clone(nodes), extra[nextID-1])
+				nextID++
+			case 2:
+				if len(nodes) > 2 {
+					i := r.IntN(len(nodes))
+					nodes = slices.Delete(slices.Clone(nodes), i, i+1)
+				}
+			default:
+				i := r.IntN(len(nodes))
+				c := nodes[i].Clone()
+				c.ApprovedRoutes = nil
+				nodes[i] = c
+			}
+		}
+	}
+
+	// The comparison is only worth something if grants were reused and
+	// recompiles narrowed.
+	require.Greater(t, reused, 100, "grants reused")
+	require.Greater(t, narrowed, 100, "recompiles narrowed")
+	require.Greater(t, narrowedPerNode, 50, "per-node recompiles narrowed")
+	require.Greater(t, narrowedDoc, 20, "document changes narrowed")
+}
+
+// ownRulesNode returns node id with addresses 100.64.0.id and fd7a::id,
+// owned by user, or tagged, and announcing and approved for routes.
+func ownRulesNode(id int, user *types.User, tags []string, routes ...string) *types.Node {
+	v4 := netip.AddrFrom4([4]byte{100, 64, 0, byte(id)})                               //nolint:gosec
+	v6 := netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 15: byte(id)}) //nolint:gosec
+
+	n := &types.Node{ID: types.NodeID(id), Hostname: fmt.Sprintf("n%d", id), IPv4: &v4, IPv6: &v6, Tags: tags} //nolint:gosec
+	if user != nil {
+		n.User, n.UserID = user, &user.ID
+	}
+
+	for _, r := range routes {
+		n.ApprovedRoutes = append(n.ApprovedRoutes, netip.MustParsePrefix(r))
+	}
+
+	n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: n.ApprovedRoutes}
+
+	return n
+}
+
+// TestFilterChangedNodesReachesOwnRules changes a node under policies
+// whose rules are per node, where no shared rule reaches the nodes whose
+// own rules change, and checks those nodes are named and their filter
+// equals a fresh compile.
+func TestFilterChangedNodesReachesOwnRules(t *testing.T) {
+	u1, u2 := &scanUsers[0], &scanUsers[1]
+
+	tests := []struct {
+		name          string
+		policy        string
+		before, after types.Nodes
+		want          []types.NodeID
+	}{
+		{
+			// a1 leaving u1 changes a2's self rules, and the exit node
+			// carries every user's.
+			name:   "self",
+			policy: `{"tagOwners":{"tag:x":["u1@"]},"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`,
+			before: types.Nodes{ownRulesNode(1, u1, nil), ownRulesNode(2, u1, nil), ownRulesNode(3, nil, []string{"tag:x"}, "0.0.0.0/0", "::/0")},
+			after:  types.Nodes{ownRulesNode(1, nil, []string{"tag:x"}), ownRulesNode(2, u1, nil), ownRulesNode(3, nil, []string{"tag:x"}, "0.0.0.0/0", "::/0")},
+			want:   []types.NodeID{2, 3},
+		},
+		{
+			// A new u2 node is a new source of the via rules r1 carries.
+			name: "via",
+			policy: `{"tagOwners":{"tag:router":["u1@"]},
+				"grants":[{"src":["u2@"],"dst":["10.1.0.0/24"],"ip":["*"],"via":["tag:router"]}]}`,
+			before: types.Nodes{ownRulesNode(1, nil, []string{"tag:router"}, "10.1.0.0/24"), ownRulesNode(2, u2, nil)},
+			after:  types.Nodes{ownRulesNode(1, nil, []string{"tag:router"}, "10.1.0.0/24"), ownRulesNode(2, u2, nil), ownRulesNode(4, u2, nil)},
+			want:   []types.NodeID{1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prev, err := NewPolicyManager([]byte(tt.policy), scanUsers, tt.before.ViewSlice())
+			require.NoError(t, err)
+
+			for _, n := range tt.before {
+				_, err := prev.FilterForNode(n.View())
+				require.NoError(t, err)
+			}
+
+			inc, err := NewPolicyManagerFrom(prev, []byte(tt.policy), scanUsers, tt.after.ViewSlice())
+			require.NoError(t, err)
+
+			fresh, err := NewPolicyManager([]byte(tt.policy), scanUsers, tt.after.ViewSlice())
+			require.NoError(t, err)
+
+			changed, all := inc.FilterChangedNodes(prev)
+			require.False(t, all)
+
+			for _, id := range tt.want {
+				assert.Contains(t, changed, id)
+
+				n := tt.after[slices.IndexFunc(tt.after, func(n *types.Node) bool { return n.ID == id })]
+
+				was, err := prev.FilterForNode(prev.nodesByID[id])
+				require.NoError(t, err)
+
+				want, err := fresh.FilterForNode(n.View())
+				require.NoError(t, err)
+
+				got, err := inc.FilterForNode(n.View())
+				require.NoError(t, err)
+
+				assert.NotEqual(t, want, was, "node %d's own rules must change", id)
+				assert.Equal(t, want, got, "node %d", id)
 			}
 		})
 	}

@@ -3,23 +3,19 @@ package state
 import (
 	"errors"
 	"net/netip"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/db"
-	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
-	"tailscale.com/types/views"
 )
 
 // persistTestSetup pre-creates a sqlite database on disk with a single
@@ -80,10 +76,6 @@ func persistTestConfig(dbPath string) *types.Config {
 		Policy: types.PolicyConfig{
 			Mode: types.PolicyModeDB,
 		},
-		Tuning: types.Tuning{
-			NodeStoreBatchSize:    TestBatchSize,
-			NodeStoreBatchTimeout: TestBatchTimeout,
-		},
 	}
 }
 
@@ -98,7 +90,7 @@ func TestPersistEmptyApprovedRoutes(t *testing.T) {
 
 	route := netip.MustParsePrefix("10.0.0.0/8")
 
-	_, _, err := s.SetApprovedRoutes(nodeID, []netip.Prefix{route})
+	_, err := s.SetApprovedRoutes(nodeID, []netip.Prefix{route})
 	require.NoError(t, err)
 
 	gotAfterApprove, err := s.DB().GetNodeByID(nodeID)
@@ -108,7 +100,7 @@ func TestPersistEmptyApprovedRoutes(t *testing.T) {
 
 	var noRoutes []netip.Prefix
 
-	_, _, err = s.SetApprovedRoutes(nodeID, noRoutes)
+	_, err = s.SetApprovedRoutes(nodeID, noRoutes)
 	require.NoError(t, err)
 
 	gotAfterClear, err := s.DB().GetNodeByID(nodeID)
@@ -124,26 +116,26 @@ func TestPersistEmptyApprovedRoutes(t *testing.T) {
 	nv, ok := s2.GetNodeByID(nodeID)
 	require.True(t, ok, "node should be loaded from DB after restart")
 	assert.Empty(t, nv.AsStruct().ApprovedRoutes,
-		"after restart, NodeStore should reflect the cleared routes")
+		"after restart, memory should reflect the cleared routes")
 }
 
 // TestPersistEmptyTags exercises the same persist path for the tags
 // column. State.SetNodeTags rejects an empty slice at the API level
 // (tags are one-way), so the test drives the bug surface directly via
-// NodeStore + persistNodeAndRefreshPolicy, which is the same code path the public
+// world + persistNode, which is the same code path the public
 // SetApprovedRoutes call exercises.
 func TestPersistEmptyTags(t *testing.T) {
 	dbPath, s, nodeID := persistTestSetup(t)
 
-	_, ok := s.nodeStore.UpdateNode(nodeID, func(n *types.Node) {
+	_, ok := s.world.UpdateNode(nodeID, func(n *types.Node) {
 		n.Tags = []string{"tag:test"}
 	})
 	require.True(t, ok)
 
-	seeded, ok := s.nodeStore.GetNode(nodeID)
+	seeded, ok := s.Snapshot().GetNode(nodeID)
 	require.True(t, ok)
 
-	_, _, err := s.persistNodeAndRefreshPolicy(seeded, s.polMan.NodesGeneration())
+	_, err := s.persistNode(seeded)
 	require.NoError(t, err)
 
 	gotAfterSeed, err := s.DB().GetNodeByID(nodeID)
@@ -151,12 +143,12 @@ func TestPersistEmptyTags(t *testing.T) {
 	require.Equal(t, []string{"tag:test"}, gotAfterSeed.Tags.List(),
 		"tags should hold the seeded value")
 
-	cleared, ok := s.nodeStore.UpdateNode(nodeID, func(n *types.Node) {
+	cleared, ok := s.world.UpdateNode(nodeID, func(n *types.Node) {
 		n.Tags = nil
 	})
 	require.True(t, ok)
 
-	_, _, err = s.persistNodeAndRefreshPolicy(cleared, s.polMan.NodesGeneration())
+	_, err = s.persistNode(cleared)
 	require.NoError(t, err)
 
 	gotAfterClear, err := s.DB().GetNodeByID(nodeID)
@@ -171,7 +163,7 @@ func TestPersistEmptyTags(t *testing.T) {
 	nv, ok := s2.GetNodeByID(nodeID)
 	require.True(t, ok)
 	assert.Empty(t, nv.AsStruct().Tags,
-		"after restart, NodeStore should reflect the cleared tags")
+		"after restart, memory should reflect the cleared tags")
 }
 
 // TestPersistEmptyEndpoints covers the endpoints column. Endpoints
@@ -183,15 +175,15 @@ func TestPersistEmptyEndpoints(t *testing.T) {
 
 	endpoint := netip.MustParseAddrPort("198.51.100.1:41641")
 
-	_, ok := s.nodeStore.UpdateNode(nodeID, func(n *types.Node) {
+	_, ok := s.world.UpdateNode(nodeID, func(n *types.Node) {
 		n.Endpoints = []netip.AddrPort{endpoint}
 	})
 	require.True(t, ok)
 
-	seeded, ok := s.nodeStore.GetNode(nodeID)
+	seeded, ok := s.Snapshot().GetNode(nodeID)
 	require.True(t, ok)
 
-	_, _, err := s.persistNodeAndRefreshPolicy(seeded, s.polMan.NodesGeneration())
+	_, err := s.persistNode(seeded)
 	require.NoError(t, err)
 
 	gotAfterSeed, err := s.DB().GetNodeByID(nodeID)
@@ -199,12 +191,12 @@ func TestPersistEmptyEndpoints(t *testing.T) {
 	require.Equal(t, []netip.AddrPort{endpoint}, gotAfterSeed.Endpoints.List(),
 		"endpoints should hold the seeded value")
 
-	cleared, ok := s.nodeStore.UpdateNode(nodeID, func(n *types.Node) {
+	cleared, ok := s.world.UpdateNode(nodeID, func(n *types.Node) {
 		n.Endpoints = nil
 	})
 	require.True(t, ok)
 
-	_, _, err = s.persistNodeAndRefreshPolicy(cleared, s.polMan.NodesGeneration())
+	_, err = s.persistNode(cleared)
 	require.NoError(t, err)
 
 	gotAfterClear, err := s.DB().GetNodeByID(nodeID)
@@ -219,14 +211,14 @@ func TestPersistEmptyEndpoints(t *testing.T) {
 	nv, ok := s2.GetNodeByID(nodeID)
 	require.True(t, ok)
 	assert.Empty(t, nv.AsStruct().Endpoints,
-		"after restart, NodeStore should reflect the cleared endpoints")
+		"after restart, memory should reflect the cleared endpoints")
 }
 
 // TestRegistrationRejectsNodeKeyClaimedByAnotherMachine proves a new
 // registration cannot claim a NodeKey already bound to a different machine.
 // NodeKeys are public (peers learn them from the netmap), so without this
 // check an authenticated party can register a node carrying a victim's
-// NodeKey. That poisons the NodeStore NodeKey index (a map keyed on NodeKey,
+// NodeKey. That poisons the NodeKey index (a map keyed on NodeKey,
 // last writer wins), so the victim's MapRequest resolves to the attacker's
 // node and is rejected by getAndValidateNode's MachineKey check (noise.go) —
 // a denial of service against the victim. getAndValidateNode already enforces
@@ -311,7 +303,7 @@ func TestRegistrationKeepsRequestTagsIntact(t *testing.T) {
 // path enforces the same 1:1 NodeKey<->MachineKey binding as the create path
 // (TestRegistrationRejectsNodeKeyClaimedByAnotherMachine) and the poll path
 // (getAndValidateNode). Without it, a node re-authenticating could rotate its
-// NodeKey to a victim's, poisoning the NodeStore NodeKey index so the victim's
+// NodeKey to a victim's, poisoning the NodeKey index so the victim's
 // MapRequest resolves to the attacker's node and is rejected — a DoS.
 func TestReauthRejectsNodeKeyClaimedByAnotherMachine(t *testing.T) {
 	dbPath := t.TempDir() + "/headscale.db"
@@ -354,7 +346,7 @@ func TestReauthRejectsNodeKeyClaimedByAnotherMachine(t *testing.T) {
 	require.NoError(t, err)
 
 	// Attacker re-authenticates its own node but supplies the victim's NodeKey.
-	_, _, err = s.applyAuthNodeUpdate(authNodeUpdateParams{
+	_, err = s.applyAuthNodeUpdate(authNodeUpdateParams{
 		ExistingNode: attackerNode,
 		RegData: &types.RegistrationData{
 			MachineKey: attackerMachine.Public(),
@@ -414,7 +406,7 @@ func TestReauthPreservesEndpointsWhenClientOmitsThem(t *testing.T) {
 
 	// Node re-authenticates, rotating its NodeKey. The RegisterRequest carries
 	// no endpoints.
-	updated, _, err := s.applyAuthNodeUpdate(authNodeUpdateParams{
+	updated, err := s.applyAuthNodeUpdate(authNodeUpdateParams{
 		ExistingNode: node,
 		RegData: &types.RegistrationData{
 			MachineKey: machine.Public(),
@@ -434,79 +426,11 @@ func TestReauthPreservesEndpointsWhenClientOmitsThem(t *testing.T) {
 		"re-auth without reported endpoints must preserve the node's live endpoints")
 }
 
-// TestReauthChange covers the decision both re-auth paths share: a keys-only
-// relogin must be an incremental peer patch (so the tailscale client takes its
-// fast patch path), never a whole-node add (which strands a re-keyed,
-// momentarily-endpoint-less peer disco-deaf); a policy change forces a full
-// recompute; a new node is a whole-node add.
-func TestReauthChange(t *testing.T) {
-	n := types.Node{
-		ID:       7,
-		NodeKey:  key.NewNode().Public(),
-		DiscoKey: key.NewDisco().Public(),
-	}
-	node := n.View()
-
-	relogin := reauthChange(node, true, false)
-	assert.Len(t, relogin.PeerPatches, 1, "relogin must be a peer patch")
-	assert.Empty(t, relogin.PeersChanged, "relogin must not be a whole-node add")
-
-	added := reauthChange(node, false, false)
-	assert.Empty(t, added.PeerPatches)
-	assert.Len(t, added.PeersChanged, 1, "a new node must be a whole-node add")
-
-	pol := reauthChange(node, true, true)
-	assert.Empty(t, pol.PeerPatches, "a policy change must not be a peer patch")
-	assert.Empty(t, pol.PeersChanged)
-	assert.False(t, pol.IsEmpty(), "a policy change must be non-empty")
-}
-
-// TestOnlyKeysChanged covers which relogins may ride the key-rotation patch:
-// one that flips Expired or changes Hostinfo peers read must not, as
-// [tailcfg.PeerChange] carries neither (#3531).
-func TestOnlyKeysChanged(t *testing.T) {
-	now := time.Now()
-	past, future := now.Add(-time.Minute), now.Add(time.Hour)
-
-	node := func(expiry time.Time, hi tailcfg.Hostinfo) types.NodeView {
-		n := types.Node{
-			NodeKey:  key.NewNode().Public(),
-			DiscoKey: key.NewDisco().Public(),
-			Expiry:   &expiry,
-			Hostinfo: &hi,
-		}
-
-		return n.View()
-	}
-
-	hi := tailcfg.Hostinfo{Hostname: "node", OS: "linux"}
-	withOSVersion, withService := hi, hi
-	withOSVersion.OSVersion = "6.1"
-	withService.Services = []tailcfg.Service{{Proto: tailcfg.PeerAPI4, Port: 4242}}
-
-	tests := []struct {
-		name          string
-		before, after types.NodeView
-		want          bool
-	}{
-		{name: "keys", before: node(future, hi), after: node(future, hi), want: true},
-		{name: "hostinfo peers do not read", before: node(future, hi), after: node(future, withOSVersion), want: true},
-		{name: "un-expired", before: node(past, hi), after: node(future, hi)},
-		{name: "hostinfo peers read", before: node(future, hi), after: node(future, withService)},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, onlyKeysChanged(tt.before, tt.after, now))
-		})
-	}
-}
-
 // TestPreAuthKeyReauthRejectsNodeKeyClaimedByAnotherMachine is the pre-auth-key
 // analogue of TestReauthRejectsNodeKeyClaimedByAnotherMachine: re-registering
 // via a pre-auth key must enforce the same 1:1 NodeKey<->MachineKey binding the
 // auth path and poll-time validation enforce, so a node cannot rotate its key
-// to a victim's and poison the NodeStore NodeKey index.
+// to a victim's and poison the NodeKey index.
 func TestPreAuthKeyReauthRejectsNodeKeyClaimedByAnotherMachine(t *testing.T) {
 	dbPath := t.TempDir() + "/headscale.db"
 	cfg := persistTestConfig(dbPath)
@@ -541,13 +465,13 @@ func TestPreAuthKeyReauthRejectsNodeKeyClaimedByAnotherMachine(t *testing.T) {
 		Hostinfo: &tailcfg.Hostinfo{Hostname: "attacker"},
 		Expiry:   time.Now().Add(24 * time.Hour),
 	}
-	_, _, err = s.HandleNodeFromPreAuthKey(regReq, attackerMachine.Public())
+	_, err = s.HandleNodeFromPreAuthKey(regReq, attackerMachine.Public())
 	require.NoError(t, err)
 
 	// Attacker re-registers its own node but supplies the victim's NodeKey.
 	attack := regReq
 	attack.NodeKey = victimNodeKey.Public()
-	_, _, err = s.HandleNodeFromPreAuthKey(attack, attackerMachine.Public())
+	_, err = s.HandleNodeFromPreAuthKey(attack, attackerMachine.Public())
 	require.ErrorIs(t, err, ErrNodeKeyInUse,
 		"pre-auth-key re-registration claiming another machine's NodeKey must be rejected")
 
@@ -559,18 +483,9 @@ func TestPreAuthKeyReauthRejectsNodeKeyClaimedByAnotherMachine(t *testing.T) {
 }
 
 var (
-	errInjectedNodeUpdate       = errors.New("injected node update failure")
-	errInjectedNodeDelete       = errors.New("injected node delete failure")
-	errInjectedPolicyNodeUpdate = errors.New("injected policy node update failure")
+	errInjectedNodeUpdate = errors.New("injected node update failure")
+	errInjectedNodeDelete = errors.New("injected node delete failure")
 )
-
-type failingSetNodesPolicyManager struct {
-	policy.PolicyManager
-}
-
-func (failingSetNodesPolicyManager) SetNodes(views.Slice[types.NodeView]) (bool, error) {
-	return false, errInjectedPolicyNodeUpdate
-}
 
 func TestDeleteNodeKeepsStoreOnDBFailure(t *testing.T) {
 	_, s, nodeID := persistTestSetup(t)
@@ -587,10 +502,9 @@ func TestDeleteNodeKeepsStoreOnDBFailure(t *testing.T) {
 		}))
 	t.Cleanup(func() { _ = s.db.DB.Callback().Delete().Remove("fail_node_delete") })
 
-	c, err := s.DeleteNode(node)
+	err := s.DeleteNode(node)
 	require.NoError(t, s.db.DB.Callback().Delete().Remove("fail_node_delete"))
 	require.ErrorIs(t, err, errInjectedNodeDelete)
-	assert.Empty(t, c, "an uncommitted deletion must not stop the node's session")
 
 	_, ok = s.GetNodeByID(nodeID)
 	assert.True(t, ok, "a database failure must leave the in-memory node available")
@@ -599,99 +513,11 @@ func TestDeleteNodeKeepsStoreOnDBFailure(t *testing.T) {
 	assert.NoError(t, err, "a failed deletion must leave the durable node row available")
 }
 
-func TestDeleteNodeReturnsRemovalOnPolicyFailure(t *testing.T) {
-	_, s, nodeID := persistTestSetup(t)
-	t.Cleanup(func() { _ = s.Close() })
-
-	node, ok := s.GetNodeByID(nodeID)
-	require.True(t, ok)
-
-	// Fail the writer's refresh too: it shares the policy manager, and a
-	// refresh it applied is not retried by the caller.
-	nodes := make(types.Nodes, 0, s.nodeStore.ListNodes().Len())
-	for _, nv := range s.nodeStore.ListNodes().All() {
-		nodes = append(nodes, nv.AsStruct())
-	}
-
-	s.nodeStore.Stop()
-	s.polMan = failingSetNodesPolicyManager{PolicyManager: s.polMan}
-	s.nodeStore = NewNodeStore(nodes, policyPeersFunc(s.polMan), TestBatchSize, TestBatchTimeout)
-	s.nodeStore.Start()
-
-	cs, err := s.DeleteNode(node)
-	require.ErrorIs(t, err, errInjectedPolicyNodeUpdate)
-	require.NotEmpty(t, cs)
-	assert.Equal(t, []types.NodeID{nodeID}, cs[0].PeersRemoved,
-		"a committed deletion must still notify peers and stop the node's session")
-	assert.Equal(t, []types.NodeID{nodeID}, cs[0].DeletedNodes,
-		"a committed deletion must identify the session to stop")
-
-	_, ok = s.GetNodeByID(nodeID)
-	assert.False(t, ok, "a committed deletion must remove the in-memory node")
-
-	_, err = s.db.GetNodeByID(nodeID)
-	require.ErrorIs(t, err, gorm.ErrRecordNotFound,
-		"a committed deletion must remove the durable node row")
-}
-
-// TestPreAuthKeyReauthRevertsNodeStoreOnDBFailure ensures a failed database
-// write during pre-auth-key re-registration does not leave the NodeStore
+// TestPreAuthKeyReauthRevertsMemoryOnDBFailure ensures a failed database
+// write during pre-auth-key re-registration does not leave memory
 // holding a node key that was never persisted: a restart would reload the old
 // row and the client's current key would no longer resolve, locking it out.
-// TestConcurrentDeleteNodesShareNodeStoreBatch deletes two nodes at once with
-// a NodeStore that applies a batch only when it holds two writes. Holding
-// persistMu across the NodeStore write gave every delete a batch, and so a
-// peer map build, of its own; under churn that serialised deletion behind one
-// rebuild each.
-func TestConcurrentDeleteNodesShareNodeStoreBatch(t *testing.T) {
-	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
-	cfg.Tuning.NodeStoreBatchSize = 2
-	cfg.Tuning.NodeStoreBatchTimeout = time.Hour
-
-	database, err := db.NewHeadscaleDatabase(cfg)
-	require.NoError(t, err)
-
-	user := database.CreateUserForTest("delete-batch-user")
-	nodes := database.CreateNodesForTest(user, 2, "delete-batch-node")
-
-	require.NoError(t, database.Close())
-
-	s, err := NewState(cfg)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
-
-	var wg sync.WaitGroup
-
-	for _, n := range nodes {
-		node, ok := s.GetNodeByID(n.ID)
-		require.True(t, ok)
-
-		wg.Go(func() {
-			_, err := s.DeleteNode(node)
-			assert.NoError(t, err)
-		})
-	}
-
-	done := make(chan struct{})
-
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("concurrent deletes must be able to share a NodeStore batch")
-	}
-
-	for _, n := range nodes {
-		_, ok := s.GetNodeByID(n.ID)
-		assert.False(t, ok, "deleted node must be gone from the NodeStore")
-	}
-}
-
-func TestPreAuthKeyReauthRevertsNodeStoreOnDBFailure(t *testing.T) {
+func TestPreAuthKeyReauthRevertsMemoryOnDBFailure(t *testing.T) {
 	dbPath := t.TempDir() + "/headscale.db"
 	cfg := persistTestConfig(dbPath)
 
@@ -711,13 +537,13 @@ func TestPreAuthKeyReauthRevertsNodeStoreOnDBFailure(t *testing.T) {
 		Hostinfo: &tailcfg.Hostinfo{Hostname: "reauth-node"},
 		Expiry:   time.Now().Add(24 * time.Hour),
 	}
-	node, _, err := s.HandleNodeFromPreAuthKey(regReq, machineKey.Public())
+	node, err := s.HandleNodeFromPreAuthKey(regReq, machineKey.Public())
 	require.NoError(t, err)
 
 	origNodeKey := node.NodeKey()
 
 	// Fail the node row update so the re-registration's database write errors
-	// after the NodeStore has already been mutated. A session connects during
+	// after memory has already been mutated. A session connects during
 	// the write; the rollback must not undo it.
 	require.NoError(t, s.db.DB.Callback().Update().Before("gorm:update").
 		Register("fail_node_update", func(tx *gorm.DB) {
@@ -729,15 +555,15 @@ func TestPreAuthKeyReauthRevertsNodeStoreOnDBFailure(t *testing.T) {
 		}))
 
 	reReg := regReq
-	reReg.NodeKey = key.NewNode().Public() // rotate -> NodeStore mutation, then DB write fails
-	_, _, err = s.HandleNodeFromPreAuthKey(reReg, machineKey.Public())
+	reReg.NodeKey = key.NewNode().Public() // rotate -> memory mutation, then DB write fails
+	_, err = s.HandleNodeFromPreAuthKey(reReg, machineKey.Public())
 	require.NoError(t, s.db.DB.Callback().Update().Remove("fail_node_update"))
 	require.Error(t, err, "re-registration must fail when the database write fails")
 
-	got, ok := s.nodeStore.GetNode(node.ID())
+	got, ok := s.GetNodeByID(node.ID())
 	require.True(t, ok)
 	require.Equal(t, origNodeKey, got.NodeKey(),
-		"NodeStore must revert to the persisted node key when the write fails")
+		"memory must revert to the persisted node key when the write fails")
 
 	online, known := got.IsOnline().GetOk()
 	require.True(t, known)
@@ -782,7 +608,7 @@ func TestConcurrentPreAuthKeyRegistrationSameMachineKey(t *testing.T) {
 
 			<-start
 
-			_, _, err := s.HandleNodeFromPreAuthKey(regReq, machineKey.Public())
+			_, err := s.HandleNodeFromPreAuthKey(regReq, machineKey.Public())
 			errs <- err
 		})
 	}
@@ -800,30 +626,30 @@ func TestConcurrentPreAuthKeyRegistrationSameMachineKey(t *testing.T) {
 }
 
 // TestUpdatePolicyManagerUsersUnchangedKeepsSnapshot ensures re-sending the
-// same user list does not rebuild peer adjacency, while a real user change
-// does.
+// same user list commits nothing, so it neither recompiles the policy nor
+// wakes a map stream, while a real user change recompiles.
 func TestUpdatePolicyManagerUsersUnchangedKeepsSnapshot(t *testing.T) {
 	_, s, _ := persistTestSetup(t)
 	t.Cleanup(func() { _ = s.Close() })
 
 	require.NoError(t, s.UpdatePolicyManagerUsersForTest())
 
-	before := s.nodeStore.data.Load()
+	before := s.Snapshot()
 
 	require.NoError(t, s.UpdatePolicyManagerUsersForTest())
-	require.Same(t, before, s.nodeStore.data.Load(),
-		"unchanged users must not rebuild the peer map")
+	require.Equal(t, before.Rev(), s.Snapshot().Rev(),
+		"unchanged users must not publish a snapshot")
 
-	_, _, err := s.CreateUser(types.User{Name: "second"})
+	_, err := s.CreateUser(types.User{Name: "second"})
 	require.NoError(t, err)
-	require.NotSame(t, before, s.nodeStore.data.Load(),
-		"a user change must rebuild the peer map")
+	require.NotEqual(t, before.PolicyRev(), s.Snapshot().PolicyRev(),
+		"a user change must recompile the policy")
 }
 
-// TestSingleUsePreAuthKeyUsedInNodeStore asserts that consuming a single-use
+// TestSingleUsePreAuthKeyUsedInMemory asserts that consuming a single-use
 // key marks it used in both the database and the node's cached AuthKey, on
 // first registration and when re-registering with a fresh single-use key.
-func TestSingleUsePreAuthKeyUsedInNodeStore(t *testing.T) {
+func TestSingleUsePreAuthKeyUsedInMemory(t *testing.T) {
 	dbPath := t.TempDir() + "/headscale.db"
 
 	s, err := NewState(persistTestConfig(dbPath))
@@ -839,7 +665,7 @@ func TestSingleUsePreAuthKeyUsedInNodeStore(t *testing.T) {
 		pak, err := s.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
 		require.NoError(t, err)
 
-		node, _, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+		node, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
 			Auth:     &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
 			NodeKey:  key.NewNode().Public(),
 			Hostinfo: &tailcfg.Hostinfo{Hostname: "single-use"},
@@ -851,7 +677,7 @@ func TestSingleUsePreAuthKeyUsedInNodeStore(t *testing.T) {
 		require.True(t, ok)
 		require.True(t, cached.AuthKey().Valid())
 		assert.Equal(t, pak.ID, cached.AuthKey().ID())
-		assert.True(t, cached.AuthKey().Used(), "NodeStore copy must be marked used")
+		assert.True(t, cached.AuthKey().Used(), "in-memory copy must be marked used")
 
 		stored, err := s.db.GetPreAuthKeyByID(pak.ID)
 		require.NoError(t, err)
@@ -865,129 +691,69 @@ func TestSingleUsePreAuthKeyUsedInNodeStore(t *testing.T) {
 	assert.Equal(t, first.ID(), second.ID(), "second key re-registers the same node")
 }
 
-// TestPersistNodeAndRefreshPolicyEmptyForPayloadOnlyChange proves
-// persistNodeAndRefreshPolicy returns an empty change when the write did not
-// touch anything policy reads, so each caller can tell a genuinely empty
-// write apart and pick its own wire change (see
-// TestPersistCallerChangeDecisions).
-func TestPersistNodeAndRefreshPolicyEmptyForPayloadOnlyChange(t *testing.T) {
-	_, s, nodeID := persistTestSetup(t)
-	t.Cleanup(func() { _ = s.Close() })
-
-	genBefore := s.polMan.NodesGeneration()
-
-	view, ok := s.nodeStore.UpdateNode(nodeID, func(n *types.Node) {
-		n.Hostinfo = &tailcfg.Hostinfo{Hostname: "payload-only"}
-	})
-	require.True(t, ok)
-
-	_, c, err := s.persistNodeAndRefreshPolicy(view, genBefore)
-	require.NoError(t, err)
-	assert.True(t, c.IsEmpty(), "a payload-only write must not fabricate a change")
-}
-
-// TestPersistCallerChangeDecisions proves each persistNodeAndRefreshPolicy
-// caller picks its own wire change when persist reports none. A caller that
-// returns nothing silently stops a node's peers from learning about it, so
-// every case here checks the exact change, not just that persist succeeded.
-func TestPersistCallerChangeDecisions(t *testing.T) {
+// TestAdminNodeWritesRecompileOnlyPolicyInputs proves each admin node write
+// is one commit, so every map stream re-renders it and the O(n^2) peer build
+// runs at most once, and recompiles the policy only when it moved something
+// the policy reads.
+func TestAdminNodeWritesRecompileOnlyPolicyInputs(t *testing.T) {
 	taggingPolicy := `{
 		"tagOwners": {"tag:ci": ["persist-user@"]},
 		"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]
 	}`
 
 	tests := []struct {
-		name             string
-		policy           string
-		setup            func(t *testing.T, s *State, nodeID types.NodeID)
-		run              func(t *testing.T, s *State, nodeID types.NodeID) change.Change
-		wantType         string
-		wantOriginNode   bool
-		wantPeersChanged bool
+		name        string
+		policy      string
+		setup       func(t *testing.T, s *State, nodeID types.NodeID)
+		run         func(t *testing.T, s *State, nodeID types.NodeID)
+		wantCompile bool
 	}{
 		{
-			name: "RenameNode resends the whole node when the rename does not affect policy",
-			run: func(t *testing.T, s *State, nodeID types.NodeID) change.Change {
+			name: "RenameNode is no policy input",
+			run: func(t *testing.T, s *State, nodeID types.NodeID) {
 				t.Helper()
 
-				_, c, err := s.RenameNode(nodeID, "renamed")
+				nv, err := s.RenameNode(nodeID, "renamed")
 				require.NoError(t, err)
-
-				return c
+				require.Equal(t, "renamed", nv.GivenName())
 			},
-			wantType:         "peers",
-			wantOriginNode:   true,
-			wantPeersChanged: true,
 		},
 		{
-			name:   "SetNodeTags reports a policy change for a real tag assignment",
+			name:   "SetNodeTags with a real tag assignment is a policy input",
 			policy: taggingPolicy,
-			run: func(t *testing.T, s *State, nodeID types.NodeID) change.Change {
+			run: func(t *testing.T, s *State, nodeID types.NodeID) {
 				t.Helper()
 
-				_, c, err := s.SetNodeTags(nodeID, []string{"tag:ci"})
+				nv, err := s.SetNodeTags(nodeID, []string{"tag:ci"})
 				require.NoError(t, err)
-
-				return c
+				require.True(t, nv.IsTagged())
 			},
-			wantType:         "policy",
-			wantOriginNode:   true,
-			wantPeersChanged: false,
+			wantCompile: true,
 		},
 		{
-			name:   "SetNodeTags resends the whole node when re-applying identical tags",
+			name:   "SetNodeTags re-applying identical tags is no policy input",
 			policy: taggingPolicy,
 			setup: func(t *testing.T, s *State, nodeID types.NodeID) {
 				t.Helper()
 
-				_, _, err := s.SetNodeTags(nodeID, []string{"tag:ci"})
+				_, err := s.SetNodeTags(nodeID, []string{"tag:ci"})
 				require.NoError(t, err)
 			},
-			run: func(t *testing.T, s *State, nodeID types.NodeID) change.Change {
+			run: func(t *testing.T, s *State, nodeID types.NodeID) {
 				t.Helper()
 
-				_, c, err := s.SetNodeTags(nodeID, []string{"tag:ci"})
+				_, err := s.SetNodeTags(nodeID, []string{"tag:ci"})
 				require.NoError(t, err)
-
-				return c
 			},
-			wantType:         "peers",
-			wantOriginNode:   true,
-			wantPeersChanged: true,
 		},
 		{
-			name: "SetApprovedRoutes of an unannounced route resends only the node",
-			run: func(t *testing.T, s *State, nodeID types.NodeID) change.Change {
+			name: "SetApprovedRoutes of an unannounced route is no policy input",
+			run: func(t *testing.T, s *State, nodeID types.NodeID) {
 				t.Helper()
 
-				_, c, err := s.SetApprovedRoutes(nodeID, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")})
+				_, err := s.SetApprovedRoutes(nodeID, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")})
 				require.NoError(t, err)
-
-				return c
 			},
-			wantType:         "peers",
-			wantOriginNode:   true,
-			wantPeersChanged: true,
-		},
-		{
-			name: "SaveNode reports no change for a payload-only save",
-			run: func(t *testing.T, s *State, nodeID types.NodeID) change.Change {
-				t.Helper()
-
-				current, ok := s.nodeStore.GetNode(nodeID)
-				require.True(t, ok)
-
-				n := current.AsStruct()
-				n.Hostinfo = &tailcfg.Hostinfo{Hostname: "saved-payload"}
-
-				_, c, err := s.SaveNode(n.View())
-				require.NoError(t, err)
-
-				return c
-			},
-			wantType:         "empty",
-			wantOriginNode:   false,
-			wantPeersChanged: false,
 		},
 	}
 
@@ -1005,71 +771,77 @@ func TestPersistCallerChangeDecisions(t *testing.T) {
 				tt.setup(t, s, nodeID)
 			}
 
-			c := tt.run(t, s, nodeID)
+			before := s.Snapshot()
 
-			assert.Equal(t, tt.wantType, c.Type())
+			tt.run(t, s, nodeID)
 
-			if tt.wantOriginNode {
-				assert.Equal(t, nodeID, c.OriginNode)
-			} else {
-				assert.Zero(t, c.OriginNode)
-			}
-
-			if tt.wantPeersChanged {
-				assert.Equal(t, []types.NodeID{nodeID}, c.PeersChanged)
-			} else {
-				assert.Empty(t, c.PeersChanged)
-			}
+			after := s.Snapshot()
+			assert.Equal(t, before.Rev()+1, after.Rev(), "the write must be one commit")
+			assert.Equal(t, tt.wantCompile, after.PolicyRev() != before.PolicyRev(), "policy recompiled")
+			checkPeersMatchFullBuild(t, after)
 		})
 	}
 }
 
-// TestRetryAfterFailedPersistReportsPolicyChange proves a policy move made by
-// a write whose database persist failed is still reported. The NodeStore write
-// already fed the policy manager, so an identical retry sees nothing new; if
-// neither call reported the move, clients would keep the filter and SSH
-// policy the write revoked.
-func TestRetryAfterFailedPersistReportsPolicyChange(t *testing.T) {
-	_, s, nodeID := persistTestSetup(t)
+// TestConcurrentTagWritesBothReachPolicy runs two SetNodeTags on different
+// nodes at once. Each commit compiles against the nodes of its own
+// snapshot, so the later one must hold both tags and its peers must match
+// a full build.
+func TestConcurrentTagWritesBothReachPolicy(t *testing.T) {
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(t, err)
+
+	nodes := database.CreateRegisteredNodesForTest(database.CreateUserForTest("pb-user"), 3, "pb-node")
+	require.NoError(t, database.Close())
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 
-	_, err := s.SetPolicy([]byte(`{
-		"tagOwners": {"tag:ci": ["persist-user@"]},
-		"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]}]
+	_, err = s.SetPolicy([]byte(`{
+		"tagOwners": {"tag:a": ["pb-user@"], "tag:b": ["pb-user@"]},
+		"acls": [{"action": "accept", "src": ["tag:a"], "dst": ["tag:b:*"]}]
 	}`))
 	require.NoError(t, err)
 
-	require.NoError(t, s.db.DB.Callback().Update().Before("gorm:update").
-		Register("fail_node_update", func(tx *gorm.DB) {
-			if tx.Statement.Table == "nodes" {
-				_ = tx.AddError(errInjectedNodeUpdate)
-			}
-		}))
-	t.Cleanup(func() { _ = s.db.DB.Callback().Update().Remove("fail_node_update") })
+	tags := [2]string{"tag:a", "tag:b"}
 
-	_, failedC, err := s.SetNodeTags(nodeID, []string{"tag:ci"})
-	require.ErrorIs(t, err, errInjectedNodeUpdate)
-	require.NoError(t, s.db.DB.Callback().Update().Remove("fail_node_update"))
+	for round := range 20 {
+		var (
+			wg   sync.WaitGroup
+			errs [2]error
+		)
 
-	_, c, err := s.SetNodeTags(nodeID, []string{"tag:ci"})
-	require.NoError(t, err)
-	assert.True(t, failedC.IncludePolicy || c.IncludePolicy,
-		"the failed call or its retry must report the policy move: failed %s, retry %s",
-		failedC.Type(), c.Type())
-	assert.Equal(t, nodeID, c.OriginNode)
+		for i := range 2 {
+			wg.Go(func() {
+				_, errs[i] = s.SetNodeTags(nodes[1+i].ID, []string{tags[(i+round)%2]})
+			})
+		}
 
-	if !failedC.IsEmpty() {
-		assert.Equal(t, nodeID, failedC.OriginNode,
-			"a failed call's change must still refresh the tagged node's self view")
+		wg.Wait()
+
+		snap := s.Snapshot()
+
+		for i := range 2 {
+			require.NoError(t, errs[i])
+
+			nv, ok := snap.GetNode(nodes[1+i].ID)
+			require.True(t, ok)
+			require.Equal(t, []string{tags[(i+round)%2]}, nv.Tags().AsSlice(), "round %d writer %d", round, i)
+		}
+
+		require.Contains(t, snap.ListPeerIDs(nodes[1].ID), nodes[2].ID, "round %d: tag:a reaches tag:b", round)
+		checkPeersMatchFullBuild(t, snap)
 	}
 }
 
-// TestFailedPersistPolicyChangeSurvivesDroppedChange covers a policy move
-// whose write failed to persist, followed by an unrelated map request whose
-// change never reaches the batcher (its initial map failed) and then a
-// successful retry. The changes that do get published must still carry the
-// policy, or clients keep the filter and SSH policy the write revoked.
-func TestFailedPersistPolicyChangeSurvivesDroppedChange(t *testing.T) {
+// TestFailedPersistKeepsPolicyMove proves a policy move made by a write whose
+// database persist failed still reaches the compiled policy. Memory is
+// written first, so clients are served the move; an identical retry then
+// only has to persist it.
+func TestFailedPersistKeepsPolicyMove(t *testing.T) {
 	_, s, nodeID := persistTestSetup(t)
 	t.Cleanup(func() { _ = s.Close() })
 
@@ -1087,40 +859,41 @@ func TestFailedPersistPolicyChangeSurvivesDroppedChange(t *testing.T) {
 		}))
 	t.Cleanup(func() { _ = s.db.DB.Callback().Update().Remove("fail_node_update") })
 
-	_, failedC, err := s.SetNodeTags(nodeID, []string{"tag:ci"})
+	before := s.Snapshot()
+
+	_, err = s.SetNodeTags(nodeID, []string{"tag:ci"})
 	require.ErrorIs(t, err, errInjectedNodeUpdate)
 	require.NoError(t, s.db.DB.Callback().Update().Remove("fail_node_update"))
 
-	nv, ok := s.GetNodeByID(nodeID)
+	failed := s.Snapshot()
+	nv, ok := failed.GetNode(nodeID)
 	require.True(t, ok)
+	assert.True(t, nv.IsTagged(), "memory keeps the write the database lost")
+	assert.NotEqual(t, before.PolicyRev(), failed.PolicyRev(),
+		"the policy must be compiled with the write the database lost")
 
-	// The map request's change is dropped, as when its initial map fails.
-	_, err = s.UpdateNodeFromMapRequest(nodeID, tailcfg.MapRequest{
-		NodeKey:  nv.NodeKey(),
-		DiscoKey: nv.DiscoKey(),
-		Hostinfo: &tailcfg.Hostinfo{Hostname: nv.Hostname()},
-	})
+	row, err := s.db.GetNodeByID(nodeID)
+	require.NoError(t, err)
+	assert.Empty(t, row.Tags, "precondition: the database lost the write")
+
+	_, err = s.SetNodeTags(nodeID, []string{"tag:ci"})
 	require.NoError(t, err)
 
-	_, retryC, err := s.SetNodeTags(nodeID, []string{"tag:ci"})
+	row, err = s.db.GetNodeByID(nodeID)
 	require.NoError(t, err)
-
-	assert.True(t, failedC.IncludePolicy || retryC.IncludePolicy,
-		"published changes must carry the policy move: failed %s, retry %s",
-		failedC.Type(), retryC.Type())
+	assert.Equal(t, []string{"tag:ci"}, row.Tags.List(), "the retry must persist the write")
 }
 
-// TestReloadPolicyReturnsChangesOnAutoApproveFailure covers a policy reload
-// whose route auto-approval fails to persist. The NodeStore write already
-// fed the approved routes to the policy manager, so no later write sees the
-// policy move again; the reload must return its changes with the error for
-// the caller to publish.
-func TestReloadPolicyReturnsChangesOnAutoApproveFailure(t *testing.T) {
+// TestReloadPolicyKeepsApprovalOnAutoApproveFailure covers a policy reload
+// whose route auto-approval fails to persist. Memory is written first, so
+// the approval and the policy compiled with it are served despite the
+// error.
+func TestReloadPolicyKeepsApprovalOnAutoApproveFailure(t *testing.T) {
 	_, s, nodeID := persistTestSetup(t)
 	t.Cleanup(func() { _ = s.Close() })
 
 	route := netip.MustParsePrefix("10.9.0.0/24")
-	_, ok := s.nodeStore.UpdateNode(nodeID, func(n *types.Node) {
+	_, ok := s.world.UpdateNode(nodeID, func(n *types.Node) {
 		n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
 	})
 	require.True(t, ok)
@@ -1139,72 +912,56 @@ func TestReloadPolicyReturnsChangesOnAutoApproveFailure(t *testing.T) {
 		}))
 	t.Cleanup(func() { _ = s.db.DB.Callback().Update().Remove("fail_node_update") })
 
-	cs, err := s.ReloadPolicy()
+	before := s.Snapshot()
+
+	err = s.ReloadPolicy()
 	require.ErrorIs(t, err, errInjectedNodeUpdate)
 
-	approved, ok := s.GetNodeByID(nodeID)
+	after := s.Snapshot()
+	approved, ok := after.GetNode(nodeID)
 	require.True(t, ok)
 	require.Contains(t, approved.ApprovedRoutes().AsSlice(), route,
-		"the NodeStore holds the approval the database write lost")
-
-	assert.True(t, slices.ContainsFunc(cs, func(c change.Change) bool { return c.IncludePolicy }),
-		"the reload must return its policy change with the error: %v", cs)
+		"memory holds the approval the database write lost")
+	assert.Contains(t, approved.SubnetRoutes(), route)
+	assert.NotEqual(t, before.PolicyRev(), after.PolicyRev(),
+		"the policy must be compiled with the approved route")
 }
 
-// TestNodeWriteChangeWhenPolicyRefreshFails fails both the NodeStore
-// writer's SetNodes and the caller's. The write still reached the
-// NodeStore, so the change returned with the error must resend the node to
-// itself and its peers rather than be empty.
-func TestNodeWriteChangeWhenPolicyRefreshFails(t *testing.T) {
-	_, s, nodeID := persistTestSetup(t)
-	t.Cleanup(func() { _ = s.Close() })
+// TestBackfillNodeIPsRecompilesPolicy pins that assigning a missing address
+// recompiles the policy: the address is a policy input, and peers would
+// otherwise only learn it from whichever unrelated write next recompiled.
+func TestBackfillNodeIPsRecompilesPolicy(t *testing.T) {
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
 
-	_, err := s.SetPolicy([]byte(`{
-		"tagOwners": {"tag:ci": ["persist-user@"]},
-		"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]
-	}`))
+	database, err := db.NewHeadscaleDatabase(cfg)
 	require.NoError(t, err)
 
-	nodes := make(types.Nodes, 0, s.nodeStore.ListNodes().Len())
-	for _, nv := range s.nodeStore.ListNodes().All() {
-		nodes = append(nodes, nv.AsStruct())
-	}
+	nodes := database.CreateRegisteredNodesForTest(database.CreateUserForTest("bf-user"), 2, "bf-node")
+	require.NoError(t, database.DB.Model(&types.Node{}).Where("id = ?", nodes[0].ID).Update("ipv4", nil).Error)
+	// Backfill copies the stored Hostinfo, which a registered client always has.
+	require.NoError(t, database.DB.Model(&types.Node{}).Where("1 = 1").Update("host_info", "{}").Error)
+	require.NoError(t, database.Close())
 
-	s.nodeStore.Stop()
-	s.polMan = failingSetNodesPolicyManager{PolicyManager: s.polMan}
-	s.nodeStore = NewNodeStore(nodes, policyPeersFunc(s.polMan), TestBatchSize, TestBatchTimeout)
-	s.nodeStore.Start()
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
 
-	tests := []struct {
-		name  string
-		write func() (change.Change, error)
-	}{
-		{name: "SetNodeTags", write: func() (change.Change, error) {
-			_, c, err := s.SetNodeTags(nodeID, []string{"tag:ci"})
-			return c, err
-		}},
-		{name: "RenameNode", write: func() (change.Change, error) {
-			_, c, err := s.RenameNode(nodeID, "renamed")
-			return c, err
-		}},
-		{name: "SetNodeExpiry", write: func() (change.Change, error) {
-			_, c, err := s.SetNodeExpiry(nodeID, nil)
-			return c, err
-		}},
-	}
+	before := s.Snapshot()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c, err := tt.write()
-			require.ErrorIs(t, err, errInjectedPolicyNodeUpdate)
-			assert.Equal(t, nodeID, c.OriginNode, "change: %s", c.Type())
-			assert.Contains(t, c.PeersChanged, nodeID, "change: %s", c.Type())
-		})
-	}
+	backfilled, err := s.BackfillNodeIPs()
+	require.NoError(t, err)
+	require.NotEmpty(t, backfilled)
+
+	after := s.Snapshot()
+	nv, ok := after.GetNode(nodes[0].ID)
+	require.True(t, ok)
+	assert.True(t, nv.IPv4().Valid(), "backfill must assign the missing address")
+	assert.NotEqual(t, before.PolicyRev(), after.PolicyRev(), "backfill must recompile the policy")
+	checkPeersMatchFullBuild(t, after)
 }
 
 // TestBackfillNodeIPsSurvivesConcurrentPersist guards the backfill against a
-// node persist landing between its database write and the NodeStore reload:
+// node persist landing between its database write and the memory reload:
 // that persist writes the old addresses back and the backfill is lost.
 func TestBackfillNodeIPsSurvivesConcurrentPersist(t *testing.T) {
 	dbPath, s, nodeID := persistTestSetup(t)
@@ -1223,7 +980,7 @@ func TestBackfillNodeIPsSurvivesConcurrentPersist(t *testing.T) {
 	require.True(t, nv.IPv6().Valid(), "precondition: node has an IPv6 address")
 
 	// The backfill reads the nodes table twice: inside its write, then to
-	// reload NodeStore. Persist the node just before the reload.
+	// reload memory. Persist the node just before the reload.
 	var reads atomic.Int32
 
 	persisted := make(chan struct{})
@@ -1248,13 +1005,13 @@ func TestBackfillNodeIPsSurvivesConcurrentPersist(t *testing.T) {
 		}))
 	t.Cleanup(func() { _ = s.db.DB.Callback().Query().Remove("persist_before_reload") })
 
-	_, _, err = s.BackfillNodeIPs()
+	_, err = s.BackfillNodeIPs()
 	require.NoError(t, err)
 	<-persisted
 
 	nv, ok = s.GetNodeByID(nodeID)
 	require.True(t, ok)
-	assert.False(t, nv.IPv6().Valid(), "NodeStore kept the removed IPv6 address")
+	assert.False(t, nv.IPv6().Valid(), "memory kept the removed IPv6 address")
 
 	dbNode, err := s.db.GetNodeByID(nodeID)
 	require.NoError(t, err)

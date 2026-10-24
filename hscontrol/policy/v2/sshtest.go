@@ -122,27 +122,8 @@ func (pm *PolicyManager) RunSSHTests() error {
 		return nil
 	}
 
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
 	cache := make(map[types.NodeID]*tailcfg.SSHPolicy)
 	results := runSSHPolicyTests(pm.pol, pm.users, pm.nodes, cache)
-
-	return wrapTestResult(errSSHPolicyTestsFailed, results.AllPassed, results.Errors)
-}
-
-// evaluateSSHTests runs the block against pol without mutating live state.
-func evaluateSSHTests(
-	pol *Policy,
-	users []types.User,
-	nodes views.Slice[types.NodeView],
-) error {
-	if pol == nil || len(pol.SSHTests) == 0 {
-		return nil
-	}
-
-	cache := make(map[types.NodeID]*tailcfg.SSHPolicy)
-	results := runSSHPolicyTests(pol, users, nodes, cache)
 
 	return wrapTestResult(errSSHPolicyTestsFailed, results.AllPassed, results.Errors)
 }

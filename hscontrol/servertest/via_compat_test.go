@@ -112,9 +112,8 @@ func runViaMapCompat(t *testing.T, c *testcapture.Capture) {
 	require.NoError(t, err, "failed to set policy")
 
 	if changed {
-		changes, err := srv.State().ReloadPolicy()
+		err := srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 	}
 
 	// Create clients matching the golden topology: tagged nodes under
@@ -201,11 +200,10 @@ func runViaMapCompat(t *testing.T, c *testcapture.Capture) {
 		cancel()
 
 		nodeID := findNodeID(t, srv, name)
-		_, routeChange, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			nodeID, nodeApproved[name],
 		)
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 	}
 
 	// Wait for peers based on golden [netmap.NetworkMap] expected counts.

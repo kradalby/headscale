@@ -3,6 +3,7 @@ package policyutil_test
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"net/netip"
 	"testing"
 
@@ -1413,4 +1414,129 @@ func TestReduceFilterRulesAllocsIndependentOfDests(t *testing.T) {
 
 	require.Equal(t, allocs(10), allocs(1000),
 		"reducing a filter must not allocate per DstPorts entry")
+}
+
+// BenchmarkReduceFilterRules compares reducing a 400-rule filter for one
+// node with parsing it each time against a Reducer built once, the way a
+// compile serves every node.
+func BenchmarkReduceFilterRules(b *testing.B) {
+	rules := make([]tailcfg.FilterRule, 400)
+	for i := range rules {
+		rules[i] = tailcfg.FilterRule{
+			SrcIPs: []string{"100.64.0.0/10"},
+			DstPorts: []tailcfg.NetPortRange{
+				{IP: fmt.Sprintf("100.64.%d.%d/32", i/250, i%250), Ports: tailcfg.PortRangeAny},
+				{IP: fmt.Sprintf("10.%d.0.0/16", i%250), Ports: tailcfg.PortRangeAny},
+			},
+		}
+	}
+
+	ip := netip.MustParseAddr("100.64.0.7")
+	node := (&types.Node{IPv4: &ip}).View()
+
+	b.Run("parse-each", func(b *testing.B) {
+		for b.Loop() {
+			policyutil.ReduceFilterRules(node, rules)
+		}
+	})
+
+	b.Run("reducer", func(b *testing.B) {
+		red := policyutil.NewReducer(rules)
+
+		for b.Loop() {
+			red.Reduce(node)
+		}
+	})
+}
+
+// BenchmarkReducerTagFanout reduces a filter whose destinations are tags
+// expanded to one address per tagged node, as a CI fleet's grants are:
+// 400 rules of 100 addresses each.
+func BenchmarkReducerTagFanout(b *testing.B) {
+	rules := make([]tailcfg.FilterRule, 400)
+	for i := range rules {
+		dsts := make([]tailcfg.NetPortRange, 100)
+		for j := range dsts {
+			n := i*100 + j
+			dsts[j] = tailcfg.NetPortRange{IP: fmt.Sprintf("100.%d.%d.%d", 64+n/65536, n/256%256, n%256), Ports: tailcfg.PortRangeAny}
+		}
+
+		rules[i] = tailcfg.FilterRule{SrcIPs: []string{"100.64.0.0/10"}, DstPorts: dsts}
+	}
+
+	ip := netip.MustParseAddr("100.64.0.7")
+	node := (&types.Node{IPv4: &ip}).View()
+	red := policyutil.NewReducer(rules)
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		red.Reduce(node)
+	}
+}
+
+// TestReducerMatchesLinearReduction builds random filters mixing single
+// addresses, prefixes, ranges, wildcards, invalid entries and CapGrant
+// rules, and checks the indexed Reducer returns exactly what the linear
+// reduction does, for nodes with and without routes.
+func TestReducerMatchesLinearReduction(t *testing.T) {
+	r := rand.New(rand.NewPCG(5, 6)) //nolint:gosec // deterministic test input
+
+	addr := func() string { return fmt.Sprintf("100.64.0.%d", r.IntN(8)) }
+
+	dst := func() string {
+		switch r.IntN(6) {
+		case 0:
+			return "*"
+		case 1:
+			return "100.64.0.0/29"
+		case 2:
+			return fmt.Sprintf("100.64.0.%d-100.64.0.%d", r.IntN(4), 4+r.IntN(4))
+		case 3:
+			return "not-an-ip"
+		case 4:
+			return "10.0.0.5"
+		default:
+			return addr()
+		}
+	}
+
+	for round := range 200 {
+		rules := make([]tailcfg.FilterRule, 1+r.IntN(6))
+		for i := range rules {
+			if r.IntN(5) == 0 {
+				rules[i] = tailcfg.FilterRule{
+					SrcIPs:   []string{"*"},
+					CapGrant: []tailcfg.CapGrant{{Dsts: []netip.Prefix{netip.MustParsePrefix(addr() + "/32")}}},
+				}
+
+				continue
+			}
+
+			for range 1 + r.IntN(5) {
+				rules[i].DstPorts = append(rules[i].DstPorts, tailcfg.NetPortRange{IP: dst(), Ports: tailcfg.PortRangeAny})
+			}
+		}
+
+		red := policyutil.NewReducer(rules)
+
+		// One cache across the round's nodes, as a compile shares it.
+		var cache policyutil.DstCache
+
+		for range 5 {
+			ip := netip.MustParseAddr(addr())
+			n := &types.Node{IPv4: &ip, Hostinfo: &tailcfg.Hostinfo{}}
+
+			if r.IntN(3) == 0 {
+				route := netip.MustParsePrefix("10.0.0.0/24")
+				n.Hostinfo.RoutableIPs = []netip.Prefix{route}
+				n.ApprovedRoutes = []netip.Prefix{route}
+			}
+
+			want := policyutil.ReduceFilterRules(n.View(), rules)
+			got := red.Reduce(n.View())
+			require.Equal(t, want, got, "round %d, node %s, routes %v", round, ip, n.ApprovedRoutes)
+			require.Equal(t, want, cache.Reduce(n.View(), rules), "cached, round %d, node %s", round, ip)
+		}
+	}
 }

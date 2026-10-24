@@ -319,7 +319,7 @@ func setScopeMatrixPolicy(t *testing.T, srv *servertest.TestServer) {
 	_, err = st.SetPolicyInDB(policy)
 	require.NoError(t, err)
 
-	_, err = st.ReloadPolicy()
+	err = st.ReloadPolicy()
 	require.NoError(t, err)
 }
 

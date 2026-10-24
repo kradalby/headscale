@@ -1489,7 +1489,7 @@ func TestTagUserMutualExclusivity(t *testing.T) {
 	// User1's user-owned node should have no rules reaching tagged nodes
 	// since there is no explicit user→tag ACL rule. ReduceFilterRules
 	// filters compiled rules to only those where the node is a destination,
-	// matching the production pipeline in filterForNodeLocked.
+	// matching the production pipeline in FilterForNode.
 	userNode := nodes[0].View()
 
 	compiled := pol.compileFilterRulesForNode(users, userNode, nodes.ViewSlice())
@@ -3956,7 +3956,7 @@ func TestCompileViaGrant(t *testing.T) {
 			nodeView := tt.node.View()
 			nodesSlice := tt.nodes.ViewSlice()
 
-			cg, err := tt.pol.compileOneGrant(tt.grant, users, nodesSlice)
+			cg, err := tt.pol.compileOneGrant(tt.grant, users, nodesSlice, nil)
 
 			if tt.wantErr != nil {
 				require.ErrorIs(t, err, tt.wantErr)
@@ -4129,7 +4129,7 @@ func TestCompileGrantWithAutogroupSelf_GrantPaths(t *testing.T) {
 			userIdx := buildUserNodeIndex(nodesSlice)
 
 			cg, err := tt.pol.compileOneGrant(
-				tt.grant, users, nodesSlice,
+				tt.grant, users, nodesSlice, nil,
 			)
 
 			if tt.wantErr != nil {

@@ -459,7 +459,23 @@ func requireAllClientsOfflineStaged(t *testing.T, headscale ControlServer, expec
 			return
 		}
 
+		debugInfo, err := headscale.DebugBatcher()
+		assert.NoError(c, err, "Failed to get batcher debug info")
+
+		if err != nil {
+			return
+		}
+
+		// Only a viewer with a live session can still be told; one that
+		// disconnected keeps the view it last received until it reconnects
+		// and gets a full map.
 		onlineMap := integrationutil.BuildExpectedOnlineMap(mapResponses)
+		for id := range onlineMap {
+			if info, ok := debugInfo.ConnectedNodes[id.String()]; !ok || !info.Connected {
+				delete(onlineMap, id)
+			}
+		}
+
 		allMapResponsesOffline := true
 
 		if len(expectedNodes) == 1 {

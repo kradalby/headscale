@@ -60,9 +60,8 @@ func TestConnectDisconnectRace(t *testing.T) {
 
 	r2ID := findNodeID(t, srv, "race-r2")
 
-	_, ch, err := srv.State().SetApprovedRoutes(r2ID, []netip.Prefix{route})
+	_, err := srv.State().SetApprovedRoutes(r2ID, []netip.Prefix{route})
 	require.NoError(t, err)
-	srv.App.Change(ch)
 
 	// Wait for advertisement + approval to be reflected as a primary
 	// route assignment in [tailcfg.NodeView.PrimaryRoutes]; otherwise we'd be racing the
@@ -90,7 +89,7 @@ func TestConnectDisconnectRace(t *testing.T) {
 
 	for i := range iterations {
 		// Establish a "current session" with a known gen for r2.
-		_, gen := srv.State().Connect(r2ID)
+		gen := srv.State().Connect(r2ID)
 
 		var wg sync.WaitGroup
 
@@ -99,12 +98,12 @@ func TestConnectDisconnectRace(t *testing.T) {
 		wg.Go(func() {
 			<-start
 
-			_, _ = srv.State().Disconnect(r2ID, gen)
+			_ = srv.State().Disconnect(r2ID, gen)
 		})
 		wg.Go(func() {
 			<-start
 
-			_, _ = srv.State().Connect(r2ID)
+			_ = srv.State().Connect(r2ID)
 		})
 
 		close(start)

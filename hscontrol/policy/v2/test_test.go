@@ -54,9 +54,7 @@ func policyTestNodes(users types.Users) types.Nodes {
 }
 
 // TestRunTests covers the engine's per-test outcome reporting. Each row
-// constructs a PolicyManager (which also runs SetPolicy's sandbox) and
-// checks the resulting RunTests behaviour. SetPolicy gating is exercised
-// separately in TestSetPolicyRejectsFailingTests.
+// constructs a PolicyManager and checks the resulting RunTests behaviour.
 func TestRunTests(t *testing.T) {
 	users := policyTestUsers()
 	nodes := policyTestNodes(users)
@@ -275,54 +273,6 @@ func TestRunTests(t *testing.T) {
 	}
 }
 
-// TestSetPolicyRejectsFailingTests asserts that SetPolicy is the user-write
-// boundary: a policy whose tests fail must be rejected without mutating the
-// live PolicyManager. NewPolicyManager (boot path) does not run tests.
-func TestSetPolicyRejectsFailingTests(t *testing.T) {
-	users := policyTestUsers()
-	nodes := policyTestNodes(users)
-
-	good := `{
-		"tagOwners": { "tag:server": ["alice@headscale.net"] },
-		"acls": [{
-			"action": "accept",
-			"src": ["alice@headscale.net"],
-			"dst": ["tag:server:22"]
-		}],
-		"tests": [{
-			"src": "alice@headscale.net",
-			"accept": ["tag:server:22"]
-		}]
-	}`
-
-	bad := `{
-		"tagOwners": { "tag:server": ["alice@headscale.net"] },
-		"acls": [{
-			"action": "accept",
-			"src": ["alice@headscale.net"],
-			"dst": ["tag:server:22"]
-		}],
-		"tests": [{
-			"src": "bob@headscale.net",
-			"accept": ["tag:server:22"]
-		}]
-	}`
-
-	pm, err := NewPolicyManager([]byte(good), users, nodes.ViewSlice())
-	require.NoError(t, err)
-
-	beforeFilter, _ := pm.Filter()
-
-	changed, err := pm.SetPolicy([]byte(bad))
-	require.Error(t, err, "SetPolicy must reject a policy whose tests fail")
-	require.False(t, changed, "SetPolicy must report no change when rejected")
-	require.ErrorIs(t, err, errPolicyTestsFailed)
-	require.Contains(t, err.Error(), "expected ALLOWED")
-
-	afterFilter, _ := pm.Filter()
-	require.Len(t, afterFilter, len(beforeFilter), "live filter must not change after a rejected SetPolicy")
-}
-
 // TestNewPolicyManagerSkipsTests asserts the boot path does not evaluate
 // tests, so a stale stored policy referencing a now-deleted user does not
 // stop the server from booting.
@@ -348,9 +298,8 @@ func TestNewPolicyManagerSkipsTests(t *testing.T) {
 	require.NoError(t, err, "boot must not run tests")
 	require.NotNil(t, pm)
 
-	// And a subsequent SetPolicy of the same body must reject — that's
-	// the user-write path.
-	_, err = pm.SetPolicy([]byte(stale))
+	// The write boundary runs the tests and must reject the same body.
+	err = pm.RunTests()
 	require.Error(t, err)
 	require.ErrorIs(t, err, errPolicyTestsFailed)
 }

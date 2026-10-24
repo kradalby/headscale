@@ -2,7 +2,6 @@ package state
 
 import (
 	"fmt"
-	"maps"
 	"net/netip"
 	"slices"
 	"testing"
@@ -15,13 +14,12 @@ import (
 
 // model mirrors the expected primary-route assignment given the
 // operations applied so far. It is intentionally simple — close to
-// what computePrimaries (node_store.go) prescribes — so divergence
+// what electPrimaryRoutes (world.go) prescribes — so divergence
 // between the model and the snapshot's primaries map flags a bug in
 // the algorithm.
 //
-// The model lives in the test file because the algorithm under test
-// is the one inside snapshotFromNodes; the model's job is to predict
-// the same answer from a separate, deliberately direct implementation.
+// The model's job is to predict the election's answer from a separate,
+// deliberately direct implementation.
 type primariesModel struct {
 	connected map[types.NodeID]bool
 	// announced mirrors Hostinfo.RoutableIPs — what the client says
@@ -87,7 +85,7 @@ func (m *primariesModel) recomputeEffective(id types.NodeID) {
 }
 
 // advertisersByPrefix returns the connected nodes that announce each
-// prefix, sorted by NodeID (matches computePrimaries' iteration).
+// prefix, sorted by NodeID (matches electPrimaryRoutes' iteration).
 func (m *primariesModel) advertisersByPrefix() map[netip.Prefix][]types.NodeID {
 	out := map[netip.Prefix][]types.NodeID{}
 
@@ -202,7 +200,7 @@ func samePrefixSet(a, b []netip.Prefix) bool {
 // catch flap regressions that move primary off a still-eligible owner.
 func checkPrimariesProperties(
 	rt *rapid.T,
-	ns *NodeStore,
+	snap *Snapshot,
 	m *primariesModel,
 	nodeIDs []types.NodeID,
 	prevSnapshotPrimaries map[netip.Prefix]types.NodeID,
@@ -215,7 +213,7 @@ func checkPrimariesProperties(
 	}
 
 	for _, id := range nodeIDs {
-		got := ns.PrimaryRoutesForNode(id)
+		got := snap.PrimaryRoutesForNode(id)
 		want := expectedByNode[id]
 
 		if !samePrefixSet(got, want) {
@@ -225,10 +223,10 @@ func checkPrimariesProperties(
 			)
 		}
 
-		if want := !m.unhealthy[id]; ns.IsNodeHealthy(id) != want {
+		if want := !m.unhealthy[id]; snap.IsNodeHealthy(id) != want {
 			rt.Fatalf(
 				"IsNodeHealthy(%d) = %v, want %v",
-				id, ns.IsNodeHealthy(id), want,
+				id, snap.IsNodeHealthy(id), want,
 			)
 		}
 	}
@@ -243,10 +241,10 @@ func checkPrimariesProperties(
 			continue
 		}
 
-		got, ok := ns.PrimaryRouteFor(p)
+		got, ok := snap.PrimaryRouteFor(p)
 		if !ok {
 			rt.Fatalf(
-				"prefix %s has at least one advertiser in the model but no primary in NodeStore",
+				"prefix %s has at least one advertiser in the model but no primary in the snapshot",
 				p,
 			)
 		}
@@ -262,7 +260,7 @@ func checkPrimariesProperties(
 	// Structural invariants on the live snapshot, independent of the
 	// model. These catch shapes the model alone cannot — e.g. an owner
 	// that is offline but still has the prefix attributed to it.
-	snapshotPrimaries := ns.PrimaryRoutes()
+	snapshotPrimaries := snap.PrimaryRoutes()
 
 	// A primary that owns ≥1 prefix in `routes` must also light up
 	// `isPrimaryRoute` (PrimaryRoutesForNode returns nil unless the
@@ -275,7 +273,7 @@ func checkPrimariesProperties(
 	}
 
 	for owner := range ownersInRoutes {
-		if got := ns.PrimaryRoutesForNode(owner); len(got) == 0 {
+		if got := snap.PrimaryRoutesForNode(owner); len(got) == 0 {
 			rt.Fatalf(
 				"node %d owns a prefix in routes but PrimaryRoutesForNode is empty",
 				owner,
@@ -288,10 +286,10 @@ func checkPrimariesProperties(
 	advertisersByPrefix := m.advertisersByPrefix()
 
 	for prefix, owner := range snapshotPrimaries {
-		nv, ok := ns.GetNode(owner)
+		nv, ok := snap.GetNode(owner)
 		if !ok || !nv.Valid() {
 			rt.Fatalf(
-				"prefix %s primary %d not present in NodeStore",
+				"prefix %s primary %d not present in the snapshot",
 				prefix, owner,
 			)
 		}
@@ -378,19 +376,7 @@ func nodeForRapid(id types.NodeID) types.Node {
 	}
 }
 
-// snapshotPrimariesCopy returns a defensive copy of the snapshot's
-// prefix→primary map so the caller can compare against a later
-// snapshot without aliasing the live map.
-func snapshotPrimariesCopy(ns *NodeStore) map[netip.Prefix]types.NodeID {
-	live := ns.PrimaryRoutes()
-
-	out := make(map[netip.Prefix]types.NodeID, len(live))
-	maps.Copy(out, live)
-
-	return out
-}
-
-// TestPrimaryRoutesProperty drives NodeStore with a randomised
+// TestPrimaryRoutesProperty drives the world with a randomised
 // sequence of high-level operations and checks that the snapshot's
 // primaries map matches a reference model after every step.
 //
@@ -427,13 +413,13 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 			netip.MustParsePrefix("10.0.1.0/24"),
 		}
 
-		ns := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
-
-		ns.Start()
-		defer ns.Stop()
+		w, err := newWorld(nil, nil, nil)
+		if err != nil {
+			rt.Fatalf("world: %v", err)
+		}
 
 		for _, id := range nodeIDs {
-			ns.PutNode(nodeForRapid(id))
+			w.PutNode(nodeForRapid(id))
 		}
 
 		m := newPrimariesModel()
@@ -461,15 +447,16 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 			// Snapshot primaries before applying the op so the
 			// anti-flap invariant has a stable reference. Reading
 			// after the model has already changed would compare a
-			// stale snapshot to a moved model.
-			prevPrimaries := snapshotPrimariesCopy(ns)
+			// stale snapshot to a moved model. Published snapshots are
+			// immutable, so the map needs no copy.
+			prevPrimaries := w.snapshot().PrimaryRoutes()
 
 			switch op {
 			case 0: // ConnectAdvertise — Connect path clears Unhealthy.
 				id := nodeGen.Draw(rt, fmt.Sprintf("id_%d", step))
 				prefs := prefixSubsetGen.Draw(rt, fmt.Sprintf("prefs_%d", step))
 
-				ns.UpdateNode(id, func(n *types.Node) {
+				w.UpdateNode(id, func(n *types.Node) {
 					n.IsOnline = new(true)
 					n.Unhealthy = false
 					n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: prefs}
@@ -490,21 +477,21 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 
 			case 1: // Disconnect — IsOnline=false; ApprovedRoutes persists.
 				id := nodeGen.Draw(rt, fmt.Sprintf("id_%d", step))
-				ns.UpdateNode(id, func(n *types.Node) {
+				w.UpdateNode(id, func(n *types.Node) {
 					n.IsOnline = new(false)
 				})
 				delete(m.connected, id)
 
 			case 2: // ProbeUnhealthy — HA prober marks node bad.
 				id := nodeGen.Draw(rt, fmt.Sprintf("id_%d", step))
-				ns.UpdateNode(id, func(n *types.Node) {
+				w.UpdateNode(id, func(n *types.Node) {
 					n.Unhealthy = true
 				})
 				m.unhealthy[id] = true
 
 			case 3: // ProbeHealthy — HA prober marks node good.
 				id := nodeGen.Draw(rt, fmt.Sprintf("id_%d", step))
-				ns.UpdateNode(id, func(n *types.Node) {
+				w.UpdateNode(id, func(n *types.Node) {
 					n.Unhealthy = false
 				})
 				delete(m.unhealthy, id)
@@ -513,7 +500,7 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 				id := nodeGen.Draw(rt, fmt.Sprintf("id_%d", step))
 				prefs := prefixSubsetGen.Draw(rt, fmt.Sprintf("prefs_%d", step))
 
-				ns.UpdateNode(id, func(n *types.Node) {
+				w.UpdateNode(id, func(n *types.Node) {
 					n.IsOnline = new(true)
 					n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: prefs}
 					n.ApprovedRoutes = prefs
@@ -552,7 +539,7 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 					}
 				}
 
-				ns.UpdateNodes(fns)
+				w.UpdateNodes(fns)
 
 				for id, unhealthy := range results {
 					if unhealthy {
@@ -564,7 +551,7 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 
 			case 6: // SimultaneousDisconnect — multiple offline in one batch.
 				// Dual-cable-pull shape: two HA routers' poll
-				// sessions both close in the same NodeStore tick.
+				// sessions both close in the same commit.
 				// Per-call Disconnect could leave the snapshot
 				// momentarily pointing at an offline owner; the
 				// batched form forces a single rebuild.
@@ -577,7 +564,7 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 					}
 				}
 
-				ns.UpdateNodes(fns)
+				w.UpdateNodes(fns)
 
 				for _, id := range ids {
 					delete(m.connected, id)
@@ -594,7 +581,7 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 				id := nodeGen.Draw(rt, fmt.Sprintf("setapp_id_%d", step))
 				prefs := prefixSubsetGen.Draw(rt, fmt.Sprintf("setapp_prefs_%d", step))
 
-				ns.UpdateNode(id, func(n *types.Node) {
+				w.UpdateNode(id, func(n *types.Node) {
 					n.ApprovedRoutes = prefs
 				})
 
@@ -609,7 +596,7 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 				// node with a stale Unhealthy bit; the test
 				// exercises that shape.
 				id := nodeGen.Draw(rt, fmt.Sprintf("expire_id_%d", step))
-				ns.UpdateNode(id, func(n *types.Node) {
+				w.UpdateNode(id, func(n *types.Node) {
 					n.IsOnline = new(false)
 				})
 
@@ -619,7 +606,7 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 
 			m.updatePrimaries()
 
-			checkPrimariesProperties(rt, ns, m, nodeIDs, prevPrimaries)
+			checkPrimariesProperties(rt, w.snapshot(), m, nodeIDs, prevPrimaries)
 		}
 	})
 }

@@ -27,7 +27,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/scope"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 )
 
 // Backend is the dependency surface the v2 API needs from the control plane:
@@ -35,9 +34,8 @@ import (
 // updates to connected clients, and the config (Policy.Mode/Path, Node.Expiry,
 // and TLS are read by the ACL and settings handlers).
 type Backend struct {
-	State  *state.State
-	Change func(...change.Change)
-	Cfg    *types.Config
+	State *state.State
+	Cfg   *types.Config
 }
 
 // security is the requirement applied to authenticated operations: an API key

@@ -145,10 +145,9 @@ func TestRoutes(t *testing.T) {
 		// Step 2: Approve the route on the server.
 		nodeID := findNodeID(t, srv, "fullrt-advertiser")
 
-		_, routeChange, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			nodeID, []netip.Prefix{route})
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 
 		// Step 3: Observer should see the route in AllowedIPs.
 		c2.WaitForCondition(t, "approved route in AllowedIPs",
@@ -273,9 +272,8 @@ func TestRoutes(t *testing.T) {
 			t.Helper()
 			id := findNodeID(t, srv, name)
 
-			_, ch, err := srv.State().SetApprovedRoutes(id, []netip.Prefix{route})
+			_, err := srv.State().SetApprovedRoutes(id, []netip.Prefix{route})
 			require.NoError(t, err)
-			srv.App.Change(ch)
 		}
 		approve("ha3203-router1")
 		approve("ha3203-router2")

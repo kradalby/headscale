@@ -46,9 +46,8 @@ func newAPIV1Harness(t *testing.T) *apiV1Harness {
 // router in TestAPIV1AuthMiddleware.
 func newHumaTestHandler(app *Headscale) http.Handler {
 	mux, _ := apiv1.Handler(apiv1.Backend{
-		State:  app.state,
-		Change: app.Change,
-		Cfg:    app.cfg,
+		State: app.state,
+		Cfg:   app.cfg,
 	})
 
 	return apiv1.WithLocalTrust(mux)

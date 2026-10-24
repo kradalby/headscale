@@ -24,7 +24,7 @@ const (
 )
 
 // DNS validation errors. Hostname-side validation lives on
-// `tailscale.com/util/dnsname` and [state.NodeStore] collision handling; only
+// `tailscale.com/util/dnsname` and the state's given-name collision handling; only
 // the username-side errors stay in this package.
 var (
 	ErrUsernameTooShort        = errors.New("username must be at least 2 characters long")
