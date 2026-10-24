@@ -383,6 +383,9 @@ func (s *Scenario) ShutdownAssertNoPanics(t *testing.T) {
 			stderr, err := os.ReadFile(stderrPath)
 			require.NoError(t, err)
 			assert.NotContains(t, string(stderr), "panic")
+			// An incremental policy compile that differed from one from
+			// scratch; see HEADSCALE_DEBUG_POLICY_AUDIT.
+			assert.NotContains(t, string(stderr), "policy audit")
 		}
 
 		return true

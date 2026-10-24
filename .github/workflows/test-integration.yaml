@@ -308,6 +308,7 @@ jobs:
           - TestSetNodeExpiryInFuture
           - TestDisableNodeExpiry
           - TestNodeOnlineStatus
+          - TestNodeOfflineReachesViewers
           - TestPingAllByIPManyUpDown
           - TestNodeDeletionEndsLongPoll
           - Test2118DeletingOnlineNodePanics

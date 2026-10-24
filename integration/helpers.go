@@ -459,39 +459,37 @@ func requireAllClientsOfflineStaged(t *testing.T, headscale ControlServer, expec
 			return
 		}
 
+		debugInfo, err := headscale.DebugBatcher()
+		assert.NoError(c, err, "Failed to get batcher debug info")
+
+		if err != nil {
+			return
+		}
+
+		// Only a viewer with a live session can still be told; one that
+		// disconnected keeps the view it last received until it reconnects
+		// and gets a full map.
 		onlineMap := integrationutil.BuildExpectedOnlineMap(mapResponses)
+		for id := range onlineMap {
+			if info, ok := debugInfo.ConnectedNodes[id.String()]; !ok || !info.Connected {
+				delete(onlineMap, id)
+			}
+		}
+
 		allMapResponsesOffline := true
 
-		if len(expectedNodes) == 1 {
-			// Single node: check if it appears in map responses
-			for nodeID := range onlineMap {
-				if !connectedRecipients[nodeID.String()] {
+		// Every live viewer must see each node offline; a lone node has
+		// no viewer to check.
+		for _, nodeID := range expectedNodes {
+			for id, peerMap := range onlineMap {
+				if !connectedRecipients[id.String()] || id == nodeID {
 					continue
 				}
 
-				if slices.Contains(expectedNodes, nodeID) {
+				if online, exists := peerMap[nodeID]; exists && online {
 					allMapResponsesOffline = false
 
-					assert.Fail(c, fmt.Sprintf("Node %d should not appear in map responses", nodeID))
-				}
-			}
-		} else {
-			// Multi-node: check peer visibility
-			for _, nodeID := range expectedNodes {
-				for id, peerMap := range onlineMap {
-					if !connectedRecipients[id.String()] {
-						continue
-					}
-
-					if id == nodeID {
-						continue // Skip self-references
-					}
-
-					if online, exists := peerMap[nodeID]; exists && online {
-						allMapResponsesOffline = false
-
-						assert.False(c, online, "Node %d should not be visible in node %d's map response", nodeID, id)
-					}
+					assert.False(c, online, "Node %d should not be visible in node %d's map response", nodeID, id)
 				}
 			}
 		}

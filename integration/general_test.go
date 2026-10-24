@@ -941,9 +941,9 @@ func TestUpdateHostnameFromClient(t *testing.T) {
 	}, time.Second, 50*time.Millisecond, "hostname updates should be reflected in node list with new suffix")
 }
 
-// peersMapResponseType is the [change.Change.Type] label that
-// headscale_mapresponse_generated_total carries for a whole-peer resend,
-// which is what [change.NodeAdded] produces.
+// peersMapResponseType is the response_type label that
+// headscale_mapresponse_generated_total carries for a response resending
+// whole peers.
 const peersMapResponseType = "peers"
 
 // mapResponseCountsByType reads headscale_mapresponse_generated_total keyed by
@@ -1033,9 +1033,9 @@ func quiescedMapResponseCounts(
 // never read should cost their peers nothing, while a field they do render has
 // to arrive. Shields-up and hostname sit on either side of that line.
 //
-// The observable is headscale_mapresponse_generated_total{response_type="peers"}:
-// [change.NodeAdded] is the whole-peer broadcast the map request path emits for
-// a Hostinfo edit peers read, and [change.Change.Type] labels it "peers".
+// The observable is headscale_mapresponse_generated_total{response_type="peers"},
+// counting responses that resend whole peers: a Hostinfo edit peers read is
+// one, an edit they never read sends nothing.
 func TestHostinfoChangeReachesPeersOnlyWhenPeerVisible(t *testing.T) {
 	IntegrationSkip(t)
 
@@ -1647,6 +1647,72 @@ func TestNodeOnlineStatus(t *testing.T) {
 
 		<-tick.C
 	}
+}
+
+// TestNodeOfflineReachesViewers takes a node offline while two viewers are
+// connected and one is not: the live viewers must be told, and the viewer
+// that comes back, which last saw the node online, must get a map saying
+// it is offline.
+func TestNodeOfflineReachesViewers(t *testing.T) {
+	IntegrationSkip(t)
+
+	spec := ScenarioSpec{
+		NodesPerUser: 4,
+		Users:        []string{"user1"},
+	}
+
+	scenario, err := NewScenario(spec)
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("offlineview"))
+	requireNoErrHeadscaleEnv(t, err)
+
+	allClients, err := scenario.ListTailscaleClients()
+	requireNoErrListClients(t, err)
+
+	err = scenario.WaitForTailscaleSync()
+	requireNoErrSync(t, err)
+
+	headscale, err := scenario.Headscale()
+	requireNoErrGetHeadscale(t, err)
+
+	gone, away, live := allClients[0], allClients[1], allClients[2:]
+	goneKey := gone.MustStatus().Self.PublicKey
+	goneID := collectExpectedNodeIDs(t, []TailscaleClient{gone})
+
+	require.NoError(t, away.Down())
+	require.NoError(t, gone.Down())
+
+	requireAllClientsOnline(t, headscale, goneID, false,
+		"the node must be offline in headscale and in live viewers' maps",
+		integrationutil.ScaledTimeout(120*time.Second))
+
+	requireSeenOffline := func(viewers []TailscaleClient, msg string) {
+		t.Helper()
+
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			for _, viewer := range viewers {
+				status, err := viewer.Status()
+				assert.NoError(c, err)
+
+				if err != nil {
+					continue
+				}
+
+				peer, ok := status.Peer[goneKey]
+				if assert.True(c, ok, "%s does not list %s", viewer.Hostname(), gone.Hostname()) {
+					assert.False(c, peer.Online, "%s sees %s online", viewer.Hostname(), gone.Hostname())
+				}
+			}
+		}, integrationutil.ScaledTimeout(30*time.Second), time.Second, msg)
+	}
+
+	requireSeenOffline(live, "live viewers must see the node offline")
+
+	require.NoError(t, away.Up())
+
+	requireSeenOffline([]TailscaleClient{away}, "a returning viewer must see the node offline")
 }
 
 // TestPingAllByIPManyUpDown is a variant of the PingAll
