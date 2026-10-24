@@ -21,9 +21,11 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/servertest"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
@@ -94,9 +96,14 @@ func runViaHACompat(t *testing.T, c *testcapture.Capture) {
 	require.NoError(t, err, "failed to set policy")
 
 	if changed {
-		changes, err := srv.State().ReloadPolicy()
+		err := srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
+	}
+
+	var delayed *delayedInitialPoll
+	if c.TestID == "via-grant-v38" {
+		delayed = &delayedInitialPoll{TB: t, captured: make(chan struct{}), release: make(chan struct{})}
+		defer delayed.unblock()
 	}
 
 	// Create nodes in SaaS node ID order so headscale assigns
@@ -114,10 +121,22 @@ func runViaHACompat(t *testing.T, c *testcapture.Capture) {
 			continue
 		}
 
-		clients[name] = servertest.NewClient(t, srv, name,
+		var clientTB testing.TB = t
+		if delayed != nil && name == "ha-b2" {
+			clientTB = delayed
+		}
+
+		clients[name] = servertest.NewClient(clientTB, srv, name,
 			servertest.WithUser(tagUser),
 			servertest.WithTags(topoNode.Tags...),
 		)
+		if clientTB == delayed {
+			select {
+			case <-delayed.captured:
+			case <-time.After(5 * time.Second):
+				t.Fatal("initial poll did not capture Hostinfo")
+			}
+		}
 	}
 
 	require.NotEmpty(t, clients, "no relevant nodes created")
@@ -159,9 +178,14 @@ func runViaHACompat(t *testing.T, c *testcapture.Capture) {
 
 		nodeID := findNodeID(t, srv, name)
 
-		_, routeChange, err := srv.State().SetApprovedRoutes(nodeID, approved)
+		_, err := srv.State().SetApprovedRoutes(nodeID, approved)
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
+	}
+
+	if delayed != nil {
+		// Deliver the old streaming request only after the explicit route
+		// updates completed, as concurrent Auto map/update routines can do.
+		delayed.unblock()
 	}
 
 	// Wait for peers.
@@ -191,6 +215,35 @@ func runViaHACompat(t *testing.T, c *testcapture.Capture) {
 			func(nm *netmap.NetworkMap) bool {
 				return nm != nil
 			})
+	}
+
+	if delayed != nil {
+		snap := srv.State().Snapshot()
+		node, ok := snap.GetNode(findNodeID(t, srv, "ha-b2"))
+		require.True(t, ok)
+
+		route := netip.MustParsePrefix("10.55.0.0/16")
+		require.Equal(t, []netip.Prefix{route}, node.AnnouncedRoutes())
+		require.Equal(t, []netip.Prefix{route}, node.ApprovedRoutes().AsSlice())
+
+		// A fresh hub rules out cached renders hiding an overwritten input.
+		fresh, err := mapper.NewStream(srv.State().DebugConfig(), mapper.NewHub(), node.ID(), tailcfg.CurrentCapabilityVersion).Initial(snap)
+		require.NoError(t, err)
+		require.Len(t, fresh, 1)
+		require.Len(t, fresh[0].PacketFilters["base"], 2)
+		primary := findNodeID(t, srv, "ha-b1").NodeID()
+		found := false
+
+		for _, peer := range fresh[0].Peers {
+			if peer.ID == primary {
+				found = true
+
+				require.Contains(t, peer.AllowedIPs, route)
+				require.Equal(t, []netip.Prefix{route}, peer.PrimaryRoutes)
+			}
+		}
+
+		require.True(t, found, "HA primary must remain visible")
 	}
 
 	// Compare each viewer's [tailcfg.MapResponse] against golden [netmap.NetworkMap].
@@ -353,6 +406,32 @@ type capturePeerSummary struct {
 	TailscaleIPs  []netip.Prefix
 	RoutePrefixes []string
 	PrimaryRoutes []string
+}
+
+// delayedInitialPoll gates Direct.sendMapRequest after it captures Hostinfo
+// and releases its mutex, so a newer non-streaming update can finish first.
+type delayedInitialPoll struct {
+	testing.TB
+
+	captured    chan struct{}
+	release     chan struct{}
+	captureOnce sync.Once
+	releaseOnce sync.Once
+}
+
+func (d *delayedInitialPoll) Logf(format string, args ...any) {
+	if format == "[v1] PollNetMap: stream=%v ep=%v" && len(args) > 0 && args[0] == true {
+		d.captureOnce.Do(func() {
+			close(d.captured)
+			<-d.release
+		})
+	}
+
+	d.TB.Logf(format, args...)
+}
+
+func (d *delayedInitialPoll) unblock() {
+	d.releaseOnce.Do(func() { close(d.release) })
 }
 
 // captureNodeOrder returns node names from a [testcapture.Capture]
@@ -664,9 +743,7 @@ func (r *stepReplay) apply(t *testing.T, step testcapture.Step) map[string]error
 			r.clients[a.Node].Disconnect(t)
 
 			for _, nv := range r.machineNodes(a.Node) {
-				changes, err := r.srv.State().DeleteNode(nv)
-				require.NoError(t, err, "%s: retire %s", step.Name, a.Node)
-				r.srv.App.Change(changes...)
+				require.NoError(t, r.srv.State().DeleteNode(nv), "%s: retire %s", step.Name, a.Node)
 			}
 
 		case "wait":
@@ -710,9 +787,7 @@ func (r *stepReplay) setPolicy(t *testing.T, stepName, policy string) {
 	require.NoError(t, err, "%s: policy", stepName)
 
 	if changed {
-		changes, err := r.srv.State().ReloadPolicy()
-		require.NoError(t, err)
-		r.srv.App.Change(changes...)
+		require.NoError(t, r.srv.State().ReloadPolicy())
 	}
 }
 
@@ -778,9 +853,8 @@ func (r *stepReplay) api(t *testing.T, stepName string, a testcapture.Action) {
 	case a.Method == http.MethodPost && strings.HasSuffix(a.Path, "/expire"):
 		now := time.Now()
 
-		_, c, err := r.srv.State().SetNodeExpiry(r.node(t, deviceAlias(t, a.Path)).ID(), &now)
+		_, err := r.srv.State().SetNodeExpiry(r.node(t, deviceAlias(t, a.Path)).ID(), &now)
 		require.NoError(t, err, "%s: expire", stepName)
-		r.srv.App.Change(c)
 
 	case strings.HasPrefix(a.Path, "/device/"):
 		alias := deviceAlias(t, a.Path)

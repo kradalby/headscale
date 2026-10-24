@@ -76,7 +76,7 @@ type nodeHealthFinding struct {
 func (s *State) scanNodeHealth() []nodeHealthFinding {
 	var findings []nodeHealthFinding
 
-	for _, nv := range s.nodeStore.ListNodes().All() {
+	for _, nv := range s.Snapshot().ListNodes().All() {
 		for _, c := range nodeHealthChecks {
 			problem, fixHint, ok := c.check(nv, s.cfg)
 			if ok {

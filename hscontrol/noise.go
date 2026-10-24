@@ -1059,7 +1059,7 @@ func (ns *noiseServer) RegistrationHandler(
 // means the node is gone and its client should re-authenticate.
 var errNodeNotInStore = errors.New("node not found")
 
-// getAndValidateNode retrieves the node from the in-memory NodeStore using the
+// getAndValidateNode retrieves the node from the latest snapshot using the
 // NodeKey and validates that it matches the MachineKey from the Noise session.
 func (ns *noiseServer) getAndValidateNode(mapRequest tailcfg.MapRequest) (types.NodeView, error) {
 	nv, ok := ns.headscale.state.GetNodeByNodeKey(mapRequest.NodeKey)

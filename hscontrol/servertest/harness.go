@@ -164,9 +164,7 @@ func (h *TestHarness) ChangePolicy(tb testing.TB, policy []byte) {
 	}
 
 	if changed {
-		changes, err := h.Server.State().ReloadPolicy()
-		h.Server.App.Change(changes...)
-
+		err := h.Server.State().ReloadPolicy()
 		if err != nil {
 			tb.Fatalf("servertest: ReloadPolicy: %v", err)
 		}

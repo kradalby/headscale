@@ -1489,7 +1489,7 @@ func TestTagUserMutualExclusivity(t *testing.T) {
 	// User1's user-owned node should have no rules reaching tagged nodes
 	// since there is no explicit user→tag ACL rule. ReduceFilterRules
 	// filters compiled rules to only those where the node is a destination,
-	// matching the production pipeline in filterForNodeLocked.
+	// matching the production pipeline in FilterForNode.
 	userNode := nodes[0].View()
 
 	compiled := pol.compileFilterRulesForNode(users, userNode, nodes.ViewSlice())
@@ -2596,6 +2596,32 @@ func TestMergeFilterRules(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestMergeFilterRulesSharesUnmergedDstPorts checks an unmerged rule keeps
+// its DstPorts, which the per-node reduction caches by, and a merge never
+// writes into the rules it reads.
+func TestMergeFilterRulesSharesUnmergedDstPorts(t *testing.T) {
+	ports := func(ips ...string) []tailcfg.NetPortRange {
+		out := make([]tailcfg.NetPortRange, 0, len(ips)+1) // spare capacity
+		for _, ip := range ips {
+			out = append(out, tailcfg.NetPortRange{IP: ip, Ports: tailcfg.PortRangeAny})
+		}
+
+		return out
+	}
+
+	a := tailcfg.FilterRule{SrcIPs: []string{"100.64.0.1"}, DstPorts: ports("100.64.0.2")}
+	b := tailcfg.FilterRule{SrcIPs: []string{"100.64.0.3"}, DstPorts: ports("100.64.0.4")}
+	c := tailcfg.FilterRule{SrcIPs: []string{"100.64.0.1"}, DstPorts: ports("100.64.0.5")}
+
+	got := mergeFilterRules([]tailcfg.FilterRule{a, b, c})
+	require.Len(t, got, 2)
+
+	assert.Same(t, &b.DstPorts[0], &got[1].DstPorts[0], "unmerged rule copied its DstPorts")
+	assert.Len(t, got[0].DstPorts, 2)
+	assert.NotSame(t, &a.DstPorts[0], &got[0].DstPorts[0], "merge reused the first rule's DstPorts")
+	assert.Empty(t, a.DstPorts[:cap(a.DstPorts)][1].IP, "merge wrote into the first rule's array")
 }
 
 func TestCompileSSHPolicy_CheckPeriodVariants(t *testing.T) {

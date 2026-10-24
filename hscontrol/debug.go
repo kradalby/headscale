@@ -1,10 +1,10 @@
 package hscontrol
 
 import (
-	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/arl/statsviz"
+	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/templates"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsweb"
@@ -132,8 +132,8 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 		writeDebug(w, r, func() any { return h.state.DebugDERPJSON() }, h.state.DebugDERPMap)
 	}))
 
-	// [state.NodeStore] endpoint
-	debug.Handle("nodestore", "NodeStore information", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// The in-memory nodes; named for the store that held them before.
+	debug.Handle("nodestore", "Nodes in memory", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeDebug(w, r, func() any { return h.state.DebugNodeStoreJSON() }, h.state.DebugNodeStore)
 	}))
 
@@ -153,7 +153,7 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 	}))
 
 	debug.Handle("mapresponses", "Map responses for all nodes", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		res, err := h.mapBatcher.DebugMapResponses()
+		res, err := mapper.DebugMapResponses()
 		if err != nil {
 			httpError(w, err)
 			return
@@ -169,8 +169,8 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 		writeJSON(w, res)
 	}))
 
-	// [mapper.Batcher] endpoint
-	debug.Handle("batcher", "Batcher connected nodes", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Connected map sessions; named for the batcher that held them before.
+	debug.Handle("batcher", "Connected map sessions", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeDebug(w, r, func() any { return h.debugBatcherJSON() }, h.debugBatcher)
 	}))
 
@@ -232,62 +232,24 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 	return debugHTTPServer
 }
 
-// debugBatcher returns debug information about the batcher's connected nodes.
+// debugBatcher returns debug information about the connected map sessions.
 func (h *Headscale) debugBatcher() string {
 	var sb strings.Builder
-	sb.WriteString("=== Batcher Connected Nodes ===\n\n")
+	sb.WriteString("=== Connected Map Sessions ===\n\n")
 
-	totalNodes := 0
-	connectedCount := 0
-
-	// Collect nodes and sort them by ID
-	type nodeStatus struct {
-		id                types.NodeID
-		connected         bool
-		activeConnections int
+	// Only nodes with a live session are listed.
+	connected := h.mapHub.Connected()
+	for _, id := range slices.Sorted(maps.Keys(connected)) {
+		fmt.Fprintf(&sb, "Node %d:\tconnected (%d connections)\n", id, connected[id])
 	}
 
-	debugInfo := h.mapBatcher.Debug()
-	nodes := make([]nodeStatus, 0, len(debugInfo))
-
-	for nodeID, info := range debugInfo {
-		nodes = append(nodes, nodeStatus{
-			id:                nodeID,
-			connected:         info.Connected,
-			activeConnections: info.ActiveConnections,
-		})
-		totalNodes++
-
-		if info.Connected {
-			connectedCount++
-		}
-	}
-
-	// Sort by node ID
-	slices.SortFunc(nodes, func(a, b nodeStatus) int {
-		return cmp.Compare(a.id, b.id)
-	})
-
-	// Output sorted nodes
-	for _, node := range nodes {
-		status := "disconnected"
-		if node.connected {
-			status = "connected"
-		}
-
-		if node.activeConnections > 0 {
-			fmt.Fprintf(&sb, "Node %d:\t%s (%d connections)\n", node.id, status, node.activeConnections)
-		} else {
-			fmt.Fprintf(&sb, "Node %d:\t%s\n", node.id, status)
-		}
-	}
-
-	fmt.Fprintf(&sb, "\nSummary: %d connected, %d total\n", connectedCount, totalNodes)
+	fmt.Fprintf(&sb, "\nSummary: %d connected, %d total\n", len(connected), len(connected))
 
 	return sb.String()
 }
 
-// DebugBatcherInfo represents batcher connection information in a structured format.
+// DebugBatcherInfo is the live map sessions per node. It keeps the batcher
+// names, as the debug endpoint does, so existing tooling still parses it.
 type DebugBatcherInfo struct {
 	ConnectedNodes map[string]DebugBatcherNodeInfo `json:"connected_nodes"` // NodeID -> node connection info
 	TotalNodes     int                             `json:"total_nodes"`
@@ -299,18 +261,17 @@ type DebugBatcherNodeInfo struct {
 	ActiveConnections int  `json:"active_connections"`
 }
 
-// debugBatcherJSON returns structured debug information about the batcher's connected nodes.
+// debugBatcherJSON returns the live map sessions per node.
 func (h *Headscale) debugBatcherJSON() DebugBatcherInfo {
 	info := DebugBatcherInfo{
 		ConnectedNodes: make(map[string]DebugBatcherNodeInfo),
 		TotalNodes:     0,
 	}
 
-	debugInfo := h.mapBatcher.Debug()
-	for nodeID, debugData := range debugInfo {
+	for nodeID, sessions := range h.mapHub.Connected() {
 		info.ConnectedNodes[fmt.Sprintf("%d", nodeID)] = DebugBatcherNodeInfo{
-			Connected:         debugData.Connected,
-			ActiveConnections: debugData.ActiveConnections,
+			Connected:         sessions > 0,
+			ActiveConnections: sessions,
 		}
 		info.TotalNodes++
 	}
@@ -320,15 +281,9 @@ func (h *Headscale) debugBatcherJSON() DebugBatcherInfo {
 
 // connectedNodesList returns a list of connected nodes for the ping page.
 func (h *Headscale) connectedNodesList() []templates.ConnectedNode {
-	debugInfo := h.mapBatcher.Debug()
-
 	var nodes []templates.ConnectedNode
 
-	for nodeID, info := range debugInfo {
-		if !info.Connected {
-			continue
-		}
-
+	for nodeID := range h.mapHub.Connected() {
 		nv, ok := h.state.GetNodeByID(nodeID)
 		if !ok {
 			continue
@@ -370,7 +325,7 @@ func (h *Headscale) doPing(ctx context.Context, query string) *templates.PingRes
 
 	nodeID := node.ID()
 
-	if !h.mapBatcher.IsConnected(nodeID) {
+	if !h.mapHub.IsConnected(nodeID) {
 		return &templates.PingResult{
 			Status:  "error",
 			NodeID:  nodeID,
@@ -385,10 +340,10 @@ func (h *Headscale) doPing(ctx context.Context, query string) *templates.PingRes
 	// not the noise chain, so URLIsNoise stays false. Operators running
 	// server_url over plain HTTP are on their own — don't do that.
 	callbackURL := h.cfg.ServerURL + "/machine/ping-response?id=" + pingID
-	h.Change(change.PingNode(nodeID, &tailcfg.PingRequest{
+	h.mapHub.Ping(nodeID, &tailcfg.PingRequest{
 		URL: callbackURL,
 		Log: true,
-	}))
+	})
 
 	select {
 	case latency := <-responseCh:

@@ -90,6 +90,14 @@ func buildIPSet(addrs []string) *netipx.IPSet {
 	return set
 }
 
+// Srcs returns the source addresses. It is shared and must not be
+// modified.
+func (m *Match) Srcs() *netipx.IPSet { return m.srcs }
+
+// Dests returns the destination addresses. It is shared and must not be
+// modified.
+func (m *Match) Dests() *netipx.IPSet { return m.dests }
+
 func (m *Match) SrcsContainsIPs(ips ...netip.Addr) bool {
 	return slices.ContainsFunc(ips, m.srcs.Contains)
 }

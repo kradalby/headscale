@@ -1088,10 +1088,8 @@ func newSSHVerdictFixture(t *testing.T) *sshVerdictFixture {
 		// autogroup:self compares hydrated users.
 		node.User = user
 
-		// SaveNode refreshes the policy manager's nodes, which
-		// SSHCheckParams resolves against.
-		_, _, err := app.state.SaveNode(node.View())
-		require.NoError(t, err)
+		// SSHCheckParams resolves against the nodes in memory.
+		app.state.PutNodeInStoreForTest(*node)
 
 		ids[i] = node.ID
 	}
@@ -1486,7 +1484,7 @@ func TestPollNetMapHandler_DeletedNodeGetsExpiredSelf(t *testing.T) {
 			nodeView, ok := app.state.GetNodeByID(node.ID)
 			require.True(t, ok)
 
-			_, err := app.state.DeleteNode(nodeView)
+			err := app.state.DeleteNode(nodeView)
 			require.NoError(t, err)
 
 			ns := &noiseServer{headscale: app, machineKey: node.MachineKey}
@@ -1915,10 +1913,8 @@ func TestPollNetMapHandler_AcceptsClientReport(t *testing.T) {
 	assert.True(t, report.Hostinfo.Equal(stored.Hostinfo().AsStruct()),
 		"accepted Hostinfo must remain unchanged, including lists longer than 256 entries")
 
-	c, err := app.state.UpdateNodeFromMapRequest(node.ID, report)
+	err := app.state.UpdateNodeFromMapRequest(node.ID, report)
 	require.NoError(t, err)
-	assert.True(t, c.IsEmpty(),
-		"an unchanged report must not be a change, got %s", c.Type())
 }
 
 func TestPollNetMapHandler_RejectsOversizedClientReport(t *testing.T) {

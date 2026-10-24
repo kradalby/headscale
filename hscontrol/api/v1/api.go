@@ -17,16 +17,13 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 )
 
 // Backend is the dependency surface the v1 API needs from the control plane:
-// the state layer, the change-notification sink that distributes updates to
-// connected nodes, and the config (only Policy.Mode and Policy.Path are read).
+// the state layer and the config (only Policy.Mode and Policy.Path are read).
 type Backend struct {
-	State  *state.State
-	Change func(...change.Change)
-	Cfg    *types.Config
+	State *state.State
+	Cfg   *types.Config
 }
 
 // NewAPI builds the v1 Huma API on the given chi router and registers every

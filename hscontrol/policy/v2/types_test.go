@@ -6445,3 +6445,22 @@ func TestPolicyMetadataFields(t *testing.T) {
 		})
 	}
 }
+
+// TestSSHSourceRejectsHostsAndPrefixes pins that SSH sources take only
+// users, groups, tags and autogroups: an address source would make the
+// rule's principals follow node addresses, which incremental compiles do
+// not track for SSH. A host and a raw prefix are both refused.
+func TestSSHSourceRejectsHostsAndPrefixes(t *testing.T) {
+	for name, src := range map[string]string{
+		"host":   `"h"`,
+		"prefix": `"100.64.0.5/32"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			pol := `{"hosts":{"h":"100.64.0.5/32"},
+				"ssh":[{"action":"accept","src":[` + src + `],"dst":["autogroup:self"],"users":["root"]}]}`
+
+			_, err := unmarshalPolicy([]byte(pol))
+			require.ErrorIs(t, err, ErrSSHSourceAliasNotSupported)
+		})
+	}
+}
