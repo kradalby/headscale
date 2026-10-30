@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,13 +19,11 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
-	"tailscale.com/types/views"
 )
 
 // lifecycleSkipReasons lists checks where headscale differs from SaaS, keyed
@@ -546,52 +543,4 @@ func hsRemoved(history []*netmap.NetworkMap, id tailcfg.NodeID) string {
 	}
 
 	return "kept"
-}
-
-func sortedStrings(s []string) string {
-	return fmt.Sprint(slices.Sorted(slices.Values(s)))
-}
-
-func selfRoutes(nm *netmap.NetworkMap) string {
-	self := nm.SelfNode
-
-	var allowed, primary []string
-
-	for _, pfx := range self.AllowedIPs().All() {
-		if !views.SliceContains(self.Addresses(), pfx) {
-			allowed = append(allowed, pfx.String())
-		}
-	}
-
-	for _, pfx := range self.PrimaryRoutes().All() {
-		primary = append(primary, pfx.String())
-	}
-
-	slices.Sort(allowed)
-	slices.Sort(primary)
-
-	return fmt.Sprintf("allowed %v primary %v", allowed, primary)
-}
-
-// selfAllowed is the node's AllowedIPs without its own addresses.
-func selfAllowed(self tailcfg.NodeView) string {
-	var out []netip.Prefix
-
-	for _, pfx := range self.AllowedIPs().All() {
-		if !views.SliceContains(self.Addresses(), pfx) {
-			out = append(out, pfx)
-		}
-	}
-
-	return prefixList(views.SliceOf(out))
-}
-
-func prefixList(pfxs views.Slice[netip.Prefix]) string {
-	return sortedStrings(util.PrefixesToString(pfxs.AsSlice()))
-}
-
-func notCompared(prefixes []string, key string) bool {
-	return slices.ContainsFunc(prefixes, func(p string) bool {
-		return strings.HasPrefix(key, p)
-	})
 }
