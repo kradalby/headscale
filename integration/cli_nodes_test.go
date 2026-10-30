@@ -675,8 +675,11 @@ func TestPreAuthKeyCorrectUserLoggedInCommand(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := client.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, client)
+		if status == nil {
+			return
+		}
+
 		assert.NotContains(ct, []string{"Starting", "Running"}, status.BackendState,
 			"Expected node to be logged out, backend state: %s", status.BackendState)
 	}, integrationutil.StatusReadyTimeout, 2*time.Second)
@@ -685,8 +688,11 @@ func TestPreAuthKeyCorrectUserLoggedInCommand(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := client.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, client)
+		if status == nil {
+			return
+		}
+
 		assert.Equal(ct, "Running", status.BackendState, "Expected node to be logged in, backend state: %s", status.BackendState)
 		// With tags-as-identity model, tagged nodes show as [types.TaggedDevices] user (2147455555)
 		// The PreAuthKey was created with tags, so the node is tagged
@@ -773,8 +779,11 @@ func TestTaggedNodesCLIOutput(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := client.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, client)
+		if status == nil {
+			return
+		}
+
 		assert.NotContains(ct, []string{"Starting", "Running"}, status.BackendState,
 			"Expected node to be logged out, backend state: %s", status.BackendState)
 	}, integrationutil.StatusReadyTimeout, 2*time.Second)
@@ -784,8 +793,11 @@ func TestTaggedNodesCLIOutput(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := client.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, client)
+		if status == nil {
+			return
+		}
+
 		assert.Equal(ct, "Running", status.BackendState, "Expected node to be logged in, backend state: %s", status.BackendState)
 		// With tags-as-identity model, tagged nodes show as [types.TaggedDevices] user (2147455555)
 		assert.Equal(ct, "userid:2147455555", status.Self.UserID.String(), "Expected node to be logged in as tagged-devices user")

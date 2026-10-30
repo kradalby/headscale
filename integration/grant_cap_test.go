@@ -250,8 +250,10 @@ func TestGrantCapRelay(t *testing.T) {
 
 	// Verify no direct path between A and B.
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		status, err := clientA.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, clientA)
+		if status == nil {
+			return
+		}
 
 		peerB := status.Peer[clientBKey]
 		assert.NotNil(c, peerB, "A should see B as a peer")
@@ -262,8 +264,10 @@ func TestGrantCapRelay(t *testing.T) {
 	}, assertTimeout, 500*time.Millisecond, "A should have no direct path to B")
 
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		status, err := clientB.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, clientB)
+		if status == nil {
+			return
+		}
 
 		peerA := status.Peer[clientAKey]
 		assert.NotNil(c, peerA, "B should see A as a peer")
@@ -340,8 +344,10 @@ func TestGrantCapRelay(t *testing.T) {
 		// Fire a ping to trigger relay path discovery (ignore output).
 		clientA.Execute([]string{"tailscale", "ping", "--c=1", "--timeout=1s", clientBIPv4.String()}) //nolint:errcheck
 
-		status, err := clientA.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, clientA)
+		if status == nil {
+			return
+		}
 
 		peerB := status.Peer[clientBKey]
 		assert.NotNil(c, peerB, "A should see B as a peer")
@@ -376,8 +382,10 @@ func TestGrantCapRelay(t *testing.T) {
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		clientB.Execute([]string{"tailscale", "ping", "--c=1", "--timeout=1s", clientAIPv4.String()}) //nolint:errcheck
 
-		status, err := clientB.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, clientB)
+		if status == nil {
+			return
+		}
 
 		peerA := status.Peer[clientAKey]
 		assert.NotNil(c, peerA, "B should see A as a peer")
@@ -429,8 +437,10 @@ func TestGrantCapRelay(t *testing.T) {
 
 	// Verify PeerRelay is gone and DERP is used.
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		status, err := clientA.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, clientA)
+		if status == nil {
+			return
+		}
 
 		peerB := status.Peer[clientBKey]
 		assert.NotNil(c, peerB, "A should still see B as a peer")
@@ -446,8 +456,10 @@ func TestGrantCapRelay(t *testing.T) {
 	}, assertTimeout, 500*time.Millisecond, "A should fall back to DERP for B")
 
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		status, err := clientB.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, clientB)
+		if status == nil {
+			return
+		}
 
 		peerA := status.Peer[clientAKey]
 		assert.NotNil(c, peerA, "B should still see A as a peer")
@@ -483,8 +495,10 @@ func TestGrantCapRelay(t *testing.T) {
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		clientA.Execute([]string{"tailscale", "ping", "--c=1", "--timeout=1s", clientBIPv4.String()}) //nolint:errcheck
 
-		status, err := clientA.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, clientA)
+		if status == nil {
+			return
+		}
 
 		peerB := status.Peer[clientBKey]
 		assert.NotNil(c, peerB, "A should see B as a peer")
@@ -500,8 +514,10 @@ func TestGrantCapRelay(t *testing.T) {
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		clientB.Execute([]string{"tailscale", "ping", "--c=1", "--timeout=1s", clientAIPv4.String()}) //nolint:errcheck
 
-		status, err := clientB.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, clientB)
+		if status == nil {
+			return
+		}
 
 		peerA := status.Peer[clientAKey]
 		assert.NotNil(c, peerA, "B should see A as a peer")

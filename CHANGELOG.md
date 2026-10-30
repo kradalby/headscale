@@ -97,10 +97,20 @@ except during an HA subnet route outage, which is what
 bound. Large tailnets use less CPU and memory, and joins and failovers
 reach clients sooner.
 `HEADSCALE_DEBUG_POLICY_AUDIT=1` checks every policy recompile against a
-compile from scratch and logs any difference. A policy write's tests run
+compile from scratch and logs any difference. A changed policy document's tests run
 against the users and nodes it is published with; if those change while the
 tests run, the write is tested again, up to three times, the last time
 holding other writes until the tests finish.
+Setting or reloading the byte-identical live document skips compilation and its
+`tests`/`sshTests`, even if changed users or nodes would now make them fail.
+Use `headscale policy check --file policy.json` to explicitly revalidate against
+the running server's current users and nodes without publishing a change.
+`headscale policy set --bypass-server-and-access-database-directly` now evaluates
+the document's `tests`/`sshTests` and one node's SSH rules against the persisted
+users and nodes before storing it, as the running server's set does, and refuses
+while a headscale answers on the configured unix socket; `--force` does not
+override that refusal. `policy get` and `policy check` keep their read-only
+bypass behaviour against a running server.
 
 [#37](https://github.com/kradalby/headscale/pull/37)
 
@@ -133,7 +143,7 @@ holding other writes until the tests finish.
 
 #### Observability
 
-- The `headscale_nodestore_*` metrics are removed. `headscale_world_nodes` replaces `headscale_nodestore_nodes`, `headscale_world_commits_total` counts committed changes and `headscale_world_write_batch_size` the node writes committed together [#37](https://github.com/kradalby/headscale/pull/37)
+- The `headscale_nodestore_*` metrics are removed. `headscale_world_nodes` replaces `headscale_nodestore_nodes`, `headscale_world_commits_total` counts published graph transactions after the initial snapshot (including DNS/DERP changes; transactions that stage no edit, refusals and panicking batches are excluded, and a panicking batch's surviving write-by-write retries each count separately), and `headscale_world_write_batch_size` records completed node batch sizes (including batches that stage no edit). A changed node batch counts as one graph transaction; neither metric proves database persistence or client delivery [#37](https://github.com/kradalby/headscale/pull/37)
 - `headscale_mapper_changes_dropped_total` is removed: each map session renders from the latest state, so no change is dropped [#37](https://github.com/kradalby/headscale/pull/37)
 - `headscale_mapresponse_generated_total` counts the responses rendered for each session, by response type, instead of each change once [#37](https://github.com/kradalby/headscale/pull/37)
 - New: `headscale_policy_compiles_total` by result (the graph's compiles at boot and on each change to the document, the users, or a node field the policy reads, published or refused; a document refused before it reaches the graph, a write's test candidate and the audit's compile are not counted), `headscale_world_commit_panics_total` and `headscale_graph_map_log_misses_total` [#37](https://github.com/kradalby/headscale/pull/37)

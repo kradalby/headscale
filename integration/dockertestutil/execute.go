@@ -123,6 +123,6 @@ func ExecuteCommand(
 
 		return stdout.String(), stderr.String(), nil
 	case <-time.After(execConfig.timeout):
-		return stdout.String(), stderr.String(), fmt.Errorf("command failed, stderr: %s: %w", stderr.String(), ErrDockertestCommandTimeout)
+		return stdout.String(), stderr.String(), fmt.Errorf("command failed after %s, stderr: %s: %w", execConfig.timeout, stderr.String(), ErrDockertestCommandTimeout)
 	}
 }

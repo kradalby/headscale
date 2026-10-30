@@ -660,7 +660,7 @@ func (t *TailscaleInContainer) Execute(
 		// log.Printf("command issued: %s", strings.Join(command, " "))
 		// log.Printf("command stderr: %s\n", stderr)
 		if stdout != "" {
-			log.Printf("command stdout: %s\n", stdout)
+			log.Printf("command failed: %v, stdout: %s\n", err, stdout)
 		}
 
 		if strings.Contains(stderr, "NeedsLogin") {
@@ -1054,28 +1054,20 @@ func (t *TailscaleInContainer) execJSON[T any](
 }
 
 // Status returns the [ipnstate.Status] of the Tailscale instance.
-func (t *TailscaleInContainer) Status(save ...bool) (*ipnstate.Status, error) {
+func (t *TailscaleInContainer) Status() (*ipnstate.Status, error) {
 	command := []string{
 		tailscaleBin,
 		"status",
 		"--json",
 	}
 
-	status, raw, err := t.execJSON[ipnstate.Status](
+	status, _, err := t.execJSON[ipnstate.Status](
 		command,
 		"executing tailscale status command",
 		"unmarshalling tailscale status",
 	)
-	if err != nil {
-		return nil, err
-	}
 
-	err = os.WriteFile(fmt.Sprintf("/tmp/control/%s_status.json", t.hostname), []byte(raw), 0o755) //nolint:gosec // test infrastructure log files
-	if err != nil {
-		return nil, fmt.Errorf("status netmap to /tmp/control: %w", err)
-	}
-
-	return status, nil
+	return status, err
 }
 
 // MustStatus returns the [ipnstate.Status] of the Tailscale instance.
