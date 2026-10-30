@@ -363,11 +363,11 @@ func TestStreamEndsWhenNodeDeleted(t *testing.T) {
 	require.ErrorIs(t, err, ErrNodeGone)
 }
 
-func mustNode(t *testing.T, s *state.State, id types.NodeID) types.NodeView {
-	t.Helper()
+func mustNode(tb testing.TB, s *state.State, id types.NodeID) types.NodeView {
+	tb.Helper()
 
 	nv, ok := s.GetNodeByID(id)
-	require.True(t, ok)
+	require.True(tb, ok)
 
 	return nv
 }
@@ -1685,6 +1685,7 @@ func scalingTailnet(b *testing.B, n int, shape string) (*state.State, []*Stream)
 		st := NewStream(cfg, hub, nv.ID(), capVer)
 		_, err := st.Initial(s.Snapshot())
 		require.NoError(b, err)
+		st.Delivered()
 
 		streams = append(streams, st)
 	}
@@ -1692,18 +1693,24 @@ func scalingTailnet(b *testing.B, n int, shape string) (*state.State, []*Stream)
 	return s, streams
 }
 
-// scalingWrites are the writes the scaling benchmarks measure; each makes
-// one change through State, given the iteration number.
-var scalingWrites = map[string]func(b *testing.B, s *state.State, i int){
-	"endpoint": func(_ *testing.B, s *state.State, i int) {
-		nodes := s.ListNodes()
-		node := nodes.At(i % nodes.Len()).AsStruct()
-		node.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(i))} //nolint:gosec // small
-		s.PutNodeInStoreForTest(*node)
+// scalingWrites are the operations the scaling benchmarks measure,
+// given a node ID and the iteration number.
+var scalingWrites = map[string]func(tb testing.TB, s *state.State, id types.NodeID, i int){
+	"endpoint": func(tb testing.TB, s *state.State, id types.NodeID, i int) {
+		tb.Helper()
+
+		node := mustNode(tb, s, id)
+		err := s.UpdateNodeFromMapRequest(id, tailcfg.MapRequest{
+			NodeKey:   node.NodeKey(),
+			DiscoKey:  node.DiscoKey(),
+			Endpoints: []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(i))}, //nolint:gosec // benchmark cycles ports
+		})
+		require.NoError(tb, err)
 	},
-	"online": func(_ *testing.B, s *state.State, i int) {
-		nodes := s.ListNodes()
-		nv := nodes.At(i % nodes.Len())
+	"online": func(tb testing.TB, s *state.State, id types.NodeID, _ int) {
+		tb.Helper()
+
+		nv := mustNode(tb, s, id)
 
 		if nv.IsOnline().Valid() && nv.IsOnline().Get() {
 			_ = s.Disconnect(nv.ID(), nv.SessionEpoch())
@@ -1711,43 +1718,82 @@ var scalingWrites = map[string]func(b *testing.B, s *state.State, i int){
 			_ = s.Connect(nv.ID())
 		}
 	},
-	"rejoin": func(_ *testing.B, s *state.State, i int) {
-		nodes := s.ListNodes()
-		node := nodes.At(i % nodes.Len()).AsStruct()
+	"rejoin": func(tb testing.TB, s *state.State, id types.NodeID, _ int) {
+		tb.Helper()
+
+		node := mustNode(tb, s, id).AsStruct()
 		s.DeleteNodeFromStoreForTest(node.ID)
 		s.PutNodeInStoreForTest(*node)
 	},
-	"rename": func(b *testing.B, s *state.State, i int) {
-		b.Helper()
+	"rename": func(tb testing.TB, s *state.State, id types.NodeID, i int) {
+		tb.Helper()
 
-		nodes := s.ListNodes()
-		_, err := s.RenameNode(nodes.At(i%nodes.Len()).ID(), fmt.Sprintf("renamed-%d", i))
-		require.NoError(b, err)
+		_, err := s.RenameNode(id, fmt.Sprintf("renamed-%d", i))
+		require.NoError(tb, err)
 	},
-	"policy": func(b *testing.B, s *state.State, i int) {
-		b.Helper()
+	"policy": func(tb testing.TB, s *state.State, _ types.NodeID, i int) {
+		tb.Helper()
 
 		_, err := s.SetPolicy([]byte(fmt.Sprintf(`{"acls":[{"action":"accept","src":["*"],"dst":["*:%d"]}]}`, 1+i%2)))
-		require.NoError(b, err)
+		require.NoError(tb, err)
 	},
-	// hidden flips the health of a node without routes, which no client
-	// is sent.
-	"hidden": func(_ *testing.B, s *state.State, i int) {
-		nodes := s.ListNodes()
-		_ = s.SetNodeHealth(nodes.At(i%nodes.Len()).ID(), i%2 == 0)
+	// Offline, unrouted nodes ignore unhealthy reports; healthy reports
+	// already match their state. This measures requests, not health changes.
+	"ignored-health": func(_ testing.TB, s *state.State, id types.NodeID, i int) {
+		_ = s.SetNodeHealth(id, i%2 == 0)
 	},
-	"derp": func(_ *testing.B, s *state.State, i int) {
+	"derp": func(_ testing.TB, s *state.State, _ types.NodeID, i int) {
 		s.SetDERPMap(&tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
 			tailcfg.DERPRegionID(900 + i%2): {RegionID: tailcfg.DERPRegionID(900 + i%2)},
 		}})
 	},
 }
 
+func TestScalingEndpointWrite(t *testing.T) {
+	cfg, s, ids := streamTestState(t, ownUserOnly)
+	before := s.Snapshot()
+	node := mustNode(t, s, ids[0])
+	st := NewStream(cfg, NewHub(), ids[1], capVer)
+	_, err := st.Initial(before)
+	require.NoError(t, err)
+	st.Delivered()
+
+	scalingWrites["endpoint"](t, s, ids[0], 1234)
+
+	want := []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1234")}
+	after := s.Snapshot()
+	updated := mustNode(t, s, ids[0])
+	require.Equal(t, want, updated.Endpoints().AsSlice())
+	require.Equal(t, node.NodeKey(), updated.NodeKey())
+	require.Equal(t, node.DiscoKey(), updated.DiscoKey())
+	require.Equal(t, node.GivenName(), updated.GivenName())
+	require.Equal(t, before.PolicyRev(), after.PolicyRev())
+	require.Equal(t, before.PeersRev(), after.PeersRev())
+
+	row, err := s.DB().GetNodeByID(ids[0])
+	require.NoError(t, err)
+	require.Equal(t, want, row.Endpoints.List(), "endpoint workload must use the persistent MapRequest path")
+
+	all, wake := Route(before, after, after.Since(before))
+	require.False(t, all)
+	require.Contains(t, wake, ids[1])
+	require.NotContains(t, wake, ids[2])
+
+	responses, err := st.Update(after)
+	require.NoError(t, err)
+	require.Len(t, responses, 1)
+	require.Len(t, responses[0].PeersChangedPatch, 1)
+	require.Equal(t, ids[0].NodeID(), responses[0].PeersChangedPatch[0].NodeID)
+	require.Equal(t, want, responses[0].PeersChangedPatch[0].Endpoints)
+}
+
 // BenchmarkScalingWrites measures one write and the updates, encoded, of
 // the sessions the hub routes it to, across write kinds, policy shapes and
 // tailnet sizes. woken/op counts the sessions routed, updates/op those
 // with something to send: the work a write needs. peer-renders/op counts
-// the peers they rendered.
+// added or changed peer references per session, not shared TailNode calls.
+// For policy writes, shape is the starting policy: setup opens visibility
+// to every node, and the loop only alternates its port.
 func BenchmarkScalingWrites(b *testing.B) {
 	sizes := []int{100, 400, 1000}
 	if testing.Short() {
@@ -1771,6 +1817,11 @@ func BenchmarkScalingWrites(b *testing.B) {
 
 					var i, updates, rendered, woken int
 
+					// allWoke guards the policy workload's every-iteration
+					// property without asserting inside the timed loop: a
+					// reflection-based assert per iteration is timed work.
+					allWoke := true
+
 					byNode := make(map[types.NodeID]*Stream, len(streams))
 					for _, st := range streams {
 						byNode[st.nodeID] = st
@@ -1778,8 +1829,32 @@ func BenchmarkScalingWrites(b *testing.B) {
 
 					last := s.Snapshot()
 
+					// The policy workload's first write expands visibility to
+					// every node. Perform and deliver it in setup, so the loop
+					// measures steady port alternation instead of one cold
+					// expansion amortized over b.N. The setup write lands on
+					// port 2, so the loop's first write is a change too.
+					if kind == "policy" {
+						write(b, s, streams[0].nodeID, 1)
+						last = s.Snapshot()
+
+						// Deliver the expansion as the loop would, so the timed
+						// iterations start from a delivered baseline.
+						for _, st := range streams {
+							out, err := st.Update(last)
+							require.NoError(b, err)
+
+							for _, resp := range out {
+								_, err := st.hub.Encode(resp, true, benchEncode)
+								require.NoError(b, err)
+							}
+
+							st.Delivered()
+						}
+					}
+
 					for b.Loop() {
-						write(b, s, i)
+						write(b, s, streams[i%len(streams)].nodeID, i)
 						i++
 
 						snap := s.Snapshot()
@@ -1796,6 +1871,15 @@ func BenchmarkScalingWrites(b *testing.B) {
 									targets = append(targets, st)
 								}
 							}
+						}
+
+						if kind == "policy" {
+							// The setup write lands on a different port than the
+							// loop starts with, so every timed iteration is a
+							// change. A setup that repeats the first port makes an
+							// iteration rewrite the identical document and wake
+							// nothing, whatever the benchtime.
+							allWoke = allWoke && len(targets) > 0
 						}
 
 						for _, st := range targets {
@@ -1818,8 +1902,19 @@ func BenchmarkScalingWrites(b *testing.B) {
 								}
 							}
 
+							st.Delivered()
+
 							rendered += st.r.rendered - before
 						}
+					}
+
+					for _, st := range streams {
+						require.Nil(b, st.pending, "successful writes confirm delivery even when attempts would fold")
+						require.Empty(b, st.hub.sentPeers[st.nodeID].attempts, "successful writes leave no failed-write history")
+					}
+
+					if kind == "policy" {
+						require.True(b, allWoke, "every timed policy iteration wakes work")
 					}
 
 					b.ReportMetric(float64(woken)/float64(i), "woken/op")
@@ -1867,6 +1962,467 @@ func TestRouteWakesNewPrimary(t *testing.T) {
 	all, wake := Route(before, after, after.Since(before))
 	require.False(t, all)
 	assert.Contains(t, wake, r2, "the new primary's own map changed")
+}
+
+func TestStreamViaMixedInternetAndSubnetRoutes(t *testing.T) {
+	cfg, s, ids := streamTestState(t, `{
+		"tagOwners":{"tag:via":["u1@"]},
+		"grants":[{"src":["u2@"],"dst":["10.0.0.0/24","2001:db8::/64","autogroup:internet"],"ip":["*"],"via":["tag:via"]}]
+	}`)
+	routes := []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/24"),
+		netip.MustParsePrefix("2001:db8::/64"),
+		tsaddr.AllIPv4(),
+		tsaddr.AllIPv6(),
+	}
+	_, err := s.SetNodeTags(ids[0], []string{"tag:via"})
+	require.NoError(t, err)
+
+	for _, id := range []types.NodeID{ids[1], ids[0]} {
+		n := mustNode(t, s, id).AsStruct()
+		n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: routes}
+		s.PutNodeInStoreForTest(*n)
+		_, err := s.SetApprovedRoutes(id, routes)
+		require.NoError(t, err)
+		s.Connect(id)
+	}
+
+	st := NewStream(cfg, NewHub(), ids[2], capVer)
+	initial, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	client := newModelClient(initial[0])
+	peer := client.peers[ids[0].NodeID()]
+	require.NotNil(t, peer)
+
+	for _, route := range routes {
+		assert.Contains(t, peer.AllowedIPs, route)
+
+		if other := client.peers[ids[1].NodeID()]; other != nil {
+			assert.NotContains(t, other.AllowedIPs, route)
+		}
+	}
+}
+
+func TestStreamViaInternetSurvivesRegularGrant(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reverse=%t", reverse), func(t *testing.T) {
+			grants := []string{
+				`{"src":["u2@"],"dst":["autogroup:internet"],"ip":["*"],"via":["tag:a"]}`,
+				`{"src":["u2@"],"dst":["autogroup:internet"],"ip":["*"],"via":["tag:b"]}`,
+				`{"src":["u2@"],"dst":["tag:a"],"ip":["*"]}`,
+			}
+			if reverse {
+				slices.Reverse(grants)
+			}
+
+			cfg, s, ids := streamTestState(t, `{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},"grants":[`+strings.Join(grants, ",")+`]}`)
+			routes := []netip.Prefix{tsaddr.AllIPv4(), tsaddr.AllIPv6()}
+			_, err := s.SetNodeTags(ids[0], []string{"tag:a"})
+			require.NoError(t, err)
+
+			n := mustNode(t, s, ids[0]).AsStruct()
+			n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: routes}
+			s.PutNodeInStoreForTest(*n)
+			_, err = s.SetApprovedRoutes(ids[0], routes)
+			require.NoError(t, err)
+			s.Connect(ids[0])
+
+			st := NewStream(cfg, NewHub(), ids[2], capVer)
+			initial, err := st.Initial(s.Snapshot())
+			require.NoError(t, err)
+
+			peer := newModelClient(initial[0]).peers[ids[0].NodeID()]
+			require.NotNil(t, peer)
+
+			for _, route := range routes {
+				assert.Contains(t, peer.AllowedIPs, route)
+				assert.NotContains(t, peer.PrimaryRoutes, route)
+			}
+		})
+	}
+}
+
+func TestStreamViaIndependentGrants(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		tags     [2][]string
+		offlineB bool
+		want     [2]bool
+	}{
+		{name: "empty", tags: [2][]string{{"tag:a"}, nil}, want: [2]bool{true, false}},
+		{name: "offline", tags: [2][]string{{"tag:a"}, {"tag:b"}}, offlineB: true, want: [2]bool{true, false}},
+		{name: "disjoint", tags: [2][]string{{"tag:a"}, {"tag:b"}}, want: [2]bool{true, true}},
+		{name: "overlap", tags: [2][]string{{"tag:a", "tag:b"}, {"tag:b"}}, want: [2]bool{true, false}},
+	} {
+		for _, reverse := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/reverse=%t", tt.name, reverse), func(t *testing.T) {
+				grants := []string{
+					`{"src":["u2@"],"dst":["10.0.0.0/24"],"ip":["*"],"via":["tag:a"]}`,
+					`{"src":["u2@"],"dst":["10.0.0.0/24"],"ip":["*"],"via":["tag:b"]}`,
+				}
+				if reverse {
+					slices.Reverse(grants)
+				}
+
+				cfg, s, ids := streamTestState(t, `{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},"grants":[`+strings.Join(grants, ",")+`]}`)
+				route := netip.MustParsePrefix("10.0.0.0/24")
+
+				for i, id := range ids[:2] {
+					if len(tt.tags[i]) > 0 {
+						_, err := s.SetNodeTags(id, tt.tags[i])
+						require.NoError(t, err)
+					}
+
+					n := mustNode(t, s, id).AsStruct()
+					n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+					s.PutNodeInStoreForTest(*n)
+					_, err := s.SetApprovedRoutes(id, []netip.Prefix{route})
+					require.NoError(t, err)
+
+					if i != 1 || !tt.offlineB {
+						s.Connect(id)
+					}
+				}
+
+				st := NewStream(cfg, NewHub(), ids[2], capVer)
+				initial, err := st.Initial(s.Snapshot())
+				require.NoError(t, err)
+
+				client := newModelClient(initial[0])
+				for i, id := range ids[:2] {
+					peer := client.peers[id.NodeID()]
+					if tt.want[i] {
+						require.NotNil(t, peer)
+						assert.Contains(t, peer.AllowedIPs, route)
+						assert.Contains(t, peer.PrimaryRoutes, route)
+					} else if peer != nil {
+						assert.NotContains(t, peer.AllowedIPs, route)
+						assert.NotContains(t, peer.PrimaryRoutes, route)
+					}
+				}
+			})
+		}
+	}
+}
+
+// viaSourceCheck asserts the viewer client's via view of the two routers:
+// the wanted router carries the route, the other does not, and want 0
+// asserts the viewer outside the source is told no via peer at all and
+// steers nothing through the routers it cannot see.
+func viaSourceCheck(
+	t *testing.T,
+	s *state.State,
+	ids [3]types.NodeID,
+	route netip.Prefix,
+	client *modelClient,
+	want types.NodeID,
+) {
+	t.Helper()
+
+	for _, id := range ids[:2] {
+		peer := client.peers[id.NodeID()]
+		switch {
+		case id == want:
+			require.NotNil(t, peer)
+			assert.Contains(t, peer.AllowedIPs, route)
+		case want == 0:
+			// A viewer outside the source is told no via peer at all,
+			// and the via result steers nothing through the routers
+			// it cannot see.
+			assert.NotContains(t, client.peers, id.NodeID(), "a viewer outside the source sees no via peer")
+
+			live := s.Snapshot()
+			v, _ := live.GetNode(ids[2])
+
+			routerView, ok := live.GetNode(id)
+			if assert.True(t, ok) {
+				via := live.Policy().ViaRoutesForPeer(v, routerView)
+				assert.Empty(t, via.Include, "a viewer outside the source steers no route to the router")
+				assert.Empty(t, via.Exclude, "a viewer outside the source steers nothing away from the router either")
+			}
+		case peer != nil:
+			assert.NotContains(t, peer.AllowedIPs, route)
+		}
+	}
+}
+
+func TestStreamViaSourceSubnets(t *testing.T) {
+	for _, family := range []struct {
+		name, source, advertised, destination, route, unrelated, exit string
+	}{
+		{"ipv4", "10.44.0.128/25", "10.44.0.0/24", "10.45.0.128/25", "10.45.0.0/24", "10.46.0.0/24", "0.0.0.0/0"},
+		{"ipv6", "2001:db8:44::/65", "2001:db8:44::/64", "2001:db8:45::/65", "2001:db8:45::/64", "2001:db8:46::/64", "::/0"},
+	} {
+		for _, mode := range []string{"approved", "unapproved", "withdrawn", "unrelated", "exit-only", "regular-overlap", "tag-source", "tag-source-unrelated"} {
+			t.Run(family.name+"/"+mode, func(t *testing.T) {
+				grant := fmt.Sprintf(`{"src":[%q],"dst":[%q],"ip":["tcp:443"],"via":["tag:via"]}`, family.source, family.destination)
+				tagOwners := `"tag:via":["u1@"]`
+
+				if mode == "regular-overlap" {
+					grant = fmt.Sprintf(`{"src":["u2@"],"dst":[%q],"ip":["tcp:443"],"via":["tag:via"]},
+						{"src":[%q],"dst":[%q],"ip":["tcp:443"]}`, family.destination, family.source, family.destination)
+				}
+
+				if strings.HasPrefix(mode, "tag-source") {
+					// The source is a tag: only a viewer advertising an
+					// approved subnet covering a member's address matches,
+					// because its own addresses are not the member's.
+					grant = fmt.Sprintf(`{"src":["tag:viewer"],"dst":[%q],"ip":["tcp:443"],"via":["tag:via"]}`, family.destination)
+					tagOwners = `"tag:via":["u1@"],"tag:viewer":["u1@"]`
+				}
+
+				cfg, s, ids := streamTestState(t, `{"tagOwners":{`+tagOwners+`},"grants":[`+grant+`]}`)
+				route := netip.MustParsePrefix(family.route)
+
+				for _, id := range []types.NodeID{ids[1], ids[0]} {
+					if mode != "regular-overlap" || id == ids[0] {
+						_, err := s.SetNodeTags(id, []string{"tag:via"})
+						require.NoError(t, err)
+					}
+
+					n := mustNode(t, s, id).AsStruct()
+					n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+					s.PutNodeInStoreForTest(*n)
+					_, err := s.SetApprovedRoutes(id, []netip.Prefix{route})
+					require.NoError(t, err)
+					s.Connect(id)
+				}
+
+				if strings.HasPrefix(mode, "tag-source") {
+					// The via router ids[0] doubles as the source member; the
+					// viewer stays untagged so only its advertised subnet can
+					// match the tag-resolved source.
+					_, err := s.SetNodeTags(ids[0], []string{"tag:via", "tag:viewer"})
+					require.NoError(t, err)
+				}
+
+				source := netip.MustParsePrefix(family.advertised)
+
+				switch mode {
+				case "unrelated":
+					source = netip.MustParsePrefix(family.unrelated)
+				case "exit-only":
+					source = netip.MustParsePrefix(family.exit)
+				case "tag-source", "tag-source-unrelated":
+					// Covers the member's tailnet address (or nothing, for
+					// the unrelated sibling); the viewer's own address is
+					// another host's, so only the advertised subnet can
+					// match the tag-resolved source.
+					covering, unrelatedSrc := "100.64.0.0/24", "10.99.0.0/24"
+					if family.name == "ipv6" {
+						covering, unrelatedSrc = "fd7a:115c:a1e0::/64", "2001:db8:99::/64"
+					}
+
+					if mode == "tag-source" {
+						source = netip.MustParsePrefix(covering)
+					} else {
+						source = netip.MustParsePrefix(unrelatedSrc)
+					}
+				}
+
+				viewer := mustNode(t, s, ids[2]).AsStruct()
+				viewer.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{source}}
+				s.PutNodeInStoreForTest(*viewer)
+
+				if mode != "unapproved" {
+					_, err := s.SetApprovedRoutes(ids[2], []netip.Prefix{source})
+					require.NoError(t, err)
+				}
+
+				if mode == "withdrawn" {
+					viewer = mustNode(t, s, ids[2]).AsStruct()
+					viewer.Hostinfo.RoutableIPs = nil
+					s.PutNodeInStoreForTest(*viewer)
+				}
+
+				snap := s.Snapshot()
+				hub := NewHub()
+				t.Cleanup(hub.Close)
+				st := NewStream(cfg, hub, ids[2], capVer)
+				initial, err := st.Initial(snap)
+				require.NoError(t, err)
+				st.Delivered()
+
+				client := newModelClient(initial[0])
+
+				want := types.NodeID(0)
+				if mode == "approved" || mode == "regular-overlap" || mode == "tag-source" {
+					want = ids[1]
+				}
+
+				viaSourceCheck(t, s, ids, route, client, want)
+
+				// Routing uses the advertised prefix, not broader packet authorization.
+				routerMap, err := NewStream(cfg, hub, ids[0], capVer).Initial(snap)
+				require.NoError(t, err)
+
+				authorized := false
+
+				for _, rule := range newModelClient(routerMap[0]).filter {
+					for _, dst := range rule.DstPorts {
+						assert.NotEqual(t, family.route, dst.IP)
+
+						if dst.IP == family.destination && dst.Ports.First == 443 && dst.Ports.Last == 443 {
+							authorized = true
+						}
+					}
+				}
+
+				if want != 0 {
+					assert.True(t, authorized, "the narrower destination and permitted port remain in the packet filter")
+				}
+
+				if mode == "approved" {
+					_ = s.SetNodeHealth(ids[1], false)
+					responses, err := st.Update(s.Snapshot())
+					require.NoError(t, err)
+
+					for _, response := range responses {
+						client.apply(response)
+					}
+
+					st.Delivered()
+					viaSourceCheck(t, s, ids, route, client, ids[0])
+
+					_, err = s.SetApprovedRoutes(ids[2], nil)
+					require.NoError(t, err)
+					responses, err = st.Update(s.Snapshot())
+					require.NoError(t, err)
+
+					for _, response := range responses {
+						client.apply(response)
+					}
+
+					st.Delivered()
+					viaSourceCheck(t, s, ids, route, client, 0)
+
+					old, err := NewStream(cfg, hub, ids[2], capVer).Initial(snap)
+					require.NoError(t, err)
+
+					client = newModelClient(old[0])
+
+					viaSourceCheck(t, s, ids, route, client, ids[1])
+				}
+			})
+		}
+	}
+}
+
+func TestStreamViaRouteFailover(t *testing.T) {
+	for _, failure := range []string{"offline", "unhealthy", "coalesced"} {
+		t.Run(failure, func(t *testing.T) {
+			cfg, s, ids := streamTestState(t, `{
+				"tagOwners":{"tag:via":["u1@"]},
+				"grants":[{"src":["u2@"],"dst":["10.0.0.0/24"],"ip":["*"],"via":["tag:via"]}]
+			}`)
+			route := netip.MustParsePrefix("10.0.0.0/24")
+			outside := s.DB().CreateRegisteredNodeForTest(s.DB().CreateUserForTest("outside"), "outside")
+			s.PutNodeInStoreForTest(*outside)
+
+			epochs := map[types.NodeID]uint64{}
+
+			for _, id := range []types.NodeID{outside.ID, ids[0], ids[1]} {
+				if id != outside.ID {
+					_, err := s.SetNodeTags(id, []string{"tag:via"})
+					require.NoError(t, err)
+				}
+
+				n := mustNode(t, s, id).AsStruct()
+				n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+				s.PutNodeInStoreForTest(*n)
+				_, err := s.SetApprovedRoutes(id, []netip.Prefix{route})
+				require.NoError(t, err)
+
+				epochs[id] = s.Connect(id)
+			}
+
+			before := s.Snapshot()
+			primary, ok := before.PrimaryRouteFor(route)
+			require.True(t, ok)
+			require.Equal(t, outside.ID, primary, "global election must not choose either via router")
+
+			st := NewStream(cfg, NewHub(), ids[2], capVer)
+			initial, err := st.Initial(before)
+			require.NoError(t, err)
+
+			client := newModelClient(initial[0])
+
+			st.Delivered()
+
+			check := func(want types.NodeID) {
+				t.Helper()
+
+				for _, id := range []types.NodeID{outside.ID, ids[0], ids[1]} {
+					peer := client.peers[id.NodeID()]
+					if id == want {
+						require.NotNil(t, peer)
+						require.Contains(t, peer.AllowedIPs, route)
+						require.Contains(t, peer.PrimaryRoutes, route)
+					} else if peer != nil {
+						require.NotContains(t, peer.AllowedIPs, route)
+						require.NotContains(t, peer.PrimaryRoutes, route)
+					}
+				}
+			}
+			check(ids[0])
+
+			if failure == "unhealthy" {
+				_ = s.SetNodeHealth(ids[0], false)
+			} else {
+				require.NoError(t, s.Disconnect(ids[0], epochs[ids[0]]))
+
+				if failure == "coalesced" {
+					epochs[ids[0]] = s.Connect(ids[0])
+				}
+			}
+
+			after := s.Snapshot()
+			require.Equal(t, before.PolicyRev(), after.PolicyRev())
+			require.Equal(t, before.PeersRev(), after.PeersRev())
+			require.Equal(t, before.PrimaryRoutes(), after.PrimaryRoutes())
+			all, wake := Route(before, after, after.Since(before))
+			require.True(t, all || slices.Contains(slices.Collect(maps.Keys(wake)), ids[2]), "via failover must wake its viewer")
+
+			update := func() {
+				responses, err := st.Update(s.Snapshot())
+				require.NoError(t, err)
+
+				for _, response := range responses {
+					client.apply(response)
+				}
+
+				st.Delivered()
+
+				fresh, err := NewStream(cfg, NewHub(), ids[2], capVer).Initial(s.Snapshot())
+				require.NoError(t, err)
+				require.Empty(t, client.sameAs(newModelClient(fresh[0])))
+			}
+			update()
+			check(ids[1])
+
+			switch failure {
+			case "unhealthy":
+				_ = s.SetNodeHealth(ids[0], true)
+			case "offline":
+				epochs[ids[0]] = s.Connect(ids[0])
+			}
+
+			update()
+			check(ids[1])
+			require.NoError(t, s.Disconnect(ids[0], epochs[ids[0]]))
+			require.NoError(t, s.Disconnect(ids[1], epochs[ids[1]]))
+			update()
+			check(0)
+
+			old, err := NewStream(cfg, NewHub(), ids[2], capVer).Initial(before)
+			require.NoError(t, err)
+
+			client = newModelClient(old[0])
+
+			check(ids[0])
+		})
+	}
 }
 
 // TestSharedFramesEncodeOnceAndIdentically has every session of an
@@ -1925,7 +2481,7 @@ func TestSharedFramesEncodeOnceAndIdentically(t *testing.T) {
 
 // benchEncode encodes a response as the poll loop sends it.
 func benchEncode(resp *tailcfg.MapResponse, compress bool) ([]byte, error) {
-	b, err := json.Marshal(resp)
+	b, err := Marshal(resp)
 	if err != nil || !compress {
 		return b, err
 	}
@@ -2144,9 +2700,72 @@ func TestDERPFramesShared(t *testing.T) {
 	}
 }
 
-// BenchmarkFirstMap renders and encodes a reconnecting node's first map
-// in a full mesh: the read every node does at once after a restart, which
-// walks every peer.
+// TestFirstMapDeliveryAfterFoldedAttempts checks a reconnect after folded
+// attempts: a peer that joined after the last delivery, was folded into the
+// node's history by failed attempts, then left, is announced as removed —
+// a failed attempt may have shown it.
+func TestFirstMapDeliveryAfterFoldedAttempts(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	hub := NewHub()
+	t.Cleanup(hub.Close)
+
+	// The delivered view holds neither the joining peer nor the node itself.
+	joined := mustNode(t, s, ids[1]).AsStruct()
+	s.DeleteNodeFromStoreForTest(ids[1])
+
+	delivered := s.Snapshot()
+	setup := NewStream(cfg, hub, ids[0], capVer)
+	_, err := setup.Initial(delivered)
+	require.NoError(t, err)
+	setup.Delivered()
+
+	// The peer joins: reconnect attempts at the newer snapshot fold its
+	// view into the node's history.
+	s.PutNodeInStoreForTest(*joined)
+	seen := s.Snapshot()
+
+	var last *Stream
+
+	for range maxPeerAttempts + 1 {
+		last = NewStream(cfg, hub, ids[0], capVer)
+		_, err = last.Initial(seen)
+		require.NoError(t, err)
+	}
+
+	require.Empty(t, hub.sentPeers[ids[0]].attempts, "folding does not mean a reconnect was delivered")
+	require.Nil(t, setup.pending, "the setup stream cannot report reconnect delivery")
+	require.NotNil(t, last.pending)
+
+	// The peer leaves: the reconnect must announce its removal, because a
+	// folded attempt may have shown it.
+	s.DeleteNodeFromStoreForTest(ids[1])
+	folded := s.Snapshot()
+
+	reconnect := NewStream(cfg, hub, ids[0], capVer)
+	resps, err := reconnect.Initial(folded)
+	require.NoError(t, err)
+
+	require.Len(t, resps, 2, "the reconnect announces the removed peer")
+	require.Equal(t, []tailcfg.NodeID{ids[1].NodeID()}, resps[1].PeersRemoved, "the folded history is what a reconnect removes")
+
+	reconnect.Delivered()
+	require.Nil(t, reconnect.pending)
+
+	// The delivered reconnect records the peers the snapshot says it sees:
+	// the hub's delivery record against the truth, not against itself.
+	require.Equal(t, folded.PeerView(ids[0]), hub.lastPeers(ids[0]), "the delivered reconnect records the snapshot's peers")
+
+	// The response decodes into the same model a fresh stream of the same
+	// snapshot would build.
+	fresh, err := NewStream(cfg, NewHub(), ids[0], capVer).Initial(folded)
+	require.NoError(t, err)
+	require.Empty(t, newModelClient(resps[0]).sameAs(newModelClient(fresh[0])))
+}
+
+// BenchmarkFirstMap separates a reconnect on a warm hub from the first
+// render on a cold hub and from reopening state (including Close). The last
+// includes DB load, policy compile and peer construction, but not process
+// startup, HTTP/Noise, or a concurrent reconnect storm.
 func BenchmarkFirstMap(b *testing.B) {
 	for _, n := range []int{1000, 10000} {
 		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) {
@@ -2154,19 +2773,65 @@ func BenchmarkFirstMap(b *testing.B) {
 			st := streams[len(streams)/2]
 			snap := s.Snapshot()
 
-			b.ReportAllocs()
+			for _, cache := range []string{"warm-hub", "cold-hub", "new-state"} {
+				for _, encoding := range []string{"json", "zstd"} {
+					b.Run(cache+"/"+encoding, func(b *testing.B) {
+						if cache == "warm-hub" {
+							first := NewStream(st.cfg, st.hub, st.nodeID, capVer)
+							resps, err := first.Initial(snap)
+							require.NoError(b, err)
+							_, err = st.hub.Encode(resps[0], encoding == "zstd", benchEncode)
+							require.NoError(b, err)
+							first.Delivered()
+						}
 
-			for b.Loop() {
-				first := NewStream(st.cfg, st.hub, st.nodeID, capVer)
+						b.ReportAllocs()
 
-				resps, err := first.Initial(snap)
-				if err != nil {
-					b.Fatal(err)
-				}
+						var (
+							first *Stream
+							size  int
+						)
 
-				_, err = Marshal(resps[0])
-				if err != nil {
-					b.Fatal(err)
+						for b.Loop() {
+							hub, current := st.hub, snap
+							if cache != "warm-hub" {
+								hub = NewHub()
+							}
+
+							var reopened *state.State
+
+							if cache == "new-state" {
+								var err error
+
+								reopened, err = state.NewState(st.cfg)
+								require.NoError(b, err)
+
+								current = reopened.Snapshot()
+							}
+
+							first = NewStream(st.cfg, hub, st.nodeID, capVer)
+							resps, err := first.Initial(current)
+							require.NoError(b, err)
+							data, err := hub.Encode(resps[0], encoding == "zstd", benchEncode)
+							require.NoError(b, err)
+							first.Delivered()
+
+							size = len(data)
+
+							if reopened != nil {
+								require.NoError(b, reopened.Close())
+							}
+						}
+
+						require.NotNil(b, first)
+						require.Nil(b, first.pending, "successful reconnects confirm delivery even when attempts would fold")
+
+						if cache == "warm-hub" {
+							require.Empty(b, st.hub.sentPeers[st.nodeID].attempts, "successful reconnects leave no failed-write history")
+						}
+
+						b.ReportMetric(float64(size), "encoded-bytes/op")
+					})
 				}
 			}
 		})

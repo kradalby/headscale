@@ -60,7 +60,7 @@ func TestDebugRegistrationCache(t *testing.T) {
 		authCache: expirable.NewLRU[types.AuthID, *types.AuthRequest](
 			defaultRegisterCacheMaxEntries, nil, time.Minute),
 	}
-	s.SetAuthCacheEntry(types.MustAuthID(), types.NewAuthRequest())
+	require.NoError(t, s.SetAuthCacheEntry(types.MustAuthID(), types.NewAuthRequest()))
 
 	info := s.DebugRegistrationCache()
 

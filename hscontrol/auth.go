@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -427,17 +428,29 @@ func registrationDataFromRequest(
 		return nil, NewHTTPError(http.StatusRequestEntityTooLarge, "registration hostinfo too large", nil)
 	}
 
-	var hostname string
+	var (
+		hostname string
+		hostinfo *tailcfg.Hostinfo
+	)
 	if req.Hostinfo != nil {
 		hostname = req.Hostinfo.Hostname
+
+		// A pending registration keeps only the fields the callback
+		// consumes; operational metadata arrives with the node's first
+		// MapRequest, so a cache of pending registrations cannot be
+		// inflated through unused request data.
+		hostinfo = &tailcfg.Hostinfo{
+			Hostname:    hostname,
+			OS:          req.Hostinfo.OS,
+			RequestTags: slices.Clone(req.Hostinfo.RequestTags),
+		}
 	}
 
 	regData := &types.RegistrationData{
 		MachineKey: machineKey,
 		NodeKey:    req.NodeKey,
 		Hostname:   hostname,
-		// Duplicate JSON fields can leave oversized backing arrays after decoding.
-		Hostinfo: req.Hostinfo.Clone(),
+		Hostinfo:   hostinfo,
 	}
 
 	if !req.Expiry.IsZero() {

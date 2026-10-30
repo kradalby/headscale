@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math/bits"
 	"math/rand/v2"
 	"net/netip"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
@@ -812,6 +814,78 @@ func TestBuildPeerMapDenseRules(t *testing.T) {
 	}
 }
 
+func TestPeerClassesSparseSidesExceedJoinBudget(t *testing.T) {
+	nodes := scanManyRulesNodes(4)
+
+	rules := make([]tailcfg.FilterRule, 126, 126+len(nodes))
+	for i := range rules {
+		rules[i] = tailcfg.FilterRule{
+			SrcIPs:   []string{fmt.Sprintf("192.0.2.%d", i+1)},
+			DstPorts: []tailcfg.NetPortRange{{IP: "198.51.100.1", Ports: tailcfg.PortRange{First: 443, Last: 443}}},
+		}
+	}
+
+	for i := range 2 {
+		rules[i].SrcIPs = []string{"100.64.0.0/10"}
+		rules[i].DstPorts[0].IP = "100.64.0.0/10"
+	}
+
+	for _, node := range nodes {
+		rules = append(rules, tailcfg.FilterRule{
+			SrcIPs:   []string{node.IPv4.String()},
+			DstPorts: []tailcfg.NetPortRange{{IP: node.IPv4.String(), Ports: tailcfg.PortRange{First: 443, Last: 443}}},
+		})
+	}
+
+	pm := &PolicyManager{matchers: matcher.MatchesFromFilterRules(rules)}
+	srcs, dsts := matcherSides(pm.matchers, nodes.ViewSlice())
+	words, postings := 0, 0
+
+	for _, sides := range [][][]uint64{srcs, dsts} {
+		for _, mask := range sides {
+			words += len(mask)
+			for _, word := range mask {
+				postings += bits.OnesCount64(word)
+			}
+		}
+	}
+
+	require.Equal(t, 24, words)
+	require.Equal(t, 24, postings, "the density gate must admit transposition")
+
+	joins := 0
+
+	for _, rule := range pm.matchers {
+		sources, destinations := 0, 0
+
+		for _, node := range nodes {
+			if rule.SrcsContainsIPs(node.IPs()...) {
+				sources++
+			}
+
+			if rule.DestsContainsIP(node.IPs()...) {
+				destinations++
+			}
+		}
+
+		joins += sources * destinations
+	}
+
+	require.Equal(t, 36, joins)
+	require.Greater(t, joins, len(nodes)*len(nodes)/2, "the join budget must select the pair scan")
+
+	classes := pm.BuildPeerClasses(nodes.ViewSlice(), nil)
+	require.Len(t, classes.views, 4, "identity rules keep distinct classes despite identical peer output")
+	require.False(t, classes.joined, "the join budget must select the pair scan")
+
+	for _, built := range []*PeerClasses{classes, pm.BuildPeerClasses(nodes.ViewSlice(), classes)} {
+		for _, node := range nodes {
+			want := slices.DeleteFunc([]types.NodeID{1, 2, 3, 4}, func(id types.NodeID) bool { return id == node.ID })
+			require.Equal(t, want, built.Peers(node.ID))
+		}
+	}
+}
+
 // BenchmarkBuildPeerMapManyRules measures [PolicyManager.BuildPeerMap] on the
 // many-rules shape, next to the pair scan it replaced.
 // Each indexed variant includes index construction and peer-map allocation.
@@ -892,6 +966,159 @@ func nilIfEmpty[T any](s []T) []T {
 	}
 
 	return s
+}
+
+// diversePeerPolicy grows identities and rules with the tailnet. Pairs
+// have one peer per node; dense has distinct classes with dense visibility.
+func diversePeerPolicy(n int, shape string) (types.Nodes, []types.User, []byte) {
+	nodes := scanManyRulesNodes(n)
+
+	var (
+		users  []types.User
+		grants []string
+		owners []string
+	)
+
+	switch shape {
+	case "pairs", "tag-pairs", "app-pairs", "overlapping-pairs", "cliques", "dense":
+		for i := 0; i < n; i += 2 {
+			src, dst := nodes[i].IPv4.String(), nodes[i+1].IPv4.String()
+			if shape == "tag-pairs" {
+				src, dst = nodes[i].Tags[0], nodes[i+1].Tags[0]
+				owners = append(owners, fmt.Sprintf(`%q:[],%q:[]`, src, dst))
+			}
+
+			if shape == "dense" {
+				dst = "*"
+			}
+
+			if shape == "cliques" {
+				src = netip.PrefixFrom(*nodes[i].IPv4, 31).String()
+				dst = src
+			}
+
+			access := `"ip":["*"]`
+			if shape == "app-pairs" {
+				access = `"app":{"example.com/cap/read":[{}]}`
+			}
+
+			grants = append(grants, fmt.Sprintf(`{"src":[%q],"dst":[%q],%s}`, src, dst, access))
+			if shape == "overlapping-pairs" {
+				grants = append(grants, fmt.Sprintf(`{"src":[%q],"dst":[%q],%s}`, nodes[i].IPv6.String(), nodes[i+1].IPv6.String(), access))
+			}
+		}
+	case "self":
+		users = make([]types.User, n/2)
+		for i := range users {
+			users[i] = types.User{ID: uint(i + 1), Name: fmt.Sprintf("u%d", i)} //nolint:gosec // bounded fixture
+		}
+
+		for i, node := range nodes {
+			node.Tags = nil
+			node.User = &users[i/2]
+			node.UserID = &users[i/2].ID
+		}
+
+		grants = append(grants, `{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["*"]}`)
+	case "allow-all":
+		return nodes, nil, nil
+	}
+
+	return nodes, users, []byte(`{"tagOwners":{` + strings.Join(owners, ",") + `},"grants":[` + strings.Join(grants, ",") + `]}`)
+}
+
+func TestBuildPeerClassesDiversity(t *testing.T) {
+	// More than 64 rules crosses matcher-word boundaries; empty, isolated,
+	// shared, and self classes are also covered by the pair-scan tests.
+	for _, shape := range []string{"pairs", "tag-pairs", "app-pairs", "overlapping-pairs", "cliques", "dense", "self", "allow-all"} {
+		t.Run(shape, func(t *testing.T) {
+			nodes, users, pol := diversePeerPolicy(130, shape)
+			pm, err := NewPolicyManager(pol, users, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			fresh := pm.BuildPeerClasses(nodes.ViewSlice(), nil)
+
+			reused := pm.BuildPeerClasses(nodes.ViewSlice(), fresh)
+			for i, node := range nodes {
+				want := []types.NodeID{nodes[i^1].ID}
+				if shape == "dense" && i%2 == 1 {
+					want = nil
+					for j := 0; j < len(nodes); j += 2 {
+						want = append(want, nodes[j].ID)
+					}
+				} else if shape == "dense" || shape == "allow-all" {
+					want = nil
+
+					for _, other := range nodes {
+						if other.ID != node.ID {
+							want = append(want, other.ID)
+						}
+					}
+				}
+
+				require.Equal(t, want, fresh.Peers(node.ID))
+				require.Equal(t, want, reused.Peers(node.ID))
+			}
+
+			// The join only runs when it is the cheaper side of the same
+			// relation: sparse policies take it, dense ones the pair scan.
+			wantJoined := slices.Contains([]string{"pairs", "tag-pairs", "app-pairs", "overlapping-pairs", "cliques"}, shape)
+			require.Equal(t, wantJoined, fresh.joined, "shape %s took the wrong path", shape)
+
+			if strings.HasSuffix(shape, "pairs") {
+				matchers := len(nodes) / 2
+				if shape == "overlapping-pairs" {
+					matchers = len(nodes)
+				}
+
+				require.Len(t, pm.matchers, matchers)
+				require.Len(t, fresh.views, len(nodes))
+			}
+		})
+	}
+}
+
+// BenchmarkPeerClassesDiversity separates compilation from fresh and reused
+// class construction. Unlike fixed-user/tag workloads, rules and classes grow.
+func BenchmarkPeerClassesDiversity(b *testing.B) {
+	for _, shape := range []string{"pairs", "tag-pairs", "dense", "self", "allow-all"} {
+		for _, n := range []int{100, 500, 1000, 2000} {
+			b.Run(fmt.Sprintf("%s/nodes=%d", shape, n), func(b *testing.B) {
+				nodes, users, pol := diversePeerPolicy(n, shape)
+				in := nodes.ViewSlice()
+				pm, err := NewPolicyManager(pol, users, in)
+				require.NoError(b, err)
+
+				prev := pm.BuildPeerClasses(in, nil)
+
+				for _, phase := range []string{"compile", "fresh", "reuse"} {
+					b.Run(phase, func(b *testing.B) {
+						b.ReportAllocs()
+
+						var built *PeerClasses
+
+						for b.Loop() {
+							switch phase {
+							case "compile":
+								_, err := NewPolicyManager(pol, users, in)
+								require.NoError(b, err)
+							case "fresh":
+								built = pm.BuildPeerClasses(in, nil)
+							case "reuse":
+								built = pm.BuildPeerClasses(in, prev)
+							}
+						}
+
+						if built != nil {
+							b.ReportMetric(float64(len(built.views)), "classes/op")
+						}
+
+						b.ReportMetric(float64(len(pm.matchers)), "matchers/op")
+					})
+				}
+			})
+		}
+	}
 }
 
 // TestBuildPeerClassesReuseMatchesFresh rebuilds peer classes from the

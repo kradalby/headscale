@@ -150,7 +150,8 @@ func (s *State) ValidatePolicy(pol []byte) error {
 	// The write path refuses a document whose tests or sshTests fail; the
 	// validate answer must agree with it, or a policy set would refuse
 	// what validate blessed.
-	if testErr := policyTestsFail(pm); testErr != nil {
+	testErr := policyTestsFail(pm)
+	if testErr != nil {
 		return invalidPolicyError{testErr}
 	}
 
@@ -387,23 +388,14 @@ func NewState(cfg *types.Config) (*State, error) {
 		}
 	}
 
-	// Last: NewLRU starts the TTL sweeper goroutine, which only Close stops.
-	authCache := expirable.NewLRU[types.AuthID, *types.AuthRequest](
-		cacheMaxEntries,
-		func(id types.AuthID, rn *types.AuthRequest) {
-			rn.FinishAuth(types.AuthVerdict{Err: ErrRegistrationExpired})
-		},
-		cacheExpiration,
-	)
-
 	s := &State{
-		cfg: cfg,
+		cfg:                 cfg,
+		authCacheMaxEntries: cacheMaxEntries,
 
-		db:        db,
-		ipAlloc:   ipAlloc,
-		world:     w,
-		authCache: authCache,
-		pings:     newPingTracker(),
+		db:      db,
+		ipAlloc: ipAlloc,
+		world:   w,
+		pings:   newPingTracker(),
 
 		sshCheckAuth:  make(map[sshCheckPair]time.Time),
 		registerLocks: xsync.NewMap[key.MachinePublic, *registrationLock](),
@@ -411,6 +403,21 @@ func NewState(cfg *types.Config) (*State, error) {
 
 		beforeAuthWrite: func() {},
 	}
+
+	// Last: NewLRU starts the TTL sweeper goroutine, which only Close stops.
+	// The cache carries the SSH reserve; an evicted regular entry releases
+	// its slot, and eviction wakes the waiter.
+	s.authCache = expirable.NewLRU[types.AuthID, *types.AuthRequest](
+		cacheMaxEntries+authCacheSSHReserve,
+		func(_ types.AuthID, rn *types.AuthRequest) {
+			if !rn.IsSSHCheck() {
+				s.authCacheRegularEntries.Add(-1)
+			}
+
+			rn.FinishAuth(types.AuthVerdict{Err: ErrRegistrationExpired})
+		},
+		cacheExpiration,
+	)
 
 	// Surface nodes whose stored data would break map generation (e.g. an
 	// invalid given name from a legacy row) so an operator can fix them. This
@@ -423,6 +430,11 @@ func NewState(cfg *types.Config) (*State, error) {
 // Close gracefully shuts down the [State] instance and releases all resources.
 func (s *State) Close() error {
 	s.pings.drain()
+
+	s.authCacheMu.Lock()
+	s.authCacheClosed = true
+	s.authCacheMu.Unlock()
+
 	// Purge before Close: Close stops the sweeper, so anything still cached
 	// would never expire and its WaitForAuth caller would hang.
 	s.authCache.Purge()
@@ -716,7 +728,9 @@ func (s *State) deleteNodeRow(node types.NodeView) (deleteOutcome, types.NodeVie
 
 	err := s.db.DeleteNode(current.AsStruct())
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		// Both spellings mean another delete already dropped the row: its
+		// caller owns the teardown, and this one must not run it again.
+		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, hsdb.ErrNodeNotFound) {
 			return deleteAlreadyGone, types.NodeView{}, nil
 		}
 
@@ -816,7 +830,8 @@ func (s *State) deleteEphemeralRow(candidate types.NodeView) (deleteOutcome, typ
 
 	err := s.db.DeleteNode(node.AsStruct())
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		// Both spellings mean another delete already dropped the row.
+		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, hsdb.ErrNodeNotFound) {
 			return deleteAlreadyGone, types.NodeView{}, nil
 		}
 
@@ -2045,6 +2060,35 @@ type authNodeUpdateParams struct {
 // applyAuthNodeUpdate applies common update logic for re-authenticating or converting
 // an existing node. It authorises a private candidate, persists it, then
 // publishes its registration fields without replacing concurrent map updates.
+// applyReauthExpiryTransition sets a re-auth candidate's expiry from the
+// tagged-status transition and the client's request: tagged nodes never
+// expire, a stale past expiry from an old logout stamp (#3371) is cleared,
+// and everything else takes the requested or cached expiry.
+func applyReauthExpiryTransition(
+	node *types.Node,
+	wasTagged bool,
+	requested, cached *time.Time,
+) {
+	isTagged := node.IsTagged()
+
+	switch {
+	case !wasTagged && isTagged:
+		// Personal → Tagged: clear expiry (tagged nodes don't expire)
+		node.Expiry = nil
+	case !isTagged:
+		// Tagged → Personal (including explicit conversion) and
+		// Personal → Personal: set expiry from client request.
+		node.Expiry = cmp.Or(requested, cached)
+	case isTagged && node.IsExpired():
+		// Tagged → Tagged, but carrying a stale PAST expiry from an older
+		// headscale's logout stamp (#3371). Tagged nodes never expire, so
+		// clear it; a deliberate future expiry has IsExpired() == false and
+		// falls through to the no-op below.
+		node.Expiry = nil
+	}
+	// Tagged → Tagged with no stale expiry: keep existing expiry - no action.
+}
+
 func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView, error) {
 	regData := params.RegData
 
@@ -2119,6 +2163,8 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 		return types.NodeView{}, ErrNodeKeyInUse
 	}
 
+	var hostinfoErr error
+
 	s.world.update(func(nodes *nodeEdit) {
 		var ok bool
 
@@ -2132,8 +2178,20 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 		node.DiscoKey = regData.DiscoKey
 		node.Hostname = params.Hostname
 
-		// Preserve NetInfo from existing node when re-registering
-		node.Hostinfo = params.ValidHostinfo
+		// A re-auth keeps the node's stored operational metadata and takes
+		// only the auth-relevant fields from the registration: the client
+		// reports operational metadata via MapRequest, not register, and a
+		// browser-facilitated relogin carries a hostinfo the node never
+		// sent. The merged result must still pass the wire bounds.
+		node.Hostinfo = cmp.Or(prior.Hostinfo.Clone(), &tailcfg.Hostinfo{})
+		node.Hostinfo.Hostname = params.Hostname
+		node.Hostinfo.RequestTags = slices.Clone(requestTags)
+
+		hostinfoErr = types.ValidateHostinfo(node.Hostinfo)
+		if hostinfoErr != nil {
+			return
+		}
+
 		node.Hostinfo.NetInfo = preserveNetInfo(
 			prior.View(),
 			prior.ID,
@@ -2171,29 +2229,9 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 		}
 
 		// Handle expiry AFTER tag processing, based on transition
-		// This ensures expiry is correctly set/cleared based on the NEW tagged status
-		isTagged := node.IsTagged()
-
-		switch {
-		case !wasTagged && isTagged:
-			// Personal → Tagged: clear expiry (tagged nodes don't expire)
-			node.Expiry = nil
-		case !isTagged:
-			// Tagged → Personal (including explicit conversion) and
-			// Personal → Personal: set expiry from client request.
-			if params.Expiry != nil {
-				node.Expiry = params.Expiry
-			} else {
-				node.Expiry = regData.Expiry
-			}
-		case isTagged && node.IsExpired():
-			// Tagged → Tagged, but carrying a stale PAST expiry from an older
-			// headscale's logout stamp (#3371). Tagged nodes never expire, so
-			// clear it; a deliberate future expiry has IsExpired() == false and
-			// falls through to the no-op below.
-			node.Expiry = nil
-		}
-		// Tagged → Tagged with no stale expiry: keep existing expiry - no action.
+		// This ensures expiry is correctly set/cleared based on the NEW
+		// tagged status.
+		applyReauthExpiryTransition(node, wasTagged, params.Expiry, regData.Expiry)
 
 		// Apply default node expiry for non-tagged nodes when the
 		// resolved expiry is still nil or zero (e.g., CLI registration
@@ -2211,6 +2249,10 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 
 	if prior == nil {
 		return types.NodeView{}, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, params.ExistingNode.ID())
+	}
+
+	if hostinfoErr != nil {
+		return types.NodeView{}, hostinfoErr
 	}
 
 	if len(rejectedTags) > 0 {

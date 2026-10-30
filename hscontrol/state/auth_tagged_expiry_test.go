@@ -81,7 +81,7 @@ func TestTaggedReauthKeepsNilExpiry(t *testing.T) {
 	}
 
 	authID := types.MustAuthID()
-	s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(regData))
+	require.NoError(t, s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(regData)))
 
 	finalNode, err := s.HandleNodeFromAuthPath(
 		authID,
@@ -167,7 +167,7 @@ func TestTaggedReauthWithReusedUserPAK(t *testing.T) {
 // reregisterExpiredUserNodeWithSpentKey registers a user-owned node with a
 // one-shot key, forces it into the expired state, and re-registers with the
 // same spent key. sameNodeKey distinguishes the two re-auth shapes:
-//   - false: the node rotates its node key (normal tailscale client on re-auth)
+//   - false: the node rotates its node key (normal tailscale client on re-auth))
 //   - true:  the node reuses its node key
 //
 // In both cases an expired node is genuinely re-authenticating and must present
@@ -407,7 +407,7 @@ func TestAuthPathRejectsTaggedAndUserCoexistence(t *testing.T) {
 		Hostinfo:   &tailcfg.Hostinfo{Hostname: "multi"},
 	}
 	authID := types.MustAuthID()
-	s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(regData))
+	require.NoError(t, s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(regData)))
 
 	_, err = s.HandleNodeFromAuthPath(authID, types.UserID(u3.ID), nil, util.RegisterMethodOIDC)
 	require.ErrorIs(t, err, ErrAmbiguousNodeOwnership)
@@ -518,7 +518,7 @@ func (n seededTaggedNode) reauth(t *testing.T, authUser *types.User, requestTags
 	rd.Expiry = clientExpiry
 
 	authID := types.MustAuthID()
-	n.s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&rd))
+	require.NoError(t, n.s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&rd)))
 
 	node, err := n.s.HandleNodeFromAuthPath(
 		authID,
@@ -1010,7 +1010,7 @@ func TestIssue3371_TaggedNodeInteractiveReloginAfterLogout(t *testing.T) {
 		},
 	}
 	authID := types.MustAuthID()
-	s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(regData))
+	require.NoError(t, s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(regData)))
 
 	relogged, err := s.HandleNodeFromAuthPath(
 		authID, types.UserID(user.ID), nil, util.RegisterMethodOIDC,

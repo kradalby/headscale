@@ -114,6 +114,25 @@ bypass behaviour against a running server.
 
 [#37](https://github.com/kradalby/headscale/pull/37)
 
+### Via-scoped subnet failover elects live routers
+
+Subnet failover for a grant with `via` now elects from the routers that are
+actually serving: an online, healthy router carrying one of the grant's tags
+and advertising an approved route overlapping the grant's destination. A healthy
+incumbent keeps the route when another router recovers, and the route moves
+when the incumbent goes offline; with no online incumbent and no healthy
+candidate, the grant provides no subnet route. Each grant elects separately
+before their route contributions are combined, so one group's failure no
+longer cancels another group's authorization, and exit-node grants steer per
+node instead of entering the subnet election. A grant source can match
+through an advertised-and-approved source subnet as well as its Tailscale
+addresses; the selection does not widen the grant's destination or port
+access. Replacing the policy document starts new scoped elections, as grant
+positions in a different document do not identify the old election scopes.
+See [the routes reference](docs/ref/routes.md) for the failover rules.
+
+[#44](https://github.com/kradalby/headscale/pull/44)
+
 ### BREAKING
 
 #### Database

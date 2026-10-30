@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math/bits"
 	"net/netip"
 	"reflect"
 	"slices"
@@ -17,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/policy/policyutil"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -1007,15 +1009,19 @@ func (pm *PolicyManager) Filter() ([]tailcfg.FilterRule, []matcher.Match) {
 	return pm.filter, pm.matchers
 }
 
-// PeerClasses holds who sees whom. Nodes that see the same nodes share a
-// class, and each class holds one sorted view: every node its members
-// see, which includes the members themselves when the class sees itself.
-// Under a global filter nodes fall into a few classes by which rules they
-// match, so the views cost O(nodes × classes), not O(nodes²); under
-// per-node rules each node is its own class.
+// PeerClasses holds who sees whom. Nodes in a class share one sorted
+// view of every node they see, including the members themselves when
+// the class sees itself.
+// Classes group nodes by which rules they match; per-node rules can split
+// them further. Views cost O(nodes × classes), which can reach O(nodes²)
+// when identities and rules grow with the tailnet.
 type PeerClasses struct {
 	classOf map[types.NodeID]int
 	views   [][]types.NodeID
+	// joined records the build joined classes on opposite sides of each
+	// matcher instead of scanning every pair: both compute the same
+	// relation, so it only says which path ran.
+	joined bool
 
 	// sides keeps what the build learnt of each node, for the next.
 	sides *sideCache
@@ -1202,12 +1208,84 @@ func (pm *PolicyManager) BuildPeerClasses(nodes views.Slice[types.NodeView], pre
 		c.classOf[n.ID()] = ci
 	}
 
+	// Join only classes on opposite sides of a rule when that visits
+	// fewer pairs. Diverse sparse policies otherwise scan C² pairs of
+	// matcher bitsets even when every class sees just one other class.
+	indexed := len(members) > 1
+	if indexed {
+		// A posting costs a word too. Do not transpose dense sides into
+		// larger lists just to discover that the pair scan was cheaper.
+		var words, postings int
+
+		for _, classes := range [2][][]uint64{srcs, dsts} {
+			for _, mask := range classes {
+				words += len(mask)
+				for _, word := range mask {
+					postings += bits.OnesCount64(word)
+				}
+			}
+		}
+
+		indexed = postings <= words
+	}
+
+	var byRule [][2][]int
+	if indexed {
+		byRule = make([][2][]int, len(matchers))
+
+		for side, classes := range [2][][]uint64{srcs, dsts} {
+			for ci, mask := range classes {
+				for w, word := range mask {
+					for word != 0 {
+						k := 64*w + bits.TrailingZeros64(word) //nolint:mnd
+						byRule[k][side] = append(byRule[k][side], ci)
+						word &= word - 1
+					}
+				}
+			}
+		}
+
+		// Repeated dense rules can join the same pair many times. Keep
+		// the short-circuit pair scan when joining would do more work.
+		budget := len(members) * len(members) / 2
+		for _, sides := range byRule {
+			budget -= len(sides[0]) * len(sides[1])
+			if budget < 0 {
+				indexed = false
+				break
+			}
+		}
+	}
+
+	var seenAt []int
+	if indexed {
+		seenAt = make([]int, len(members))
+	}
+
 	for a := range members {
 		var seen [][]types.NodeID
 
-		for b := range members {
-			if canAccessSides(srcs[a], dsts[b]) || canAccessSides(srcs[b], dsts[a]) {
-				seen = append(seen, members[b])
+		if indexed {
+			for side, mask := range [2][]uint64{srcs[a], dsts[a]} {
+				for w, word := range mask {
+					for word != 0 {
+						k := 64*w + bits.TrailingZeros64(word) //nolint:mnd
+						for _, b := range byRule[k][1-side] {
+							if seenAt[b] != a+1 {
+								seenAt[b] = a + 1
+								seen = append(seen, members[b])
+							}
+						}
+
+						word &= word - 1
+					}
+				}
+			}
+		} else {
+			for b := range members {
+				if canAccessSides(srcs[a], dsts[b]) || canAccessSides(srcs[b], dsts[a]) {
+					seen = append(seen, members[b])
+				}
 			}
 		}
 
@@ -1215,6 +1293,8 @@ func (pm *PolicyManager) BuildPeerClasses(nodes views.Slice[types.NodeView], pre
 		slices.Sort(view)
 		c.views = append(c.views, view)
 	}
+
+	c.joined = indexed
 
 	if pm.needsPerNodeFilter {
 		pm.addNodeOnlyPeers(c, nodes)
@@ -2204,14 +2284,33 @@ type viaPrep struct {
 	dsts     [][]netip.Prefix
 	internet []bool
 	// primary holds, per via grant, the lowest-ID node carrying one of
-	// its via tags for each approved subnet route: the via-scoped HA
-	// election, which ignores online state.
+	// its via tags for static policy inspection. Live snapshots elect
+	// from routers using current availability instead.
 	primary []map[netip.Prefix]types.NodeID
+	scopes  map[netip.Prefix][]viaScope
+}
+
+type viaScope struct {
+	grant      int
+	candidates views.Slice[types.NodeID]
+}
+
+type viaKey struct {
+	grant  int
+	prefix netip.Prefix
 }
 
 // viaPrep returns the policy's via preparation, building it on first use.
 func (pm *PolicyManager) viaPrep() *viaPrep {
+	if pm == nil {
+		return nil
+	}
+
 	pm.viaOnce.Do(func() {
+		if pm.pol == nil || !slices.ContainsFunc(pm.pol.Grants, Grant.HasVia) {
+			return
+		}
+
 		grants := slices.Clone(pm.pol.Grants)
 		for _, acl := range pm.pol.ACLs {
 			grants = append(grants, aclToGrants(acl)...)
@@ -2223,7 +2322,14 @@ func (pm *PolicyManager) viaPrep() *viaPrep {
 			dsts:     make([][]netip.Prefix, len(grants)),
 			internet: make([]bool, len(grants)),
 			primary:  make([]map[netip.Prefix]types.NodeID, len(grants)),
+			scopes:   make(map[netip.Prefix][]viaScope),
 		}
+
+		// Grants sharing tags and destinations elect from the same
+		// routers and win the same primaries: build each combination once
+		// and share its candidates.
+		candidates := make([]map[netip.Prefix][]types.NodeID, 0, len(grants))
+		primaries := make([]map[netip.Prefix]types.NodeID, 0, len(grants))
 
 		for i, grant := range grants {
 			var b netipx.IPSetBuilder
@@ -2243,21 +2349,56 @@ func (pm *PolicyManager) viaPrep() *viaPrep {
 			prep.dsts[i], prep.internet[i] = resolveViaDestinations(pm.pol, pm.users, pm.nodes, grant.Destinations)
 
 			if !grant.HasVia() {
+				candidates = append(candidates, nil)
+				primaries = append(primaries, nil)
+
 				continue
 			}
 
-			primary := make(map[netip.Prefix]types.NodeID)
+			var (
+				routers map[netip.Prefix][]types.NodeID
+				primary map[netip.Prefix]types.NodeID
+			)
 
-			for _, node := range pm.nodes.All() {
-				if !slices.ContainsFunc(grant.Via, func(t Tag) bool { return node.HasTag(string(t)) }) {
-					continue
+			for j := range i {
+				if slices.Equal(grants[j].Via, grant.Via) && slices.Equal(prep.dsts[j], prep.dsts[i]) {
+					routers, primary = candidates[j], primaries[j]
+
+					break
 				}
+			}
 
-				for _, route := range node.SubnetRoutes() {
-					if id, ok := primary[route]; !ok || node.ID() < id {
-						primary[route] = node.ID()
+			if routers == nil {
+				routers = make(map[netip.Prefix][]types.NodeID)
+
+				for _, node := range pm.nodes.All() {
+					if !slices.ContainsFunc(grant.Via, func(t Tag) bool { return node.HasTag(string(t)) }) {
+						continue
+					}
+
+					for _, route := range node.SubnetRoutes() {
+						if !slices.ContainsFunc(prep.dsts[i], route.Overlaps) {
+							continue
+						}
+
+						routers[route] = append(routers[route], node.ID())
 					}
 				}
+
+				primary = make(map[netip.Prefix]types.NodeID, len(routers))
+
+				// ids are sorted, so the first is the lowest-ID router.
+				for prefix, ids := range routers {
+					slices.Sort(ids)
+					primary[prefix] = ids[0]
+				}
+			}
+
+			candidates = append(candidates, routers)
+			primaries = append(primaries, primary)
+
+			for prefix, ids := range routers {
+				prep.scopes[prefix] = append(prep.scopes[prefix], viaScope{i, views.SliceOf(ids)})
 			}
 
 			prep.primary[i] = primary
@@ -2269,24 +2410,359 @@ func (pm *PolicyManager) viaPrep() *viaPrep {
 	return pm.via
 }
 
-// ViaRoutesForPeer computes via grant effects for a viewer-peer pair.
-// For each via grant where the viewer matches the source, it checks whether the
-// peer advertises any of the grant's destination prefixes. If the peer has the
-// via tag, those prefixes go into [types.ViaRouteResult.Include]; otherwise
-// into [types.ViaRouteResult.Exclude].
-//
-// Grant sources, destinations and via primaries are prepared once per compile;
-// each call applies them to the viewer-peer pair.
-//
-//nolint:gocyclo // three-pass via-grant resolution (match, primary election, regular-overlap)
-func (pm *PolicyManager) ViaRoutesForPeer(viewer, peer types.NodeView) types.ViaRouteResult {
-	var result types.ViaRouteResult
+// ViaRoutes binds immutable live elections to the policy defining their scopes.
+// An empty election still applies that policy's exclusions and exit steering.
+type ViaRoutes struct {
+	policy  *PolicyManager
+	winners *graph.Map[viaKey, types.NodeID]
+}
 
-	if pm == nil {
-		return result
+// ElectViaRoutes revisits only scopes a change can move: those reached by
+// touched prefixes, and — when the policy binding changed — those whose
+// candidate membership moved with it. A different policy document starts
+// every election anew. elect runs synchronously with read-only candidates
+// and the scope's prior winner; it must use the caller's in-progress
+// snapshot. The boolean reports winner changes; callers must adopt the
+// returned policy binding even when it is false.
+func (pm *PolicyManager) ElectViaRoutes(previous *ViaRoutes, touched map[netip.Prefix]struct{}, elect func(views.Slice[types.NodeID], types.NodeID) (types.NodeID, bool)) (*ViaRoutes, bool) {
+	e := newViaElection(previous)
+	// Only the same document gives positional scopes the same meaning.
+	continuous := previous != nil && previous.policy != nil && pm != nil && previous.policy.pol == pm.pol
+
+	prep := pm.viaPrep()
+
+	// candidates returns the previous binding's candidates for a scope, and
+	// whether it had any: a scope only keeps its winner when both its key
+	// and its candidates survive a recompile.
+	candidates := func(old *viaPrep, k viaKey) (views.Slice[types.NodeID], bool) {
+		if old == nil {
+			return views.Slice[types.NodeID]{}, false
+		}
+
+		for _, scope := range old.scopes[k.prefix] {
+			if scope.grant == k.grant {
+				return scope.candidates, true
+			}
+		}
+
+		return views.Slice[types.NodeID]{}, false
 	}
 
-	if pm.pol == nil {
+	switch {
+	case previous != nil && previous.policy == pm:
+		// Same binding, so prep still describes these nodes. A failed
+		// compile also lands here: it keeps the previous policy manager,
+		// whose scopes were frozen against an older node list — the same
+		// last-good staleness the compiled policy serves everywhere.
+		if prep != nil {
+			for prefix := range touched {
+				for _, scope := range prep.scopes[prefix] {
+					e.electScope(prefix, scope, continuous, elect)
+				}
+			}
+		}
+	case continuous:
+		// A same-document recompile rebuilt the policy against new nodes.
+		// Revisit scopes whose prefixes a changed router names or whose
+		// candidates moved; the rest keep their winners.
+		old := previous.policy.viaPrep()
+		seen := make(map[viaKey]struct{})
+
+		if prep != nil {
+			for prefix, scopes := range prep.scopes {
+				for _, scope := range scopes {
+					k := viaKey{scope.grant, prefix}
+					seen[k] = struct{}{}
+
+					if _, ok := touched[prefix]; !ok {
+						if prev, had := candidates(old, k); had && sameNodeIDSlice(prev, scope.candidates) {
+							continue
+						}
+					}
+
+					e.electScope(prefix, scope, continuous, elect)
+				}
+			}
+		}
+
+		for k := range e.winners.All() {
+			if _, ok := seen[k]; !ok {
+				e.set(k, 0, false)
+			}
+		}
+	default:
+		return pm.electAll(previous, elect)
+	}
+
+	binding, changed := e.result(pm)
+	if !changed && previous != nil && previous.policy == pm {
+		return previous, false
+	}
+
+	return binding, changed
+}
+
+// electAll elects every scope from previous's winners, dropping keys the
+// policy no longer scopes. A different document, a first election, and the
+// from-scratch audit take it.
+func (pm *PolicyManager) electAll(previous *ViaRoutes, elect func(views.Slice[types.NodeID], types.NodeID) (types.NodeID, bool)) (*ViaRoutes, bool) {
+	e := newViaElection(previous)
+	continuous := previous != nil && previous.policy != nil && pm != nil && previous.policy.pol == pm.pol
+
+	seen := make(map[viaKey]struct{})
+
+	if prep := pm.viaPrep(); prep != nil {
+		for prefix, scopes := range prep.scopes {
+			for _, scope := range scopes {
+				seen[viaKey{scope.grant, prefix}] = struct{}{}
+				e.electScope(prefix, scope, continuous, elect)
+			}
+		}
+	}
+
+	for k := range e.winners.All() {
+		if _, ok := seen[k]; !ok {
+			e.set(k, 0, false)
+		}
+	}
+
+	return e.result(pm)
+}
+
+// AuditViaElections recomputes every scope from previous — the incumbents
+// the adopted election was seeded with — and reports whether the outcome
+// matches the election the world adopted. It is the from-scratch reference
+// for HEADSCALE_DEBUG_POLICY_AUDIT.
+func (pm *PolicyManager) AuditViaElections(previous, elected *ViaRoutes, elect func(views.Slice[types.NodeID], types.NodeID) (types.NodeID, bool)) bool {
+	want, _ := pm.electAll(previous, elect)
+
+	var have *graph.Map[viaKey, types.NodeID]
+	if elected != nil && elected.policy == pm {
+		have = elected.winners
+	}
+
+	return sameViaWinners(want.winners, have)
+}
+
+// sameViaWinners compares two election winner maps.
+func sameViaWinners(a, b *graph.Map[viaKey, types.NodeID]) bool {
+	if a == b {
+		return true
+	}
+
+	if a == nil || b == nil {
+		return (a == nil || a.Len() == 0) && (b == nil || b.Len() == 0)
+	}
+
+	if a.Len() != b.Len() {
+		return false
+	}
+
+	for k, v := range a.All() {
+		if w, ok := b.Get(k); !ok || w != v {
+			return false
+		}
+	}
+
+	return true
+}
+
+// viaElection stages one election pass over the winners of previous.
+type viaElection struct {
+	winners *graph.Map[viaKey, types.NodeID]
+	edit    *graph.MapEdit[viaKey, types.NodeID]
+}
+
+func newViaElection(previous *ViaRoutes) *viaElection {
+	// A pass over a carried binding reuses its winners; only a first
+	// election builds a fresh map.
+	if previous != nil && previous.winners != nil {
+		return &viaElection{winners: previous.winners}
+	}
+
+	return &viaElection{winners: graph.NewMap[viaKey](func(a, b types.NodeID) bool { return a == b }, nil)}
+}
+
+func (e *viaElection) set(k viaKey, id types.NodeID, present bool) {
+	// Read the staged edit once it exists: a later pass over the same
+	// key must see what this election already staged.
+	old, existed := e.winners.Get(k)
+	if e.edit != nil {
+		old, existed = e.edit.Get(k)
+	}
+
+	if existed == present && (!present || old == id) {
+		return
+	}
+
+	if e.edit == nil {
+		e.edit = e.winners.Edit()
+	}
+
+	if present {
+		e.edit.Set(k, id)
+	} else {
+		e.edit.Delete(k)
+	}
+}
+
+func (e *viaElection) electScope(prefix netip.Prefix, scope viaScope, continuous bool, elect func(views.Slice[types.NodeID], types.NodeID) (types.NodeID, bool)) {
+	k := viaKey{scope.grant, prefix}
+
+	var incumbent types.NodeID
+	if continuous {
+		// Read the staged edit once it exists, as set does: a scope
+		// elected earlier in this pass is its own incumbent.
+		incumbent, _ = e.winners.Get(k)
+		if e.edit != nil {
+			incumbent, _ = e.edit.Get(k)
+		}
+	}
+
+	id, ok := elect(scope.candidates, incumbent)
+	e.set(k, id, ok)
+}
+
+func (e *viaElection) result(pm *PolicyManager) (*ViaRoutes, bool) {
+	next := e.winners
+	if e.edit != nil {
+		next = e.edit.Done()
+	}
+
+	return &ViaRoutes{policy: pm, winners: next}, next != e.winners
+}
+
+// sameNodeIDSlice compares two sorted node ID slices without copying them.
+func sameNodeIDSlice(a, b views.Slice[types.NodeID]) bool {
+	if a.Len() != b.Len() {
+		return false
+	}
+
+	for i := range a.Len() {
+		if a.At(i) != b.At(i) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// ForPeer resolves routes using only this result's policy and live elections.
+func (v *ViaRoutes) ForPeer(viewer, peer types.NodeView) types.ViaRouteResult {
+	if v == nil {
+		return types.ViaRouteResult{}
+	}
+
+	return v.policy.viaRoutesForPeer(viewer, peer, func(grant int, prefix netip.Prefix) types.NodeID {
+		id, _ := v.winners.Get(viaKey{grant, prefix})
+		return id
+	})
+}
+
+// ChangedNodes includes losing and gaining routers between retained snapshots,
+// not just the latest transaction. Expired map history falls back to comparison.
+func (v *ViaRoutes) ChangedNodes(previous *ViaRoutes) []types.NodeID {
+	var before, after *graph.Map[viaKey, types.NodeID]
+	if previous != nil {
+		before = previous.winners
+	}
+
+	if v != nil {
+		after = v.winners
+	}
+
+	var ids []types.NodeID
+
+	for _, k := range graph.Changes(before, after) {
+		if id, ok := before.Get(k); ok {
+			ids = append(ids, id)
+		}
+
+		if id, ok := after.Get(k); ok {
+			ids = append(ids, id)
+		}
+	}
+
+	slices.Sort(ids)
+
+	return slices.Compact(ids)
+}
+
+// HasOutage reports whether any elected winner is unavailable while none of
+// its scope's candidates is: the routers coming back should be elected
+// together, not one write at a time. A scope whose routers are all offline
+// elects no winner, so it is invisible here — the same blind spot the global
+// election's routes map has. available decides availability against the
+// caller's in-progress snapshot.
+func (v *ViaRoutes) HasOutage(available func(types.NodeID) bool) bool {
+	if v == nil {
+		return false
+	}
+
+	prep := v.policy.viaPrep()
+	if prep == nil {
+		return false
+	}
+
+	for k, id := range v.winners.All() {
+		if available(id) {
+			continue
+		}
+
+		// An available candidate would win the next election; only a
+		// scope with none left is an outage. A winner whose scope the
+		// policy no longer scopes — which the election cannot produce —
+		// is not one.
+		scoped, anyAvailable := false, false
+
+		for _, scope := range prep.scopes[k.prefix] {
+			if scope.grant != k.grant {
+				continue
+			}
+
+			scoped = true
+
+			for _, candidate := range scope.candidates.All() {
+				if available(candidate) {
+					anyAvailable = true
+
+					break
+				}
+			}
+		}
+
+		if scoped && !anyAvailable {
+			return true
+		}
+	}
+
+	return false
+}
+
+// ViaRoutesForPeer computes via grant effects for a viewer-peer pair.
+// For each via grant where the viewer matches the source, the prefixes the
+// peer advertises among the grant's destinations go into
+// [types.ViaRouteResult.Include] when this inspection elects the peer for
+// them — exit routes steer per node and need no election — and into
+// [types.ViaRouteResult.Exclude] otherwise, including when no router wins
+// the scope.
+//
+// This is static policy inspection, not live routing. Snapshots use ViaRoutes.
+func (pm *PolicyManager) ViaRoutesForPeer(viewer, peer types.NodeView) types.ViaRouteResult {
+	return pm.viaRoutesForPeer(viewer, peer, func(grant int, prefix netip.Prefix) types.NodeID {
+		// Zero when no router of this scope advertises the prefix: the
+		// scope elects nobody, so nothing routes through the peer.
+		id, _ := pm.viaPrep().primary[grant][prefix]
+		return id
+	})
+}
+
+//nolint:gocyclo // via-grant election followed by regular-grant overlap
+func (pm *PolicyManager) viaRoutesForPeer(viewer, peer types.NodeView, primary func(int, netip.Prefix) types.NodeID) types.ViaRouteResult {
+	var result types.ViaRouteResult
+
+	prep := pm.viaPrep()
+	if prep == nil {
 		return result
 	}
 
@@ -2295,17 +2771,13 @@ func (pm *PolicyManager) ViaRoutesForPeer(viewer, peer types.NodeView) types.Via
 		return result
 	}
 
-	// Only via grants can add to the result, and ACLs never carry via.
-	if !slices.ContainsFunc(pm.pol.Grants, Grant.HasVia) {
-		return result
-	}
-
-	prep := pm.viaPrep()
 	grants := prep.grants
 	viewerIPs := viewer.IPs()
+	viewerSubnets := viewer.SubnetRoutes()
 
 	matchViewer := func(i int) bool {
-		return prep.srcs[i] != nil && slices.ContainsFunc(viewerIPs, prep.srcs[i].Contains)
+		return prep.srcs[i] != nil && (slices.ContainsFunc(viewerIPs, prep.srcs[i].Contains) ||
+			slices.ContainsFunc(viewerSubnets, prep.srcs[i].OverlapsPrefix))
 	}
 	resolvedDstPrefixes, grantHasAutoGroupInternet := prep.dsts, prep.internet
 
@@ -2330,7 +2802,9 @@ func (pm *PolicyManager) ViaRoutesForPeer(viewer, peer types.NodeView) types.Via
 
 		for _, dstPrefix := range resolvedDstPrefixes[i] {
 			for _, route := range peerSubnetRoutes {
-				if dstPrefix.Overlaps(route) {
+				// A route can cover several destinations of one grant;
+				// it is still one route the peer carries.
+				if dstPrefix.Overlaps(route) && !slices.Contains(matchedPrefixes, route) {
 					matchedPrefixes = append(matchedPrefixes, route)
 				}
 			}
@@ -2360,70 +2834,24 @@ func (pm *PolicyManager) ViaRoutesForPeer(viewer, peer types.NodeView) types.Via
 			}
 		}
 
-		if peerHasVia {
-			result.Include = append(result.Include, matchedPrefixes...)
-		} else {
-			result.Exclude = append(result.Exclude, matchedPrefixes...)
+		// Elect within each grant before combining contributions: one
+		// group's failure must not cancel another group's authorization.
+		for _, prefix := range matchedPrefixes {
+			include := peerHasVia
+			// Exit routes use per-node steering, not subnet HA elections.
+			if include && !tsaddr.IsExitRoute(prefix) {
+				include = peer.ID() == primary(i, prefix)
+			}
+
+			if include {
+				result.Include = append(result.Include, prefix)
+			} else {
+				result.Exclude = append(result.Exclude, prefix)
+			}
 		}
 	}
 
-	// Detect prefixes that should fall back to HA primary election
-	// rather than per-viewer via steering. Two conditions trigger this:
-	//
-	// 1. Multi-router via: a via grant's tag matches multiple peers
-	//    advertising the same prefix.
-	// 2. Regular grant overlap: a non-via grant also covers the same
-	//    prefix for this viewer.
-	//
-	// When neither condition is met, per-viewer via steering applies.
 	if len(result.Include) > 0 || len(result.Exclude) > 0 {
-		// Multi-router via election: when a via grant's tag matches
-		// multiple peers advertising the same prefix, only the
-		// lowest-ID peer (the via-group primary) keeps the prefix in
-		// Include. The others move to Exclude. This mirrors HA
-		// primary election scoped to the via tag group.
-		//
-		// Unlike the global [tailcfg.Node.PrimaryRoutes] election
-		// (routes/primary.go), which picks one primary across ALL
-		// advertisers of a prefix, this election is scoped to the via tag.
-		// Two via grants with different tags (e.g., tag:ha-a vs tag:ha-b)
-		// each elect their own winner independently.
-		//
-		// Only process via grants where the viewer matches the source,
-		// otherwise grants for other viewer groups would incorrectly
-		// demote the peer.
-		for i, grant := range grants {
-			if !grant.HasVia() {
-				continue
-			}
-
-			if !matchViewer(i) {
-				continue
-			}
-
-			// Elect per matched route, not per dst — a peer can only
-			// be primary for a prefix it actually advertises, and one
-			// dst may cover multiple distinct routes.
-			for _, dstPrefix := range resolvedDstPrefixes[i] {
-				for _, included := range slices.Clone(result.Include) {
-					if !dstPrefix.Overlaps(included) {
-						continue
-					}
-
-					viaPrimaryID := prep.primary[i][included]
-
-					if viaPrimaryID != 0 && peer.ID() != viaPrimaryID {
-						result.Include = slices.DeleteFunc(result.Include, func(p netip.Prefix) bool {
-							return p == included
-						})
-						if !slices.Contains(result.Exclude, included) {
-							result.Exclude = append(result.Exclude, included)
-						}
-					}
-				}
-			}
-		}
-
 		// Check for regular (non-via) grants covering the same prefix.
 		// When a regular grant also covers a prefix that a via grant
 		// included, defer to global HA primary election (UsePrimary).
@@ -2440,13 +2868,13 @@ func (pm *PolicyManager) ViaRoutesForPeer(viewer, peer types.NodeView) types.Via
 				continue
 			}
 
-			// A non-via grant covering routes that a via grant included
+			// A non-via grant covering subnets that a via grant included
 			// defers to global HA primary election. Match by overlap so
 			// a broader or narrower regular dst still catches the
 			// routes the via grant added to Include.
 			for _, dstPrefix := range resolvedDstPrefixes[i] {
 				for _, p := range result.Include {
-					if dstPrefix.Overlaps(p) &&
+					if !tsaddr.IsExitRoute(p) && dstPrefix.Overlaps(p) &&
 						!slices.Contains(result.UsePrimary, p) {
 						result.UsePrimary = append(result.UsePrimary, p)
 					}

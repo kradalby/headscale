@@ -972,23 +972,29 @@ func (ns *noiseServer) RegistrationHandler(
 	decodeErr := json.NewDecoder(req.Body).Decode(&registerRequest)
 	if decodeErr == nil {
 		if registerRequest.Followup != "" {
-			// Keep only fields used by logout checks or a refreshed registration.
+			// A follow-up discards request data a logout check or a
+			// refreshed registration does not consume: the wire cap guards
+			// initial registrations, while a follow-up keeps only the
+			// auth-relevant hostinfo fields, dropping the rest.
 			var auth *tailcfg.RegisterResponseAuth
 			if registerRequest.Auth != nil {
 				auth = &tailcfg.RegisterResponseAuth{}
 			}
 
+			var followupHi *tailcfg.Hostinfo
+
+			if hi := registerRequest.Hostinfo; hi != nil {
+				followupHi = &tailcfg.Hostinfo{
+					Hostname:    hi.Hostname,
+					OS:          hi.OS,
+					RequestTags: slices.Clone(hi.RequestTags),
+				}
+			}
+
 			registerRequest = tailcfg.RegisterRequest{
 				Version: registerRequest.Version, NodeKey: registerRequest.NodeKey,
 				Followup: registerRequest.Followup, Expiry: registerRequest.Expiry,
-				Auth: auth, Hostinfo: func() *tailcfg.Hostinfo {
-					regData, regErr := registrationDataFromRequest(registerRequest, ns.machineKey)
-					if regErr != nil {
-						return nil
-					}
-
-					return regData.Hostinfo
-				}(),
+				Auth: auth, Hostinfo: followupHi,
 			}
 		}
 

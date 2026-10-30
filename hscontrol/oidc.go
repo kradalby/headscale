@@ -52,7 +52,6 @@ var errOIDCStateTooShort = errors.New("oidc state parameter is too short")
 var (
 	errEmptyOIDCCallbackParams = errors.New("empty OIDC callback params")
 	errNoOIDCIDToken           = errors.New("extracting ID token")
-	errNoOIDCRegistrationInfo  = errors.New("registration info not in cache")
 	errOIDCAllowedDomains      = errors.New(
 		"authenticated principal does not match any allowed domain",
 	)
@@ -190,13 +189,24 @@ func (a *AuthProviderOIDC) authHandler(
 		return
 	}
 
-	// Set the state and nonce cookies to protect against CSRF attacks
-	state := rands.HexString(64)
-	a.setCSRFCookie(writer, req, "state", state)
+	authReq, ok := a.h.state.GetAuthCacheEntry(authID)
+	if !ok {
+		httpUserError(writer, NewHTTPError(http.StatusGone, "login session expired, try again", nil))
+		return
+	}
 
-	// Set the state and nonce cookies to protect against CSRF attacks
+	if registration && !authReq.IsRegistration() {
+		httpUserError(writer, NewHTTPError(http.StatusBadRequest, "auth session is not for node registration", nil))
+		return
+	}
+
+	if !registration && !authReq.IsSSHCheck() {
+		httpUserError(writer, NewHTTPError(http.StatusBadRequest, "auth session is not for SSH check", nil))
+		return
+	}
+
+	state := rands.HexString(64)
 	nonce := rands.HexString(64)
-	a.setCSRFCookie(writer, req, "nonce", nonce)
 
 	registrationInfo := AuthInfo{
 		AuthID:       authID,
@@ -242,6 +252,9 @@ func (a *AuthProviderOIDC) authHandler(
 		return
 	}
 
+	a.setCSRFCookie(writer, req, "state", state)
+	a.setCSRFCookie(writer, req, "nonce", nonce)
+
 	authURL := a.oauth2Config.AuthCodeURL(state, extras...)
 	log.Debug().Caller().Msgf("redirecting to %s for authentication", authURL)
 
@@ -276,7 +289,23 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		return
 	}
 
-	oauth2Token, err := a.getOauth2Token(req.Context(), code, state)
+	// A cookie-bound callback spends its state even if authentication fails;
+	// retrying then requires a fresh login flow rather than reusing the
+	// callback, and a failed exchange must release the pending-state slot.
+	authInfo := a.getAuthInfoFromState(state)
+	if authInfo == nil {
+		httpUserError(writer, NewHTTPError(http.StatusGone, "login session expired, try again", nil))
+		return
+	}
+
+	// A provider-reported failure spends the callback's state too; the
+	// provider's own description is not echoed to the browser.
+	if req.URL.Query().Get("error") != "" {
+		httpUserError(writer, NewHTTPError(http.StatusForbidden, "OIDC authentication failed", nil))
+		return
+	}
+
+	oauth2Token, err := a.getOauth2Token(req.Context(), code, authInfo)
 	if err != nil {
 		httpUserError(writer, err)
 		return
@@ -368,14 +397,6 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 	// If the node exists, then the node should be reauthenticated,
 	// if the node does not exist, and the machine key exists, then
 	// this is a new node that should be registered.
-	authInfo := a.getAuthInfoFromState(state)
-	if authInfo == nil {
-		log.Debug().Caller().Str("state", state).Msg("state not found in cache, login session may have expired")
-		httpUserError(writer, NewHTTPError(http.StatusGone, "login session expired, try again", nil))
-
-		return
-	}
-
 	// If this is a registration flow, render the confirmation
 	// interstitial instead of finalising the registration immediately.
 	// Without an explicit user click, a single GET to
@@ -495,10 +516,13 @@ func (a *AuthProviderOIDC) determineNodeExpiry(idTokenExpiration time.Time) *tim
 func extractCodeAndStateParamFromRequest(
 	req *http.Request,
 ) (string, string, error) {
-	code := req.URL.Query().Get("code")
-	state := req.URL.Query().Get("state")
+	query := req.URL.Query()
+	code := query.Get("code")
+	state := query.Get("state")
 
-	if code == "" || state == "" {
+	// A provider-reported error arrives without a code; it is consumed as
+	// the callback's own failure, so only a request with neither is empty.
+	if (code == "" && query.Get("error") == "") || state == "" {
 		return "", "", NewHTTPError(http.StatusBadRequest, "missing code or state parameter", errEmptyOIDCCallbackParams)
 	}
 
@@ -517,19 +541,12 @@ func extractCodeAndStateParamFromRequest(
 func (a *AuthProviderOIDC) getOauth2Token(
 	ctx context.Context,
 	code string,
-	state string,
+	authInfo *AuthInfo,
 ) (*oauth2.Token, error) {
 	var exchangeOpts []oauth2.AuthCodeOption
 
-	if a.cfg.PKCE.Enabled {
-		regInfo, ok := a.authCache.Get(state)
-		if !ok {
-			return nil, NewHTTPError(http.StatusNotFound, "registration not found", errNoOIDCRegistrationInfo)
-		}
-
-		if regInfo.Verifier != nil {
-			exchangeOpts = []oauth2.AuthCodeOption{oauth2.VerifierOption(*regInfo.Verifier)}
-		}
+	if a.cfg.PKCE.Enabled && authInfo.Verifier != nil {
+		exchangeOpts = []oauth2.AuthCodeOption{oauth2.VerifierOption(*authInfo.Verifier)}
 	}
 
 	oauth2Token, err := a.oauth2Config.Exchange(ctx, code, exchangeOpts...)
@@ -1066,6 +1083,11 @@ func (a *AuthProviderOIDC) handleRegistration(
 		util.RegisterMethodOIDC,
 	)
 	if err != nil {
+		if errors.Is(err, types.ErrHostinfoTooLarge) {
+			return false, newHTTPUserError(http.StatusBadRequest, "node report too large",
+				"This device reports too much data. Ask your administrator to reduce its reported metadata, then sign in again.", err)
+		}
+
 		return false, fmt.Errorf("registering node: %w", err)
 	}
 

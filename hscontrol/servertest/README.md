@@ -106,3 +106,89 @@ performs extra runtime stack inspection in test binaries; confirm CPU
 findings against a standalone server before optimizing them. Docker/real
 tailscaled tests remain necessary for network behavior, data-plane traffic,
 and a server-only resource ceiling.
+
+## Policy and map microbenchmarks
+
+The mapper's `BenchmarkScalingWrites` uses ten users or twenty tags regardless
+of node count. That measures growth within a fixed policy, not growth in
+policy diversity. It selects a node from the existing streams before each
+write. Endpoint writes use `UpdateNodeFromMapRequest`, including SQLite
+persistence, without `ListNodes` or the test insertion helper's
+whole-tailnet name scan. Rejoin still measures test-helper deletion and
+insertion, including name validation, not authentication or durable
+registration. The encoder uses the same cached node JSON and zstd
+compression as the poll loop.
+
+`ignored-health` measures alternating unchanged and rejected health requests
+on offline nodes without approved routes. It does not measure accepted
+hidden-state mutations. Earlier results named this workload `hidden`; those
+results must not be interpreted as evidence about actual health transitions.
+
+`policy/<shape>` names the starting policy. Setup replaces that policy with
+`*` to `*:2` and delivers the expansion, so the timed loop only alternates ports
+1 and 2 under full visibility: a steady recompile and diff, not the one-time
+visibility expansion the replacement causes — every iteration is a change. Under the old arrangement, that expansion
+dominated the first write — `policy/self` at 10,000 nodes expanded ten
+1,000-node user groups from 999 to 9,999 peers per client, 90,000,000 added
+peer entries across 10,000 updated sessions, a cost that belongs to setup.
+
+The `peer-renders/op` metric sums `len(netMap.changed)` across sessions:
+added or pointer-changed peer references, excluding removals. It does not
+count shared `peerRenders.render` calls or `TailNode` cache misses, and
+pointer changes need not produce wire changes. Successful setup maps,
+updates and reconnects call `Delivered` after encoding (or after setup's
+simulated delivery); untimed checks reject retained failed-write attempts.
+
+`BenchmarkPeerClassesDiversity` in `hscontrol/policy/v2` grows identities and
+rules with the tailnet:
+
+- `pairs`: N nodes, N/2 independent IP grants, N classes, one peer per node.
+- `tag-pairs`: the same visibility with N distinct tags and N/2 tag grants.
+- `dense`: N/2 distinct sources can reach everyone, producing N/2+1 classes
+  and dense output.
+- `self`: N/2 users with two devices each and an `autogroup:self` grant.
+- `allow-all`: one shared class, the fixed-diversity comparison.
+
+Each shape separates policy compilation, class construction without previous
+sides (`fresh`), and construction reusing unchanged nodes and rules
+(`reuse`). These are individual stages, not registration latency. In
+particular, `reuse` does not include a policy edit or a joining node.
+Construction phases report `classes/op`: the class views the phase's own
+build produced, including a shared base view that per-node rules may
+supersede. Compilation does not build or report class views.
+
+Run from the Nix shell:
+
+```sh
+go test ./hscontrol/policy/v2 -run '^$' -bench '^BenchmarkPeerClassesDiversity$' -benchtime=200ms -count=5 -cpu=1
+go test ./hscontrol/mapper -run '^$' -bench '^BenchmarkFirstMap/nodes=1000$/' -benchtime=200ms -count=5 -cpu=1
+go test ./hscontrol/mapper -run '^$' -bench '^BenchmarkFirstMap/nodes=10000$/' -benchtime=200ms -count=5 -cpu=1
+```
+
+Class construction used to compare every class pair, intersecting up to
+ceil(M/64) matcher words for M rules. Sparse sides now join the classes on
+opposite sides of each matcher, deduplicating symmetric neighbors; the
+build records which path ran, and the diversity suite asserts the sparse
+shapes join while the dense shape keeps the scan. Dense sides or excessive
+repeated joins retain the short-circuit pair scan. The join changes only
+the shared-rule calculation; per-node self/via grants still add their peers
+afterwards. An unchanged visibility relation includes self edges inside a
+class; `Peers` removes the requesting node.
+
+This does not make the entire build linear. Fresh side evaluation still
+checks N nodes against M matchers. Reuse remaps matcher bits per node, also
+O(NM). Stored side bitsets cost O(N ceil(M/64)); views can cost O(NC) for C
+classes, reaching O(N²). Policy diversity and dense output remain
+architectural limits: measurements of this join live in the pull request
+that introduced it, and new hardware deserves new measurements, not these.
+
+`BenchmarkFirstMap` distinguishes `warm-hub`, `cold-hub`, and `new-state`
+for both JSON and zstd. A cold hub starts new render/class/encoding caches
+but uses an already compiled world. `new-state` also reopens the existing
+SQLite database, loads nodes, compiles policy and constructs peers; state
+closure is included in its time. Neither case restarts the OS process,
+performs HTTP/Noise handshakes, or measures a concurrent reconnect storm.
+zstd in test binaries has the extra stack inspection described above. A
+warm, uncompressed map is therefore not evidence of cold server restart
+behavior, and none of these microbenchmarks establish restart convergence
+or a production latency guarantee.
