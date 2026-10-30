@@ -221,7 +221,19 @@ func (hsdb *HSDatabase) NodeSetExpiry(nodeID types.NodeID, expiry *time.Time) er
 // NodeSetExpiry sets a new expiry time for a node.
 // If expiry is nil, the node's expiry is disabled (node will never expire).
 func NodeSetExpiry(tx *gorm.DB, nodeID types.NodeID, expiry *time.Time) error {
-	return tx.Model(&types.Node{}).Where("id = ?", nodeID).Update("expiry", expiry).Error
+	result := tx.Model(&types.Node{}).Where("id = ?", nodeID).Update("expiry", expiry)
+	if result.Error != nil {
+		return result.Error
+	}
+
+	// The lifetime deletes drop the row before the world node; a zero here
+	// means the row is gone, not that the value happened to match (SQLite
+	// and Postgres both count matched rows).
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+
+	return nil
 }
 
 func (hsdb *HSDatabase) DeleteNode(node *types.Node) error {
@@ -243,6 +255,9 @@ func DeleteNode(tx *gorm.DB,
 		return result.Error
 	}
 
+	// Zero rows means another delete already dropped the row: its caller
+	// owns the teardown, and this one must not run it a second time (a
+	// double teardown could free an already-reallocated IP).
 	if result.RowsAffected == 0 {
 		return ErrNodeNotFound
 	}

@@ -225,7 +225,7 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 	})
 
 	// Start subsystems.
-	tb.Cleanup(app.MapHub().Close)
+	tb.Cleanup(app.DrainMapSessions)
 	app.StartEphemeralGCForTest(tb)
 
 	// Start the HTTP server. By default it binds an in-memory network so all
@@ -285,8 +285,25 @@ func (s *TestServer) State() *state.State {
 // The ephemeral GC stops in the [testing.TB.Cleanup] callback registered by
 // [hscontrol.Headscale.StartEphemeralGCForTest].
 func (s *TestServer) Close() {
+	// End the long polls first: a closed hub is what unblocks them, and
+	// Shutdown then waits for the handlers — including any session that has
+	// not reached clientStreamsOpen.Add yet — so the drain below cannot
+	// miss a late session and return while its final persist still runs.
+	// Shutdown does not force lingering connections closed, so the
+	// unconditional Close after it caps the wait past the deadline.
+	//
+	// This ordering is not pinned by a discriminating test: the window (a
+	// session admitted after the drain's Wait) is a scheduler race, and the
+	// pre-fix Close also blocked here once a handler was parked.
+	s.App.MapHub().Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_ = s.httpServer.Shutdown(ctx)
 	s.httpServer.Close()
 	s.ln.Close()
+	s.App.DrainMapSessions()
 }
 
 // MemNet returns the in-memory network used by this server,
