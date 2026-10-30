@@ -130,6 +130,9 @@ type world struct {
 	full         chan struct{}
 	inOutage     atomic.Bool
 
+	// servesRoute is [types.Config.ServesRoute]; nil serves every route.
+	servesRoute func(netip.Prefix) bool
+
 	// outageMu and outageRev order the outage stores: a state computed
 	// from an older snapshot than the one already stored must not win,
 	// whichever of two concurrent writers finished first.
@@ -1591,6 +1594,14 @@ func (s *Snapshot) RoutesForPeer(viewer, peer types.NodeView, matchers []matcher
 		if slices.Contains(viewerSubnets, p) && !slices.Contains(reduced, p) {
 			reduced = append(reduced, p)
 		}
+	}
+
+	// A single address inside the node ranges names a node, not a subnet: it
+	// stays approved and in the router's own entry, but no viewer is served
+	// it. Via inclusions skip the election, so the rule applies here, to
+	// everything the viewer gets.
+	if s.w.servesRoute != nil {
+		reduced = slices.DeleteFunc(reduced, func(p netip.Prefix) bool { return !s.w.servesRoute(p) })
 	}
 
 	return reduced

@@ -374,6 +374,7 @@ func NewState(cfg *types.Config) (*State, error) {
 	}
 
 	w.batchSize, w.batchTimeout = cfg.Tuning.NodeStoreBatchSize, cfg.Tuning.NodeStoreBatchTimeout
+	w.servesRoute = cfg.ServesRoute
 	// The stored policy's tests are checked once at boot, and by
 	// [State.SetPolicy] for each changed document; a node change
 	// recompiles the policy without them. A failure here only warns: a stale stored policy (a
