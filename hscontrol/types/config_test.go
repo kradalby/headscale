@@ -1028,6 +1028,13 @@ func TestExtraRecordsAreLowercased(t *testing.T) {
 		{Name: "nas.fritz.box", Type: "A", Value: "192.168.1.3"},
 	}
 
+	// WithExtraRecords also canonicalizes the order, so a republished set
+	// compares equal regardless of the publisher's map order.
+	wantSorted := []tailcfg.DNSRecord{
+		{Name: "nas.fritz.box", Type: "A", Value: "192.168.1.3"},
+		{Name: "printer.fritz.box", Type: "A", Value: "192.168.1.2"},
+	}
+
 	tcfg := dnsToTailcfgDNS(DNSConfig{
 		MagicDNS:     true,
 		BaseDomain:   "example.com",
@@ -1038,11 +1045,130 @@ func TestExtraRecordsAreLowercased(t *testing.T) {
 	}
 
 	cfg := &Config{TailcfgDNSConfig: &tailcfg.DNSConfig{}}
-	cfg.SetExtraRecords(mixed)
+	dns := cfg.DNSView().WithExtraRecords(mixed)
 
-	if diff := cmp.Diff(want, cfg.TailcfgDNSConfig.ExtraRecords); diff != "" {
-		t.Errorf("SetExtraRecords mismatch (-want +got):\n%s", diff)
+	if diff := cmp.Diff(wantSorted, dns.ExtraRecords().AsSlice()); diff != "" {
+		t.Errorf("WithExtraRecords mismatch (-want +got):\n%s", diff)
 	}
+}
+
+func TestDNSViewWireCopies(t *testing.T) {
+	resolver := &dnstype.Resolver{Addr: "1.1.1.1", BootstrapResolution: []netip.Addr{netip.MustParseAddr("1.0.0.1")}}
+	cfg := &Config{TailcfgDNSConfig: &tailcfg.DNSConfig{
+		Resolvers:         []*dnstype.Resolver{resolver},
+		FallbackResolvers: []*dnstype.Resolver{resolver},
+		Routes:            map[string][]*dnstype.Resolver{"split.test": {resolver}},
+		Domains:           []string{"example.com"},
+		ExtraRecords:      []tailcfg.DNSRecord{{Name: "Service.Example.COM", Value: "100.64.0.99"}},
+	}}
+	view := cfg.DNSView()
+	resolver.Addr = "9.9.9.9"
+	resolver.BootstrapResolution[0] = netip.MustParseAddr("9.9.9.10")
+	cfg.TailcfgDNSConfig.ExtraRecords[0].Name = "input.example.com"
+
+	first := view.AsStruct()
+	second := view.AsStruct()
+
+	for _, resolvers := range [][]*dnstype.Resolver{first.Resolvers, first.FallbackResolvers, first.Routes["split.test"]} {
+		resolvers[0].Addr = "8.8.8.8"
+		resolvers[0].BootstrapResolution[0] = netip.MustParseAddr("8.8.4.4")
+	}
+
+	first.Domains[0] = "output.test"
+	first.ExtraRecords[0].Name = "output.test"
+	delete(first.Routes, "split.test")
+
+	for _, out := range []*tailcfg.DNSConfig{second, view.AsStruct()} {
+		for _, resolvers := range [][]*dnstype.Resolver{out.Resolvers, out.FallbackResolvers, out.Routes["split.test"]} {
+			require.Len(t, resolvers, 1)
+			assert.Equal(t, "1.1.1.1", resolvers[0].Addr)
+			assert.Equal(t, []netip.Addr{netip.MustParseAddr("1.0.0.1")}, resolvers[0].BootstrapResolution)
+		}
+
+		assert.Equal(t, []string{"example.com"}, out.Domains)
+		assert.Equal(t, []tailcfg.DNSRecord{{Name: "service.example.com", Value: "100.64.0.99"}}, out.ExtraRecords)
+	}
+}
+
+func TestDNSViewIPv6PartialNibbleRoutes(t *testing.T) {
+	// Host bits set: the view must derive the zones from the masked prefix.
+	prefix := netip.MustParsePrefix("fd7a:115c:a1e0:ffff::1/51")
+	cfg := &Config{
+		PrefixV6:         &prefix,
+		TailcfgDNSConfig: &tailcfg.DNSConfig{Proxied: true},
+	}
+
+	assert.Equal(t, map[string][]*dnstype.Resolver{
+		"e.0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa": {},
+		"f.0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa": {},
+	}, cfg.DNSView().AsStruct().Routes)
+}
+
+func TestDNSViewNilTemplate(t *testing.T) {
+	node := (&Node{GivenName: "laptop"}).View()
+
+	for _, enabled := range []bool{false, true} {
+		cfg := &Config{BaseDomain: "example.com", DNSConfig: DNSConfig{Certificates: CertificatesConfig{Enabled: enabled}}}
+		view := cfg.DNSView()
+		assert.Nil(t, view.AsStruct())
+		assert.Equal(t, "example.com", view.BaseDomain())
+		name, ok := node.CertDomain(view)
+		assert.Equal(t, enabled, ok, "nil wire config alone does not disable certificate eligibility")
+
+		if ok {
+			assert.Equal(t, "laptop.example.com", name)
+		}
+
+		// Records live outside the wire config, so an operator record at
+		// the node's name must block the certificate even with a nil wire.
+		blocked, ok := node.CertDomain(view.WithExtraRecords([]tailcfg.DNSRecord{{Name: "laptop.example.com"}}))
+		assert.False(t, ok, "an operator record at the node's name blocks the certificate name")
+		assert.Empty(t, blocked)
+	}
+
+	var zero DNSView
+	assert.Nil(t, zero.AsStruct())
+	assert.Empty(t, zero.BaseDomain())
+	assert.Empty(t, zero.ExtraRecordsPath())
+	_, ok := node.CertDomain(zero)
+	assert.False(t, ok)
+}
+
+func TestDNSViewNilRoutesNormalized(t *testing.T) {
+	cfg := &Config{TailcfgDNSConfig: &tailcfg.DNSConfig{
+		Routes: map[string][]*dnstype.Resolver{"svc.example.com": nil},
+	}}
+
+	out := cfg.DNSView().AsStruct()
+	require.Len(t, out.Routes, 1)
+	assert.NotNil(t, out.Routes["svc.example.com"], "nil routes must not reach the wire as null")
+	assert.Empty(t, out.Routes["svc.example.com"])
+}
+
+func TestDNSViewCapturesProviderIsolation(t *testing.T) {
+	provider, err := hsdns.NewProvider("acmedns", map[string]any{"config": map[string]any{
+		"laptop.example.com": map[string]any{
+			"username": "user", "password": "pass", "subdomain": "reg", "server_url": "https://auth.example.com",
+		},
+	}}, func(string) (any, bool) { return nil, false })
+	require.NoError(t, err)
+
+	cfg := &Config{
+		BaseDomain:       "example.com",
+		DNSConfig:        DNSConfig{Certificates: CertificatesConfig{Enabled: true}},
+		TailcfgDNSConfig: &tailcfg.DNSConfig{},
+		DNSChallenge:     DNSChallengeConfig{Provider: provider},
+	}
+	view := cfg.DNSView()
+	cfg.DNSChallenge.Provider = nil
+	cfg.DNSConfig.Certificates.Enabled = false
+	cfg.BaseDomain = "changed.test"
+	name, ok := (&Node{GivenName: "laptop"}).View().CertDomain(view)
+	assert.True(t, ok)
+	assert.Equal(t, "laptop.example.com", name)
+
+	_, ok = (&Node{GivenName: "other"}).View().CertDomain(view)
+	assert.False(t, ok, "replacing the builder's provider must not bypass isolation")
 }
 
 func TestDNSChallengeConfig(t *testing.T) {

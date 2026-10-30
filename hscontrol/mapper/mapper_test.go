@@ -73,9 +73,9 @@ func TestDNSConfigMapResponse(t *testing.T) {
 			nodeInShared1 := mach("test_get_shared_nodes_1", "shared1", 1)
 
 			got := generateDNSConfig(
-				&types.Config{
+				(&types.Config{
 					TailcfgDNSConfig: &dnsConfigOrig,
-				},
+				}).DNSView(),
 				nodeInShared1.View(),
 				nil,
 			)
@@ -90,17 +90,17 @@ func TestDNSConfigMapResponse(t *testing.T) {
 func TestNextDNSCapMapRendering(t *testing.T) {
 	t.Parallel()
 
-	mkConfig := func(addrs ...string) *types.Config {
+	mkConfig := func(addrs ...string) types.DNSView {
 		resolvers := make([]*dnstype.Resolver, len(addrs))
 		for i, a := range addrs {
 			resolvers[i] = &dnstype.Resolver{Addr: a}
 		}
 
-		return &types.Config{
+		return (&types.Config{
 			TailcfgDNSConfig: &tailcfg.DNSConfig{
 				Resolvers: resolvers,
 			},
-		}
+		}).DNSView()
 	}
 
 	mkNode := func() types.NodeView {
@@ -305,7 +305,7 @@ func TestGenerateDNSConfigNilHostinfoNoPanic(t *testing.T) {
 	}
 
 	require.NotPanics(t, func() {
-		generateDNSConfig(cfg, node, nil)
+		generateDNSConfig(cfg.DNSView(), node, nil)
 	}, "generateDNSConfig must not panic when a node has nil Hostinfo")
 }
 
@@ -726,7 +726,7 @@ func TestCertDomains(t *testing.T) {
 				},
 			}
 
-			got := generateDNSConfig(cfg, tt.node.View(), nil)
+			got := generateDNSConfig(cfg.DNSView(), tt.node.View(), nil)
 			assert.Equal(t, tt.want, got.CertDomains)
 			assert.Nil(t, cfg.TailcfgDNSConfig.CertDomains, "global DNS config must stay untouched")
 		})

@@ -48,9 +48,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
-	"tailscale.com/util/dnsname"
 )
 
 var (
@@ -231,44 +229,6 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 	}
 
 	app.authProvider = authProvider
-
-	if app.cfg.TailcfgDNSConfig != nil && app.cfg.TailcfgDNSConfig.Proxied { // if MagicDNS
-		// TODO(kradalby): revisit why this takes a list.
-		var magicDNSDomains []dnsname.FQDN
-		if cfg.PrefixV4 != nil {
-			magicDNSDomains = append(
-				magicDNSDomains,
-				util.GenerateIPv4DNSRootDomain(*cfg.PrefixV4)...,
-			)
-		}
-
-		if cfg.PrefixV6 != nil {
-			magicDNSDomains = append(
-				magicDNSDomains,
-				util.GenerateIPv6DNSRootDomain(*cfg.PrefixV6)...,
-			)
-		}
-
-		// we might have routes already from Split DNS
-		if app.cfg.TailcfgDNSConfig.Routes == nil {
-			app.cfg.TailcfgDNSConfig.Routes = make(map[string][]*dnstype.Resolver)
-		}
-
-		for _, d := range magicDNSDomains {
-			// Empty non-nil slice rather than nil: tailcfg.DNSConfig.Clone
-			// and dns.Config.Clone in tailscale drop map entries whose
-			// value is nil (see tailscale.com/tailcfg/tailcfg_clone.go and
-			// tailscale.com/net/dns/dns_clone.go: `if sv == nil { continue }`).
-			// Sending nil here caused the client's wgengine LinkChange:major
-			// handler to clobber /etc/resolv.conf on every tunnel-IP rebind
-			// — the handler reapplies a Clone of lastDNSConfig and the magic
-			// DNS routes vanish, taking the resolver with them for ~6 min
-			// until the next route-changing netmap. Empty slice survives
-			// Clone and carries the same "resolve locally" semantics
-			// ([tailcfg.DNSConfig.Routes] documents the empty-resolver form).
-			app.cfg.TailcfgDNSConfig.Routes[d.WithoutTrailingDot()] = []*dnstype.Resolver{}
-		}
-	}
 
 	if cfg.DERP.ServerEnabled {
 		derpServerKey, err := readOrCreatePrivateKey(cfg.DERP.ServerPrivateKeyPath)
@@ -565,7 +525,9 @@ func (h *Headscale) Serve() error {
 	}
 
 	if dumpConfig {
-		spew.Dump(h.cfg)
+		// The served DNS lives in the frozen snapshot; the raw startup
+		// builder no longer carries the MagicDNS reverse routes.
+		spew.Dump(h.state.DebugConfig())
 	}
 
 	versionInfo := types.GetVersionInfo()
@@ -616,8 +578,8 @@ func (h *Headscale) Serve() error {
 		h.ephemeralGC.Schedule(node.ID(), h.cfg.Node.Ephemeral.InactivityTimeout)
 	}
 
-	if h.cfg.DNSConfig.ExtraRecordsPath != "" {
-		h.extraRecordMan, err = dns.NewExtraRecordsManager(h.cfg.DNSConfig.ExtraRecordsPath)
+	if path := h.state.Snapshot().DNS().ExtraRecordsPath(); path != "" {
+		h.extraRecordMan, err = dns.NewExtraRecordsManager(path)
 		if err != nil {
 			return fmt.Errorf("setting up extrarecord manager: %w", err)
 		}

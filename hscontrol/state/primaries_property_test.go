@@ -413,7 +413,7 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 			netip.MustParsePrefix("10.0.1.0/24"),
 		}
 
-		w, err := newWorld(nil, nil, nil)
+		w, err := newWorld(nil, nil, nil, types.DNSView{})
 		if err != nil {
 			rt.Fatalf("world: %v", err)
 		}

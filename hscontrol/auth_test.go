@@ -3372,7 +3372,7 @@ func TestWebFlowReauthDifferentUser(t *testing.T) {
 }
 
 // Helper function to create test app.
-func createTestApp(t *testing.T, options ...func(*types.Config)) *Headscale {
+func createTestApp(t *testing.T, configure ...func(*types.Config)) *Headscale {
 	t.Helper()
 
 	tmpDir := t.TempDir()
@@ -3395,8 +3395,8 @@ func createTestApp(t *testing.T, options ...func(*types.Config)) *Headscale {
 		},
 	}
 
-	for _, opt := range options {
-		opt(&cfg)
+	for _, f := range configure {
+		f(&cfg)
 	}
 
 	app, err := NewHeadscale(&cfg)
@@ -4586,7 +4586,7 @@ func TestFollowupWaitPrefersCompletedAuthOverExpiredContext(t *testing.T) {
 			NodeKey:  nodeKey,
 		}
 
-		resp, err := app.waitForFollowup(ctx, req.Followup, registrationDataFromRequest(req, machineKey))
+		resp, err := app.waitForFollowup(ctx, req, machineKey)
 		switch {
 		case err != nil:
 			timeouts++

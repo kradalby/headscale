@@ -319,13 +319,12 @@ func NewState(cfg *types.Config) (*State, error) {
 		return nil, fmt.Errorf("loading policy: %w", err)
 	}
 
-	w, err := newWorld(nodes, users, pol)
+	w, err := newWorld(nodes, users, pol, cfg.DNSView())
 	if err != nil {
 		return nil, fmt.Errorf("initializing policy manager: %w", err)
 	}
 
 	w.batchSize, w.batchTimeout = cfg.Tuning.NodeStoreBatchSize, cfg.Tuning.NodeStoreBatchTimeout
-
 	// The stored policy's tests are checked once at boot, and by
 	// [State.SetPolicy] for each changed document; a node change
 	// recompiles the policy without them. A failure here only warns: a stale stored policy (a
@@ -420,10 +419,9 @@ func (s *State) DERPMap() tailcfg.DERPMapView {
 	return s.Snapshot().DERPMap().View()
 }
 
-// SetExtraRecords replaces the extra DNS records. The config keeps serving
-// them to the DNS config builder; the world input wakes map streams.
+// SetExtraRecords publishes the extra DNS records and wakes map streams in
+// the same graph commit.
 func (s *State) SetExtraRecords(records []tailcfg.DNSRecord) {
-	s.cfg.SetExtraRecords(records)
 	s.world.SetExtraRecords(records)
 }
 
@@ -1025,7 +1023,7 @@ func (s *State) RenameNode(nodeID types.NodeID, newName string) (types.NodeView,
 	// Validate the label AND that the resulting FQDN fits MaxHostnameLength:
 	// a valid 63-char label can still overflow under a long base_domain, and
 	// an unmappable name would break this node and its peers (issue #3346).
-	err := types.ValidateGivenName(newName, s.cfg.BaseDomain)
+	err := types.ValidateGivenName(newName, s.Snapshot().DNS().BaseDomain())
 	if err != nil {
 		return types.NodeView{}, fmt.Errorf("%w: %w", ErrGivenNameInvalid, err)
 	}

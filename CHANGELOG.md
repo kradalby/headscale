@@ -232,6 +232,9 @@ reported in Headscale: ANT-2026-MLP8ZR5T, ANT-2026-LYVGXVSW, ANT-2026-AWGRB7O1, 
 - Fix release builds reporting their version with a `+dirty` suffix [#3584](https://github.com/juanfont/headscale/pull/3584)
 - Fix SSH policy `acceptEnv` having no effect, so allowed environment variables reach SSH sessions. Upgrade SSH destination nodes to Tailscale v1.104.4 or newer before using `acceptEnv`, because older clients can disclose forwarded values [#3569](https://github.com/juanfont/headscale/pull/3569)
 
+- MagicDNS reverse zones for IPv4 prefixes whose configured address has host bits set, and for IPv6 prefixes whose mask is not nibble-aligned, are enumerated from the masked prefix, so tailnets with such custom prefixes advertise the correct set of reverse zones [#40](https://github.com/kradalby/headscale/pull/40)
+- Split-DNS zones with an empty resolver list are now sent as an empty route — handled by the client's built-in resolver — instead of `null` [#40](https://github.com/kradalby/headscale/pull/40)
+
 ## 0.29.6 (2026-10-24)
 
 **Minimum supported Tailscale client version: v1.80.0**

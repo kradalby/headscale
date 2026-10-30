@@ -933,8 +933,9 @@ func TestDeletedNodeEndsStreamCleanly(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			app := createTestApp(t)
-			app.cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{}
+			app := createTestApp(t, func(cfg *types.Config) {
+				cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{}
+			})
 
 			user := app.state.CreateUserForTest("poll-delete-clean-user")
 			pak, err := app.state.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)

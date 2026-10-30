@@ -68,12 +68,19 @@ func registerSettings(api huma.API, b Backend) {
 
 		cfg := b.Cfg
 
+		// A Backend without a State (test wiring) serves the startup
+		// config; production always wires the frozen snapshot view.
+		certsEnabled := cfg.DNSConfig.Certificates.Enabled
+		if b.State != nil {
+			certsEnabled = b.State.Snapshot().DNS().CertificatesEnabled()
+		}
+
 		return &settingsOutput{Body: TailnetSettings{
 			// File-mode policy is genuinely externally managed (read-only via API).
 			ACLsExternallyManagedOn: cfg.Policy.Mode == types.PolicyModeFile,
 			DevicesKeyDurationDays:  int(cfg.Node.Expiry / (24 * time.Hour)),
 			// Tailscale's toggle for node certificates, not headscale's own TLS.
-			HTTPSEnabled:                           cfg.DNSConfig.Certificates.Enabled,
+			HTTPSEnabled:                           certsEnabled,
 			UsersRoleAllowedToJoinExternalTailnets: "none",
 		}}, nil
 	})
