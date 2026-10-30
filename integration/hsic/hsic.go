@@ -1715,10 +1715,6 @@ func (t *HeadscaleInContainer) SendInterrupt() error {
 	return nil
 }
 
-func (t *HeadscaleInContainer) GetAllMapReponses() (map[types.NodeID][]tailcfg.MapResponse, error) {
-	return t.debugJSON[map[types.NodeID][]tailcfg.MapResponse]("mapresponses")
-}
-
 // PrimaryRoutes fetches the primary routes from the debug endpoint.
 func (t *HeadscaleInContainer) PrimaryRoutes() (*types.DebugRoutes, error) {
 	return t.debugJSON[*types.DebugRoutes]("routes")

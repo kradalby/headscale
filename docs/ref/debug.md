@@ -116,3 +116,60 @@ additional protection despite listening on all interfaces.
     ```
 
     Access the debug interface on your device by opening `http://<IP_OF_HEADSCALE>:9090/debug/` in your web browser.
+
+### Checking control-plane progress
+
+These signals describe different stages of an update:
+
+| Signal                                                             | What it establishes                                                                                                                                                                                                                                                   | What it does not establish                                                          |
+| ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `/health` on the main HTTP listener                                | The database ping succeeded (`pass`, HTTP 200), or failed (`fail`, HTTP 500).                                                                                                                                                                                         | Graph progress, policy correctness, or client delivery.                             |
+| `headscale_world_commits_total`                                    | A graph transaction published a new snapshot after the initial snapshot. Node, user, policy, extra DNS record and DERP changes count; a node batch counts once, unless its commit panics and the surviving writes are retried individually, each counting separately. | Database persistence, a response for every commit, or client receipt.               |
+| `/debug/batcher`                                                   | Map sessions currently registered with the mapper hub, including the number per node.                                                                                                                                                                                 | A session consuming notifications, completing writes, or applying a new netmap.     |
+| `/debug/nodestore`, `/debug/filter`, `/debug/ssh`, `/debug/routes` | Current in-memory nodes, compiled policy output and route assignments.                                                                                                                                                                                                | A client's installed state, or a consistent snapshot across separate HTTP requests. |
+| `/debug/derp`                                                      | A summary of the current graph's DERP regions and servers.                                                                                                                                                                                                            | A historical DERP map, its revision, or client receipt.                             |
+
+The commit counter excludes transactions that stage no edit — an unknown node, unchanged users, a byte-identical policy, equal DNS records or DERP maps — and refused and panicking transactions. A panicking node batch is retried write by write and each surviving publication counts separately. A node write that stages an identical copy of the node still counts. A separate startup DNS or DERP publication
+counts; constructing the initial graph snapshot does not. A committed node or user change still counts if its policy
+recompile fails and the graph retains the last good compiled policy. `headscale_world_commit_panics_total` reports
+panicking node write batches. `headscale_world_write_batch_size` records completed node batches, including no-op
+batches; failed batches are not observed, but successful individual retries are.
+
+Notifications coalesce: a slow stream can render the latest snapshot without sending every intermediate commit.
+An idle commit counter is normal when nothing changes. A rising counter or a connected session alone cannot prove
+that a particular update reached a client.
+
+When an update appears stuck:
+
+1. Check `/health` and server logs for database errors, `node write panicked`, or
+   `compiling policy; keeping the last good policy`.
+1. Inspect the affected node and live policy/route output using the debug endpoints above. `/debug/policy` reads the
+   configured policy file or database document; it does not prove that document is the one currently compiled —
+   `/debug/policy-manager` reports the policy manager state, the policy currently serving.
+   `/debug/config` exposes DNS configuration; there is no dedicated DNS revision or history endpoint.
+1. Check `/debug/batcher` for the node's session, then inspect its `tailscale debug netmap`, `tailscale status --json`
+   or `tailscale dns status --all` to verify the relevant state arrived. Compare the actual field, such as the endpoint,
+   route or extra DNS record, rather than inferring delivery from the connection count.
+
+With `HEADSCALE_DEBUG_DUMP_MAPRESPONSE_PATH` set before server startup, `/debug/mapresponses` exposes dumped responses.
+These are generated responses, dumped before network writes; they do not prove receipt or application by a client.
+
+### Revalidating policy and auditing incremental compilation
+
+Setting or reloading the byte-identical live policy is a no-op for policy compilation and its `tests`/`sshTests`.
+This remains true when users or nodes changed since the policy was accepted. SIGHUP can still run route auto-approval.
+To run both test blocks against the running server's current users and nodes without changing its policy:
+
+```console
+headscale policy check --file policy.json
+```
+
+When the server is stopped, add `--bypass-server-and-access-database-directly` to check against persisted users and nodes.
+At boot, failing stored policy tests log a warning and do not prevent startup.
+
+`HEADSCALE_DEBUG_POLICY_AUDIT=1` compares incremental policy compilation and derived peer classes with fresh compilation
+and peer scans when those graph cells recompute. Mismatches log `policy audit`; integration tests treat them as failures.
+This checks policy-derived results, including filters, route matchers and peer visibility. It does not continuously
+revalidate policy tests, audit endpoint-only commits that skip recompilation, or check DNS rendering, notification
+routing, response diffs, network writes or client state. Fresh peer scans are quadratic, so this diagnostic can add
+substantial cost on large tailnets.

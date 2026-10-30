@@ -97,7 +97,7 @@ func TestAuthWebFlowLogoutAndReloginSameUser(t *testing.T) {
 	expectedNodes := collectExpectedNodeIDs(t, allClients)
 
 	// Validate initial connection state
-	validateInitialConnection(t, headscale, expectedNodes)
+	validateInitialConnection(t, headscale, allClients, expectedNodes)
 
 	var listNodes []*clientv1.Node
 
@@ -135,7 +135,7 @@ func TestAuthWebFlowLogoutAndReloginSameUser(t *testing.T) {
 	requireNoErrLogout(t, err)
 
 	// Validate that all nodes are offline after logout
-	validateLogoutComplete(t, headscale, expectedNodes)
+	validateLogoutComplete(t, headscale, allClients, expectedNodes)
 
 	t.Logf("all clients logged out")
 
@@ -159,7 +159,7 @@ func TestAuthWebFlowLogoutAndReloginSameUser(t *testing.T) {
 	t.Logf("node count first login: %d, after relogin: %d", nodeCountBeforeLogout, len(listNodes))
 
 	// Validate connection state after relogin
-	validateReloginComplete(t, headscale, expectedNodes)
+	validateReloginComplete(t, headscale, allClients, expectedNodes)
 
 	allIps, err = scenario.ListTailscaleClientsIPs()
 	requireNoErrListClientIPs(t, err)
@@ -430,7 +430,7 @@ func TestAuthWebFlowLogoutAndReloginNewUser(t *testing.T) {
 	expectedNodes := collectExpectedNodeIDs(t, allClients)
 
 	// Validate initial connection state
-	validateInitialConnection(t, headscale, expectedNodes)
+	validateInitialConnection(t, headscale, allClients, expectedNodes)
 
 	var listNodes []*clientv1.Node
 
@@ -458,7 +458,7 @@ func TestAuthWebFlowLogoutAndReloginNewUser(t *testing.T) {
 	requireNoErrLogout(t, err)
 
 	// Validate that all nodes are offline after logout
-	validateLogoutComplete(t, headscale, expectedNodes)
+	validateLogoutComplete(t, headscale, allClients, expectedNodes)
 
 	t.Logf("all clients logged out")
 
@@ -510,7 +510,7 @@ func TestAuthWebFlowLogoutAndReloginNewUser(t *testing.T) {
 	}
 
 	// Validate connection state after relogin as user1
-	validateReloginComplete(t, headscale, expectedUser1Nodes)
+	validateReloginComplete(t, headscale, allClients, expectedUser1Nodes)
 
 	// Validate that user2's old nodes still exist in database (but are expired/offline)
 	// When CLI registration creates new nodes for user1, user2's old nodes remain
@@ -529,9 +529,7 @@ func TestAuthWebFlowLogoutAndReloginNewUser(t *testing.T) {
 
 	for _, client := range allClients {
 		assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(ct, err, "Failed to get status for client %s", client.Hostname())
-			assert.Equal(ct, "user1@test.no", status.User[status.Self.UserID].LoginName, "Client %s should be logged in as user1 after web flow user switch, got %s", client.Hostname(), status.User[status.Self.UserID].LoginName)
+			assertClientLogin(ct, client, "user1@test.no")
 		}, integrationutil.StatusReadyTimeout, 2*time.Second, "validating %s is logged in as user1 after web flow user switch", client.Hostname())
 	}
 
