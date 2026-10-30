@@ -2706,10 +2706,7 @@ func (s *State) HandleNodeFromAuthPath(
 	all := s.Snapshot().GetNodesByMachineKeyAllUsers(machineKey)
 
 	// Named conditions - describe WHAT we found, not HOW we check it.
-	existingNodeSameUser, nodeExistsForSameUser := all[types.UserID(user.ID)]
-
-	taggedNode, hasTagged := all[0]
-	existingNodeIsTagged := hasTagged && taggedNode.IsTagged()
+	existingNode, nodeExists := loginNode(all, types.UserID(user.ID))
 
 	var existingNodeOtherUser types.NodeView
 
@@ -2720,14 +2717,6 @@ func (s *State) HandleNodeFromAuthPath(
 			existingNodeOtherUser = n
 			existingNodeOwnedByOtherUser = true
 		}
-	}
-
-	// A tagged node and a user-owned node cannot legitimately share a machine
-	// key (validateNodeOwnership enforces tags XOR user ownership). If both are
-	// present the machine key is in a corrupt/ambiguous state; reject rather
-	// than converting an arbitrary node and orphaning the other.
-	if existingNodeIsTagged && (nodeExistsForSameUser || existingNodeOwnedByOtherUser) {
-		return types.NodeView{}, ErrAmbiguousNodeOwnership
 	}
 
 	// Create logger with common fields for all auth operations
@@ -2750,15 +2739,15 @@ func (s *State) HandleNodeFromAuthPath(
 
 	var finalNode types.NodeView
 
-	if nodeExistsForSameUser {
-		updateParams.ExistingNode = existingNodeSameUser
+	if nodeExists && !existingNode.IsTagged() {
+		updateParams.ExistingNode = existingNode
 
 		finalNode, err = s.applyAuthNodeUpdate(updateParams)
 		if err != nil {
 			return types.NodeView{}, err
 		}
-	} else if existingNodeIsTagged {
-		updateParams.ExistingNode = taggedNode
+	} else if nodeExists {
+		updateParams.ExistingNode = existingNode
 		updateParams.IsConvertFromTag = true
 
 		finalNode, err = s.applyAuthNodeUpdate(updateParams)
@@ -2844,31 +2833,27 @@ func (s *State) createNewNodeFromAuth(
 
 // HandleNodeFromPreAuthKey handles node registration using a pre-authentication key.
 // findExistingNodeForPAK looks up an existing node by machine key,
-// matching the PAK's ownership. For user-owned keys it checks the
-// user's ID; for tagged keys it checks UserID(0) since tagged nodes
-// have no owning user.
+// matching the PAK's ownership. A key with a user finds that user's node,
+// else the machine's tagged node; a tags-only key checks UserID(0) since
+// tagged nodes have no owning user.
 func (s *State) findExistingNodeForPAK(
 	machineKey key.MachinePublic,
 	pak *types.PreAuthKey,
+	nodeKey key.NodePublic,
 ) (types.NodeView, bool, error) {
 	all := s.Snapshot().GetNodesByMachineKeyAllUsers(machineKey)
 
 	if pak.User != nil {
-		if node, ok := all[types.UserID(pak.User.ID)]; ok {
-			return node, true, nil
+		node, ok := all[types.UserID(pak.User.ID)]
+		if !ok {
+			// The machine's tagged node, when the key speaks for it. Any other
+			// key under its own node key is the device restarting (#3312);
+			// pakReregister lets that key only wake it.
+			node, ok = all[0]
+			ok = ok && node.IsTagged() && (pak.CanReauthenticate(node) || node.NodeKey() == nodeKey)
 		}
 
-		// The node may have been converted to a tagged node since it first
-		// registered (SetNodeTags clears UserID, re-indexing it under UserID(0)).
-		// It is still the same machine, proven by the machine key, so recognise
-		// it for re-registration instead of re-validating the spent key or
-		// creating a duplicate node. Re-registration preserves the node's tagged
-		// ownership. See https://github.com/juanfont/headscale/issues/3312.
-		if node, ok := all[0]; ok && node.IsTagged() {
-			return node, true, nil
-		}
-
-		return types.NodeView{}, false, nil
+		return node, ok, nil
 	}
 
 	// A tagged key re-registers the same machine regardless of how it is
@@ -2906,6 +2891,25 @@ func (s *State) findExistingNodeForPAK(
 	return types.NodeView{}, false, nil
 }
 
+// loginNode picks, from a machine's nodes, the one a login by userID
+// re-authenticates: the user's own node, else the machine's tagged node when
+// the user can claim it. A tagged node that joined by login records no former
+// owner, so any login re-authenticates it, as before; the tags the login asks
+// for decide whether it stays tagged. Otherwise another user's login on a
+// tagged machine adds a device for that user beside it, as on Tailscale SaaS.
+func loginNode(all map[types.UserID]types.NodeView, userID types.UserID) (types.NodeView, bool) {
+	if node, ok := all[userID]; ok {
+		return node, true
+	}
+
+	if node, ok := all[0]; ok && node.IsTagged() &&
+		(node.ClaimableBy(userID) || node.RegisterMethod() != util.RegisterMethodAuthKey) {
+		return node, true
+	}
+
+	return types.NodeView{}, false
+}
+
 // pakSkipsValidation reports whether re-registering n with pak may skip key
 // validation at now. The machine key proves identity and a pre-auth key only
 // authorises the initial join, so a plain restart (container "tailscale up
@@ -2916,15 +2920,27 @@ func (s *State) findExistingNodeForPAK(
 //   - a tagged key converting a user-owned node to tagged;
 //   - a different credential, which can change tags or ephemeral lifetime.
 //
+// A key that does not speak for a tagged node only wakes it and binds
+// nothing, so it is held only to the node key and expiry.
+//
 // It is a pure function of the node so the writer can decide again
 // on the node it actually replaces.
 func pakSkipsValidation(n types.NodeView, pak *types.PreAuthKey, nodeKey key.NodePublic, now time.Time) bool {
-	if !n.Valid() || !n.AuthKeyID().Valid() || n.AuthKeyID().Get() != pak.ID {
+	if !n.Valid() {
 		return false
 	}
 
 	isNodeKeyRotation := n.NodeKey() != nodeKey
 	isExpired := n.IsExpiredAt(now)
+
+	if !pak.CanReauthenticate(n) {
+		return n.IsTagged() && !isNodeKeyRotation && !isExpired
+	}
+
+	if !n.AuthKeyID().Valid() || n.AuthKeyID().Get() != pak.ID {
+		return false
+	}
+
 	isOwnershipConversion := pak.ConvertsNodeToTagged(n)
 	isRetag := pak.RetagsNode(n)
 	ownershipMatches := n.IsTagged() ||
@@ -2934,14 +2950,22 @@ func pakSkipsValidation(n types.NodeView, pak *types.PreAuthKey, nodeKey key.Nod
 		!isOwnershipConversion && !isRetag
 }
 
-// pakReregisterErr is the authorisation decision for re-registering n with
-// pak at now: nil when validation may be skipped, else the key's validity.
-func pakReregisterErr(n types.NodeView, pak *types.PreAuthKey, nodeKey key.NodePublic, now time.Time) error {
+// pakReregister is the authorisation decision for re-registering n with pak
+// at now: whether the key re-authenticates n, and nil when validation may be
+// skipped, else the key's validity. A key that does not speak for n only
+// wakes it under its own node key.
+func pakReregister(n types.NodeView, pak *types.PreAuthKey, nodeKey key.NodePublic, now time.Time) (bool, error) {
+	reauth := pak.CanReauthenticate(n)
 	if pakSkipsValidation(n, pak, nodeKey, now) {
-		return nil
+		return reauth, nil
 	}
 
-	return pak.ValidAt(now)
+	err := pak.ValidAt(now)
+	if err == nil && !reauth {
+		err = types.PAKError("authkey cannot re-authenticate this node")
+	}
+
+	return reauth, err
 }
 
 //nolint:gocyclo // sequential validation/update/create paths with security-sensitive ordering
@@ -2977,7 +3001,7 @@ func (s *State) HandleNodeFromPreAuthKey(
 		}
 	}
 
-	existingNodeSameUser, existsSameUser, err := s.findExistingNodeForPAK(machineKey, pak)
+	existingNodeSameUser, existsSameUser, err := s.findExistingNodeForPAK(machineKey, pak, regReq.NodeKey)
 	if err != nil {
 		return types.NodeView{}, err
 	}
@@ -3154,6 +3178,7 @@ func (s *State) reregisterNodeWithPAK(
 	var (
 		prior, candidate *types.Node
 		authErr          error
+		reauth           bool
 	)
 
 	// Held through publication so a concurrent persistNode cannot overwrite
@@ -3190,12 +3215,11 @@ func (s *State) reregisterNodeWithPAK(
 		// One clock read, so the whole mutation is decided at one instant.
 		now := time.Now()
 
-		authErr = pakReregisterErr(node.View(), pak, regReq.NodeKey, now)
+		reauth, authErr = pakReregister(node.View(), pak, regReq.NodeKey, now)
 		if authErr != nil {
 			return
 		}
 
-		node.NodeKey = regReq.NodeKey
 		node.Hostname = hostname
 
 		// TODO(kradalby): We should ensure we use the same hostinfo and node merge semantics
@@ -3204,6 +3228,18 @@ func (s *State) reregisterNodeWithPAK(
 		// Preserve NetInfo from existing node when re-registering
 		node.Hostinfo = validHostinfo
 		node.Hostinfo.NetInfo = preserveNetInfo(prior.View(), prior.ID, validHostinfo)
+
+		// Preserve online state during re-registration so a live node does
+		// not appear offline before the client restarts its map stream.
+		node.LastSeen = new(now)
+
+		if !reauth {
+			candidate = node
+
+			return
+		}
+
+		node.NodeKey = regReq.NodeKey
 
 		node.RegisterMethod = util.RegisterMethodAuthKey
 
@@ -3236,6 +3272,13 @@ func (s *State) reregisterNodeWithPAK(
 			if wasUserOwned || node.IsExpiredAt(now) {
 				node.Expiry = nil
 			}
+		} else if node.IsTagged() && !pak.IsTagged() && prior.NodeKey != regReq.NodeKey {
+			// A user key that speaks for a tagged node, with a new node key,
+			// takes it back as that user's device, as on Tailscale SaaS. A
+			// relogin under the same node key keeps it tagged.
+			node.Tags = nil
+			node.UserID = &pak.User.ID
+			node.User = pak.User
 		}
 
 		node.AuthKey = pak.AsCredential()
@@ -3246,9 +3289,6 @@ func (s *State) reregisterNodeWithPAK(
 		if !pak.Reusable && !pak.Used {
 			node.AuthKey.Used = true
 		}
-		// Preserve online state during re-registration so a live node does
-		// not appear offline before the client restarts its map stream.
-		node.LastSeen = new(now)
 
 		// Tagged nodes keep their existing expiry (disabled).
 		// User-owned nodes update expiry from the client request,
@@ -3299,7 +3339,11 @@ func (s *State) reregisterNodeWithPAK(
 		// re-registration presents a key just loaded from the database, so
 		// its ID must be persisted here — otherwise a restart reloads the old
 		// key and any key-scoped property (e.g. Ephemeral) silently reverts.
-		reregColumns := append(slices.Clone(nodeUpdateColumns), "AuthKeyID")
+		// A wake-up keeps the prior key, which may have been deleted (#2862).
+		reregColumns := nodeUpdateColumns
+		if reauth {
+			reregColumns = append(slices.Clone(nodeUpdateColumns), "AuthKeyID")
+		}
 
 		result := tx.Select(reregColumns).Updates(candidate)
 		if result.Error != nil {
@@ -3315,7 +3359,7 @@ func (s *State) reregisterNodeWithPAK(
 		// atomic compare-and-set in [hsdb.UsePreAuthKey] would otherwise
 		// reject it as "authkey already used", locking out containers
 		// that restart with the same one-shot key.
-		if !pak.Reusable && !pak.Used {
+		if reauth && !pak.Reusable && !pak.Used {
 			err := hsdb.UsePreAuthKey(tx, pak)
 			if err != nil {
 				return nil, fmt.Errorf("using pre auth key: %w", err)
