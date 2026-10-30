@@ -28,6 +28,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -230,6 +231,83 @@ func (w *recordingResponseWriter) statusCode() int {
 	defer w.mu.Unlock()
 
 	return w.status
+}
+
+func TestNonStreamMapRequestRejectsReauthenticatedKey(t *testing.T) {
+	app := createTestApp(t)
+	user := app.state.CreateUserForTest("map-reauth")
+	pak, err := app.state.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+	require.NoError(t, err)
+
+	machineKey := key.NewMachine().Public()
+	initial, err := app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+		Auth:    &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
+		NodeKey: key.NewNode().Public(), Hostinfo: &tailcfg.Hostinfo{Hostname: "before-reauth"},
+		Expiry: time.Now().Add(time.Hour),
+	}, machineKey)
+	require.NoError(t, err)
+
+	node := initial.AsStruct()
+	ns := noiseServer{headscale: app, machineKey: node.MachineKey}
+	req := tailcfg.MapRequest{
+		NodeKey: node.NodeKey, DiscoKey: key.NewDisco().Public(), OmitPeers: true,
+		Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:4242")},
+		Hostinfo: &tailcfg.Hostinfo{
+			Hostname: "stale", NetInfo: &tailcfg.NetInfo{PreferredDERP: 7},
+			RoutableIPs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")},
+		},
+	}
+
+	// Authenticate the request, then delay its mutation across real reauthentication.
+	authenticated, err := ns.getAndValidateNode(req)
+	require.NoError(t, err)
+
+	writer := httptest.NewRecorder()
+	session := app.newMapSession(t.Context(), req, writer, authenticated.AsStruct())
+	registered, err := app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+		Auth:    &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
+		NodeKey: key.NewNode().Public(), Hostinfo: &tailcfg.Hostinfo{Hostname: "reauthenticated"},
+		Expiry: time.Now().Add(time.Hour),
+	}, node.MachineKey)
+	require.NoError(t, err)
+	require.Equal(t, node.ID, registered.ID())
+
+	before := app.state.Snapshot()
+	durableBefore, err := app.state.DB().GetNodeByID(node.ID)
+	require.NoError(t, err)
+	session.serve()
+	assert.Equal(t, http.StatusNotFound, writer.Code)
+	assert.Equal(t, before.Rev(), app.state.Snapshot().Rev(), "rejected requests must not publish")
+	live, ok := app.state.GetNodeByID(node.ID)
+	require.True(t, ok)
+	assert.Equal(t, registered.AsStruct(), live.AsStruct())
+
+	durableAfter, err := app.state.DB().GetNodeByID(node.ID)
+	require.NoError(t, err)
+	assert.Equal(t, durableBefore, durableAfter, "rejected requests must not persist")
+
+	// The same payload remains a valid update when authenticated with the live key.
+	req.NodeKey = registered.NodeKey()
+	authenticated, err = ns.getAndValidateNode(req)
+	require.NoError(t, err)
+
+	writer = httptest.NewRecorder()
+	app.newMapSession(t.Context(), req, writer, authenticated.AsStruct()).serve()
+	require.Equal(t, http.StatusOK, writer.Code)
+
+	live, ok = app.state.GetNodeByID(node.ID)
+	require.True(t, ok)
+	assert.Equal(t, req.NodeKey, live.NodeKey())
+	assert.Equal(t, req.DiscoKey, live.DiscoKey())
+	assert.Equal(t, req.Hostinfo, live.Hostinfo().AsStruct())
+	assert.Equal(t, req.Endpoints, live.Endpoints().AsSlice())
+
+	durableAfter, err = app.state.DB().GetNodeByID(node.ID)
+	require.NoError(t, err)
+	assert.Equal(t, req.NodeKey, durableAfter.NodeKey)
+	assert.Equal(t, req.DiscoKey, durableAfter.DiscoKey)
+	assert.Equal(t, req.Hostinfo, durableAfter.Hostinfo)
+	assert.Equal(t, types.AddrPorts(req.Endpoints), durableAfter.Endpoints)
 }
 
 // TestServeLongPollWritesErrorWhenInitialMapFails proves that when the initial
@@ -516,6 +594,223 @@ func TestEphemeralGCSparesNodeMadePermanent(t *testing.T) {
 
 	// Nothing here cancels the timer, so unscheduled means it fired.
 	assert.False(t, app.ephemeralGC.IsScheduled(nodeView.ID()), "test sanity: the timer fired")
+}
+
+func TestEphemeralGCRechecksAfterRegistrationSQL(t *testing.T) {
+	for _, change := range []string{"make_permanent", "reconnect"} {
+		t.Run(change, func(t *testing.T) {
+			app := createTestApp(t)
+			app.StartEphemeralGCForTest(t)
+			user := app.state.CreateUserForTest("gc-reauth")
+			initial, err := app.state.CreatePreAuthKey(user.TypedID(), true, true, nil, nil)
+			require.NoError(t, err)
+
+			machine := key.NewMachine().Public()
+			req := tailcfg.RegisterRequest{
+				Auth: &tailcfg.RegisterResponseAuth{AuthKey: initial.Key}, NodeKey: key.NewNode().Public(),
+				Hostinfo: &tailcfg.Hostinfo{Hostname: "gc-reauth"},
+			}
+			node, err := app.state.HandleNodeFromPreAuthKey(req, machine)
+			require.NoError(t, err)
+
+			if change == "make_permanent" {
+				permanent, err := app.state.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+				require.NoError(t, err)
+
+				req.Auth = &tailcfg.RegisterResponseAuth{AuthKey: permanent.Key}
+			}
+
+			sqlEntered, sqlRelease := make(chan struct{}), make(chan struct{})
+			release := sync.OnceFunc(func() { close(sqlRelease) })
+			// A second nodes write in the window must fail the test with
+			// context, not "close of closed channel".
+			entered := sync.OnceFunc(func() { close(sqlEntered) })
+
+			require.NoError(t, app.state.DB().DB.Callback().Update().Before("gorm:update").Register("pause_gc_reauth", func(tx *gorm.DB) {
+				if tx.Statement.Table == "nodes" {
+					entered()
+					<-sqlRelease
+				}
+			}))
+			t.Cleanup(func() { _ = app.state.DB().DB.Callback().Update().Remove("pause_gc_reauth") })
+
+			done, finished := make(chan error, 1), make(chan struct{})
+			go func() {
+				defer close(finished)
+
+				_, err := app.state.HandleNodeFromPreAuthKey(req, machine)
+				done <- err
+			}()
+
+			defer func() { release(); <-finished }()
+
+			<-sqlEntered
+			app.ephemeralGC.Schedule(node.ID(), 0)
+			require.Eventually(t, ephemeralGCInFlight, 5*time.Second, time.Millisecond, "GC must wait behind registration SQL")
+
+			if change == "reconnect" {
+				epoch := make(chan uint64, 1)
+				go func() { epoch <- app.state.Connect(node.ID()) }()
+
+				select {
+				case connected := <-epoch:
+					require.NotZero(t, connected, "registration SQL must not block session admission")
+				case <-time.After(5 * time.Second):
+					t.Fatal("Connect blocked behind registration SQL")
+				}
+			}
+
+			release()
+			require.NoError(t, <-done)
+			require.Eventually(t, func() bool { return !ephemeralGCInFlight() }, 5*time.Second, time.Millisecond)
+
+			live, ok := app.state.GetNodeByID(node.ID())
+			require.True(t, ok, "GC must recheck the state published while it waited")
+
+			durable, err := app.state.DB().GetNodeByID(node.ID())
+			require.NoError(t, err)
+
+			if change == "make_permanent" {
+				assert.False(t, live.IsEphemeral())
+				assert.False(t, durable.IsEphemeral())
+			} else {
+				assert.Equal(t, 1, live.ActiveSessions())
+			}
+		})
+	}
+}
+
+func TestEphemeralGCExcludesConnectDuringDeletion(t *testing.T) {
+	app := createTestApp(t)
+	app.StartEphemeralGCForTest(t)
+	user := app.state.CreateUserForTest("gc-connect")
+	pak, err := app.state.CreatePreAuthKey(user.TypedID(), true, true, nil, nil)
+	require.NoError(t, err)
+	node, err := app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+		Auth: &tailcfg.RegisterResponseAuth{AuthKey: pak.Key}, NodeKey: key.NewNode().Public(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "gc-connect"},
+	}, key.NewMachine().Public())
+	require.NoError(t, err)
+
+	sqlEntered, sqlRelease := make(chan struct{}), make(chan struct{})
+
+	release := sync.OnceFunc(func() { close(sqlRelease) })
+	defer release()
+	// A second nodes write in the window must fail with context, not
+	// "close of closed channel".
+	entered := sync.OnceFunc(func() { close(sqlEntered) })
+
+	require.NoError(t, app.state.DB().DB.Callback().Delete().Before("gorm:delete").Register("pause_gc_delete", func(tx *gorm.DB) {
+		if tx.Statement.Table == "nodes" {
+			entered()
+			<-sqlRelease
+		}
+	}))
+	t.Cleanup(func() { _ = app.state.DB().DB.Callback().Delete().Remove("pause_gc_delete") })
+	app.ephemeralGC.Schedule(node.ID(), 0)
+	<-sqlEntered
+
+	connected := make(chan uint64, 1)
+	go func() { connected <- app.state.Connect(node.ID()) }()
+
+	var epoch uint64
+
+	returned := false
+
+	require.Eventually(t, func() bool {
+		select {
+		case epoch = <-connected:
+			returned = true
+			return true
+		default:
+			// A dump that fills the buffer is cut short and can miss the
+			// target goroutine, so it grows until the dump fits.
+			buf := make([]byte, 64<<10)
+
+			n := runtime.Stack(buf, true)
+			for n == len(buf) {
+				buf = make([]byte, 2*len(buf))
+				n = runtime.Stack(buf, true)
+			}
+
+			for g := range strings.SplitSeq(string(buf[:n]), "\n\n") {
+				if strings.Contains(g, "(*State).Connect(") && strings.Contains(g, "[sync.RWMutex.RLock") {
+					return true
+				}
+			}
+
+			return false
+		}
+	}, 5*time.Second, time.Millisecond)
+	release()
+
+	if !returned {
+		epoch = <-connected
+	}
+
+	assert.Zero(t, epoch, "Connect must not acquire a node being durably deleted")
+	require.Eventually(t, func() bool { return !ephemeralGCInFlight() }, 5*time.Second, time.Millisecond)
+
+	_, ok := app.state.GetNodeByID(node.ID())
+	assert.False(t, ok)
+}
+
+func TestEphemeralGCDeletionFailurePreservesNode(t *testing.T) {
+	app := createTestApp(t)
+	app.StartEphemeralGCForTest(t)
+	user := app.state.CreateUserForTest("gc-failure")
+	pak, err := app.state.CreatePreAuthKey(user.TypedID(), true, true, nil, nil)
+	require.NoError(t, err)
+	node, err := app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+		Auth: &tailcfg.RegisterResponseAuth{AuthKey: pak.Key}, NodeKey: key.NewNode().Public(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "gc-failure"},
+	}, key.NewMachine().Public())
+	require.NoError(t, err)
+
+	attempted := make(chan struct{})
+	attempt := sync.OnceFunc(func() { close(attempted) })
+
+	require.NoError(t, app.state.DB().DB.Callback().Delete().Before("gorm:delete").Register("fail_gc_delete", func(tx *gorm.DB) {
+		if tx.Statement.Table == "nodes" {
+			_ = tx.AddError(sql.ErrConnDone)
+
+			attempt()
+		}
+	}))
+	t.Cleanup(func() { _ = app.state.DB().DB.Callback().Delete().Remove("fail_gc_delete") })
+	app.ephemeralGC.Schedule(node.ID(), 0)
+	<-attempted
+	require.Eventually(t, func() bool { return !ephemeralGCInFlight() }, 5*time.Second, time.Millisecond)
+
+	live, ok := app.state.GetNodeByID(node.ID())
+	require.True(t, ok)
+	assert.Equal(t, node.AsStruct(), live.AsStruct())
+	durable, err := app.state.DB().GetNodeByID(node.ID())
+	require.NoError(t, err)
+	assert.Equal(t, node.NodeKey(), durable.NodeKey)
+	assert.True(t, durable.IsEphemeral())
+	require.NotZero(t, app.state.Connect(node.ID()), "failed deletion must release session admission")
+}
+
+// ephemeralGCInFlight synchronizes with the real callback, including its SQL wait.
+// The stack dump grows until it fits: a cut dump can miss the GC goroutine
+// and turn a timing observation into a false timeout.
+func ephemeralGCInFlight() bool {
+	buf := make([]byte, 64<<10)
+
+	n := runtime.Stack(buf, true)
+	for n == len(buf) {
+		buf = make([]byte, 2*len(buf))
+		n = runtime.Stack(buf, true)
+	}
+
+	for g := range strings.SplitSeq(string(buf[:n]), "\n\n") {
+		if strings.Contains(g, ".NewHeadscale.func") && strings.Contains(g, "(*State).Delete") {
+			return true
+		}
+	}
+
+	return false
 }
 
 // TestEphemeralGCDoesNotDeleteReconnectedNode replays, in order, the

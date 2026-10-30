@@ -39,8 +39,7 @@ type RegistrationData struct {
 	// DiscoKey is the disco public key for peer-to-peer connections.
 	DiscoKey key.DiscoPublic
 
-	// Hostname is the resolved hostname for the registering node.
-	// Already validated/normalised by EnsureHostname at producer time.
+	// Hostname is the raw hostname reported by the registering node.
 	Hostname string
 
 	// Hostinfo carries hostname and requested tags for auth, and OS for the

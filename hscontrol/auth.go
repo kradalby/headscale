@@ -2,11 +2,11 @@ package hscontrol
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 	"time"
 
@@ -17,6 +17,17 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
+
+// The auth cache's entry cap also needs a per-request bound on retained Hostinfo.
+const maxRegistrationHostinfoBytes = 16 << 10
+
+// byteCounter counts what an encoder writes, without retaining it.
+type byteCounter struct{ n int }
+
+func (c *byteCounter) Write(p []byte) (int, error) {
+	c.n += len(p)
+	return len(p), nil
+}
 
 type AuthProvider interface {
 	RegisterHandler(w http.ResponseWriter, r *http.Request)
@@ -145,7 +156,12 @@ func (h *Headscale) handleRegister(
 	// node has already started the registration process and we should wait for
 	// it to finish the original registration.
 	if req.Followup != "" {
-		return h.waitForFollowup(ctx, req.Followup, registrationDataFromRequest(req, machineKey))
+		regData, regErr := registrationDataFromRequest(req, machineKey)
+		if regErr != nil {
+			return nil, regErr
+		}
+
+		return h.waitForFollowup(ctx, req.Followup, regData)
 	}
 
 	// Pre authenticated keys are handled slightly different than interactive
@@ -199,7 +215,6 @@ func (h *Headscale) handleLogout(
 	if node.IsExpired() {
 		log.Trace().
 			EmbedObject(node).
-			Interface("reg.req", req).
 			Bool("unexpected", true).
 			Msg("Node key expired, forcing re-authentication")
 
@@ -221,54 +236,6 @@ func (h *Headscale) handleLogout(
 		return nil, NewHTTPError(http.StatusBadRequest, "extending key is not allowed", nil)
 	}
 
-	// If the request expiry is in the past, we consider it a logout.
-	// Zero expiry is handled in [Headscale.handleRegister] before calling this function.
-	if req.Expiry.Before(time.Now()) {
-		log.Debug().
-			EmbedObject(node).
-			Bool("is_ephemeral", node.IsEphemeral()).
-			Bool("has_authkey", node.AuthKey().Valid()).
-			Time("req.expiry", req.Expiry).
-			Msg("Processing logout request with past expiry")
-
-		if node.IsEphemeral() {
-			log.Info().
-				EmbedObject(node).
-				Msg("Deleting ephemeral node during logout")
-
-			err := h.state.DeleteNode(node)
-			if err != nil {
-				return nil, fmt.Errorf("deleting ephemeral node: %w", err)
-			}
-
-			return &tailcfg.RegisterResponse{
-				NodeKeyExpired:    true,
-				MachineAuthorized: false,
-			}, nil
-		}
-
-		log.Debug().
-			EmbedObject(node).
-			Msg("Node is not ephemeral, setting expiry instead of deleting")
-	}
-
-	// Tagged nodes have key expiry permanently disabled (they are owned by
-	// their tags, not a user, and never expire - KB 1068). Logging one out has
-	// no expiry semantics, so do not stamp an expiry on it: doing so leaves the
-	// node IsExpired() forever and it can never re-authenticate (#3371). The
-	// admin path `headscale nodes expire` remains free to set a deliberate
-	// expiry via SetNodeExpiry; only the logout path is guarded here.
-	if node.IsTagged() {
-		log.Debug().
-			EmbedObject(node).
-			Msg("Tagged node logout: not stamping expiry (tagged nodes never expire)")
-
-		return nodeToRegisterResponse(node), nil
-	}
-
-	// Update the internal state with the nodes new expiry, meaning it is
-	// logged out.
-	//
 	// Clamp the client-supplied value to now: Tailscale sends the
 	// sentinel time.Unix(123, 0) on logout (controlclient/direct.go),
 	// and storing it verbatim propagates a 1970 KeyExpiry to every
@@ -279,9 +246,17 @@ func (h *Headscale) handleLogout(
 		expiry = now
 	}
 
-	updatedNode, err := h.state.SetNodeExpiry(node.ID(), &expiry)
+	updatedNode, err := h.state.LogoutNode(node, &expiry)
 	if err != nil {
-		return nil, fmt.Errorf("setting node expiry: %w", err)
+		if errors.Is(err, state.ErrNodeKeyChanged) || errors.Is(err, state.ErrNodeNotInNodeStore) {
+			return nil, NewHTTPError(http.StatusUnauthorized, "node registration changed", err)
+		}
+
+		return nil, fmt.Errorf("logging out node: %w", err)
+	}
+
+	if !updatedNode.Valid() {
+		return &tailcfg.RegisterResponse{NodeKeyExpired: true, MachineAuthorized: false}, nil
 	}
 
 	return nodeToRegisterResponse(updatedNode), nil
@@ -418,32 +393,51 @@ func (h *Headscale) reqToNewRegisterResponse(
 	}, nil
 }
 
-// registrationDataFromRequest keeps only auth and confirmation metadata;
-// operational metadata arrives with the node's first MapRequest.
+// registrationDataFromRequest builds the [types.RegistrationData] payload stored
+// in the auth cache for a pending registration. The original [tailcfg.Hostinfo] is
+// retained so that consumers see the original fields, subject to a payload
+// limit in addition to the auth cache's entry count. Encoded size is not heap size.
 func registrationDataFromRequest(
 	req tailcfg.RegisterRequest,
 	machineKey key.MachinePublic,
-) *types.RegistrationData {
-	var (
-		hostname string
-		hostinfo *tailcfg.Hostinfo
-	)
+) (*types.RegistrationData, error) {
+	// Count the encoded hostinfo without handing json.Marshal its second
+	// copy: Marshal compacts what it encodes into a fresh payload-sized
+	// slice, and this route is unauthenticated up to the 1 MiB noise body —
+	// a rejected registration must not pay that. The encoder fills a pooled
+	// buffer that sync.Pool retains until a GC drops it (one per P); the
+	// counting writer itself retains nothing. The trailing newline the
+	// encoder appends is subtracted so the cap is exactly the JSON
+	// encoding's size, as documented.
+	encoded := &byteCounter{}
 
+	err := json.NewEncoder(encoded).Encode(req.Hostinfo)
+	if err != nil {
+		return nil, NewHTTPError(http.StatusBadRequest, "invalid registration hostinfo", err)
+	}
+
+	if encoded.n-1 > maxRegistrationHostinfoBytes {
+		// Unobservable rejections look like server bugs to operators; the
+		// size says whether a real client is hitting the cap.
+		log.Warn().
+			Int("hostinfo_bytes", encoded.n-1).
+			Int("hostinfo_limit", maxRegistrationHostinfoBytes).
+			Msg("registration hostinfo too large, rejecting")
+
+		return nil, NewHTTPError(http.StatusRequestEntityTooLarge, "registration hostinfo too large", nil)
+	}
+
+	var hostname string
 	if req.Hostinfo != nil {
 		hostname = req.Hostinfo.Hostname
-
-		hostinfo = &tailcfg.Hostinfo{
-			Hostname:    hostname,
-			OS:          req.Hostinfo.OS,
-			RequestTags: slices.Clone(req.Hostinfo.RequestTags),
-		}
 	}
 
 	regData := &types.RegistrationData{
 		MachineKey: machineKey,
 		NodeKey:    req.NodeKey,
 		Hostname:   hostname,
-		Hostinfo:   hostinfo,
+		// Duplicate JSON fields can leave oversized backing arrays after decoding.
+		Hostinfo: req.Hostinfo.Clone(),
 	}
 
 	if !req.Expiry.IsZero() {
@@ -451,7 +445,7 @@ func registrationDataFromRequest(
 		regData.Expiry = &expiry
 	}
 
-	return regData
+	return regData, nil
 }
 
 func (h *Headscale) handleRegisterWithAuthKey(
@@ -503,7 +497,6 @@ func (h *Headscale) handleRegisterWithAuthKey(
 	log.Trace().
 		Caller().
 		Interface("reg.resp", resp).
-		Interface("reg.req", req).
 		EmbedObject(node).
 		Msg("RegisterResponse")
 
@@ -531,9 +524,12 @@ func (h *Headscale) handleRegisterInteractive(
 			Msg("Received registration request with empty hostname, generated default")
 	}
 
-	authRegReq := types.NewRegisterAuthRequest(
-		registrationDataFromRequest(req, machineKey),
-	)
+	regData, err := registrationDataFromRequest(req, machineKey)
+	if err != nil {
+		return nil, err
+	}
+
+	authRegReq := types.NewRegisterAuthRequest(regData)
 
 	err = h.state.SetAuthCacheEntry(authID, authRegReq)
 	if err != nil {

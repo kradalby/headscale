@@ -207,7 +207,17 @@ func (m *mapSession) afterServeLongPoll() {
 func (m *mapSession) serve() {
 	err := m.h.state.UpdateNodeFromMapRequest(m.node.ID, m.req)
 	if err != nil {
+		// Tailscale maps a streaming 404 to re-registration; this lite
+		// endpoint only gets its status logged, and the client's next full
+		// request carries the new key anyway. The status is still kept
+		// truthful: a request authenticated with a replaced key, or one
+		// whose node was deleted, is a 404, not a 500.
+		if errors.Is(err, state.ErrNodeKeyChanged) || errors.Is(err, state.ErrNodeNotInNodeStore) {
+			err = NewHTTPError(http.StatusNotFound, "node not found", err)
+		}
+
 		httpError(m.w, err)
+
 		return
 	}
 
