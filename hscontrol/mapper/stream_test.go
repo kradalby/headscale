@@ -35,6 +35,12 @@ import (
 
 const capVer = tailcfg.CurrentCapabilityVersion
 
+// preNetmapRemovalsVer is one below the capability version of Tailscale v1.104,
+// the first release whose clients also derived removals from a full netmap
+// (tailscale/tailscale#15660): these clients still need explicit
+// PeersRemoved frames. The hub emits them for every capability version.
+const preNetmapRemovalsVer = capver.FullNetmapRemovalsCapVer - 1
+
 // streamTestState returns a State with users u1, u2 and nodes n1, n1b
 // (u1) and n2 (u2), under policy (allow-all when empty).
 func streamTestState(tb testing.TB, policy string, configure ...func(*types.Config)) (*types.Config, *state.State, [3]types.NodeID) {
@@ -3409,4 +3415,235 @@ func TestRouteCoalescedEndpointWritesStayScoped(t *testing.T) {
 	require.Contains(t, wake, ids[0])
 	require.Contains(t, wake, ids[1])
 	require.NotContains(t, wake, ids[2])
+}
+
+// TestOfflinePeerHistorySurvivesPartialReconnect keeps clients at different
+// generations of one peer class, then loses the removal frame on a reconnect:
+// the next reconnect replays the removal. Removals a client holds only from a
+// failed write are pinned by TestHubFoldsUnconfirmedViews and
+// TestStreamAnnouncesRemovalOfAPeerOnlyAFailedInitialCarried; policy-driven
+// removal of a still-live peer is pinned by the random-writes oracle test.
+func TestOfflinePeerHistorySurvivesPartialReconnect(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	hub := NewHub()
+	u1, err := s.GetUserByName("u1")
+	require.NoError(t, err)
+
+	clients := make(map[types.NodeID]*modelClient)
+
+	for i := range 12 {
+		n := s.CreateRegisteredNodeForTest(u1, fmt.Sprintf("offline-%d", i))
+		n.User = u1
+		s.PutNodeInStoreForTest(*n)
+		sess := hub.Join(n.ID, func() {})
+		st := NewStream(cfg, hub, n.ID, preNetmapRemovalsVer)
+		st.Attach(sess)
+		resps, err := st.Initial(s.Snapshot())
+		require.NoError(t, err)
+		require.Len(t, resps, 1)
+		clients[n.ID] = newModelClient(resps[0])
+
+		st.Delivered()
+		require.False(t, hub.Leave(sess))
+	}
+
+	// Every client pinned the generation it left: distinct revisions, one
+	// current class.
+	hub.mu.Lock()
+
+	generations := make([]uint64, 0, len(clients))
+	for id := range clients {
+		generations = append(generations, hub.sentPeers[id].rev)
+	}
+	hub.mu.Unlock()
+
+	distinct := make(map[uint64]bool, len(generations))
+	for _, rev := range generations {
+		distinct[rev] = true
+	}
+
+	require.Len(t, distinct, len(clients), "every client pinned its own generation")
+
+	require.Len(t, s.Snapshot().PeerViews(), 1, "one current class can leave many historical views")
+	require.NoError(t, s.DeleteNode(mustNode(t, s, ids[1])))
+
+	for id, client := range clients {
+		sess := hub.Join(id, func() {})
+		st := NewStream(cfg, hub, id, preNetmapRemovalsVer)
+		st.Attach(sess)
+		resps, err := st.Initial(s.Snapshot())
+		require.NoError(t, err)
+		require.Len(t, resps, 2)
+
+		// The full frame arrives without the removed peer, but the
+		// removal frame that would clear the delta consumer fails.
+		require.NotContains(t, peerSet(resps[0]), ids[1].NodeID())
+		client.apply(resps[0])
+		require.Contains(t, client.deltaPeers, ids[1].NodeID())
+		require.False(t, hub.Leave(sess))
+
+		sess = hub.Join(id, func() {})
+		st = NewStream(cfg, hub, id, preNetmapRemovalsVer)
+		st.Attach(sess)
+		resps, err = st.Initial(s.Snapshot())
+		require.NoError(t, err)
+		require.Len(t, resps, 2)
+		require.Equal(t, []tailcfg.NodeID{ids[1].NodeID()}, resps[1].PeersRemoved)
+
+		for _, resp := range resps {
+			client.apply(resp)
+		}
+
+		st.Delivered()
+		require.False(t, hub.Leave(sess))
+
+		resps, err = NewStream(cfg, hub, id, preNetmapRemovalsVer).Initial(s.Snapshot())
+		require.NoError(t, err)
+		require.Len(t, resps, 1, "a delivered removal needs no replay")
+
+		// The delta consumer now holds exactly a fresh map's peer set.
+		assert.Equal(t, peerSet(resps[0]), client.deltaPeers)
+		assert.NotContains(t, client.deltaPeers, ids[1].NodeID())
+	}
+}
+
+// BenchmarkOfflinePeerHistory measures retained peer-ID storage after all
+// sessions leave. Growing views differ by one join per disconnect; shared
+// views all come from one snapshot; growing-sparse keeps the growing counts
+// while spacing the IDs apart, a control for the ID-compressed designs the
+// docs weigh, where raw slices still retain by array, not by ID value. Every
+// simulated delivery succeeds, so the counts cover confirmed views: a write
+// that fails part way keeps the same arrays as unconfirmed attempts. Counts
+// deduplicate backing arrays but exclude maps, render caches and heap slack.
+func BenchmarkOfflinePeerHistory(b *testing.B) {
+	for _, n := range []int{64, 256, 1024} {
+		for _, shape := range []string{"shared", "growing", "growing-sparse"} {
+			for _, version := range []tailcfg.CapabilityVersion{preNetmapRemovalsVer, capver.FullNetmapRemovalsCapVer} {
+				b.Run(fmt.Sprintf("%s/cap=%d/offline=%d", shape, version, n), func(b *testing.B) {
+					initial := 3
+					if shape == "shared" {
+						initial += n
+					}
+
+					cfg, s := benchState(b, initial)
+					base := s.ListNodes()
+					nodes := make(types.Nodes, n)
+					ip4, ip6 := base.At(2).IPv4().Get().Next(), base.At(2).IPv6().Get().Next()
+
+					for i := range nodes {
+						if shape == "shared" {
+							nodes[i] = base.At(i + 3).AsStruct()
+
+							continue
+						}
+
+						node := base.At(0).AsStruct()
+
+						node.ID = types.NodeID(i + 4) //nolint:gosec // bounded benchmark size
+						if shape == "growing-sparse" {
+							node.ID <<= 20
+						}
+
+						node.Hostname = fmt.Sprintf("offline-%d", i)
+						node.GivenName = node.Hostname
+						node.NodeKey = key.NewNode().Public()
+						v4, v6 := ip4, ip6
+						node.IPv4, node.IPv6 = &v4, &v6
+						nodes[i] = node
+						ip4, ip6 = ip4.Next(), ip6.Next()
+					}
+
+					for b.Loop() {
+						hub := NewHub()
+
+						for _, node := range nodes {
+							if shape != "shared" {
+								// Membership writes are not what is
+								// measured; keep shapes comparable.
+								b.StopTimer()
+								s.PutNodeInStoreForTest(*node)
+								b.StartTimer()
+							}
+
+							sess := hub.Join(node.ID, func() {})
+							st := NewStream(cfg, hub, node.ID, version)
+							st.Attach(sess)
+
+							_, err := st.Initial(s.Snapshot())
+							if err != nil {
+								b.Fatal(err)
+							}
+
+							st.Delivered()
+
+							if hub.Leave(sess) {
+								b.Fatal("unexpected second session")
+							}
+						}
+
+						b.StopTimer()
+
+						// Hold the hub's lock while history is counted,
+						// like every other sentPeers reader does.
+						hub.mu.Lock()
+						histories := len(hub.sentPeers)
+						arrays := make(map[*types.NodeID][]types.NodeID, histories)
+
+						for _, history := range hub.sentPeers {
+							for _, view := range append([][]types.NodeID{history.ids}, history.attempts...) {
+								if len(view) > 0 {
+									arrays[&view[0]] = view
+								}
+							}
+						}
+
+						var retained, capacity int
+						for _, view := range arrays {
+							retained += len(view)
+							capacity += cap(view)
+						}
+						hub.mu.Unlock()
+
+						// The table in docs/ref/debug.md restates these counts;
+						// they are asserted whenever the benchmark runs, and no
+						// CI lane runs benchmarks. Only the counts are asserted:
+						// bytes report allocator-dependent capacity, which the
+						// doc anchors to its toolchain.
+						require.Equal(b, n, histories, "one history per offline node")
+
+						if shape == "shared" {
+							require.Len(b, arrays, 1, "one class pins one array")
+							require.Equal(b, n+3, retained)
+						} else {
+							require.Len(b, arrays, n, "one array per generation")
+							require.Equal(b, n*(n+7)/2, retained)
+						}
+
+						views := s.Snapshot().PeerViews()
+						b.ReportMetric(float64(len(views)), "current-classes")
+
+						// The published view count: the one class holds
+						// every offline node and itself.
+						require.Len(b, views, 1, "one current class")
+						require.Len(b, views[0], n+3)
+						b.ReportMetric(float64(len(views[0])), "view-IDs")
+
+						b.ReportMetric(float64(histories), "histories")
+						b.ReportMetric(float64(len(arrays)), "history-arrays")
+						b.ReportMetric(float64(retained), "retained-IDs")
+						b.ReportMetric(float64(capacity*8), "history-ID-bytes")
+						runtime.KeepAlive(hub)
+
+						if shape != "shared" {
+							for _, node := range nodes {
+								s.DeleteNodeFromStoreForTest(node.ID)
+							}
+						}
+
+						b.StartTimer()
+					}
+				})
+			}
+		}
+	}
 }
