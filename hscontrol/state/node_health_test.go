@@ -46,9 +46,7 @@ func TestGivenNameMapsToValidFQDNCheck(t *testing.T) {
 }
 
 func TestExpiryIsEncodableCheck(t *testing.T) {
-	cfg := &types.Config{}
-
-	_, _, ok := expiryIsEncodable.check((&types.Node{ID: 1}).View(), cfg)
+	_, _, ok := expiryIsEncodable.check((&types.Node{ID: 1}).View(), types.DNSView{})
 	require.True(t, ok, "a node without expiry must pass the check")
 
 	earliest := time.Date(0, time.January, 1, 0, 0, 0, 0, time.UTC)
@@ -64,7 +62,7 @@ func TestExpiryIsEncodableCheck(t *testing.T) {
 		{latest.Add(time.Second), false},
 	} {
 		node := &types.Node{ID: 7, Expiry: &tt.expiry}
-		problem, fixHint, ok := expiryIsEncodable.check(node.View(), cfg)
+		problem, fixHint, ok := expiryIsEncodable.check(node.View(), types.DNSView{})
 		require.Equal(t, tt.ok, ok, "expiry %s", tt.expiry)
 
 		if !ok {
