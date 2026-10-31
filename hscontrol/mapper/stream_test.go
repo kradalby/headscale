@@ -27,6 +27,7 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
 	"tailscale.com/util/zstdframe"
@@ -36,15 +37,15 @@ const capVer = tailcfg.CurrentCapabilityVersion
 
 // streamTestState returns a State with users u1, u2 and nodes n1, n1b
 // (u1) and n2 (u2), under policy (allow-all when empty).
-func streamTestState(t *testing.T, policy string) (*types.Config, *state.State, [3]types.NodeID) {
-	t.Helper()
+func streamTestState(tb testing.TB, policy string, configure ...func(*types.Config)) (*types.Config, *state.State, [3]types.NodeID) {
+	tb.Helper()
 
 	p4 := netip.MustParsePrefix("100.64.0.0/10")
 	p6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
 	cfg := &types.Config{
 		Database: types.DatabaseConfig{
 			Type:   types.DatabaseSqlite,
-			Sqlite: types.SqliteConfig{Path: t.TempDir() + "/h.db"},
+			Sqlite: types.SqliteConfig{Path: tb.TempDir() + "/h.db"},
 		},
 		PrefixV4:     &p4,
 		PrefixV6:     &p6,
@@ -54,19 +55,23 @@ func streamTestState(t *testing.T, policy string) (*types.Config, *state.State, 
 		Policy:       types.PolicyConfig{Mode: types.PolicyModeDB},
 	}
 
+	for _, f := range configure {
+		f(cfg)
+	}
+
 	database, err := db.NewHeadscaleDatabase(cfg)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
 	u1 := database.CreateUserForTest("u1")
 	u2 := database.CreateUserForTest("u2")
 	n1 := database.CreateRegisteredNodeForTest(u1, "n1")
 	n1b := database.CreateRegisteredNodeForTest(u1, "n1b")
 	n2 := database.CreateRegisteredNodeForTest(u2, "n2")
-	require.NoError(t, database.Close())
+	require.NoError(tb, database.Close())
 
 	s, err := state.NewState(cfg)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	require.NoError(tb, err)
+	tb.Cleanup(func() { _ = s.Close() })
 
 	s.SetDERPMap(&tailcfg.DERPMap{
 		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
@@ -74,7 +79,7 @@ func streamTestState(t *testing.T, policy string) (*types.Config, *state.State, 
 
 	if policy != "" {
 		_, err = s.SetPolicy([]byte(policy))
-		require.NoError(t, err)
+		require.NoError(tb, err)
 	}
 
 	return cfg, s, [3]types.NodeID{n1.ID, n1b.ID, n2.ID}
@@ -2195,34 +2200,386 @@ func TestRouteWakesViewersOfAnOfflineNodeThatExpires(t *testing.T) {
 // the name now belongs to a service, on the next update and not only on
 // its next own change.
 func TestStreamSelfDropsHTTPSWhenAnExtraRecordTakesItsName(t *testing.T) {
-	cfg, s, ids := streamTestState(t, `{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`)
-	cfg.DNSConfig.Certificates.Enabled = true
-	cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{}
+	cfg, s, ids := streamTestState(t, `{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`, func(cfg *types.Config) {
+		cfg.DNSConfig.Certificates.Enabled = true
+		cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{}
+	})
 
 	node := mustNode(t, s, ids[0])
-	domain, ok := node.CertDomain(cfg)
+	domain, ok := node.CertDomain(s.Snapshot().DNS())
 	require.True(t, ok, "test sanity: the node has a certificate name")
 
 	st := NewStream(cfg, NewHub(), ids[0], capVer)
 	first, err := st.Initial(s.Snapshot())
 	require.NoError(t, err)
 	require.Contains(t, first[0].Node.CapMap, nodecap.HTTPS)
+	client := newModelClient(first[0])
 
-	s.SetExtraRecords([]tailcfg.DNSRecord{{Name: domain, Value: "100.64.0.99"}})
+	st.Delivered()
 
-	resps, err := st.Update(s.Snapshot())
+	before := s.Snapshot()
+	for _, records := range [][]tailcfg.DNSRecord{
+		{{Name: domain, Value: "100.64.0.99"}},
+		nil,
+		{{Name: domain, Value: "100.64.0.98"}},
+		nil,
+	} {
+		s.SetExtraRecords(records)
+		after := s.Snapshot()
+		all, _ := Route(before, after, after.Since(before))
+		require.True(t, all, "DNS changes must wake the session")
+
+		resps, err := st.Update(after)
+		require.NoError(t, err)
+		require.NotEmpty(t, resps)
+
+		for _, r := range resps {
+			client.apply(r)
+		}
+
+		st.Delivered()
+		assert.Equal(t, records, client.dns.ExtraRecords)
+		_, https := client.self.CapMap[nodecap.HTTPS]
+		assert.Equal(t, len(records) == 0, https)
+
+		if len(records) == 0 {
+			assert.Equal(t, []string{domain}, client.dns.CertDomains)
+		} else {
+			assert.Empty(t, client.dns.CertDomains)
+		}
+
+		before = after
+	}
+}
+
+// A record taking a peer's name must not change that peer's rendered
+// entry: peer renders read a records-free view by construction, and
+// their CapMap comes from policy, not certificate eligibility.
+func TestStreamPeerRendersIgnoreExtraRecords(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "", func(cfg *types.Config) {
+		cfg.DNSConfig.Certificates.Enabled = true
+		cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{}
+	})
+
+	peerDomain, err := mustNode(t, s, ids[1]).GetFQDN(cfg.BaseDomain)
 	require.NoError(t, err)
 
-	var self *tailcfg.Node
+	peerDomain = strings.TrimSuffix(peerDomain, ".")
 
-	for _, r := range resps {
-		if r.Node != nil {
-			self = r.Node
-		}
+	renderPeers := func(snap *state.Snapshot) map[tailcfg.NodeID]*tailcfg.Node {
+		t.Helper()
+
+		r := newRenderer(cfg, NewHub(), ids[0], capVer)
+		nm, err := r.render(snap)
+		require.NoError(t, err)
+
+		out := maps.Collect(nm.allPeers())
+		require.NotEmpty(t, out, "test sanity: the node must see peers")
+
+		return out
 	}
 
-	require.NotNil(t, self, "the node's own entry must be resent")
-	assert.NotContains(t, self.CapMap, nodecap.HTTPS)
+	before := renderPeers(s.Snapshot())
+
+	s.SetExtraRecords([]tailcfg.DNSRecord{{Name: peerDomain, Type: "A", Value: "100.64.0.99"}})
+
+	after := renderPeers(s.Snapshot())
+
+	for id, p := range before {
+		assert.True(t, reflect.DeepEqual(p, after[id]), "peer %d must not depend on DNS records", id)
+
+		_, https := p.CapMap[nodecap.HTTPS]
+		assert.False(t, https, "peers never report certificate eligibility")
+	}
+}
+
+// A retained snapshot must keep its records and certificate eligibility even
+// when rendered for the first time after a reload, including a record removal.
+func TestStreamDNSUsesSnapshot(t *testing.T) {
+	initial := []tailcfg.DNSRecord{{Name: "service.headscale.test", Type: "A", Value: "100.64.0.99"}}
+	cfg, s, ids := streamTestState(t, "", func(cfg *types.Config) {
+		cfg.DNSConfig.Certificates.Enabled = true
+		cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{ExtraRecords: initial}
+	})
+	node := mustNode(t, s, ids[0])
+	domain, err := node.GetFQDN(cfg.BaseDomain)
+	require.NoError(t, err)
+
+	domain = strings.TrimSuffix(domain, ".")
+
+	before := s.Snapshot()
+	records := []tailcfg.DNSRecord{{Name: strings.ToUpper(domain), Type: "A", Value: "100.64.0.99"}}
+	s.SetExtraRecords(records)
+	during := s.Snapshot()
+	// The publisher retains ownership of its input, not of the stored records.
+	records[0].Name = "unrelated.headscale.test"
+
+	s.SetExtraRecords(nil)
+	after := s.Snapshot()
+
+	for _, tt := range []struct {
+		name    string
+		snap    *state.Snapshot
+		records []tailcfg.DNSRecord
+		cert    bool
+	}{
+		{"initial", before, initial, true},
+		{"collision", during, []tailcfg.DNSRecord{{Name: domain, Type: "A", Value: "100.64.0.99"}}, false},
+		{"removed", after, nil, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			st := NewStream(cfg, NewHub(), ids[0], capVer)
+			out, err := st.Initial(tt.snap)
+			require.NoError(t, err)
+			require.Len(t, out, 1)
+			require.NotNil(t, out[0].DNSConfig)
+			assert.Equal(t, tt.records, out[0].DNSConfig.ExtraRecords)
+			_, https := out[0].Node.CapMap[nodecap.HTTPS]
+			assert.Equal(t, tt.cert, https)
+
+			if tt.cert {
+				assert.Equal(t, []string{domain}, out[0].DNSConfig.CertDomains)
+			} else {
+				assert.Empty(t, out[0].DNSConfig.CertDomains)
+			}
+		})
+	}
+}
+
+// dnsBenchTailnet builds a tailnet of n nodes under one user with DNS
+// certificates enabled — the shape the DNS snapshot benchmark needs at
+// sizes streamTestState does not reach.
+func dnsBenchTailnet(tb testing.TB, n int, records []tailcfg.DNSRecord) (*types.Config, *state.State, types.NodeID) {
+	tb.Helper()
+
+	p4 := netip.MustParsePrefix("100.64.0.0/10")
+	p6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+	cfg := &types.Config{
+		Database: types.DatabaseConfig{
+			Type:   types.DatabaseSqlite,
+			Sqlite: types.SqliteConfig{Path: tb.TempDir() + "/h.db"},
+		},
+		PrefixV4:         &p4,
+		PrefixV6:         &p6,
+		BaseDomain:       "headscale.test",
+		ServerURL:        "https://headscale.test",
+		DNSConfig:        types.DNSConfig{Certificates: types.CertificatesConfig{Enabled: true}},
+		TailcfgDNSConfig: &tailcfg.DNSConfig{Proxied: true, ExtraRecords: records},
+		Policy:           types.PolicyConfig{Mode: types.PolicyModeDB},
+	}
+
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(tb, err)
+
+	u1 := database.CreateUserForTest("u1")
+
+	first := database.CreateRegisteredNodeForTest(u1, "n1").ID
+	for i := 1; i < n; i++ {
+		database.CreateRegisteredNodeForTest(u1, fmt.Sprintf("n%d", i+1))
+	}
+
+	require.NoError(tb, database.Close())
+
+	s, err := state.NewState(cfg)
+	require.NoError(tb, err)
+	tb.Cleanup(func() { _ = s.Close() })
+
+	s.SetDERPMap(&tailcfg.DERPMap{
+		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
+	})
+
+	// The benchmark is meaningless if policy wiring ever regressed to
+	// deny-by-default: the measured netmaps would be silently empty.
+	out, err := NewStream(cfg, NewHub(), first, capVer).Initial(s.Snapshot())
+	require.NoError(tb, err)
+	require.NotEmpty(tb, out[0].Peers)
+
+	return cfg, s, first
+}
+
+func BenchmarkDNSSnapshot(b *testing.B) {
+	for _, nodes := range []int{3, 1000} {
+		for _, records := range []int{1, 128} {
+			for _, reload := range []bool{false, true} {
+				b.Run(fmt.Sprintf("nodes=%d/records=%d/reload=%t", nodes, records, reload), func(b *testing.B) {
+					recs := make([]tailcfg.DNSRecord, records)
+					for i := range recs {
+						recs[i] = tailcfg.DNSRecord{Name: fmt.Sprintf("service%d.headscale.test", i), Type: "A", Value: "100.64.0.99"}
+					}
+
+					cfg, s, id := dnsBenchTailnet(b, nodes, recs)
+					snap := s.Snapshot()
+
+					b.ReportAllocs()
+
+					// shortcut: B/op detects record-copy regressions only; a
+					// records scan in a peer render allocates nothing, so it
+					// is invisible to both oracles —
+					// TestStreamPeerRendersIgnoreExtraRecords covers
+					// output-visible records dependencies only.
+					for b.Loop() {
+						if reload {
+							if recs[0].Value == "100.64.0.99" {
+								recs[0].Value = "100.64.0.98"
+							} else {
+								recs[0].Value = "100.64.0.99"
+							}
+
+							s.SetExtraRecords(recs)
+							snap = s.Snapshot()
+						}
+
+						// A fresh hub per iteration rebuilds the class maps,
+						// so every iteration pays the peer renders the
+						// snapshot must keep independent of the records.
+						st := NewStream(cfg, NewHub(), id, capVer)
+
+						_, err := st.Initial(snap)
+						if err != nil {
+							b.Fatal(err)
+						}
+
+						st.Delivered()
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestStreamDNSOwnsStartupSettings(t *testing.T) {
+	resolver := &dnstype.Resolver{Addr: "1.1.1.1", BootstrapResolution: []netip.Addr{netip.MustParseAddr("1.0.0.1")}}
+	cfg, s, ids := streamTestState(t, "", func(cfg *types.Config) {
+		cfg.DNSConfig.Certificates.Enabled = true
+		cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{
+			Proxied:           true,
+			Domains:           []string{"headscale.test"},
+			Resolvers:         []*dnstype.Resolver{resolver},
+			FallbackResolvers: []*dnstype.Resolver{resolver},
+			Routes:            map[string][]*dnstype.Resolver{"split.test": {resolver}},
+		}
+	})
+	before := s.Snapshot()
+	cfg.BaseDomain = "changed.test"
+	cfg.DNSConfig.Certificates.Enabled = false
+	cfg.TailcfgDNSConfig.Domains[0] = "changed.test"
+	resolver.Addr = "9.9.9.9"
+	resolver.BootstrapResolution[0] = netip.MustParseAddr("9.9.9.10")
+
+	s.SetExtraRecords([]tailcfg.DNSRecord{{Name: "service.headscale.test", Value: "100.64.0.99"}})
+
+	for _, snap := range []*state.Snapshot{before, s.Snapshot()} {
+		out, err := NewStream(cfg, NewHub(), ids[0], capVer).Initial(snap)
+		require.NoError(t, err)
+		require.Len(t, out, 1)
+		assert.Equal(t, "n1.headscale.test.", out[0].Node.Name)
+		assert.Contains(t, out[0].Node.CapMap, nodecap.HTTPS)
+		assert.Equal(t, []string{"n1.headscale.test"}, out[0].DNSConfig.CertDomains)
+		assert.Equal(t, []string{"headscale.test"}, out[0].DNSConfig.Domains)
+
+		for _, resolvers := range [][]*dnstype.Resolver{out[0].DNSConfig.Resolvers, out[0].DNSConfig.FallbackResolvers, out[0].DNSConfig.Routes["split.test"]} {
+			require.Len(t, resolvers, 1)
+			assert.Equal(t, "1.1.1.1", resolvers[0].Addr)
+			assert.Equal(t, []netip.Addr{netip.MustParseAddr("1.0.0.1")}, resolvers[0].BootstrapResolution)
+		}
+
+		for _, peer := range out[0].Peers {
+			assert.True(t, strings.HasSuffix(peer.Name, ".headscale.test."))
+		}
+	}
+}
+
+func TestStreamDNSInitialReverseRoutes(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "", func(cfg *types.Config) {
+		cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{
+			Proxied: true,
+			Routes: map[string][]*dnstype.Resolver{
+				"split.test":          {{Addr: "1.1.1.1"}},
+				"64.100.in-addr.arpa": {{Addr: "9.9.9.9"}},
+			},
+		}
+	})
+	out, err := NewStream(cfg, NewHub(), ids[0], capVer).Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	for _, zone := range []string{"64.100.in-addr.arpa", "127.100.in-addr.arpa", "0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa"} {
+		resolvers, ok := out[0].DNSConfig.Routes[zone]
+		assert.True(t, ok, zone)
+		assert.NotNil(t, resolvers, zone)
+		assert.Empty(t, resolvers, zone)
+	}
+
+	assert.Equal(t, []*dnstype.Resolver{{Addr: "1.1.1.1"}}, out[0].DNSConfig.Routes["split.test"])
+}
+
+func TestStreamDNSConcurrentSnapshots(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "", func(cfg *types.Config) {
+		cfg.DNSConfig.Certificates.Enabled = true
+		cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{}
+	})
+	domain, err := mustNode(t, s, ids[0]).GetFQDN(cfg.BaseDomain)
+	require.NoError(t, err)
+
+	domain = strings.TrimSuffix(domain, ".")
+	before := s.Snapshot()
+	records := []tailcfg.DNSRecord{{Name: domain, Type: "A", Value: "100.64.0.99"}}
+	pristine := slices.Clone(records)
+	s.SetExtraRecords(records)
+	during := s.Snapshot()
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for range 100 {
+			records[0].Name = domain
+
+			s.SetExtraRecords(nil)
+			s.SetExtraRecords(records)
+			// The publisher keeps ownership of its input: leave the slice
+			// mutated while readers render, so an aliased view would show
+			// (and -race would flag the shared write).
+			records[0].Name = "mutated." + domain
+		}
+	})
+
+	for range 4 {
+		wg.Go(func() {
+			r := newRenderer(cfg, NewHub(), ids[0], capVer)
+
+			for range 100 {
+				for _, snap := range []*state.Snapshot{before, during, s.Snapshot()} {
+					nm, err := r.render(snap)
+					if err != nil {
+						t.Errorf("rendering snapshot: %v", err)
+
+						return
+					}
+
+					_, https := nm.self.CapMap[nodecap.HTTPS]
+					if !assert.Equal(t, len(nm.dns.ExtraRecords) == 0, https) {
+						return
+					}
+
+					if https {
+						if !assert.Equal(t, []string{domain}, nm.dns.CertDomains) {
+							return
+						}
+					} else if !assert.Empty(t, nm.dns.CertDomains) {
+						return
+					}
+
+					if snap == before && !assert.Empty(t, nm.dns.ExtraRecords) {
+						return
+					}
+
+					if snap == during && !assert.Equal(t, pristine, nm.dns.ExtraRecords) {
+						return
+					}
+				}
+			}
+		})
+	}
+
+	wg.Wait()
 }
 
 // TestRouteWakesViewerGainingARouteByPolicy grants a viewer that already
@@ -2440,7 +2797,7 @@ func TestPeerRendersForgetDropsEveryCapVer(t *testing.T) {
 	var pr peerRenders
 
 	for _, cv := range []tailcfg.CapabilityVersion{capVer, capVer - 1} {
-		_, err := pr.render(cfg, cv, s.Snapshot().Rev(), 1, node, nil)
+		_, err := pr.render(cfg, s.Snapshot().DNS(), cv, s.Snapshot().Rev(), 1, node, nil)
 		require.NoError(t, err)
 	}
 

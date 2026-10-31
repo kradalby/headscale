@@ -867,7 +867,9 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	nv, ok := ns.headscale.state.GetNodeByNodeKey(setDNS.NodeKey)
+	snap := ns.headscale.state.Snapshot()
+
+	nv, ok := snap.GetNodeByNodeKey(setDNS.NodeKey)
 	if !ok {
 		httpError(writer, NewHTTPError(http.StatusNotFound, "node not found", errNodeNotInStore))
 
@@ -881,7 +883,7 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	name, err := validateSetDNS(setDNS, nv, ns.headscale.cfg)
+	name, err := validateSetDNS(setDNS, nv, snap.DNS())
 	if err != nil {
 		httpError(writer, err)
 
@@ -922,12 +924,12 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 // machine key and the client's LocalAPI forwards any name and value, so
 // this is what stops a node from writing arbitrary records into the
 // operator's zone.
-func validateSetDNS(req tailcfg.SetDNSRequest, nv types.NodeView, cfg *types.Config) (string, error) {
+func validateSetDNS(req tailcfg.SetDNSRequest, nv types.NodeView, dns types.DNSView) (string, error) {
 	if nv.IsExpired() {
 		return "", NewHTTPError(http.StatusForbidden, "node is expired", nil)
 	}
 
-	domain, ok := nv.CertDomain(cfg)
+	domain, ok := nv.CertDomain(dns)
 	if !ok {
 		return "", NewHTTPError(http.StatusForbidden, "node has no certificate name", nil)
 	}

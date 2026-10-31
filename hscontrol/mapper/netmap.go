@@ -221,6 +221,7 @@ type peerRender struct {
 // must not be modified; see [withRoutes].
 func (pr *peerRenders) render(
 	cfg *types.Config,
+	dns types.DNSView,
 	capVer tailcfg.CapabilityVersion,
 	rev, policy uint64,
 	peer types.NodeView,
@@ -250,7 +251,11 @@ func (pr *peerRenders) render(
 		}
 	}
 
-	tn, err := peer.TailNode(capVer, func(types.NodeID) []netip.Prefix { return nil }, cfg, caps)
+	// Peers must not read DNS records: the class cache reuses peer renders
+	// across DNS revisions, and the peer CapMap is replaced below. Names come
+	// from the frozen base domain, so a records-free view keeps peer renders
+	// independent of record changes by construction.
+	tn, err := peer.TailNode(capVer, func(types.NodeID) []netip.Prefix { return nil }, cfg, dns.WithExtraRecords(nil), caps)
 	if err != nil {
 		return nil, err
 	}
@@ -314,10 +319,12 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 	pm := snap.Policy()
 	capMaps := pm.NodeCapMaps()
 
+	dns := snap.DNS()
+
 	if k := (selfKey{self: self, policy: snap.PolicyRev(), primaries: snap.PrimariesRev(), dns: snap.DNSRev()}); r.self == nil || k != r.selfKey {
 		tn, err := self.TailNode(r.capVer, func(types.NodeID) []netip.Prefix {
 			return snap.SelfRoutes(self)
-		}, r.cfg, capMaps[self.ID()])
+		}, r.cfg, dns, capMaps[self.ID()])
 		if err != nil {
 			return nil, err
 		}
@@ -343,7 +350,7 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 	}
 
 	if k := (dnsKey{self: self, policy: snap.PolicyRev(), dns: snap.DNSRev()}); r.dns == nil || k != r.dnsKey {
-		r.dns, r.dnsKey = generateDNSConfig(r.cfg, self, capMaps[self.ID()]), k
+		r.dns, r.dnsKey = generateDNSConfig(dns, self, capMaps[self.ID()]), k
 	}
 
 	nm := &netMap{
@@ -608,6 +615,8 @@ func (cm *classMaps) get(
 
 	e, changed := newPeerMap().Edit(), view
 
+	dns := snap.DNS()
+
 	if cur != nil {
 		if touched, ok := snap.NodesTouchedSince(cur.nodes); ok {
 			e, changed = cur.peers.Edit(), slices.Concat(touched, snap.CapsChangedSince(cur.caps))
@@ -622,7 +631,7 @@ func (cm *classMaps) get(
 			continue
 		}
 
-		tn, err := renders.render(cfg, capVer, snap.Rev(), policy, peer, capMaps)
+		tn, err := renders.render(cfg, dns, capVer, snap.Rev(), policy, peer, capMaps)
 		if err != nil {
 			// One peer with invalid data must not blank out the map for
 			// every node that can see it.

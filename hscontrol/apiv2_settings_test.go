@@ -14,14 +14,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// settingsAPIWithConfig registers the v2 API over a Backend carrying cfg and a
-// zero State — the settings GET reads only b.Cfg, so the other handlers (which
-// would need State) are simply never hit.
+// settingsAPIWithConfig freezes DNS through normal startup while keeping the
+// unrelated settings table independent of database and policy setup.
 func settingsAPIWithConfig(t *testing.T, cfg *types.Config) humatest.TestAPI {
 	t.Helper()
 
+	app := createTestApp(t, func(startup *types.Config) {
+		startup.BaseDomain = cfg.BaseDomain
+		startup.DNSConfig = cfg.DNSConfig
+		startup.TailcfgDNSConfig = cfg.TailcfgDNSConfig
+	})
 	_, api := humatest.New(t, apiv2.Config())
-	apiv2.Register(api, apiv2.Backend{Cfg: cfg})
+	apiv2.Register(api, apiv2.Backend{Cfg: cfg, State: app.state})
 
 	return api
 }
@@ -36,6 +40,24 @@ func getSettings(t *testing.T, api humatest.TestAPI) apiv2.TailnetSettings {
 	require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &s))
 
 	return s
+}
+
+func TestAPIv2SettingsUsesFrozenDNS(t *testing.T) {
+	cfg := &types.Config{DNSConfig: types.DNSConfig{Certificates: types.CertificatesConfig{Enabled: true}}}
+	api := settingsAPIWithConfig(t, cfg)
+	cfg.DNSConfig.Certificates.Enabled = false
+
+	assert.True(t, getSettings(t, api).HTTPSEnabled)
+}
+
+// A Backend without a State (the ACL test wiring) must keep the settings GET
+// serving from the startup config instead of panicking.
+func TestAPIv2SettingsWithoutState(t *testing.T) {
+	cfg := &types.Config{DNSConfig: types.DNSConfig{Certificates: types.CertificatesConfig{Enabled: true}}}
+	_, api := humatest.New(t, apiv2.Config())
+	apiv2.Register(api, apiv2.Backend{Cfg: cfg})
+
+	assert.True(t, getSettings(t, api).HTTPSEnabled)
 }
 
 // TestAPIv2SettingsComputedFields validates the GET mapping for each field that

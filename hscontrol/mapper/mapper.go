@@ -86,11 +86,11 @@ const (
 var nextDNSProfileRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
 func generateDNSConfig(
-	cfg *types.Config,
+	dns types.DNSView,
 	node types.NodeView,
 	capMap tailcfg.NodeCapMap,
 ) *tailcfg.DNSConfig {
-	dnsConfig := cfg.CloneTailcfgDNSConfig()
+	dnsConfig := dns.AsStruct()
 	if dnsConfig == nil {
 		return nil
 	}
@@ -116,7 +116,7 @@ func generateDNSConfig(
 		}
 	}
 
-	if domain, ok := node.CertDomain(cfg); ok {
+	if domain, ok := node.CertDomain(dns); ok {
 		dnsConfig.CertDomains = []string{domain}
 	}
 

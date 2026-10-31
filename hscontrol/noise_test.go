@@ -25,7 +25,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/juanfont/headscale/hscontrol/capver"
-	"github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/dns/dnstest"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
@@ -1550,12 +1549,13 @@ func challengeValue(seed string) string {
 func setDNSTestApp(t *testing.T) (*Headscale, *dnstest.Provider) {
 	t.Helper()
 
-	app := createTestApp(t)
-	app.cfg.BaseDomain = setDNSZone
-	app.cfg.DNSConfig.Certificates = types.CertificatesConfig{Enabled: true, Zone: setDNSZone}
-
 	provider := &dnstest.Provider{}
-	app.challenges = dns.NewChallenges(provider, setDNSZone, nil, 0)
+	app := createTestApp(t, func(cfg *types.Config) {
+		cfg.BaseDomain = setDNSZone
+		cfg.DNSConfig.Certificates = types.CertificatesConfig{Enabled: true, Zone: setDNSZone}
+		cfg.DNSChallenge.Provider = provider
+		cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{}
+	})
 	t.Cleanup(app.challenges.Close)
 
 	return app, provider
@@ -1774,6 +1774,34 @@ func TestSetDNSHandler(t *testing.T) {
 			assert.Equal(t, []string{value}, provider.Values("_acme-challenge.laptop."+setDNSZone+"."))
 		})
 	}
+}
+
+func TestSetDNSHandlerExtraRecordsReload(t *testing.T) {
+	app, provider := setDNSTestApp(t)
+	app.cfg.BaseDomain = "changed.example.com"
+	app.cfg.DNSConfig.Certificates.Enabled = false
+	user := app.state.CreateUserForTest("set-dns-reload")
+	laptop := putCertNode(t, app, user, "laptop")
+	ns := &noiseServer{headscale: app, machineKey: laptop.MachineKey}
+	req := tailcfg.SetDNSRequest{
+		Version: tailcfg.CurrentCapabilityVersion,
+		NodeKey: laptop.NodeKey,
+		Name:    "_acme-challenge.laptop." + setDNSZone,
+		Type:    "TXT",
+		Value:   challengeValue("reload"),
+	}
+
+	app.state.SetExtraRecords([]tailcfg.DNSRecord{{Name: "www.LAPTOP." + setDNSZone + ".", Type: "A", Value: "100.64.0.99"}})
+
+	denied := setDNS(t, ns, req)
+	require.Equal(t, http.StatusForbidden, denied.Code, denied.Body.String())
+	assert.Empty(t, provider.Calls())
+
+	app.state.SetExtraRecords(nil)
+
+	allowed := setDNS(t, ns, req)
+	require.Equal(t, http.StatusOK, allowed.Code, allowed.Body.String())
+	assert.Equal(t, []string{req.Value}, provider.Values(req.Name+"."))
 }
 
 // TestSetDNSHandlerProviderErrors pins the status codes the client shows

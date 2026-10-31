@@ -180,12 +180,19 @@ headscale/
   operations (node updates, policy evaluation, IP allocation) go through
   the `State` type, not directly to the database.
 - **The world** (`hscontrol/state/world.go`) holds nodes, users, the
-  policy source, the DERP map and extra DNS records as graph inputs, and
+  policy source, the DERP map and an immutable DNS view (`types.DNSView`,
+  frozen settings plus the extra records) as graph inputs, and
   derives the node index, the compiled policy, peer classes and primary
   routes from them. A derived cell recomputes only when a cell it read
   changed. Every read takes one immutable `Snapshot`; node writes go
   through `world.update`, which commits writes arriving together in one
   transaction.
+- **DNS ownership**: `Config.DNSView` freezes startup DNS settings, including
+  MagicDNS reverse routes. Runtime readers of the client-facing DNS config use
+  `Snapshot.DNS`; only extra records change after construction. Wire and debug
+  serializers get owned copies. The DNS-01 challenge config (`DNSChallenge`)
+  stays on `Config`, except the provider's `Isolates` predicate, which the view
+  captures at construction.
 - **The map-request sync point** is
   `State.UpdateNodeFromMapRequest()` in `hscontrol/state/state.go`. This
   is where Hostinfo changes, endpoint updates, and route advertisements
