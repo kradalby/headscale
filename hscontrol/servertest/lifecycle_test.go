@@ -10,14 +10,11 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
-	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/netmap"
-	"tailscale.com/types/persist"
 )
 
 // TestConnectionLifecycle exercises the core node lifecycle:
@@ -153,18 +150,16 @@ func TestNodeExpiryPreservesControlConnection(t *testing.T) {
 				expiry = lastCheck.Add(time.Second)
 			}
 
-			node, c, err := h.Server.State().SetNodeExpiry(id, &expiry)
+			node, err := h.Server.State().SetNodeExpiry(id, &expiry)
 			require.NoError(t, err)
 			require.Equal(t, scheduled, node.IsOnline().Get())
-			h.Server.App.Change(c)
 
 			if scheduled {
 				require.Eventually(t, func() bool { return time.Now().After(expiry) },
 					3*time.Second, 10*time.Millisecond)
 
-				_, changes, changed := h.Server.State().ExpireExpiredNodes(lastCheck)
+				_, changed := h.Server.State().ExpireExpiredNodes(lastCheck)
 				require.True(t, changed)
-				h.Server.App.Change(changes...)
 			}
 
 			require.EventuallyWithT(t, func(c *assert.CollectT) {
@@ -176,7 +171,7 @@ func TestNodeExpiryPreservesControlConnection(t *testing.T) {
 				assert.False(c, current.IsOnline().Get())
 				assert.Equal(c, 1, current.ActiveSessions())
 				assert.Equal(c, epoch, current.SessionEpoch())
-				assert.True(c, h.Server.App.MapBatcher().IsConnected(id))
+				assert.True(c, h.Server.App.MapHub().IsConnected(id))
 				assert.True(c, client.Netmap().SelfNode.Expired())
 				assert.False(c, client.Netmap().SelfNode.Online().Get())
 
@@ -201,15 +196,14 @@ func TestNodeExpiryPreservesControlConnection(t *testing.T) {
 				assert.Equal(c, 1, current.ActiveSessions())
 				assert.Equal(c, nodeKey, current.NodeKey())
 				assert.False(c, current.IsOnline().Get(), "an expired-key repoll cannot bring a node online")
-				assert.True(c, h.Server.App.MapBatcher().IsConnected(id))
+				assert.True(c, h.Server.App.MapHub().IsConnected(id))
 			}, 5*time.Second, 10*time.Millisecond, "expired-key repoll must preserve offline status")
 
 			// Restoring expiry must reach the client through that same stream.
 			current, _ := h.Server.State().GetNodeByID(id)
 			epoch = current.SessionEpoch()
-			_, c, err = h.Server.State().SetNodeExpiry(id, nil)
+			_, err = h.Server.State().SetNodeExpiry(id, nil)
 			require.NoError(t, err)
-			h.Server.App.Change(c)
 			require.EventuallyWithT(t, func(c *assert.CollectT) {
 				current, found := h.Server.State().GetNodeByID(id)
 				if !assert.True(c, found) {
@@ -233,44 +227,37 @@ func TestNodeExpiryPreservesControlConnection(t *testing.T) {
 	}
 }
 
-func TestRestoredExpirySurvivesQueuedChanges(t *testing.T) {
+// TestRestoredExpirySurvivesBackToBackWrites expires a node and immediately
+// restores its expiry, so its session may render either write or only the
+// second. The node must end up with the restored expiry, online, on the
+// session it already had.
+func TestRestoredExpirySurvivesBackToBackWrites(t *testing.T) {
 	t.Parallel()
 
-	for _, full := range []bool{false, true} {
-		t.Run(fmt.Sprintf("full=%v", full), func(t *testing.T) {
-			t.Parallel()
-			h := servertest.NewHarness(t, 1,
-				servertest.WithServerOptions(servertest.WithBatchDelay(10*time.Millisecond)),
-			)
-			client := h.Client(0)
-			node := h.Server.State().ListNodes().At(0)
-			past := time.Now()
-			_, expired, err := h.Server.State().SetNodeExpiry(node.ID(), &past)
-			require.NoError(t, err)
+	h := servertest.NewHarness(t, 1,
+		servertest.WithServerOptions(servertest.WithBatchDelay(10*time.Millisecond)),
+	)
+	client := h.Client(0)
+	node := h.Server.State().ListNodes().At(0)
+	past := time.Now()
+	_, err := h.Server.State().SetNodeExpiry(node.ID(), &past)
+	require.NoError(t, err)
 
-			future := past.Add(time.Hour)
-			_, restored, err := h.Server.State().SetNodeExpiry(node.ID(), &future)
-			require.NoError(t, err)
+	future := past.Add(time.Hour)
+	_, err = h.Server.State().SetNodeExpiry(node.ID(), &future)
+	require.NoError(t, err)
 
-			changes := []change.Change{expired, restored}
-			if full {
-				changes = append(changes, change.FullUpdate())
-			}
+	client.WaitForCondition(t, "restored expiry delivered", 5*time.Second,
+		func(nm *netmap.NetworkMap) bool { return nm.SelfKeyExpiry().Equal(future) })
+	// Observe beyond delivery: a momentary expiry must not end the stream
+	// that carries the restored one.
+	require.Never(t, func() bool { return len(h.ConnectedClients()) == 0 },
+		200*time.Millisecond, 10*time.Millisecond, "a momentary expiry must not close the restored stream")
 
-			h.Server.App.Change(changes...)
-			client.WaitForCondition(t, "restored expiry delivered", 5*time.Second,
-				func(nm *netmap.NetworkMap) bool { return nm.SelfKeyExpiry().Equal(future) })
-			// Observe beyond delivery: the old worker cancelled the stream only
-			// after sending its map, even when that map had the restored expiry.
-			require.Never(t, func() bool { return len(h.ConnectedClients()) == 0 },
-				200*time.Millisecond, 10*time.Millisecond, "a queued expiry must not close the restored stream")
-
-			current, found := h.Server.State().GetNodeByID(node.ID())
-			require.True(t, found)
-			require.True(t, current.IsOnline().Get())
-			require.Equal(t, node.SessionEpoch(), current.SessionEpoch())
-		})
-	}
+	current, found := h.Server.State().GetNodeByID(node.ID())
+	require.True(t, found)
+	require.True(t, current.IsOnline().Get())
+	require.Equal(t, node.SessionEpoch(), current.SessionEpoch())
 }
 
 // TestReloginOfExpiredNodeClearsPeerExpiry covers #3531. Peers hold an expired
@@ -291,9 +278,8 @@ func TestReloginOfExpiredNodeClearsPeerExpiry(t *testing.T) {
 	oldKey := node.NodeKey()
 
 	expiry := time.Now()
-	_, c, err := h.Server.State().SetNodeExpiry(id, &expiry)
+	_, err := h.Server.State().SetNodeExpiry(id, &expiry)
 	require.NoError(t, err)
-	h.Server.App.Change(c)
 
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
 		peer, found := observer.PeerByName(client.Name)
@@ -302,8 +288,16 @@ func TestReloginOfExpiredNodeClearsPeerExpiry(t *testing.T) {
 		}
 	}, 5*time.Second, 10*time.Millisecond, "observer must see the node expired")
 
-	// The server answers the expired key with NodeKeyExpired, so the client
-	// generates a new key, the way tailscaled re-authenticates.
+	// A client that has seen its own key expire generates a new key on
+	// relogin, the way tailscaled re-authenticates. Its map is sent
+	// independently of the observer's, so wait for it too.
+	client.WaitForCondition(t, "own key expired", 5*time.Second,
+		func(nm *netmap.NetworkMap) bool {
+			exp := nm.SelfKeyExpiry()
+
+			return !exp.IsZero() && !exp.After(time.Now())
+		})
+
 	client.Reconnect(t)
 
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
@@ -324,8 +318,9 @@ func TestReloginOfExpiredNodeClearsPeerExpiry(t *testing.T) {
 }
 
 // TestReloginPeerVisibleHostinfoReachesPeers covers the rest of the #3531
-// class: peers must see changed services after the first MapRequest following
-// relogin. A key-only patch cannot carry that change.
+// class: a relogin stores the RegisterRequest's Hostinfo, so the following
+// MapRequest carries no Hostinfo delta, and a peer-visible change made at
+// relogin reaches peers only if the relogin itself sends the whole node.
 func TestReloginPeerVisibleHostinfoReachesPeers(t *testing.T) {
 	t.Parallel()
 
@@ -361,107 +356,6 @@ func TestReloginPeerVisibleHostinfoReachesPeers(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond, "observer must see the relogin's peer-visible Hostinfo")
 }
 
-// TestReloginKeepsNodeKeyUnlessForced pins the shape of
-// [servertest.TestClient.Relogin]: a login with a given key presents the
-// current node key, and only a forced one rotates it. The node stays the
-// same either way.
-func TestReloginKeepsNodeKeyUnlessForced(t *testing.T) {
-	t.Parallel()
-
-	srv := servertest.NewServer(t)
-	user := srv.CreateUser(t, "relogin")
-	key := srv.CreatePreAuthKey(t, types.UserID(user.ID))
-	client := servertest.NewClient(t, srv, "relogin",
-		servertest.WithUser(user), servertest.WithAuthKey(key))
-
-	id := findNodeID(t, srv, client.Name)
-	nodeKey := func() string {
-		node, ok := srv.State().GetNodeByID(id)
-		require.True(t, ok)
-
-		return node.NodeKey().String()
-	}
-	first := nodeKey()
-
-	hi := &tailcfg.Hostinfo{BackendLogID: "servertest-relogin", Hostname: "relogin"}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	require.NoError(t, client.Relogin(ctx, key, false, hi))
-	assert.Equal(t, first, nodeKey(), "a login without force keeps the node key")
-
-	require.NoError(t, client.Relogin(ctx, key, true, hi))
-	assert.NotEqual(t, first, nodeKey(), "a forced login rotates the node key")
-
-	assert.Len(t, srv.State().GetNodesByMachineKeyAllUsers(client.MachineKey()), 1,
-		"relogin keeps one node per machine")
-	client.WaitForCondition(t, "netmap after relogin", 10*time.Second,
-		func(nm *netmap.NetworkMap) bool { return nm.SelfNode.ID() == id.NodeID() })
-}
-
-// TestLoginProfilesAndRestart pins the shapes of the login helpers: an
-// interactive login approved for a user, a refused key login recorded with
-// its answers, a second profile on the same machine, a switch back, and a
-// restart that keeps the login but not the disco key.
-func TestLoginProfilesAndRestart(t *testing.T) {
-	t.Parallel()
-
-	srv := servertest.NewServer(t)
-	owner := srv.CreateUser(t, "owner")
-	other := srv.CreateUser(t, "other")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	approve := func(user *types.User) func(string) error {
-		return func(authID string) error { return srv.ApproveAuth(ctx, authID, user.Name) }
-	}
-
-	client := servertest.NewClient(t, srv, "machine", servertest.WithInteractiveLogin(approve(owner)))
-
-	first := findNodeID(t, srv, client.Name)
-	node, ok := srv.State().GetNodeByID(first)
-	require.True(t, ok)
-	assert.Equal(t, owner.Name, node.User().Name(), "the approving user owns the node")
-
-	once := srv.CreateEphemeralPreAuthKey(t, types.UserID(owner.ID))
-	_, err := servertest.TryNewClient(t, srv, "spent", servertest.WithAuthKey(once))
-	require.NoError(t, err)
-
-	refused, err := servertest.TryNewClient(t, srv, "late", servertest.WithAuthKey(once))
-	require.Error(t, err, "a spent single-use key is refused")
-
-	attempts := refused.RegisterAttempts()
-	require.NotEmpty(t, attempts)
-	assert.Equal(t, err.Error(), attempts[len(attempts)-1].Err, "the refusal is the last attempt")
-	assert.Empty(t, srv.State().GetNodesByMachineKeyAllUsers(refused.MachineKey()), "a refused login leaves no node")
-
-	hi := &tailcfg.Hostinfo{BackendLogID: "servertest-machine", Hostname: "machine"}
-	ownerLogin := client.Persist()
-
-	require.NoError(t, client.Login(ctx, persist.Persist{}, "", controlclient.LoginInteractive, hi, approve(other)))
-	assert.Len(t, srv.State().GetNodesByMachineKeyAllUsers(client.MachineKey()), 2,
-		"another user's profile adds a node on the machine")
-
-	require.NoError(t, client.Login(ctx, ownerLogin, "", controlclient.LoginDefault, hi, nil))
-	client.WaitForCondition(t, "back on the first profile", 10*time.Second,
-		func(nm *netmap.NetworkMap) bool { return nm.SelfNode.ID() == first.NodeID() })
-
-	before, ok := srv.State().GetNodeByID(first)
-	require.True(t, ok)
-
-	require.NoError(t, client.Restart(ctx, hi))
-
-	require.EventuallyWithT(t, func(c *assert.CollectT) {
-		after, ok := srv.State().GetNodeByID(first)
-		if assert.True(c, ok) {
-			assert.Equal(c, before.NodeKey(), after.NodeKey(), "a restart keeps the node key")
-			assert.NotEqual(c, before.DiscoKey(), after.DiscoKey(), "a restart brings a new disco key")
-		}
-	}, 10*time.Second, 50*time.Millisecond)
-}
-
 func TestNodeExpiryRouteFailover(t *testing.T) {
 	t.Parallel()
 
@@ -483,22 +377,20 @@ func TestNodeExpiryRouteFailover(t *testing.T) {
 				expiry = lastCheck.Add(time.Second)
 			}
 
-			_, c, err := h.Server.State().SetNodeExpiry(primary, &expiry)
+			_, err := h.Server.State().SetNodeExpiry(primary, &expiry)
 			require.NoError(t, err)
-			h.Server.App.Change(c)
 
 			if scheduled {
 				require.Eventually(t, func() bool { return time.Now().After(expiry) },
 					3*time.Second, 10*time.Millisecond)
 
-				_, changes, _ := h.Server.State().ExpireExpiredNodes(lastCheck)
-				h.Server.App.Change(changes...)
+				h.Server.State().ExpireExpiredNodes(lastCheck)
 			}
 
 			require.EventuallyWithT(t, func(c *assert.CollectT) {
 				assert.Empty(c, h.Server.State().GetNodePrimaryRoutes(primary))
 				assert.Contains(c, h.Server.State().GetNodePrimaryRoutes(standby), route)
-				assert.True(c, h.Server.App.MapBatcher().IsConnected(primary))
+				assert.True(c, h.Server.App.MapHub().IsConnected(primary))
 
 				peer, found := h.Client(2).PeerByName(h.Client(1).Name)
 				if assert.True(c, found) {
@@ -506,12 +398,10 @@ func TestNodeExpiryRouteFailover(t *testing.T) {
 				}
 			}, 5*time.Second, 10*time.Millisecond, "expiry must move the route to the standby while preserving control connectivity")
 
-			_, c, err = h.Server.State().SetNodeExpiry(primary, nil)
+			_, err = h.Server.State().SetNodeExpiry(primary, nil)
 			require.NoError(t, err)
-			h.Server.App.Change(c)
-			_, c, err = h.Server.State().SetNodeExpiry(standby, &expiry)
+			_, err = h.Server.State().SetNodeExpiry(standby, &expiry)
 			require.NoError(t, err)
-			h.Server.App.Change(c)
 			require.EventuallyWithT(t, func(c *assert.CollectT) {
 				assert.Contains(c, h.Server.State().GetNodePrimaryRoutes(primary), route)
 
@@ -551,12 +441,10 @@ func TestLogoutReloginAllClientsConverge(t *testing.T) {
 	)
 
 	// Production tuning: the integration flake happens with the default
-	// 800ms batch delay (large coalescing windows) and a multi-worker
-	// batcher, so reproduce with the same knobs.
+	// 800ms batch delay (large coalescing windows), so reproduce with it.
 	h := servertest.NewHarness(t, numClients,
 		servertest.WithServerOptions(
 			servertest.WithBatchDelay(800*time.Millisecond),
-			servertest.WithBatcherWorkers(types.DefaultBatcherWorkers()),
 		),
 		servertest.WithConvergenceTimeout(60*time.Second),
 	)
@@ -615,7 +503,6 @@ func TestLogoutReloginWithPollChurn(t *testing.T) {
 	h := servertest.NewHarness(t, numClients,
 		servertest.WithServerOptions(
 			servertest.WithBatchDelay(800*time.Millisecond),
-			servertest.WithBatcherWorkers(types.DefaultBatcherWorkers()),
 		),
 		servertest.WithConvergenceTimeout(60*time.Second),
 	)

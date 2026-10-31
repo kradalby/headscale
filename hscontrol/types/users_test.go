@@ -3,12 +3,66 @@ package types
 import (
 	"database/sql"
 	"encoding/json"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
+	"gorm.io/gorm"
 )
+
+// userPolicyInputs classifies every User field, those of embedded structs
+// included: true when user aliases resolve on it, so PolicyEqual must
+// compare it. Each comes with a change to it.
+var userPolicyInputs = map[string]struct {
+	read   bool
+	change func(*User)
+}{
+	"ID":                 {true, func(u *User) { u.ID = 2 }},
+	"Name":               {true, func(u *User) { u.Name = "b" }},
+	"Email":              {true, func(u *User) { u.Email = "b@example.com" }},
+	"ProviderIdentifier": {true, func(u *User) { u.ProviderIdentifier = sql.NullString{String: "oidc|b", Valid: true} }},
+	"CreatedAt":          {false, func(u *User) { u.CreatedAt = time.Unix(1, 0) }},
+	"UpdatedAt":          {false, func(u *User) { u.UpdatedAt = time.Unix(1, 0) }},
+	"DeletedAt":          {false, func(u *User) { u.DeletedAt = gorm.DeletedAt{Time: time.Unix(1, 0), Valid: true} }},
+	"DisplayName":        {false, func(u *User) { u.DisplayName = "B" }},
+	"Provider":           {false, func(u *User) { u.Provider = "oidc" }},
+	"ProfilePicURL":      {false, func(u *User) { u.ProfilePicURL = "https://example.com/b.png" }},
+}
+
+// TestPolicyEqualCoversEveryUserField fails on a User field nobody
+// classified, and on one PolicyEqual compares or ignores against its
+// classification: one the policy resolves on that PolicyEqual misses is a
+// policy never recompiled when it changes.
+func TestPolicyEqualCoversEveryUserField(t *testing.T) {
+	var walk func(reflect.Type)
+
+	walk = func(typ reflect.Type) {
+		for f := range typ.Fields() {
+			if f.Anonymous && f.Type.Kind() == reflect.Struct {
+				walk(f.Type)
+
+				continue
+			}
+
+			if _, ok := userPolicyInputs[f.Name]; f.IsExported() && !ok {
+				t.Errorf("User.%s is not in userPolicyInputs; if the policy reads it, teach PolicyEqual", f.Name)
+			}
+		}
+	}
+
+	walk(reflect.TypeFor[User]())
+
+	base := User{ID: 1, Name: "a", Email: "a@example.com"}
+
+	for name, field := range userPolicyInputs {
+		changed := base
+		field.change(&changed)
+		assert.Equal(t, !field.read, base.PolicyEqual(&changed), name)
+	}
+}
 
 func TestUnmarshallOIDCClaims(t *testing.T) {
 	tests := []struct {

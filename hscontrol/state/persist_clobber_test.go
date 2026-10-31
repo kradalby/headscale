@@ -11,7 +11,7 @@ import (
 // TestPersistNodeDoesNotClobberConcurrentAdminWrite ensures that persisting a
 // node snapshot captured earlier (as UpdateNodeFromMapRequest does at the top
 // of its body) cannot overwrite a concurrent admin write (SetNodeTags) that
-// landed in between. NodeStore is the source of truth; the database row must
+// landed in between. Memory is the source of truth; the database row must
 // converge on it rather than reverting to the stale snapshot.
 func TestPersistNodeDoesNotClobberConcurrentAdminWrite(t *testing.T) {
 	dbPath, s, nodeID := persistTestSetup(t)
@@ -29,16 +29,16 @@ func TestPersistNodeDoesNotClobberConcurrentAdminWrite(t *testing.T) {
 	require.True(t, before.UserID().Valid(), "node should start with a UserID")
 
 	// (1) Map-request captures the node snapshot (the stale view).
-	staleView, ok := s.nodeStore.GetNode(nodeID)
+	staleView, ok := s.Snapshot().GetNode(nodeID)
 	require.True(t, ok)
 
 	staleNode := staleView.AsStruct()
 	staleNode.Hostinfo = &tailcfg.Hostinfo{Hostname: "persist-node"}
 	staleView = staleNode.View()
 
-	// (2) Concurrent admin SetNodeTags lands in the window: NodeStore + DB
+	// (2) Concurrent admin SetNodeTags lands in the window: memory + DB
 	// become tagged and user ownership is cleared.
-	_, _, err = s.SetNodeTags(nodeID, []string{"tag:foo"})
+	_, err = s.SetNodeTags(nodeID, []string{"tag:foo"})
 	require.NoError(t, err)
 
 	dbAfterAdmin, err := s.DB().GetNodeByID(nodeID)
@@ -47,7 +47,7 @@ func TestPersistNodeDoesNotClobberConcurrentAdminWrite(t *testing.T) {
 		"precondition: admin SetNodeTags must have written the tag to the DB")
 
 	// (3) Map-request persists its stale snapshot.
-	_, _, err = s.persistNodeAndRefreshPolicy(staleView, s.polMan.NodesGeneration())
+	_, err = s.persistNode(staleView)
 	require.NoError(t, err)
 
 	// The admin write must survive.

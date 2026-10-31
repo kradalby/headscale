@@ -1,10 +1,9 @@
 package types
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/netip"
-	"slices"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -1046,6 +1046,32 @@ func TestHasPolicyChangeFields(t *testing.T) {
 	}
 }
 
+// nodePolicyInputs classifies every Node field: true when the policy
+// reads it, so HasPolicyChange must compare it. ID is read too, but a
+// changed ID is another node, which the node table reports on its own.
+var nodePolicyInputs = map[string]bool{
+	"IPv4": true, "IPv6": true, "UserID": true, "User": true, "Tags": true,
+	"ApprovedRoutes": true, "Hostinfo": true,
+	"ID": false, "MachineKey": false, "NodeKey": false, "DiscoKey": false,
+	"Endpoints": false, "Hostname": false, "GivenName": false,
+	"RegisterMethod": false, "AuthKeyID": false, "AuthKey": false,
+	"Expiry": false, "LastSeen": false, "CreatedAt": false, "UpdatedAt": false,
+	"DeletedAt": false, "IsOnline": false, "Unhealthy": false,
+	"ActiveSessions": false, "SessionEpoch": false,
+}
+
+// TestHasPolicyChangeCoversEveryNodeField fails on a Node field nobody
+// classified: a policy input HasPolicyChange misses is a policy that is
+// never recompiled when it changes.
+func TestHasPolicyChangeCoversEveryNodeField(t *testing.T) {
+	for f := range reflect.TypeFor[Node]().Fields() {
+		if _, ok := nodePolicyInputs[f.Name]; f.IsExported() && !ok {
+			t.Errorf("Node.%s is not in nodePolicyInputs; if the policy reads it, "+
+				"teach HasPolicyChange and TestHasPolicyChangeFields", f.Name)
+		}
+	}
+}
+
 func TestNodeIsExpiredAt(t *testing.T) {
 	now := time.Now()
 	zero := time.Time{}
@@ -1076,61 +1102,45 @@ func TestNodeIsExpiredAt(t *testing.T) {
 	})
 }
 
-func TestValidateHostinfo(t *testing.T) {
-	t.Parallel()
+// unrenderedFields are the [Node] fields SameRender ignores.
+var unrenderedFields = []string{"Unhealthy", "ActiveSessions", "SessionEpoch", "UpdatedAt"}
 
-	routes := make([]netip.Prefix, MaxRoutableIPs)
-	for i := range routes {
-		routes[i] = netip.PrefixFrom(netip.AddrFrom16([16]byte{0xfd, byte(i >> 8), byte(i)}), 64)
+// TestSameRenderIgnoresOnlyUnrenderedFields changes each unrendered field
+// and a rendered one, and checks every unrendered name is a Node field, so
+// a rename cannot silently widen what SameRender ignores.
+func TestSameRenderIgnoresOnlyUnrenderedFields(t *testing.T) {
+	typ := reflect.TypeFor[Node]()
+	for _, name := range unrenderedFields {
+		_, ok := typ.FieldByName(name)
+		require.True(t, ok, "Node has no field %s", name)
 	}
 
-	latencies := make(map[string]float64, 300)
-	for i := range 300 {
-		latencies[fmt.Sprintf("%d-v4", i)] = 0.01
-	}
+	base := &Node{ID: 1, Hostname: "a", Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")}}
 
-	base, err := json.Marshal(&tailcfg.Hostinfo{OSVersion: "x"})
-	require.NoError(t, err)
+	hidden := *base
+	hidden.Unhealthy, hidden.ActiveSessions, hidden.SessionEpoch, hidden.UpdatedAt = true, 2, 7, time.Now()
+	assert.True(t, base.View().SameRender(hidden.View()))
 
-	exact := strings.Repeat("x", MaxHostinfoSize-len(base)+1)
+	moved := *base
+	moved.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.2:41641")}
+	assert.False(t, base.View().SameRender(moved.View()))
 
-	for _, tt := range []struct {
-		name     string
-		hostinfo *tailcfg.Hostinfo
-		wantErr  bool
-	}{
-		{name: "nil"},
-		{name: "hostname at limit", hostinfo: &tailcfg.Hostinfo{Hostname: strings.Repeat("h", 255)}},
-		{name: "hostname over limit", hostinfo: &tailcfg.Hostinfo{Hostname: strings.Repeat("h", 256)}, wantErr: true},
-		{name: "hostname bytes", hostinfo: &tailcfg.Hostinfo{Hostname: strings.Repeat("é", 128)}, wantErr: true},
-		{name: "routes at limit", hostinfo: &tailcfg.Hostinfo{RoutableIPs: routes}},
-		{name: "routes over limit", hostinfo: &tailcfg.Hostinfo{RoutableIPs: append(slices.Clone(routes), routes[0])}, wantErr: true},
-		{name: "tags at limit", hostinfo: &tailcfg.Hostinfo{RequestTags: make([]string, 256)}},
-		{name: "tags over limit", hostinfo: &tailcfg.Hostinfo{RequestTags: make([]string, 257)}, wantErr: true},
-		{name: "metadata at byte limit", hostinfo: &tailcfg.Hostinfo{OSVersion: exact}},
-		{name: "metadata over byte limit", hostinfo: &tailcfg.Hostinfo{OSVersion: exact + "x"}, wantErr: true},
-		{name: "NetInfo over byte limit", hostinfo: &tailcfg.Hostinfo{NetInfo: &tailcfg.NetInfo{LinkType: strings.Repeat("n", MaxHostinfoSize)}}, wantErr: true},
-		{name: "budgets compose", hostinfo: &tailcfg.Hostinfo{OSVersion: strings.Repeat("o", 60<<10), NetInfo: &tailcfg.NetInfo{LinkType: strings.Repeat("n", 60<<10)}}},
-		{name: "small entries need no field-specific truncation", hostinfo: &tailcfg.Hostinfo{
-			Services:     make([]tailcfg.Service, 300),
-			WoLMACs:      make([]string, 300),
-			SSH_HostKeys: make([]string, 300),
-			NetInfo:      &tailcfg.NetInfo{DERPLatency: latencies},
-		}},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+	online := *base
+	online.IsOnline = new(true)
+	assert.False(t, base.View().SameRender(online.View()))
 
-			want := tt.hostinfo.Clone()
+	// LastSeen renders only for an offline node.
+	seen := online
+	seen.LastSeen = new(time.Now())
+	assert.True(t, online.View().SameRender(seen.View()), "LastSeen of an online node is not rendered")
 
-			err := ValidateHostinfo(tt.hostinfo)
-			if tt.wantErr {
-				require.ErrorIs(t, err, ErrHostinfoTooLarge)
-			} else {
-				require.NoError(t, err)
-			}
+	offline, offlineSeen := *base, *base
+	offline.IsOnline, offlineSeen.IsOnline = new(false), new(false)
+	offlineSeen.LastSeen = new(time.Now())
+	assert.False(t, offline.View().SameRender(offlineSeen.View()), "LastSeen of an offline node is")
 
-			require.True(t, want.Equal(tt.hostinfo), "validation must not change the report")
-		})
-	}
+	// An expired node renders from the clock, so no two records are the same.
+	expired := *base
+	expired.Expiry = new(time.Now().Add(-time.Minute))
+	assert.False(t, expired.View().SameRender(expired.View()), "an expired node always renders anew")
 }

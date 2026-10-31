@@ -134,9 +134,7 @@ func (quietScaleTB) Logf(string, ...any) {}
 func runScale(t *testing.T, nodes int, tc scaleCase) {
 	t.Helper()
 
-	workers := min(4, runtime.GOMAXPROCS(0))
-
-	opts := []ServerOption{WithBatcherWorkers(workers)}
+	var opts []ServerOption
 	if _, largeRun := os.LookupEnv("HEADSCALE_STRESS_NODES"); !largeRun {
 		opts = append(opts, WithNodeStoreBatchTimeout(10*time.Millisecond))
 	}
@@ -149,10 +147,9 @@ func runScale(t *testing.T, nodes int, tc scaleCase) {
 	const convergenceTimeout = 2 * time.Minute
 
 	t.Logf(
-		"target_nodes=%d devices_per_user=%d workers=%d gomaxprocs=%d gomemlimit=%q go=%s",
+		"target_nodes=%d devices_per_user=%d gomaxprocs=%d gomemlimit=%q go=%s",
 		nodes,
 		scaleDevicesPerUser,
-		workers,
 		runtime.GOMAXPROCS(0),
 		os.Getenv("GOMEMLIMIT"),
 		runtime.Version(),
@@ -211,9 +208,7 @@ func runScale(t *testing.T, nodes int, tc scaleCase) {
 		require.NoError(t, err)
 		_, err = srv.State().SetPolicyInDB(string(data))
 		require.NoError(t, err)
-		changes, err := srv.State().ReloadPolicy()
-		srv.App.Change(changes...)
-		require.NoError(t, err)
+		require.NoError(t, srv.State().ReloadPolicy())
 	}
 
 	waitForState := func(generation string, revoked bool, osMarker string) {
@@ -507,16 +502,17 @@ func checkScaleStreams(
 ) {
 	t.Helper()
 
-	require.Zero(t, srv.App.MapBatcher().WorkErrors(), "mapper work failed")
-	connections := srv.App.MapBatcher().Debug()
-	require.Len(t, connections, len(clients))
+	// A reconnected client's old session leaves the hub on its own time.
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		connections := srv.App.MapHub().Connected()
+		assert.Len(ct, connections, len(clients))
 
-	for id, info := range connections {
-		_, known := indices[id.NodeID()]
-		require.True(t, known, "unexpected connected node %s", id)
-		require.True(t, info.Connected, "node %s disconnected on server", id)
-		require.Equal(t, 1, info.ActiveConnections, "node %s", id)
-	}
+		for id, sessions := range connections {
+			_, known := indices[id.NodeID()]
+			assert.True(ct, known, "unexpected connected node %s", id)
+			assert.Equal(ct, 1, sessions, "node %s", id)
+		}
+	}, 10*time.Second, 20*time.Millisecond, "one session per client")
 
 	for _, c := range clients {
 		require.NotNil(t, c, "client registration failed")

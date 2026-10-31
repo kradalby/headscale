@@ -45,10 +45,8 @@ type ServerOption func(*serverConfig)
 
 type serverConfig struct {
 	batchDelay            time.Duration
-	bufferedChanSize      int
 	ephemeralTimeout      time.Duration
 	nodeExpiry            time.Duration
-	batcherWorkers        int
 	nodeStoreBatchTimeout time.Duration
 	taildropEnabled       bool
 	logTailEnabled        bool
@@ -61,31 +59,19 @@ type serverConfig struct {
 func defaultServerConfig() *serverConfig {
 	return &serverConfig{
 		batchDelay:       50 * time.Millisecond,
-		bufferedChanSize: 30,
-		batcherWorkers:   1,
 		ephemeralTimeout: 30 * time.Second,
 		taildropEnabled:  true,
 	}
 }
 
-// WithBatchDelay sets the batcher's change coalescing delay.
+// WithBatchDelay sets how long a map session coalesces a burst of
+// changes into one update.
 func WithBatchDelay(d time.Duration) ServerOption {
 	return func(c *serverConfig) { c.batchDelay = d }
 }
 
-// WithBufferedChanSize sets the per-node map session channel buffer.
-func WithBufferedChanSize(n int) ServerOption {
-	return func(c *serverConfig) { c.bufferedChanSize = n }
-}
-
-// WithBatcherWorkers sets the number of batcher worker goroutines.
-// Defaults to 1 for deterministic tests; pass
-// [types.DefaultBatcherWorkers] to match production concurrency.
-func WithBatcherWorkers(n int) ServerOption {
-	return func(c *serverConfig) { c.batcherWorkers = n }
-}
-
-// WithNodeStoreBatchTimeout overrides the server's default write-batch wait.
+// WithNodeStoreBatchTimeout overrides how long node writes wait to batch
+// during an HA outage.
 func WithNodeStoreBatchTimeout(d time.Duration) ServerOption {
 	return func(c *serverConfig) { c.nodeStoreBatchTimeout = d }
 }
@@ -183,10 +169,8 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 		Taildrop: types.TaildropConfig{Enabled: sc.taildropEnabled},
 		LogTail:  types.LogTailConfig{Enabled: sc.logTailEnabled},
 		Tuning: types.Tuning{
-			BatchChangeDelay:               sc.batchDelay,
-			BatcherWorkers:                 sc.batcherWorkers,
-			NodeMapSessionBufferedChanSize: sc.bufferedChanSize,
-			NodeStoreBatchTimeout:          sc.nodeStoreBatchTimeout,
+			BatchChangeDelay:      sc.batchDelay,
+			NodeStoreBatchTimeout: sc.nodeStoreBatchTimeout,
 		},
 	}
 
@@ -241,7 +225,7 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 	})
 
 	// Start subsystems.
-	app.StartBatcherForTest(tb)
+	tb.Cleanup(app.MapHub().Close)
 	app.StartEphemeralGCForTest(tb)
 
 	// Start the HTTP server. By default it binds an in-memory network so all
@@ -298,8 +282,7 @@ func (s *TestServer) State() *state.State {
 }
 
 // Close shuts down the in-memory HTTP server and listener.
-// Subsystem cleanup (batcher, ephemeral GC) is handled by
-// [testing.TB.Cleanup] callbacks registered in [hscontrol.Headscale.StartBatcherForTest] and
+// The ephemeral GC stops in the [testing.TB.Cleanup] callback registered by
 // [hscontrol.Headscale.StartEphemeralGCForTest].
 func (s *TestServer) Close() {
 	s.httpServer.Close()
@@ -316,7 +299,7 @@ func (s *TestServer) MemNet() *memnet.Network {
 func (s *TestServer) CreateUser(tb testing.TB, name string) *types.User {
 	tb.Helper()
 
-	u, _, err := s.st.CreateUser(types.User{Name: name})
+	u, err := s.st.CreateUser(types.User{Name: name})
 	if err != nil {
 		tb.Fatalf("servertest: CreateUser(%q): %v", name, err)
 	}
@@ -384,9 +367,9 @@ func (s *TestServer) CreateAPIKey(tb testing.TB, owner *types.User) string {
 }
 
 // CreateRegisteredNode mints a registered node (allocated IPs, registered
-// method) in BOTH the database and the in-memory NodeStore, then returns its
-// view. The v2 device endpoints resolve nodes via State.GetNodeByID, which reads
-// the NodeStore, so a DB-only node would be invisible to them.
+// method) in BOTH the database and the world, then returns its view. The v2
+// device endpoints resolve nodes via State.GetNodeByID, which reads the world,
+// so a DB-only node would be invisible to them.
 func (s *TestServer) CreateRegisteredNode(tb testing.TB, owner *types.User, hostname ...string) types.NodeView {
 	tb.Helper()
 

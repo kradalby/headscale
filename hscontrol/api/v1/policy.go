@@ -12,6 +12,7 @@ import (
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"tailscale.com/util/multierr"
 )
 
 func init() {
@@ -142,9 +143,7 @@ func registerPolicy(api huma.API, b Backend) {
 
 		// Reload even when content is unchanged: routes manually disabled before
 		// may now qualify for auto-approval, so they must be re-evaluated.
-		cs, err := b.State.ReloadPolicy()
-		b.Change(cs...)
-
+		err = b.State.ReloadPolicy()
 		if err != nil {
 			return nil, huma.Error500InternalServerError("reloading policy", err)
 		}
@@ -179,7 +178,7 @@ func registerPolicy(api huma.API, b Backend) {
 			return nil, huma.Error400BadRequest(err.Error(), err)
 		}
 
-		_, err = pm.SetPolicy(polB)
+		err = multierr.New(pm.RunTests(), pm.RunSSHTests())
 		if err != nil {
 			return nil, huma.Error400BadRequest(err.Error(), err)
 		}

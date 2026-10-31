@@ -36,10 +36,10 @@ func newOAuthTestServer(t *testing.T) (*Headscale, string, string) {
 	require.NoError(t, err)
 	_, err = app.state.SetPolicyInDB(policy)
 	require.NoError(t, err)
-	_, err = app.state.ReloadPolicy()
+	err = app.state.ReloadPolicy()
 	require.NoError(t, err)
 
-	mux, _ := apiv2.Handler(apiv2.Backend{State: app.state, Change: app.Change, Cfg: app.cfg})
+	mux, _ := apiv2.Handler(apiv2.Backend{State: app.state, Cfg: app.cfg})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
@@ -300,7 +300,7 @@ func TestAPIv2OAuth_TagOwnedBy(t *testing.T) {
 	require.NoError(t, err)
 	_, err = app.state.SetPolicyInDB(policy)
 	require.NoError(t, err)
-	_, err = app.state.ReloadPolicy()
+	err = app.state.ReloadPolicy()
 	require.NoError(t, err)
 
 	_, secret := createClient(t, baseURL, admin, []string{"auth_keys"}, []string{"tag:k8s-operator"})

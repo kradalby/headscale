@@ -1,5 +1,5 @@
 // Replay golden HuJSON captures under testdata/sshtest_results/*.hujson:
-// the 200 path requires headscale's evaluateSSHTests to pass; the
+// the 200 path requires headscale's RunSSHTests to pass; the
 // non-200 path requires headscale to reject the same input with the
 // captured error body as a substring. Divergences are listed in
 // knownSSHTesterDivergences with the engine gap each represents.
@@ -13,6 +13,7 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/util/multierr"
 )
 
 // knownSSHTesterDivergences names the engine gap for each capture where
@@ -56,7 +57,7 @@ func TestSSHTesterCompat(t *testing.T) {
 				require.NoError(t, parseErr,
 					"tailscale accepted this policy; headscale must parse it")
 
-				_, setErr := pm.SetPolicy(policyJSON)
+				setErr := multierr.New(pm.RunTests(), pm.RunSSHTests())
 				require.NoError(t, setErr,
 					"tailscale accepted this policy; headscale sshTests must pass")
 
@@ -69,7 +70,7 @@ func TestSSHTesterCompat(t *testing.T) {
 			case parseErr != nil:
 				got = parseErr
 			default:
-				_, setErr := pm.SetPolicy(policyJSON)
+				setErr := multierr.New(pm.RunTests(), pm.RunSSHTests())
 				got = setErr
 			}
 

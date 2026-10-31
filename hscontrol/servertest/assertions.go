@@ -1,7 +1,11 @@
 package servertest
 
 import (
+	"slices"
 	"testing"
+
+	"github.com/juanfont/headscale/hscontrol/types"
+	"tailscale.com/tailcfg"
 )
 
 // AssertMeshComplete verifies that every client in the slice sees
@@ -65,9 +69,9 @@ func AssertPeerOnline(tb testing.TB, observer *TestClient, peerName string) {
 	}
 }
 
-// AssertConsistentState checks that all clients agree on peer
-// properties: every connected client should see the same set of
-// peer hostnames.
+// AssertConsistentState checks that every client sees every other one
+// and that its peer list is exactly the peers the server holds for it: a
+// peer it should have dropped is as wrong as one it lacks.
 func AssertConsistentState(tb testing.TB, clients []*TestClient) {
 	tb.Helper()
 
@@ -95,6 +99,27 @@ func AssertConsistentState(tb testing.TB, clients []*TestClient) {
 				tb.Errorf("AssertConsistentState: %s does not see %s (peers: %v)",
 					c.Name, other.Name, c.PeerNames())
 			}
+		}
+
+		if !nm.SelfNode.Valid() {
+			continue
+		}
+
+		var want []tailcfg.NodeID
+		for _, p := range c.server.State().ListPeers(types.NodeID(nm.SelfNode.ID())).All() { //nolint:gosec // node IDs are positive
+			want = append(want, tailcfg.NodeID(p.ID())) //nolint:gosec // node IDs fit
+		}
+
+		got := make([]tailcfg.NodeID, 0, len(nm.Peers))
+		for _, p := range nm.Peers {
+			got = append(got, p.ID())
+		}
+
+		slices.Sort(want)
+		slices.Sort(got)
+
+		if !slices.Equal(got, want) {
+			tb.Errorf("AssertConsistentState: %s has peers %v, server holds %v", c.Name, got, want)
 		}
 	}
 }

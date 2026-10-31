@@ -150,9 +150,7 @@ func registerACL(api huma.API, b Backend) {
 			return nil, huma.Error500InternalServerError("setting policy", err)
 		}
 
-		cs, err := b.State.ReloadPolicy()
-		b.Change(cs...)
-
+		err = b.State.ReloadPolicy()
 		if err != nil {
 			return nil, huma.Error500InternalServerError("reloading policy", err)
 		}

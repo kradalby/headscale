@@ -268,16 +268,6 @@ func WithDERPConfig(derpMap tailcfg.DERPMap) Option {
 	}
 }
 
-// WithTuning allows changing the tuning settings easily.
-func WithTuning(batchTimeout time.Duration, mapSessionChanSize int) Option {
-	return func(hsic *HeadscaleInContainer) {
-		hsic.env["HEADSCALE_TUNING_BATCH_CHANGE_DELAY"] = batchTimeout.String()
-		hsic.env["HEADSCALE_TUNING_NODE_MAPSESSION_BUFFERED_CHAN_SIZE"] = strconv.Itoa(
-			mapSessionChanSize,
-		)
-	}
-}
-
 func WithHAProbing(interval, timeout time.Duration) Option {
 	return func(hsic *HeadscaleInContainer) {
 		hsic.env["HEADSCALE_NODE_ROUTES_HA_PROBE_INTERVAL"] = interval.String()
@@ -447,6 +437,9 @@ func New(
 		"HEADSCALE_DEBUG_DEADLOCK_TIMEOUT=5s",
 		"HEADSCALE_DEBUG_HIGH_CARDINALITY_METRICS=1",
 		"HEADSCALE_DEBUG_DUMP_CONFIG=1",
+		// Check every incremental policy compile against one from scratch;
+		// a mismatch logs "policy audit", which fails the test at shutdown.
+		"HEADSCALE_DEBUG_POLICY_AUDIT=1",
 	}
 	if hsic.hasTLS() {
 		hsic.env["HEADSCALE_TLS_CERT_PATH"] = tlsCertPath

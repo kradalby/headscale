@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/http"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/rs/zerolog"
@@ -28,15 +30,26 @@ const (
 	// stopWriteGrace is how long a stopped session's write in flight may
 	// take to finish before its stream is reset.
 	stopWriteGrace = 5 * time.Second
+
+	// writeStallTimeout is how long one write may block before the session
+	// is taken as stalled: it leaves the hub and stops, so a client that
+	// stopped reading cannot hold a session that receives nothing. The
+	// clock starts once the frame is encoded and progress counts per written
+	// chunk ([frameChunkSize]), so a reader slower than one chunk per
+	// timeout, about 3 KB/s once the transport's buffers are full, is
+	// taken as stalled too.
+	writeStallTimeout = 5 * time.Second
 )
 
-// errMapSessionStopped is a write refused because the batcher stopped the
-// session; the poll loop ends as if it had seen cancelCh.
+// errMapSessionStopped is a write refused because the session was stopped;
+// the poll loop ends as if it had seen cancelCh.
 var errMapSessionStopped = errors.New("map session stopped")
 
 type contextKey string
 
 const nodeNameContextKey = contextKey("nodeName")
+
+var errServerShuttingDown = NewHTTPError(http.StatusServiceUnavailable, "server shutting down", nil)
 
 type mapSession struct {
 	h      *Headscale
@@ -44,13 +57,22 @@ type mapSession struct {
 	ctx    context.Context //nolint:containedctx
 	capVer tailcfg.CapabilityVersion
 
-	ch             chan *tailcfg.MapResponse
 	cancelCh       chan struct{}
 	cancelChClosed atomic.Bool
+	stopOnce       sync.Once
 
-	// writing is set while [mapSession.writeMap] runs, so
-	// [mapSession.stopFromBatcher] interrupts only a write that may be stuck.
-	writing atomic.Bool
+	// writing is the number of the encoded write [mapSession.writeMap] is
+	// sending, 0 while encoding or idle: [mapSession.stop] interrupts only
+	// a write that may be stuck, and a stall timer only the write it was set for.
+	writing atomic.Uint64
+
+	// hubSession is the session's place in the map hub, left on a stall.
+	hubSession atomic.Pointer[mapper.Session]
+
+	// writeSeq numbers writes. stallTimeout is [writeStallTimeout],
+	// shorter in tests.
+	writeSeq     atomic.Uint64
+	stallTimeout time.Duration
 
 	keepAlive       time.Duration
 	keepAliveTicker *time.Ticker
@@ -77,11 +99,11 @@ func (h *Headscale) newMapSession(
 		node:   node,
 		capVer: req.Version,
 
-		ch:       make(chan *tailcfg.MapResponse, h.cfg.Tuning.NodeMapSessionBufferedChanSize),
 		cancelCh: make(chan struct{}),
 
 		keepAlive:       ka,
 		keepAliveTicker: nil,
+		stallTimeout:    writeStallTimeout,
 
 		log: log.With().
 			Str(zf.Component, "poll").
@@ -104,20 +126,47 @@ func (m *mapSession) resetKeepAlive() {
 	m.keepAliveTicker.Reset(m.keepAlive)
 }
 
-func (m *mapSession) stopFromBatcher() {
-	if m.cancelChClosed.CompareAndSwap(false, true) {
+// stallWrite ends the session if write seq is still the one running: a
+// timer firing as its write returns finds no write, or the next one under
+// another number.
+func (m *mapSession) stallWrite(seq uint64) {
+	if m.writing.Load() != seq {
+		return
+	}
+
+	m.stall()
+}
+
+// stall ends a session whose write has blocked past [writeStallTimeout]:
+// it leaves the hub at once, so the node no longer counts as connected,
+// and stops, which bounds the write by [stopWriteGrace].
+func (m *mapSession) stall() {
+	m.log.Warn().Caller().Dur("stall", m.stallTimeout).Msg("map write stalled, ending session")
+
+	if sess := m.hubSession.Load(); sess != nil {
+		m.h.mapHub.Leave(sess)
+	}
+
+	m.stop()
+}
+
+// stop ends the session from outside its loop, e.g. on shutdown.
+func (m *mapSession) stop() {
+	// Handler cleanup must wait for a concurrent deadline call before its
+	// ResponseWriter is released by net/http.
+	m.stopOnce.Do(func() {
+		m.cancelChClosed.Store(true)
 		close(m.cancelCh)
 
 		// A channel signal cannot interrupt a response write that is blocked on
 		// HTTP/2 flow control, so a client that stopped reading would keep the
-		// map session, and therefore server shutdown, alive indefinitely.
-		// An expired write deadline resets the stream with INTERNAL_ERROR,
-		// which the client reports as a server error, so it is only a bound:
-		// an idle session sees cancelCh, and a write the client keeps reading
-		// finishes first, both ending the stream cleanly. writeMap checks
-		// cancelChClosed after raising writing, so one side always sees the
-		// other.
-		if !m.writing.Load() {
+		// map session, and therefore server shutdown, alive indefinitely. An
+		// expired write deadline resets the stream with INTERNAL_ERROR, which
+		// the client reports as a server error, so it is only a bound: an idle
+		// session sees cancelCh, and a write the client keeps reading finishes
+		// first, both ending the stream cleanly. writeMap checks cancelChClosed
+		// after setting writing, so one side always sees the other.
+		if m.writing.Load() == 0 {
 			return
 		}
 
@@ -125,48 +174,54 @@ func (m *mapSession) stopFromBatcher() {
 		if err != nil && !errors.Is(err, http.ErrNotSupported) {
 			m.log.Debug().Caller().Err(err).Msg("failed to interrupt map response write")
 		}
+	})
+}
+
+// renderFirst renders stream's initial map within the hub's bound on
+// concurrent first maps, releasing its slot even if the render panics. It
+// reports false when done closed before a slot was free.
+func (m *mapSession) renderFirst(done <-chan struct{}, stream *mapper.Stream) ([]*tailcfg.MapResponse, bool, error) {
+	release, ok := m.h.mapHub.RenderFirst(done, m.cancelCh)
+	if !ok {
+		return nil, false, nil
 	}
+	defer release()
+
+	initial, err := stream.Initial(m.h.state.Snapshot())
+
+	return initial, true, err
 }
 
 // afterServeLongPoll is called when a long-polling session ends and the node
 // is disconnected.
 func (m *mapSession) afterServeLongPoll() {
-	if m.node.IsEphemeral() {
+	// The live node, not the session's copy: it may have been deleted, or
+	// re-registered permanent, while the session ran.
+	if node, ok := m.h.state.GetNodeByID(m.node.ID); ok && node.IsEphemeral() {
 		m.h.ephemeralGC.Schedule(m.node.ID, m.h.cfg.Node.Ephemeral.InactivityTimeout)
 	}
 }
 
-// serve handles non-streaming requests.
+// serve handles non-streaming requests: the node tells us about its
+// current configuration and only wants a status code back.
 func (m *mapSession) serve() {
-	// This is the mechanism where the node gives us information about its
-	// current configuration.
-	//
-	// Process the [tailcfg.MapRequest] to update node state (endpoints, hostinfo, etc.)
-	c, err := m.h.state.UpdateNodeFromMapRequest(m.node.ID, m.req)
-	m.h.Change(c)
-
+	err := m.h.state.UpdateNodeFromMapRequest(m.node.ID, m.req)
 	if err != nil {
 		httpError(m.w, err)
 		return
 	}
 
-	// If OmitPeers is true and Stream is false
-	// then the server will let clients update their endpoints without
-	// breaking existing long-polling (Stream == true) connections.
-	// In this case, the server can omit the entire response; the client
-	// only checks the HTTP response status code.
-	//
-	// This is what Tailscale calls a Lite update, the client ignores
-	// the response and just wants a 200.
-	// !req.stream && req.OmitPeers
+	// A "lite" update (!Stream && OmitPeers) lets clients update their
+	// endpoints without breaking an existing long poll. The client only
+	// checks the status code.
 	if m.isEndpointUpdate() {
 		m.w.WriteHeader(http.StatusOK)
 		mapResponseEndpointUpdates.WithLabelValues("ok").Inc()
 	}
 }
 
-// serveLongPoll ensures the node gets the appropriate updates from either
-// polling or immediate responses.
+// serveLongPoll streams the node's map: a full map first, then whatever
+// changes in what the node sees, as the world changes.
 //
 //nolint:gocyclo
 func (m *mapSession) serveLongPoll() {
@@ -176,56 +231,47 @@ func (m *mapSession) serveLongPoll() {
 	m.h.clientStreamsOpen.Add(1)
 	defer m.h.clientStreamsOpen.Done()
 
-	// connectGen is set by [state.State.Connect] below and captured by the deferred cleanup closure.
-	// Each Connect acquires one live session in state; the cleanup must release
-	// it with exactly one [state.State.Disconnect] call, in every exit path, or
-	// the node's session count leaks and it stays online forever.
-	var connectGen uint64
+	// connectGen is set by [state.State.Connect] below and captured by the
+	// deferred cleanup. Each Connect acquires one live session in state;
+	// the cleanup must release it with exactly one [state.State.Disconnect]
+	// call in every exit path, or the node stays online forever.
+	var (
+		connectGen uint64
+		sess       *mapper.Session
+	)
 
-	// Clean up the session when the client disconnects
 	defer func() {
-		m.stopFromBatcher()
+		m.stop()
 
-		stillConnected := m.h.mapBatcher.RemoveNode(m.node.ID, m.ch)
+		stillConnected := false
+		if sess != nil {
+			stillConnected = m.h.mapHub.Leave(sess)
+		}
 
-		// This session never reached [state.State.Connect]; there is no
-		// session to release.
 		if connectGen == 0 {
 			return
 		}
 
-		// When a node disconnects, it might rapidly reconnect (e.g. mobile clients, network weather).
-		// Instead of immediately marking the node as offline, we wait a few seconds to see if it reconnects.
-		// If it reconnects during the wait, the new session's Connect raises the
-		// session count, so the release below keeps the node online.
-		//
-		// This avoids flapping nodes in the UI and unnecessary churn in the network.
-		// This is not my favourite solution, but it kind of works in our eventually consistent world.
-		//
-		// When another session already replaced this one (stillConnected), skip
-		// the wait — but never the release itself. A cancelled map request whose
-		// handler ran late is exactly such a session: if it kept its session
-		// acquired on this path, the surviving session's release could never
-		// take the node offline (the relogin flake).
-		// A deleted or expired node cannot return online through a map
-		// reconnect, so release its session without the reconnect grace.
-		// See: https://github.com/juanfont/headscale/issues/3410
+		// A node that drops its stream often reconnects within seconds
+		// (mobile clients, network weather). Wait a little before marking
+		// it offline so it does not flap; a reconnect's own Connect keeps
+		// it online either way. A session replaced by another skips the
+		// wait but still releases. A deleted or expired node cannot come
+		// back through a map reconnect, so it skips the grace.
 		node, nodeExists := m.h.state.GetNodeByID(m.node.ID)
 
 		if !stillConnected && nodeExists && !node.IsExpired() {
-			// Wait up to 10 seconds for the node to reconnect.
-			// 10 seconds was arbitrary chosen as a reasonable time to reconnect.
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
 
 		waitForReconnect:
 			for range 10 {
-				if m.h.mapBatcher.IsConnected(m.node.ID) {
+				if m.h.mapHub.IsConnected(m.node.ID) {
 					break
 				}
 
 				select {
-				case <-m.h.mapBatcher.Done():
+				case <-m.h.mapHub.Done():
 					// Reconnect grace has no purpose once the server is stopping.
 					break waitForReconnect
 				case <-ticker.C:
@@ -233,10 +279,7 @@ func (m *mapSession) serveLongPoll() {
 			}
 		}
 
-		// Release this session. The node goes offline exactly when the last
-		// live session is released, so releases from replaced or stale
-		// sessions are harmless regardless of the order they run in.
-		disconnectChanges, err := m.h.state.Disconnect(m.node.ID, connectGen)
+		err := m.h.state.Disconnect(m.node.ID, connectGen)
 		if err != nil {
 			// A node deleted mid-session is gone by the time its own session
 			// releases; that is the expected order, not a failure.
@@ -247,13 +290,8 @@ func (m *mapSession) serveLongPoll() {
 			}
 		}
 
-		if len(disconnectChanges) == 0 {
-			return
-		}
-
-		m.h.Change(disconnectChanges...)
 		m.afterServeLongPoll()
-		m.log.Info().Caller().Str(zf.Chan, fmt.Sprintf("%p", m.ch)).Msg("node has disconnected")
+		m.log.Info().Caller().Msg("node has disconnected")
 	}()
 
 	ctx, cancel := context.WithCancel(context.WithValue(m.ctx, nodeNameContextKey, m.node.Hostname))
@@ -261,72 +299,62 @@ func (m *mapSession) serveLongPoll() {
 
 	m.keepAliveTicker = time.NewTicker(m.keepAlive)
 
-	// Process the initial [tailcfg.MapRequest] to update node state (endpoints, hostinfo, etc.)
-	// This must be done BEFORE calling [state.State.Connect] to ensure routes are properly synchronized.
-	// When nodes reconnect, they send their hostinfo with announced routes in the [tailcfg.MapRequest].
-	// We need this data in [state.NodeStore] before [state.State.Connect] sets up the primary routes, because
-	// [types.NodeView.SubnetRoutes] calculates the intersection of announced and approved routes. If we
-	// call [state.State.Connect] first, [types.NodeView.SubnetRoutes] returns empty (no announced routes yet), causing
-	// the node to be incorrectly removed from AvailableRoutes.
-	mapReqChange, err := m.h.state.UpdateNodeFromMapRequest(m.node.ID, m.req)
+	// Streaming requests are read-only since capability 68: their captured
+	// payload may predate an explicit update or reauthentication.
+	// Join before rendering the initial map, so a change committed between
+	// the two wakes the loop instead of being lost.
+	sess = m.h.mapHub.Join(m.node.ID, m.stop)
+	m.hubSession.Store(sess)
+
+	if sess == nil {
+		httpError(m.w, errServerShuttingDown)
+
+		return
+	}
+
+	connectGen = m.h.state.Connect(m.node.ID)
+	if connectGen == 0 {
+		// An empty 200 would make the client retry an unexpected EOF (#3346).
+		httpError(m.w, state.ErrNodeNotFound)
+
+		return
+	}
+
+	// Cancel ephemeral GC only after Connect succeeds, or a departed node
+	// whose reconnect failed would have no deletion timer (issue #3382).
+	// Cancelling a node without a timer does nothing.
+	m.h.ephemeralGC.Cancel(m.node.ID)
+
+	m.log.Info().Caller().Msg("node has connected")
+
+	stream := mapper.NewStream(m.h.cfg, m.h.mapHub, m.node.ID, m.capVer)
+	stream.Attach(sess)
+
+	initial, ok, err := m.renderFirst(ctx.Done(), stream)
+	if !ok {
+		return
+	}
+
 	if err != nil {
-		m.h.Change(mapReqChange)
-
-		m.log.Error().Caller().Err(err).Msg("failed to update node from initial MapRequest")
-		// Write an explicit error rather than returning silently: a bare
-		// return leaves net/http to send an empty 200, which the client
-		// reads as "unexpected EOF" and retries forever (issue #3346).
+		m.log.Error().Caller().Err(err).Msg("failed to render initial map")
 		httpError(m.w, err)
 
 		return
 	}
 
-	// Connect the node after its state has been updated.
-	// We send two separate change notifications because these are distinct operations:
-	// 1. [state.State.UpdateNodeFromMapRequest]: processes the client's reported state (routes, endpoints, hostinfo)
-	// 2. [state.State.Connect]: marks the node online and recalculates primary routes based on the updated state
-	// While this results in two notifications, it ensures route data is synchronized before
-	// primary route selection occurs, which is critical for proper HA subnet router failover.
-	var connectChanges []change.Change
-
-	connectChanges, connectGen = m.h.state.Connect(m.node.ID)
-
-	// Cancel ephemeral GC only after Connect succeeds. Cancelling at the start
-	// of serveLongPoll left departed nodes without a deletion timer when a
-	// reconnect attempt failed before Connect (issue #3382).
-	if m.node.IsEphemeral() {
-		m.h.ephemeralGC.Cancel(m.node.ID)
-	}
-
-	m.log.Info().Caller().Str(zf.Chan, fmt.Sprintf("%p", m.ch)).Msg("node has connected")
-
-	// TODO(kradalby): Redo the comments here
-	// Add node to batcher so it can receive updates,
-	// adding this before connecting it to the state ensure that
-	// it does not miss any updates that might be sent in the split
-	// time between the node connecting and the batcher being ready.
-	if err := m.h.mapBatcher.AddNode(m.node.ID, m.ch, m.capVer, m.stopFromBatcher); err != nil { //nolint:noinlineerr
-		m.log.Error().Caller().Err(err).Msg("failed to add node to batcher")
-		// The map request already changed state other nodes must see.
-		m.h.Change(mapReqChange)
-
-		// Write an explicit error rather than returning silently: a bare
-		// return leaves net/http to send an empty 200, which the client
-		// reads as "unexpected EOF" and retries forever (issue #3346).
-		httpError(m.w, err)
-
+	if !m.writeAll(initial) {
 		return
 	}
 
-	m.log.Debug().Caller().Msg("node added to batcher")
+	stream.Delivered()
 
-	m.h.Change(mapReqChange)
-	m.h.Change(connectChanges...)
+	// coalesce bounds how often an update is rendered, so a burst of
+	// writes reaches the client as one update.
+	coalesce := m.h.cfg.Tuning.BatchChangeDelay
 
-	// Loop through updates and continuously send them to the
-	// client.
+	var lastUpdate time.Time
+
 	for {
-		// consume channels with update, keep alives or "batch" blocking signals
 		select {
 		case <-m.cancelCh:
 			m.log.Trace().Caller().Msg("poll cancelled received")
@@ -335,34 +363,47 @@ func (m *mapSession) serveLongPoll() {
 			return
 
 		case <-ctx.Done():
-			m.log.Trace().Caller().Str(zf.Chan, fmt.Sprintf("%p", m.ch)).Msg("poll context done")
+			m.log.Trace().Caller().Msg("poll context done")
 			mapResponseEnded.WithLabelValues("done").Inc()
 
 			return
 
-		// Consume updates sent to node
-		case update, ok := <-m.ch:
-			m.log.Trace().Caller().Bool(zf.OK, ok).Msg("received update from channel")
-
-			if !ok {
-				m.log.Trace().Caller().Msg("update channel closed, streaming session is likely being replaced")
-				return
+		case <-sess.Wakes():
+			if wait := coalesce - time.Since(lastUpdate); wait > 0 {
+				select {
+				case <-time.After(wait):
+				case <-ctx.Done():
+					return
+				case <-m.cancelCh:
+					return
+				}
 			}
 
-			err := m.writeMap(update)
-			if errors.Is(err, errMapSessionStopped) {
-				mapResponseEnded.WithLabelValues("cancelled").Inc()
+			lastUpdate = time.Now()
+
+			resps, err := stream.Update(m.h.state.Snapshot())
+			if errors.Is(err, mapper.ErrNodeGone) {
+				m.log.Info().Caller().Msg("node removed, ending map session")
 
 				return
 			}
 
 			if err != nil {
-				m.log.Error().Caller().Err(err).Msg("cannot write update to client")
+				m.log.Error().Caller().Err(err).Msg("rendering map update")
+
+				continue
+			}
+
+			if !m.writeAll(resps) {
 				return
 			}
 
-			m.log.Trace().Caller().Msg("update sent")
-			m.resetKeepAlive()
+			stream.Delivered()
+
+		case pr := <-sess.Pings():
+			if !m.writeAll(stream.Ping(pr)) {
+				return
+			}
 
 		case <-m.keepAliveTicker.C:
 			err := m.writeMap(&keepAlive)
@@ -387,13 +428,42 @@ func (m *mapSession) serveLongPoll() {
 	}
 }
 
+// writeAll writes resps in order and reports whether the stream is still
+// usable.
+func (m *mapSession) writeAll(resps []*tailcfg.MapResponse) bool {
+	for _, resp := range resps {
+		err := m.writeMap(resp)
+		if errors.Is(err, errMapSessionStopped) {
+			mapResponseEnded.WithLabelValues("cancelled").Inc()
+
+			return false
+		}
+
+		if err != nil {
+			m.log.Error().Caller().Err(err).Msg("cannot write update to client")
+			mapResponseSent.WithLabelValues("error", "update").Inc()
+
+			return false
+		}
+
+		mapResponseSent.WithLabelValues("ok", "update").Inc()
+	}
+
+	if len(resps) > 0 {
+		m.resetKeepAlive()
+	}
+
+	return true
+}
+
 // writeMap writes the map response to the client.
 // It handles compression if requested and any headers that need to be set.
 // It also handles flushing the response if the [http.ResponseWriter]
 // implements [http.Flusher].
 func (m *mapSession) writeMap(msg *tailcfg.MapResponse) error {
-	m.writing.Store(true)
-	defer m.writing.Store(false)
+	seq := m.writeSeq.Add(1)
+
+	defer m.writing.Store(0)
 
 	if m.cancelChClosed.Load() {
 		return errMapSessionStopped
@@ -401,14 +471,41 @@ func (m *mapSession) writeMap(msg *tailcfg.MapResponse) error {
 
 	startWrite := time.Now()
 
-	err := writeMapResponse(m.w, m.req.Compress, m.isStreaming(), msg)
+	// A slow reader keeps the write moving; one that stops reading for the
+	// budget is taken as gone. Armed by the first progress, once the frame
+	// is encoded: encoding is the server's time, not the client's.
+	stalled := time.AfterFunc(m.stallTimeout, func() { m.stallWrite(seq) })
+	stalled.Stop()
+
+	defer stalled.Stop()
+
+	progress := func() { stalled.Reset(m.stallTimeout) }
+
+	// Sessions sending the same update share its encoding.
+	encode := func(msg *tailcfg.MapResponse, compress bool) ([]byte, error) {
+		body, err := m.h.mapHub.Encode(msg, compress, encodeMapResponse)
+		if err != nil {
+			return nil, err
+		}
+
+		// Encoding may outlast the stop grace. A stopped session sends no
+		// frame; only a write already sending needs a deadline to interrupt it.
+		m.writing.Store(seq)
+
+		if m.cancelChClosed.Load() {
+			return nil, errMapSessionStopped
+		}
+
+		return body, nil
+	}
+
+	err := writeMapFrame(m.w, m.isStreaming(), msg, m.req.Compress == util.ZstdCompression, encode, progress)
 	if err != nil {
 		return err
 	}
 
 	m.log.Trace().
 		Caller().
-		Str(zf.Chan, fmt.Sprintf("%p", m.ch)).
 		TimeDiff("timeSpent", time.Now(), startWrite).
 		Str(zf.MachineKey, m.node.MachineKey.String()).
 		Bool("keepalive", msg.KeepAlive).
@@ -425,13 +522,42 @@ func (m *mapSession) writeMap(msg *tailcfg.MapResponse) error {
 // It is shared with the deleted-node path in [noiseServer.PollNetMapHandler],
 // which has no [mapSession] to write through.
 func writeMapResponse(w http.ResponseWriter, compress string, flush bool, msg *tailcfg.MapResponse) error {
-	jsonBody, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("marshalling map response: %w", err)
+	return writeMapFrame(w, flush, msg, compress == util.ZstdCompression, encodeMapResponse, nil)
+}
+
+// encodeMapResponse marshals msg and, when compress, zstd compresses it.
+func encodeMapResponse(msg *tailcfg.MapResponse, compress bool) ([]byte, error) {
+	if msg == &keepAlive {
+		return keepAliveFrame(compress)
 	}
 
-	if compress == util.ZstdCompression {
+	jsonBody, err := mapper.Marshal(msg)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling map response: %w", err)
+	}
+
+	if compress {
 		jsonBody = zstdframe.AppendEncode(nil, jsonBody, zstdframe.FastestCompression)
+	}
+
+	return jsonBody, nil
+}
+
+// writeMapFrame writes msg encoded by encode, length prefixed.
+// When streaming it writes in chunks, calling progress once the frame is
+// encoded and after each chunk the client accepted, so a caller can tell a
+// slow reader from a stopped one.
+func writeMapFrame(
+	w http.ResponseWriter,
+	flush bool,
+	msg *tailcfg.MapResponse,
+	compress bool,
+	encode func(*tailcfg.MapResponse, bool) ([]byte, error),
+	progress func(),
+) error {
+	jsonBody, err := encode(msg, compress)
+	if err != nil {
+		return err
 	}
 
 	data := make([]byte, reservedResponseHeaderSize, reservedResponseHeaderSize+len(jsonBody))
@@ -439,20 +565,84 @@ func writeMapResponse(w http.ResponseWriter, compress string, flush bool, msg *t
 	binary.LittleEndian.PutUint32(data, uint32(len(jsonBody)))
 	data = append(data, jsonBody...)
 
-	_, err = w.Write(data)
-	if err != nil {
+	if progress != nil {
+		progress()
+	}
+
+	if !flush {
+		_, err = w.Write(data)
+
 		return err
 	}
 
-	if flush {
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		} else {
+	for chunk := range slices.Chunk(data, frameChunkSize) {
+		_, err = w.Write(chunk)
+		if err != nil {
+			return err
+		}
+
+		// HTTP/2 buffers a small write, so only the flush can fail.
+		err = flushError(w)
+		if errors.Is(err, http.ErrNotSupported) {
 			log.Error().Caller().Msg("responseWriter does not implement http.Flusher, cannot flush")
+		} else if err != nil {
+			return err
+		}
+
+		if progress != nil {
+			progress()
 		}
 	}
 
 	return nil
+}
+
+// flushError flushes w and returns the error of the writer it wraps: the
+// middleware wrapping the poll's writer implements only Flush, which drops
+// it, and [http.ResponseController] would stop there.
+func flushError(w http.ResponseWriter) error {
+	for inner := w; ; {
+		if f, ok := inner.(interface{ FlushError() error }); ok {
+			return f.FlushError()
+		}
+
+		u, ok := inner.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+
+		inner = u.Unwrap()
+	}
+
+	return http.NewResponseController(w).Flush()
+}
+
+// frameChunkSize is how much of a frame is written before checking the
+// client keeps reading.
+const frameChunkSize = 16 << 10
+
+// keepAliveFrame returns keepAlive encoded, which every session sends.
+func keepAliveFrame(compress bool) ([]byte, error) {
+	i := 0
+	if compress {
+		i = 1
+	}
+
+	f := &keepAliveFrames[i]
+	f.once.Do(func() {
+		f.b, f.err = json.Marshal(&keepAlive)
+		if f.err == nil && compress {
+			f.b = zstdframe.AppendEncode(nil, f.b, zstdframe.FastestCompression)
+		}
+	})
+
+	return f.b, f.err
+}
+
+var keepAliveFrames [2]struct {
+	once sync.Once
+	b    []byte
+	err  error
 }
 
 var keepAlive = tailcfg.MapResponse{

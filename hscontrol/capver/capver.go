@@ -29,7 +29,7 @@ const fullNetmapRemovalsCapVer tailcfg.CapabilityVersion = 148
 // All capability-version-gated cleanups should be registered here.
 func CanOldCodeBeCleanedUp() {
 	if MinSupportedCapabilityVersion >= fullNetmapRemovalsCapVer {
-		panic("the tailscale/tailscale#15660 compat can be cleaned up: grep for it (hscontrol/mapper/batcher.go and its tests)")
+		panic("the tailscale/tailscale#15660 compat can be cleaned up: grep for it (hscontrol/mapper/diff.go and its tests)")
 	}
 }
 

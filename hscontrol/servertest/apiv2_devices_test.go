@@ -36,7 +36,7 @@ func setBaselinePolicy(t *testing.T, srv *servertest.TestServer) {
 	_, err = st.SetPolicyInDB(baselinePolicy)
 	require.NoError(t, err)
 
-	_, err = st.ReloadPolicy()
+	err = st.ReloadPolicy()
 	require.NoError(t, err)
 }
 
@@ -133,7 +133,7 @@ func apiv2DevicesGoClient(t *testing.T, srv *servertest.TestServer, baseURL, api
 
 	// SetKey — seed a real expiry first so disabling it is a state transition.
 	future := time.Now().Add(24 * time.Hour)
-	_, _, err = srv.State().SetNodeExpiry(id, &future)
+	_, err = srv.State().SetNodeExpiry(id, &future)
 	require.NoError(t, err)
 	require.True(t, srvNodeView(t, srv, id).Expiry().Valid())
 
@@ -301,7 +301,7 @@ func apiv2DevicesTSCLI(t *testing.T, srv *servertest.TestServer, baseURL, apiKey
 
 	// Key — seed a real expiry first so disabling it is a transition.
 	future := time.Now().Add(24 * time.Hour)
-	_, _, err := srv.State().SetNodeExpiry(id, &future)
+	_, err := srv.State().SetNodeExpiry(id, &future)
 	require.NoError(t, err)
 
 	run("set", "device", "key", "--device", deviceID, "--disable-expiry")
@@ -353,6 +353,17 @@ func apiv2SettingsTSCLI(t *testing.T, baseURL, apiKey string) {
 // devicesACLTFConfig exercises Terraform device + ACL data sources AND resources.
 // %s is the test node's hostname (the tailscale_device data source key).
 const devicesACLTFConfig = `
+terraform {
+  required_providers {
+    tailscale = {
+      source  = "tailscale/tailscale"
+      version = "~> 0.21"
+    }
+  }
+}
+
+provider "tailscale" {}
+
 resource "tailscale_acl" "policy" {
   acl = jsonencode({
     tagOwners = { "tag:ci" = ["apiv2@"] }
@@ -406,10 +417,10 @@ output "enabled_routes" { value = tailscale_device_subnet_routes.dut.routes }
 // outputs (read path) against the server truth, and the resulting server state
 // (write path). parallelism=1 avoids racing concurrent mutations on the one
 // shared node.
-func apiv2DevicesACLTerraform(t *testing.T, version string, srv *servertest.TestServer, baseURL, apiKey, hostname string, id types.NodeID) {
+func apiv2DevicesACLTerraform(t *testing.T, srv *servertest.TestServer, baseURL, apiKey, hostname string, id types.NodeID) {
 	t.Helper()
 
-	tf := newTofu(t, version, baseURL, apiKey, fmt.Sprintf(devicesACLTFConfig, hostname))
+	tf := newTofu(t, baseURL, apiKey, fmt.Sprintf(devicesACLTFConfig, hostname))
 
 	tf.run("init", "-no-color", "-input=false")
 	tf.run("apply", "-auto-approve", "-no-color", "-input=false", "-parallelism=1")

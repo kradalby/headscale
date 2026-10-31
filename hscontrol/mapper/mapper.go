@@ -1,3 +1,7 @@
+// Package mapper turns world snapshots into the map responses each session
+// sends. A [Hub] tracks live sessions and wakes those a commit can reach
+// ([Route]); each session's [Stream] renders its node's map from the latest
+// snapshot and sends the difference from what it last sent.
 package mapper
 
 import (
@@ -14,9 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/rs/zerolog/log"
 	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
@@ -31,39 +33,6 @@ const (
 )
 
 var debugDumpMapResponsePath = envknob.String("HEADSCALE_DEBUG_DUMP_MAPRESPONSE_PATH")
-
-// TODO: Optimise
-// As this work continues, the idea is that there will be one Mapper instance
-// per node, attached to the open stream between the control and client.
-// This means that this can hold a state per node and we can use that to
-// improve the mapresponses sent.
-// We could:
-// - Keep information about the previous mapresponse so we can send a diff
-// - Store hashes
-// - Create a "minifier" that removes info not needed for the node
-// - some sort of batching, wait for 5 or 60 seconds before sending
-
-type mapper struct {
-	// Configuration
-	state   *state.State
-	cfg     *types.Config
-	batcher *Batcher
-
-	created time.Time
-}
-
-func newMapper(
-	cfg *types.Config,
-	state *state.State,
-) *mapper {
-	// uid, _ := util.GenerateRandomStringDNSSafe(mapperIDLength)
-	return &mapper{
-		state: state,
-		cfg:   cfg,
-
-		created: time.Now(),
-	}
-}
 
 // generateUserProfiles creates user profiles for [tailcfg.MapResponse].
 func generateUserProfiles(
@@ -262,221 +231,7 @@ func addNextDNSMetadata(resolvers []*dnstype.Resolver, node types.NodeView) {
 	}
 }
 
-// fullMapResponse returns a [tailcfg.MapResponse] for the given node.
-//
-//nolint:unused
-func (m *mapper) fullMapResponse(
-	nodeID types.NodeID,
-	capVer tailcfg.CapabilityVersion,
-) (*tailcfg.MapResponse, error) {
-	peers := m.state.ListPeers(nodeID)
-
-	return m.NewMapResponseBuilder(nodeID).
-		WithDebugType(fullResponseDebug).
-		WithCapabilityVersion(capVer).
-		WithSelfNode().
-		WithDERPMap().
-		WithDomain().
-		WithCollectServicesDisabled().
-		WithDebugConfig().
-		WithSSHPolicy().
-		WithDNSConfig().
-		WithUserProfiles(peers).
-		WithPacketFilters().
-		WithPeers(peers).
-		Build()
-}
-
-func (m *mapper) selfMapResponse(
-	nodeID types.NodeID,
-	capVer tailcfg.CapabilityVersion,
-) (*tailcfg.MapResponse, error) {
-	ma, err := m.NewMapResponseBuilder(nodeID).
-		WithDebugType(selfResponseDebug).
-		WithCapabilityVersion(capVer).
-		WithSelfNode().
-		Build()
-	if err != nil {
-		return nil, err
-	}
-
-	// Set the peers to nil, to ensure the node does not think
-	// its getting a new list.
-	ma.Peers = nil
-
-	return ma, err
-}
-
-// policyChangeResponse creates a [tailcfg.MapResponse] for policy changes.
-// Peers no longer visible after the change are sent separately, see
-// [handleNodeChange]. It sends:
-//   - PeersChanged for remaining peers (their AllowedIPs may have changed due to policy)
-//   - Updated PacketFilters
-//   - Updated SSHPolicy (SSH rules may reference users/groups that changed);
-//     dropped per connection when unchanged, see [connectionEntry.withSSHPolicyDelta]
-//   - The node's own self info, which renders from the same state as peers;
-//     dropped per connection when unchanged, see [connectionEntry.withSelfDelta]
-//
-// DNSConfig is left out: it forces clients into a full netmap rebuild, and
-// the node's DNS config inputs arrive with its own [change.SelfUpdate], see
-// [state.State.DrainSelfRefreshes].
-//
-// This avoids the issue where an empty Peers slice is interpreted by Tailscale
-// clients as "no change" rather than "no peers".
-func (m *mapper) policyChangeResponse(
-	nodeID types.NodeID,
-	capVer tailcfg.CapabilityVersion,
-	currentPeers views.Slice[types.NodeView],
-) (*tailcfg.MapResponse, error) {
-	builder := m.NewMapResponseBuilder(nodeID).
-		WithDebugType(policyResponseDebug).
-		WithCapabilityVersion(capVer).
-		WithPacketFilters().
-		WithSSHPolicy().
-		WithSelfNode()
-
-	// Send remaining peers in PeersChanged - their AllowedIPs may have
-	// changed due to the policy update (e.g., different routes allowed).
-	// Cross-user peers must also carry their user profile, otherwise the
-	// client's netmap shows the peer without a UserProfiles[user] entry.
-	if currentPeers.Len() > 0 {
-		builder.WithUserProfiles(currentPeers)
-		builder.WithPeerChanges(currentPeers)
-	}
-
-	return builder.Build()
-}
-
-// buildFromChange builds a [tailcfg.MapResponse] from a [change.Change] specification.
-// This provides fine-grained control over what gets included in the response.
-func (m *mapper) buildFromChange(
-	nodeID types.NodeID,
-	capVer tailcfg.CapabilityVersion,
-	resp *change.Change,
-) (*tailcfg.MapResponse, error) {
-	if resp.IsEmpty() {
-		return nil, nil //nolint:nilnil // Empty response means nothing to send, not an error
-	}
-
-	// If this is a self-update (the changed node is the receiving node),
-	// send a self-update response to ensure the node sees its own changes.
-	if resp.OriginNode != 0 && resp.OriginNode == nodeID {
-		return m.selfMapResponse(nodeID, capVer)
-	}
-
-	builder := m.NewMapResponseBuilder(nodeID).
-		WithCapabilityVersion(capVer).
-		WithDebugType(changeResponseDebug)
-
-	// Clients forget the logtail instruction when their process restarts, and
-	// every stream opens with a full map, so full maps carry it.
-	if resp.IsFull() {
-		builder.WithDebugConfig()
-	}
-
-	if resp.IncludeSelf {
-		builder.WithSelfNode()
-	}
-
-	if resp.IncludeDERPMap {
-		builder.WithDERPMap()
-	}
-
-	if resp.IncludeDNS {
-		builder.WithDNSConfig()
-	}
-
-	if resp.IncludeDomain {
-		builder.WithDomain()
-	}
-
-	if resp.IncludePolicy {
-		builder.WithPacketFilters()
-		builder.WithSSHPolicy()
-	}
-
-	if resp.SendAllPeers {
-		peers := m.state.ListPeers(nodeID)
-		builder.WithUserProfiles(peers)
-		builder.WithPeers(peers)
-	} else {
-		if len(resp.PeersChanged) > 0 {
-			// Visibility may leave none of the changed peers for this
-			// recipient; the profiles would then carry only its own
-			// user, which it already holds.
-			if peers := m.state.ListPeers(nodeID, resp.PeersChanged...); peers.Len() > 0 {
-				builder.WithUserProfiles(peers)
-				builder.WithPeerChanges(peers)
-			}
-		}
-
-		if len(resp.PeersRemoved) > 0 {
-			builder.WithPeersRemoved(resp.PeersRemoved...)
-		}
-	}
-
-	patches := m.filterVisiblePeerPatches(nodeID, resp.PeerPatches)
-	if len(patches) > 0 {
-		builder.WithPeerChangedPatch(patches)
-	}
-
-	if resp.PingRequest != nil {
-		builder.WithPingRequest(resp.PingRequest)
-	}
-
-	return builder.Build()
-}
-
-// filterVisiblePeerPatches drops peer-change patches whose target is not in
-// the recipient's NodeStore peer map, the same set
-// [MapResponseBuilder.buildTailPeers] is fed from. Without it, online/offline,
-// endpoint, and key-expiry patches disclose the existence, presence, and
-// addresses of peers the recipient's policy forbids it from accessing.
-func (m *mapper) filterVisiblePeerPatches(
-	nodeID types.NodeID,
-	patches []*tailcfg.PeerChange,
-) []*tailcfg.PeerChange {
-	if len(patches) == 0 {
-		return patches
-	}
-
-	// Key by tailcfg.NodeID so patches are looked up by patch.NodeID
-	// directly, avoiding an unchecked int64->uint64 conversion.
-	peers := m.state.ListPeers(nodeID)
-
-	visible := make(map[tailcfg.NodeID]struct{}, peers.Len())
-	for _, peer := range peers.All() {
-		visible[peer.ID().NodeID()] = struct{}{}
-	}
-
-	return filterByVisible(visible, patches, func(p *tailcfg.PeerChange) tailcfg.NodeID {
-		return p.NodeID
-	})
-}
-
-// filterByVisible keeps only the items whose key resolves to a NodeID present
-// in the visible set, preserving input order.
-func filterByVisible[T any](
-	visible map[tailcfg.NodeID]struct{},
-	items []T,
-	key func(T) tailcfg.NodeID,
-) []T {
-	var filtered []T
-
-	for _, it := range items {
-		if _, ok := visible[key(it)]; ok {
-			filtered = append(filtered, it)
-		}
-	}
-
-	return filtered
-}
-
-func writeDebugMapResponse(
-	resp *tailcfg.MapResponse,
-	t debugType,
-	nodeID types.NodeID,
-) {
+func writeDebugMapResponse(resp *tailcfg.MapResponse, nodeID types.NodeID) {
 	body, err := json.MarshalIndent(resp, "", "  ")
 	if err != nil {
 		panic(err)
@@ -494,7 +249,7 @@ func writeDebugMapResponse(
 
 	mapResponsePath := path.Join(
 		mPath,
-		fmt.Sprintf("%s-%s.json", now, t),
+		now+".json",
 	)
 
 	log.Trace().Msgf("writing MapResponse to %s", mapResponsePath)
@@ -505,7 +260,9 @@ func writeDebugMapResponse(
 	}
 }
 
-func (m *mapper) debugMapResponses() (map[types.NodeID][]tailcfg.MapResponse, error) {
+// DebugMapResponses returns the map responses dumped to
+// HEADSCALE_DEBUG_DUMP_MAPRESPONSE_PATH, or nil when dumping is off.
+func DebugMapResponses() (map[types.NodeID][]tailcfg.MapResponse, error) {
 	if debugDumpMapResponsePath == "" {
 		return nil, nil //nolint:nilnil // intentional: no data when debug path not set
 	}

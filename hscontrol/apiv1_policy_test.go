@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -166,21 +165,13 @@ func createFilePolicyApp(t *testing.T) *Headscale {
 		},
 		Tuning: types.Tuning{
 			BatchChangeDelay: 100 * time.Millisecond,
-			BatcherWorkers:   1,
 		},
 	}
 
 	app, err := NewHeadscale(&cfg)
 	require.NoError(t, err)
 
-	app.mapBatcher = mapper.NewBatcherAndMapper(&cfg, app.state)
-	app.mapBatcher.Start()
-
-	t.Cleanup(func() {
-		if app.mapBatcher != nil {
-			app.mapBatcher.Close()
-		}
-	})
+	t.Cleanup(app.mapHub.Close)
 
 	return app
 }

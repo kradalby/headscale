@@ -1,21 +1,21 @@
 package hscontrol
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"net/http"
-	"net/netip"
 	"net/url"
+	"runtime/pprof"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/mapper"
-	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
@@ -593,7 +593,7 @@ func TestAuthenticationFlows(t *testing.T) {
 
 				// Expire the node
 				expiredTime := time.Now().Add(-1 * time.Hour)
-				_, _, err = app.state.SetNodeExpiry(node.ID(), &expiredTime)
+				_, err = app.state.SetNodeExpiry(node.ID(), &expiredTime)
 
 				return "", err
 			},
@@ -688,10 +688,9 @@ func TestAuthenticationFlows(t *testing.T) {
 				}
 
 				nodeToRegister := types.NewRegisterAuthRequest(&types.RegistrationData{
-					MachineKey: machineKey1.Public(),
-					Hostname:   "followup-success-node",
+					Hostname: "followup-success-node",
 				})
-				require.NoError(t, app.state.SetAuthCacheEntry(regID, nodeToRegister))
+				app.state.SetAuthCacheEntry(regID, nodeToRegister)
 
 				// Simulate successful registration
 				// [Headscale.handleRegister] will receive the value when it starts waiting
@@ -736,10 +735,9 @@ func TestAuthenticationFlows(t *testing.T) {
 				}
 
 				nodeToRegister := types.NewRegisterAuthRequest(&types.RegistrationData{
-					MachineKey: machineKey1.Public(),
-					Hostname:   "followup-timeout-node",
+					Hostname: "followup-timeout-node",
 				})
-				require.NoError(t, app.state.SetAuthCacheEntry(regID, nodeToRegister))
+				app.state.SetAuthCacheEntry(regID, nodeToRegister)
 				// Don't call FinishRegistration - will timeout
 
 				return fmt.Sprintf("http://localhost:8080/register/%s", regID), nil
@@ -1222,7 +1220,7 @@ func TestAuthenticationFlows(t *testing.T) {
 					assert.True(c, found)
 				}, 1*time.Second, 50*time.Millisecond)
 
-				_, _, err = app.state.SetNodeTags(node.ID(), []string{"tag:admin"})
+				_, err = app.state.SetNodeTags(node.ID(), []string{"tag:admin"})
 				require.NoError(t, err)
 
 				spent, err := app.state.GetPreAuthKey(pak.Key)
@@ -1574,10 +1572,9 @@ func TestAuthenticationFlows(t *testing.T) {
 				}
 
 				nodeToRegister := types.NewRegisterAuthRequest(&types.RegistrationData{
-					MachineKey: machineKey1.Public(),
-					Hostname:   "nil-response-node",
+					Hostname: "nil-response-node",
 				})
-				require.NoError(t, app.state.SetAuthCacheEntry(regID, nodeToRegister))
+				app.state.SetAuthCacheEntry(regID, nodeToRegister)
 
 				// Simulate registration that returns empty NodeView (cache expired during auth)
 				go func() {
@@ -1645,8 +1642,15 @@ func TestAuthenticationFlows(t *testing.T) {
 		},
 
 		// === AUTH PROVIDER EDGE CASES ===
-		// Interactive registration retains auth metadata. The first map request
-		// supplies the remaining Hostinfo fields.
+		// TEST: Interactive workflow preserves custom hostinfo
+		// WHAT: Tests that custom hostinfo fields are preserved through interactive flow
+		// INPUT: Interactive registration with detailed hostinfo (OS, version, model)
+		// EXPECTED: Node registers with all hostinfo fields preserved
+		// WHY: Ensures interactive flow doesn't lose custom hostinfo data
+		// NOTE: RequestTags are NOT tested here because tag authorization via
+		// advertise-tags requires the user to have existing nodes (for IP-based
+		// ownership verification). New users registering their first node cannot
+		// claim tags via RequestTags - they must use a tagged PreAuthKey instead.
 		{
 			name: "interactive_workflow_with_custom_hostinfo",
 			setupFunc: func(t *testing.T, app *Headscale) (string, error) { //nolint:thelper
@@ -1673,29 +1677,15 @@ func TestAuthenticationFlows(t *testing.T) {
 			validateCompleteResponse: true,
 			expectedAuthURLPattern:   "/register/",
 			validate: func(t *testing.T, resp *tailcfg.RegisterResponse, app *Headscale) { //nolint:thelper
-				// Confirm the minimal cached report, then restore the operational fields.
+				// Verify custom hostinfo was preserved through interactive workflow
 				node, found := app.state.GetNodeByNodeKey(nodeKey1.Public())
 				assert.True(t, found, "node should be found after interactive registration")
 
 				if found {
 					assert.Equal(t, "custom-interactive-node", node.Hostname())
 					assert.Equal(t, "linux", node.Hostinfo().OS())
-					assert.Empty(t, node.Hostinfo().OSVersion())
-					assert.Empty(t, node.Hostinfo().DeviceModel())
-
-					_, err := app.state.UpdateNodeFromMapRequest(node.ID(), tailcfg.MapRequest{
-						NodeKey: node.NodeKey(), DiscoKey: node.DiscoKey(),
-						Hostinfo: &tailcfg.Hostinfo{
-							Hostname: node.Hostname(), OS: "linux",
-							OSVersion: "20.04", DeviceModel: "server",
-						},
-					})
-					require.NoError(t, err)
-
-					updated, ok := app.state.GetNodeByID(node.ID())
-					require.True(t, ok)
-					assert.Equal(t, "20.04", updated.Hostinfo().OSVersion())
-					assert.Equal(t, "server", updated.Hostinfo().DeviceModel())
+					assert.Equal(t, "20.04", node.Hostinfo().OSVersion())
+					assert.Equal(t, "server", node.Hostinfo().DeviceModel())
 				}
 			},
 		},
@@ -2334,31 +2324,41 @@ func TestAuthenticationFlows(t *testing.T) {
 				// Start multiple concurrent followup requests
 				authURL := resp.AuthURL
 				numConcurrent := 3
-				results := make(chan error, numConcurrent)
+
+				type result struct {
+					resp *tailcfg.RegisterResponse
+					err  error
+				}
+
+				results := make(chan result, numConcurrent)
 
 				for i := range numConcurrent {
 					go func(index int) {
+						labelFollowup(t.Name())
+
+						// No expiry, as a client's followup carries none.
 						followupReq := tailcfg.RegisterRequest{
 							NodeKey:  nodeKey1.Public(),
 							Followup: authURL,
 							Hostinfo: &tailcfg.Hostinfo{
 								Hostname: fmt.Sprintf("concurrent-node-%d", index),
 							},
-							Expiry: time.Now().Add(24 * time.Hour),
 						}
 
-						_, err := app.handleRegister(context.Background(), followupReq, machineKey1.Public())
-						results <- err
+						resp, err := app.handleRegister(context.Background(), followupReq, machineKey1.Public())
+						results <- result{resp, err}
 					}(i)
 				}
 
-				// Complete the authentication to signal the waiting goroutines
-				// The goroutines will receive from the buffered channel when ready
+				// All three wait before the registration completes: the first
+				// gets the node, the others are sent to register again.
+				waitFollowupsParked(t, numConcurrent)
+
 				registrationID, err := extractRegistrationIDFromAuthURL(authURL)
 				require.NoError(t, err)
 
 				user := app.state.CreateUserForTest("concurrent-test-user")
-				_, _, err = app.state.HandleNodeFromAuthPath(
+				_, err = app.state.HandleNodeFromAuthPath(
 					registrationID,
 					types.UserID(user.ID),
 					nil,
@@ -2366,22 +2366,24 @@ func TestAuthenticationFlows(t *testing.T) {
 				)
 				require.NoError(t, err)
 
-				// Collect results - at least one should succeed
-				successCount := 0
+				authorized := 0
 
 				for range numConcurrent {
 					select {
-					case err := <-results:
-						if err == nil {
-							successCount++
+					case r := <-results:
+						require.NoError(t, r.err, "every waiting followup must be answered")
+
+						if r.resp.MachineAuthorized {
+							authorized++
+						} else {
+							assert.Contains(t, r.resp.AuthURL, "/register/", "the others are sent to register again")
 						}
 					case <-time.After(2 * time.Second):
-						// Some may timeout, which is expected
+						t.Fatal("a waiting followup was never answered")
 					}
 				}
 
-				// At least one concurrent request should have succeeded
-				assert.GreaterOrEqual(t, successCount, 1, "at least one concurrent registration should succeed")
+				assert.Equal(t, 1, authorized, "exactly one waiter gets the node")
 			},
 		},
 		// TEST: Interactive workflow with node key rotation attempt
@@ -2532,7 +2534,7 @@ func TestAuthenticationFlows(t *testing.T) {
 
 				// Try to complete authentication with invalid user ID (should cause error)
 				invalidUserID := types.UserID(99999) // Non-existent user
-				_, _, err = app.state.HandleNodeFromAuthPath(
+				_, err = app.state.HandleNodeFromAuthPath(
 					registrationID,
 					invalidUserID,
 					nil,
@@ -2666,16 +2668,18 @@ func TestAuthenticationFlows(t *testing.T) {
 				responseChan := make(chan *tailcfg.RegisterResponse, 1)
 				errorChan := make(chan error, 1)
 
+				// No Expiry: clients send one only to log out.
 				followupReq := tailcfg.RegisterRequest{
 					NodeKey:  nodeKey1.Public(),
 					Followup: authURL2,
 					Hostinfo: &tailcfg.Hostinfo{
 						Hostname: "pending-node-2",
 					},
-					Expiry: time.Now().Add(24 * time.Hour),
 				}
 
 				go func() {
+					labelFollowup(t.Name())
+
 					resp, err := app.handleRegister(context.Background(), followupReq, machineKey1.Public())
 					if err != nil {
 						errorChan <- err
@@ -2685,9 +2689,11 @@ func TestAuthenticationFlows(t *testing.T) {
 					responseChan <- resp
 				}()
 
+				waitFollowupsParked(t, 1)
+
 				// Complete authentication for second registration
 				// The goroutine will receive the node from the buffered channel
-				_, _, err = app.state.HandleNodeFromAuthPath(
+				_, err = app.state.HandleNodeFromAuthPath(
 					regID2,
 					types.UserID(user.ID),
 					nil,
@@ -2872,15 +2878,21 @@ func runInteractiveWorkflowTest(t *testing.T, tt struct {
 			if step.callAuthPath {
 				require.NotEmpty(t, registrationID, "registration ID should be available from previous step")
 
-				// Prepare followup request
+				// Prepare followup request. Clients send Expiry only to log
+				// out, so a followup carries none; one copied from the initial
+				// request would read as a key extension if the goroutine below
+				// runs after authentication completes.
 				followupReq := tt.request(dynamicValue)
 				followupReq.Followup = authURL
+				followupReq.Expiry = time.Time{}
 
 				// Start the followup request in a goroutine - it will wait for channel signal
 				responseChan := make(chan *tailcfg.RegisterResponse, 1)
 				errorChan := make(chan error, 1)
 
 				go func() {
+					labelFollowup(t.Name())
+
 					resp, err := app.handleRegister(context.Background(), followupReq, machineKey)
 					if err != nil {
 						errorChan <- err
@@ -2890,9 +2902,11 @@ func runInteractiveWorkflowTest(t *testing.T, tt struct {
 					responseChan <- resp
 				}()
 
+				waitFollowupsParked(t, 1)
+
 				// Complete the authentication - the goroutine will receive from the buffered channel
 				user := app.state.CreateUserForTest("interactive-test-user")
-				_, _, err = app.state.HandleNodeFromAuthPath(
+				_, err = app.state.HandleNodeFromAuthPath(
 					registrationID,
 					types.UserID(user.ID),
 					nil, // no custom expiry
@@ -2972,7 +2986,7 @@ func validateCompleteRegistrationResponse(t *testing.T, resp *tailcfg.RegisterRe
 }
 
 // Simple test to validate basic node creation and lookup.
-func TestNodeStoreLookup(t *testing.T) {
+func TestNodeLookupAfterCreate(t *testing.T) {
 	app := createTestApp(t)
 
 	machineKey := key.NewMachine()
@@ -3270,7 +3284,7 @@ func TestWebFlowReauthDifferentUser(t *testing.T) {
 
 	// Step 4: Admin completes authentication via CLI
 	// This simulates: headscale auth register --auth-id <id> --user user2
-	node, _, err := app.state.HandleNodeFromAuthPath(
+	node, err := app.state.HandleNodeFromAuthPath(
 		regID,
 		types.UserID(user2.ID), // Register to user2, not user1!
 		nil,                    // No custom expiry
@@ -3378,129 +3392,30 @@ func createTestApp(t *testing.T, options ...func(*types.Config)) *Headscale {
 		},
 		Tuning: types.Tuning{
 			BatchChangeDelay: 100 * time.Millisecond,
-			BatcherWorkers:   1,
 		},
 	}
 
-	for _, option := range options {
-		option(&cfg)
+	for _, opt := range options {
+		opt(&cfg)
 	}
 
 	app, err := NewHeadscale(&cfg)
 	require.NoError(t, err)
 
-	// Initialize and start the mapBatcher to handle Change() calls
-	app.mapBatcher = mapper.NewBatcherAndMapper(&cfg, app.state)
-	app.mapBatcher.Start()
+	// A test that swaps app.state closes this one itself.
+	created := app.state
 
-	// Clean up the batcher when the test finishes
 	t.Cleanup(func() {
-		if app.mapBatcher != nil {
-			app.mapBatcher.Close()
+		if app.state == created {
+			_ = created.Close()
 		}
 	})
 
+	// The hub's watch would otherwise outlive the test. Cleanups run last
+	// first: the hub closes before the state.
+	t.Cleanup(func() { app.mapHub.Close() })
+
 	return app
-}
-
-func TestRegistrationFollowupReleasesRejectedSession(t *testing.T) {
-	app := createTestApp(t, func(cfg *types.Config) {
-		cfg.Tuning.RegisterCacheMaxEntries = 1
-	})
-	defer func() { require.NoError(t, app.state.Close()) }()
-
-	machineKey := key.NewMachine().Public()
-	req := tailcfg.RegisterRequest{
-		NodeKey:  key.NewNode().Public(),
-		Hostinfo: &tailcfg.Hostinfo{Hostname: "rejected-registration"},
-	}
-	initial, err := app.handleRegisterInteractive(req, machineKey)
-	require.NoError(t, err)
-
-	req.Followup = initial.AuthURL
-	initialURL, err := url.Parse(initial.AuthURL)
-	require.NoError(t, err)
-	authID, err := types.AuthIDFromString(strings.TrimPrefix(initialURL.Path, "/register/"))
-	require.NoError(t, err)
-
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-
-	_, err = app.waitForFollowup(ctx, req.Followup, registrationDataFromRequest(req, machineKey))
-	require.ErrorIs(t, err, context.Canceled)
-
-	_, present := app.state.GetAuthCacheEntry(authID)
-	require.True(t, present, "a canceled poll must leave the pending session available")
-
-	body := fmt.Appendf(nil, `{"authId":%q}`, authID.String())
-	rejected := callHandler(newHumaTestHandler(app), http.MethodPost, "/api/v1/auth/reject", body)
-	require.Equal(t, http.StatusOK, rejected.status)
-
-	_, present = app.state.GetAuthCacheEntry(authID)
-	require.True(t, present, "the verdict must remain available until follow-up consumes it")
-
-	followup, err := app.waitForFollowup(t.Context(), req.Followup, registrationDataFromRequest(req, machineKey))
-	require.NoError(t, err, "consuming the rejection must free capacity for the replacement")
-	require.NotEmpty(t, followup.AuthURL)
-	require.NotEqual(t, initial.AuthURL, followup.AuthURL)
-
-	_, present = app.state.GetAuthCacheEntry(authID)
-	require.False(t, present, "the consumed session must release its slot")
-}
-
-func TestAuthAdmissionErrors(t *testing.T) {
-	for _, flow := range []string{"interactive", "followup", "ssh"} {
-		t.Run(flow, func(t *testing.T) {
-			app := createTestApp(t, func(cfg *types.Config) {
-				cfg.Tuning.RegisterCacheMaxEntries = 1
-			})
-			defer func() { require.NoError(t, app.state.Close()) }()
-
-			id := types.MustAuthID()
-			pending := types.NewAuthRequest()
-			require.NoError(t, app.state.SetAuthCacheEntry(id, pending))
-
-			if flow == "ssh" {
-				for range 64 {
-					require.NoError(t, app.state.SetAuthCacheEntry(types.MustAuthID(), types.NewSSHCheckAuthRequest(1, 2)))
-				}
-			}
-
-			req := tailcfg.RegisterRequest{
-				NodeKey:  key.NewNode().Public(),
-				Hostinfo: &tailcfg.Hostinfo{Hostname: "pending-node"},
-			}
-			machineKey := key.NewMachine().Public()
-
-			var err error
-
-			switch flow {
-			case "interactive":
-				var resp *tailcfg.RegisterResponse
-
-				resp, err = app.handleRegisterInteractive(req, machineKey)
-				require.Nil(t, resp, "refused admission must not publish an auth URL")
-			case "followup":
-				var resp *tailcfg.RegisterResponse
-
-				resp, err = app.reqToNewRegisterResponse(registrationDataFromRequest(req, machineKey))
-				require.Nil(t, resp, "refused admission must not publish an auth URL")
-			case "ssh":
-				ns := &noiseServer{headscale: app}
-
-				var action *tailcfg.SSHAction
-
-				action, err = ns.sshActionHoldAndDelegate(zerolog.Nop(), &tailcfg.SSHAction{}, 1, 2, "alice")
-				require.Nil(t, action, "refused admission must not publish a delegation URL")
-			}
-
-			require.ErrorIs(t, err, state.ErrAuthCacheFull)
-
-			got, ok := app.state.GetAuthCacheEntry(id)
-			require.True(t, ok)
-			require.Same(t, pending, got)
-		})
-	}
 }
 
 // TestGitHubIssue2830_NodeRestartWithUsedPreAuthKey tests the scenario reported in
@@ -3925,10 +3840,10 @@ func TestWebAuthRejectsUnauthorizedRequestTags(t *testing.T) {
 			RequestTags: []string{"tag:unauthorized"}, // This tag is not in policy
 		},
 	})
-	require.NoError(t, app.state.SetAuthCacheEntry(registrationID, regEntry))
+	app.state.SetAuthCacheEntry(registrationID, regEntry)
 
 	// Complete the web auth - should fail because tag is unauthorized
-	_, _, err := app.state.HandleNodeFromAuthPath(
+	_, err := app.state.HandleNodeFromAuthPath(
 		registrationID,
 		types.UserID(user.ID),
 		nil, // no expiry
@@ -3988,10 +3903,10 @@ func TestWebAuthReauthWithEmptyTagsRemovesAllTags(t *testing.T) {
 			RequestTags: []string{"tag:valid-owned", "tag:second"},
 		},
 	})
-	require.NoError(t, app.state.SetAuthCacheEntry(registrationID1, regEntry1))
+	app.state.SetAuthCacheEntry(registrationID1, regEntry1)
 
 	// Complete initial registration with tags
-	node, _, err := app.state.HandleNodeFromAuthPath(
+	node, err := app.state.HandleNodeFromAuthPath(
 		registrationID1,
 		types.UserID(user.ID),
 		nil,
@@ -4015,10 +3930,10 @@ func TestWebAuthReauthWithEmptyTagsRemovesAllTags(t *testing.T) {
 			RequestTags: []string{}, // EMPTY - should untag
 		},
 	})
-	require.NoError(t, app.state.SetAuthCacheEntry(registrationID2, regEntry2))
+	app.state.SetAuthCacheEntry(registrationID2, regEntry2)
 
 	// Complete reauth with empty tags
-	nodeAfterReauth, _, err := app.state.HandleNodeFromAuthPath(
+	nodeAfterReauth, err := app.state.HandleNodeFromAuthPath(
 		registrationID2,
 		types.UserID(user.ID),
 		nil,
@@ -4101,10 +4016,10 @@ func TestAuthKeyTaggedToUserOwnedViaReauth(t *testing.T) {
 			RequestTags: []string{}, // EMPTY - should untag
 		},
 	})
-	require.NoError(t, app.state.SetAuthCacheEntry(registrationID, regEntry))
+	app.state.SetAuthCacheEntry(registrationID, regEntry)
 
 	// Complete reauth with empty tags
-	nodeAfterReauth, _, err := app.state.HandleNodeFromAuthPath(
+	nodeAfterReauth, err := app.state.HandleNodeFromAuthPath(
 		registrationID,
 		types.UserID(user.ID),
 		nil,
@@ -4225,7 +4140,7 @@ func TestDeletedPreAuthKeyNotRecreatedOnNodeUpdate(t *testing.T) {
 
 	// Process the [tailcfg.MapRequest]-like update
 	// This calls [state.State.UpdateNodeFromMapRequest] which eventually calls [state.State.persistNodeAndRefreshPolicy]
-	_, err = app.state.UpdateNodeFromMapRequest(node.ID(), mapReq)
+	err = app.state.UpdateNodeFromMapRequest(node.ID(), mapReq)
 	require.NoError(t, err, "UpdateNodeFromMapRequest should succeed")
 	t.Log("Simulated MapRequest update completed")
 
@@ -4238,10 +4153,9 @@ func TestDeletedPreAuthKeyNotRecreatedOnNodeUpdate(t *testing.T) {
 	t.Log("SUCCESS: PreAuthKey remained deleted after node update")
 }
 
-// TestTaggedNodeWithoutUserToDifferentUser tests that a user's login on the
-// machine of a node registered with a tags-only PreAuthKey (no user) works
-// without panicking (#3038). No user made the key, so the login gets a device
-// of its own and the tagged node stays.
+// TestTaggedNodeWithoutUserToDifferentUser tests that a node registered with a
+// tags-only PreAuthKey (no user) can be re-registered to a different user
+// without panicking. This reproduces the issue reported in #3038.
 func TestTaggedNodeWithoutUserToDifferentUser(t *testing.T) {
 	t.Parallel()
 
@@ -4301,12 +4215,12 @@ func TestTaggedNodeWithoutUserToDifferentUser(t *testing.T) {
 			RequestTags: []string{}, // Empty - transition to user-owned
 		},
 	})
-	require.NoError(t, app.state.SetAuthCacheEntry(registrationID, regEntry))
+	app.state.SetAuthCacheEntry(registrationID, regEntry)
 
 	// This should NOT panic - before the fix, this would panic with:
 	// panic: runtime error: invalid memory address or nil pointer dereference
 	// at [types.UserView.Name] because the existing node has no User
-	nodeAfterReauth, _, err := app.state.HandleNodeFromAuthPath(
+	nodeAfterReauth, err := app.state.HandleNodeFromAuthPath(
 		registrationID,
 		types.UserID(alice.ID),
 		nil,
@@ -4314,21 +4228,19 @@ func TestTaggedNodeWithoutUserToDifferentUser(t *testing.T) {
 	)
 	require.NoError(t, err, "Re-registration to alice should succeed without panic")
 
+	// Verify the existing tagged node was converted to be owned by alice (same node ID)
 	require.True(t, nodeAfterReauth.Valid(), "Node should be valid")
 	require.True(t, nodeAfterReauth.UserID().Valid(), "Node should have a UserID")
 	require.Equal(t, alice.ID, nodeAfterReauth.UserID().Get(), "Node should be owned by alice")
-	require.NotEqual(t, node.ID(), nodeAfterReauth.ID(), "alice gets a device of her own")
-	require.False(t, nodeAfterReauth.IsTagged(), "Node should not be tagged")
-
-	tagged, ok := app.state.GetNodeByID(node.ID())
-	require.True(t, ok, "the tagged node stays")
-	require.ElementsMatch(t, tags, tagged.Tags().AsSlice())
+	require.Equal(t, node.ID(), nodeAfterReauth.ID(), "Should be the same node (converted, not new)")
+	require.False(t, nodeAfterReauth.IsTagged(), "Node should no longer be tagged")
+	require.Empty(t, nodeAfterReauth.Tags().AsSlice(), "Node should have no tags")
 
 	// Verify [types.NodeView.Owner] works without panicking - this is what the mapper's
 	// [generateUserProfiles] calls, and it would panic with a nil pointer
-	// dereference if node.User was not set.
+	// dereference if node.User was not set during the tag→user conversion.
 	owner := nodeAfterReauth.Owner()
-	require.True(t, owner.Valid(), "Owner should be valid (mapper would panic if nil)")
+	require.True(t, owner.Valid(), "Owner should be valid after conversion (mapper would panic if nil)")
 	require.Equal(t, alice.ID, owner.Model().ID, "Owner should be alice")
 
 	t.Logf("Re-registration complete - Node ID: %d, Tags: %v, IsTagged: %t, UserID: %d",
@@ -4435,9 +4347,9 @@ func TestHandleNodeFromAuthPath_OldUserNil_NoPanic(t *testing.T) {
 			Hostname: "authpath-orphan-newuser",
 		},
 	})
-	require.NoError(t, app.state.SetAuthCacheEntry(authID, regEntry))
+	app.state.SetAuthCacheEntry(authID, regEntry)
 
-	node, _, err := app.state.HandleNodeFromAuthPath(
+	node, err := app.state.HandleNodeFromAuthPath(
 		authID,
 		types.UserID(userB.ID),
 		nil,
@@ -4450,22 +4362,23 @@ func TestHandleNodeFromAuthPath_OldUserNil_NoPanic(t *testing.T) {
 }
 
 // TestHandleNodeFromAuthPath_ReloginWholeNode covers an interactive (web or
-// OIDC) relogin that rotates the node key. A [tailcfg.PeerChange] patch can
-// neither clear a peer's Expired flag nor carry Hostinfo, so a relogin that
-// un-expires the node or changes Hostinfo peers read must be sent as a whole
-// node. A relogin that only rotates keys keeps the key-rotation patch.
+// OIDC) relogin that rotates the node key, as a peer's map stream sees it. A
+// [tailcfg.PeerChange] patch can neither clear a peer's Expired flag nor
+// carry Hostinfo, so a relogin that un-expires the node or changes Hostinfo
+// peers read must reach the peer as a whole node. A relogin that only
+// rotates keys stays a patch.
 func TestHandleNodeFromAuthPath_ReloginWholeNode(t *testing.T) {
 	tests := []struct {
 		name      string
 		expired   bool
-		hostname  string
+		services  []tailcfg.Service
 		wantPatch bool
 	}{
 		{name: "keys only", wantPatch: true},
 		{name: "expired", expired: true},
 		{
-			name:     "peer-visible hostname",
-			hostname: "renamed-node",
+			name:     "peer-visible hostinfo",
+			services: []tailcfg.Service{{Proto: tailcfg.PeerAPI4, Port: 4242}},
 		},
 	}
 
@@ -4483,23 +4396,26 @@ func TestHandleNodeFromAuthPath_ReloginWholeNode(t *testing.T) {
 
 			app.state.PutNodeInStoreForTest(*node)
 
-			hostname := node.Hostname
-			if tt.hostname != "" {
-				hostname = tt.hostname
-			}
+			peer := app.state.CreateRegisteredNodeForTest(user, "authpath-relogin-peer")
+			app.state.PutNodeInStoreForTest(*peer)
+
+			stream := mapper.NewStream(app.cfg, app.MapHub(), peer.ID, tailcfg.CurrentCapabilityVersion)
+			_, err := stream.Initial(app.state.Snapshot())
+			require.NoError(t, err)
 
 			newNodeKey := key.NewNode()
 			authID := types.MustAuthID()
-			require.NoError(t, app.state.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+			app.state.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
 				MachineKey: node.MachineKey,
 				NodeKey:    newNodeKey.Public(),
-				Hostname:   hostname,
+				Hostname:   node.Hostname,
 				Hostinfo: &tailcfg.Hostinfo{
-					Hostname: hostname,
+					Hostname: node.Hostname,
+					Services: tt.services,
 				},
-			})))
+			}))
 
-			relogged, c, err := app.state.HandleNodeFromAuthPath(
+			relogged, err := app.state.HandleNodeFromAuthPath(
 				authID,
 				types.UserID(user.ID),
 				nil,
@@ -4509,12 +4425,30 @@ func TestHandleNodeFromAuthPath_ReloginWholeNode(t *testing.T) {
 			require.Equal(t, node.ID, relogged.ID(), "relogin must update the existing node")
 			require.Equal(t, newNodeKey.Public(), relogged.NodeKey())
 
+			resps, err := stream.Update(app.state.Snapshot())
+			require.NoError(t, err)
+
+			var (
+				patches []tailcfg.NodeID
+				whole   []tailcfg.NodeID
+			)
+
+			for _, r := range resps {
+				for _, p := range r.PeersChangedPatch {
+					patches = append(patches, p.NodeID)
+				}
+
+				for _, p := range slices.Concat(r.Peers, r.PeersChanged) {
+					whole = append(whole, p.ID)
+				}
+			}
+
 			if tt.wantPatch {
-				assert.Empty(t, c.PeersChanged, "relogin must not be a whole-node add")
-				assert.Len(t, c.PeerPatches, 1, "relogin must be a peer patch")
+				assert.Empty(t, whole, "relogin must not be a whole-node update")
+				assert.Equal(t, []tailcfg.NodeID{node.ID.NodeID()}, patches, "relogin must be a peer patch")
 			} else {
-				assert.Empty(t, c.PeerPatches, "relogin must not be a peer patch")
-				assert.Contains(t, c.PeersChanged, node.ID, "relogin must be a whole-node add")
+				assert.Empty(t, patches, "relogin must not be a peer patch")
+				assert.Contains(t, whole, node.ID.NodeID(), "relogin must be a whole-node update")
 			}
 		})
 	}
@@ -4538,7 +4472,7 @@ func TestWaitForFollowupMachineKeyMismatch(t *testing.T) {
 	app := createTestApp(t)
 
 	victimMachineKey := key.NewMachine()
-	foreignMachineKey := key.NewMachine()
+	attackerMachineKey := key.NewMachine()
 
 	// Park a completed registration in the auth cache, as a node that is
 	// already polling for its verdict would see it.
@@ -4549,7 +4483,7 @@ func TestWaitForFollowupMachineKeyMismatch(t *testing.T) {
 			NodeKey:    key.NewNode().Public(),
 			Hostname:   hostname,
 		})
-		require.NoError(t, app.state.SetAuthCacheEntry(authID, regEntry))
+		app.state.SetAuthCacheEntry(authID, regEntry)
 
 		user := app.state.CreateUserForTest(hostname + "-user")
 		node := app.state.CreateNodeForTest(user, hostname)
@@ -4573,9 +4507,7 @@ func TestWaitForFollowupMachineKeyMismatch(t *testing.T) {
 	}
 
 	t.Run("mismatched machine key is rejected", func(t *testing.T) {
-		resp, err := followup(
-			newPendingFollowup("followup-mismatch"), foreignMachineKey.Public(),
-		)
+		resp, err := followup(newPendingFollowup("followup-mismatch"), attackerMachineKey.Public())
 
 		require.Error(t, err, "followup with a foreign machine key must not succeed")
 		assert.Nil(t, resp, "no registration details should be returned")
@@ -4595,60 +4527,6 @@ func TestWaitForFollowupMachineKeyMismatch(t *testing.T) {
 		require.NotNil(t, resp)
 		assert.True(t, resp.MachineAuthorized)
 		assert.NotEmpty(t, resp.User.DisplayName, "the owner's identity is returned on the legitimate path")
-	})
-
-	// refusedAtOnce sends a follow-up that must be refused before it waits:
-	// a session hands out one verdict, so a waiter that is not the owner
-	// would take it from the owner.
-	refusedAtOnce := func(t *testing.T, url string, machineKey key.MachinePublic) {
-		t.Helper()
-
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-
-		resp, err := app.handleRegister(ctx, tailcfg.RegisterRequest{
-			Followup: url,
-			NodeKey:  key.NewNode().Public(),
-		}, machineKey)
-		require.NoError(t, ctx.Err(), "the follow-up must be refused, not left waiting")
-		require.Error(t, err)
-		assert.Nil(t, resp)
-
-		var httpErr HTTPError
-		require.ErrorAs(t, err, &httpErr)
-		assert.Equal(t, http.StatusUnauthorized, httpErr.Code)
-	}
-
-	t.Run("mismatched machine key is refused while pending", func(t *testing.T) {
-		authID := types.MustAuthID()
-		regEntry := types.NewRegisterAuthRequest(&types.RegistrationData{
-			MachineKey: victimMachineKey.Public(),
-			NodeKey:    key.NewNode().Public(),
-			Hostname:   "followup-pending",
-		})
-		require.NoError(t, app.state.SetAuthCacheEntry(authID, regEntry))
-
-		url := fmt.Sprintf("http://localhost:8080/register/%s", authID)
-		refusedAtOnce(t, url, foreignMachineKey.Public())
-
-		user := app.state.CreateUserForTest("followup-pending-user")
-		node := app.state.CreateNodeForTest(user, "followup-pending")
-		node.MachineKey = victimMachineKey.Public()
-		node.User = user
-		regEntry.FinishAuth(types.AuthVerdict{Node: node.View()})
-
-		resp, err := followup(url, victimMachineKey.Public())
-		require.NoError(t, err)
-		assert.True(t, resp.MachineAuthorized,
-			"the owner must still collect the verdict")
-	})
-
-	t.Run("ssh check session is not a registration", func(t *testing.T) {
-		authID := types.MustAuthID()
-		require.NoError(t, app.state.SetAuthCacheEntry(authID, types.NewSSHCheckAuthRequest(1, 2)))
-
-		refusedAtOnce(t, fmt.Sprintf("http://localhost:8080/register/%s", authID),
-			victimMachineKey.Public())
 	})
 }
 
@@ -4686,15 +4564,15 @@ func TestFollowupWaitPrefersCompletedAuthOverExpiredContext(t *testing.T) {
 		require.NoError(t, err)
 
 		authReq := types.NewRegisterAuthRequest(&types.RegistrationData{
-			MachineKey: machineKey,
-			Hostname:   "followup-race-node",
+			Hostname: "followup-race-node",
 		})
-		require.NoError(t, app.state.SetAuthCacheEntry(regID, authReq))
+		app.state.SetAuthCacheEntry(regID, authReq)
 
 		// Registration completes BEFORE we wait: verdict is buffered.
 		user := app.state.CreateUserForTest(fmt.Sprintf("followup-race-user-%d", i))
 		node := app.state.CreateNodeForTest(user, "followup-race-node")
-		// Production builds the node from the machine key cached in the
+		// waitForFollowup fails closed unless the node carries the polling
+		// session's machine key; production sets this via the cached
 		// RegistrationData. CreateNodeForTest picks a random one.
 		node.MachineKey = machineKey
 		authReq.FinishAuth(types.AuthVerdict{Node: node.View()})
@@ -4703,10 +4581,12 @@ func TestFollowupWaitPrefersCompletedAuthOverExpiredContext(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		regData := &types.RegistrationData{MachineKey: machineKey, NodeKey: nodeKey}
-		followup := fmt.Sprintf("http://localhost:8080/register/%s", regID)
+		req := tailcfg.RegisterRequest{
+			Followup: fmt.Sprintf("http://localhost:8080/register/%s", regID),
+			NodeKey:  nodeKey,
+		}
 
-		resp, err := app.waitForFollowup(ctx, followup, regData)
+		resp, err := app.waitForFollowup(ctx, req.Followup, registrationDataFromRequest(req, machineKey))
 		switch {
 		case err != nil:
 			timeouts++
@@ -4721,258 +4601,44 @@ func TestFollowupWaitPrefersCompletedAuthOverExpiredContext(t *testing.T) {
 	assert.Equal(t, iterations, authorized, "every completed registration must be returned as authorized")
 }
 
-// TestRegisterRejectsUnencodableExpiry proves a registration cannot store a key
-// expiry that is in range in its own zone but outside the years [0,9999] in
-// UTC, which every map carrying the node would fail to encode.
-func TestRegisterRejectsUnencodableExpiry(t *testing.T) {
-	app := createTestApp(t)
-
-	user := app.state.CreateUserForTest("expiry-range-user")
-	pak, err := app.state.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
-	require.NoError(t, err)
-
-	register := func(expiry time.Time) (key.NodePublic, error) {
-		nodeKey := key.NewNode().Public()
-
-		_, err := app.handleRegister(context.Background(), tailcfg.RegisterRequest{
-			Auth:     &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
-			NodeKey:  nodeKey,
-			Hostinfo: &tailcfg.Hostinfo{Hostname: "expiry-range-node"},
-			Expiry:   expiry,
-		}, key.NewMachine().Public())
-
-		return nodeKey, err
-	}
-
-	for _, raw := range []string{
-		"9999-12-31T23:59:59-23:59",
-		"0000-01-01T00:00:00+23:59",
-	} {
-		expiry, err := time.Parse(time.RFC3339, raw)
-		require.NoError(t, err)
-
-		nodeKey, err := register(expiry)
-
-		httpErr, ok := errors.AsType[HTTPError](err)
-		require.True(t, ok, "expiry %s: want an HTTPError, got %v", raw, err)
-		require.Equal(t, http.StatusBadRequest, httpErr.Code)
-
-		_, found := app.state.GetNodeByNodeKey(nodeKey)
-		require.False(t, found, "expiry %s must not create a node", raw)
-	}
-
-	// The latest encodable expiry still registers, and SQLite reads it back
-	// although it is in the year 10000 east of UTC.
-	latest := time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC)
-	nodeKey, err := register(latest.In(time.FixedZone("", 60*60)))
-	require.NoError(t, err, "the latest encodable expiry must still register")
-
-	node, found := app.state.GetNodeByNodeKey(nodeKey)
-	require.True(t, found)
-
-	stored, err := app.state.DB().GetNodeByID(node.ID())
-	require.NoError(t, err)
-	assert.True(t, latest.Equal(*stored.Expiry))
+// labelFollowup marks the calling goroutine as a followup of the test
+// named name, so parkedFollowups counts it and no other test's.
+func labelFollowup(name string) {
+	pprof.SetGoroutineLabels(pprof.WithLabels(context.Background(), pprof.Labels("followup", name)))
 }
 
-// TestPendingRegistrationKeepsAuthMetadata pins that operational reports do
-// not stay in the auth cache before the first MapRequest.
-func TestPendingRegistrationKeepsAuthMetadata(t *testing.T) {
-	app := createTestApp(t)
-	hostinfo := &tailcfg.Hostinfo{
-		Hostname: "pending-router", OS: "linux", OSVersion: "6.12.0",
-		RequestTags:  []string{"tag:router"},
-		RoutableIPs:  []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")},
-		Services:     []tailcfg.Service{{Proto: tailcfg.PeerAPI4, Port: 41641}},
-		NetInfo:      &tailcfg.NetInfo{PreferredDERP: 1},
-		SSH_HostKeys: []string{"ssh-ed25519 key"},
-	}
-	resp, err := app.handleRegister(context.Background(), tailcfg.RegisterRequest{
-		NodeKey: key.NewNode().Public(), Hostinfo: hostinfo,
-	}, key.NewMachine().Public())
-	require.NoError(t, err)
-	authID, err := extractRegistrationIDFromAuthURL(resp.AuthURL)
-	require.NoError(t, err)
+// parkedFollowups counts the followups labelled name blocked in
+// waitForFollowup. It runs inside Eventually, so it reports nothing itself.
+func parkedFollowups(name string) int {
+	var buf bytes.Buffer
 
-	entry, ok := app.state.GetAuthCacheEntry(authID)
-	require.True(t, ok)
-	assert.Equal(t, &tailcfg.Hostinfo{
-		Hostname: "pending-router", OS: "linux", RequestTags: []string{"tag:router"},
-	}, entry.RegistrationData().Hostinfo)
-	hostinfo.RequestTags[0] = "tag:changed"
-	assert.Equal(t, []string{"tag:router"}, entry.RegistrationData().Hostinfo.RequestTags)
-	assert.Len(t, hostinfo.RoutableIPs, 1, "the request itself must be left alone")
-}
+	_ = pprof.Lookup("goroutine").WriteTo(&buf, 1)
 
-// TestFollowupParksOneRequestPerRegistration pins that a pending registration
-// keeps one waiting follow-up, the newest. The session hands out one verdict,
-// so older waiters are answered at once instead of staying parked until the
-// session ends and then each opening a new one.
-func TestFollowupParksOneRequestPerRegistration(t *testing.T) {
-	app := createTestApp(t)
+	label := fmt.Sprintf("%q:%q", "followup", name)
+	n := 0
 
-	machineKey := key.NewMachine().Public()
-	authID := types.MustAuthID()
-	reg := types.NewRegisterAuthRequest(&types.RegistrationData{
-		MachineKey: machineKey,
-		Hostname:   "followup-park-node",
-	})
-	require.NoError(t, app.state.SetAuthCacheEntry(authID, reg))
+	// The header line runs into the first sample without a blank line.
+	_, samples, _ := strings.Cut(buf.String(), "\n")
 
-	regData := &types.RegistrationData{
-		MachineKey: machineKey,
-		NodeKey:    key.NewNode().Public(),
-	}
-	followup := fmt.Sprintf("http://localhost:8080/register/%s", authID)
-
-	const followups = 50
-
-	type answer struct {
-		resp *tailcfg.RegisterResponse
-		err  error
-	}
-
-	answered := make(chan answer, followups)
-
-	for range followups {
-		go func() {
-			resp, err := app.waitForFollowup(t.Context(), followup, regData)
-			answered <- answer{resp, err}
-		}()
-	}
-
-	next := func(msg string) answer {
-		t.Helper()
-
-		select {
-		case a := <-answered:
-			return a
-		case <-time.After(5 * time.Second):
-			require.FailNow(t, msg)
-
-			return answer{}
+	for block := range strings.SplitSeq(samples, "\n\n") {
+		if !strings.Contains(block, label) || !strings.Contains(block, ").waitForFollowup+") {
+			continue
 		}
+
+		count, _, _ := strings.Cut(block, " @ ")
+		c, _ := strconv.Atoi(count)
+		n += c
 	}
 
-	for range followups - 1 {
-		var httpErr HTTPError
-		require.ErrorAs(t,
-			next("more than one follow-up is parked on the registration").err,
-			&httpErr)
-		assert.Equal(t, http.StatusConflict, httpErr.Code)
-	}
-
-	select {
-	case a := <-answered:
-		require.FailNowf(t, "the newest follow-up must still be waiting", "got %+v", a)
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	cacheLen := func() int {
-		n, _ := app.state.DebugRegistrationCache()["current_len"].(int)
-
-		return n
-	}
-	before := cacheLen()
-
-	user := app.state.CreateUserForTest("followup-park-user")
-	node := app.state.CreateNodeForTest(user, "followup-park-node")
-	node.MachineKey = machineKey
-	node.User = user
-	reg.FinishAuth(types.AuthVerdict{Node: node.View()})
-
-	last := next("the parked follow-up did not collect the verdict")
-	require.NoError(t, last.err)
-	assert.True(t, last.resp.MachineAuthorized)
-	assert.LessOrEqual(t, cacheLen(), before+1,
-		"the verdict must not open a session per waiter")
+	return n
 }
 
-func TestFollowupURLLength(t *testing.T) {
-	t.Parallel()
+// waitFollowupsParked waits until n of t's followups are blocked waiting
+// for their registration, so the test completes authentication after the
+// clients asked for the result rather than racing them.
+func waitFollowupsParked(t *testing.T, n int) {
+	t.Helper()
 
-	for _, length := range []int{maxFollowupURLLength, maxFollowupURLLength + 1} {
-		t.Run(strconv.Itoa(length), func(t *testing.T) {
-			t.Parallel()
-
-			app := createTestApp(t)
-			followup := fmt.Sprintf("http://localhost:8080/register/%s?padding=", types.MustAuthID())
-			followup += strings.Repeat("x", length-len(followup))
-			regData := &types.RegistrationData{
-				MachineKey: key.NewMachine().Public(),
-				NodeKey:    key.NewNode().Public(),
-				Hostname:   "followup-length-node",
-			}
-
-			resp, err := app.waitForFollowup(t.Context(), followup, regData)
-
-			if length > maxFollowupURLLength {
-				var httpErr HTTPError
-				require.ErrorAs(t, err, &httpErr)
-				assert.Equal(t, http.StatusUnauthorized, httpErr.Code)
-				assert.Equal(t, "followup URL too long", httpErr.Msg)
-				assert.Nil(t, resp)
-				assert.Equal(t, 0, app.state.DebugRegistrationCache()["current_len"])
-
-				return
-			}
-
-			require.NoError(t, err)
-			require.NotNil(t, resp)
-			assert.NotEmpty(t, resp.AuthURL)
-		})
-	}
-}
-
-func TestFollowupRefreshKeepsAuthMetadata(t *testing.T) {
-	t.Parallel()
-
-	for _, completed := range []bool{false, true} {
-		t.Run(fmt.Sprintf("completed=%t", completed), func(t *testing.T) {
-			t.Parallel()
-
-			app := createTestApp(t)
-			machineKey := key.NewMachine().Public()
-			authID := types.MustAuthID()
-
-			if completed {
-				reg := types.NewRegisterAuthRequest(&types.RegistrationData{
-					MachineKey: machineKey, Hostname: "previous-request",
-				})
-				require.NoError(t, app.state.SetAuthCacheEntry(authID, reg))
-				reg.FinishAuth(types.AuthVerdict{})
-			}
-
-			expiry := time.Now().UTC().Add(time.Hour)
-			req := tailcfg.RegisterRequest{
-				Followup: fmt.Sprintf("http://localhost:8080/register/%s", authID),
-				NodeKey:  key.NewNode().Public(),
-				Expiry:   expiry,
-				Hostinfo: &tailcfg.Hostinfo{
-					Hostname: "refreshed-node", OS: "linux", OSVersion: "6.12",
-					RequestTags: []string{"tag:router"},
-					Services:    []tailcfg.Service{{Proto: tailcfg.PeerAPI4, Port: 41641}},
-				},
-			}
-			resp, err := app.handleRegister(t.Context(), req, machineKey)
-			require.NoError(t, err)
-			require.NotNil(t, resp)
-			newAuthID, err := extractRegistrationIDFromAuthURL(resp.AuthURL)
-			require.NoError(t, err)
-			assert.NotEqual(t, authID, newAuthID)
-			entry, ok := app.state.GetAuthCacheEntry(newAuthID)
-			require.True(t, ok)
-			assert.Equal(t, &types.RegistrationData{
-				MachineKey: machineKey,
-				NodeKey:    req.NodeKey,
-				Hostname:   "refreshed-node",
-				Expiry:     &expiry,
-				Hostinfo: &tailcfg.Hostinfo{
-					Hostname: "refreshed-node", OS: "linux", RequestTags: []string{"tag:router"},
-				},
-			}, entry.RegistrationData())
-			req.Hostinfo.RequestTags[0] = "tag:changed"
-			assert.Equal(t, []string{"tag:router"}, entry.RegistrationData().Hostinfo.RequestTags)
-		})
-	}
+	require.Eventually(t, func() bool { return parkedFollowups(t.Name()) >= n },
+		2*time.Second, 5*time.Millisecond, "followup request never parked")
 }

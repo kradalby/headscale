@@ -220,24 +220,31 @@ func (r PolicyTestResults) failures() []TestFailure {
 	var out []TestFailure
 
 	for _, res := range r.Results {
-		if !res.Passed {
-			one := PolicyTestResults{Results: []PolicyTestResult{res}}
-			out = append(out, TestFailure{Src: res.Src, Errors: strings.Split(one.Errors(), "\n")})
+		if res.Passed {
+			continue
 		}
+
+		one := PolicyTestResults{Results: []PolicyTestResult{res}}
+
+		out = append(out, TestFailure{
+			Src:    res.Src,
+			Errors: strings.Split(one.Errors(), "\n"),
+		})
 	}
 
 	return out
 }
 
-// testReport is the outcome of a tests or sshTests run.
+// testReport is the common shape of a tests and an sshTests run.
 type testReport interface {
 	Errors() string
+
 	failures() []TestFailure
 }
 
 // wrapTestResult returns nil when every test passed, otherwise wraps the
-// rendered failure breakdown in sentinel. The report is rendered only on the
-// failure path.
+// rendered failure breakdown in sentinel. The report is rendered only on
+// the failure path.
 func wrapTestResult(sentinel error, allPassed bool, r testReport) error {
 	if allPassed {
 		return nil
@@ -257,32 +264,7 @@ func (pm *PolicyManager) RunTests() error {
 		return nil
 	}
 
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
 	results := runPolicyTests(pm.pol, pm.filter, pm.users, pm.nodes)
-
-	return wrapTestResult(errPolicyTestsFailed, results.AllPassed, results)
-}
-
-// evaluateTests runs the `tests` block against a fresh compilation of pol.
-// It is the user-write sandbox: the live [PolicyManager] state is left
-// untouched, so a failing test rejects the write without side effects.
-func evaluateTests(pol *Policy, users []types.User, nodes views.Slice[types.NodeView]) error {
-	if pol == nil || len(pol.Tests) == 0 {
-		return nil
-	}
-
-	grants := pol.compileGrants(users, nodes)
-
-	var filter []tailcfg.FilterRule
-	if pol.ACLs == nil && pol.Grants == nil {
-		filter = tailcfg.FilterAllowAll
-	} else {
-		filter = globalFilterRules(grants)
-	}
-
-	results := runPolicyTests(pol, filter, users, nodes)
 
 	return wrapTestResult(errPolicyTestsFailed, results.AllPassed, results)
 }

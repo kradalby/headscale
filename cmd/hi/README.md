@@ -202,14 +202,15 @@ When a test fails, read the artefacts **in this order**:
    sqlite> SELECT id, hostname, user_id, tags FROM nodes WHERE hostname LIKE '%problematic%';
    ```
 
-6. **`*_metrics.txt`** — Prometheus dumps for latency, NodeStore
-   operation timing, database query performance, memory usage.
+6. **`*_metrics.txt`** — Prometheus dumps for latency, graph commits and
+   policy compiles (`headscale_world_*`, `headscale_policy_compiles_total`),
+   database query performance, memory usage.
 
 ## Heuristic: infrastructure vs code
 
 **Before blaming Docker, disk, or network: read `hs-*.stderr.log` in
 full.** In practice, well over 99% of failures are code bugs (policy
-evaluation, NodeStore sync, route approval) rather than infrastructure.
+evaluation, map-request sync, route approval) rather than infrastructure.
 
 Actual infrastructure failures have signature error messages:
 
@@ -235,9 +236,9 @@ the test expects a route.
 - **Right fix**: wrap the assertion in `EventuallyWithT`. See
   [`../../integration/README.md`](../../integration/README.md).
 
-### NodeStore sync issues
+### Map-request sync issues
 
-Route changes not reflected in the NodeStore snapshot. Symptom: route
+Route changes not reflected in the world snapshot. Symptom: route
 advertisements in logs but no tracking updates in subsequent reads.
 
 The sync point is `State.UpdateNodeFromMapRequest()` in
@@ -255,10 +256,9 @@ connectivity.
 ### Policy evaluation race
 
 Symptom: tests that change policy and immediately assert peer visibility
-fail intermittently. Policy changes trigger async recomputation.
-
-- See recent fixes in `git log -- hscontrol/state/` for examples (e.g.
-  the `PolicyChange` trigger on every Connect/Disconnect).
+fail intermittently. The policy compiles in the commit that stores it, but
+each session renders and sends its new map afterwards, and the client
+applies it later still: assert inside `EventuallyWithT`.
 
 ### SQLite vs PostgreSQL timing differences
 

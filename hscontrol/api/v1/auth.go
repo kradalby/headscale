@@ -84,21 +84,17 @@ func registerAuth(api huma.API, b Backend) {
 			return nil, mapError("looking up user", err)
 		}
 
-		node, nodeChange, err := b.State.HandleNodeFromAuthPath(
+		node, err := b.State.HandleNodeFromAuthPath(
 			registrationID,
 			types.UserID(user.ID),
 			nil,
 			util.RegisterMethodCLI,
 		)
 		if err != nil {
-			b.Change(nodeChange)
-
 			return nil, mapError("registering node", err)
 		}
 
-		routeChange, err := b.State.AutoApproveRoutes(node)
-		b.Change(nodeChange, routeChange)
-
+		err = b.State.AutoApproveRoutes(node)
 		if err != nil {
 			return nil, huma.Error500InternalServerError("auto approving routes", err)
 		}

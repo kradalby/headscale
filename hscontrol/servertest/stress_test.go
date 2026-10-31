@@ -119,9 +119,8 @@ func TestStressConnectDisconnect(t *testing.T) {
 		nv, ok := srv.State().GetNodeByID(nodeID)
 		require.True(t, ok)
 
-		deleteChange, err := srv.State().DeleteNode(nv)
+		err := srv.State().DeleteNode(nv)
 		require.NoError(t, err)
-		srv.App.Change(deleteChange...)
 
 		// c2 should see c1 disappear.
 		c2.WaitForCondition(t, "deleted node gone", 10*time.Second,
@@ -209,17 +208,21 @@ func TestStressStateMutations(t *testing.T) {
 
 		c1.WaitForPeers(t, 1, 10*time.Second)
 
+		routes := make([]netip.Prefix, 10)
+		for i := range routes {
+			routes[i] = netip.MustParsePrefix(fmt.Sprintf("10.%d.0.0/24", i))
+		}
+
+		// Advertise every route, so each approval changes what c2 sees.
+		advertiseRoutes(t, c1, c2, routes)
+
 		nodeID := findNodeID(t, srv, "rapidrt-node1")
 
 		// Rapidly change routes 10 times.
-		for i := range 10 {
-			route := netip.MustParsePrefix(
-				fmt.Sprintf("10.%d.0.0/24", i))
-
-			_, routeChange, err := srv.State().SetApprovedRoutes(
+		for _, route := range routes {
+			_, err := srv.State().SetApprovedRoutes(
 				nodeID, []netip.Prefix{route})
 			require.NoError(t, err)
-			srv.App.Change(routeChange)
 		}
 
 		// Final route should be 10.9.0.0/24.
@@ -234,11 +237,14 @@ func TestStressStateMutations(t *testing.T) {
 		assert.Len(t, finalRoutes, 1,
 			"should have exactly 1 approved route (the last one set)")
 
-		// c2 should eventually see the update.
+		// c2 should eventually see exactly the last route.
 		c2.WaitForCondition(t, "final route update received",
 			10*time.Second,
 			func(nm *netmap.NetworkMap) bool {
-				return c2.UpdateCount() > 2
+				p, ok := peerByHostname(nm, "rapidrt-node1")
+
+				return ok && p.PrimaryRoutes().Len() == 1 &&
+					p.PrimaryRoutes().At(0) == expected
 			})
 	})
 
@@ -264,9 +270,8 @@ func TestStressStateMutations(t *testing.T) {
 		for i := range 5 {
 			finalName = fmt.Sprintf("renamed-%d", i)
 
-			_, renameChange, err := srv.State().RenameNode(nodeID, finalName)
+			_, err := srv.State().RenameNode(nodeID, finalName)
 			require.NoError(t, err)
-			srv.App.Change(renameChange)
 		}
 
 		// Server state should have the final name.
@@ -312,9 +317,8 @@ func TestStressStateMutations(t *testing.T) {
 			require.NoError(t, err)
 
 			if changed {
-				changes, err := srv.State().ReloadPolicy()
+				err := srv.State().ReloadPolicy()
 				require.NoError(t, err)
-				srv.App.Change(changes...)
 			}
 		}
 
@@ -625,10 +629,7 @@ func TestStressChurn(t *testing.T) {
 		}
 
 		// Wait for the new set to converge.
-		for _, c := range clients {
-			c.WaitForPeers(t, n-1, 30*time.Second)
-		}
-
+		waitForMutualVisibility(t, clients, 30*time.Second)
 		servertest.AssertSymmetricVisibility(t, clients)
 	})
 

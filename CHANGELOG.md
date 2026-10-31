@@ -84,6 +84,26 @@ clients, and how to run the same setup without Nix.
 the ACME DNS-01 challenge through a built-in DNS provider: `acmedns`,
 `cloudflare`, `gigahost`, `hetzner`, `powerdns` or `rfc2136`. `dns.base_domain` must be a public domain you control. [#3554](https://github.com/juanfont/headscale/pull/3554)
 
+### Control plane scales with what changes, not tailnet size
+
+A change now reaches only the nodes that see it, and costs about what those
+nodes are sent: an endpoint update, a join or a policy edit no longer
+reworks every node's map, and a change no node sees costs almost nothing.
+Policy recompiles reuse what a node change cannot reach, connected nodes
+that see the same peers share one copy of them, and a peer is encoded once
+for every map that carries it. Node writes no longer wait to be batched
+except during an HA subnet route outage, which is what
+`tuning.node_store_batch_timeout` and `tuning.node_store_batch_size` now
+bound. Large tailnets use less CPU and memory, and joins and failovers
+reach clients sooner.
+`HEADSCALE_DEBUG_POLICY_AUDIT=1` checks every policy recompile against a
+compile from scratch and logs any difference. A policy write's tests run
+against the users and nodes it is published with; if those change while the
+tests run, the write is tested again, up to three times, the last time
+holding other writes until the tests finish.
+
+[#37](https://github.com/kradalby/headscale/pull/37)
+
 ### BREAKING
 
 #### Database
@@ -109,6 +129,14 @@ the ACME DNS-01 challenge through a built-in DNS provider: `acmedns`,
 - `tls_cert_path`, `tls_key_path`, `tls_letsencrypt_*`, `acme_url` and `acme_email` are deprecated in favour of `tls.cert_path`, `tls.key_path` and `tls.acme.*` [#3554](https://github.com/juanfont/headscale/pull/3554)
   - The old keys continue to work, with a warning, but will be removed in a future release
 - Headscale's own ACME certificate is managed by CertMagic instead of autocert; the first start registers a new ACME account and obtains a new certificate in `tls.acme.cache_dir`, which now defaults to `/var/lib/headscale/cache` [#3554](https://github.com/juanfont/headscale/pull/3554)
+- `tuning.batcher_workers`, `tuning.notifier_send_timeout` and `tuning.node_mapsession_buffered_chan_size` have no effect and log a deprecation warning when set [#37](https://github.com/kradalby/headscale/pull/37)
+
+#### Observability
+
+- The `headscale_nodestore_*` metrics are removed. `headscale_world_nodes` replaces `headscale_nodestore_nodes`, `headscale_world_commits_total` counts committed changes and `headscale_world_write_batch_size` the node writes committed together [#37](https://github.com/kradalby/headscale/pull/37)
+- `headscale_mapper_changes_dropped_total` is removed: each map session renders from the latest state, so no change is dropped [#37](https://github.com/kradalby/headscale/pull/37)
+- `headscale_mapresponse_generated_total` counts the responses rendered for each session, by response type, instead of each change once [#37](https://github.com/kradalby/headscale/pull/37)
+- New: `headscale_policy_compiles_total` by result (the graph's compiles at boot and on each change to the document, the users, or a node field the policy reads, published or refused; a document refused before it reaches the graph, a write's test candidate and the audit's compile are not counted), `headscale_world_commit_panics_total` and `headscale_graph_map_log_misses_total` [#37](https://github.com/kradalby/headscale/pull/37)
 
 #### CLI
 
@@ -342,7 +370,7 @@ named sources and destinations and cover the whole policy — both `acls` and `g
 contribute. They run on user-initiated writes via `headscale policy set`, on SIGHUP reload
 (`systemctl reload headscale` / `kill -HUP $(pidof headscale)`), and on `headscale policy check`.
 A failing test rejects the write before it is applied, with the same error message Tailscale SaaS
-would return for the same policy.
+would return for the same policy. Tests run against the users and nodes the policy is published with.
 
 At boot a stored policy whose tests no longer pass — for example because a referenced user was
 deleted while the server was offline — logs a warning and the server keeps running. Fix the
@@ -361,7 +389,7 @@ reach any destination, and `check` requires reachability specifically through a 
 rule. Tests run on `headscale policy set`, on SIGHUP reload (`systemctl reload headscale` /
 `kill -HUP $(pidof headscale)`), and on `headscale policy check`. A failing test rejects the
 write before it is applied, with the same error message Tailscale SaaS would return for the same
-policy.
+policy. Tests run against the users and nodes the policy is published with.
 
 At boot a stored policy whose sshTests no longer pass — for example because a referenced user was
 deleted while the server was offline — logs a warning and the server keeps running. Fix the

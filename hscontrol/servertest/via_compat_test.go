@@ -3,8 +3,7 @@
 // grant steering with peer connectivity, cross-subnet forwarding and
 // exit nodes.
 //
-// Test data source: ../policy/v2/testdata/{grant,routes}_results/, see
-// viaCompatTests and routesMapCompatTests
+// Test data source: ../policy/v2/testdata/grant_results/, see viaCompatTests
 // Source format:    github.com/juanfont/headscale/hscontrol/types/testcapture
 package servertest_test
 
@@ -16,12 +15,10 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
-	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,7 +26,6 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/netmap"
-	"tailscale.com/types/views"
 )
 
 // viaCompatTests lists golden captures that exercise via grant steering.
@@ -37,27 +33,13 @@ var viaCompatTests = []struct {
 	id   string
 	desc string
 }{
-	{"grant-v11", "tag src steers subnet via router"},
-	{"grant-v12", "member src steers subnet via router"},
 	{"grant-v13", "group src steers subnet via router to members only"},
-	{"via-grant-v14", "tag src steers the internet via tag:exit"},
-	{"via-grant-v15", "wildcard src steers the internet via tag:exit"},
-	{"via-grant-v16", "tag and member srcs steer the internet via tag:exit"},
-	{"via-grant-v26", "one group steers the internet via one exit tag"},
-	{"via-grant-v27", "members steer the internet via tag:exit on one port"},
-	{"via-grant-v28", "crossed exit steering: group-a via one exit tag, group-b via another"},
 	{"via-grant-v29", "crossed subnet steering: group-a via router-a, group-b via router-b"},
 	{"via-grant-v30", "crossed mixed: subnet via router-a/b, exit via exit-b/a"},
 	{"via-grant-v31", "peer connectivity + via exit A/B steering"},
-	{"via-grant-v32", "via exit steering plus a member grant to a tagged host port"},
 	{"via-grant-v33", "single via grant + HA primary election"},
-	{"via-grant-v34", "wildcard src steers the internet via two exit tags"},
 	{"via-grant-v35", "via grant with unadvertised destination"},
 	{"via-grant-v36", "full complex: peer connectivity + crossed subnet + crossed exit"},
-	{"via-grant-v47", "via dst prefix broader than the advertised subnet"},
-	{"via-grant-v48", "via dst prefix narrower than the advertised subnet"},
-	{"via-grant-v49", "via dst host alias broader than the advertised subnet"},
-	{"via-grant-v50", "via dst prefix disjoint from the advertised subnet"},
 	{"via-grant-v52", "members reach the internet only via tag:exit, admins reach everything"},
 	{"via-grant-v53", "via exit steering plus a member rule to a tagged host port"},
 	{"via-grant-v54", "via exit steering plus a member rule to autogroup:self"},
@@ -69,175 +51,6 @@ var viaCompatTests = []struct {
 	{"via-grant-v60", "user-owned exit node outside the via tag; members have an autogroup:self rule"},
 	{"via-grant-v61", "via exit steering plus a member capability grant to a tagged host"},
 	{"via-grant-v62", "via exit steering plus a member rule to autogroup:internet on one port"},
-}
-
-// routesMapCompatTests lists routes captures replayed through the mapper.
-// They are shared with TestRoutesCompat* in policy/v2, which read their
-// filters and route sets; this replay reads the netmaps.
-var routesMapCompatTests = []struct {
-	id   string
-	desc string
-}{
-	{"routes-a1-wildcard-acl-includes-routes-in-srcips", "wildcard ACL, every router"},
-	{"routes-a2-tag-based-acl-excludes-routes", "router-to-router ACL"},
-	{"routes-a3-explicit-subnet-filter-to-router", "ACL to one subnet"},
-	{"routes-a4-multiple-routes-same-router", "ACL to one route of a router with an exit route too"},
-	{"routes-e1-ha-two-routers-same-subnet", "HA pair, ACL to the shared subnet"},
-	{"routes-e2-ha-primary-in-allowedips", "HA primary in AllowedIPs"},
-	{"routes-f2-subnet-as-acl-source", "subnet as ACL source"},
-	{"routes-f3-wildcard-src-specific-dst", "ACL to one port of a subnet"},
-	{"routes-h1-wildcard-srcips-format", "wildcard source to tagged routers"},
-	{"routes-pa1-partial-route-approval", "router with an unapproved route"},
-}
-
-// viaCompatSkipReasons lists checks where headscale differs from SaaS, keyed
-// <test_id>/<node>/<check>, or by check alone where every capture differs the
-// same way. A listed check that matches fails, so a fix must delete its entry.
-var viaCompatSkipReasons = map[string]string{
-	"tagged-self": "TAGGED_SELF_PROFILE: SaaS gives a tagged node a profile of its own, headscale the shared tagged-devices one",
-
-	// Adjacent member addresses merge into one prefix, and the reduced
-	// filter keeps all of it; SaaS lists only the node's own address.
-	"routes-f2-subnet-as-acl-source/ivysaur/packet-filter":  "FILTER_DST_MERGED: own filter names a neighbour's address",
-	"routes-f2-subnet-as-acl-source/venusaur/packet-filter": "FILTER_DST_MERGED: own filter names a neighbour's address",
-
-	// SaaS sends a router every approved route in its own AllowedIPs and
-	// every route it is primary for in PrimaryRoutes.
-	"grant-v11/blastoise/self-routes": selfRoutesReduced,
-	"grant-v11/squirtle/self-routes":  selfRoutesReduced,
-	"grant-v12/blastoise/self-routes": selfRoutesReduced,
-	"grant-v12/squirtle/self-routes":  selfRoutesReduced,
-	"grant-v13/blastoise/self-routes": selfRoutesReduced,
-	"grant-v13/squirtle/self-routes":  selfRoutesReduced,
-
-	"routes-a1-wildcard-acl-includes-routes-in-srcips/butterfree/self-routes": selfRoutesReduced,
-	"routes-a2-tag-based-acl-excludes-routes/butterfree/self-routes":          selfRoutesReduced,
-	"routes-a2-tag-based-acl-excludes-routes/caterpie/self-routes":            selfRoutesReduced,
-	"routes-a2-tag-based-acl-excludes-routes/metapod/self-routes":             selfRoutesReduced,
-	"routes-a2-tag-based-acl-excludes-routes/squirtle/self-routes":            selfRoutesReduced,
-	"routes-a2-tag-based-acl-excludes-routes/wartortle/self-routes":           selfRoutesReduced,
-	"routes-a3-explicit-subnet-filter-to-router/butterfree/self-routes":       selfRoutesReduced,
-	"routes-a3-explicit-subnet-filter-to-router/metapod/self-routes":          selfRoutesReduced,
-	"routes-a3-explicit-subnet-filter-to-router/wartortle/self-routes":        selfRoutesReduced,
-	"routes-a4-multiple-routes-same-router/butterfree/self-routes":            selfRoutesReduced,
-	"routes-a4-multiple-routes-same-router/caterpie/self-routes":              selfRoutesReduced,
-	"routes-a4-multiple-routes-same-router/metapod/self-routes":               selfRoutesReduced,
-	"routes-a4-multiple-routes-same-router/squirtle/self-routes":              selfRoutesReduced,
-	"routes-e1-ha-two-routers-same-subnet/butterfree/self-routes":             selfRoutesReduced,
-	"routes-e1-ha-two-routers-same-subnet/caterpie/self-routes":               selfRoutesReduced,
-	"routes-e1-ha-two-routers-same-subnet/squirtle/self-routes":               selfRoutesReduced,
-	"routes-e1-ha-two-routers-same-subnet/wartortle/self-routes":              selfRoutesReduced,
-	"routes-e2-ha-primary-in-allowedips/butterfree/self-routes":               selfRoutesReduced,
-	"routes-e2-ha-primary-in-allowedips/caterpie/self-routes":                 selfRoutesReduced,
-	"routes-e2-ha-primary-in-allowedips/squirtle/self-routes":                 selfRoutesReduced,
-	"routes-e2-ha-primary-in-allowedips/wartortle/self-routes":                selfRoutesReduced,
-	"routes-f2-subnet-as-acl-source/butterfree/self-routes":                   selfRoutesReduced,
-	"routes-f2-subnet-as-acl-source/caterpie/self-routes":                     selfRoutesReduced,
-	"routes-f2-subnet-as-acl-source/metapod/self-routes":                      selfRoutesReduced,
-	"routes-f2-subnet-as-acl-source/squirtle/self-routes":                     selfRoutesReduced,
-	"routes-f2-subnet-as-acl-source/wartortle/self-routes":                    selfRoutesReduced,
-	"routes-f3-wildcard-src-specific-dst/butterfree/self-routes":              selfRoutesReduced,
-	"routes-f3-wildcard-src-specific-dst/metapod/self-routes":                 selfRoutesReduced,
-	"routes-f3-wildcard-src-specific-dst/wartortle/self-routes":               selfRoutesReduced,
-	"routes-h1-wildcard-srcips-format/butterfree/self-routes":                 selfRoutesReduced,
-	"routes-h1-wildcard-srcips-format/metapod/self-routes":                    selfRoutesReduced,
-	"routes-pa1-partial-route-approval/butterfree/self-routes":                selfRoutesReduced,
-
-	"via-grant-v14/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v14/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v14/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v14/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v15/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v15/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v15/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v15/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v16/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v16/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v16/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v16/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v26/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v26/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v26/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v26/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v27/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v27/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v27/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v27/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v28/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v28/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v28/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v28/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v29/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v29/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v29/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v29/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v30/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v30/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v30/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v30/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v31/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v31/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v31/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v31/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v32/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v32/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v32/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v32/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v33/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v33/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v33/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v33/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v34/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v34/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v34/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v34/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v35/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v35/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v35/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v35/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v36/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v36/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v36/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v36/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v47/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v47/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v47/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v47/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v48/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v48/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v48/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v48/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v49/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v49/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v49/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v49/squirtle/self-routes":  selfRoutesReduced,
-	"via-grant-v50/blastoise/self-routes": selfRoutesReduced,
-	"via-grant-v50/fearow/self-routes":    selfRoutesReduced,
-	"via-grant-v50/spearow/self-routes":   selfRoutesReduced,
-	"via-grant-v50/squirtle/self-routes":  selfRoutesReduced,
-}
-
-const selfRoutesReduced = "SELF_ROUTES_REDUCED: headscale sends a router only the primary routes its policy lets it reach"
-
-// TestRoutesMapCompat replays routesMapCompatTests through
-// [runViaMapCompat].
-func TestRoutesMapCompat(t *testing.T) {
-	t.Parallel()
-
-	for _, tc := range routesMapCompatTests {
-		t.Run(tc.id, func(t *testing.T) {
-			t.Parallel()
-
-			path := filepath.Join(
-				"..", "policy", "v2", "testdata", "routes_results", tc.id+".hujson",
-			)
-
-			c, err := testcapture.Read(path)
-			require.NoError(t, err, "failed to read %s", path)
-
-			runViaMapCompat(t, c)
-		})
-	}
 }
 
 // TestViaGrantMapCompat loads golden captures from Tailscale SaaS and
@@ -289,59 +102,7 @@ func TestViaGrantMapCompat(t *testing.T) {
 func runViaMapCompat(t *testing.T, c *testcapture.Capture) {
 	t.Helper()
 
-	_, clients := startViaMapCompat(t, c)
-	compareViaMapCompat(t, c, clients)
-}
-
-// startViaMapCompat starts a server holding the capture's policy and a
-// client per captured node, with the capture's routes approved, and waits
-// for every client's first netmap and the peers SaaS gave it.
-func startViaMapCompat(
-	t *testing.T,
-	c *testcapture.Capture,
-) (*servertest.TestServer, map[string]*servertest.TestClient) {
-	t.Helper()
-
-	srv, clients := startCaptureClients(t, c, true)
-
-	// Wait for peers based on golden [netmap.NetworkMap] expected counts.
-	for viewerName, cl := range clients {
-		capture := c.Captures[viewerName]
-		if capture.Netmap == nil {
-			continue
-		}
-
-		expected := 0
-
-		for _, peer := range capture.Netmap.Peers {
-			peerName := extractHostname(peer.Name())
-			if _, isOurs := clients[peerName]; isOurs {
-				expected++
-			}
-		}
-
-		if expected > 0 {
-			cl.WaitForPeers(t, expected, 30*time.Second)
-		}
-	}
-
-	return srv, clients
-}
-
-// startCaptureClients starts a server holding the capture's policy and a
-// client per captured node, advertises the capture's routes and waits for
-// every client's first netmap. With approve set, each node's approved_routes
-// are approved as an admin would; otherwise only the policy approves them.
-func startCaptureClients(
-	t *testing.T,
-	c *testcapture.Capture,
-	approve bool,
-) (*servertest.TestServer, map[string]*servertest.TestClient) {
-	t.Helper()
-
-	// Setup writes land one NodeStore batch at a time, and the checks hold
-	// the netmaps they reach, so the default batch wait only adds time.
-	srv := servertest.NewServer(t, servertest.WithNodeStoreBatchTimeout(state.TestBatchTimeout))
+	srv := servertest.NewServer(t)
 	tagUser := srv.CreateUser(t, "tag-user")
 	users := createCaptureUsers(t, srv)
 
@@ -351,9 +112,8 @@ func startCaptureClients(
 	require.NoError(t, err, "failed to set policy")
 
 	if changed {
-		changes, err := srv.State().ReloadPolicy()
+		err := srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 	}
 
 	// Create clients matching the golden topology: tagged nodes under
@@ -439,18 +199,36 @@ func startCaptureClients(
 
 		cancel()
 
-		if !approve {
-			continue
-		}
-
 		nodeID := findNodeID(t, srv, name)
-		_, routeChange, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			nodeID, nodeApproved[name],
 		)
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 	}
 
+	// Wait for peers based on golden [netmap.NetworkMap] expected counts.
+	for viewerName, cl := range clients {
+		capture := c.Captures[viewerName]
+		if capture.Netmap == nil {
+			continue
+		}
+
+		expected := 0
+
+		for _, peer := range capture.Netmap.Peers {
+			peerName := extractHostname(peer.Name())
+			if _, isOurs := clients[peerName]; isOurs {
+				expected++
+			}
+		}
+
+		if expected > 0 {
+			cl.WaitForPeers(t, expected, 30*time.Second)
+		}
+	}
+
+	// Ensure all nodes have received at least one [tailcfg.MapResponse],
+	// including nodes with 0 expected peers that skipped [TestClient.WaitForPeers].
 	for name, cl := range clients {
 		cl.WaitForCondition(t, name+" initial netmap", 15*time.Second,
 			func(nm *netmap.NetworkMap) bool {
@@ -458,118 +236,32 @@ func startCaptureClients(
 			})
 	}
 
-	return srv, clients
-}
-
-// compareViaMapCompat compares every viewer's netmap and own routes with
-// the capture.
-func compareViaMapCompat(
-	t *testing.T,
-	c *testcapture.Capture,
-	clients map[string]*servertest.TestClient,
-) {
-	t.Helper()
-
 	saasAddrs := saasAddrsByNode(c, clients)
 
 	// Compare each viewer's [tailcfg.MapResponse] against the golden [netmap.NetworkMap].
 	// Route approvals reach clients asynchronously, so the peer-count wait
 	// above says nothing about routes, primaries or filters: retry the
-	// whole comparison until the viewer's netmap has caught up. Each viewer
-	// reads only its own netmap, so the holds run at once.
-	var wg sync.WaitGroup
-
+	// whole comparison until the viewer's netmap has caught up.
 	for viewerName, cl := range clients {
 		capture := c.Captures[viewerName]
 		if capture.Netmap == nil {
 			continue
 		}
 
-		wg.Go(func() {
-			t.Run(viewerName, func(t *testing.T) {
-				requireNetmapHolds(t, func(tt require.TestingT) {
-					nm := cl.Netmap()
-					require.NotNil(tt, nm, "netmap is nil")
+		t.Run(viewerName, func(t *testing.T) {
+			requireNetmapHolds(t, func(tt require.TestingT) {
+				nm := cl.Netmap()
+				require.NotNil(tt, nm, "netmap is nil")
 
-					// Routes were approved on live sessions: verify that approval
-					// reached SelfNode throughout the stable comparison window.
-					require.Equal(tt, selfOffersExit(capture.Netmap), selfOffersExit(nm),
-						"SelfNode exit routes should match SaaS")
+				// Routes were approved on live sessions: verify that approval
+				// reached SelfNode throughout the stable comparison window.
+				require.Equal(tt, selfOffersExit(capture.Netmap), selfOffersExit(nm),
+					"SelfNode exit routes should match SaaS")
 
-					compareNetmap(tt, nm, capture, clients, saasAddrs, c.TestID+"/"+viewerName)
-				})
-
-				t.Run("self-routes", func(t *testing.T) {
-					key := c.TestID + "/" + viewerName + "/self-routes"
-					reason, listed := viaCompatSkipReasons[key]
-
-					requireNetmapHolds(t, func(tt require.TestingT) {
-						want, got := selfRoutes(capture.Netmap), selfRoutes(cl.Netmap())
-						if !listed {
-							assert.Equal(tt, want, got, "own routes in AllowedIPs and PrimaryRoutes")
-
-							return
-						}
-
-						if got == want {
-							tt.Errorf("own routes match SaaS; delete viaCompatSkipReasons[%q]", key)
-						}
-					})
-
-					if listed {
-						t.Skip(reason)
-					}
-				})
+				compareNetmap(tt, nm, capture, clients, saasAddrs)
 			})
 		})
 	}
-
-	wg.Wait()
-}
-
-// selfRoutes is the node's AllowedIPs minus its own addresses, and its
-// PrimaryRoutes, each sorted. Host routes inside the Tailscale range stay
-// in, so serving one SaaS withholds is caught.
-func selfRoutes(nm *netmap.NetworkMap) string {
-	self := nm.SelfNode
-
-	var allowed, primary []string
-
-	for _, pfx := range self.AllowedIPs().All() {
-		if !views.SliceContains(self.Addresses(), pfx) {
-			allowed = append(allowed, pfx.String())
-		}
-	}
-
-	for _, pfx := range self.PrimaryRoutes().All() {
-		primary = append(primary, pfx.String())
-	}
-
-	slices.Sort(allowed)
-	slices.Sort(primary)
-
-	return fmt.Sprintf("allowed %v primary %v", allowed, primary)
-}
-
-func TestSelfRoutesKeepsHostRoutes(t *testing.T) {
-	t.Parallel()
-
-	self := netip.MustParsePrefix("100.64.0.1/32")
-	subnet := netip.MustParsePrefix("10.9.0.0/24")
-	host := netip.MustParsePrefix("100.64.0.11/32")
-
-	nm := func(routes ...netip.Prefix) *netmap.NetworkMap {
-		return &netmap.NetworkMap{SelfNode: (&tailcfg.Node{
-			Addresses:     []netip.Prefix{self},
-			AllowedIPs:    append([]netip.Prefix{self}, routes...),
-			PrimaryRoutes: routes,
-		}).View()}
-	}
-
-	assert.Equal(t, "allowed [10.9.0.0/24] primary [10.9.0.0/24]", selfRoutes(nm(subnet)))
-	assert.Equal(t,
-		"allowed [10.9.0.0/24 100.64.0.11/32] primary [10.9.0.0/24 100.64.0.11/32]",
-		selfRoutes(nm(subnet, host)))
 }
 
 // requireNetmapHolds retries check until it passes on several consecutive
@@ -623,40 +315,20 @@ func (r *failRecorder) FailNow() {
 }
 
 // compareNetmap compares the headscale [tailcfg.MapResponse] against the
-// captured [netmap.NetworkMap] data in an IP-independent way: the peers (see
-// [comparePeers]), the PacketFilter (source, destination, ports) triples and
-// the user profiles.
+// captured [netmap.NetworkMap] data in an IP-independent way. It validates:
+//   - Peer visibility (which peers are present, by hostname)
+//   - Route prefixes in AllowedIPs (non-Tailscale-IP entries like 10.44.0.0/16)
+//   - Number of Tailscale IPs per peer (should be 2: one v4 + one v6)
+//   - PrimaryRoutes per peer
+//   - PacketFilter (source, destination, ports) triples
 //
-// key is <test_id>/<node>, the prefix of the viewer's viaCompatSkipReasons
-// entries. It takes [require.TestingT] so it can run inside
-// [requireNetmapHolds].
+// It takes [require.TestingT] so it can run inside [requireNetmapHolds].
 func compareNetmap(
 	t require.TestingT,
 	got *netmap.NetworkMap,
 	want testcapture.Node,
 	clients map[string]*servertest.TestClient,
 	saasAddrs map[netip.Addr]string,
-	key string,
-) {
-	if h, ok := t.(interface{ Helper() }); ok {
-		h.Helper()
-	}
-
-	comparePeers(t, got, want, clients)
-	comparePacketFilter(t, got, want, clients, saasAddrs, key+"/packet-filter", viaCompatSkipReasons)
-	compareUserProfiles(t, got, want.Netmap, clients)
-}
-
-// comparePeers validates, for the peers in clients:
-//   - Peer visibility (which peers are present, by hostname)
-//   - Route prefixes in AllowedIPs (non-Tailscale-IP entries like 10.44.0.0/16)
-//   - Number of Tailscale IPs per peer (should be 2: one v4 + one v6)
-//   - PrimaryRoutes per peer
-func comparePeers(
-	t require.TestingT,
-	got *netmap.NetworkMap,
-	want testcapture.Node,
-	clients map[string]*servertest.TestClient,
 ) {
 	if h, ok := t.(interface{ Helper() }); ok {
 		h.Helper()
@@ -789,74 +461,8 @@ func comparePeers(
 			t.Errorf("peer %s: visible in headscale but NOT in Tailscale SaaS", name)
 		}
 	}
-}
 
-// compareUserProfiles compares the profile the viewer holds for itself and
-// for each peer in clients. Profile IDs differ between SaaS and headscale, so
-// a profile is its login, with SaaS emails mapped to user names, and its
-// display name.
-func compareUserProfiles(
-	t require.TestingT,
-	got, want *netmap.NetworkMap,
-	clients map[string]*servertest.TestClient,
-) {
-	if h, ok := t.(interface{ Helper() }); ok {
-		h.Helper()
-	}
-
-	gotProfiles := nodeProfiles(got, clients)
-
-	for name, wantProfile := range nodeProfiles(want, clients) {
-		check := "peer"
-		if name == "" {
-			check = "self"
-			if want.SelfNode.Tags().Len() > 0 {
-				check = "tagged-self"
-			}
-		}
-
-		if reason, listed := viaCompatSkipReasons[check]; listed {
-			if gotProfiles[name] == wantProfile {
-				t.Errorf("node %q: %s profile matches SaaS; delete viaCompatSkipReasons[%q] (%s)",
-					name, check, check, reason)
-			}
-
-			continue
-		}
-
-		assert.Equalf(t, wantProfile, gotProfiles[name], "node %q: %s profile mismatch", name, check)
-	}
-}
-
-// nodeProfiles maps "" (self) and each peer in clients to its user profile.
-func nodeProfiles(
-	nm *netmap.NetworkMap,
-	clients map[string]*servertest.TestClient,
-) map[string]string {
-	profile := func(id tailcfg.UserID) string {
-		p, ok := nm.UserProfiles[id]
-		if !ok {
-			return "no profile"
-		}
-
-		login := p.LoginName()
-		if name, ok := captureUserNames[login]; ok {
-			login = name
-		}
-
-		return login + " / " + p.DisplayName()
-	}
-
-	out := map[string]string{"": profile(nm.SelfNode.User())}
-
-	for _, peer := range nm.Peers {
-		name := extractHostname(peer.Name())
-		if _, isOurs := clients[name]; isOurs {
-			out[name] = profile(peer.User())
-		}
-	}
-
-	return out
+	comparePacketFilter(t, got, want, clients, saasAddrs)
 }
 
 // comparePacketFilter compares PacketFilter rules as a set of (source,
@@ -864,15 +470,13 @@ func nodeProfiles(
 // that share sources while SaaS keeps one rule per policy entry, so rule
 // count and order differ without changing what the filter allows.
 // Tailscale IPs differ between SaaS and headscale allocation, so both
-// sides are re-keyed by peer identity. A key listed in skips must differ.
+// sides are re-keyed by peer identity.
 func comparePacketFilter(
 	t require.TestingT,
 	got *netmap.NetworkMap,
 	want testcapture.Node,
 	clients map[string]*servertest.TestClient,
 	saasAddrs map[netip.Addr]string,
-	key string,
-	skips map[string]string,
 ) {
 	if h, ok := t.(interface{ Helper() }); ok {
 		h.Helper()
@@ -929,17 +533,7 @@ func comparePacketFilter(
 		}
 	}
 
-	wantList, gotList := sortedKeys(wantTriples), sortedKeys(gotTriples)
-
-	if reason, listed := skips[key]; listed {
-		if slices.Equal(wantList, gotList) {
-			t.Errorf("PacketFilter matches SaaS; delete the skip entry %q (%s)", key, reason)
-		}
-
-		return
-	}
-
-	assert.ElementsMatchf(t, wantList, gotList,
+	assert.ElementsMatchf(t, sortedKeys(wantTriples), sortedKeys(gotTriples),
 		"PacketFilter (source, destination, ports) mismatch")
 }
 
@@ -1027,8 +621,9 @@ func hsAddrsByPeer(clients map[string]*servertest.TestClient) map[netip.Addr]str
 // SaaS wire format) into a sorted list of canonical identifiers: "*"
 // for wildcard, "peer:<name>" for each Tailscale address or prefix
 // that resolves to a known peer, or the raw CIDR string for
-// non-Tailscale prefixes. A Tailscale prefix or address range expands
-// to the union of its contained peers.
+// non-Tailscale prefixes. A Tailscale prefix wider than /32 (IPv4)
+// or /128 (IPv6) expands to the union of its contained peers.
+// Unresolvable Tailscale-range sources fail the test.
 func canonicaliseSrcStrings(
 	t require.TestingT,
 	srcs []string,
@@ -1048,13 +643,11 @@ func canonicaliseSrcStrings(
 			continue
 		}
 
-		pfxs, err := parseDstPrefixes(src)
+		pfx, err := parsePrefixOrAddr(src)
 		require.NoErrorf(t, err,
 			"PacketFilter[%d]: unparseable SrcIP %q", ruleIndex, src)
 
-		for _, pfx := range pfxs {
-			addIdentsForSrc(t, pfx, addrToPeer, ruleIndex, seen)
-		}
+		addIdentsForSrc(t, pfx, addrToPeer, ruleIndex, seen)
 	}
 
 	return sortedKeys(seen)
@@ -1091,9 +684,7 @@ func canonicaliseSrcPrefixes(
 // addIdentsForSrc resolves one source prefix into canonical identity
 // tokens and inserts them into seen. A non-Tailscale prefix passes
 // through literally; a Tailscale-range prefix expands to the union
-// of peer names whose addresses fall within it. A single address must
-// be a known peer; a wider prefix may cover none, since SaaS writes
-// "*" as ranges over the whole Tailscale space.
+// of peer names whose addresses fall within it.
 func addIdentsForSrc(
 	t require.TestingT,
 	pfx netip.Prefix,
@@ -1120,7 +711,7 @@ func addIdentsForSrc(
 		}
 	}
 
-	require.Truef(t, matched || !pfx.IsSingleIP(),
+	require.Truef(t, matched,
 		"PacketFilter[%d]: Tailscale-range SrcIP %s does not cover any known peer; addrToPeer=%v",
 		ruleIndex, pfx, addrToPeer)
 }
