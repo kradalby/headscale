@@ -196,8 +196,10 @@ type Hub struct {
 	// sentPeers is the peer view each node was last sent, kept across its
 	// sessions so a reconnect can announce peers removed in between. Views
 	// are the snapshot's, shared by every node seeing the same peers, so
-	// this costs no copy per node, and an offline node's entry can wait for
-	// the node's deletion instead of an offline timeout.
+	// this costs no copy per node within one generation. Offline nodes can
+	// pin different generations: aggregate history can still cost O(nodes²)
+	// even with one current class. Entries wait for delivery or deletion;
+	// a timeout would lose removals a reconnecting client still needs.
 	sentPeers map[types.NodeID]sentView
 
 	// renders and classes are shared by every session's renderer, and
