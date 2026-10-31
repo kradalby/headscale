@@ -160,8 +160,7 @@ control_logs/20260409-104215-mdjtzx/
 ├── hs-<test>-<hash>_metrics.txt       # Prometheus metrics dump
 ├── hs-<test>-<hash>-mapresponses/     # MapResponse protocol captures
 ├── ts-<client>-<hash>.stderr.log      # tailscale client errors
-├── ts-<client>-<hash>.stdout.log      # tailscale client output
-└── ts-<client>-<hash>_status.json     # client network-status dump
+└── ts-<client>-<hash>.stdout.log      # tailscale client output
 ```
 
 Artefacts persist after cleanup. Old runs accumulate fast — delete
@@ -191,9 +190,7 @@ When a test fails, read the artefacts **in this order**:
        control_logs/*/hs-*-mapresponses/001.json
    ```
 
-4. **`*_status.json`** — client peer-connectivity state.
-
-5. **`hs-*.db`** — SQLite snapshot for post-mortem consistency checks.
+4. **`hs-*.db`** — SQLite snapshot for post-mortem consistency checks.
 
    ```bash
    sqlite3 control_logs/<runID>/hs-*.db
@@ -202,7 +199,7 @@ When a test fails, read the artefacts **in this order**:
    sqlite> SELECT id, hostname, user_id, tags FROM nodes WHERE hostname LIKE '%problematic%';
    ```
 
-6. **`*_metrics.txt`** — Prometheus dumps for latency, graph commits and
+5. **`*_metrics.txt`** — Prometheus dumps for latency, graph commits and
    policy compiles (`headscale_world_*`, `headscale_policy_compiles_total`),
    database query performance, memory usage.
 

@@ -15,6 +15,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
@@ -141,6 +142,229 @@ func testWorld(t *testing.T, nodes ...*types.Node) (*world, []types.User) {
 	require.NoError(t, err)
 
 	return w, users
+}
+
+// worldCommitCount reads the package-global counter, so the metric tests
+// below compare deltas and this package's tests must stay serial (no
+// t.Parallel anywhere in it).
+func worldCommitCount(t *testing.T) float64 {
+	t.Helper()
+
+	return testutil.ToFloat64(worldCommits)
+}
+
+func TestWorldCommitMetric(t *testing.T) {
+	before := worldCommitCount(t)
+	w, users := testWorld(t,
+		worldNode(1, &types.User{}, "100.64.0.1"),
+		worldNode(2, &types.User{}, "100.64.0.2"),
+	)
+	assert.InDelta(t, before, worldCommitCount(t), 0, "initialization is not a write")
+
+	users[0].DisplayName = "Alice"
+	pol := []byte(`{"grants":[]}`)
+	dm := &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: {RegionID: 1}}}
+	records := []tailcfg.DNSRecord{{Name: "example.test", Type: "A", Value: "192.0.2.1"}}
+	update := func(n *types.Node) { n.Hostname += "-updated" }
+
+	for _, tt := range []struct {
+		name    string
+		write   func()
+		commits uint64
+	}{
+		{"node", func() { w.UpdateNode(1, update) }, 1},
+		{"node batch", func() { w.UpdateNodes(map[types.NodeID]UpdateNodeFunc{1: update, 2: update}) }, 1},
+		// A write that replaces a node with an identical copy still counts:
+		// it stages an edit, and the nodes input compares nodes by identity.
+		{"unchanged node", func() { w.UpdateNode(1, func(*types.Node) {}) }, 1},
+		{"add node", func() { w.PutNode(*worldNode(3, &users[0], "100.64.0.3")) }, 1},
+		{"delete node", func() { w.DeleteNode(3) }, 1},
+		{"missing node", func() { w.DeleteNode(99) }, 0},
+		{"users", func() { require.NoError(t, w.SetUsers(users)) }, 1},
+		{"unchanged users", func() { require.NoError(t, w.SetUsers(slices.Clone(users))) }, 0},
+		{"policy", func() {
+			changed, err := w.SetPolicy(pol, (*Snapshot).PolicyErr)
+			require.NoError(t, err)
+			require.True(t, changed)
+		}, 1},
+		{"unchanged policy", func() {
+			changed, err := w.SetPolicy(slices.Clone(pol), (*Snapshot).PolicyErr)
+			require.NoError(t, err)
+			require.False(t, changed)
+		}, 0},
+		{"refused policy", func() {
+			changed, err := w.SetPolicy([]byte(ownUserPolicy), func(*Snapshot) error { return errPolicyInputsMoved })
+			require.ErrorIs(t, err, errPolicyInputsMoved)
+			require.False(t, changed)
+		}, 0},
+		{"DERP", func() { w.SetDERPMap(dm) }, 1},
+		{"unchanged DERP", func() { w.SetDERPMap(dm.Clone()) }, 0},
+		{"DNS", func() { w.SetExtraRecords(records) }, 1},
+		{"unchanged DNS", func() { w.SetExtraRecords(slices.Clone(records)) }, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			before := worldCommitCount(t)
+			rev := w.snapshot().Rev()
+
+			tt.write()
+			assert.Equal(t, rev+tt.commits, w.snapshot().Rev())
+			assert.InDelta(t, before+float64(tt.commits), worldCommitCount(t), 0)
+
+			assert.InDelta(t, float64(w.snapshot().ListNodes().Len()), testutil.ToFloat64(worldNodes), 0, "node gauge describes published nodes")
+		})
+	}
+}
+
+func TestWorldCommitMetricExcludesDerivationPanic(t *testing.T) {
+	for _, kind := range []string{"node", "users"} {
+		t.Run(kind, func(t *testing.T) {
+			g := graph.New()
+			w := &world{g: g}
+			w.nodes = g.NewInput("nodes", graph.NewMap[types.NodeID](graph.Same[*types.Node], nil), graph.Same[*nodeMap])
+			w.users = g.NewInput("users", []types.User(nil), slices.Equal[[]types.User])
+			graph.NewDerived(g, "panic after staging", graph.Same[int], func(s *graph.Snapshot, _ int) int {
+				s.Get(w.nodes)
+				s.Get(w.users)
+
+				if s.Rev() > 1 {
+					panic("derivation failed")
+				}
+
+				return 0
+			})
+			_, err := g.Update(func(*graph.Tx) error { return nil })
+			require.NoError(t, err)
+
+			before := worldCommitCount(t)
+			gaugeBefore := testutil.ToFloat64(worldNodes)
+
+			// A sentinel the batch must not overwrite; restored so later
+			// tests read the gauge this package's serial run left behind.
+			worldNodes.Set(0)
+			t.Cleanup(func() { worldNodes.Set(gaugeBefore) })
+
+			if kind == "node" {
+				_, p, _ := w.commitBatch([]*nodeWrite{{fn: func(e *nodeEdit) {
+					e.Set(1, &types.Node{ID: 1})
+				}}})
+				require.Equal(t, "derivation failed", p)
+			} else {
+				require.PanicsWithValue(t, "derivation failed", func() { require.NoError(t, w.SetUsers([]types.User{{Name: "alice"}})) })
+			}
+
+			assert.EqualValues(t, 1, g.Snapshot().Rev(), "a panic publishes nothing")
+			assert.Zero(t, g.Snapshot().Get(w.nodes).Len(), "a failed derivation publishes no node")
+			assert.InDelta(t, before, worldCommitCount(t), 0, "staging inputs is not a commit")
+			assert.Zero(t, testutil.ToFloat64(worldNodes), "a failed derivation must not change the node gauge")
+		})
+	}
+}
+
+// A panicking batch is retried write by write; each surviving write that
+// publishes counts separately, which the commit counter's help text states.
+// The test drives the real commit loop, not commitBatch alone, so a
+// regression in commitWrites' retry wiring changes the count.
+func TestWorldCommitMetricCountsPanicRetriesSeparately(t *testing.T) {
+	g := graph.New()
+	w := &world{g: g}
+	w.nodes = g.NewInput("nodes", graph.NewMap[types.NodeID](graph.Same[*types.Node], nil), graph.Same[*nodeMap])
+	// The derivation fails whenever node 1 is staged, so a batch containing
+	// it panics and only its sibling writes survive the per-write retry.
+	graph.NewDerived(g, "panic on node 1", graph.Same[int], func(s *graph.Snapshot, _ int) int {
+		nodes := s.Get(w.nodes)
+
+		if s.Rev() > 1 {
+			if _, ok := nodes.Get(1); ok {
+				panic("derivation failed")
+			}
+		}
+
+		return 0
+	})
+	_, err := g.Update(func(*graph.Tx) error { return nil })
+	require.NoError(t, err)
+
+	before := worldCommitCount(t)
+	gaugeBefore := testutil.ToFloat64(worldNodes)
+
+	t.Cleanup(func() { worldNodes.Set(gaugeBefore) })
+
+	// Hold a first commit open until both writes queue into one batch, as
+	// group commit batches concurrent writers (the pattern of
+	// TestWorldWritePanicFailsOnlyItsWriter).
+	inCommit, release := make(chan struct{}), make(chan struct{})
+
+	// Releasing the hold is cleanup-safe: a failed assertion must not
+	// strand the held commit or the writers on their done channels, and
+	// the retry loop delivers each write's panic to its own writer, where
+	// the recovers below pick it up.
+	var releaseOnce sync.Once
+
+	releaseHold := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseHold)
+
+	go w.update(func(*nodeEdit) {
+		close(inCommit)
+		<-release
+	})
+
+	<-inCommit
+
+	var (
+		wg        sync.WaitGroup
+		panicked  any
+		goodPanic any
+		good      *Snapshot
+	)
+
+	wg.Go(func() {
+		defer func() { panicked = recover() }()
+
+		w.update(func(e *nodeEdit) { e.Set(1, &types.Node{ID: 1}) })
+	})
+	wg.Go(func() {
+		defer func() { goodPanic = recover() }()
+
+		good = w.update(func(e *nodeEdit) { e.Set(2, &types.Node{ID: 2}) })
+	})
+
+	require.Eventually(t, func() bool {
+		w.writeMu.Lock()
+		defer w.writeMu.Unlock()
+
+		return len(w.writes) == 2
+	}, time.Second, time.Millisecond, "both writes must queue into one batch")
+
+	releaseHold()
+
+	// A regression that stops retrying a panicked batch blocks every
+	// writer on its done channel; fail fast with a message instead of
+	// hanging the package until its timeout.
+	waited := make(chan struct{})
+
+	go func() {
+		wg.Wait()
+		close(waited)
+	}()
+
+	select {
+	case <-waited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the individual retries did not finish; commitWrites' retry loop looks broken")
+	}
+
+	require.Nil(t, goodPanic, "the surviving write must commit, not panic")
+
+	assert.Equal(t, "derivation failed", panicked, "the panicking write's retry re-raises it")
+	require.NotNil(t, good, "the surviving write commits")
+
+	n2, ok := good.GetNode(2)
+	require.True(t, ok, "the survivor's snapshot carries its node")
+	assert.Equal(t, types.NodeID(2), n2.ID())
+
+	assert.InDelta(t, before+1, worldCommitCount(t), 0,
+		"the batch attempt counts nothing and the surviving retry counts once")
+	assert.InDelta(t, float64(1), testutil.ToFloat64(worldNodes), 0, "only the survivor's node is published")
 }
 
 func TestWorldPayloadWriteKeepsPolicy(t *testing.T) {

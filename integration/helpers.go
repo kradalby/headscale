@@ -27,6 +27,7 @@ import (
 	"github.com/oauth2-proxy/mockoidc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/wgengine/filter"
 )
@@ -64,13 +65,16 @@ func onlineLabel(online bool) string {
 	return stateOffline
 }
 
-var errNoNewClientFound = errors.New("no new client found")
+var (
+	errNoNewClientFound    = errors.New("no new client found")
+	errInvalidClientStatus = errors.New("invalid client status")
+)
 
 // NodeSystemStatus represents the status of a node across different systems.
 type NodeSystemStatus struct {
 	Batcher          bool
 	BatcherConnCount int
-	MapResponses     bool
+	ClientPeers      bool
 	NodeStore        bool
 }
 
@@ -142,35 +146,35 @@ func collectExpectedNodeIDs(t *testing.T, clients []TailscaleClient) []types.Nod
 // validateInitialConnection performs comprehensive validation after initial client login.
 // Validates that all nodes are online and have proper [tailcfg.NetInfo]/DERP configuration,
 // essential for ensuring successful initial connection state in relogin tests.
-func validateInitialConnection(t *testing.T, headscale ControlServer, expectedNodes []types.NodeID) {
+func validateInitialConnection(t *testing.T, headscale ControlServer, clients []TailscaleClient, expectedNodes []types.NodeID) {
 	t.Helper()
 
-	requireAllClientsOnline(t, headscale, expectedNodes, true, "all clients should be connected after initial login", 120*time.Second)
+	requireAllClientsOnline(t, headscale, clients, expectedNodes, true, "all clients should be connected after initial login", 120*time.Second)
 	requireAllClientsNetInfoAndDERP(t, headscale, expectedNodes, "all clients should have NetInfo and DERP after initial login", 3*time.Minute)
 }
 
 // validateLogoutComplete performs comprehensive validation after client logout.
 // Ensures all nodes are properly offline across all headscale systems,
 // critical for validating clean logout state in relogin tests.
-func validateLogoutComplete(t *testing.T, headscale ControlServer, expectedNodes []types.NodeID) {
+func validateLogoutComplete(t *testing.T, headscale ControlServer, clients []TailscaleClient, expectedNodes []types.NodeID) {
 	t.Helper()
 
-	requireAllClientsOnline(t, headscale, expectedNodes, false, "all nodes should be offline after logout", 120*time.Second)
+	requireAllClientsOnline(t, headscale, clients, expectedNodes, false, "all nodes should be offline after logout", 120*time.Second)
 }
 
 // validateReloginComplete performs comprehensive validation after client relogin.
 // Validates that all nodes are back online with proper [tailcfg.NetInfo]/DERP configuration,
 // ensuring successful relogin state restoration in integration tests.
-func validateReloginComplete(t *testing.T, headscale ControlServer, expectedNodes []types.NodeID) {
+func validateReloginComplete(t *testing.T, headscale ControlServer, clients []TailscaleClient, expectedNodes []types.NodeID) {
 	t.Helper()
 
-	requireAllClientsOnline(t, headscale, expectedNodes, true, "all clients should be connected after relogin", integrationutil.ScaledTimeout(120*time.Second))
+	requireAllClientsOnline(t, headscale, clients, expectedNodes, true, "all clients should be connected after relogin", integrationutil.ScaledTimeout(120*time.Second))
 	requireAllClientsNetInfoAndDERP(t, headscale, expectedNodes, "all clients should have NetInfo and DERP after relogin", integrationutil.ScaledTimeout(3*time.Minute))
 }
 
 // requireAllClientsOnline validates that all nodes are online/offline across all headscale systems
 // requireAllClientsOnline verifies all expected nodes are in the specified online state across all systems.
-func requireAllClientsOnline(t *testing.T, headscale ControlServer, expectedNodes []types.NodeID, expectedOnline bool, message string, timeout time.Duration) {
+func requireAllClientsOnline(t *testing.T, headscale ControlServer, clients []TailscaleClient, expectedNodes []types.NodeID, expectedOnline bool, message string, timeout time.Duration) {
 	t.Helper()
 
 	startTime := time.Now()
@@ -181,10 +185,10 @@ func requireAllClientsOnline(t *testing.T, headscale ControlServer, expectedNode
 
 	if expectedOnline {
 		// For online validation, use the existing logic with full timeout
-		requireAllClientsOnlineWithSingleTimeout(t, headscale, expectedNodes, expectedOnline, message, timeout)
+		requireAllClientsOnlineWithSingleTimeout(t, headscale, clients, expectedNodes, expectedOnline, message, timeout)
 	} else {
 		// For offline validation, use staged approach with component-specific timeouts
-		requireAllClientsOfflineStaged(t, headscale, expectedNodes)
+		requireAllClientsOfflineStaged(t, headscale, clients, expectedNodes)
 	}
 
 	endTime := time.Now()
@@ -194,7 +198,7 @@ func requireAllClientsOnline(t *testing.T, headscale ControlServer, expectedNode
 // requireAllClientsOnlineWithSingleTimeout is the original validation logic for online state.
 //
 //nolint:gocyclo // complex validation with multiple node states
-func requireAllClientsOnlineWithSingleTimeout(t *testing.T, headscale ControlServer, expectedNodes []types.NodeID, expectedOnline bool, message string, timeout time.Duration) {
+func requireAllClientsOnlineWithSingleTimeout(t *testing.T, headscale ControlServer, clients []TailscaleClient, expectedNodes []types.NodeID, expectedOnline bool, message string, timeout time.Duration) {
 	t.Helper()
 
 	var prevReport string
@@ -210,9 +214,9 @@ func requireAllClientsOnlineWithSingleTimeout(t *testing.T, headscale ControlSer
 			return
 		}
 
-		// Get map responses
-		mapResponses, err := headscale.GetAllMapReponses()
-		assert.NoError(c, err, "Failed to get map responses")
+		// Generated dumps include abandoned streams and failed writes, not client receipt.
+		onlineMap, err := clientOnlineMap(clients)
+		assert.NoError(c, err, "Failed to read client peer state")
 
 		if err != nil {
 			return
@@ -233,16 +237,16 @@ func requireAllClientsOnlineWithSingleTimeout(t *testing.T, headscale ControlSer
 		}
 
 		// Disconnected recipients retain historical maps from earlier logins.
-		for id := range mapResponses {
+		for id := range onlineMap {
 			if recipient, ok := debugInfo.ConnectedNodes[id.String()]; !ok || !recipient.Connected {
-				delete(mapResponses, id)
+				delete(onlineMap, id)
 			}
 		}
 
-		// Check that we have map responses for expected nodes
-		mapResponseCount := len(mapResponses)
 		expectedCount := len(expectedNodes)
-		assert.GreaterOrEqual(c, mapResponseCount, expectedCount, "MapResponses insufficient - expected at least %d responses, got %d", expectedCount, mapResponseCount)
+		for _, nodeID := range expectedNodes {
+			assert.Contains(c, onlineMap, nodeID, "Expected node %d has no running or readable client", nodeID)
+		}
 
 		// Build status map for each node
 		nodeStatus := make(map[types.NodeID]NodeSystemStatus)
@@ -271,13 +275,12 @@ func requireAllClientsOnlineWithSingleTimeout(t *testing.T, headscale ControlSer
 			}
 		}
 
-		// Check map responses using [integrationutil.BuildExpectedOnlineMap]
+		// Check the peers installed by each running client.
 		onlineFromMaps := make(map[types.NodeID]bool)
-		onlineMap := integrationutil.BuildExpectedOnlineMap(mapResponses)
 
 		// For single node scenarios, we can't validate peer visibility since there are no peers
 		if len(expectedNodes) == 1 {
-			// For single node, just check that we have map responses for the node
+			// For a single node, require its running client.
 			for nodeID := range nodeStatus {
 				if _, exists := onlineMap[nodeID]; exists {
 					onlineFromMaps[nodeID] = true
@@ -315,12 +318,12 @@ func requireAllClientsOnlineWithSingleTimeout(t *testing.T, headscale ControlSer
 			}
 		}
 
-		assert.Lenf(c, onlineFromMaps, expectedCount, "MapResponses missing nodes in status check")
+		assert.Lenf(c, onlineFromMaps, expectedCount, "Client status missing nodes")
 
-		// Update status with map response data
+		// Update status with client-observed peer data.
 		for nodeID, online := range onlineFromMaps {
 			if status, exists := nodeStatus[nodeID]; exists {
-				status.MapResponses = online
+				status.ClientPeers = online
 				nodeStatus[nodeID] = status
 			}
 		}
@@ -346,7 +349,7 @@ func requireAllClientsOnlineWithSingleTimeout(t *testing.T, headscale ControlSer
 		for _, nodeID := range ids {
 			status := nodeStatus[nodeID]
 			systemsMatch := (status.Batcher == expectedOnline) &&
-				(status.MapResponses == expectedOnline) &&
+				(status.ClientPeers == expectedOnline) &&
 				(status.NodeStore == expectedOnline)
 
 			if !systemsMatch {
@@ -355,7 +358,7 @@ func requireAllClientsOnlineWithSingleTimeout(t *testing.T, headscale ControlSer
 				fmt.Fprintf(&failureReport, "node:%d is not fully %s (timestamp: %s):\n", nodeID, stateStr, time.Now().Format(TimestampFormat))
 				fmt.Fprintf(&failureReport, "  - batcher: %t (expected: %t)\n", status.Batcher, expectedOnline)
 				fmt.Fprintf(&failureReport, "    - conn count: %d\n", status.BatcherConnCount)
-				fmt.Fprintf(&failureReport, "  - mapresponses: %t (expected: %t, down with at least one peer)\n", status.MapResponses, expectedOnline)
+				fmt.Fprintf(&failureReport, "  - client peers: %t (expected: %t)\n", status.ClientPeers, expectedOnline)
 				fmt.Fprintf(&failureReport, "  - nodestore: %t (expected: %t)\n", status.NodeStore, expectedOnline)
 			}
 		}
@@ -376,12 +379,12 @@ func requireAllClientsOnlineWithSingleTimeout(t *testing.T, headscale ControlSer
 			assert.Fail(c, failureReport.String())
 		}
 
-		assert.True(c, allMatch, "Not all %d nodes are %s across all systems (batcher, mapresponses, nodestore)", len(expectedNodes), stateStr)
+		assert.True(c, allMatch, "Not all %d nodes are %s across all systems (batcher, client peers, nodestore)", len(expectedNodes), stateStr)
 	}, timeout, 2*time.Second, message)
 }
 
 // requireAllClientsOfflineStaged validates offline state with staged timeouts for different components.
-func requireAllClientsOfflineStaged(t *testing.T, headscale ControlServer, expectedNodes []types.NodeID) {
+func requireAllClientsOfflineStaged(t *testing.T, headscale ControlServer, clients []TailscaleClient, expectedNodes []types.NodeID) {
 	t.Helper()
 
 	connectedRecipients := make(map[string]bool)
@@ -452,8 +455,8 @@ func requireAllClientsOfflineStaged(t *testing.T, headscale ControlServer, expec
 
 	t.Logf("Stage 3: Verifying map response propagation for %d nodes (allowing for peer map update delays)", len(expectedNodes))
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
-		mapResponses, err := headscale.GetAllMapReponses()
-		assert.NoError(c, err, "Failed to get map responses")
+		onlineMap, err := clientOnlineMap(clients)
+		assert.NoError(c, err, "Failed to read client peer state")
 
 		if err != nil {
 			return
@@ -469,10 +472,17 @@ func requireAllClientsOfflineStaged(t *testing.T, headscale ControlServer, expec
 		// Only a viewer with a live session can still be told; one that
 		// disconnected keeps the view it last received until it reconnects
 		// and gets a full map.
-		onlineMap := integrationutil.BuildExpectedOnlineMap(mapResponses)
 		for id := range onlineMap {
 			if info, ok := debugInfo.ConnectedNodes[id.String()]; !ok || !info.Connected {
 				delete(onlineMap, id)
+			}
+		}
+
+		for id := range connectedRecipients {
+			if info, ok := debugInfo.ConnectedNodes[id]; ok && info.Connected {
+				nodeID, err := strconv.ParseUint(id, 10, 64)
+				assert.NoError(c, err)
+				assert.Contains(c, onlineMap, types.NodeID(nodeID), "Connected viewer %s has no running or readable client", id)
 			}
 		}
 
@@ -498,6 +508,92 @@ func requireAllClientsOfflineStaged(t *testing.T, headscale ControlServer, expec
 	}, integrationutil.ScaledTimeout(60*time.Second), 2*time.Second, "map response propagation validation")
 
 	t.Logf("All stages completed: nodes are fully offline across all systems")
+}
+
+// clientObservation is one client's read: skipped when its status could
+// not be read or it is not Running, failed when it is Running yet
+// unusable, and its identity and peers when it read.
+type clientObservation struct {
+	id    types.NodeID
+	peers map[types.NodeID]bool
+	skip  bool
+	err   error
+}
+
+func observeClient(client TailscaleClient) clientObservation {
+	status, err := client.Status()
+	if err != nil {
+		return clientObservation{skip: true}
+	}
+
+	if status == nil {
+		return clientObservation{err: errInvalidClientStatus}
+	}
+
+	if status.BackendState != "Running" {
+		return clientObservation{skip: true}
+	}
+
+	if status.Self == nil {
+		return clientObservation{err: errInvalidClientStatus}
+	}
+
+	id, err := strconv.ParseUint(string(status.Self.ID), 10, 64)
+	if err != nil {
+		return clientObservation{err: fmt.Errorf("parsing client ID: %w", err)}
+	}
+
+	peers := make(map[types.NodeID]bool, len(status.Peer))
+	for _, peer := range status.Peer {
+		if peer == nil {
+			return clientObservation{err: errInvalidClientStatus}
+		}
+
+		peerID, err := strconv.ParseUint(string(peer.ID), 10, 64)
+		if err != nil {
+			return clientObservation{err: fmt.Errorf("parsing peer ID: %w", err)}
+		}
+
+		peers[types.NodeID(peerID)] = peer.Online
+	}
+
+	return clientObservation{id: types.NodeID(id), peers: peers}
+}
+
+// clientOnlineMap reports, for every client whose status reads, the peers
+// its installed map shows and their online state. A client whose status
+// cannot be read is skipped: a flaky read must not hide the readable
+// clients, and a node the caller expects still fails convergence checks by
+// being absent. A client that is Running yet unusable (nil status, no self,
+// an unparsable ID) is a real defect and fails the read. Each read is a
+// container round-trip, so the clients are read concurrently.
+func clientOnlineMap(clients []TailscaleClient) (map[types.NodeID]map[types.NodeID]bool, error) {
+	observations := make([]clientObservation, len(clients))
+
+	var wg sync.WaitGroup
+	for i, client := range clients {
+		wg.Go(func() {
+			observations[i] = observeClient(client)
+		})
+	}
+
+	wg.Wait()
+
+	result := make(map[types.NodeID]map[types.NodeID]bool, len(clients))
+
+	for _, o := range observations {
+		if o.err != nil {
+			return nil, o.err
+		}
+
+		if o.skip {
+			continue
+		}
+
+		result[o.id] = o.peers
+	}
+
+	return result, nil
 }
 
 // requireAllClientsNetInfoAndDERP validates that all nodes have [tailcfg.NetInfo] in the database
@@ -644,6 +740,37 @@ func assertCurlFailWithCollect(c *assert.CollectT, client TailscaleClient, url, 
 	assert.Error(c, err, msg)
 }
 
+func assertClientStatus(t assert.TestingT, client TailscaleClient) *ipnstate.Status {
+	if h, ok := t.(interface{ Helper() }); ok {
+		h.Helper()
+	}
+
+	status, err := client.Status()
+	if !assert.NoError(t, err, "Failed to get status for client %s", client.Hostname()) { //nolint:testifylint // CollectT callbacks must record errors without calling FailNow.
+		return nil
+	}
+
+	if !assert.NotNil(t, status, "Missing status for client %s", client.Hostname()) {
+		return nil
+	}
+
+	return status
+}
+
+func assertClientLogin(t assert.TestingT, client TailscaleClient, expectedLogin string) {
+	if h, ok := t.(interface{ Helper() }); ok {
+		h.Helper()
+	}
+
+	status := assertClientStatus(t, client)
+	if status == nil || !assert.NotNil(t, status.Self, "Missing self in status for client %s", client.Hostname()) {
+		return
+	}
+
+	login := status.User[status.Self.UserID].LoginName
+	assert.Equal(t, expectedLogin, login, "Client %s should be logged in as %s after user switch, got %s", client.Hostname(), expectedLogin, login)
+}
+
 // assertTailscaleNodesLogout verifies that all provided Tailscale clients
 // are in the logged-out state (NeedsLogin).
 func assertTailscaleNodesLogout(t assert.TestingT, clients []TailscaleClient) {
@@ -652,8 +779,11 @@ func assertTailscaleNodesLogout(t assert.TestingT, clients []TailscaleClient) {
 	}
 
 	for _, client := range clients {
-		status, err := client.Status()
-		assert.NoError(t, err, "failed to get status for client %s", client.Hostname()) //nolint:testifylint // assert.TestingT interface
+		status := assertClientStatus(t, client)
+		if status == nil {
+			continue
+		}
+
 		assert.Equal(t, "NeedsLogin", status.BackendState,
 			"client %s should be logged out", client.Hostname())
 	}
@@ -846,7 +976,7 @@ func assertValidNetmap(t *testing.T, client TailscaleClient) {
 func assertValidStatus(t *testing.T, client TailscaleClient) {
 	t.Helper()
 
-	status, err := client.Status(true)
+	status, err := client.Status()
 	if err != nil {
 		t.Fatalf("getting status for %q: %s", client.Hostname(), err)
 	}
