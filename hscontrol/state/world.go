@@ -1766,13 +1766,13 @@ func (s *Snapshot) CapsChangedSince(v CapsVersion) []types.NodeID {
 	return graph.Changes(v.m, s.s.Get(s.w.nodeCaps))
 }
 
-// NodesVersion is the nodes of a snapshot, which a reader keeps to ask a
-// later snapshot what changed since. Holding one costs only what later
-// writes replaced.
+// NodesVersion identifies the nodes of a snapshot, which a reader keeps to
+// ask a later snapshot what changed since. It holds no nodes, so a reader
+// that keeps one for long, such as an idle peer class, pins nothing.
 type NodesVersion struct{ m *nodeMap }
 
-// NodesVersion returns the nodes of s.
-func (s *Snapshot) NodesVersion() NodesVersion { return NodesVersion{m: s.nodes()} }
+// NodesVersion returns the version of the nodes of s.
+func (s *Snapshot) NodesVersion() NodesVersion { return NodesVersion{m: s.nodes().Cursor()} }
 
 // NodesTouchedSince returns the nodes the writes from v to s touched,
 // possibly with repeats and nodes that changed back, while v is within
