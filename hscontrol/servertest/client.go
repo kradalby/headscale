@@ -321,9 +321,12 @@ func (c *TestClient) tryLogin(ctx context.Context, flags controlclient.LoginFlag
 		c.mu.Lock()
 		c.registers = append(c.registers, testcapture.RegisterAttempt{Err: err.Error()})
 		c.mu.Unlock()
+
+		return err
 	}
 
-	return err
+	// Direct lacks Auto's post-login update loop; streams are read-only.
+	return c.direct.SendUpdate(ctx)
 }
 
 // waitLogin waits on the auth URL while approve completes the login it names.
@@ -566,6 +569,11 @@ func (c *TestClient) ReloginAndPoll(ctx context.Context) error {
 
 	if url != "" {
 		return fmt.Errorf("servertest: TryLogin(%s): unexpected auth URL %q (expected auto-auth with preauth key)", c.Name, url) //nolint:err113
+	}
+
+	err = c.direct.SendUpdate(ctx)
+	if err != nil {
+		return fmt.Errorf("servertest: SendUpdate(%s): %w", c.Name, err)
 	}
 
 	c.resetNetmapState()
