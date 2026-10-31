@@ -819,10 +819,9 @@ func TestTaggedReauthRejectedTagKeepsKeyAndName(t *testing.T) {
 	assert.ElementsMatch(t, []string{"tag:foo"}, after.Tags().AsSlice())
 }
 
-// TestTaggedReauthChecksTagsAsTheWriteCommits takes a tag's ownership away
-// just before the re-auth writes the node: a check made ahead of the write
-// would pass, so the write itself must refuse the tag and commit nothing.
-func TestTaggedReauthChecksTagsAsTheWriteCommits(t *testing.T) {
+// TestTaggedReauthChecksTagsWhenStaging removes permission before the candidate
+// is authorized, so neither the tag nor the other registration fields may publish.
+func TestTaggedReauthChecksTagsWhenStaging(t *testing.T) {
 	n := seedTagOwnedNode(t, []string{"tag:foo"}, "")
 
 	owner := n.s.CreateUserForTest("owner")
@@ -844,7 +843,7 @@ func TestTaggedReauthChecksTagsAsTheWriteCommits(t *testing.T) {
 
 	_, err = n.reauth(t, owner, []string{"tag:foo", "tag:bar"}, nil)
 	require.ErrorIs(t, err, ErrRequestedTagsInvalidOrNotPermitted,
-		"a tag no longer owned when the write commits must be refused, not dropped")
+		"a tag no longer owned when staging must be refused, not dropped")
 
 	after := n.get(t)
 	assert.Equal(t, before.NodeKey(), after.NodeKey(), "the refused write commits nothing")
@@ -886,6 +885,45 @@ func TestTaggedReauthDuplicateTagsDeduped(t *testing.T) {
 		"duplicate requested tags must be deduped to a single tag")
 }
 
+// TestLogoutRechecksTaggedUnderThePersistLock pins dsf F3: LogoutNode's
+// tagged guard must be re-decided under persistMu. An admin retag landing
+// between the unlocked checks and the expiry write would otherwise stamp a
+// past expiry on a tagged node — and this PR's pakSkipsValidation tightening
+// removed the spent-key self-heal that used to clear such a stamp, so an
+// accidental logout would leave the tagged device locked out for good.
+func TestLogoutRechecksTaggedUnderThePersistLock(t *testing.T) {
+	_, s, id := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	_, err := s.SetPolicy([]byte(`{"tagOwners":{"tag:logout":["persist-user@"]}}`))
+	require.NoError(t, err)
+
+	node, ok := s.GetNodeByID(id)
+	require.True(t, ok)
+	require.False(t, node.IsTagged(), "precondition: the node starts user-owned")
+
+	// An admin retag lands in the window between the unlocked checks and
+	// the locked write.
+	s.beforeLogoutWrite = func() {
+		_, err := s.SetNodeTags(id, []string{"tag:logout"})
+		require.NoError(t, err)
+	}
+
+	past := time.Now().Add(-time.Hour)
+	loggedOut, err := s.LogoutNode(node, &past)
+	require.NoError(t, err)
+
+	live, ok := s.GetNodeByID(id)
+	require.True(t, ok)
+	assert.True(t, live.IsTagged(), "the admin's retag stands")
+	assert.False(t, loggedOut.IsExpired(), "a client logout must not expire a node the lock saw tagged")
+	assert.False(t, live.Expiry().Valid(), "no expiry may be stamped on the tagged node")
+
+	durable, err := s.db.GetNodeByID(id)
+	require.NoError(t, err)
+	assert.False(t, durable.IsExpired(), "the durable row must not carry the logout stamp")
+}
+
 // TestTaggedReauthPreservesOnlineAndLastSeen pins the reauth side-effect
 // invariants documented at applyAuthNodeUpdate: online status is owned by the
 // poll lifecycle and must not be reset here, and LastSeen is refreshed.
@@ -896,15 +934,10 @@ func TestTaggedReauthPreservesOnlineAndLastSeen(t *testing.T) {
 	_, err := n.s.SetPolicy(fmt.Appendf(nil, `{"tagOwners":{"tag:foo":["%s@"]}}`, owner.Name))
 	require.NoError(t, err)
 
-	// Mark the node online before reauth.
-	_, ok := n.s.world.UpdateNode(n.id, func(nd *types.Node) {
-		nd.IsOnline = new(true)
-	})
-	require.True(t, ok)
+	require.NotZero(t, n.s.Connect(n.id))
 
 	finalNode, err := n.reauth(t, owner, []string{"tag:foo"}, nil)
 	require.NoError(t, err)
-	require.NotNil(t, finalNode.IsOnline().Get())
 	require.True(t, finalNode.IsOnline().Get(),
 		"re-auth must not reset online status (owned by the poll lifecycle)")
 	require.NotNil(t, finalNode.LastSeen().Get(), "LastSeen must be set on reauth")
@@ -1055,49 +1088,82 @@ func TestIssue3371_TaggedNodePastExpirySelfHealsOnReregister(t *testing.T) {
 	require.Equal(t, nodeID, healed.ID(), "must be the same node")
 }
 
-// TestIssue3371_ExpiredTaggedNodeSameSpentKeyNotRevalidated is the gating test
-// for the isExpired-gate exclusion (state.go: `&& !existingNodeSameUser.IsTagged()`).
-// A tagged node carrying a stale PAST expiry, re-registering with the SAME
-// single-use key and the SAME node key (no rotation), must take the
-// skip-validation fast path — otherwise the spent key is re-validated and
-// rejected with "authkey already used", the exact lockout #3371 fixes. Without
-// the tagged exclusion this fails; with it the node self-heals. The neighbours
-// all rotate the node key or use a reusable key, so validation runs regardless
-// and none probes this fast-path exclusion.
-func TestIssue3371_ExpiredTaggedNodeSameSpentKeyNotRevalidated(t *testing.T) {
-	s := newRetagTestState(t)
+func TestExpiredTaggedNodeRejectsInvalidPAK(t *testing.T) {
+	for _, invalid := range []string{"spent", "revoked", "expired"} {
+		t.Run(invalid, func(t *testing.T) {
+			s := newRetagTestState(t)
 
-	// Single-use tagged key.
-	pak, err := s.CreatePreAuthKey(nil, false, false, nil, []string{"tag:foo"})
-	require.NoError(t, err)
+			pak, err := s.CreatePreAuthKey(nil, invalid != "spent", false, nil, []string{"tag:foo"})
+			require.NoError(t, err)
 
-	machineKey := key.NewMachine()
-	nodeKey := key.NewNode()
-	regReq := tailcfg.RegisterRequest{
-		Auth:     &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
-		NodeKey:  nodeKey.Public(),
-		Hostinfo: &tailcfg.Hostinfo{Hostname: "spent-tagged"},
+			machineKey := key.NewMachine()
+			nodeKey := key.NewNode()
+			regReq := tailcfg.RegisterRequest{
+				Auth:     &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
+				NodeKey:  nodeKey.Public(),
+				Hostinfo: &tailcfg.Hostinfo{Hostname: "spent-tagged"},
+			}
+			node, err := s.HandleNodeFromPreAuthKey(regReq, machineKey.Public())
+			require.NoError(t, err)
+			require.True(t, node.IsTagged())
+
+			switch invalid {
+			case "revoked":
+				require.NoError(t, s.RevokePreAuthKey(pak.ID))
+			case "expired":
+				require.NoError(t, s.ExpirePreAuthKey(pak.ID))
+			}
+
+			past := time.Now().Add(-1 * time.Hour)
+			_, err = s.SetNodeExpiry(node.ID(), &past)
+			require.NoError(t, err)
+
+			before := s.Snapshot().Rev()
+			_, err = s.HandleNodeFromPreAuthKey(regReq, machineKey.Public())
+			require.Error(t, err, "admin expiration requires fresh authorization, including for tagged nodes")
+			assert.Equal(t, before, s.Snapshot().Rev())
+			live, ok := s.GetNodeByID(node.ID())
+			require.True(t, ok)
+			assert.Equal(t, past.UnixNano(), live.Expiry().Get().UnixNano())
+
+			durable, err := s.db.GetNodeByID(node.ID())
+			require.NoError(t, err)
+			require.NotNil(t, durable.Expiry)
+			assert.Equal(t, past.UnixNano(), durable.Expiry.UnixNano())
+		})
 	}
-	node, err := s.HandleNodeFromPreAuthKey(regReq, machineKey.Public())
-	require.NoError(t, err)
-	require.True(t, node.IsTagged())
+}
 
-	// Stale past (logout) expiry, and the single-use key is now spent.
-	past := time.Now().Add(-1 * time.Hour)
-	_, ok := s.world.UpdateNode(node.ID(), func(n *types.Node) {
-		n.Expiry = &past
-	})
-	require.True(t, ok)
+func TestInvalidPAKRestartCannotExtendExpiry(t *testing.T) {
+	for _, invalid := range []string{"spent", "revoked", "expired"} {
+		t.Run(invalid, func(t *testing.T) {
+			s := newRetagTestState(t)
+			user := s.CreateUserForTest("owner")
+			pak, err := s.CreatePreAuthKey(user.TypedID(), invalid != "spent", false, nil, nil)
+			require.NoError(t, err)
 
-	// Re-register with the SAME key and the SAME node key (no rotation). The
-	// tagged exclusion from the isExpired gate must let this skip validation, so
-	// the spent single-use key is not rejected.
-	healed, err := s.HandleNodeFromPreAuthKey(regReq, machineKey.Public())
-	require.NoError(t, err,
-		"a tagged node with a stale past expiry must skip re-validation of its spent key")
-	require.False(t, healed.IsExpired(), "stale expiry cleared")
-	require.Nil(t, healed.AsStruct().Expiry, "tagged node key-expiry disabled")
-	require.Equal(t, node.ID(), healed.ID())
+			c := registerForPAKRereg(t, s, pak)
+
+			switch invalid {
+			case "revoked":
+				require.NoError(t, s.RevokePreAuthKey(pak.ID))
+			case "expired":
+				require.NoError(t, s.ExpirePreAuthKey(pak.ID))
+			}
+
+			for _, requested := range []time.Time{time.Now().Add(48 * time.Hour), {}} {
+				c.regReq.Expiry = requested
+				live, err := s.HandleNodeFromPreAuthKey(c.regReq, c.machineKey)
+				require.NoError(t, err, "unchanged-key restarts remain supported")
+				require.True(t, live.Expiry().Valid())
+				assert.Equal(t, c.node.Expiry().Get().UnixNano(), live.Expiry().Get().UnixNano())
+				durable, err := s.db.GetNodeByID(c.node.ID())
+				require.NoError(t, err)
+				require.NotNil(t, durable.Expiry)
+				assert.Equal(t, c.node.Expiry().Get().UnixNano(), durable.Expiry.UnixNano())
+			}
+		})
+	}
 }
 
 // TestTaggedPAKReauthRetagsExistingTaggedNode reproduces issue #3370: an
@@ -1693,6 +1759,69 @@ func oldPAKSkipExpr(n types.NodeView, pak *types.PreAuthKey, nodeKey key.NodePub
 		!isOwnershipConversion && !isRetag
 }
 
+func TestPAKReplacementRequiresValidCredential(t *testing.T) {
+	for _, ownership := range []string{"personal", "tagged"} {
+		for _, direction := range []string{"make_permanent", "make_ephemeral"} {
+			for _, validity := range []string{"spent", "revoked", "expired", "valid"} {
+				t.Run(ownership+"/"+direction+"/"+validity, func(t *testing.T) {
+					s := newRetagTestState(t)
+					user := s.CreateUserForTest("owner")
+
+					var tags []string
+
+					owner := user.TypedID()
+
+					if ownership == "tagged" {
+						tags = []string{"tag:service"}
+						owner = nil
+					}
+
+					wasEphemeral := direction == "make_permanent"
+					original, err := s.CreatePreAuthKey(owner, true, wasEphemeral, nil, tags)
+					require.NoError(t, err)
+					c := registerForPAKRereg(t, s, original)
+					replacement, err := s.CreatePreAuthKey(user.TypedID(), validity != "spent", !wasEphemeral, nil, nil)
+					require.NoError(t, err)
+
+					switch validity {
+					case "spent":
+						registerForPAKRereg(t, s, replacement)
+					case "revoked":
+						require.NoError(t, s.RevokePreAuthKey(replacement.ID))
+					case "expired":
+						require.NoError(t, s.ExpirePreAuthKey(replacement.ID))
+					}
+
+					c.regReq.Auth = &tailcfg.RegisterResponseAuth{AuthKey: replacement.Key}
+					before := s.Snapshot().Rev()
+					_, err = s.HandleNodeFromPreAuthKey(c.regReq, c.machineKey)
+					wantID, wantEphemeral := original.ID, wasEphemeral
+
+					if validity == "valid" {
+						require.NoError(t, err)
+
+						wantID, wantEphemeral = replacement.ID, !wasEphemeral
+					} else {
+						require.Error(t, err, "an invalid replacement key cannot authorize a lifecycle change")
+						assert.Equal(t, before, s.Snapshot().Rev(), "rejection must not publish registration changes")
+					}
+
+					live, ok := s.GetNodeByID(c.node.ID())
+					require.True(t, ok)
+					assert.Equal(t, wantID, live.AuthKeyID().Get())
+					assert.Equal(t, wantEphemeral, live.IsEphemeral())
+
+					durable, err := s.db.GetNodeByID(c.node.ID())
+					require.NoError(t, err)
+					require.NotNil(t, durable.AuthKeyID)
+					assert.Equal(t, wantID, *durable.AuthKeyID)
+					assert.Equal(t, wantEphemeral, durable.IsEphemeral())
+				})
+			}
+		}
+	}
+}
+
 func TestPAKSkipsValidation(t *testing.T) {
 	now := time.Now()
 	past := now.Add(-time.Hour)
@@ -1710,11 +1839,12 @@ func TestPAKSkipsValidation(t *testing.T) {
 
 	userNode := func(uid uint, expiry *time.Time) *types.Node {
 		return &types.Node{
-			ID:      1,
-			NodeKey: nodeKey,
-			UserID:  &uid,
-			User:    &types.User{ID: uid},
-			Expiry:  expiry,
+			AuthKeyID: &keyID,
+			ID:        1,
+			NodeKey:   nodeKey,
+			UserID:    &uid,
+			User:      &types.User{ID: uid},
+			Expiry:    expiry,
 		}
 	}
 	taggedNode := func(expiry *time.Time, authKeyID *uint64) *types.Node {
@@ -1742,14 +1872,15 @@ func TestPAKSkipsValidation(t *testing.T) {
 		{"expired user node", userNode(ownerID, &past), userKey, nodeKey, true, false},
 		{"zero expiry", userNode(ownerID, &zero), userKey, nodeKey, true, true},
 		{"nil expiry", userNode(ownerID, nil), userKey, nodeKey, true, true},
-		{"expired tagged node, same key", taggedNode(&past, &keyID), taggedKey, nodeKey, true, true},
+		{"expired tagged node, same key", taggedNode(&past, &keyID), taggedKey, nodeKey, false, false},
 		{"conversion", userNode(ownerID, &future), taggedKey, nodeKey, true, false},
 		{"retag, AuthKeyID nil", taggedNode(nil, nil), taggedKey, nodeKey, true, false},
 		{"retag, other AuthKeyID", taggedNode(nil, &otherKeyID), taggedKey, nodeKey, true, false},
 		{"retag, same AuthKeyID", taggedNode(nil, &keyID), taggedKey, nodeKey, true, true},
 		{"tagged key, rotation", taggedNode(nil, &keyID), taggedKey, otherNodeKey, true, false},
-		{"user key on a tagged node", taggedNode(nil, &otherKeyID), userKey, nodeKey, true, true},
-		{"user key on an expired tagged node", taggedNode(&past, nil), userKey, nodeKey, true, true},
+		{"user key on a tagged node", taggedNode(nil, &otherKeyID), userKey, nodeKey, false, false},
+		{"user key without an association", taggedNode(nil, nil), userKey, nodeKey, false, false},
+		{"user key on an expired tagged node", taggedNode(&past, nil), userKey, nodeKey, false, false},
 		{"user key on another user's node", userNode(otherUserID, &future), userKey, nodeKey, false, false},
 		{"user node expiry equals now", userNode(ownerID, &now), userKey, nodeKey, false, true},
 		{"user node expired one nanosecond before now", userNode(ownerID, &oneNanoAgo), userKey, nodeKey, false, false},
@@ -1971,7 +2102,7 @@ func TestPAKReregisterRevalidatesAtMutation(t *testing.T) {
 		c := registerForPAKRereg(t, s, k)
 		view, pak := c.lookup(t, k.Key)
 
-		// A MapRequest reconcile moves the node to a new node key.
+		// Simulate an intervening registration replacing the node key.
 		reconciled := key.NewNode().Public()
 		_, ok := s.world.UpdateNode(c.node.ID(), func(n *types.Node) {
 			n.NodeKey = reconciled
@@ -2083,7 +2214,10 @@ func TestPAKReregisterRevalidatesAtMutation(t *testing.T) {
 		regReq := c.regReq
 		regReq.Auth = &tailcfg.RegisterResponseAuth{AuthKey: k.Key}
 
-		view, pak := c.lookup(t, k.Key)
+		view := c.node
+		pak, err := s.GetPreAuthKey(k.Key)
+		require.NoError(t, err)
+		require.False(t, pakSkipsValidation(view, pak, regReq.NodeKey, time.Now()))
 		require.NoError(t, pak.ValidAt(time.Now()))
 
 		tA := time.Now()
@@ -2146,9 +2280,8 @@ func TestPAKReregisterRevalidatesAtMutation(t *testing.T) {
 }
 
 // TestPAKReregisterRollbackKeepsPriorWrite: when the database rejects a
-// re-registration, the in-memory rollback must restore the node the writer
-// replaced, not the lookup's older view, so an admin expiry landed in between
-// survives.
+// re-registration, discarding its private candidate must preserve the current
+// node, including an admin expiry that landed after the lookup's older view.
 func TestPAKReregisterRollbackKeepsPriorWrite(t *testing.T) {
 	s := newRetagTestState(t)
 	user := s.CreateUserForTest("pakuser")
@@ -2164,7 +2297,10 @@ func TestPAKReregisterRollbackKeepsPriorWrite(t *testing.T) {
 	regReq := c.regReq
 	regReq.Auth = &tailcfg.RegisterResponseAuth{AuthKey: k.Key}
 
-	view, pak := c.lookup(t, k.Key)
+	view := c.node
+	pak, err := s.GetPreAuthKey(k.Key)
+	require.NoError(t, err)
+	require.False(t, pakSkipsValidation(view, pak, regReq.NodeKey, time.Now()))
 	require.False(t, pak.Used, "precondition: the lookup read a fresh single-use key")
 
 	tA := time.Now()
@@ -2182,7 +2318,7 @@ func TestPAKReregisterRollbackKeepsPriorWrite(t *testing.T) {
 	require.ErrorIs(t, err, types.PAKError("authkey already used"))
 
 	ns, _ := c.fields(t)
-	require.Equal(t, tA.UnixNano(), ns.Expiry, "rollback must keep the admin expiry")
+	require.Equal(t, tA.UnixNano(), ns.Expiry, "failed auth must keep the admin expiry")
 	require.Equal(t, &k0.ID, ns.AuthKeyID)
 	require.Equal(t, "h0", ns.Hostname)
 }

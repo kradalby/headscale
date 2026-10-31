@@ -19,6 +19,146 @@ import (
 	"tailscale.com/types/opt"
 )
 
+func TestMapRequestChecksNodeKeyInsideWriter(t *testing.T) {
+	_, s, id := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	node, ok := s.GetNodeByID(id)
+	require.True(t, ok)
+
+	before := s.Snapshot()
+	rowUpdates := countNodeRowUpdates(t, s)
+	newKey := key.NewNode().Public()
+	entered, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+
+	var wg sync.WaitGroup
+
+	t.Cleanup(func() { unblock(); wg.Wait() })
+	wg.Go(func() {
+		s.world.UpdateNode(id, func(n *types.Node) {
+			close(entered)
+			<-release
+
+			n.NodeKey = newKey
+		})
+	})
+	<-entered
+
+	result := make(chan error, 1)
+
+	wg.Go(func() {
+		result <- s.UpdateNodeFromMapRequest(id, tailcfg.MapRequest{
+			NodeKey: node.NodeKey(), DiscoKey: key.NewDisco().Public(),
+			Hostinfo: &tailcfg.Hostinfo{Hostname: "stale"},
+		})
+	})
+	require.Eventually(t, func() bool {
+		s.world.writeMu.Lock()
+		defer s.world.writeMu.Unlock()
+
+		return len(s.world.writes) == 1
+	}, 5*time.Second, time.Millisecond, "map request must queue before the key change commits")
+	unblock()
+	wg.Wait()
+	require.ErrorIs(t, <-result, ErrNodeKeyChanged)
+
+	expected := node.AsStruct()
+	expected.NodeKey = newKey
+	live, ok := s.GetNodeByID(id)
+	require.True(t, ok)
+	assert.Equal(t, expected, live.AsStruct())
+	assert.Equal(t, before.Rev()+1, s.Snapshot().Rev(), "only the key change may publish")
+	assert.Zero(t, rowUpdates.Load())
+
+	// A zero key is not a trusted internal bypass.
+	require.ErrorIs(t, s.UpdateNodeFromMapRequest(id, tailcfg.MapRequest{}), ErrNodeKeyChanged)
+	assert.Equal(t, before.Rev()+1, s.Snapshot().Rev())
+	assert.Zero(t, rowUpdates.Load())
+}
+
+func TestMapRequestDeletedInSameBatch(t *testing.T) {
+	for _, substantive := range []bool{false, true} {
+		t.Run(fmt.Sprintf("substantive=%v", substantive), func(t *testing.T) {
+			_, s, id := persistTestSetup(t)
+			t.Cleanup(func() { _ = s.Close() })
+
+			node, ok := s.GetNodeByID(id)
+			require.True(t, ok)
+
+			req := tailcfg.MapRequest{NodeKey: node.NodeKey(), DiscoKey: node.DiscoKey()}
+			if substantive {
+				req.Hostinfo = &tailcfg.Hostinfo{Hostname: "changed"}
+			}
+
+			rowUpdates := countNodeRowUpdates(t, s)
+			entered, release := make(chan struct{}), make(chan struct{})
+			unblock := sync.OnceFunc(func() { close(release) })
+
+			var wg sync.WaitGroup
+
+			t.Cleanup(func() { unblock(); wg.Wait() })
+			wg.Go(func() {
+				s.world.update(func(*nodeEdit) { close(entered); <-release })
+			})
+			<-entered
+
+			result := make(chan error, 1)
+
+			wg.Go(func() { result <- s.UpdateNodeFromMapRequest(id, req) })
+
+			queued := func(count int) bool {
+				s.world.writeMu.Lock()
+				defer s.world.writeMu.Unlock()
+
+				return len(s.world.writes) == count
+			}
+
+			require.Eventually(t, func() bool { return queued(1) }, 5*time.Second, time.Millisecond)
+			wg.Go(func() { s.world.DeleteNode(id) })
+			require.Eventually(t, func() bool { return queued(2) }, 5*time.Second, time.Millisecond)
+			unblock()
+			wg.Wait()
+			require.ErrorIs(t, <-result, ErrNodeNotInNodeStore)
+
+			_, ok = s.GetNodeByID(id)
+			require.False(t, ok)
+			require.Zero(t, rowUpdates.Load())
+		})
+	}
+}
+
+// TestVanishedRowSurfacesInPersists pins that a persist against a deleted
+// row reports the row gone instead of silent success. The lifetime deletes
+// drop the row first and the world node a beat later; a map-request persist
+// or an expiry landing in that window writes zero rows, and the database is
+// the source of truth — callers must see ErrNodeNotInNodeStore, not a no-op
+// reported as success.
+func TestVanishedRowSurfacesInPersists(t *testing.T) {
+	_, s, id := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	node, ok := s.GetNodeByID(id)
+	require.True(t, ok)
+
+	// The window between the row delete and the world delete, as the
+	// lifetime deletes leave it: row gone, memory still has the node.
+	require.NoError(t, s.db.DeleteNode(node.AsStruct()))
+
+	err := s.UpdateNodeFromMapRequest(id, tailcfg.MapRequest{
+		NodeKey:  node.NodeKey(),
+		DiscoKey: key.NewDisco().Public(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "vanished"},
+	})
+	require.ErrorIs(t, err, ErrNodeNotInNodeStore, "a persist that wrote zero rows is not a success")
+
+	_, err = s.SetNodeExpiry(id, new(time.Now().Add(time.Hour)))
+	require.ErrorIs(t, err, ErrNodeNotInNodeStore, "an expiry that wrote zero rows is not a success")
+
+	// Manual cleanup: the row is already gone, drop the world node too.
+	s.world.DeleteNode(id)
+}
+
 func TestMapRequestOwnsRequestData(t *testing.T) {
 	_, s, nodeID := persistTestSetup(t)
 	t.Cleanup(func() { _ = s.Close() })
@@ -538,7 +678,7 @@ func TestMapRequestDERPOnlyChangeKeepsGivenName(t *testing.T) {
 }
 
 func TestConcurrentMapRequestDERPUsesPersistedState(t *testing.T) {
-	for _, rotateKey := range []bool{false, true} {
+	for _, rotateDiscoKey := range []bool{false, true} {
 		for _, tt := range []struct {
 			name                string
 			firstDERP, lastDERP tailcfg.DERPRegionID
@@ -548,8 +688,8 @@ func TestConcurrentMapRequestDERPUsesPersistedState(t *testing.T) {
 			{name: "superseded clear", firstDERP: 0, lastDERP: 3},
 		} {
 			name := tt.name
-			if rotateKey {
-				name += " with key rotation"
+			if rotateDiscoKey {
+				name += " with disco key rotation"
 			}
 
 			t.Run(name, func(t *testing.T) {
@@ -570,8 +710,7 @@ func TestConcurrentMapRequestDERPUsesPersistedState(t *testing.T) {
 				err := s.UpdateNodeFromMapRequest(nodeID, req)
 				require.NoError(t, err)
 
-				if rotateKey {
-					req.NodeKey = key.NewNode().Public()
+				if rotateDiscoKey {
 					req.DiscoKey = key.NewDisco().Public()
 				}
 

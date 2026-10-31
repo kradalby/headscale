@@ -5,10 +5,12 @@ import (
 	"maps"
 	"net/netip"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/db"
@@ -545,9 +547,8 @@ func TestPreAuthKeyReauthRevertsMemoryOnDBFailure(t *testing.T) {
 
 	origNodeKey := node.NodeKey()
 
-	// Fail the node row update so the re-registration's database write errors
-	// after memory has already been mutated. A session connects during
-	// the write; the rollback must not undo it.
+	// Fail the node row update. A session connects during the transaction;
+	// refusing the registration must not undo it.
 	require.NoError(t, s.db.DB.Callback().Update().Before("gorm:update").
 		Register("fail_node_update", func(tx *gorm.DB) {
 			if tx.Statement.Table == "nodes" {
@@ -558,7 +559,7 @@ func TestPreAuthKeyReauthRevertsMemoryOnDBFailure(t *testing.T) {
 		}))
 
 	reReg := regReq
-	reReg.NodeKey = key.NewNode().Public() // rotate -> memory mutation, then DB write fails
+	reReg.NodeKey = key.NewNode().Public() // The failed transaction must not publish this rotation.
 	_, err = s.HandleNodeFromPreAuthKey(reReg, machineKey.Public())
 	require.NoError(t, s.db.DB.Callback().Update().Remove("fail_node_update"))
 	require.Error(t, err, "re-registration must fail when the database write fails")
@@ -566,11 +567,11 @@ func TestPreAuthKeyReauthRevertsMemoryOnDBFailure(t *testing.T) {
 	got, ok := s.GetNodeByID(node.ID())
 	require.True(t, ok)
 	require.Equal(t, origNodeKey, got.NodeKey(),
-		"memory must revert to the persisted node key when the write fails")
+		"memory must keep the persisted node key when the write fails")
 
 	online, known := got.IsOnline().GetOk()
 	require.True(t, known)
-	require.True(t, online, "rollback dropped the session that connected during the write")
+	require.True(t, online, "failed auth must keep the session that connected during the write")
 }
 
 // TestConcurrentPreAuthKeyRegistrationSameMachineKey ensures concurrent
@@ -1130,8 +1131,7 @@ func TestAuthReauthRevertsMemoryOnDBFailure(t *testing.T) {
 
 // reauthEntryPoints prepares a re-authentication of node, with a fresh
 // node key, through each way a node re-authenticates: interactively and by
-// pre-auth key. The returned func runs it, touching the database only
-// after its memory write.
+// pre-auth key. The returned func runs the staged transaction and publication.
 var reauthEntryPoints = map[string]func(t *testing.T, s *State, node types.NodeView) func() error{
 	"interactive": func(_ *testing.T, s *State, node types.NodeView) func() error {
 		return func() error {
@@ -1174,6 +1174,683 @@ var reauthEntryPoints = map[string]func(t *testing.T, s *State, node types.NodeV
 	},
 }
 
+func TestReauthPublishesOnlyAfterCommit(t *testing.T) {
+	for _, path := range []string{"interactive", "pre-auth key"} {
+		for _, succeeds := range []bool{false, true} {
+			name := "failure"
+			if succeeds {
+				name = "success"
+			}
+
+			t.Run(path+"/"+name, func(t *testing.T) {
+				_, s, id := persistTestSetup(t)
+				t.Cleanup(func() { _ = s.Close() })
+
+				_, err := s.SetPolicy([]byte(`{"tagOwners":{"tag:auth":["persist-user@"]}}`))
+				require.NoError(t, err)
+				_, err = s.SetNodeExpiry(id, new(time.Now().Add(-time.Hour)))
+				require.NoError(t, err)
+				s.Connect(id)
+				node, ok := s.GetNodeByID(id)
+				require.True(t, ok)
+
+				created, err := s.CreatePreAuthKey(nil, false, false, nil, []string{"tag:auth"})
+				require.NoError(t, err)
+				pak, err := s.GetPreAuthKey(created.Key)
+				require.NoError(t, err)
+
+				if path == "pre-auth key" && !succeeds {
+					// Lose the credential CAS after the auth lookup read an unused key.
+					require.NoError(t, s.db.Write(func(tx *gorm.DB) error {
+						return db.UsePreAuthKey(tx, &types.PreAuthKey{ID: pak.ID})
+					}))
+				}
+
+				sub := s.Subscribe()
+				defer sub.Close()
+
+				before := s.Snapshot().Rev()
+				keyAfter := key.NewNode().Public()
+				checked := 0
+
+				require.NoError(t, s.db.DB.Callback().Update().Before("gorm:update").Register("observe_auth", func(tx *gorm.DB) {
+					if tx.Statement.Table != "nodes" && tx.Statement.Table != "credentials" {
+						return
+					}
+
+					checked++
+					live, found := s.GetNodeByID(id)
+					assert.True(t, found)
+					assert.Equal(t, pakFieldsOf(node.AsStruct()), pakFieldsOf(live.AsStruct()), "uncommitted identity must stay private")
+					assert.Equal(t, before, s.Snapshot().Rev(), "staging must not publish a graph revision")
+					_, found = s.GetNodeByNodeKey(keyAfter)
+					assert.False(t, found, "uncommitted node key must not authenticate")
+
+					select {
+					case <-sub.C:
+						t.Error("staging woke graph subscribers")
+					default:
+					}
+
+					if path == "interactive" && !succeeds {
+						_ = tx.AddError(errInjectedNodeUpdate)
+					}
+				}))
+				t.Cleanup(func() { _ = s.db.DB.Callback().Update().Remove("observe_auth") })
+
+				hi := &tailcfg.Hostinfo{Hostname: "reauth", RequestTags: []string{"tag:auth"}}
+				if path == "interactive" {
+					_, err = s.applyAuthNodeUpdate(authNodeUpdateParams{
+						ExistingNode: node,
+						RegData: &types.RegistrationData{
+							MachineKey: node.MachineKey(), NodeKey: keyAfter, Hostinfo: hi,
+						},
+						ValidHostinfo: hi, Hostname: hi.Hostname, User: node.User().AsStruct(),
+					})
+				} else {
+					_, err = s.reregisterNodeWithPAK(node, pak, tailcfg.RegisterRequest{
+						NodeKey: keyAfter, Hostinfo: hi,
+					}, node.MachineKey(), hi.Hostname, hi)
+				}
+
+				require.Positive(t, checked, "the test must reach the transaction")
+
+				live, ok := s.GetNodeByID(id)
+				require.True(t, ok)
+
+				if succeeds {
+					require.NoError(t, err)
+					assert.Equal(t, keyAfter, live.NodeKey())
+					assert.Equal(t, []string{"tag:auth"}, live.Tags().AsSlice())
+					assert.False(t, live.UserID().Valid())
+					assert.False(t, live.Expiry().Valid())
+					assert.True(t, live.IsOnline().Get(), "committed reauth revives a connected expired node")
+					assert.Equal(t, before+1, s.Snapshot().Rev(), "publish the committed identity once")
+				} else {
+					if path == "interactive" {
+						require.ErrorIs(t, err, errInjectedNodeUpdate)
+					} else {
+						require.ErrorIs(t, err, types.PAKError("authkey already used"))
+					}
+
+					assert.Equal(t, pakFieldsOf(node.AsStruct()), pakFieldsOf(live.AsStruct()))
+					assert.Equal(t, before, s.Snapshot().Rev(), "failed auth needs no rollback publication")
+					assert.False(t, live.IsOnline().Get(), "failed auth leaves the connected node expired")
+				}
+
+				durable, err := s.db.GetNodeByID(id)
+				require.NoError(t, err)
+				assert.Equal(t, pakFieldsOf(durable), pakFieldsOf(live.AsStruct()))
+			})
+		}
+	}
+}
+
+func TestReauthPublicationKeepsConcurrentMapUpdate(t *testing.T) {
+	for name, reauthWith := range reauthEntryPoints {
+		for _, keepHostname := range []bool{false, true} {
+			caseName := "changed hostname"
+			if keepHostname {
+				caseName = "unchanged hostname"
+			}
+
+			t.Run(name+"/"+caseName, func(t *testing.T) {
+				dbPath, s, id := persistTestSetup(t)
+				t.Cleanup(func() { _ = s.Close() })
+
+				node, ok := s.GetNodeByID(id)
+				require.True(t, ok)
+				run := reauthWith(t, s, node)
+
+				req := tailcfg.MapRequest{
+					NodeKey: node.NodeKey(), DiscoKey: key.NewDisco().Public(),
+					Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:4242")},
+					Hostinfo:  &tailcfg.Hostinfo{Hostname: "concurrent", OS: "linux", NetInfo: &tailcfg.NetInfo{PreferredDERP: 7}},
+				}
+				if keepHostname {
+					req.Hostinfo.Hostname = node.Hostname()
+				}
+
+				updated := make(chan error, 1)
+
+				var (
+					concurrent types.NodeView
+					once       sync.Once
+				)
+
+				require.NoError(t, s.db.DB.Callback().Update().Before("gorm:update").Register("map_during_auth", func(tx *gorm.DB) {
+					if tx.Statement.Table != "nodes" {
+						return
+					}
+
+					once.Do(func() {
+						s.Connect(id)
+						go func() { updated <- s.UpdateNodeFromMapRequest(id, req) }()
+
+						require.Eventually(t, func() bool {
+							concurrent, _ = s.GetNodeByID(id)
+							return concurrent.Hostinfo().Valid() && concurrent.Hostinfo().OS() == "linux"
+						}, 5*time.Second, time.Millisecond, "map updates must progress during the auth transaction")
+					})
+				}))
+				t.Cleanup(func() { _ = s.db.DB.Callback().Update().Remove("map_during_auth") })
+
+				require.NoError(t, run())
+				require.NoError(t, <-updated)
+
+				live, ok := s.GetNodeByID(id)
+				require.True(t, ok)
+				assert.Equal(t, req.DiscoKey, live.DiscoKey())
+				assert.NotEqual(t, node.NodeKey(), live.NodeKey(), "the old stream must not undo committed reauth")
+				assert.Equal(t, req.Endpoints, live.Endpoints().AsSlice())
+				assert.Equal(t, req.Hostinfo, live.Hostinfo().AsStruct())
+				assert.Equal(t, req.Hostinfo.Hostname, live.Hostname())
+				assert.Equal(t, concurrent.LastSeen(), live.LastSeen())
+				assert.Equal(t, concurrent.ActiveSessions(), live.ActiveSessions())
+				assert.True(t, live.IsOnline().Get())
+
+				durable, err := s.db.GetNodeByID(id)
+				require.NoError(t, err)
+				assert.Equal(t, live.NodeKey(), durable.NodeKey)
+				assert.Equal(t, req.Endpoints, []netip.AddrPort(durable.Endpoints))
+				assert.Equal(t, req.Hostinfo, durable.Hostinfo)
+				assert.Equal(t, req.Hostinfo.Hostname, durable.Hostname)
+
+				req.NodeKey = live.NodeKey()
+				require.NoError(t, s.UpdateNodeFromMapRequest(id, req))
+				require.NoError(t, s.Close())
+				reopened := persistTestReopen(t, dbPath)
+				reloaded, ok := reopened.GetNodeByID(id)
+				require.True(t, ok)
+				assert.Equal(t, req.Hostinfo.Hostname, reloaded.Hostname())
+				assert.Equal(t, req.Hostinfo, reloaded.Hostinfo().AsStruct())
+			})
+		}
+	}
+}
+
+func TestConcurrentReauthCannotClaimSameNodeKey(t *testing.T) {
+	for _, path := range []string{"interactive", "pre-auth key"} {
+		t.Run(path, func(t *testing.T) {
+			_, s, id := persistTestSetup(t)
+			t.Cleanup(func() { _ = s.Close() })
+
+			first, ok := s.GetNodeByID(id)
+			require.True(t, ok)
+
+			second, err := s.createAndSaveNewNode(newNodeParams{
+				User: *first.User().AsStruct(), MachineKey: key.NewMachine().Public(),
+				NodeKey: key.NewNode().Public(), Hostname: "second",
+			})
+			require.NoError(t, err)
+
+			uid := types.UserID(first.User().ID())
+			created, err := s.CreatePreAuthKey(&uid, true, false, nil, nil)
+			require.NoError(t, err)
+			pak, err := s.GetPreAuthKey(created.Key)
+			require.NoError(t, err)
+
+			claimed := key.NewNode().Public()
+			done := make(chan error, 2)
+
+			s.persistMu.Lock()
+
+			unlock := sync.OnceFunc(s.persistMu.Unlock)
+			defer unlock()
+
+			for _, node := range []types.NodeView{first, second} {
+				go func() {
+					hi := &tailcfg.Hostinfo{Hostname: node.Hostname()}
+
+					var err error
+					if path == "interactive" {
+						_, err = s.applyAuthNodeUpdate(authNodeUpdateParams{
+							ExistingNode:  node,
+							RegData:       &types.RegistrationData{MachineKey: node.MachineKey(), NodeKey: claimed},
+							ValidHostinfo: hi, Hostname: hi.Hostname, User: node.User().AsStruct(),
+						})
+					} else {
+						_, err = s.reregisterNodeWithPAK(node, pak, tailcfg.RegisterRequest{NodeKey: claimed},
+							node.MachineKey(), hi.Hostname, hi)
+					}
+
+					done <- err
+				}()
+			}
+			// Both requests must have reached persistence before either proceeds.
+			require.Eventually(t, func() bool {
+				// The dump grows until it fits: a cut dump can miss a
+				// parked registration and under-count the waiters.
+				buf := make([]byte, 64<<10)
+
+				n := runtime.Stack(buf, true)
+				for n == len(buf) {
+					buf = make([]byte, 2*len(buf))
+					n = runtime.Stack(buf, true)
+				}
+
+				waiting := 0
+
+				for g := range strings.SplitSeq(string(buf[:n]), "\n\n") {
+					if strings.Contains(g, "[sync.Mutex.Lock") &&
+						(strings.Contains(g, ".applyAuthNodeUpdate(") || strings.Contains(g, ".reregisterNodeWithPAK(")) {
+						waiting++
+					}
+				}
+
+				return waiting == 2
+			}, 5*time.Second, time.Millisecond)
+			unlock()
+
+			a, b := <-done, <-done
+			if a == nil {
+				require.ErrorIs(t, b, ErrNodeKeyInUse)
+			} else {
+				require.ErrorIs(t, a, ErrNodeKeyInUse)
+				require.NoError(t, b)
+			}
+		})
+	}
+}
+
+// TestConcurrentFreshJoinsCommitTogether pins that a fresh join does not
+// serialise the whole tailnet behind persistMu: distinct machines joining
+// concurrently must all queue their PutNode into one held batch, as any other
+// burst of world writes does. A global persistMu held across each join's
+// INSERT and publish would leave the burst stuck behind the first join's
+// commit and defeat the group-commit batching the world documents.
+func TestConcurrentFreshJoinsCommitTogether(t *testing.T) {
+	_, s, id := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	node, ok := s.GetNodeByID(id)
+	require.True(t, ok)
+
+	user := node.User().AsStruct()
+
+	pak, err := s.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+	require.NoError(t, err)
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+
+	var wg sync.WaitGroup
+
+	t.Cleanup(func() { unblock(); wg.Wait() })
+
+	wg.Go(func() {
+		s.world.update(func(*nodeEdit) { close(entered); <-release })
+	})
+	<-entered
+
+	const joins = 8
+
+	done := make(chan error, joins)
+	for range joins {
+		go func() {
+			_, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+				Auth:     &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
+				NodeKey:  key.NewNode().Public(),
+				Hostinfo: &tailcfg.Hostinfo{Hostname: "batched-join"},
+			}, key.NewMachine().Public())
+			done <- err
+		}()
+	}
+
+	// Every join must reach the held batch while the leader is parked:
+	// the burst costs one commit, not one per join.
+	require.Eventually(t, func() bool {
+		s.world.writeMu.Lock()
+		defer s.world.writeMu.Unlock()
+
+		return len(s.world.writes) == joins
+	}, 5*time.Second, time.Millisecond, "fresh joins must batch, not serialise behind the first join")
+
+	unblock()
+	wg.Wait()
+
+	for range joins {
+		require.NoError(t, <-done)
+	}
+
+	assert.Zero(t, s.claimLocks.Size(), "claim locks must not outlive their registrations")
+}
+
+func TestFreshRegistrationCannotRaceNodeKeyClaim(t *testing.T) {
+	for _, firstPath := range []string{"fresh", "interactive", "pre-auth key"} {
+		t.Run(firstPath, func(t *testing.T) {
+			dbPath, s, id := persistTestSetup(t)
+			t.Cleanup(func() { _ = s.Close() })
+
+			node, ok := s.GetNodeByID(id)
+			require.True(t, ok)
+
+			user := node.User().AsStruct()
+			uid := types.UserID(user.ID)
+			created, err := s.CreatePreAuthKey(&uid, true, false, nil, nil)
+			require.NoError(t, err)
+			pak, err := s.GetPreAuthKey(created.Key)
+			require.NoError(t, err)
+
+			claimed := key.NewNode().Public()
+			fresh := func() error {
+				_, err := s.createAndSaveNewNode(newNodeParams{
+					User: *user, MachineKey: key.NewMachine().Public(), NodeKey: claimed,
+					Hostname: "fresh", Hostinfo: &tailcfg.Hostinfo{Hostname: "fresh"},
+				})
+
+				return err
+			}
+
+			sqlDB, err := s.db.DB.DB()
+			require.NoError(t, err)
+			held, err := sqlDB.Conn(t.Context())
+			require.NoError(t, err)
+
+			release := sync.OnceFunc(func() { assert.NoError(t, held.Close()) })
+			defer release()
+
+			waits := sqlDB.Stats().WaitCount
+			done := make(chan error, 2)
+
+			go func() {
+				hi := &tailcfg.Hostinfo{Hostname: node.Hostname()}
+
+				var err error
+
+				switch firstPath {
+				case "fresh":
+					err = fresh()
+				case "interactive":
+					_, err = s.applyAuthNodeUpdate(authNodeUpdateParams{
+						ExistingNode: node, RegData: &types.RegistrationData{MachineKey: node.MachineKey(), NodeKey: claimed},
+						ValidHostinfo: hi, Hostname: hi.Hostname, User: user,
+					})
+				case "pre-auth key":
+					_, err = s.reregisterNodeWithPAK(node, pak, tailcfg.RegisterRequest{NodeKey: claimed}, node.MachineKey(), hi.Hostname, hi)
+				}
+
+				done <- err
+			}()
+
+			require.Eventually(t, func() bool { return sqlDB.Stats().WaitCount > waits }, 5*time.Second, time.Millisecond)
+
+			go func() { done <- fresh() }()
+
+			require.Eventually(t, func() bool {
+				if sqlDB.Stats().WaitCount > waits+1 {
+					return true
+				}
+
+				// The dump grows until it fits: a cut dump can miss the
+				// parked claim and lose the race it is probing.
+				buf := make([]byte, 64<<10)
+
+				n := runtime.Stack(buf, true)
+				for n == len(buf) {
+					buf = make([]byte, 2*len(buf))
+					n = runtime.Stack(buf, true)
+				}
+
+				for g := range strings.SplitSeq(string(buf[:n]), "\n\n") {
+					if strings.Contains(g, "[sync.Mutex.Lock") && strings.Contains(g, ".createAndSaveNewNode(") {
+						return true
+					}
+				}
+
+				return false
+			}, 5*time.Second, time.Millisecond, "both claims must reach their persistence wait")
+			release()
+
+			a, b := <-done, <-done
+			if a == nil {
+				require.ErrorIs(t, b, ErrNodeKeyInUse)
+			} else {
+				require.ErrorIs(t, a, ErrNodeKeyInUse)
+				require.NoError(t, b)
+			}
+
+			rows, err := s.db.ListNodes()
+			require.NoError(t, err)
+
+			var holders []types.NodeID
+
+			for _, row := range rows {
+				if row.NodeKey == claimed {
+					holders = append(holders, row.ID)
+				}
+			}
+
+			require.Len(t, holders, 1, "only one durable claim may survive")
+
+			winner, ok := s.GetNodeByNodeKey(claimed)
+			require.True(t, ok)
+			assert.Equal(t, holders[0], winner.ID())
+			require.NoError(t, s.Close())
+			reopened := persistTestReopen(t, dbPath)
+			reloaded, ok := reopened.GetNodeByNodeKey(claimed)
+			require.True(t, ok)
+			assert.Equal(t, winner.MachineKey(), reloaded.MachineKey())
+		})
+	}
+}
+
+func TestReauthRejectsDeletedRowBeforePublication(t *testing.T) {
+	for name, reauthWith := range reauthEntryPoints {
+		t.Run(name, func(t *testing.T) {
+			_, s, id := persistTestSetup(t)
+			t.Cleanup(func() { _ = s.Close() })
+
+			node, ok := s.GetNodeByID(id)
+			require.True(t, ok)
+			run := reauthWith(t, s, node)
+			// DeleteNode releases persistMu before removing the graph node.
+			require.NoError(t, s.db.DeleteNode(node.AsStruct()))
+			before := s.Snapshot().Rev()
+
+			require.ErrorIs(t, run(), ErrNodeNotInNodeStore)
+			assert.Equal(t, before, s.Snapshot().Rev())
+			_, err := s.db.GetNodeByID(id)
+			require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+		})
+	}
+}
+
+func TestReauthPublicationExpiresPastSweepWatermark(t *testing.T) {
+	for name, reauthWith := range reauthEntryPoints {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				_, s, id := persistTestSetup(t)
+				t.Cleanup(func() { _ = s.Close() })
+
+				_, err := s.SetNodeExpiry(id, new(time.Now().Add(2*time.Hour)))
+				require.NoError(t, err)
+				s.Connect(id)
+				node, ok := s.GetNodeByID(id)
+				require.True(t, ok)
+				require.True(t, node.IsOnline().Get())
+				run := reauthWith(t, s, node)
+				watermark := time.Now()
+
+				require.NoError(t, s.db.DB.Callback().Update().Before("gorm:update").Register("delay_auth_expiry", func(tx *gorm.DB) {
+					if tx.Statement.Table != "nodes" {
+						return
+					}
+
+					<-time.After(90 * time.Minute)
+
+					var expired bool
+
+					watermark, expired = s.ExpireExpiredNodes(watermark)
+					assert.False(t, expired, "the still-private earlier expiry is invisible to the sweep")
+					<-time.After(time.Hour)
+				}))
+				t.Cleanup(func() { _ = s.db.DB.Callback().Update().Remove("delay_auth_expiry") })
+				require.NoError(t, run())
+
+				_, expired := s.ExpireExpiredNodes(watermark)
+				assert.False(t, expired, "the new expiry predates the last sweep")
+
+				live, ok := s.GetNodeByID(id)
+				require.True(t, ok)
+				assert.True(t, live.IsExpired())
+				assert.False(t, live.IsOnline().Get(), "publication must not retain expired online state")
+			})
+		})
+	}
+}
+
+func BenchmarkPublishRegistrationUnchangedOwner(b *testing.B) {
+	for _, count := range []int{1, 100, 1000} {
+		b.Run(strconv.Itoa(count), func(b *testing.B) {
+			users := make([]types.User, count)
+			for i := range users {
+				users[i] = types.User{ID: uint(i + 1), Name: "user" + strconv.Itoa(i)}
+			}
+
+			owner := &users[count-1]
+			node := &types.Node{ID: 1, NodeKey: key.NewNode().Public(), UserID: &owner.ID, User: owner, LastSeen: new(time.Now())}
+			w, err := newWorld(types.Nodes{node}, users, nil, types.DNSView{})
+			require.NoError(b, err)
+
+			s := &State{world: w}
+			candidate := node.Clone()
+
+			s.persistMu.Lock()
+			defer s.persistMu.Unlock()
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				_, err := s.publishRegistration(node, candidate)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkPublishRegistrationChangedOwner covers the merge branch the
+// unchanged-owner benchmark skips: a candidate carrying a different owner
+// re-resolves it against the snapshot's user list, so its cost follows that
+// list, not the tailnet's node count. The candidate alternates between two
+// owners near the end of the list each iteration, so the re-resolve branch
+// and its full scan run on every operation, not just the first.
+func BenchmarkPublishRegistrationChangedOwner(b *testing.B) {
+	for _, count := range []int{100, 1000} {
+		b.Run(strconv.Itoa(count), func(b *testing.B) {
+			users := make([]types.User, count)
+			for i := range users {
+				users[i] = types.User{ID: uint(i + 1), Name: "user" + strconv.Itoa(i)}
+			}
+
+			owner := &users[count-1]
+			node := &types.Node{ID: 1, NodeKey: key.NewNode().Public(), UserID: &owner.ID, User: owner, LastSeen: new(time.Now())}
+			w, err := newWorld(types.Nodes{node}, users, nil, types.DNSView{})
+			require.NoError(b, err)
+
+			s := &State{world: w}
+			candidate := node.Clone()
+
+			owners := [2]*types.User{&users[count-2], owner}
+
+			s.persistMu.Lock()
+			defer s.persistMu.Unlock()
+
+			b.ReportAllocs()
+
+			var i int
+
+			for b.Loop() {
+				newOwner := owners[i%2]
+				i++
+
+				candidate.UserID = &newOwner.ID
+				candidate.User = newOwner
+
+				_, err := s.publishRegistration(node, candidate)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestReauthPublicationUsesCurrentOwner(t *testing.T) {
+	_, s, id := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	_, err := s.SetPolicy([]byte(`{"tagOwners":{"tag:auth":["persist-user@"]}}`))
+	require.NoError(t, err)
+
+	node, ok := s.GetNodeByID(id)
+	require.True(t, ok)
+
+	user := node.User().AsStruct()
+	node, err = s.SetNodeTags(id, []string{"tag:auth"})
+	require.NoError(t, err)
+
+	// A user rename has committed, but its graph refresh lands during reauth.
+	renamed := *user
+	renamed.Name = "renamed-owner"
+	require.NoError(t, s.db.DB.Model(&renamed).Update("name", renamed.Name).Error)
+	require.NoError(t, s.db.DB.Callback().Update().Before("gorm:update").Register("refresh_owner", func(tx *gorm.DB) {
+		if tx.Statement.Table == "nodes" {
+			require.NoError(t, s.world.SetUsers([]types.User{renamed}))
+		}
+	}))
+	t.Cleanup(func() { _ = s.db.DB.Callback().Update().Remove("refresh_owner") })
+
+	got, err := s.applyAuthNodeUpdate(authNodeUpdateParams{
+		ExistingNode:  node,
+		RegData:       &types.RegistrationData{MachineKey: node.MachineKey(), NodeKey: key.NewNode().Public()},
+		ValidHostinfo: &tailcfg.Hostinfo{Hostname: node.Hostname()}, Hostname: node.Hostname(),
+		User: user, IsConvertFromTag: true, RegisterMethod: util.RegisterMethodOIDC,
+	})
+	require.NoError(t, err)
+	require.False(t, got.IsTagged())
+	assert.Equal(t, renamed.Name, got.User().Name())
+	require.NoError(t, s.refreshUsers())
+	got, ok = s.GetNodeByID(id)
+	require.True(t, ok)
+	assert.Equal(t, renamed.Name, got.User().Name(), "an unchanged user list will not repair a stale owner")
+}
+
+func TestReauthAuthorizesBeforeConcurrentPolicyChange(t *testing.T) {
+	_, s, id := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	_, err := s.SetPolicy([]byte(`{"tagOwners":{"tag:auth":["persist-user@"]}}`))
+	require.NoError(t, err)
+
+	node, ok := s.GetNodeByID(id)
+	require.True(t, ok)
+	require.NoError(t, s.db.DB.Callback().Update().Before("gorm:update").Register("change_policy", func(tx *gorm.DB) {
+		if tx.Statement.Table == "nodes" {
+			// Removing a tag owner does not revoke a grant already authorised.
+			_, err := s.SetPolicy([]byte(`{"tagOwners":{"tag:auth":[]}}`))
+			assert.NoError(t, err)
+
+			live, found := s.GetNodeByID(id)
+			assert.True(t, found)
+			assert.False(t, live.IsTagged(), "the authorised candidate still waits for commit")
+		}
+	}))
+	t.Cleanup(func() { _ = s.db.DB.Callback().Update().Remove("change_policy") })
+
+	hi := &tailcfg.Hostinfo{Hostname: node.Hostname(), RequestTags: []string{"tag:auth"}}
+	got, err := s.applyAuthNodeUpdate(authNodeUpdateParams{
+		ExistingNode:  node,
+		RegData:       &types.RegistrationData{MachineKey: node.MachineKey(), NodeKey: key.NewNode().Public(), Hostinfo: hi},
+		ValidHostinfo: hi, Hostname: node.Hostname(), User: node.User().AsStruct(),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"tag:auth"}, got.Tags().AsSlice())
+	assert.False(t, s.Snapshot().Policy().UserCanHaveTag(node.User(), "tag:auth"))
+}
+
 // expiryWaits reports whether a SetNodeExpiry is blocked on persistMu or,
 // past its memory write, on the database connection.
 func expiryWaits() bool {
@@ -1200,8 +1877,8 @@ func expiryWaits() bool {
 }
 
 // TestAdminExpiryDuringReauthReachesTheRow expires a node while a
-// re-authentication that succeeds sits between its memory write and its
-// row write, the single database connection held so the admin's write
+// re-authentication that succeeds waits for its transaction, the single
+// database connection held so the admin's write
 // could slip in first: the row must end as memory does, or a restart
 // brings the revoked node back unexpired. Who gets the connection first is
 // random, so each entry point runs several times.
@@ -1222,15 +1899,14 @@ func TestAdminExpiryDuringReauthReachesTheRow(t *testing.T) {
 				held, err := sqlDB.Conn(t.Context())
 				require.NoError(t, err)
 
+				waits := sqlDB.Stats().WaitCount
 				reauth := make(chan error, 1)
 
 				go func() { reauth <- run() }()
 
 				require.Eventually(t, func() bool {
-					n, _ := s.GetNodeByID(id)
-
-					return n.NodeKey() != node.NodeKey()
-				}, 5*time.Second, time.Millisecond, "test sanity: the re-auth wrote memory")
+					return sqlDB.Stats().WaitCount > waits
+				}, 5*time.Second, time.Millisecond, "test sanity: the re-auth is waiting for its transaction")
 
 				admin := make(chan error, 1)
 
@@ -1262,9 +1938,8 @@ func TestAdminExpiryDuringReauthReachesTheRow(t *testing.T) {
 
 // TestAuthReauthRollbackKeepsLaterAdminWrites fails a re-auth's database
 // write, interactive or by pre-auth key, while an admin expires or retags
-// the node in between: the rollback must keep the admin's value, which it
-// persisted itself, and restore only what the failed write set. An expiry
-// waits for the re-auth instead; it must still stand afterwards.
+// the node. Both admin writes wait for the re-auth's private candidate to
+// be discarded, then their values must remain in memory and the database.
 func TestAuthReauthRollbackKeepsLaterAdminWrites(t *testing.T) {
 	admins := map[string]struct {
 		write func(t *testing.T, s *State, id types.NodeID)
@@ -1343,8 +2018,7 @@ func testReauthRollbackKeepsAdminWrite(
 		admin(t, s, id)
 	}()
 
-	// A retag is live at once, its database write waiting for the
-	// re-auth's transaction; an expiry waits for the whole re-auth.
+	// Both a retag and an expiry wait for the whole re-auth under persistMu.
 	landed := func() bool {
 		n, _ := s.GetNodeByID(id)
 
@@ -1373,7 +2047,7 @@ func testReauthRollbackKeepsAdminWrite(
 
 	got, ok := s.GetNodeByID(id)
 	require.True(t, ok)
-	assert.Equal(t, node.NodeKey(), got.NodeKey(), "the failed write's node key is undone")
+	assert.Equal(t, node.NodeKey(), got.NodeKey(), "the failed write must not publish its node key")
 	assert.Equal(t, want.IsExpired(), got.IsExpired(), "the admin's expiry stands")
 	assert.Equal(t, want.Tags().AsSlice(), got.Tags().AsSlice(), "the admin's tags stand")
 
@@ -1384,11 +2058,10 @@ func testReauthRollbackKeepsAdminWrite(
 	assert.Equal(t, durable.NodeKey, got.NodeKey())
 }
 
-// TestReauthRollbackKeepsSameBatchWrite batches a write with a re-auth into
-// one commit and fails the re-auth's database write. Its rollback compares
-// against the node as the re-auth left it, so the batched write, published
-// in the same snapshot, keeps its value; an admin retag cannot join the
-// batch at all, as it waits for the re-auth.
+// TestReauthRollbackKeepsSameBatchWrite batches a Hostinfo write with
+// re-auth staging, then fails the re-auth's database write. Discarding the
+// private candidate must keep the batched Hostinfo; an admin retag cannot
+// join the batch because it waits for the whole re-auth under persistMu.
 func TestReauthRollbackKeepsSameBatchWrite(t *testing.T) {
 	for name, reauthWith := range reauthEntryPoints {
 		for kind, batched := range map[string]func(s *State, id types.NodeID) error{
@@ -1427,8 +2100,8 @@ func TestReauthRollbackKeepsSameBatchWrite(t *testing.T) {
 				}))
 				t.Cleanup(func() { _ = s.db.DB.Callback().Update().Remove("fail_reauth_once") })
 
-				// Hold a commit so the re-auth and the batched write queue
-				// behind it and commit together.
+				// Hold a commit so staging and the Hostinfo write queue together;
+				// an admin retag waits for the re-auth instead.
 				entered, release, held := make(chan struct{}), make(chan struct{}), make(chan struct{})
 
 				go func() {
@@ -1473,7 +2146,7 @@ func TestReauthRollbackKeepsSameBatchWrite(t *testing.T) {
 
 				live, ok := s.GetNodeByID(id)
 				require.True(t, ok)
-				assert.Equal(t, node.NodeKey(), live.NodeKey(), "the failed re-auth's key is rolled back")
+				assert.Equal(t, node.NodeKey(), live.NodeKey(), "the failed re-auth's key must not publish")
 
 				durable, err := s.DB().GetNodeByID(id)
 				require.NoError(t, err)
@@ -1491,10 +2164,10 @@ func TestReauthRollbackKeepsSameBatchWrite(t *testing.T) {
 }
 
 // TestReauthRollbackKeepsAConcurrentUserRename renames the node's owner
-// while a re-auth waits on its database write, which then fails: the
-// rollback must keep the renamed user, as nothing refreshes a node's user
-// again once the user list is current. Retagged covers a re-auth that took
-// the node from its owner, whose rollback hands it back.
+// while a re-auth waits on its database write, which then fails. Discarding
+// the private candidate must keep the renamed user, as an unchanged user
+// list will not refresh it again. Retagged covers a failed candidate that
+// would have removed user ownership.
 func TestReauthRollbackKeepsAConcurrentUserRename(t *testing.T) {
 	retagged := func(_ *testing.T, s *State, node types.NodeView) func() error {
 		return func() error {
@@ -1589,8 +2262,8 @@ func TestReauthRollbackKeepsAConcurrentUserRename(t *testing.T) {
 
 			live, ok := s.GetNodeByID(id)
 			require.True(t, ok)
-			require.True(t, live.User().Valid(), "the node is the user's again")
-			assert.Equal(t, "renamed-user", live.User().Name(), "the rollback keeps the rename")
+			require.True(t, live.User().Valid(), "the node must keep its user ownership")
+			assert.Equal(t, "renamed-user", live.User().Name(), "failed auth must keep the rename")
 
 			require.NoError(t, s.refreshUsers())
 

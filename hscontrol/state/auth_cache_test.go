@@ -13,6 +13,8 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 )
 
 func newTestAuthCache(t *testing.T, maxEntries int, ttl time.Duration) *expirable.LRU[types.AuthID, *types.AuthRequest] {
@@ -288,6 +290,21 @@ func authCacheSweepers(t *testing.T, gid string) int {
 	}
 
 	return n
+}
+
+func TestRejectedRegistrationsReleaseMachineLocks(t *testing.T) {
+	s, err := NewState(persistTestConfig(t.TempDir() + "/headscale.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	for range 32 {
+		_, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+			Auth: &tailcfg.RegisterResponseAuth{AuthKey: "invalid"}, NodeKey: key.NewNode().Public(),
+		}, key.NewMachine().Public())
+		require.Error(t, err)
+	}
+
+	assert.Zero(t, s.registerLocks.Size(), "failed unauthenticated machines must not retain locks")
 }
 
 // TestStateCloseStopsAuthCacheSweeper verifies that closing a State stops

@@ -5,17 +5,100 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/netmap"
 )
+
+func TestServerCloseWaitsForLastSeenPersistence(t *testing.T) {
+	h := servertest.NewHarness(t, 1)
+	id := findNodeID(t, h.Server, h.Client(0).Name)
+	entered, unblock := make(chan struct{}), make(chan struct{})
+
+	release := sync.OnceFunc(func() { close(unblock) })
+	defer release()
+	// A second nodes write in the window must fail with context, not
+	// "close of closed channel".
+	enter := sync.OnceFunc(func() { close(entered) })
+
+	sqlDB := h.Server.State().DB().DB
+	require.NoError(t, sqlDB.Callback().Update().Before("gorm:update").Register("pause_last_seen", func(tx *gorm.DB) {
+		if tx.Statement.Table == "nodes" {
+			enter()
+			<-unblock
+		}
+	}))
+	t.Cleanup(func() { _ = sqlDB.Callback().Update().Remove("pause_last_seen") })
+	h.Client(0).Disconnect(t)
+	h.Server.App.MapHub().Close()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream cleanup did not reach LastSeen persistence")
+	}
+
+	closed := make(chan struct{})
+
+	go func() { h.Server.Close(); close(closed) }()
+
+	returned := false
+
+	require.Eventually(t, func() bool {
+		select {
+		case <-closed:
+			returned = true
+			return true
+		default:
+			// The dump grows until it fits: a cut dump can miss the
+			// parked Close and lose the ordering it is probing.
+			buf := make([]byte, 64<<10)
+
+			n := runtime.Stack(buf, true)
+			for n == len(buf) {
+				buf = make([]byte, 2*len(buf))
+				n = runtime.Stack(buf, true)
+			}
+
+			// Close covers the final session persistence either while
+			// Shutdown waits the handlers out (its frame is
+			// net/http.(*Server).Shutdown) or at the drain's Wait.
+			for g := range strings.SplitSeq(string(buf[:n]), "\n\n") {
+				if !strings.Contains(g, "(*TestServer).Close(") {
+					continue
+				}
+
+				if strings.Contains(g, "net/http.(*Server).Shutdown(") || strings.Contains(g, "WaitGroup).Wait(") {
+					return true
+				}
+			}
+
+			return false
+		}
+	}, 5*time.Second, time.Millisecond)
+	assert.False(t, returned, "server close must cover final session persistence before DB teardown")
+	release()
+	<-closed
+
+	live, ok := h.Server.State().GetNodeByID(id)
+	require.True(t, ok)
+	assert.Zero(t, live.ActiveSessions())
+
+	durable, err := h.Server.State().DB().GetNodeByID(id)
+	require.NoError(t, err)
+	require.NotNil(t, durable.LastSeen)
+	assert.Equal(t, live.LastSeen().Get().UnixNano(), durable.LastSeen.UnixNano())
+}
 
 // TestConnectionLifecycle exercises the core node lifecycle:
 // connecting, seeing peers, joining mid-session, departing, and

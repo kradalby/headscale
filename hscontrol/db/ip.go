@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net/netip"
 	"sync"
+	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
@@ -389,4 +390,22 @@ func (i *IPAllocator) FreeIPs(ips []netip.Addr) {
 	for _, ip := range ips {
 		i.usedIPs.Remove(ip)
 	}
+}
+
+// IsUsed reports whether ip is currently handed out, for tests asserting
+// which addresses a node's teardown freed.
+func (i *IPAllocator) IsUsed(ip netip.Addr) (bool, error) {
+	if !testing.Testing() {
+		panic("IsUsed can only be called during tests")
+	}
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	set, err := i.usedIPs.IPSet()
+	if err != nil {
+		return false, err
+	}
+
+	return set.Contains(ip), nil
 }

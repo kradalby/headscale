@@ -44,7 +44,7 @@ var givenNameMapsToValidFQDN = nodeHealthCheck{
 // any peer's — so its expiry must be reset to recover.
 var expiryIsEncodable = nodeHealthCheck{
 	name: "expiry-is-encodable",
-	check: func(nv types.NodeView, _ *types.Config) (string, string, bool) {
+	check: func(nv types.NodeView, _ types.DNSView) (string, string, bool) {
 		// No expiry is sent as the zero time, which is in range.
 		expiry, _ := nv.Expiry().GetOk()
 
