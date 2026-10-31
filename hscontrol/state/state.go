@@ -2207,7 +2207,11 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 
 		node := prior.Clone()
 		node.NodeKey = regData.NodeKey
-		node.DiscoKey = regData.DiscoKey
+		// A pending registration carries no disco key; the live one stays
+		// until the node reports a new one.
+		if !regData.DiscoKey.IsZero() {
+			node.DiscoKey = regData.DiscoKey
+		}
 		node.Hostname = params.Hostname
 
 		// A re-auth keeps the node's stored operational metadata and takes

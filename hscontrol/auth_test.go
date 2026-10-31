@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"runtime"
 	"runtime/pprof"
@@ -5111,4 +5112,33 @@ func TestRegisterRejectsUnencodableExpiry(t *testing.T) {
 	stored, err := app.state.DB().GetNodeByID(node.ID())
 	require.NoError(t, err)
 	assert.True(t, latest.Equal(*stored.Expiry))
+}
+
+// TestPendingRegistrationKeepsAuthMetadata pins that operational reports do
+// not stay in the auth cache before the first MapRequest.
+func TestPendingRegistrationKeepsAuthMetadata(t *testing.T) {
+	app := createTestApp(t)
+	hostinfo := &tailcfg.Hostinfo{
+		Hostname: "pending-router", OS: "linux", OSVersion: "6.12.0",
+		RequestTags:  []string{"tag:router"},
+		RoutableIPs:  []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")},
+		Services:     []tailcfg.Service{{Proto: tailcfg.PeerAPI4, Port: 41641}},
+		NetInfo:      &tailcfg.NetInfo{PreferredDERP: 1},
+		SSH_HostKeys: []string{"ssh-ed25519 key"},
+	}
+	resp, err := app.handleRegister(context.Background(), tailcfg.RegisterRequest{
+		NodeKey: key.NewNode().Public(), Hostinfo: hostinfo,
+	}, key.NewMachine().Public())
+	require.NoError(t, err)
+	authID, err := extractRegistrationIDFromAuthURL(resp.AuthURL)
+	require.NoError(t, err)
+
+	entry, ok := app.state.GetAuthCacheEntry(authID)
+	require.True(t, ok)
+	assert.Equal(t, &tailcfg.Hostinfo{
+		Hostname: "pending-router", OS: "linux", RequestTags: []string{"tag:router"},
+	}, entry.RegistrationData().Hostinfo)
+	hostinfo.RequestTags[0] = "tag:changed"
+	assert.Equal(t, []string{"tag:router"}, entry.RegistrationData().Hostinfo.RequestTags)
+	assert.Len(t, hostinfo.RoutableIPs, 1, "the request itself must be left alone")
 }
