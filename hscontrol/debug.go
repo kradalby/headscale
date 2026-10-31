@@ -36,8 +36,10 @@ func protectedDebugHandler(h http.Handler) http.Handler {
 		// [tsweb.AllowDebugAccess] rejects X-Forwarded-For and non-TS IPs.
 		// Additionally allow private/LAN addresses so operators can reach
 		// debug endpoints from their local network without tailscaled.
+		_, forwarded := r.Header["X-Forwarded-For"]
+
 		ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err == nil {
+		if err == nil && !forwarded {
 			ip, parseErr := netip.ParseAddr(ipStr)
 			if parseErr == nil && ip.IsPrivate() {
 				h.ServeHTTP(w, r)
@@ -228,6 +230,7 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 		ReadTimeout:  types.HTTPTimeout,
 		WriteTimeout: 0,
 	}
+	h.registerDebugGraph(debugMux, debug, debugHTTPServer)
 
 	return debugHTTPServer
 }
