@@ -215,6 +215,12 @@ type peerPolicy struct {
 type compiledPolicy struct {
 	pm  policy.PolicyManager
 	err error
+
+	// src, users and nodes (a policy-nodes generation) are what pm was
+	// compiled from.
+	src   []byte
+	users []types.User
+	nodes uint64
 }
 
 // newWorld builds the graph and publishes its first snapshot. It fails
@@ -264,7 +270,8 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 		func(s *graph.Snapshot, prev *compiledPolicy) *compiledPolicy {
 			src := s.Get(w.policySrc)
 			users := s.Get(w.policyUsers)
-			nodes := s.Get(w.policyNodes).list
+			pn := s.Get(w.policyNodes)
+			nodes := pn.list
 
 			var last policy.PolicyManager
 			if prev != nil {
@@ -274,9 +281,28 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 			pm, err := policy.NewPolicyManagerFrom(last, src, users, nodes)
 			if err != nil {
 				policyCompiles.WithLabelValues("error").Inc()
+
+				// A user change that breaks the unchanged document (such as
+				// a second user with a name it lists) keeps the last good
+				// users, as a refused policy write would, but the nodes must
+				// still move: a re-tag or delete has to revoke access.
+				if prev != nil && prev.pm != nil && bytes.Equal(prev.src, src) && prev.nodes != pn.gen {
+					retry, retryErr := policy.NewPolicyManagerFrom(last, src, prev.users, nodes)
+					if retryErr == nil {
+						log.Error().Err(err).Msg("compiling policy; keeping the last good users")
+
+						return &compiledPolicy{pm: retry, err: err, src: src, users: prev.users, nodes: pn.gen}
+					}
+				}
+
 				log.Error().Err(err).Msg("compiling policy; keeping the last good policy")
 
-				return &compiledPolicy{pm: last, err: err}
+				kept := &compiledPolicy{pm: last, err: err}
+				if prev != nil {
+					kept.src, kept.users, kept.nodes = prev.src, prev.users, prev.nodes
+				}
+
+				return kept
 			}
 
 			policyCompiles.WithLabelValues("ok").Inc()
@@ -289,7 +315,7 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 				}
 			}
 
-			return &compiledPolicy{pm: pm}
+			return &compiledPolicy{pm: pm, src: src, users: users, nodes: pn.gen}
 		})
 
 	w.peerPolicy = graph.NewDerived(g, "peer-policy", func(a, b peerPolicy) bool { return a.gen == b.gen },

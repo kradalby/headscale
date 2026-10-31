@@ -1,6 +1,7 @@
 package state
 
 import (
+	"database/sql"
 	"fmt"
 	"maps"
 	"math/rand/v2"
@@ -2951,4 +2952,55 @@ func TestRegistrationRollbackRestoresExpiryOnlineInvariant(t *testing.T) {
 			assert.False(t, elected, "expired router must not remain HA primary after failed auth")
 		})
 	}
+}
+
+// TestDuplicateUserNameKeepsNodeChangesCompiling pins that a second user with
+// a name the policy lists, which an OIDC login from another issuer can create,
+// does not freeze the policy: the last good users stay, the failure stays
+// visible, and a re-tag still revokes access.
+func TestDuplicateUserNameKeepsNodeChangesCompiling(t *testing.T) {
+	alice := &types.User{Name: "alice"}
+	alice.ID = 1
+
+	pol := `{"groups":{"group:admins":["alice@"]},
+	  "tagOwners":{"tag:dev":["group:admins"],"tag:prod":["group:admins"],"tag:quarantine":["group:admins"]},
+	  "acls":[{"action":"accept","src":["tag:dev"],"dst":["tag:prod:*"]}]}`
+
+	dev := worldNode(2, alice, "100.64.0.2")
+	dev.Tags = []string{"tag:dev"}
+	prod := worldNode(3, alice, "100.64.0.3")
+	prod.Tags = []string{"tag:prod"}
+
+	users := []types.User{*alice}
+	w, err := newWorld(types.Nodes{dev, prod}, users, []byte(pol), types.DNSView{})
+	require.NoError(t, err)
+
+	allows := func(src string) bool {
+		t.Helper()
+
+		nv, _ := w.snapshot().GetNode(3)
+		rules, err := w.snapshot().Policy().FilterForNode(nv)
+		require.NoError(t, err)
+
+		return slices.ContainsFunc(rules, func(r tailcfg.FilterRule) bool {
+			return slices.Contains(r.SrcIPs, src) || slices.Contains(r.SrcIPs, src+"/32")
+		})
+	}
+	require.True(t, allows("100.64.0.2"), "precondition: tag:dev reaches tag:prod")
+
+	dup := types.User{
+		ID:                 7,
+		Name:               "alice",
+		ProviderIdentifier: sql.NullString{String: "https://idp.example|sub", Valid: true},
+	}
+	require.ErrorContains(t, w.SetUsers(append(slices.Clone(users), dup)), "multiple users found")
+
+	w.UpdateNode(2, func(n *types.Node) { n.Tags = []string{"tag:quarantine"} })
+
+	require.ErrorContains(t, w.snapshot().PolicyErr(), "multiple users found", "the failure stays visible")
+	assert.False(t, allows("100.64.0.2"), "a re-tag revokes access while the duplicate exists")
+	assert.NotContains(t, w.snapshot().ListPeerIDs(3), types.NodeID(2))
+
+	require.NoError(t, w.SetUsers(users))
+	assert.NoError(t, w.snapshot().PolicyErr(), "removing the duplicate clears the failure")
 }
