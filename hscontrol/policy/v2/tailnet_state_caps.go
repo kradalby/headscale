@@ -22,20 +22,11 @@ import (
 	"tailscale.com/tailcfg/nodecap"
 )
 
-// PeerCapMap returns the subset of peerSelfCaps the Tailscale client
-// reads from the peer view (rather than the self view) given the
-// peer's state. Returns nil when no peer-consumed cap applies, matching
-// the empirical wire shape where [tailcfg.Node.CapMap] is omitted for
-// most peers.
+// PeerCapMap returns [nodecap.SuggestExitNode] for an approved exit node,
+// preserving its policy value from peerSelfCaps. Other peers return nil,
+// matching the wire shape where [tailcfg.Node.CapMap] is omitted.
 //
-// Caps the client reads from the peer view rather than the self view
-// ([tailcfg.NodeAttrSuggestExitNode], read by
-// [tailscale.com/ipn/ipnlocal.LocalBackend.SuggestExitNode], and
-// [tailcfg.NodeAttrDNSSubdomainResolve]) are emitted only when the
-// peer satisfies the cap's emission condition. This function encodes
-// those conditions; the mapper calls it from
-// [mapper.MapResponseBuilder.buildTailPeers] and the compat test calls
-// it to compute the expected per-peer wire shape.
+// Mapper peer rendering and compatibility tests share this emission rule.
 func PeerCapMap(peer types.NodeView, peerSelfCaps tailcfg.NodeCapMap) tailcfg.NodeCapMap {
 	// suggest-exit-node — surfaced on Peer.CapMap when the peer
 	// advertises exit routes AND those routes are approved, with or

@@ -327,12 +327,12 @@ func TestWithRoutesMatchesTailNode(t *testing.T) {
 
 	cfg := &types.Config{BaseDomain: "example.com"}
 
-	want, err := peer.TailNode(capVer, func(types.NodeID) []netip.Prefix { return routes }, cfg, nil)
+	want, err := peer.TailNode(capVer, func(types.NodeID) []netip.Prefix { return routes }, cfg, cfg.DNSView(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	base, err := (&peerRenders{}).render(cfg, capVer, 1, 1, peer, nil)
+	base, err := (&peerRenders{}).render(cfg, cfg.DNSView(), capVer, 1, 1, peer, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

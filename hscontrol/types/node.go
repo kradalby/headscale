@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	hsdns "github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
@@ -853,12 +852,12 @@ func (nv NodeView) MarshalZerologObject(e *zerolog.Event) {
 // CertDomain returns the name the node may get a TLS certificate for with
 // `tailscale cert`: its MagicDNS name without the trailing dot, exactly as
 // the client matches it against its own name.
-func (nv NodeView) CertDomain(cfg *Config) (string, bool) {
-	if !nv.Valid() || !cfg.DNSConfig.Certificates.Enabled {
+func (nv NodeView) CertDomain(dns DNSView) (string, bool) {
+	if !nv.Valid() || !dns.CertificatesEnabled() {
 		return "", false
 	}
 
-	fqdn, err := nv.GetFQDN(cfg.BaseDomain)
+	fqdn, err := nv.GetFQDN(dns.BaseDomain())
 	if err != nil {
 		return "", false
 	}
@@ -875,14 +874,14 @@ func (nv NodeView) CertDomain(cfg *Config) (string, bool) {
 	// certificate for a name the operator gave to a service. A wildcard
 	// order shares its challenge record with the bare name, so names
 	// below the node's are covered too.
-	if cfg.extraRecordAtOrBelow(domain) {
+	if dns.extraRecordAtOrBelow(domain) {
 		return "", false
 	}
 
 	// A node may publish only its own name's challenge, which keeps it from
 	// other names' certificates only where the provider answers each name's
 	// challenge apart.
-	if iso, ok := cfg.DNSChallenge.Provider.(hsdns.Isolator); ok && !iso.Isolates(domain) {
+	if isolates := dns.settings.isolates; isolates != nil && !isolates(domain) {
 		return "", false
 	}
 
@@ -1284,13 +1283,14 @@ func TailNodes(
 	capVer tailcfg.CapabilityVersion,
 	primaryRouteFunc RouteFunc,
 	cfg *Config,
+	dns DNSView,
 ) ([]*tailcfg.Node, error) {
 	tNodes := make([]*tailcfg.Node, 0, nodes.Len())
 
 	for _, node := range nodes.All() {
 		// nil selfPolicyCaps: this batch builds peer views; the caller
 		// sets each peer's CapMap from [policyv2.PeerCapMap].
-		tNode, err := node.TailNode(capVer, primaryRouteFunc, cfg, nil)
+		tNode, err := node.TailNode(capVer, primaryRouteFunc, cfg, dns, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -1312,13 +1312,14 @@ func (nv NodeView) TailNode(
 	capVer tailcfg.CapabilityVersion,
 	primaryRouteFunc RouteFunc,
 	cfg *Config,
+	dns DNSView,
 	selfPolicyCaps tailcfg.NodeCapMap,
 ) (*tailcfg.Node, error) {
 	if !nv.Valid() {
 		return nil, ErrInvalidNodeView
 	}
 
-	hostname, err := nv.GetFQDN(cfg.BaseDomain)
+	hostname, err := nv.GetFQDN(dns.BaseDomain())
 	if err != nil {
 		return nil, err
 	}
@@ -1370,7 +1371,7 @@ func (nv NodeView) TailNode(
 	// Baseline caps every node receives, regardless of policy. Mirrors
 	// what Tailscale SaaS emits for a default tailnet.
 	// cfg.Taildrop.Enabled gates CapabilityFileSharing.
-	// cfg.DNSConfig.Certificates.Enabled gates HTTPS, without which
+	// The snapshot's certificate settings gate HTTPS, without which
 	// `tailscale serve` refuses to serve HTTPS.
 	capMap := tailcfg.NodeCapMap{
 		nodecap.Admin:                   []tailcfg.RawMessage{},
@@ -1382,7 +1383,7 @@ func (nv NodeView) TailNode(
 		capMap[nodecap.FileSharing] = []tailcfg.RawMessage{}
 	}
 
-	if _, ok := nv.CertDomain(cfg); ok {
+	if _, ok := nv.CertDomain(dns); ok {
 		capMap[nodecap.HTTPS] = []tailcfg.RawMessage{}
 	}
 

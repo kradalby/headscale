@@ -13,7 +13,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -147,8 +146,8 @@ type Config struct {
 	// not directly converted into a [tailcfg.DNSConfig].
 	DNSConfig DNSConfig
 
-	// TailcfgDNSConfig is the tailcfg representation of the DNS configuration,
-	// it can be used directly when sending Netmaps to clients.
+	// TailcfgDNSConfig is a startup builder, frozen by [Config.DNSView].
+	// Runtime DNS readers require the snapshot's [DNSView] instead.
 	TailcfgDNSConfig *tailcfg.DNSConfig
 
 	DNSChallenge DNSChallengeConfig
@@ -1963,46 +1962,6 @@ func (d *deprecator) Apply(v *configValidator) {
 	}
 }
 
-// tailcfgDNSMu guards concurrent access to the mutable ExtraRecords of
-// [Config.TailcfgDNSConfig] between the extra-records file watcher (writer)
-// and the per-client map builds that clone it (readers). It is a package-level
-// lock so [Config] stays freely copyable during construction.
-var tailcfgDNSMu sync.RWMutex
-
-// CloneTailcfgDNSConfig returns a deep copy of [Config.TailcfgDNSConfig], or
-// nil if none is set. Safe for concurrent use with [Config.SetExtraRecords].
-func (c *Config) CloneTailcfgDNSConfig() *tailcfg.DNSConfig {
-	tailcfgDNSMu.RLock()
-	defer tailcfgDNSMu.RUnlock()
-
-	if c.TailcfgDNSConfig == nil {
-		return nil
-	}
-
-	return c.TailcfgDNSConfig.Clone()
-}
-
-// extraRecordAtOrBelow reports whether an extra DNS record is name or a
-// subdomain of it. Case is ignored, as in TLS name matching; name is
-// lowercase.
-func (c *Config) extraRecordAtOrBelow(name string) bool {
-	tailcfgDNSMu.RLock()
-	defer tailcfgDNSMu.RUnlock()
-
-	if c.TailcfgDNSConfig == nil {
-		return false
-	}
-
-	for _, r := range c.TailcfgDNSConfig.ExtraRecords {
-		rn := strings.ToLower(strings.TrimSuffix(r.Name, "."))
-		if rn == name || strings.HasSuffix(rn, "."+name) {
-			return true
-		}
-	}
-
-	return false
-}
-
 // TailcfgDebug returns the [tailcfg.Debug] for full map responses: nil when
 // logtail is enabled, leaving client log uploads as the client set them,
 // otherwise an instruction to stop uploading logs.
@@ -2014,22 +1973,11 @@ func (c *Config) TailcfgDebug() *tailcfg.Debug {
 	return &tailcfg.Debug{DisableLogTail: true}
 }
 
-// SetExtraRecords replaces the ExtraRecords of [Config.TailcfgDNSConfig]. Safe
-// for concurrent use with [Config.CloneTailcfgDNSConfig].
-func (c *Config) SetExtraRecords(records []tailcfg.DNSRecord) {
-	tailcfgDNSMu.Lock()
-	defer tailcfgDNSMu.Unlock()
-
-	if c.TailcfgDNSConfig != nil {
-		c.TailcfgDNSConfig.ExtraRecords = lowercaseRecordNames(records)
-	}
-}
-
 // lowercaseRecordNames normalizes DNS record names to lowercase, as DNS names
 // are case-insensitive and clients match extra records by exact name.
 func lowercaseRecordNames(records []tailcfg.DNSRecord) []tailcfg.DNSRecord {
-	if len(records) == 0 {
-		return records
+	if records == nil {
+		return nil
 	}
 
 	normalized := make([]tailcfg.DNSRecord, len(records))

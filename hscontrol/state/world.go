@@ -130,12 +130,12 @@ type world struct {
 	// caller's checks and the commit.
 	beforePolicyCommit func()
 
-	nodes        graph.Input[*nodeMap]
-	users        graph.Input[[]types.User]
-	policyUsers  graph.Derived[[]types.User]
-	policySrc    graph.Input[[]byte]
-	derpMap      graph.Input[*tailcfg.DERPMap]
-	extraRecords graph.Input[[]tailcfg.DNSRecord]
+	nodes       graph.Input[*nodeMap]
+	users       graph.Input[[]types.User]
+	policyUsers graph.Derived[[]types.User]
+	policySrc   graph.Input[[]byte]
+	derpMap     graph.Input[*tailcfg.DERPMap]
+	dns         graph.Input[types.DNSView]
 
 	index       graph.Derived[*nodeIndex]
 	policyNodes graph.Derived[policyNodes]
@@ -199,7 +199,7 @@ type compiledPolicy struct {
 
 // newWorld builds the graph and publishes its first snapshot. It fails
 // when the policy does not compile against users and nodes.
-func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, error) {
+func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DNSView) (*world, error) {
 	g := graph.New()
 	w := &world{g: g, full: make(chan struct{}, 1), beforePolicyCommit: func() {}}
 
@@ -220,10 +220,10 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte) (*world, err
 	w.policyUsers = graph.NewDerived(g, "policy-users", types.SamePolicyUsers,
 		func(s *graph.Snapshot, _ []types.User) []types.User { return s.Get(w.users) })
 	w.policySrc = g.NewInput("policy-source", polSrc, graph.Never[[]byte])
-	// Both are refreshed on a timer; an unchanged value must not wake
-	// every session.
+	// The DERP map is refreshed on a timer and DNS by the extra-records
+	// watcher; an unchanged value must not wake every session.
 	w.derpMap = g.NewInput("derp-map", (*tailcfg.DERPMap)(nil), sameDERPMap)
-	w.extraRecords = g.NewInput("extra-records", []tailcfg.DNSRecord(nil), slices.Equal[[]tailcfg.DNSRecord])
+	w.dns = g.NewInput("dns", dns, types.DNSView.Equal)
 
 	w.index = graph.NewDerived(g, "index", graph.Same[*nodeIndex],
 		func(s *graph.Snapshot, prev *nodeIndex) *nodeIndex {
@@ -1028,8 +1028,10 @@ func sameDERPMap(a, b *tailcfg.DERPMap) bool {
 
 // SetExtraRecords replaces the extra DNS records.
 func (w *world) SetExtraRecords(records []tailcfg.DNSRecord) {
+	dns := w.snapshot().DNS().WithExtraRecords(records)
+
 	_, _ = w.g.Update(func(tx *graph.Tx) error {
-		graph.Set(tx, w.extraRecords, records)
+		graph.Set(tx, w.dns, dns)
 
 		return nil
 	})
@@ -1293,6 +1295,9 @@ func (s *Snapshot) Users() []types.User { return s.s.Get(s.w.users) }
 // DERPMap returns the DERP map.
 func (s *Snapshot) DERPMap() *tailcfg.DERPMap { return s.s.Get(s.w.derpMap) }
 
+// DNS returns the immutable DNS settings and records of this snapshot.
+func (s *Snapshot) DNS() types.DNSView { return s.s.Get(s.w.dns) }
+
 // PrimaryRoutes returns the prefix→primary assignment. It is shared and
 // must not be modified.
 func (s *Snapshot) PrimaryRoutes() map[netip.Prefix]types.NodeID {
@@ -1544,4 +1549,4 @@ func (s *Snapshot) PeersRev() uint64 { return graph.ChangedAt(s.s, s.w.peers) }
 func (s *Snapshot) PrimariesRev() uint64 { return graph.ChangedAt(s.s, s.w.primaries) }
 
 // DNSRev is the revision of the latest extra DNS records change.
-func (s *Snapshot) DNSRev() uint64 { return graph.ChangedAt(s.s, s.w.extraRecords) }
+func (s *Snapshot) DNSRev() uint64 { return graph.ChangedAt(s.s, s.w.dns) }
