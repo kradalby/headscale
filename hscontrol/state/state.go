@@ -2212,6 +2212,7 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 		if !regData.DiscoKey.IsZero() {
 			node.DiscoKey = regData.DiscoKey
 		}
+
 		node.Hostname = params.Hostname
 
 		// A re-auth keeps the node's stored operational metadata and takes
@@ -3203,7 +3204,7 @@ func (s *State) HandleNodeFromPreAuthKey(
 // whether the key must be valid on the node it replaces, at its own clock, and
 // leaves the node untouched when it is not. existingNodeSameUser is used only
 // for its ID and for logging.
-func (s *State) reregisterNodeWithPAK(
+func (s *State) reregisterNodeWithPAK( //nolint:gocyclo // one branch per upstream re-auth rule; extraction would split the decision
 	existingNodeSameUser types.NodeView,
 	pak *types.PreAuthKey,
 	regReq tailcfg.RegisterRequest,

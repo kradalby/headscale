@@ -225,7 +225,9 @@ type compiledPolicy struct {
 
 // newWorld builds the graph and publishes its first snapshot. It fails
 // when the policy does not compile against users and nodes.
-func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DNSView) (*world, error) {
+func newWorld( //nolint:gocyclo // one branch per graph input; extraction would split the wiring
+	nodes types.Nodes, users []types.User, polSrc []byte, dns types.DNSView,
+) (*world, error) {
 	g := graph.New()
 	w := &world{g: g, full: make(chan struct{}, 1), beforePolicyCommit: func() {}}
 
