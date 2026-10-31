@@ -112,6 +112,10 @@ func (m *Map[K, V]) ChangedSince(old *Map[K, V]) ([]K, bool) {
 		return nil, false
 	}
 
+	if m.id == old.id {
+		return nil, true
+	}
+
 	// Find old in the log before collecting: a reader too far behind
 	// must not pay for the whole log.
 	n, found := 0, false
@@ -139,6 +143,18 @@ func (m *Map[K, V]) ChangedSince(old *Map[K, V]) ([]K, bool) {
 			return keys, true
 		}
 	}
+}
+
+// Cursor returns a Map that stands for m only as the old side of
+// [Map.ChangedSince]: it holds none of m's entries, so a reader keeping it
+// to ask a later Map what changed pins nothing. Reading it any other way
+// sees an empty Map.
+func (m *Map[K, V]) Cursor() *Map[K, V] {
+	if m == nil {
+		return nil
+	}
+
+	return &Map[K, V]{id: m.id}
 }
 
 // Changes returns the keys whose entry differs between old and m, each

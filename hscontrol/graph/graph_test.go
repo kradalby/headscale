@@ -570,3 +570,36 @@ func TestUpdateCheckedRefusalPublishesNothing(t *testing.T) {
 		t.Fatalf("the graph must stay usable after a panicking check: %v", err)
 	}
 }
+
+// TestMapCursorAnswersChangedSince pins that a Cursor stands in for its Map
+// as the old side of ChangedSince, edits ahead or none, and holds no entries.
+func TestMapCursorAnswersChangedSince(t *testing.T) {
+	base := NewMap(Same[int], map[int]int{1: 1, 2: 2})
+	cur := base.Cursor()
+
+	if cur.Len() != 0 {
+		t.Fatalf("cursor holds %d entries", cur.Len())
+	}
+
+	if keys, ok := base.ChangedSince(cur); !ok || len(keys) != 0 {
+		t.Fatalf("unchanged map from its cursor = %v, %t", keys, ok)
+	}
+
+	e := base.Edit()
+	e.Set(3, 3)
+	next := e.Done()
+
+	want, _ := next.ChangedSince(base)
+
+	got, ok := next.ChangedSince(cur)
+	if !ok || !slices.Equal(got, want) {
+		t.Fatalf("ChangedSince(cursor) = %v, %t; want %v", got, ok, want)
+	}
+
+	e = base.Edit()
+	e.Set(4, 4)
+
+	if _, ok := e.Done().ChangedSince(next.Cursor()); ok {
+		t.Fatal("a sibling's cursor must not read as a lineage")
+	}
+}

@@ -51,11 +51,14 @@ type PolicyManager interface {
 	// NodeCanApproveRoute reports whether the given node can approve the given route.
 	NodeCanApproveRoute(node types.NodeView, route netip.Prefix) bool
 
-	// ViaRoutesForPeer computes via grant effects for a viewer-peer pair.
-	// It returns which routes should be included (peer is via-designated for viewer)
-	// and excluded (steered to a different peer). When no via grants apply,
-	// both fields are empty and the caller falls back to existing behavior.
+	// ViaRoutesForPeer is static policy inspection. Live routing must use
+	// the immutable result of ElectViaRoutes instead.
 	ViaRoutesForPeer(viewer, peer types.NodeView) types.ViaRouteResult
+	// ElectViaRoutes revisits only scopes a change can move: touched
+	// prefixes, and on a recompile the scopes whose candidates moved. It
+	// reports winner changes, not policy-binding changes; callers must
+	// adopt the returned result even when the boolean is false.
+	ElectViaRoutes(previous *policyv2.ViaRoutes, touched map[netip.Prefix]struct{}, elect func(views.Slice[types.NodeID], types.NodeID) (types.NodeID, bool)) (*policyv2.ViaRoutes, bool)
 
 	// NodeCapMap returns compiled policy capabilities for the given node,
 	// or nil when none target it. The map is a defensive clone; its values

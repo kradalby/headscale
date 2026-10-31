@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/policy/policyutil"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -22,6 +24,7 @@ import (
 	"pgregory.net/rapid"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/views"
 )
 
 func node(name, ipv4, ipv6 string, user types.User) *types.Node {
@@ -1234,6 +1237,454 @@ func TestIssue2990SameUserTaggedDevice(t *testing.T) {
 
 	for i, rule := range filter2 {
 		t.Logf("  rule %d: SrcIPs=%v DstPorts=%v", i, rule.SrcIPs, rule.DstPorts)
+	}
+}
+
+func TestElectViaRoutesDestinationScopes(t *testing.T) {
+	tests := []struct {
+		name         string
+		route        string
+		destinations string
+		wantSubnets  int
+		wantExit     bool
+	}{
+		{name: "unrelated IPv4", route: "10.1.0.0/24", destinations: `["10.2.0.0/24"]`},
+		{name: "unrelated IPv6", route: "fd00:1::/64", destinations: `["fd00:2::/64"]`},
+		{name: "opposite address family", route: "10.1.0.0/24", destinations: `["fd00:1::/64"]`},
+		{name: "internet with IPv4 subnet", route: "10.1.0.0/24", destinations: `["autogroup:internet"]`, wantExit: true},
+		{name: "internet with IPv6 subnet", route: "fd00:1::/64", destinations: `["autogroup:internet"]`, wantExit: true},
+		{name: "narrow IPv4 destination", route: "10.1.0.0/24", destinations: `["10.1.0.128/25"]`, wantSubnets: 1},
+		{name: "broad IPv4 destination", route: "10.1.0.128/25", destinations: `["10.1.0.0/24"]`, wantSubnets: 1},
+		{name: "narrow IPv6 destination", route: "fd00:1::/64", destinations: `["fd00:1::/65"]`, wantSubnets: 1},
+		{name: "broad IPv6 destination", route: "fd00:1::/65", destinations: `["fd00:1::/64"]`, wantSubnets: 1},
+		{name: "mixed IPv4 and exit", route: "10.1.0.0/24", destinations: `["10.1.0.128/25","fd00:2::/64","autogroup:internet"]`, wantSubnets: 1, wantExit: true},
+		{name: "mixed IPv6 and exit", route: "fd00:1::/64", destinations: `["10.2.0.0/24","fd00:1::/65","autogroup:internet"]`, wantSubnets: 1, wantExit: true},
+		{name: "two destinations one scope", route: "10.1.0.0/24", destinations: `["10.1.0.0/25","10.1.0.128/25"]`, wantSubnets: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			users := types.Users{{ID: 1, Name: "alice"}}
+			route := mp(tt.route)
+			exits := []netip.Prefix{mp("0.0.0.0/0"), mp("::/0")}
+			nodes := make(types.Nodes, 1, 3)
+			nodes[0] = node("viewer", "100.64.0.1", "fd7a:115c:a1e0::1", users[0])
+			nodes[0].ID = 1
+
+			for _, id := range []types.NodeID{2, 3} {
+				nodes = append(nodes, &types.Node{
+					ID:             id,
+					IPv4:           ap(fmt.Sprintf("100.64.0.%d", id)),
+					Tags:           []string{"tag:router"},
+					Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: append([]netip.Prefix{route}, exits...)},
+					ApprovedRoutes: append([]netip.Prefix{route}, exits...),
+				})
+			}
+
+			pol := fmt.Sprintf(`{"tagOwners":{"tag:router":["alice@"]},"grants":[{"src":["100.64.0.1"],"dst":%s,"ip":["*"],"via":["tag:router"]}]}`, tt.destinations)
+			pm, err := NewPolicyManager([]byte(pol), users, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			calls, wantCalls := 0, 0
+			winner := types.NodeID(2)
+			elect := func(candidates views.Slice[types.NodeID], _ types.NodeID) (types.NodeID, bool) {
+				require.Equal(t, []types.NodeID{2, 3}, candidates.AsSlice())
+
+				calls++
+
+				return winner, true
+			}
+
+			wantSubnet := tt.wantSubnets > 0
+			if wantSubnet {
+				wantCalls = 1
+			}
+
+			before, changed := pm.ElectViaRoutes(nil, nil, elect)
+
+			assert.Equal(t, wantCalls, calls, "only usable subnet destinations need elections")
+			assert.Equal(t, wantSubnet, changed)
+
+			var wantRoutes []netip.Prefix
+			// A peer route covering several destinations of one grant is
+			// still one route: it appears once in the result.
+			if tt.wantSubnets > 0 {
+				wantRoutes = append(wantRoutes, route)
+			}
+
+			if tt.wantExit {
+				wantRoutes = append(wantRoutes, exits...)
+			}
+
+			assert.ElementsMatch(t, wantRoutes, before.ForPeer(nodes[0].View(), nodes[1].View()).Include)
+			assert.ElementsMatch(t, wantRoutes, pm.ViaRoutesForPeer(nodes[0].View(), nodes[1].View()).Include)
+
+			calls, winner = 0, 3
+			after, changed := pm.ElectViaRoutes(before, map[netip.Prefix]struct{}{route: {}}, elect)
+
+			assert.Equal(t, wantCalls, calls, "an irrelevant touched prefix does not revisit grants")
+			assert.Equal(t, wantSubnet, changed)
+
+			if wantSubnet {
+				assert.Equal(t, []types.NodeID{2, 3}, after.ChangedNodes(before))
+			} else {
+				// The contract is adopt-the-returned-result, not pointer
+				// reuse: an equal fresh binding satisfies it.
+				assert.Empty(t, after.ChangedNodes(before))
+				assert.Equal(t, before.ForPeer(nodes[0].View(), nodes[1].View()), after.ForPeer(nodes[0].View(), nodes[1].View()))
+			}
+
+			assert.ElementsMatch(t, wantRoutes, after.ForPeer(nodes[0].View(), nodes[2].View()).Include)
+			assert.ElementsMatch(t, wantRoutes, before.ForPeer(nodes[0].View(), nodes[1].View()).Include, "old elections remain immutable")
+
+			calls = 0
+			unchanged, changed := pm.ElectViaRoutes(after, map[netip.Prefix]struct{}{route: {}}, elect)
+
+			assert.Equal(t, wantCalls, calls)
+			assert.False(t, changed)
+			assert.Empty(t, unchanged.ChangedNodes(after), "an equal binding is adopted without a winner change")
+
+			// An election that elects nobody drops the scope's winner
+			// rather than falling back to a static one.
+			calls = 0
+			none, changed := pm.ElectViaRoutes(unchanged, map[netip.Prefix]struct{}{route: {}}, func(_ views.Slice[types.NodeID], _ types.NodeID) (types.NodeID, bool) {
+				calls++
+
+				return 0, false
+			})
+
+			assert.Equal(t, wantCalls, calls)
+			assert.Equal(t, wantSubnet, changed)
+			assert.NotContains(t, none.ForPeer(nodes[0].View(), nodes[1].View()).Include, route, "no elected winner routes the subnet")
+
+			if wantSubnet {
+				assert.Contains(t, none.ForPeer(nodes[0].View(), nodes[1].View()).Exclude, route)
+			}
+		})
+	}
+}
+
+func TestElectViaRoutesSameDocumentRecompile(t *testing.T) {
+	users := types.Users{{ID: 1, Name: "alice"}}
+
+	router := func(id types.NodeID, tag string, route netip.Prefix) *types.Node {
+		return &types.Node{
+			ID:             id,
+			IPv4:           ap(fmt.Sprintf("100.64.0.%d", id)),
+			Tags:           []string{tag},
+			Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}},
+			ApprovedRoutes: []netip.Prefix{route},
+		}
+	}
+
+	routeA, routeB := mp("10.1.0.0/24"), mp("10.2.0.0/24")
+	viewer := node("viewer", "100.64.0.1", "fd7a:115c:a1e0::1", users[0])
+	viewer.ID = 1
+
+	nodes := types.Nodes{
+		viewer,
+		router(2, "tag:a", routeA),
+		router(3, "tag:b", routeB),
+	}
+
+	pol := []byte(`{"tagOwners":{"tag:a":["alice@"],"tag:b":["alice@"]},"grants":[
+		{"src":["100.64.0.1"],"dst":["10.1.0.0/24"],"ip":["*"],"via":["tag:a"]},
+		{"src":["100.64.0.1"],"dst":["10.2.0.0/24"],"ip":["*"],"via":["tag:b"]}]}`)
+
+	electCount := 0
+	elect := func(_ views.Slice[types.NodeID], _ types.NodeID) (types.NodeID, bool) {
+		electCount++
+
+		return 2, true
+	}
+
+	pm, err := NewPolicyManager(pol, users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	before, changed := pm.ElectViaRoutes(nil, nil, elect)
+	require.True(t, changed)
+	require.Equal(t, 2, electCount, "each scope elects once")
+
+	view, peerA := nodes[0].View(), nodes[1].View()
+
+	// A same-document recompile goes through NewPolicyManagerFrom, which
+	// reuses the parsed document.
+	recompile := func(nodes views.Slice[types.NodeView]) *PolicyManager {
+		t.Helper()
+
+		recompiled, err := NewPolicyManagerFrom(pm, pol, users, nodes)
+		require.NoError(t, err)
+
+		return recompiled
+	}
+
+	t.Run("unchanged nodes elect nothing", func(t *testing.T) {
+		electCount = 0
+		after, changed := recompile(nodes.ViewSlice()).ElectViaRoutes(before, map[netip.Prefix]struct{}{mp("10.9.0.0/24"): {}}, elect)
+
+		assert.Zero(t, electCount, "a same-document recompile against unchanged nodes must not revisit scopes")
+		assert.False(t, changed)
+		assert.Equal(t, before.ForPeer(view, peerA), after.ForPeer(view, peerA))
+	})
+
+	t.Run("joined candidates re-elect only their scope", func(t *testing.T) {
+		joined := append(slices.Clone(nodes), router(4, "tag:a", routeA))
+		grown, err := NewPolicyManagerFrom(pm, pol, users, joined.ViewSlice())
+		require.NoError(t, err)
+
+		electCount = 0
+		after, _ := grown.ElectViaRoutes(before, nil, elect)
+
+		assert.Equal(t, 1, electCount, "only the scope whose candidates changed re-elects")
+		require.Len(t, after.ForPeer(view, peerA).Include, 1)
+		assert.Empty(t, after.ChangedNodes(before), "an unchanged winner is not a change")
+	})
+
+	t.Run("removed candidacy drops the scope's winner", func(t *testing.T) {
+		untagged := slices.Clone(nodes)
+		untagged[2] = untagged[2].Clone()
+		untagged[2].Tags = nil
+		shrunk, err := NewPolicyManagerFrom(pm, pol, users, untagged.ViewSlice())
+		require.NoError(t, err)
+
+		electCount = 0
+		after, changed := shrunk.ElectViaRoutes(before, nil, elect)
+
+		assert.Zero(t, electCount, "an emptied scope deletes its winner without electing")
+		assert.True(t, changed)
+		assert.Equal(t, []types.NodeID{2}, after.ChangedNodes(before), "the scope's old winner is reported changed")
+		assert.Empty(t, after.ForPeer(view, nodes[2].View()).Include)
+	})
+}
+
+func TestAuditViaElections(t *testing.T) {
+	users := types.Users{{ID: 1, Name: "alice"}}
+	route := mp("10.1.0.0/24")
+
+	router := func(id types.NodeID) *types.Node {
+		return &types.Node{
+			ID:             id,
+			IPv4:           ap(fmt.Sprintf("100.64.0.%d", id)),
+			Tags:           []string{"tag:router"},
+			Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}},
+			ApprovedRoutes: []netip.Prefix{route},
+		}
+	}
+
+	viewer := node("viewer", "100.64.0.1", "fd7a:115c:a1e0::1", users[0])
+	viewer.ID = 1
+
+	nodes := types.Nodes{viewer, router(2), router(3)}
+	pol := []byte(`{"tagOwners":{"tag:router":["alice@"]},"grants":[
+		{"src":["100.64.0.1"],"dst":["10.1.0.0/24"],"ip":["*"],"via":["tag:router"]}]}`)
+
+	pm, err := NewPolicyManager(pol, users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	elect := func(_ views.Slice[types.NodeID], incumbent types.NodeID) (types.NodeID, bool) {
+		if incumbent != 0 {
+			return incumbent, true
+		}
+
+		return 2, true
+	}
+
+	elected, _ := pm.ElectViaRoutes(nil, nil, elect)
+	require.Len(t, elected.ForPeer(viewer.View(), nodes[1].View()).Include, 1)
+
+	assert.True(t, pm.AuditViaElections(nil, elected, elect), "an incremental election agrees with a full one")
+
+	// An adopted winner a full election would not pick is a mismatch.
+	wrong, _ := pm.ElectViaRoutes(nil, nil, func(_ views.Slice[types.NodeID], _ types.NodeID) (types.NodeID, bool) {
+		return 3, true
+	})
+
+	assert.False(t, pm.AuditViaElections(nil, wrong, elect), "a winner the election would not pick is reported")
+}
+
+// TestViaRoutesForPeerForeignPeer checks static via inspection answers for
+// a peer the compiled policy does not know: no scope elects it, so nothing
+// routes through it.
+func TestViaRoutesForPeerForeignPeer(t *testing.T) {
+	users := types.Users{{ID: 1, Name: "alice"}}
+	knownRoute, foreignRoute := mp("10.1.0.0/24"), mp("10.1.99.0/24")
+
+	viewer := node("viewer", "100.64.0.1", "fd7a:115c:a1e0::1", users[0])
+	viewer.ID = 1
+
+	known := node("router", "100.64.0.2", "fd7a:115c:a1e0::2", users[0])
+	known.ID = 2
+	known.Tags = []string{"tag:router"}
+	known.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{knownRoute}}
+	known.ApprovedRoutes = []netip.Prefix{knownRoute}
+
+	nodes := types.Nodes{viewer, known}
+	pol := []byte(`{"tagOwners":{"tag:router":["alice@"]},"grants":[
+		{"src":["100.64.0.1"],"dst":["10.1.0.0/16"],"ip":["*"],"via":["tag:router"]}]}`)
+
+	pm, err := NewPolicyManager(pol, users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	foreign := node("foreign", "100.64.0.99", "fd7a:115c:a1e0::99", users[0])
+	foreign.ID = 99
+	foreign.Tags = []string{"tag:router"}
+	foreign.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{mp("10.9.0.0/24")}}
+	foreign.ApprovedRoutes = []netip.Prefix{mp("10.9.0.0/24")}
+
+	result := pm.ViaRoutesForPeer(viewer.View(), foreign.View())
+	assert.Empty(t, result.Include, "a peer no scope elects must not carry routes")
+	assert.NotContains(t, result.Exclude, mp("10.9.0.0/24"), "an unrelated prefix is not steered")
+
+	foreign.Hostinfo.RoutableIPs = []netip.Prefix{foreignRoute}
+	foreign.ApprovedRoutes = []netip.Prefix{foreignRoute}
+
+	// The peer advertises a scoped destination, but no election knows the
+	// peer, so no winner exists for it.
+	result = pm.ViaRoutesForPeer(viewer.View(), foreign.View())
+	assert.Empty(t, result.Include, "a scope without an elected winner excludes its routes")
+	assert.Contains(t, result.Exclude, foreignRoute)
+}
+
+// TestElectViaRoutesPassReuse checks an election pass over a carried
+// binding re-elects the carried incumbent and returns the binding
+// unchanged: the winners are reused, not rebuilt.
+func TestElectViaRoutesPassReuse(t *testing.T) {
+	users := types.Users{{ID: 1, Name: "alice"}}
+	route := mp("10.1.0.0/24")
+
+	router := func(id types.NodeID) *types.Node {
+		return &types.Node{
+			ID:             id,
+			IPv4:           ap(fmt.Sprintf("100.64.0.%d", id)),
+			Tags:           []string{"tag:router"},
+			Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}},
+			ApprovedRoutes: []netip.Prefix{route},
+		}
+	}
+
+	viewer := node("viewer", "100.64.0.1", "fd7a:115c:a1e0::1", users[0])
+	viewer.ID = 1
+
+	pol := []byte(`{"tagOwners":{"tag:router":["alice@"]},"grants":[
+		{"src":["100.64.0.1"],"dst":["10.1.0.0/24"],"ip":["*"],"via":["tag:router"]}]}`)
+
+	pm, err := NewPolicyManager(pol, users, types.Nodes{viewer, router(2), router(3)}.ViewSlice())
+	require.NoError(t, err)
+
+	// The stub records the incumbent it was handed: a lost incumbent
+	// re-electing the same winner must still fail the oracle.
+	var incumbentSeen types.NodeID
+
+	elect := func(_ views.Slice[types.NodeID], incumbent types.NodeID) (types.NodeID, bool) {
+		incumbentSeen = incumbent
+
+		carried := incumbent
+		if incumbent == 0 {
+			carried = 2
+		}
+
+		return carried, true
+	}
+
+	before, changed := pm.ElectViaRoutes(nil, nil, elect)
+	require.True(t, changed)
+	require.Len(t, pm.viaPrep().scopes[route], 1, "the scope elects once")
+
+	// A pass over the carried winners with a touched prefix re-elects the
+	// incumbent and returns the binding unchanged: the winners are reused,
+	// not rebuilt.
+	touched := map[netip.Prefix]struct{}{route: {}}
+
+	allocs := testing.AllocsPerRun(20, func() { pm.ElectViaRoutes(before, touched, elect) })
+
+	after, changed := pm.ElectViaRoutes(before, touched, elect)
+
+	require.Equal(t, types.NodeID(2), incumbentSeen, "the touched pass re-elects the carried incumbent")
+	assert.False(t, changed)
+	assert.Same(t, before, after, "an unchanged pass returns the carried binding")
+
+	// The pass's floor is the binding adoption; a rebuilt winner map
+	// would exceed it.
+	assert.LessOrEqual(t, allocs, float64(3), "an unchanged election pass must reuse the carried winners")
+}
+
+// TestViaRoutesHasOutage covers the outage condition and its blind spots:
+// an unavailable winner with no available candidate is an outage, an
+// available candidate is not, and a winner the policy no longer scopes —
+// which the election cannot produce — must not read as one.
+func TestViaRoutesHasOutage(t *testing.T) {
+	users := types.Users{{ID: 1, Name: "alice"}}
+	route := mp("10.1.0.0/24")
+
+	router := func(id types.NodeID) *types.Node {
+		return &types.Node{
+			ID:             id,
+			IPv4:           ap(fmt.Sprintf("100.64.0.%d", id)),
+			Tags:           []string{"tag:router"},
+			Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}},
+			ApprovedRoutes: []netip.Prefix{route},
+		}
+	}
+
+	viewer := node("viewer", "100.64.0.1", "fd7a:115c:a1e0::1", users[0])
+	viewer.ID = 1
+
+	pol := []byte(`{"tagOwners":{"tag:router":["alice@"]},"grants":[
+		{"src":["100.64.0.1"],"dst":["10.1.0.0/24"],"ip":["*"],"via":["tag:router"]}]}`)
+
+	pm, err := NewPolicyManager(pol, users, types.Nodes{viewer, router(2), router(3)}.ViewSlice())
+	require.NoError(t, err)
+
+	binding, _ := pm.ElectViaRoutes(nil, nil, func(_ views.Slice[types.NodeID], _ types.NodeID) (types.NodeID, bool) {
+		return 2, true
+	})
+
+	none, onlyThree := func(types.NodeID) bool { return false }, func(id types.NodeID) bool { return id == 3 }
+
+	assert.True(t, binding.HasOutage(none), "an unavailable winner with no available candidate is an outage")
+	assert.False(t, binding.HasOutage(onlyThree), "an available candidate ends the outage")
+
+	orphan := graph.NewMap[viaKey](func(a, b types.NodeID) bool { return a == b }, nil)
+	e := orphan.Edit()
+	e.Set(viaKey{grant: 99, prefix: route}, 2)
+
+	lost := &ViaRoutes{policy: pm, winners: e.Done()}
+	assert.False(t, lost.HasOutage(none), "a winner the policy no longer scopes is not an outage")
+}
+
+// TestViaPrepSharesDuplicateGrants pins the duplicate-grant sharing: a
+// grant identical to an earlier one elects from the same routers and wins
+// the same primaries, so its primary map is the earlier grant's, not a
+// fresh copy per grant.
+func TestViaPrepSharesDuplicateGrants(t *testing.T) {
+	users := types.Users{{ID: 1, Name: "alice"}}
+	route := mp("10.1.0.0/24")
+
+	router := func(id types.NodeID) *types.Node {
+		return &types.Node{
+			ID:             id,
+			IPv4:           ap(fmt.Sprintf("100.64.0.%d", id)),
+			Tags:           []string{"tag:router"},
+			Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}},
+			ApprovedRoutes: []netip.Prefix{route},
+		}
+	}
+
+	grant := `{"src":["100.64.0.1"],"dst":["10.1.0.0/24"],"ip":["*"],"via":["tag:router"]}`
+	pol := []byte(`{"tagOwners":{"tag:router":["alice@"]},"grants":[` +
+		strings.Repeat(grant+",", 127) + grant + `]}`)
+
+	pm, err := NewPolicyManager(pol, users, types.Nodes{router(2), router(3)}.ViewSlice())
+	require.NoError(t, err)
+
+	prep := pm.viaPrep()
+	require.NotNil(t, prep)
+
+	scopes := prep.scopes[route]
+	require.Len(t, scopes, 128, "each grant scopes the route")
+
+	first := reflect.ValueOf(prep.primary[0]).Pointer()
+	for i := range scopes {
+		assert.Equal(t, first, reflect.ValueOf(prep.primary[i]).Pointer(), "grant %d shares the first grant's routers and primaries", i)
 	}
 }
 

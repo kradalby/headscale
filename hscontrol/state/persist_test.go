@@ -1,10 +1,12 @@
 package state
 
 import (
+	"encoding/json"
 	"errors"
 	"maps"
 	"net/netip"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -2271,4 +2273,515 @@ func TestReauthRollbackKeepsAConcurrentUserRename(t *testing.T) {
 			assert.Equal(t, "renamed-user", again.User().Name(), "and nothing refreshes a stale one later")
 		})
 	}
+}
+
+// TestNewStateBoundsStoredClientReport covers legacy reports before they reach peers.
+func TestNewStateBoundsStoredClientReport(t *testing.T) {
+	endpoints := make([]netip.AddrPort, types.MaxEndpoints+1)
+	for i := range endpoints {
+		endpoints[i] = netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(i))
+	}
+
+	routes := make([]netip.Prefix, types.MaxRoutableIPs+1)
+	for i := range routes {
+		routes[i] = netip.PrefixFrom(netip.AddrFrom16([16]byte{0xfd, byte(i >> 8), byte(i)}), 64)
+	}
+
+	for _, tt := range []struct {
+		name          string
+		hostname      string
+		endpoints     []netip.AddrPort
+		routes        []netip.Prefix
+		wantHostname  string
+		wantEndpoints []netip.AddrPort
+		wantRoutes    []netip.Prefix
+	}{
+		{
+			name:          "at limits",
+			hostname:      strings.Repeat("h", types.MaxHostnameLength),
+			endpoints:     endpoints[:types.MaxEndpoints],
+			routes:        routes[:types.MaxRoutableIPs],
+			wantHostname:  strings.Repeat("h", types.MaxHostnameLength),
+			wantEndpoints: endpoints[:types.MaxEndpoints],
+			wantRoutes:    routes[:types.MaxRoutableIPs],
+		},
+		{
+			name:          "over limits",
+			hostname:      strings.Repeat("h", types.MaxHostnameLength+1),
+			endpoints:     endpoints,
+			routes:        routes,
+			wantHostname:  strings.Repeat("h", types.MaxHostnameLength),
+			wantEndpoints: endpoints[:types.MaxEndpoints],
+			wantRoutes:    routes[:types.MaxRoutableIPs],
+		},
+		{
+			name:     "multibyte hostname and zoned endpoint",
+			hostname: strings.Repeat("h", types.MaxHostnameLength-1) + "é",
+			endpoints: []netip.AddrPort{
+				netip.MustParseAddrPort("[fe80::1%eth0]:41641"), endpoints[0],
+			},
+			wantHostname:  strings.Repeat("h", types.MaxHostnameLength-1),
+			wantEndpoints: endpoints[:1],
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dbPath := t.TempDir() + "/headscale.db"
+			cfg := persistTestConfig(dbPath)
+			database, err := db.NewHeadscaleDatabase(cfg)
+			require.NoError(t, err)
+
+			user := database.CreateUserForTest("bound-user")
+			node := database.CreateRegisteredNodeForTest(user, "bounded")
+			err = database.DB.Model(node).Select("Hostname", "Endpoints", "Hostinfo").
+				Updates(&types.Node{
+					Hostname:  tt.hostname,
+					Endpoints: tt.endpoints,
+					Hostinfo: &tailcfg.Hostinfo{
+						Hostname: tt.hostname, RoutableIPs: tt.routes,
+						NetInfo: &tailcfg.NetInfo{PreferredDERP: 1, DERPLatency: map[string]float64{"1-v4": 0.01}},
+					},
+				}).Error
+			require.NoError(t, err)
+			require.NoError(t, database.Close())
+
+			s, err := NewState(cfg)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = s.Close() })
+
+			nv, ok := s.GetNodeByID(node.ID)
+			require.True(t, ok)
+			require.True(t, nv.Hostinfo().Valid())
+			assert.Equal(t, tailcfg.DERPRegionID(1), nv.Hostinfo().NetInfo().PreferredDERP())
+			assert.Nil(t, nv.Hostinfo().AsStruct().NetInfo.DERPLatency)
+			assert.Equal(t, tt.wantHostname, nv.Hostname())
+			assert.Equal(t, tt.wantHostname, nv.Hostinfo().Hostname())
+			assert.Equal(t, tt.wantEndpoints, nv.Endpoints().AsSlice())
+			assert.Equal(t, tt.wantRoutes, nv.Hostinfo().RoutableIPs().AsSlice())
+
+			err = s.UpdateNodeFromMapRequest(node.ID, tailcfg.MapRequest{
+				NodeKey: nv.NodeKey(), DiscoKey: key.NewDisco().Public(),
+			})
+			require.NoError(t, err)
+
+			reported, ok := s.GetNodeByID(node.ID)
+			require.True(t, ok)
+			assert.Equal(t, tt.wantEndpoints, reported.Endpoints().AsSlice(), "peers are sent the bounded endpoints")
+
+			row, err := s.DB().GetNodeByID(node.ID)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantHostname, row.Hostname, "the next persist rewrites the row")
+			assert.True(t, slices.Equal(tt.wantEndpoints, row.Endpoints), "persisted endpoints match the bounded report")
+			assert.Equal(t, tt.wantRoutes, row.Hostinfo.RoutableIPs)
+		})
+	}
+}
+
+func TestNewStateDiscardsOversizedHostinfo(t *testing.T) {
+	dbPath, s, nodeID := persistTestSetup(t)
+	err := s.DB().DB.Model(&types.Node{ID: nodeID}).Select("Hostinfo").
+		Updates(&types.Node{Hostinfo: &tailcfg.Hostinfo{
+			OSVersion: strings.Repeat("v", types.MaxHostinfoSize),
+		}}).Error
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+
+	nv, ok := persistTestReopen(t, dbPath).GetNodeByID(nodeID)
+	require.True(t, ok)
+	assert.False(t, nv.Hostinfo().Valid(),
+		"oversized Hostinfo is dropped until the node reports again")
+}
+
+// TestBootKeepsHostinfoTheMapPathStored pins that the startup check keeps
+// what the map path accepted. A report without NetInfo keeps the stored one,
+// so a stored Hostinfo can combine fields from two reports.
+func TestBootKeepsHostinfoTheMapPathStored(t *testing.T) {
+	dbPath, s, nodeID := persistTestSetup(t)
+
+	nv, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+
+	for _, hi := range []*tailcfg.Hostinfo{
+		{
+			Hostname: nv.Hostname(),
+			NetInfo: &tailcfg.NetInfo{
+				PreferredDERP: 1,
+				LinkType:      strings.Repeat("l", 60<<10),
+			},
+		},
+		{Hostname: nv.Hostname(), OSVersion: strings.Repeat("v", 60<<10)},
+	} {
+		req := tailcfg.MapRequest{
+			NodeKey: nv.NodeKey(), DiscoKey: nv.DiscoKey(), Hostinfo: hi,
+		}
+		require.NoError(t, types.ValidateHostinfo(req.Hostinfo))
+
+		err := s.UpdateNodeFromMapRequest(nodeID, req)
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, s.Close())
+
+	reloaded, ok := persistTestReopen(t, dbPath).GetNodeByID(nodeID)
+	require.True(t, ok)
+	require.True(t, reloaded.Hostinfo().Valid(),
+		"the startup check must keep a Hostinfo the map path stored")
+	assert.Equal(t, tailcfg.DERPRegionID(1),
+		reloaded.Hostinfo().NetInfo().PreferredDERP())
+
+	osVersionLen := len(reloaded.Hostinfo().OSVersion())
+	assert.Equal(t, 60<<10, osVersionLen)
+}
+
+// TestSetNodeExpiryRejectsUnencodableExpiry proves an admin cannot store a key
+// expiry that every map carrying the node would fail to encode.
+func TestSetNodeExpiryRejectsUnencodableExpiry(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	beyond, err := time.Parse(time.RFC3339, "9999-12-31T23:59:59-23:59")
+	require.NoError(t, err)
+
+	before := s.Snapshot().Rev()
+
+	_, err = s.SetNodeExpiry(nodeID, &beyond)
+	require.ErrorIs(t, err, types.ErrExpiryOutOfRange)
+	require.Equal(t, before, s.Snapshot().Rev(),
+		"a refused expiry must not reach the world")
+
+	latest := time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC)
+	_, err = s.SetNodeExpiry(nodeID, &latest)
+	require.NoError(t, err)
+}
+
+// TestAuthPathRejectsUnencodableExpiry proves an expiry handed to the auth
+// path, such as an OIDC token's, cannot store what SetNodeExpiry refuses.
+func TestAuthPathRejectsUnencodableExpiry(t *testing.T) {
+	_, s, _ := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	user := s.CreateUserForTest("auth-path-user")
+	nodeKey := key.NewNode().Public()
+	authID := types.MustAuthID()
+	require.NoError(t, s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: key.NewMachine().Public(),
+		NodeKey:    nodeKey,
+		Hostname:   "auth-path-node",
+	})))
+
+	// How go-oidc reads an exp claim in the year 10000.
+	beyond := time.Unix(253402300800, 0)
+
+	_, err := s.HandleNodeFromAuthPath(
+		authID, types.UserID(user.ID), &beyond, util.RegisterMethodOIDC,
+	)
+	require.ErrorIs(t, err, types.ErrExpiryOutOfRange)
+
+	_, found := s.GetNodeByNodeKey(nodeKey)
+	require.False(t, found, "a refused expiry must not create a node")
+}
+
+// TestAcceptedExpirySurvivesRestart proves an accepted expiry that is already in
+// the year 10000 in its own zone is stored so SQLite can load it at the next
+// start. go-oidc reads a token's exp in the server's zone, east of UTC here.
+func TestAcceptedExpirySurvivesRestart(t *testing.T) {
+	latest := time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC)
+	east := latest.In(time.FixedZone("", 60*60))
+
+	dbPath, s, adminID := persistTestSetup(t)
+
+	_, err := s.SetNodeExpiry(adminID, &east)
+	require.NoError(t, err)
+
+	user := s.CreateUserForTest("oidc-user")
+	authID := types.MustAuthID()
+	require.NoError(t, s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: key.NewMachine().Public(),
+		NodeKey:    key.NewNode().Public(),
+		Hostname:   "oidc-node",
+	})))
+
+	oidcNode, err := s.HandleNodeFromAuthPath(
+		authID, types.UserID(user.ID), &east, util.RegisterMethodOIDC,
+	)
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+
+	s = persistTestReopen(t, dbPath)
+
+	for _, id := range []types.NodeID{adminID, oidcNode.ID()} {
+		nv, ok := s.GetNodeByID(id)
+		require.True(t, ok)
+		assert.True(t, latest.Equal(nv.Expiry().Get()), "node %d", id)
+	}
+}
+
+// TestLoadedExpiryIsUTC proves an expiry the database returns in another zone is
+// served in UTC. PostgreSQL returns the server's zone, where the latest accepted
+// expiry is in the year 10000 and cannot be encoded.
+func TestLoadedExpiryIsUTC(t *testing.T) {
+	dbPath, s, nodeID := persistTestSetup(t)
+	require.NoError(t, s.Close())
+
+	expiry := time.Date(2030, time.January, 1, 0, 0, 0, 0, time.UTC)
+
+	database, err := db.NewHeadscaleDatabase(persistTestConfig(dbPath))
+	require.NoError(t, err)
+	require.NoError(t, database.DB.Model(&types.Node{}).Where("id = ?", nodeID).
+		Update("expiry", expiry.In(time.FixedZone("", 60*60))).Error)
+	require.NoError(t, database.Close())
+
+	s = persistTestReopen(t, dbPath)
+
+	nv, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+
+	got := nv.Expiry().Get()
+	assert.True(t, expiry.Equal(got))
+	assert.Equal(t, time.UTC, got.Location())
+}
+
+// TestReauthKeepsOperationalMetadata covers a relogin before the next map request.
+// Pending registrations carry only auth metadata; live connectivity must survive.
+func TestReauthKeepsOperationalMetadata(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	route := netip.MustParsePrefix("10.0.0.0/24")
+
+	node, ok := s.world.UpdateNode(nodeID, func(n *types.Node) {
+		n.Hostinfo = &tailcfg.Hostinfo{
+			Hostname: n.Hostname, RoutableIPs: []netip.Prefix{route},
+			OS: "linux", OSVersion: "6.12.0",
+			Services:     []tailcfg.Service{{Proto: tailcfg.PeerAPI4, Port: 41641}},
+			SSH_HostKeys: []string{"ssh-ed25519 key"},
+			NetInfo:      &tailcfg.NetInfo{PreferredDERP: 1},
+		}
+		n.DiscoKey = key.NewDisco().Public()
+		n.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")}
+		n.ApprovedRoutes = []netip.Prefix{route}
+	})
+	require.True(t, ok)
+
+	epoch := s.Connect(nodeID)
+	require.NotZero(t, epoch)
+	require.Equal(t, []netip.Prefix{route}, s.GetNodePrimaryRoutes(nodeID),
+		"precondition: the node serves its route")
+
+	authID := types.MustAuthID()
+	require.NoError(t, s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: node.MachineKey(),
+		NodeKey:    key.NewNode().Public(),
+		Hostname:   node.Hostname(),
+		Hostinfo:   &tailcfg.Hostinfo{Hostname: node.Hostname()},
+	})))
+
+	relogged, err := s.HandleNodeFromAuthPath(
+		authID, node.TypedUserID(), nil, util.RegisterMethodOIDC,
+	)
+	require.NoError(t, err)
+	require.Equal(t, nodeID, relogged.ID(), "relogin must update the existing node")
+
+	assert.Equal(t, []netip.Prefix{route}, relogged.AnnouncedRoutes())
+	assert.Equal(t, []netip.Prefix{route}, s.GetNodePrimaryRoutes(nodeID))
+	assert.True(t, node.Hostinfo().Equal(relogged.Hostinfo()))
+	assert.Equal(t, node.DiscoKey(), relogged.DiscoKey())
+	assert.Equal(t, node.Endpoints(), relogged.Endpoints())
+}
+
+func TestReauthKeepsTaggedFutureExpiry(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	_, err := s.SetPolicy([]byte(`{"tagOwners":{"tag:ci":["persist-user@"]}}`))
+	require.NoError(t, err)
+
+	node, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+
+	userID := node.TypedUserID()
+	_, err = s.SetNodeTags(nodeID, []string{"tag:ci"})
+	require.NoError(t, err)
+
+	future := time.Now().Add(time.Hour).UTC()
+	node, ok = s.world.UpdateNode(nodeID, func(n *types.Node) {
+		n.Expiry = &future
+	})
+	require.True(t, ok)
+	require.True(t, node.IsTagged())
+
+	authID := types.MustAuthID()
+	require.NoError(t, s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: node.MachineKey(), NodeKey: key.NewNode().Public(),
+		Hostname: node.Hostname(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: node.Hostname(), RequestTags: []string{"tag:ci"}},
+	})))
+	relogged, err := s.HandleNodeFromAuthPath(authID, userID, nil, util.RegisterMethodOIDC)
+	require.NoError(t, err)
+	require.Equal(t, nodeID, relogged.ID())
+	require.True(t, relogged.IsTagged())
+	require.True(t, relogged.Expiry().Valid())
+	assert.True(t, future.Equal(relogged.Expiry().Get()))
+
+	row, err := s.DB().GetNodeByID(nodeID)
+	require.NoError(t, err)
+	require.NotNil(t, row.Expiry)
+	assert.True(t, future.Equal(*row.Expiry))
+}
+
+func TestReauthReplacesReportedTags(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	_, err := s.SetPolicy([]byte(`{"tagOwners":{"tag:a":["persist-user@"],"tag:b":["persist-user@"]}}`))
+	require.NoError(t, err)
+
+	node, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+
+	userID := node.TypedUserID()
+
+	for _, tags := range [][]string{{"tag:a"}, nil, {"tag:b"}} {
+		want := slices.Clone(tags)
+		authID := types.MustAuthID()
+		require.NoError(t, s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+			MachineKey: node.MachineKey(), NodeKey: key.NewNode().Public(),
+			Hostname: node.Hostname(),
+			Hostinfo: &tailcfg.Hostinfo{Hostname: node.Hostname(), RequestTags: tags},
+		})))
+		relogged, err := s.HandleNodeFromAuthPath(authID, userID, nil, util.RegisterMethodOIDC)
+		require.NoError(t, err)
+		require.Equal(t, nodeID, relogged.ID())
+		assert.Equal(t, want, relogged.Hostinfo().RequestTags().AsSlice())
+		assert.Equal(t, len(want) > 0, relogged.IsTagged())
+
+		if len(tags) > 0 {
+			tags[0] = "tag:changed"
+		}
+
+		stored, ok := s.GetNodeByID(nodeID)
+		require.True(t, ok)
+		assert.Equal(t, want, stored.Hostinfo().RequestTags().AsSlice(),
+			"cached tags must not alias stored Hostinfo")
+
+		row, err := s.DB().GetNodeByID(nodeID)
+		require.NoError(t, err)
+		assert.Equal(t, want, row.Hostinfo.RequestTags)
+	}
+}
+
+func TestReauthRejectsOversizedMergedHostinfo(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	node, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+
+	hi := &tailcfg.Hostinfo{Hostname: node.Hostname(), OSVersion: "v"}
+	encoded, err := json.Marshal(hi)
+	require.NoError(t, err)
+
+	hi.OSVersion = strings.Repeat("v", types.MaxHostinfoSize-len(encoded)+1)
+	require.NoError(t, types.ValidateHostinfo(hi))
+	err = s.UpdateNodeFromMapRequest(nodeID, tailcfg.MapRequest{
+		NodeKey: node.NodeKey(), DiscoKey: node.DiscoKey(), Hostinfo: hi,
+	})
+	require.NoError(t, err)
+
+	before, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+
+	rowBefore, err := s.DB().GetNodeByID(nodeID)
+	require.NoError(t, err)
+
+	hostname := strings.Repeat("h", types.MaxHostnameLength)
+	require.NoError(t, types.ValidateHostinfo(&tailcfg.Hostinfo{Hostname: hostname}))
+
+	authID := types.MustAuthID()
+	require.NoError(t, s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: node.MachineKey(), NodeKey: key.NewNode().Public(),
+		Hostname: hostname, Hostinfo: &tailcfg.Hostinfo{Hostname: hostname},
+	})))
+	_, err = s.HandleNodeFromAuthPath(authID, node.TypedUserID(), nil, util.RegisterMethodOIDC)
+	require.ErrorIs(t, err, types.ErrHostinfoTooLarge)
+
+	after, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+	assert.Equal(t, before.AsStruct(), after.AsStruct(), "rejected merge leaves the live node unchanged")
+
+	rowAfter, err := s.DB().GetNodeByID(nodeID)
+	require.NoError(t, err)
+	assert.Equal(t, rowBefore, rowAfter, "rejected merge leaves the stored node unchanged")
+}
+
+func TestDeleteNodeTwiceReleasesAddressOnce(t *testing.T) {
+	prefix := netip.MustParsePrefix("100.64.0.0/30")
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+	cfg.PrefixV4 = &prefix
+	cfg.PrefixV6 = nil
+	cfg.IPAllocation = types.IPAllocationStrategyRandom
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	user := s.CreateUserForTest("delete-user")
+	pak, err := s.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+	require.NoError(t, err)
+	node, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+		Auth:     &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
+		NodeKey:  key.NewNode().Public(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "delete-node"},
+	}, key.NewMachine().Public())
+	require.NoError(t, err)
+
+	stale := node
+
+	_, _, err = s.ipAlloc.Next()
+	require.NoError(t, err)
+	err = s.DeleteNode(node)
+	require.NoError(t, err)
+	reissued, _, err := s.ipAlloc.Next()
+	require.NoError(t, err)
+	require.Equal(t, node.IPv4().Get(), *reissued)
+
+	before := s.Snapshot().Rev()
+	require.NoError(t, s.DeleteNode(stale))
+	assert.Equal(t, before, s.Snapshot().Rev(), "the second delete announces nothing")
+
+	_, _, err = s.ipAlloc.Next()
+	require.ErrorIs(t, err, db.ErrCouldNotAllocateIP)
+}
+
+// TestLockRegistrationSerialisesSameMachineKey pins that dropping unused
+// locks never lets two registrations of one machine key run at once.
+func TestLockRegistrationSerialisesSameMachineKey(t *testing.T) {
+	s, err := NewState(persistTestConfig(t.TempDir() + "/headscale.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	machineKey := key.NewMachine().Public()
+
+	var (
+		wg      sync.WaitGroup
+		holders atomic.Int32
+		overlap atomic.Bool
+	)
+
+	for range 64 {
+		wg.Go(func() {
+			defer s.lockRegistration(machineKey)()
+
+			if holders.Add(1) != 1 {
+				overlap.Store(true)
+			}
+
+			runtime.Gosched()
+			holders.Add(-1)
+		})
+	}
+
+	wg.Wait()
+
+	require.False(t, overlap.Load(), "two registrations held the lock at once")
+	require.Zero(t, s.registerLocks.Size())
 }

@@ -384,7 +384,11 @@ func TestRegistrationHandler_RegistrationPayloadLimit(t *testing.T) {
 	app := createTestApp(t)
 	defer func() { require.NoError(t, app.state.Close()) }()
 
-	hostinfo := &tailcfg.Hostinfo{Hostname: "node", OS: strings.Repeat("x", types.MaxHostinfoSize-128)}
+	// The registration wire caps the encoded hostinfo at 16 KiB before the
+	// payload bound; a hostinfo alone cannot reach the 64 KiB payload
+	// limit. Keep the test's intent — an oversized registration never
+	// enters the auth cache — at our stricter boundary.
+	hostinfo := &tailcfg.Hostinfo{Hostname: "node", OS: strings.Repeat("x", maxRegistrationHostinfoBytes)}
 	require.NoError(t, types.ValidateHostinfo(hostinfo), "the full registration must reach cache admission")
 
 	ns := &noiseServer{headscale: app, machineKey: key.NewMachine().Public()}
@@ -398,8 +402,7 @@ func TestRegistrationHandler_RegistrationPayloadLimit(t *testing.T) {
 
 	var response tailcfg.RegisterResponse
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
-	require.Contains(t, response.Error, types.ErrRegistrationPayloadTooLarge.Error())
-	require.Contains(t, response.Error, strconv.Itoa(types.MaxRegistrationPayloadBytes))
+	require.Contains(t, response.Error, "registration hostinfo too large")
 	require.Empty(t, response.AuthURL)
 	require.False(t, response.MachineAuthorized)
 	require.Zero(t, app.state.DebugRegistrationCache()["current_len"], "oversized registrations must not enter the auth cache")

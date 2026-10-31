@@ -56,9 +56,7 @@ var reauthSkipReasons = map[string]string{
 	"reauth-user/a5-expired-valid-key/u-valid/outcome":  expiredKeyNotRotated,
 	"reauth-user/a5-expired-valid-key/u-valid/node-key": expiredKeyAccepted,
 
-	"reauth-owner/u-renew-relogin/u-renew/expiry": sameKeyRenewsExpiry,
-	"reauth-user/a1-spent-key/u-spent/expiry":     sameKeyRenewsExpiry,
-	"reauth-user/a2-valid-key/u-valid/expiry":     sameKeyRenewsExpiry,
+	"reauth-user/a2-valid-key/u-valid/expiry": sameKeyRenewsExpiry,
 
 	"reauth-foreign/t-logout-logout/t-logout/expiry":    taggedLogoutNotExpired,
 	"reauth-foreign/t-logout-logout/t-logout/peer-obs":  taggedLogoutNotExpired,

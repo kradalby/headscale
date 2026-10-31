@@ -80,11 +80,16 @@ var (
 	// where the incremental compile differs.
 	policyAudit         = envknob.RegisterBool("HEADSCALE_DEBUG_POLICY_AUDIT")
 	policyAuditFailures atomic.Uint64
+	policyAuditRuns     atomic.Uint64
 )
 
 // PolicyAuditFailures counts the compiles the policy audit found to
 // differ from a compile from scratch.
 func PolicyAuditFailures() uint64 { return policyAuditFailures.Load() }
+
+// PolicyAuditRuns counts the from-scratch via election audits that ran,
+// so a test can prove the audit is wired, not merely quiet.
+func PolicyAuditRuns() uint64 { return policyAuditRuns.Load() }
 
 // nodeMap is the set of nodes. A stored node is never mutated: a write
 // stores a modified copy, so a [types.NodeView] taken from a snapshot stays
@@ -102,7 +107,7 @@ type nodeEdit = graph.MapEdit[types.NodeID, *types.Node]
 //	nodes ──► index ──► policyNodes ─┬─► policy ──► peers
 //	users ───────────────────────────┤
 //	policySrc ───────────────────────┘
-//	index ──► primaries
+//	index, nodes, policy ──► primaries
 //
 // The nodes, users and policySrc inputs are written only through the
 // methods below, which serialise on the graph.
@@ -124,6 +129,21 @@ type world struct {
 	batchTimeout time.Duration
 	full         chan struct{}
 	inOutage     atomic.Bool
+
+	// servesRoute is [types.Config.ServesRoute]; nil serves every route.
+	servesRoute func(netip.Prefix) bool
+
+	// outageMu and outageRev order the outage stores: a state computed
+	// from an older snapshot than the one already stored must not win,
+	// whichever of two concurrent writers finished first.
+	outageMu  sync.Mutex
+	outageRev uint64
+
+	// outageStores and routesClones are test oracles, world-owned so a
+	// test reads exact deltas from its own synchronous writes and no
+	// other test's world can interfere.
+	outageStores atomic.Uint64
+	routesClones atomic.Uint64
 
 	// beforePolicyCommit, for tests, runs just before [world.SetPolicy]
 	// takes the graph's lock: the last point a write can land between a
@@ -195,11 +215,19 @@ type peerPolicy struct {
 type compiledPolicy struct {
 	pm  policy.PolicyManager
 	err error
+
+	// src, users and nodes (a policy-nodes generation) are what pm was
+	// compiled from.
+	src   []byte
+	users []types.User
+	nodes uint64
 }
 
 // newWorld builds the graph and publishes its first snapshot. It fails
 // when the policy does not compile against users and nodes.
-func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DNSView) (*world, error) {
+func newWorld( //nolint:gocyclo // one branch per graph input; extraction would split the wiring
+	nodes types.Nodes, users []types.User, polSrc []byte, dns types.DNSView,
+) (*world, error) {
 	g := graph.New()
 	w := &world{g: g, full: make(chan struct{}, 1), beforePolicyCommit: func() {}}
 
@@ -244,7 +272,8 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 		func(s *graph.Snapshot, prev *compiledPolicy) *compiledPolicy {
 			src := s.Get(w.policySrc)
 			users := s.Get(w.policyUsers)
-			nodes := s.Get(w.policyNodes).list
+			pn := s.Get(w.policyNodes)
+			nodes := pn.list
 
 			var last policy.PolicyManager
 			if prev != nil {
@@ -254,9 +283,28 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 			pm, err := policy.NewPolicyManagerFrom(last, src, users, nodes)
 			if err != nil {
 				policyCompiles.WithLabelValues("error").Inc()
+
+				// A user change that breaks the unchanged document (such as
+				// a second user with a name it lists) keeps the last good
+				// users, as a refused policy write would, but the nodes must
+				// still move: a re-tag or delete has to revoke access.
+				if prev != nil && prev.pm != nil && bytes.Equal(prev.src, src) && prev.nodes != pn.gen {
+					retry, retryErr := policy.NewPolicyManagerFrom(last, src, prev.users, nodes)
+					if retryErr == nil {
+						log.Error().Err(err).Msg("compiling policy; keeping the last good users")
+
+						return &compiledPolicy{pm: retry, err: err, src: src, users: prev.users, nodes: pn.gen}
+					}
+				}
+
 				log.Error().Err(err).Msg("compiling policy; keeping the last good policy")
 
-				return &compiledPolicy{pm: last, err: err}
+				kept := &compiledPolicy{pm: last, err: err}
+				if prev != nil {
+					kept.src, kept.users, kept.nodes = prev.src, prev.users, prev.nodes
+				}
+
+				return kept
 			}
 
 			policyCompiles.WithLabelValues("ok").Inc()
@@ -269,7 +317,7 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 				}
 			}
 
-			return &compiledPolicy{pm: pm}
+			return &compiledPolicy{pm: pm, src: src, users: users, nodes: pn.gen}
 		})
 
 	w.peerPolicy = graph.NewDerived(g, "peer-policy", func(a, b peerPolicy) bool { return a.gen == b.gen },
@@ -342,35 +390,7 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 			return next
 		})
 
-	w.primaries = graph.NewDerived(g, "primaries", samePrimaries,
-		func(s *graph.Snapshot, prev primaryRoutes) primaryRoutes {
-			nodes := s.Get(w.nodes)
-			if prev.from == nil {
-				return newPrimaryRoutes(electPrimaryRoutes(nodes, nil), nodes, prev)
-			}
-
-			// Only the prefixes a changed router names can elect anew.
-			touched := electionPrefixes(prev.from, nodes)
-			if len(touched) == 0 {
-				prev.from = nodes
-
-				return prev
-			}
-
-			groups := s.Get(w.index).advertisers.Groups
-			routes := maps.Clone(prev.routes)
-
-			for p := range touched {
-				candidates, _ := groups.Get(p)
-				if primary, ok := electPrimary(nodes, candidates, prev.routes, p); ok {
-					routes[p] = primary
-				} else {
-					delete(routes, p)
-				}
-			}
-
-			return newPrimaryRoutes(routes, nodes, prev)
-		})
+	w.primaries = graph.NewDerived(g, "primaries", samePrimaries, w.electPrimaries)
 
 	snap, err := g.Update(func(*graph.Tx) error { return nil })
 	if err != nil {
@@ -542,6 +562,41 @@ func policyFactsChanged(from, to *nodeMap) bool {
 	return false
 }
 
+// electionInputChanged reports whether a change between from and to can
+// move an election: a router's availability moves the prefixes it names,
+// and a policy fact — a join, a leave, tags, addresses, routes — can move
+// more. One walk decides exactly what [electionPrefixes] and
+// [policyFactsChanged] decide separately. The arms run cheapest first:
+// presence, then availability guarded by routes, then the policy facts.
+func electionInputChanged(from, to *nodeMap) bool {
+	for _, id := range graph.Changes(from, to) {
+		old, wasOK := from.Get(id)
+		n, isOK := to.Get(id)
+
+		if wasOK != isOK {
+			// A join or a leave is a policy fact change.
+			return true
+		}
+
+		// Availability moves only the prefixes a changed router names: a
+		// node without election routes — a plain client, an exit-only
+		// router — moves none.
+		if old.Online() != n.Online() ||
+			old.Unhealthy != n.Unhealthy ||
+			!slices.Equal(old.AllApprovedRoutes(), n.AllApprovedRoutes()) {
+			if len(electionRoutes(old))+len(electionRoutes(n)) > 0 {
+				return true
+			}
+		}
+
+		if old.View().HasPolicyChange(n.View()) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // sameUserForNodes reports whether a node holding user a needs no copy of
 // b: they differ at most in timestamps, which no map or policy reads. A
 // login bumping UpdatedAt then rewrites none of the user's nodes.
@@ -551,10 +606,105 @@ func sameUserForNodes(a, b types.User) bool {
 	return a == b
 }
 
-// primaryRoutes is the prefix→primary election and the nodes it was held
-// against.
+// electPrimaries re-elects the prefixes a change can move. prev is a
+// per-commit copy of the cell's boxed value, so fields may be reassigned
+// here, but maps shared with published snapshots (routes, byNode) must
+// never be mutated in place.
+func (w *world) electPrimaries(s *graph.Snapshot, prev primaryRoutes) primaryRoutes {
+	nodes := s.Get(w.nodes)
+	pm := s.Get(w.policy).pm
+
+	var (
+		touched map[netip.Prefix]struct{}
+		routes  map[netip.Prefix]types.NodeID
+	)
+
+	if prev.from == nil {
+		routes = electPrimaryRoutes(nodes, nil)
+	} else {
+		// Only the prefixes a changed router names can elect anew.
+		touched = electionPrefixes(prev.from, nodes)
+		if len(touched) == 0 && pm == prev.policy {
+			prev.from = nodes
+
+			return prev
+		}
+
+		routes = prev.routes
+
+		if len(touched) > 0 {
+			// The touched prefixes elect anew; the rest keep their winners.
+			// The map is cloned only when a winner actually moves, so a
+			// touched commit that re-elects everyone allocates nothing.
+			groups := s.Get(w.index).advertisers.Groups
+
+			var moved bool
+
+			for p := range touched {
+				candidates, _ := groups.Get(p)
+				primary, ok := electPrimary(nodes, views.SliceOf(candidates), prev.routes[p])
+
+				cur, had := prev.routes[p]
+				if (ok && (!had || cur != primary)) || (!ok && had) {
+					if !moved {
+						moved = true
+						routes = maps.Clone(prev.routes)
+
+						w.routesClones.Add(1)
+					}
+
+					if ok {
+						routes[p] = primary
+					} else {
+						delete(routes, p)
+					}
+				}
+			}
+		}
+	}
+
+	var via *policyv2.ViaRoutes
+
+	// The seed only survives the pm == nil path: no policy means the last
+	// via binding must be dropped.
+	changed := pm == nil && prev.via != nil
+	if pm != nil {
+		electRoute := func(candidates views.Slice[types.NodeID], incumbent types.NodeID) (types.NodeID, bool) {
+			return electPrimary(nodes, candidates, incumbent)
+		}
+
+		via, changed = pm.ElectViaRoutes(prev.via, touched, electRoute)
+
+		// The from-scratch reference for the incremental election above:
+		// seeded with the same incumbents, it must agree with what the
+		// world adopted.
+		if policyAudit() {
+			if pmv2, ok := pm.(*policyv2.PolicyManager); ok {
+				policyAuditRuns.Add(1)
+
+				if !pmv2.AuditViaElections(prev.via, via, electRoute) {
+					policyAuditFailures.Add(1)
+					log.Error().Msg("policy audit: via election differs from a full one")
+				}
+			}
+		}
+	}
+
+	next := newPrimaryRoutes(routes, nodes, prev)
+	if changed {
+		next.gen++
+	}
+
+	next.via, next.policy = via, pm
+
+	return next
+}
+
+// primaryRoutes holds global and via-scoped elections from the same snapshot.
 type primaryRoutes struct {
 	routes map[netip.Prefix]types.NodeID
+	via    *policyv2.ViaRoutes
+	policy policy.PolicyManager
 	// byNode is routes inverted, each node's prefixes sorted.
 	byNode map[types.NodeID][]netip.Prefix
 	from   *nodeMap
@@ -759,8 +909,10 @@ func (w *world) commitBatch(batch []*nodeWrite) (out *Snapshot, p any, stack []b
 		}
 
 		if w.batchTimeout > 0 {
-			// Health can change without moving the primary.
-			checkOutage = len(electionPrefixes(cur, next)) > 0
+			// Health can change without moving the primary, and policy
+			// facts — tags, routes — can move elections without touching
+			// anything the availability diff sees. One walk decides.
+			checkOutage = electionInputChanged(cur, next)
 		}
 
 		graph.Set(tx, w.nodes, next)
@@ -779,10 +931,30 @@ func (w *world) commitBatch(batch []*nodeWrite) (out *Snapshot, p any, stack []b
 
 	out = &Snapshot{s: snap, w: w}
 	if checkOutage {
-		w.inOutage.Store(hasOutage(out))
+		w.storeOutage(out)
 	}
 
 	return out, nil, nil
+}
+
+// storeOutage records the outage state of snap, refusing a state computed
+// from an older snapshot than the one already stored: whichever of two
+// concurrent writers finished first, the newer snapshot's state wins.
+func (w *world) storeOutage(snap *Snapshot) {
+	// The state is a pure function of an immutable snapshot: compute it
+	// outside the lock and hold the lock only to order the stores.
+	rev, out := snap.Rev(), hasOutage(snap)
+
+	w.outageMu.Lock()
+	defer w.outageMu.Unlock()
+
+	if rev < w.outageRev {
+		return
+	}
+
+	w.outageRev = rev
+	w.inOutage.Store(out)
+	w.outageStores.Add(1)
 }
 
 // handOff ends the commit loop when no writes are queued, or starts the
@@ -988,6 +1160,12 @@ func (w *world) SetUsers(users []types.User) error {
 
 	if changed {
 		worldCommits.Inc()
+
+		// A user change can move elections like a policy change can,
+		// without any node availability changing.
+		if w.batchTimeout > 0 {
+			w.storeOutage(w.snapshot())
+		}
 	}
 
 	return snap.Get(w.policy).err
@@ -1021,6 +1199,12 @@ func (w *world) SetPolicy(src []byte, check func(*Snapshot) error) (bool, error)
 	}
 
 	worldCommits.Inc()
+
+	// A policy change can move elections without any node availability
+	// changing; the outage state follows it.
+	if w.batchTimeout > 0 {
+		w.storeOutage(w.snapshot())
+	}
 
 	return true, nil
 }
@@ -1140,7 +1324,16 @@ func hasOutage(s *Snapshot) bool {
 		}
 	}
 
-	return false
+	// Via scopes count too: their candidates are not the global advertisers,
+	// so a scope can lose every router while the global election stays
+	// healthy through an untagged one.
+	available := func(id types.NodeID) bool {
+		n, ok := nodes.Get(id)
+
+		return ok && n.Online() && !n.Unhealthy
+	}
+
+	return s.s.Get(s.w.primaries).via.HasOutage(available)
 }
 
 // electPrimaryRoutes elects every prefix from scratch, keeping prev's
@@ -1153,7 +1346,7 @@ func electPrimaryRoutes(
 	routes := make(map[netip.Prefix]types.NodeID, len(advertisers))
 
 	for prefix, candidates := range advertisers {
-		if primary, ok := electPrimary(nodes, candidates, prev, prefix); ok {
+		if primary, ok := electPrimary(nodes, views.SliceOf(candidates), prev[prefix]); ok {
 			routes[prefix] = primary
 		}
 	}
@@ -1161,31 +1354,40 @@ func electPrimaryRoutes(
 	return routes
 }
 
-// electPrimary picks the primary for prefix among candidates, its online
-// advertisers in ID order: a healthy incumbent keeps it, otherwise the
-// lowest healthy candidate takes it; when none is healthy, the incumbent
-// keeps it rather than flap.
+// electPrimary picks among candidates in ID order: a healthy online
+// incumbent keeps the route, otherwise the lowest healthy candidate takes
+// it. With no healthy candidate an online incumbent retains the route
+// rather than flap; an offline one drops it.
 func electPrimary(
 	nodes *nodeMap,
-	candidates []types.NodeID,
-	prev map[netip.Prefix]types.NodeID,
-	prefix netip.Prefix,
+	candidates views.Slice[types.NodeID],
+	cur types.NodeID,
 ) (types.NodeID, bool) {
-	healthy := func(id types.NodeID) bool {
-		n, _ := nodes.Get(id)
+	var firstHealthy types.NodeID
 
-		return !n.Unhealthy
+	incumbent := false
+
+	for _, id := range candidates.All() {
+		n, ok := nodes.Get(id)
+		if !ok || !n.Online() {
+			continue
+		}
+
+		if id == cur {
+			incumbent = true
+
+			if !n.Unhealthy {
+				return cur, true
+			}
+		}
+
+		if !n.Unhealthy && firstHealthy == 0 {
+			firstHealthy = id
+		}
 	}
 
-	cur, hadPrimary := prev[prefix]
-	incumbent := hadPrimary && slices.Contains(candidates, cur)
-
-	if incumbent && healthy(cur) {
-		return cur, true
-	}
-
-	if i := slices.IndexFunc(candidates, healthy); i >= 0 {
-		return candidates[i], true
+	if firstHealthy != 0 {
+		return firstHealthy, true
 	}
 
 	return cur, incumbent
@@ -1388,7 +1590,7 @@ func (s *Snapshot) PrimaryRoutesString() string {
 // the peer is primary for always sees it, so HA secondaries know the
 // primary.
 func (s *Snapshot) RoutesForPeer(viewer, peer types.NodeView, matchers []matcher.Match) []netip.Prefix {
-	via := s.Policy().ViaRoutesForPeer(viewer, peer)
+	via := s.s.Get(s.w.primaries).via.ForPeer(viewer, peer)
 	primaries := s.PrimaryRoutesForNode(peer.ID())
 	candidates := slices.Concat(primaries, peer.ExitRoutes())
 
@@ -1422,6 +1624,14 @@ func (s *Snapshot) RoutesForPeer(viewer, peer types.NodeView, matchers []matcher
 		}
 	}
 
+	// A single address inside the node ranges names a node, not a subnet: it
+	// stays approved and in the router's own entry, but no viewer is served
+	// it. Via inclusions skip the election, so the rule applies here, to
+	// everything the viewer gets.
+	if s.w.servesRoute != nil {
+		reduced = slices.DeleteFunc(reduced, func(p netip.Prefix) bool { return !s.w.servesRoute(p) })
+	}
+
 	return reduced
 }
 
@@ -1449,7 +1659,7 @@ type Change struct {
 	// Nodes includes nodes changed back or deleted between snapshots
 	// when commits coalesced: a session may have rendered them meanwhile.
 	Nodes []types.NodeID
-	// Primaries are the nodes that gained or lost a primary route.
+	// Primaries are the nodes that gained or lost a global or via-scoped route.
 	Primaries []types.NodeID
 	// PeerSets are the nodes whose set of peers differs.
 	PeerSets []types.NodeID
@@ -1503,6 +1713,12 @@ func (s *Snapshot) Since(old *Snapshot) Change {
 			s.s.Get(s.w.primaries).byNode,
 			slices.Equal[[]netip.Prefix],
 		)
+
+		was, now := old.s.Get(old.w.primaries).via, s.s.Get(s.w.primaries).via
+		c.Primaries = append(c.Primaries, now.ChangedNodes(was)...)
+
+		slices.Sort(c.Primaries)
+		c.Primaries = slices.Compact(c.Primaries)
 	}
 
 	if s.PeersRev() != old.PeersRev() {
@@ -1552,13 +1768,13 @@ func (s *Snapshot) CapsChangedSince(v CapsVersion) []types.NodeID {
 	return graph.Changes(v.m, s.s.Get(s.w.nodeCaps))
 }
 
-// NodesVersion is the nodes of a snapshot, which a reader keeps to ask a
-// later snapshot what changed since. Holding one costs only what later
-// writes replaced.
+// NodesVersion identifies the nodes of a snapshot, which a reader keeps to
+// ask a later snapshot what changed since. It holds no nodes, so a reader
+// that keeps one for long, such as an idle peer class, pins nothing.
 type NodesVersion struct{ m *nodeMap }
 
-// NodesVersion returns the nodes of s.
-func (s *Snapshot) NodesVersion() NodesVersion { return NodesVersion{m: s.nodes()} }
+// NodesVersion returns the version of the nodes of s.
+func (s *Snapshot) NodesVersion() NodesVersion { return NodesVersion{m: s.nodes().Cursor()} }
 
 // NodesTouchedSince returns the nodes the writes from v to s touched,
 // possibly with repeats and nodes that changed back, while v is within
@@ -1578,7 +1794,7 @@ func (s *Snapshot) PolicyRev() uint64 { return graph.ChangedAt(s.s, s.w.policy) 
 // PeersRev is the revision of the latest change to peer visibility.
 func (s *Snapshot) PeersRev() uint64 { return graph.ChangedAt(s.s, s.w.peers) }
 
-// PrimariesRev is the revision of the latest primary route change.
+// PrimariesRev is the revision of the latest global or via-scoped route change.
 func (s *Snapshot) PrimariesRev() uint64 { return graph.ChangedAt(s.s, s.w.primaries) }
 
 // DNSRev is the revision of the latest extra DNS records change.

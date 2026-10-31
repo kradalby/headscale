@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -420,7 +421,8 @@ type delayedInitialPoll struct {
 }
 
 func (d *delayedInitialPoll) Logf(format string, args ...any) {
-	if format == "[v1] PollNetMap: stream=%v ep=%v" && len(args) > 0 && args[0] == true {
+	// The client renders its lines before logging them.
+	if strings.HasPrefix(fmt.Sprintf(format, args...), "[v1] PollNetMap: stream=true") {
 		d.captureOnce.Do(func() {
 			close(d.captured)
 			<-d.release
