@@ -52,12 +52,12 @@ var (
 	worldCommits = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: prometheusNamespace,
 		Name:      "world_commits_total",
-		Help:      "Committed control-plane graph transactions.",
+		Help:      "Control-plane graph transactions publishing a new snapshot after the initial snapshot, including node, user, policy, DNS and DERP changes. Transactions that stage no edit — an unknown node, unchanged users, a byte-identical policy, equal DNS records or DERP maps — and refused and panicking ones are excluded; a panicking node batch is retried write by write, each surviving publication counting separately. A node write that stages an identical copy of the node still counts, as does a commit whose policy recompile fails. This does not count database persistence or client delivery.",
 	})
 	_ = promauto.NewCounterFunc(prometheus.CounterOpts{
 		Namespace: prometheusNamespace,
 		Name:      "world_commit_panics_total",
-		Help:      "Node write commits that panicked; their writers failed, the graph kept serving.",
+		Help:      "Node write commits that panicked; a batch's writers are retried individually, so only the writers that panic again fail. The graph kept serving.",
 	}, func() float64 { return float64(worldCommitPanics.Load()) })
 	worldNodes = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: prometheusNamespace,
@@ -67,7 +67,7 @@ var (
 	worldBatchSize = promauto.NewHistogram(prometheus.HistogramOpts{
 		Namespace: prometheusNamespace,
 		Name:      "world_write_batch_size",
-		Help:      "Node writes committed together.",
+		Help:      "Node writes in completed batches, including no-op batches. Panicking batches are excluded; successful individual retries are observed separately.",
 		Buckets:   []float64{1, 2, 5, 10, 20, 50, 100, 200},
 	})
 	policyCompiles = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -743,7 +743,7 @@ func (w *world) commitBatch(batch []*nodeWrite) (out *Snapshot, p any, stack []b
 		}
 	}()
 
-	var checkOutage bool
+	var checkOutage, changed bool
 
 	snap, _ := w.g.Update(func(tx *graph.Tx) error {
 		cur := graph.Peek(tx, w.nodes)
@@ -764,11 +764,16 @@ func (w *world) commitBatch(batch []*nodeWrite) (out *Snapshot, p any, stack []b
 		}
 
 		graph.Set(tx, w.nodes, next)
-		worldNodes.Set(float64(next.Len()))
-		worldCommits.Inc()
+
+		changed = true
 
 		return nil
 	})
+
+	if changed {
+		worldNodes.Set(float64(snap.Get(w.nodes).Len()))
+		worldCommits.Inc()
+	}
 
 	worldBatchSize.Observe(float64(len(batch)))
 
@@ -942,7 +947,14 @@ func (w *world) SetUsers(users []types.User) error {
 		byID[users[i].ID] = &users[i]
 	}
 
+	var changed bool
+
 	snap, err := w.g.Update(func(tx *graph.Tx) error {
+		changed = !slices.Equal(graph.Peek(tx, w.users), users)
+		if !changed {
+			return nil
+		}
+
 		graph.Set(tx, w.users, slices.Clone(users))
 
 		cur := graph.Peek(tx, w.nodes)
@@ -968,12 +980,14 @@ func (w *world) SetUsers(users []types.User) error {
 			graph.Set(tx, w.nodes, next)
 		}
 
-		worldCommits.Inc()
-
 		return nil
 	})
 	if err != nil {
 		return err
+	}
+
+	if changed {
+		worldCommits.Inc()
 	}
 
 	return snap.Get(w.policy).err
@@ -1013,11 +1027,20 @@ func (w *world) SetPolicy(src []byte, check func(*Snapshot) error) (bool, error)
 
 // SetDERPMap replaces the DERP map.
 func (w *world) SetDERPMap(dm *tailcfg.DERPMap) {
+	var changed bool
+
 	_, _ = w.g.Update(func(tx *graph.Tx) error {
-		graph.Set(tx, w.derpMap, dm)
+		changed = !sameDERPMap(graph.Peek(tx, w.derpMap), dm)
+		if changed {
+			graph.Set(tx, w.derpMap, dm)
+		}
 
 		return nil
 	})
+
+	if changed {
+		worldCommits.Inc()
+	}
 }
 
 // sameDERPMap compares DERP maps by content; a fetch returns a new map
@@ -1028,13 +1051,23 @@ func sameDERPMap(a, b *tailcfg.DERPMap) bool {
 
 // SetExtraRecords replaces the extra DNS records.
 func (w *world) SetExtraRecords(records []tailcfg.DNSRecord) {
-	dns := w.snapshot().DNS().WithExtraRecords(records)
+	var changed bool
 
 	_, _ = w.g.Update(func(tx *graph.Tx) error {
-		graph.Set(tx, w.dns, dns)
+		cur := graph.Peek(tx, w.dns)
+		dns := cur.WithExtraRecords(records)
+
+		changed = !cur.Equal(dns)
+		if changed {
+			graph.Set(tx, w.dns, dns)
+		}
 
 		return nil
 	})
+
+	if changed {
+		worldCommits.Inc()
+	}
 }
 
 // uniqueGivenName returns a DNS label for self based on base that no other

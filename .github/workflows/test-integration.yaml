@@ -314,6 +314,9 @@ jobs:
           - Test2118DeletingOnlineNodePanics
           - TestGrantCapRelay
           - TestGrantCapDrive
+          - TestOnlineOracleIgnoresFailedStaleInitial
+          - TestClientOnlineMapUnavailable
+          - TestClientStatusAssertions
           - TestK8sOperator
           - TestEnablingRoutes
           - TestHASubnetRouterFailover
