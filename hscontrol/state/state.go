@@ -358,6 +358,12 @@ func NewState(cfg *types.Config) (*State, error) {
 	for _, node := range nodes {
 		node.IsOnline = new(false)
 
+		// PostgreSQL returns the server's zone, where the latest accepted
+		// expiry is in the year 10000 and cannot be encoded.
+		if node.Expiry != nil {
+			node.Expiry = new(node.Expiry.UTC())
+		}
+
 		// Legacy reports must pass the same checks before entering the world.
 		// The next persist rewrites trimmed or discarded metadata.
 		if len(node.Hostname) > types.MaxHostnameLength {
@@ -2128,16 +2134,6 @@ func applyReauthExpiryTransition(
 func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView, error) {
 	regData := params.RegData
 
-	// An OIDC token's expiry arrives here without passing handleRegister;
-	// refuse one that cannot be encoded instead of storing it.
-	if params.Expiry != nil {
-		utc, err := types.ValidateExpiry(*params.Expiry)
-		if err != nil {
-			return types.NodeView{}, err
-		}
-
-		params.Expiry = &utc
-	}
 	// Log the operation type
 	if params.IsConvertFromTag {
 		log.Info().
@@ -2704,6 +2700,17 @@ func (s *State) HandleNodeFromAuthPath(
 	expiry *time.Time,
 	registrationMethod string,
 ) (types.NodeView, error) {
+	// An OIDC token's expiry arrives here without passing handleRegister;
+	// refuse one that cannot be encoded before any branch stores it.
+	if expiry != nil {
+		utc, err := types.ValidateExpiry(*expiry)
+		if err != nil {
+			return types.NodeView{}, err
+		}
+
+		expiry = &utc
+	}
+
 	// Get the registration entry from cache
 	regEntry, ok := s.GetAuthCacheEntry(authID)
 	if !ok {
