@@ -688,21 +688,30 @@ func TestAuthenticationFlows(t *testing.T) {
 				}
 
 				nodeToRegister := types.NewRegisterAuthRequest(&types.RegistrationData{
-					Hostname: "followup-success-node",
+					MachineKey: machineKey1.Public(),
+					Hostname:   "followup-success-node",
 				})
-				app.state.SetAuthCacheEntry(regID, nodeToRegister)
+				require.NoError(t, app.state.SetAuthCacheEntry(regID, nodeToRegister))
 
-				// Simulate successful registration
-				// [Headscale.handleRegister] will receive the value when it starts waiting
+				// Simulate successful registration. All database work runs
+				// synchronously here so the goroutine below cannot race the
+				// subtest's cleanup closing the database.
+				user := app.state.CreateUserForTest("followup-user")
+
+				node := app.state.CreateNodeForTest(user, "followup-success-node")
+				// [State.HandleNodeFromAuthPath] resolves the node from the
+				// machine key cached when the registration was opened, so on
+				// the real path the node carries the polling session's
+				// machine key. CreateNodeForTest picks a random one.
+				node.MachineKey = machineKey1.Public()
+
+				done := make(chan struct{})
+
+				t.Cleanup(func() { <-done })
+
 				go func() {
-					user := app.state.CreateUserForTest("followup-user")
+					defer close(done)
 
-					node := app.state.CreateNodeForTest(user, "followup-success-node")
-					// [State.HandleNodeFromAuthPath] resolves the node from the
-					// machine key cached when the registration was opened, so on
-					// the real path the node carries the polling session's
-					// machine key. CreateNodeForTest picks a random one.
-					node.MachineKey = machineKey1.Public()
 					nodeToRegister.FinishAuth(types.AuthVerdict{Node: node.View()})
 				}()
 
@@ -735,9 +744,10 @@ func TestAuthenticationFlows(t *testing.T) {
 				}
 
 				nodeToRegister := types.NewRegisterAuthRequest(&types.RegistrationData{
-					Hostname: "followup-timeout-node",
+					MachineKey: machineKey1.Public(),
+					Hostname:   "followup-timeout-node",
 				})
-				app.state.SetAuthCacheEntry(regID, nodeToRegister)
+				require.NoError(t, app.state.SetAuthCacheEntry(regID, nodeToRegister))
 				// Don't call FinishRegistration - will timeout
 
 				return fmt.Sprintf("http://localhost:8080/register/%s", regID), nil
@@ -1572,12 +1582,19 @@ func TestAuthenticationFlows(t *testing.T) {
 				}
 
 				nodeToRegister := types.NewRegisterAuthRequest(&types.RegistrationData{
-					Hostname: "nil-response-node",
+					MachineKey: machineKey1.Public(),
+					Hostname:   "nil-response-node",
 				})
-				app.state.SetAuthCacheEntry(regID, nodeToRegister)
+				require.NoError(t, app.state.SetAuthCacheEntry(regID, nodeToRegister))
 
 				// Simulate registration that returns empty NodeView (cache expired during auth)
+				done := make(chan struct{})
+
+				t.Cleanup(func() { <-done })
+
 				go func() {
+					defer close(done)
+
 					nodeToRegister.FinishAuth(types.AuthVerdict{Node: types.NodeView{}}) // Empty view indicates cache expiry
 				}()
 
@@ -4586,7 +4603,7 @@ func TestFollowupWaitPrefersCompletedAuthOverExpiredContext(t *testing.T) {
 			NodeKey:  nodeKey,
 		}
 
-		resp, err := app.waitForFollowup(ctx, req, machineKey)
+		resp, err := app.waitForFollowup(ctx, req.Followup, registrationDataFromRequest(req, machineKey))
 		switch {
 		case err != nil:
 			timeouts++

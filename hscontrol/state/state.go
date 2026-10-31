@@ -153,7 +153,8 @@ func (s *State) ValidatePolicy(pol []byte) error {
 	// The write path refuses a document whose tests or sshTests fail; the
 	// validate answer must agree with it, or a policy set would refuse
 	// what validate blessed.
-	if testErr := policyTestsFail(pm); testErr != nil {
+	testErr := policyTestsFail(pm)
+	if testErr != nil {
 		return invalidPolicyError{testErr}
 	}
 
