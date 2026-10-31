@@ -15,10 +15,10 @@ import (
 // minVersionParts is the minimum number of version parts needed for major.minor.
 const minVersionParts = 2
 
-// fullNetmapRemovalsCapVer is the capability version of Tailscale main when
+// FullNetmapRemovalsCapVer is the capability version of Tailscale main when
 // clients started reporting peers a full netmap drops as removed
 // (tailscale/tailscale#15660); v1.104 is the first release at or above it.
-const fullNetmapRemovalsCapVer tailcfg.CapabilityVersion = 148
+const FullNetmapRemovalsCapVer tailcfg.CapabilityVersion = 148
 
 // CanOldCodeBeCleanedUp is called at server startup to panic when
 // [MinSupportedCapabilityVersion] has crossed a threshold at which a
@@ -28,7 +28,7 @@ const fullNetmapRemovalsCapVer tailcfg.CapabilityVersion = 148
 //
 // All capability-version-gated cleanups should be registered here.
 func CanOldCodeBeCleanedUp() {
-	if MinSupportedCapabilityVersion >= fullNetmapRemovalsCapVer {
+	if MinSupportedCapabilityVersion >= FullNetmapRemovalsCapVer {
 		panic("the tailscale/tailscale#15660 compat can be cleaned up: grep for it (hscontrol/mapper/diff.go and its tests)")
 	}
 }
