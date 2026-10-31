@@ -18,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 	"pgregory.net/rapid"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -2007,27 +2008,55 @@ func TestWorldWritePanicCountsOnce(t *testing.T) {
 }
 
 func TestRegistrationRollbackRestoresExpiryOnlineInvariant(t *testing.T) {
-	alice := &types.User{Name: "alice"}
-	alice.ID = 1
-	node := worldNode(1, alice, "100.64.0.1")
-	node.Expiry = new(time.Now().Add(-time.Hour))
-	node.IsOnline = new(false)
-	prefix := netip.MustParsePrefix("10.0.0.0/24")
-	node.Hostinfo.RoutableIPs = []netip.Prefix{prefix}
-	node.ApprovedRoutes = []netip.Prefix{prefix}
-	w, _ := testWorld(t, node)
-	s := &State{world: w}
-	prior := node.Clone()
-	wroteView, _ := w.UpdateNode(node.ID, func(n *types.Node) { n.Expiry = new(time.Now().Add(time.Hour)) })
-	wrote := wroteView.AsStruct()
+	for name, reauthWith := range reauthEntryPoints {
+		t.Run(name, func(t *testing.T) {
+			_, s, id := persistTestSetup(t)
+			t.Cleanup(func() { _ = s.Close() })
 
-	require.NotZero(t, s.Connect(node.ID))
-	s.restoreRegistration(prior, wrote)
-	s.ExpireExpiredNodes(time.Now().Add(-time.Minute))
-	live, _ := s.GetNodeByID(node.ID)
-	require.True(t, live.IsExpired())
-	assert.False(t, live.Online(), "rollback must not leave an expired node online")
+			node, ok := s.GetNodeByID(id)
+			require.True(t, ok)
 
-	_, elected := s.Snapshot().PrimaryRouteFor(prefix)
-	assert.False(t, elected, "expired router must not remain HA primary after rollback")
+			prefix := netip.MustParsePrefix("10.0.0.0/24")
+			require.NoError(t, s.UpdateNodeFromMapRequest(id, tailcfg.MapRequest{
+				NodeKey:  node.NodeKey(),
+				Hostinfo: &tailcfg.Hostinfo{Hostname: node.Hostname(), RoutableIPs: []netip.Prefix{prefix}},
+			}))
+			_, err := s.SetApprovedRoutes(id, []netip.Prefix{prefix})
+			require.NoError(t, err)
+			node, err = s.SetNodeExpiry(id, new(time.Now().Add(-time.Hour)))
+			require.NoError(t, err)
+			run := reauthWith(t, s, node)
+
+			// Connect while the real reauth transaction is in flight, then fail it.
+			// The candidate must never let this expired router become online or primary.
+			require.NoError(t, s.db.DB.Callback().Update().Before("gorm:update").Register("connect_then_fail", func(tx *gorm.DB) {
+				if tx.Statement.Table != "nodes" {
+					return
+				}
+
+				require.NotZero(t, s.Connect(id))
+				live, found := s.GetNodeByID(id)
+				require.True(t, found)
+				assert.True(t, live.IsExpired())
+				assert.False(t, live.Online(), "uncommitted auth must not revive the expired session")
+
+				_, elected := s.Snapshot().PrimaryRouteFor(prefix)
+				assert.False(t, elected, "uncommitted auth must not elect the expired router")
+
+				_ = tx.AddError(errInjectedNodeUpdate)
+			}))
+			t.Cleanup(func() { _ = s.db.DB.Callback().Update().Remove("connect_then_fail") })
+
+			require.ErrorIs(t, run(), errInjectedNodeUpdate)
+			s.ExpireExpiredNodes(time.Now().Add(-time.Minute))
+			live, ok := s.GetNodeByID(id)
+			require.True(t, ok)
+			require.True(t, live.IsExpired())
+			assert.Equal(t, 1, live.ActiveSessions(), "failed auth must keep the concurrent session")
+			assert.False(t, live.Online(), "failed auth must leave the expired node offline")
+
+			_, elected := s.Snapshot().PrimaryRouteFor(prefix)
+			assert.False(t, elected, "expired router must not remain HA primary after failed auth")
+		})
+	}
 }

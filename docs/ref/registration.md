@@ -33,6 +33,13 @@ node can be approved with:
 - [Headscale API](api.md)
 - Or delegated to an identity provider via [OpenID Connect](oidc.md)
 
+Pending interactive registrations retain client Hostinfo until approval or expiry. Headscale rejects Hostinfo larger
+than 16 KiB after JSON encoding, including when refreshing a followup registration. The Noise registration endpoint
+returns HTTP 200 with the error in `RegisterResponse.Error`, without admitting a cache entry. The auth cache also
+limits the number of pending entries. These limits do not represent an exact heap-memory bound. Authkey
+registrations do not enter the pending-entry cache: they present a valid credential before any Hostinfo is
+retained, so the cap applies to the interactive paths only.
+
 Web authentication relies on the presence of a Headscale user. Use the `headscale users` command to create a new
 user[^1]:
 
@@ -124,6 +131,15 @@ overload.
 Registration with a pre authenticated key (or auth key) is a non-interactive way to register a new node. The Headscale
 administrator creates a preauthkey upfront and this preauthkey can then be used to register a node non-interactively.
 Its best suited for automation.
+
+An unexpired node can restart with its unchanged node key and its previously used, expired or revoked auth key, provided
+it does not change ownership or tags. A different auth key must be valid, including when changing ephemeral lifetime.
+This compatibility path preserves the existing node expiry; extending or removing
+expiry requires a valid auth key. An expired node, including an admin-expired tagged node, requires fresh authorization.
+A logout or registration update that still resolves to its node after a reauthentication replaced the node key is
+rejected instead of modifying the newer registration: the logout reaches the client as an error in
+`RegisterResponse.Error`, a non-streaming map request as HTTP 404. A logout whose node key no longer resolves at all
+starts a fresh interactive registration and gets a new `AuthURL`.
 
 === "Personal devices"
 

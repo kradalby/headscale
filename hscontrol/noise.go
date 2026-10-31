@@ -981,7 +981,14 @@ func (ns *noiseServer) RegistrationHandler(
 			registerRequest = tailcfg.RegisterRequest{
 				Version: registerRequest.Version, NodeKey: registerRequest.NodeKey,
 				Followup: registerRequest.Followup, Expiry: registerRequest.Expiry,
-				Auth: auth, Hostinfo: registrationDataFromRequest(registerRequest, ns.machineKey).Hostinfo,
+				Auth: auth, Hostinfo: func() *tailcfg.Hostinfo {
+					regData, regErr := registrationDataFromRequest(registerRequest, ns.machineKey)
+					if regErr != nil {
+						return nil
+					}
+
+					return regData.Hostinfo
+				}(),
 			}
 		}
 
