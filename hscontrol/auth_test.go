@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/mapper"
+	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -5141,4 +5142,111 @@ func TestPendingRegistrationKeepsAuthMetadata(t *testing.T) {
 	hostinfo.RequestTags[0] = "tag:changed"
 	assert.Equal(t, []string{"tag:router"}, entry.RegistrationData().Hostinfo.RequestTags)
 	assert.Len(t, hostinfo.RoutableIPs, 1, "the request itself must be left alone")
+}
+
+func TestAuthAdmissionErrors(t *testing.T) {
+	for _, flow := range []string{"interactive", "followup", "ssh"} {
+		t.Run(flow, func(t *testing.T) {
+			app := createTestApp(t, func(cfg *types.Config) {
+				cfg.Tuning.RegisterCacheMaxEntries = 1
+			})
+			defer func() { require.NoError(t, app.state.Close()) }()
+
+			id := types.MustAuthID()
+			pending := types.NewAuthRequest()
+			require.NoError(t, app.state.SetAuthCacheEntry(id, pending))
+
+			if flow == "ssh" {
+				for range 64 {
+					require.NoError(t, app.state.SetAuthCacheEntry(types.MustAuthID(), types.NewSSHCheckAuthRequest(1, 2)))
+				}
+			}
+
+			req := tailcfg.RegisterRequest{
+				NodeKey:  key.NewNode().Public(),
+				Hostinfo: &tailcfg.Hostinfo{Hostname: "pending-node"},
+			}
+			machineKey := key.NewMachine().Public()
+			regData, err := registrationDataFromRequest(req, machineKey)
+			require.NoError(t, err)
+
+			switch flow {
+			case "interactive":
+				var resp *tailcfg.RegisterResponse
+
+				resp, err = app.handleRegisterInteractive(req, machineKey)
+				require.Nil(t, resp, "refused admission must not publish an auth URL")
+			case "followup":
+				var resp *tailcfg.RegisterResponse
+
+				resp, err = app.reqToNewRegisterResponse(regData)
+				require.Nil(t, resp, "refused admission must not publish an auth URL")
+			case "ssh":
+				ns := &noiseServer{headscale: app}
+
+				var action *tailcfg.SSHAction
+
+				action, err = ns.sshActionHoldAndDelegate(zerolog.Nop(), &tailcfg.SSHAction{}, 1, 2, "alice")
+				require.Nil(t, action, "refused admission must not publish a delegation URL")
+			}
+
+			require.ErrorIs(t, err, state.ErrAuthCacheFull)
+
+			got, ok := app.state.GetAuthCacheEntry(id)
+			require.True(t, ok)
+			require.Same(t, pending, got)
+		})
+	}
+}
+
+func TestRegistrationFollowupReleasesRejectedSession(t *testing.T) {
+	app := createTestApp(t, func(cfg *types.Config) {
+		cfg.Tuning.RegisterCacheMaxEntries = 1
+	})
+	defer func() { require.NoError(t, app.state.Close()) }()
+
+	machineKey := key.NewMachine().Public()
+	req := tailcfg.RegisterRequest{
+		NodeKey:  key.NewNode().Public(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "rejected-registration"},
+	}
+	initial, err := app.handleRegisterInteractive(req, machineKey)
+	require.NoError(t, err)
+
+	req.Followup = initial.AuthURL
+	initialURL, err := url.Parse(initial.AuthURL)
+	require.NoError(t, err)
+	authID, err := types.AuthIDFromString(strings.TrimPrefix(initialURL.Path, "/register/"))
+	require.NoError(t, err)
+
+	regData := func() *types.RegistrationData {
+		data, err := registrationDataFromRequest(req, machineKey)
+		require.NoError(t, err)
+
+		return data
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err = app.waitForFollowup(ctx, req.Followup, regData())
+	require.ErrorIs(t, err, context.Canceled)
+
+	_, present := app.state.GetAuthCacheEntry(authID)
+	require.True(t, present, "a canceled poll must leave the pending session available")
+
+	body := fmt.Appendf(nil, `{"authId":%q}`, authID.String())
+	rejected := callHandler(newHumaTestHandler(app), http.MethodPost, "/api/v1/auth/reject", body)
+	require.Equal(t, http.StatusOK, rejected.status)
+
+	_, present = app.state.GetAuthCacheEntry(authID)
+	require.True(t, present, "the verdict must remain available until follow-up consumes it")
+
+	followup, err := app.waitForFollowup(t.Context(), req.Followup, regData())
+	require.NoError(t, err, "consuming the rejection must free capacity for the replacement")
+	require.NotEmpty(t, followup.AuthURL)
+	require.NotEqual(t, initial.AuthURL, followup.AuthURL)
+
+	_, present = app.state.GetAuthCacheEntry(authID)
+	require.False(t, present, "the consumed session must release its slot")
 }

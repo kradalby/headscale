@@ -208,11 +208,9 @@ type State struct {
 	// ipAlloc manages IP address allocation for nodes
 	ipAlloc *hsdb.IPAllocator
 
-	// authCache holds any pending authentication requests from either auth
-	// type (Web and OIDC). It is a bounded LRU keyed by AuthID; oldest
-	// entries are evicted once the size cap is reached, and entries that
-	// time out have their auth verdict resolved with ErrRegistrationExpired
-	// via the eviction callback so any waiting goroutines wake.
+	// authCache holds pending Web, OIDC and SSH authentication requests.
+	// Admission preserves unexpired entries at capacity. Expiry resolves the
+	// verdict with ErrRegistrationExpired so waiting goroutines wake.
 	authCache *expirable.LRU[types.AuthID, *types.AuthRequest]
 
 	authCacheMaxEntries     int
@@ -1945,7 +1943,9 @@ func (s *State) DeleteExpiredAccessTokens(cutoff time.Time) (int64, error) {
 
 // GetAuthCacheEntry retrieves a pending auth request from the cache.
 func (s *State) GetAuthCacheEntry(id types.AuthID) (*types.AuthRequest, bool) {
-	return s.authCache.Get(id)
+	// Preserve insertion order so admission can reclaim expired entries from
+	// the oldest end without scanning every pending authentication.
+	return s.authCache.Peek(id)
 }
 
 // DeleteAuthCacheEntry releases a consumed authentication transaction.

@@ -330,3 +330,23 @@ func TestStateCloseStopsAuthCacheSweeper(t *testing.T) {
 		return authCacheSweepers(t, gid) == 0
 	}, 5*time.Second, 10*time.Millisecond, "sweeper must stop on State.Close")
 }
+
+// TestAuthCacheReadKeepsReclaimOrder pins that reading a pending entry does not
+// move it: admission reclaims expired entries from the oldest end only, so a
+// read that moved one would hide it behind a live entry and refuse new work.
+func TestAuthCacheReadKeepsReclaimOrder(t *testing.T) {
+	s, err := NewState(persistTestConfig(t.TempDir() + "/headscale.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+	first, second := types.MustAuthID(), types.MustAuthID()
+	require.NoError(t, s.SetAuthCacheEntry(first, types.NewAuthRequest()))
+	require.NoError(t, s.SetAuthCacheEntry(second, types.NewAuthRequest()))
+
+	_, ok := s.GetAuthCacheEntry(first)
+	require.True(t, ok)
+
+	oldest, _, ok := s.authCache.GetOldest()
+	require.True(t, ok)
+	assert.Equal(t, first, oldest, "the entry that expires first stays at the reclaim end")
+}

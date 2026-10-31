@@ -30,13 +30,9 @@ const (
 	defaultOAuthOptionsCount = 3
 	authCacheExpiration      = time.Minute * 15
 
-	// authCacheMaxEntries bounds the OIDC state→[AuthInfo] cache to prevent
-	// unauthenticated cache-fill DoS via repeated /register/{auth_id} or
-	// /auth/{auth_id} GETs that mint OIDC state cookies.
+	// Registrations may use authCacheMaxEntries slots; SSH checks may also use
+	// the reserve so new registrations cannot fill all pending OIDC capacity.
 	authCacheMaxEntries = 1024
-
-	// SSH checks may also use the reserve so new registrations cannot
-	// fill all pending OIDC capacity.
 	authCacheSSHReserve = 64
 
 	// cookieNamePrefixLen is the number of leading characters from a
@@ -76,8 +72,9 @@ type AuthProviderOIDC struct {
 	cfg       *types.OIDCConfig
 
 	// authCache holds auth information between the auth and the callback
-	// steps. It is a bounded [expirable.LRU] keyed by OIDC state, evicting oldest
-	// entries to keep the cache footprint constant under attack.
+	// steps, keyed by OIDC state. Admission refuses new state at capacity
+	// instead of evicting; reads use Peek to preserve insertion order, so the
+	// oldest entry expires first.
 	authCache *expirable.LRU[string, AuthInfo]
 
 	// authCacheMu serializes non-evicting admission and single-use consumption.
