@@ -20,7 +20,7 @@ endef
 
 # Source file collections using shell find for better performance
 GO_SOURCES := $(shell find . -name '*.go' -not -path './gen/*' -not -path './vendor/*')
-PRETTIER_SOURCES := $(shell find . \( -name '*.md' -o -name '*.yaml' -o -name '*.yml' -o -name '*.ts' -o -name '*.js' -o -name '*.html' -o -name '*.css' -o -name '*.scss' -o -name '*.sass' \) -not -path './gen/*' -not -path './vendor/*' -not -path './node_modules/*')
+PRETTIER_SOURCES := $(shell find . \( -name '*.md' -o -name '*.yaml' -o -name '*.yml' -o -name '*.ts' -o -name '*.js' -o -name '*.html' -o -name '*.css' -o -name '*.scss' -o -name '*.sass' \) -not -path './gen/*' -not -path './vendor/*' -not -path './node_modules/*' -not -path '*/elm-stuff/*' -not -path '*/.elm/*' -not -path './hscontrol/assets/debug-graph/elm.js')
 
 # Default target
 .PHONY: all
@@ -76,6 +76,15 @@ lint: lint-go
 lint-go: check-deps $(GO_SOURCES) go.mod go.sum
 	@echo "Linting Go code..."
 	golangci-lint run --timeout 10m
+
+# Optional local asset for Go tests with -tags=headscale_debug.
+.PHONY: debug-graph debug-graph-check
+debug-graph:
+	@output=$$(nix build .\#debug-graph --no-link --print-out-paths) && \
+		install -m 644 "$$output/elm.js" hscontrol/assets/debug-graph/elm.js
+
+debug-graph-check:
+	nix build .\#checks.$$(nix eval --impure --raw --expr builtins.currentSystem).debug-graph --no-link
 
 # Code generation
 .PHONY: generate
@@ -133,6 +142,8 @@ help:
 	@echo "  fmt          - Format all code (Go, docs, markup)"
 	@echo "  lint         - Lint all code (Go)"
 	@echo "  generate     - Generate code (go generate + client)"
+	@echo "  debug-graph  - Prepare the local Elm asset for tagged Go tests"
+	@echo "  debug-graph-check - Validate the frontend build, formatting and browser bridge"
 	@echo "  dev          - Full development workflow (fmt + lint + test + build)"
 	@echo "  clean        - Clean build artifacts"
 	@echo ""
