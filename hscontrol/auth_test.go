@@ -752,7 +752,8 @@ func TestAuthenticationFlows(t *testing.T) {
 				}
 
 				nodeToRegister := types.NewRegisterAuthRequest(&types.RegistrationData{
-					Hostname: "followup-timeout-node",
+					MachineKey: machineKey1.Public(),
+					Hostname:   "followup-timeout-node",
 				})
 				require.NoError(t, app.state.SetAuthCacheEntry(regID, nodeToRegister))
 				// Don't call FinishRegistration - will timeout
@@ -4513,7 +4514,7 @@ func TestWaitForFollowupMachineKeyMismatch(t *testing.T) {
 	app := createTestApp(t)
 
 	victimMachineKey := key.NewMachine()
-	attackerMachineKey := key.NewMachine()
+	foreignMachineKey := key.NewMachine()
 
 	// Park a completed registration in the auth cache, as a node that is
 	// already polling for its verdict would see it.
@@ -4548,7 +4549,9 @@ func TestWaitForFollowupMachineKeyMismatch(t *testing.T) {
 	}
 
 	t.Run("mismatched machine key is rejected", func(t *testing.T) {
-		resp, err := followup(newPendingFollowup("followup-mismatch"), attackerMachineKey.Public())
+		resp, err := followup(
+			newPendingFollowup("followup-mismatch"), foreignMachineKey.Public(),
+		)
 
 		require.Error(t, err, "followup with a foreign machine key must not succeed")
 		assert.Nil(t, resp, "no registration details should be returned")
@@ -4568,6 +4571,60 @@ func TestWaitForFollowupMachineKeyMismatch(t *testing.T) {
 		require.NotNil(t, resp)
 		assert.True(t, resp.MachineAuthorized)
 		assert.NotEmpty(t, resp.User.DisplayName, "the owner's identity is returned on the legitimate path")
+	})
+
+	// refusedAtOnce sends a follow-up that must be refused before it waits:
+	// a session hands out one verdict, so a waiter that is not the owner
+	// would take it from the owner.
+	refusedAtOnce := func(t *testing.T, url string, machineKey key.MachinePublic) {
+		t.Helper()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		resp, err := app.handleRegister(ctx, tailcfg.RegisterRequest{
+			Followup: url,
+			NodeKey:  key.NewNode().Public(),
+		}, machineKey)
+		require.NoError(t, ctx.Err(), "the follow-up must be refused, not left waiting")
+		require.Error(t, err)
+		assert.Nil(t, resp)
+
+		var httpErr HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusUnauthorized, httpErr.Code)
+	}
+
+	t.Run("mismatched machine key is refused while pending", func(t *testing.T) {
+		authID := types.MustAuthID()
+		regEntry := types.NewRegisterAuthRequest(&types.RegistrationData{
+			MachineKey: victimMachineKey.Public(),
+			NodeKey:    key.NewNode().Public(),
+			Hostname:   "followup-pending",
+		})
+		require.NoError(t, app.state.SetAuthCacheEntry(authID, regEntry))
+
+		url := fmt.Sprintf("http://localhost:8080/register/%s", authID)
+		refusedAtOnce(t, url, foreignMachineKey.Public())
+
+		user := app.state.CreateUserForTest("followup-pending-user")
+		node := app.state.CreateNodeForTest(user, "followup-pending")
+		node.MachineKey = victimMachineKey.Public()
+		node.User = user
+		regEntry.FinishAuth(types.AuthVerdict{Node: node.View()})
+
+		resp, err := followup(url, victimMachineKey.Public())
+		require.NoError(t, err)
+		assert.True(t, resp.MachineAuthorized,
+			"the owner must still collect the verdict")
+	})
+
+	t.Run("ssh check session is not a registration", func(t *testing.T) {
+		authID := types.MustAuthID()
+		require.NoError(t, app.state.SetAuthCacheEntry(authID, types.NewSSHCheckAuthRequest(1, 2)))
+
+		refusedAtOnce(t, fmt.Sprintf("http://localhost:8080/register/%s", authID),
+			victimMachineKey.Public())
 	})
 }
 
@@ -5249,4 +5306,177 @@ func TestRegistrationFollowupReleasesRejectedSession(t *testing.T) {
 
 	_, present = app.state.GetAuthCacheEntry(authID)
 	require.False(t, present, "the consumed session must release its slot")
+}
+
+// TestFollowupParksOneRequestPerRegistration pins that a pending registration
+// keeps one waiting follow-up, the newest. The session hands out one verdict,
+// so older waiters are answered at once instead of staying parked until the
+// session ends and then each opening a new one.
+func TestFollowupParksOneRequestPerRegistration(t *testing.T) {
+	app := createTestApp(t)
+
+	machineKey := key.NewMachine().Public()
+	authID := types.MustAuthID()
+	reg := types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: machineKey,
+		Hostname:   "followup-park-node",
+	})
+	require.NoError(t, app.state.SetAuthCacheEntry(authID, reg))
+
+	regData := &types.RegistrationData{
+		MachineKey: machineKey,
+		NodeKey:    key.NewNode().Public(),
+	}
+	followup := fmt.Sprintf("http://localhost:8080/register/%s", authID)
+
+	const followups = 50
+
+	type answer struct {
+		resp *tailcfg.RegisterResponse
+		err  error
+	}
+
+	answered := make(chan answer, followups)
+
+	for range followups {
+		go func() {
+			resp, err := app.waitForFollowup(t.Context(), followup, regData)
+			answered <- answer{resp, err}
+		}()
+	}
+
+	next := func(msg string) answer {
+		t.Helper()
+
+		select {
+		case a := <-answered:
+			return a
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, msg)
+
+			return answer{}
+		}
+	}
+
+	for range followups - 1 {
+		var httpErr HTTPError
+		require.ErrorAs(t,
+			next("more than one follow-up is parked on the registration").err,
+			&httpErr)
+		assert.Equal(t, http.StatusConflict, httpErr.Code)
+	}
+
+	select {
+	case a := <-answered:
+		require.FailNowf(t, "the newest follow-up must still be waiting", "got %+v", a)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cacheLen := func() int {
+		n, _ := app.state.DebugRegistrationCache()["current_len"].(int)
+
+		return n
+	}
+	before := cacheLen()
+
+	user := app.state.CreateUserForTest("followup-park-user")
+	node := app.state.CreateNodeForTest(user, "followup-park-node")
+	node.MachineKey = machineKey
+	node.User = user
+	reg.FinishAuth(types.AuthVerdict{Node: node.View()})
+
+	last := next("the parked follow-up did not collect the verdict")
+	require.NoError(t, last.err)
+	assert.True(t, last.resp.MachineAuthorized)
+	assert.LessOrEqual(t, cacheLen(), before+1,
+		"the verdict must not open a session per waiter")
+}
+
+func TestFollowupRefreshKeepsAuthMetadata(t *testing.T) {
+	t.Parallel()
+
+	for _, completed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("completed=%t", completed), func(t *testing.T) {
+			t.Parallel()
+
+			app := createTestApp(t)
+			machineKey := key.NewMachine().Public()
+			authID := types.MustAuthID()
+
+			if completed {
+				reg := types.NewRegisterAuthRequest(&types.RegistrationData{
+					MachineKey: machineKey, Hostname: "previous-request",
+				})
+				require.NoError(t, app.state.SetAuthCacheEntry(authID, reg))
+				reg.FinishAuth(types.AuthVerdict{})
+			}
+
+			expiry := time.Now().UTC().Add(time.Hour)
+			req := tailcfg.RegisterRequest{
+				Followup: fmt.Sprintf("http://localhost:8080/register/%s", authID),
+				NodeKey:  key.NewNode().Public(),
+				Expiry:   expiry,
+				Hostinfo: &tailcfg.Hostinfo{
+					Hostname: "refreshed-node", OS: "linux", OSVersion: "6.12",
+					RequestTags: []string{"tag:router"},
+					Services:    []tailcfg.Service{{Proto: tailcfg.PeerAPI4, Port: 41641}},
+				},
+			}
+			resp, err := app.handleRegister(t.Context(), req, machineKey)
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			newAuthID, err := extractRegistrationIDFromAuthURL(resp.AuthURL)
+			require.NoError(t, err)
+			assert.NotEqual(t, authID, newAuthID)
+			entry, ok := app.state.GetAuthCacheEntry(newAuthID)
+			require.True(t, ok)
+			assert.Equal(t, &types.RegistrationData{
+				MachineKey: machineKey,
+				NodeKey:    req.NodeKey,
+				Hostname:   "refreshed-node",
+				Expiry:     &expiry,
+				Hostinfo: &tailcfg.Hostinfo{
+					Hostname: "refreshed-node", OS: "linux", RequestTags: []string{"tag:router"},
+				},
+			}, entry.RegistrationData())
+			req.Hostinfo.RequestTags[0] = "tag:changed"
+			assert.Equal(t, []string{"tag:router"}, entry.RegistrationData().Hostinfo.RequestTags)
+		})
+	}
+}
+
+func TestFollowupURLLength(t *testing.T) {
+	t.Parallel()
+
+	for _, length := range []int{maxFollowupURLLength, maxFollowupURLLength + 1} {
+		t.Run(strconv.Itoa(length), func(t *testing.T) {
+			t.Parallel()
+
+			app := createTestApp(t)
+			followup := fmt.Sprintf("http://localhost:8080/register/%s?padding=", types.MustAuthID())
+			followup += strings.Repeat("x", length-len(followup))
+			regData := &types.RegistrationData{
+				MachineKey: key.NewMachine().Public(),
+				NodeKey:    key.NewNode().Public(),
+				Hostname:   "followup-length-node",
+			}
+
+			resp, err := app.waitForFollowup(t.Context(), followup, regData)
+
+			if length > maxFollowupURLLength {
+				var httpErr HTTPError
+				require.ErrorAs(t, err, &httpErr)
+				assert.Equal(t, http.StatusUnauthorized, httpErr.Code)
+				assert.Equal(t, "followup URL too long", httpErr.Msg)
+				assert.Nil(t, resp)
+				assert.Equal(t, 0, app.state.DebugRegistrationCache()["current_len"])
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			assert.NotEmpty(t, resp.AuthURL)
+		})
+	}
 }

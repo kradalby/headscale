@@ -12,12 +12,14 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
+	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/persist"
 )
 
 func TestServerCloseWaitsForLastSeenPersistence(t *testing.T) {
@@ -740,4 +742,105 @@ func TestServerStateCleanup(t *testing.T) {
 	database, err := srv.State().DB().DB.DB()
 	require.NoError(t, err)
 	require.ErrorContains(t, database.Ping(), "database is closed")
+}
+
+// TestReloginKeepsNodeKeyUnlessForced pins the shape of
+// [servertest.TestClient.Relogin]: a login with a given key presents the
+// current node key, and only a forced one rotates it. The node stays the
+// same either way.
+func TestReloginKeepsNodeKeyUnlessForced(t *testing.T) {
+	t.Parallel()
+
+	srv := servertest.NewServer(t)
+	user := srv.CreateUser(t, "relogin")
+	key := srv.CreatePreAuthKey(t, types.UserID(user.ID))
+	client := servertest.NewClient(t, srv, "relogin",
+		servertest.WithUser(user), servertest.WithAuthKey(key))
+
+	id := findNodeID(t, srv, client.Name)
+	nodeKey := func() string {
+		node, ok := srv.State().GetNodeByID(id)
+		require.True(t, ok)
+
+		return node.NodeKey().String()
+	}
+	first := nodeKey()
+
+	hi := &tailcfg.Hostinfo{BackendLogID: "servertest-relogin", Hostname: "relogin"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, client.Relogin(ctx, key, false, hi))
+	assert.Equal(t, first, nodeKey(), "a login without force keeps the node key")
+
+	require.NoError(t, client.Relogin(ctx, key, true, hi))
+	assert.NotEqual(t, first, nodeKey(), "a forced login rotates the node key")
+
+	assert.Len(t, srv.State().GetNodesByMachineKeyAllUsers(client.MachineKey()), 1,
+		"relogin keeps one node per machine")
+	client.WaitForCondition(t, "netmap after relogin", 10*time.Second,
+		func(nm *netmap.NetworkMap) bool { return nm.SelfNode.ID() == id.NodeID() })
+}
+
+// TestLoginProfilesAndRestart pins the shapes of the login helpers: an
+// interactive login approved for a user, a refused key login recorded with
+// its answers, a second profile on the same machine, a switch back, and a
+// restart that keeps the login but not the disco key.
+func TestLoginProfilesAndRestart(t *testing.T) {
+	t.Parallel()
+
+	srv := servertest.NewServer(t)
+	owner := srv.CreateUser(t, "owner")
+	other := srv.CreateUser(t, "other")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	approve := func(user *types.User) func(string) error {
+		return func(authID string) error { return srv.ApproveAuth(ctx, authID, user.Name) }
+	}
+
+	client := servertest.NewClient(t, srv, "machine", servertest.WithInteractiveLogin(approve(owner)))
+
+	first := findNodeID(t, srv, client.Name)
+	node, ok := srv.State().GetNodeByID(first)
+	require.True(t, ok)
+	assert.Equal(t, owner.Name, node.User().Name(), "the approving user owns the node")
+
+	once := srv.CreateEphemeralPreAuthKey(t, types.UserID(owner.ID))
+	_, err := servertest.TryNewClient(t, srv, "spent", servertest.WithAuthKey(once))
+	require.NoError(t, err)
+
+	refused, err := servertest.TryNewClient(t, srv, "late", servertest.WithAuthKey(once))
+	require.Error(t, err, "a spent single-use key is refused")
+
+	attempts := refused.RegisterAttempts()
+	require.NotEmpty(t, attempts)
+	assert.Equal(t, err.Error(), attempts[len(attempts)-1].Err, "the refusal is the last attempt")
+	assert.Empty(t, srv.State().GetNodesByMachineKeyAllUsers(refused.MachineKey()), "a refused login leaves no node")
+
+	hi := &tailcfg.Hostinfo{BackendLogID: "servertest-machine", Hostname: "machine"}
+	ownerLogin := client.Persist()
+
+	require.NoError(t, client.Login(ctx, persist.Persist{}, "", controlclient.LoginInteractive, hi, approve(other)))
+	assert.Len(t, srv.State().GetNodesByMachineKeyAllUsers(client.MachineKey()), 2,
+		"another user's profile adds a node on the machine")
+
+	require.NoError(t, client.Login(ctx, ownerLogin, "", controlclient.LoginDefault, hi, nil))
+	client.WaitForCondition(t, "back on the first profile", 10*time.Second,
+		func(nm *netmap.NetworkMap) bool { return nm.SelfNode.ID() == first.NodeID() })
+
+	before, ok := srv.State().GetNodeByID(first)
+	require.True(t, ok)
+
+	require.NoError(t, client.Restart(ctx, hi))
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		after, ok := srv.State().GetNodeByID(first)
+		if assert.True(c, ok) {
+			assert.Equal(c, before.NodeKey(), after.NodeKey(), "a restart keeps the node key")
+			assert.NotEqual(c, before.DiscoKey(), after.DiscoKey(), "a restart brings a new disco key")
+		}
+	}, 10*time.Second, 50*time.Millisecond)
 }

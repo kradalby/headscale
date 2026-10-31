@@ -1960,6 +1960,7 @@ func TestPAKSkipsValidation(t *testing.T) {
 		{"zero expiry", userNode(ownerID, &zero), userKey, nodeKey, true, true},
 		{"nil expiry", userNode(ownerID, nil), userKey, nodeKey, true, true},
 		{"expired tagged node, same key", taggedNode(&past, &keyID), taggedKey, nodeKey, false, false},
+		{"tagged node with future expiry, same key", taggedNode(&future, &keyID), taggedKey, nodeKey, true, true},
 		{"conversion", userNode(ownerID, &future), taggedKey, nodeKey, true, false},
 		{"retag, AuthKeyID nil", taggedNode(nil, nil), taggedKey, nodeKey, true, false},
 		{"retag, other AuthKeyID", taggedNode(nil, &otherKeyID), taggedKey, nodeKey, true, false},
@@ -2638,4 +2639,42 @@ func TestPAKWakeRechecksAuthorityAtMutation(t *testing.T) {
 	afterCache, afterDB := c.fields(t)
 	assert.Equal(t, beforeCache, afterCache)
 	assert.Equal(t, beforeDB, afterDB)
+}
+
+func TestExpiredTaggedNodeRequiresValidPreAuthKey(t *testing.T) {
+	for _, reusable := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reusable=%t", reusable), func(t *testing.T) {
+			s := newRetagTestState(t)
+			pak, err := s.CreatePreAuthKey(nil, reusable, false, nil, []string{"tag:foo"})
+			require.NoError(t, err)
+			c := registerForPAKRereg(t, s, pak)
+			past := time.Now().Add(-time.Hour)
+			_, err = s.SetNodeExpiry(c.node.ID(), &past)
+			require.NoError(t, err)
+			nsBefore, rowBefore := c.fields(t)
+			require.Equal(t, past.UnixNano(), nsBefore.Expiry)
+			require.Equal(t, nsBefore, rowBefore)
+
+			node, err := s.HandleNodeFromPreAuthKey(c.regReq, c.machineKey)
+			if !reusable {
+				require.ErrorIs(t, err, types.PAKError("authkey already used"))
+				nsAfter, rowAfter := c.fields(t)
+				require.Equal(t, nsBefore, nsAfter, "a spent key must leave the node expired")
+				require.Equal(t, rowBefore, rowAfter, "a spent key must leave the row expired")
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, c.node.ID(), node.ID())
+			require.False(t, node.Expiry().Valid(), "a valid key disables tagged node expiry")
+			current, ok := s.GetNodeByID(c.node.ID())
+			require.True(t, ok)
+			require.False(t, current.Expiry().Valid())
+
+			stored, err := s.db.GetNodeByID(c.node.ID())
+			require.NoError(t, err)
+			require.Nil(t, stored.Expiry)
+		})
+	}
 }

@@ -2712,3 +2712,76 @@ func TestReauthRejectsOversizedMergedHostinfo(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, rowBefore, rowAfter, "rejected merge leaves the stored node unchanged")
 }
+
+func TestDeleteNodeTwiceReleasesAddressOnce(t *testing.T) {
+	prefix := netip.MustParsePrefix("100.64.0.0/30")
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+	cfg.PrefixV4 = &prefix
+	cfg.PrefixV6 = nil
+	cfg.IPAllocation = types.IPAllocationStrategyRandom
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	user := s.CreateUserForTest("delete-user")
+	pak, err := s.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+	require.NoError(t, err)
+	node, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+		Auth:     &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
+		NodeKey:  key.NewNode().Public(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "delete-node"},
+	}, key.NewMachine().Public())
+	require.NoError(t, err)
+
+	stale := node
+
+	_, _, err = s.ipAlloc.Next()
+	require.NoError(t, err)
+	err = s.DeleteNode(node)
+	require.NoError(t, err)
+	reissued, _, err := s.ipAlloc.Next()
+	require.NoError(t, err)
+	require.Equal(t, node.IPv4().Get(), *reissued)
+
+	before := s.Snapshot().Rev()
+	require.NoError(t, s.DeleteNode(stale))
+	assert.Equal(t, before, s.Snapshot().Rev(), "the second delete announces nothing")
+
+	_, _, err = s.ipAlloc.Next()
+	require.ErrorIs(t, err, db.ErrCouldNotAllocateIP)
+}
+
+// TestLockRegistrationSerialisesSameMachineKey pins that dropping unused
+// locks never lets two registrations of one machine key run at once.
+func TestLockRegistrationSerialisesSameMachineKey(t *testing.T) {
+	s, err := NewState(persistTestConfig(t.TempDir() + "/headscale.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	machineKey := key.NewMachine().Public()
+
+	var (
+		wg      sync.WaitGroup
+		holders atomic.Int32
+		overlap atomic.Bool
+	)
+
+	for range 64 {
+		wg.Go(func() {
+			defer s.lockRegistration(machineKey)()
+
+			if holders.Add(1) != 1 {
+				overlap.Store(true)
+			}
+
+			runtime.Gosched()
+			holders.Add(-1)
+		})
+	}
+
+	wg.Wait()
+
+	require.False(t, overlap.Load(), "two registrations held the lock at once")
+	require.Zero(t, s.registerLocks.Size())
+}
