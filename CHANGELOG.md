@@ -185,6 +185,7 @@ holding other writes until the tests finish.
 - Every endpoint change a node reports reaches its peers, STUN-only ones included. Peers are rendered from the stored node, so the stored endpoints are what they get; withholding STUN-only additions, as 0.29 did, would need endpoint types stored alongside them [#37](https://github.com/kradalby/headscale/pull/37)
 - A user created or renamed so that a policy's `user@` name matches several users no longer fails the user write or the boot: that name grants nothing, every other entry (other members of its groups included) still applies, and a warning names it. Setting a policy that names such a user is still refused, now in grants too [#37](https://github.com/kradalby/headscale/pull/37)
 - Peers are rendered for at most the server's current capability version, so a client newer than the server sees each peer's `Cap` as the server's current version, not its own [#37](https://github.com/kradalby/headscale/pull/37)
+- MagicDNS reverse zones for IPv4 prefixes whose configured address has host bits set, and for IPv6 prefixes whose mask is not nibble-aligned, are enumerated from the masked prefix, so tailnets with such custom prefixes advertise the correct set of reverse zones [#40](https://github.com/kradalby/headscale/pull/40)
 - Split-DNS zones with an empty resolver list are now sent as an empty route — handled by the client's built-in resolver — instead of `null` [#40](https://github.com/kradalby/headscale/pull/40)
 
 ## 0.29.7 (2026-10-30)

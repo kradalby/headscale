@@ -94,6 +94,10 @@ func ValidateUsername(username string) error {
 // From the netmask we can find out the wildcard bits (the bits that are not set in the netmask).
 // This allows us to then calculate the subnets included in the subsequent class block and generate the entries.
 func GenerateIPv4DNSRootDomain(ipPrefix netip.Prefix) []dnsname.FQDN {
+	// Host bits are not part of the prefix: the zones enumerate the masked
+	// octet, matching the allocator's view of the prefix.
+	ipPrefix = ipPrefix.Masked()
+
 	// Conversion to the std lib [net.IPNet], a bit easier to operate
 	netRange := netipx.PrefixIPNet(ipPrefix)
 	maskBits, _ := netRange.Mask.Size()
@@ -157,7 +161,7 @@ func GenerateIPv6DNSRootDomain(ipPrefix netip.Prefix) []dnsname.FQDN {
 	const nibbleLen = 4
 
 	maskBits, _ := netipx.PrefixIPNet(ipPrefix).Mask.Size()
-	expanded := ipPrefix.Addr().StringExpanded()
+	expanded := ipPrefix.Masked().Addr().StringExpanded()
 	nibbleStr := strings.ReplaceAll(expanded, ":", "")
 
 	// TODO?: that does not look the most efficient implementation,
@@ -183,11 +187,12 @@ func GenerateIPv6DNSRootDomain(ipPrefix netip.Prefix) []dnsname.FQDN {
 		dom, _ := makeDomain()
 		fqdns = append(fqdns, dom)
 	} else {
-		domCount := 1 << (maskBits % nibbleLen)
+		domCount := 1 << (nibbleLen - maskBits%nibbleLen)
+		minVal, _ := strconv.ParseInt(string(nibbleStr[maskBits/nibbleLen]), 16, 8)
 
 		fqdns = make([]dnsname.FQDN, 0, domCount)
 		for i := range domCount {
-			varNibble := fmt.Sprintf("%x", i)
+			varNibble := fmt.Sprintf("%x", minVal+int64(i))
 
 			dom, err := makeDomain(varNibble)
 			if err != nil {
