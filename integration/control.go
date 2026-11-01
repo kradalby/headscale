@@ -45,7 +45,6 @@ type ControlServer interface {
 	GetHostname() string
 	GetIPInNetwork(network *dockertest.Network) string
 	SetPolicy(pol *policyv2.Policy) error
-	GetAllMapReponses() (map[types.NodeID][]tailcfg.MapResponse, error)
 	PrimaryRoutes() (*types.DebugRoutes, error)
 	DebugBatcher() (*hscontrol.DebugBatcherInfo, error)
 	DebugNodeStore() (map[types.NodeID]types.Node, error)

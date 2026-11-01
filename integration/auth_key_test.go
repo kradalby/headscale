@@ -51,7 +51,7 @@ func TestAuthKeyLogoutAndReloginSameUser(t *testing.T) {
 	requireNoErrGetHeadscale(t, err)
 
 	expectedNodes := collectExpectedNodeIDs(t, allClients)
-	requireAllClientsOnline(t, headscale, expectedNodes, true, "all clients should be connected", integrationutil.ScaledTimeout(120*time.Second))
+	requireAllClientsOnline(t, headscale, allClients, expectedNodes, true, "all clients should be connected", integrationutil.ScaledTimeout(120*time.Second))
 
 	// Validate that all nodes have [tailcfg.NetInfo] and DERP servers before logout
 	requireAllClientsNetInfoAndDERP(t, headscale, expectedNodes, "all clients should have NetInfo and DERP before logout", 3*time.Minute)
@@ -100,7 +100,7 @@ func TestAuthKeyLogoutAndReloginSameUser(t *testing.T) {
 	requireNoErrLogout(t, err)
 
 	// After taking down all nodes, verify all systems show nodes offline
-	requireAllClientsOnline(t, headscale, expectedNodes, false, "all nodes should have logged out", integrationutil.ScaledTimeout(120*time.Second))
+	requireAllClientsOnline(t, headscale, allClients, expectedNodes, false, "all nodes should have logged out", integrationutil.ScaledTimeout(120*time.Second))
 
 	t.Logf("all clients logged out")
 
@@ -145,7 +145,7 @@ func TestAuthKeyLogoutAndReloginSameUser(t *testing.T) {
 		assertLastSeenSet(t, node)
 	}
 
-	requireAllClientsOnline(t, headscale, expectedNodes, true, "all clients should be connected to batcher", integrationutil.ScaledTimeout(120*time.Second))
+	requireAllClientsOnline(t, headscale, allClients, expectedNodes, true, "all clients should be connected to batcher", integrationutil.ScaledTimeout(120*time.Second))
 
 	// Wait for Tailscale sync before validating [tailcfg.NetInfo] to ensure proper state propagation
 	err = scenario.WaitForTailscaleSync()
@@ -236,7 +236,7 @@ func TestAuthKeyLogoutAndReloginNewUser(t *testing.T) {
 	expectedNodes := collectExpectedNodeIDs(t, allClients)
 
 	// Validate initial connection state
-	requireAllClientsOnline(t, headscale, expectedNodes, true, "all clients should be connected after initial login", integrationutil.ScaledTimeout(120*time.Second))
+	requireAllClientsOnline(t, headscale, allClients, expectedNodes, true, "all clients should be connected after initial login", integrationutil.ScaledTimeout(120*time.Second))
 	requireAllClientsNetInfoAndDERP(t, headscale, expectedNodes, "all clients should have NetInfo and DERP after initial login", 3*time.Minute)
 
 	var (
@@ -266,7 +266,7 @@ func TestAuthKeyLogoutAndReloginNewUser(t *testing.T) {
 	requireNoErrLogout(t, err)
 
 	// Validate that all nodes are offline after logout
-	requireAllClientsOnline(t, headscale, expectedNodes, false, "all nodes should be offline after logout", integrationutil.ScaledTimeout(120*time.Second))
+	requireAllClientsOnline(t, headscale, allClients, expectedNodes, false, "all nodes should be offline after logout", integrationutil.ScaledTimeout(120*time.Second))
 
 	t.Logf("all clients logged out")
 
@@ -306,7 +306,7 @@ func TestAuthKeyLogoutAndReloginNewUser(t *testing.T) {
 	}
 
 	// Validate connection state after relogin as user1
-	requireAllClientsOnline(t, headscale, expectedUser1Nodes, true, "all user1 nodes should be connected after relogin", integrationutil.ScaledTimeout(120*time.Second))
+	requireAllClientsOnline(t, headscale, allClients, expectedUser1Nodes, true, "all user1 nodes should be connected after relogin", integrationutil.ScaledTimeout(120*time.Second))
 	requireAllClientsNetInfoAndDERP(t, headscale, expectedUser1Nodes, "all user1 nodes should have NetInfo and DERP after relogin", 3*time.Minute)
 
 	// Validate that user2 still has their original nodes after user1's re-authentication
@@ -327,9 +327,7 @@ func TestAuthKeyLogoutAndReloginNewUser(t *testing.T) {
 
 	for _, client := range allClients {
 		assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(ct, err, "Failed to get status for client %s", client.Hostname())
-			assert.Equal(ct, "user1@test.no", status.User[status.Self.UserID].LoginName, "Client %s should be logged in as user1 after user switch, got %s", client.Hostname(), status.User[status.Self.UserID].LoginName)
+			assertClientLogin(ct, client, "user1@test.no")
 		}, integrationutil.StatusReadyTimeout, 2*time.Second, "validating %s is logged in as user1 after auth key user switch", client.Hostname())
 	}
 }
@@ -380,7 +378,7 @@ func TestAuthKeyLogoutAndReloginSameUserExpiredKey(t *testing.T) {
 	expectedNodes := collectExpectedNodeIDs(t, allClients)
 
 	// Validate initial connection state
-	requireAllClientsOnline(t, headscale, expectedNodes, true, "all clients should be connected after initial login", integrationutil.ScaledTimeout(120*time.Second))
+	requireAllClientsOnline(t, headscale, allClients, expectedNodes, true, "all clients should be connected after initial login", integrationutil.ScaledTimeout(120*time.Second))
 	requireAllClientsNetInfoAndDERP(t, headscale, expectedNodes, "all clients should have NetInfo and DERP after initial login", 3*time.Minute)
 
 	var (
@@ -410,7 +408,7 @@ func TestAuthKeyLogoutAndReloginSameUserExpiredKey(t *testing.T) {
 	requireNoErrLogout(t, err)
 
 	// Validate that all nodes are offline after logout
-	requireAllClientsOnline(t, headscale, expectedNodes, false, "all nodes should be offline after logout", integrationutil.ScaledTimeout(120*time.Second))
+	requireAllClientsOnline(t, headscale, allClients, expectedNodes, false, "all nodes should be offline after logout", integrationutil.ScaledTimeout(120*time.Second))
 
 	t.Logf("all clients logged out")
 
@@ -504,7 +502,7 @@ func TestAuthKeyDeleteKey(t *testing.T) {
 	t.Logf("Node %d (%s) created successfully with auth_key_id=%d", nodeID, nodeName, authKeyID)
 
 	// Verify node is online
-	requireAllClientsOnline(t, headscale, []types.NodeID{types.NodeID(nodeID)}, true, "node should be online initially", integrationutil.ScaledTimeout(120*time.Second))
+	requireAllClientsOnline(t, headscale, []TailscaleClient{client}, []types.NodeID{types.NodeID(nodeID)}, true, "node should be online initially", integrationutil.ScaledTimeout(120*time.Second))
 
 	// DELETE the pre-auth key using the API
 	t.Logf("Deleting pre-auth key ID %d using API", authKeyID)
@@ -521,8 +519,11 @@ func TestAuthKeyDeleteKey(t *testing.T) {
 
 	// Wait for client to fully stop before bringing it back up
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		status, err := client.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, client)
+		if status == nil {
+			return
+		}
+
 		assert.Equal(c, "Stopped", status.BackendState)
 	}, integrationutil.ScaledTimeout(10*time.Second), integrationutil.FastPoll, "client should be stopped")
 
@@ -532,7 +533,7 @@ func TestAuthKeyDeleteKey(t *testing.T) {
 	// Verify node comes back online
 	// This will FAIL without the fix because auth key validation will reject deleted key
 	// With the fix, [tailcfg.Node.MachineKey] identity allows reconnection even with deleted key
-	requireAllClientsOnline(t, headscale, []types.NodeID{types.NodeID(nodeID)}, true, "node should reconnect after restart despite deleted key", integrationutil.ScaledTimeout(120*time.Second))
+	requireAllClientsOnline(t, headscale, []TailscaleClient{client}, []types.NodeID{types.NodeID(nodeID)}, true, "node should reconnect after restart despite deleted key", integrationutil.ScaledTimeout(120*time.Second))
 
 	t.Logf("✓ Node successfully reconnected after its auth key was deleted")
 }
@@ -644,8 +645,11 @@ func TestAuthKeyLogoutAndReloginRoutesPreserved(t *testing.T) {
 
 	// Wait for logout to complete
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := client.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, client)
+		if status == nil {
+			return
+		}
+
 		assert.Equal(ct, "NeedsLogin", status.BackendState, "Expected NeedsLogin state after logout")
 	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for logout to complete")
 
@@ -674,8 +678,11 @@ func TestAuthKeyLogoutAndReloginRoutesPreserved(t *testing.T) {
 
 	// Wait for client to be running
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := client.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, client)
+		if status == nil {
+			return
+		}
+
 		assert.Equal(ct, "Running", status.BackendState, "Expected Running state after relogin")
 	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for relogin to complete")
 

@@ -379,10 +379,9 @@ func cleanupSuccessfulTestArtifacts(logsDir string, verbose bool) error {
 				continue
 			}
 
-			// Remove database, metrics, and status files, but keep logs
+			// Remove database and metrics files, but keep logs
 			shouldRemove := strings.HasSuffix(name, ".db") ||
-				strings.HasSuffix(name, "_metrics.txt") ||
-				strings.HasSuffix(name, "_status.json")
+				strings.HasSuffix(name, "_metrics.txt")
 
 			if shouldRemove {
 				info, infoErr := entry.Info()
