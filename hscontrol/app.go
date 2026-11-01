@@ -166,43 +166,18 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 
 	// Initialize ephemeral garbage collector
 	ephemeralGC := db.NewEphemeralGarbageCollector(func(ni types.NodeID) {
-		node, ok := app.state.GetNodeByID(ni)
-		if !ok {
-			// A delete that raced this timer already did its job.
-			log.Debug().Caller().Uint64("node.id", ni.Uint64()).Msg("ephemeral node already deleted, skipping garbage collection")
-
-			return
-		}
-
-		// Re-registering with a permanent key cancels nothing, and the poll
-		// path only cancels for ephemeral nodes, so the old timer still fires.
-		if !node.IsEphemeral() {
-			log.Debug().Caller().EmbedObject(node).Msg("node is no longer ephemeral, skipping garbage collection")
-
-			return
-		}
-
 		// Schedule and Cancel run outside the session transition, so a
 		// disconnecting session can arm a timer after a reconnect already
-		// cancelled it. The session count is authoritative; a stale timer
-		// is dropped and the next disconnect arms a fresh one. Not Online():
-		// an expired node keeps polling while offline.
-		// ponytail: a Connect between this check and DeleteNode still loses
-		// the node; only reachable after a full inactivity timeout. Needs a
-		// delete-if-idle in State if that edge matters.
-		if node.ActiveSessions() > 0 {
-			log.Debug().Caller().EmbedObject(node).Msg("ephemeral node has a live session, skipping garbage collection")
-
-			return
-		}
-
-		err := app.state.DeleteNode(node)
+		// cancelled it. State rechecks lifetime and sessions against deletion.
+		deleted, err := app.state.DeleteEphemeralNode(ni)
 		if err != nil {
-			log.Error().Err(err).EmbedObject(node).Msg("ephemeral node deletion failed")
+			log.Error().Err(err).Uint64("node.id", ni.Uint64()).Msg("ephemeral node deletion failed")
 			return
 		}
 
-		log.Debug().Caller().EmbedObject(node).Msg("ephemeral node deleted because garbage collection timeout reached")
+		if deleted {
+			log.Debug().Caller().Uint64("node.id", ni.Uint64()).Msg("ephemeral node deleted because garbage collection timeout reached")
+		}
 	})
 	app.ephemeralGC = ephemeralGC
 
@@ -918,11 +893,8 @@ func (h *Headscale) Serve() error {
 					h.challenges.Close() //nolint:contextcheck // each delete has its own bounded context
 				}
 
-				info("closing map sessions")
-				h.mapHub.Close()
-
-				info("waiting for netmap stream to close")
-				h.clientStreamsOpen.Wait()
+				info("closing map sessions and waiting for stream cleanup")
+				h.DrainMapSessions()
 
 				info("shutting down api server (socket)")
 
@@ -1277,6 +1249,13 @@ func (h *Headscale) SetBeforeMapRequestForTest(tb testing.TB, fn func(types.Node
 
 	h.beforeMapRequest.Store(&fn)
 	tb.Cleanup(func() { h.beforeMapRequest.Store(nil) })
+}
+
+// DrainMapSessions stops map streams and waits for their final persistence.
+// Call after stopping request admission and before closing State.
+func (h *Headscale) DrainMapSessions() {
+	h.mapHub.Close()
+	h.clientStreamsOpen.Wait()
 }
 
 // MapHub returns the registry of live map sessions (for test use).

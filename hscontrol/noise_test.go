@@ -430,6 +430,61 @@ func requireBelowFloorRejected(t *testing.T, rec *httptest.ResponseRecorder) {
 	assert.Contains(t, rec.Body.String(), ErrUnsupportedClientVersion.Error())
 }
 
+// TestRegistrationHandler_LogoutOfAChangedRegistration pins the wire shape of
+// a logout refused because its node changed under it: HTTP 200 with the
+// refusal in RegisterResponse.Error, which controlclient surfaces, and nothing
+// a client could act on — no AuthURL, no authorization, no cache entry.
+func TestRegistrationHandler_LogoutOfAChangedRegistration(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(t *testing.T, app *Headscale, node types.NodeView)
+	}{
+		{"deleted", func(t *testing.T, app *Headscale, node types.NodeView) {
+			t.Helper()
+			require.NoError(t, app.state.DeleteNode(node))
+		}},
+		{"rekeyed", func(t *testing.T, app *Headscale, node types.NodeView) {
+			t.Helper()
+
+			rekeyed := node.AsStruct()
+			rekeyed.NodeKey = key.NewNode().Public()
+			app.state.PutNodeInStoreForTest(*rekeyed)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := createTestApp(t)
+			defer func() { require.NoError(t, app.state.Close()) }()
+
+			user := app.state.CreateUserForTest("logout-wire")
+			pak, err := app.state.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+			require.NoError(t, err)
+
+			machine := key.NewMachine().Public()
+			nodeKey := key.NewNode().Public()
+			node, err := app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+				Auth: &tailcfg.RegisterResponseAuth{AuthKey: pak.Key}, NodeKey: nodeKey,
+				Hostinfo: &tailcfg.Hostinfo{Hostname: "logout-wire"},
+			}, machine)
+			require.NoError(t, err)
+
+			app.state.SetBeforeLogoutWriteForTest(func() { tc.change(t, app, node) })
+
+			ns := &noiseServer{headscale: app, machineKey: machine}
+			rec := serveRegister(t, ns, tailcfg.RegisterRequest{
+				Version: capver.MinSupportedCapabilityVersion,
+				NodeKey: nodeKey,
+				Expiry:  time.Unix(123, 0),
+			})
+			require.Equal(t, http.StatusOK, rec.Code, "controlclient only surfaces RegisterResponse.Error with HTTP 200")
+
+			var response tailcfg.RegisterResponse
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+			assert.Equal(t, tailcfg.RegisterResponse{Error: "node registration changed"}, response)
+			assert.Zero(t, app.state.DebugRegistrationCache()["current_len"], "a refused logout must not start a registration")
+		})
+	}
+}
+
 // TestRegistrationHandler_BelowFloorLeavesNoStateChange pins that the
 // capability floor is checked before [Headscale.handleRegister]. A logout,
 // pre-auth key use or auth-cache write that ran first would not be undone by

@@ -6,6 +6,8 @@ import (
 	"math/rand/v2"
 	"net/netip"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,11 +15,95 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/persist"
 )
+
+func TestServerCloseWaitsForLastSeenPersistence(t *testing.T) {
+	h := servertest.NewHarness(t, 1)
+	id := findNodeID(t, h.Server, h.Client(0).Name)
+	entered, unblock := make(chan struct{}), make(chan struct{})
+
+	release := sync.OnceFunc(func() { close(unblock) })
+	defer release()
+	// A second nodes write in the window must fail with context, not
+	// "close of closed channel".
+	enter := sync.OnceFunc(func() { close(entered) })
+
+	var persisted atomic.Bool
+
+	sqlDB := h.Server.State().DB().DB
+	require.NoError(t, sqlDB.Callback().Update().Before("gorm:update").Register("pause_last_seen", func(tx *gorm.DB) {
+		if tx.Statement.Table == "nodes" {
+			enter()
+			<-unblock
+		}
+	}))
+	require.NoError(t, sqlDB.Callback().Update().After("gorm:update").Register("last_seen_persisted", func(tx *gorm.DB) {
+		if tx.Statement.Table == "nodes" {
+			persisted.Store(true)
+		}
+	}))
+	t.Cleanup(func() {
+		_ = sqlDB.Callback().Update().Remove("pause_last_seen")
+		_ = sqlDB.Callback().Update().Remove("last_seen_persisted")
+	})
+
+	// Close waits for the handlers once Shutdown runs; the cleanup's Close
+	// runs it again.
+	shuttingDown := make(chan struct{})
+
+	h.Server.RegisterOnShutdown(sync.OnceFunc(func() { close(shuttingDown) }))
+
+	h.Client(0).Disconnect(t)
+	h.Server.App.MapHub().Close()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream cleanup did not reach LastSeen persistence")
+	}
+
+	closed := make(chan struct{})
+
+	go func() { h.Server.Close(); close(closed) }()
+
+	select {
+	case <-shuttingDown:
+	case <-closed:
+		t.Fatal("server close must cover final session persistence before DB teardown")
+	case <-time.After(5 * time.Second):
+		t.Fatal("server close neither waited for the handlers nor returned")
+	}
+
+	// Shutdown's hook runs as Close starts waiting, so a Close that does
+	// not wait can still return after it; it must stay parked while the
+	// final persist is held.
+	require.Never(t, func() bool {
+		select {
+		case <-closed:
+			return true
+		default:
+			return false
+		}
+	}, 500*time.Millisecond, 10*time.Millisecond, "server close returned while the final session persistence was held")
+
+	release()
+	<-closed
+	assert.True(t, persisted.Load(), "server close returned before the final session persistence finished")
+
+	live, ok := h.Server.State().GetNodeByID(id)
+	require.True(t, ok)
+	assert.Zero(t, live.ActiveSessions())
+
+	durable, err := h.Server.State().DB().GetNodeByID(id)
+	require.NoError(t, err)
+	require.NotNil(t, durable.LastSeen)
+	assert.Equal(t, live.LastSeen().Get().UnixNano(), durable.LastSeen.UnixNano())
+}
 
 // TestConnectionLifecycle exercises the core node lifecycle:
 // connecting, seeing peers, joining mid-session, departing, and

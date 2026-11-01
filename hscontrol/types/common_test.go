@@ -1,6 +1,7 @@
 package types
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -9,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
@@ -155,6 +158,48 @@ func TestAuthRequestPrepareForCachePayloadLimit(t *testing.T) {
 			assert.Equal(t, data, req.RegistrationData())
 		})
 	}
+}
+
+// TestAuthRequestPrepareForCacheLogsOversizeOnce pins the operator-visible
+// signal for a rejected registration: the rejection is otherwise
+// indistinguishable from a server bug, and the size says whether a real client
+// is hitting the limit.
+func TestAuthRequestPrepareForCacheLogsOversizeOnce(t *testing.T) {
+	previous, previousLevel := log.Logger, zerolog.GlobalLevel()
+
+	t.Cleanup(func() {
+		log.Logger = previous
+
+		zerolog.SetGlobalLevel(previousLevel)
+	})
+
+	var output bytes.Buffer
+
+	log.Logger = zerolog.New(&output)
+
+	// Test binaries default to error level, which hides the warning.
+	zerolog.SetGlobalLevel(zerolog.WarnLevel)
+
+	data := &RegistrationData{Hostname: strings.Repeat("x", MaxRegistrationPayloadBytes)}
+	encoded, err := json.Marshal(data)
+	require.NoError(t, err)
+
+	err = NewRegisterAuthRequest(data).PrepareForCache()
+	require.ErrorIs(t, err, ErrRegistrationPayloadTooLarge)
+
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	require.Len(t, lines, 1, "one rejection logs once")
+
+	var entry map[string]any
+	require.NoError(t, json.Unmarshal([]byte(lines[0]), &entry))
+	assert.Equal(t, "warn", entry["level"])
+	assert.InDelta(t, len(encoded), entry["payload_bytes"], 0)
+	assert.InDelta(t, MaxRegistrationPayloadBytes, entry["payload_limit"], 0)
+
+	output.Reset()
+
+	require.NoError(t, NewRegisterAuthRequest(&RegistrationData{Hostname: "ok"}).PrepareForCache())
+	assert.Empty(t, output.String(), "an admitted registration logs nothing")
 }
 
 func TestAuthRequestPrepareForCacheRouteAndServiceMetadata(t *testing.T) {

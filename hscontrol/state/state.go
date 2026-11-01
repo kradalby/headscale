@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
@@ -53,11 +54,7 @@ const (
 	// registerCacheExpiration defines how long node registration entries remain in cache.
 	registerCacheExpiration = time.Minute * 15
 
-	// defaultRegisterCacheMaxEntries is the default upper bound on the number
-	// of pending registration entries the auth cache will hold. With a 15-minute
-	// TTL and a stripped-down RegistrationData payload (~200 bytes per entry),
-	// 1024 entries cap the worst-case cache footprint at well under 1 MiB even
-	// under sustained unauthenticated cache-fill attempts.
+	// Cap pending requests as well as the interactive handler's per-request payload.
 	defaultRegisterCacheMaxEntries = 1024
 
 	authCacheSSHReserve = 64
@@ -76,6 +73,9 @@ var ErrInvalidNodeView = errors.New("invalid node view provided")
 // snapshot, deleted while the caller worked on it. It keeps upstream's
 // name, which callers match, from before the snapshot replaced NodeStore.
 var ErrNodeNotInNodeStore = errors.New("node no longer exists")
+
+// ErrNodeKeyChanged rejects a map request authenticated before reauthentication.
+var ErrNodeKeyChanged = errors.New("node key changed since map request authentication")
 
 // ErrNodeNameNotUnique is returned when a node name is not unique.
 var ErrNodeNameNotUnique = errors.New("node name is not unique")
@@ -249,6 +249,15 @@ type State struct {
 	// always converges on the in-memory node rather than being clobbered by a
 	// stale caller snapshot or resurrected by an update racing with deletion.
 	rows rowLocks
+	// connectMu excludes session admission (State.Connect, its only reader)
+	// from a lifetime delete in flight: a Connect arriving while the row is
+	// being removed must wait or find the node gone, never acquire a live
+	// epoch for it. It is never acquired under a row lock — a session parked
+	// on its batched world write must not stall a persist behind a delete
+	// waiting that session out — and a delete waiting behind registration
+	// SQL must not block admission, so the GC decides the node's lifetime
+	// first and only then takes it.
+	connectMu sync.RWMutex
 
 	// reportSeq numbers the map reports worth persisting
 	// ([types.Node.ReportGen]); durable holds, per node, the highest number
@@ -264,6 +273,10 @@ type State struct {
 	// node: where a check made ahead of the write would already be stale.
 	beforeAuthWrite func()
 
+	// beforeLogoutWrite, for tests, interposes an admin write between
+	// LogoutNode's unlocked checks and its locked re-decision.
+	beforeLogoutWrite func()
+
 	// usersMu serialises listing users and handing them to the world, so a
 	// slow refresh cannot replace a newer user list with an older one.
 	usersMu sync.Mutex
@@ -278,6 +291,13 @@ type State struct {
 	// registrations of the same machine resolve to a single node instead of
 	// racing the find-then-create section and each creating their own.
 	registerLocks *xsync.Map[key.MachinePublic, *registrationLock]
+
+	// claimLocks serialises NodeKey claims per key across fresh
+	// registrations and re-authentications, so two writers cannot both
+	// insert or rotate onto the same NodeKey. Unrelated claims stay
+	// concurrent: fresh joins batch into one commit instead of queueing
+	// behind each other on a row lock.
+	claimLocks *xsync.Map[key.NodePublic, *registrationLock]
 }
 
 type registrationLock struct {
@@ -290,6 +310,13 @@ type registrationLock struct {
 // returns the unlock function.
 func (s *State) lockRegistration(machineKey key.MachinePublic) func() {
 	return lockKeyed(s.registerLocks, machineKey)
+}
+
+// lockNodeKey serialises writes claiming a single NodeKey — a fresh
+// registration inserting it or a re-auth rotating onto it — and returns the
+// unlock function.
+func (s *State) lockNodeKey(nodeKey key.NodePublic) func() {
+	return lockKeyed(s.claimLocks, nodeKey)
 }
 
 // lockKeyed serialises access per key with a refcounted lock: entries are
@@ -445,6 +472,7 @@ func NewState(cfg *types.Config) (*State, error) {
 
 		sshCheckAuth:  make(map[sshCheckPair]time.Time),
 		registerLocks: xsync.NewMap[key.MachinePublic, *registrationLock](),
+		claimLocks:    xsync.NewMap[key.NodePublic, *registrationLock](),
 
 		beforeAuthWrite: func() {},
 
@@ -831,11 +859,11 @@ func (s *State) persistNodeLocked(node types.NodeView) (types.NodeView, error) {
 		return types.NodeView{}, fmt.Errorf("saving node: %w", result.Error)
 	}
 
-	// Deletion drops the row before the world node, and releases the row
-	// lock in between, so a write landing in that window matches zero rows.
-	// SQLite and Postgres both count matched rows even when values are
-	// unchanged; report the row gone instead of a no-op dressed as success,
-	// and record nothing durable for a node being deleted.
+	// The lifetime deletes drop the row before the world node, so a write
+	// landing in that window matches zero rows. SQLite and Postgres both
+	// count matched rows even when values are unchanged; report the row
+	// gone instead of a no-op dressed as success, and record nothing
+	// durable for a node being deleted.
 	if result.RowsAffected == 0 {
 		s.forgetDurable(node.ID())
 
@@ -877,20 +905,9 @@ func (s *State) forgetDurable(id types.NodeID) {
 }
 
 // DeleteNode permanently removes a node and cleans up associated resources.
-// Concurrent deletes of one node act once: a call that finds the row already
-// gone returns nil, and only the call that removed the row frees the
-// addresses.
 func (s *State) DeleteNode(node types.NodeView) error {
-	unlock := s.rows.lock(node.ID())
-	err := s.db.DeleteNode(node.AsStruct())
-
-	unlock()
-
+	outcome, fresh, err := s.deleteNodeRow(node)
 	if err != nil {
-		if errors.Is(err, hsdb.ErrNodeNotFound) {
-			return nil
-		}
-
 		return err
 	}
 
@@ -901,20 +918,162 @@ func (s *State) DeleteNode(node types.NodeView) error {
 	// ErrNodeNotInNodeStore (persistNodeLocked), and holding it would keep
 	// concurrent deletes out of one group commit. The window between the row
 	// delete and this write is deliberate and short.
+	//
+	// The row write's own winner owns the teardown — a second one could free
+	// a reallocated address — but a winner that died before removing the
+	// world node would orphan it in peers' maps until restart, and the world
+	// delete is idempotent, so every delete completes it.
 	s.world.DeleteNode(node.ID())
 	s.forgetDurable(node.ID())
 
-	s.ipAlloc.FreeIPs(node.IPs())
-
-	if fn := s.onNodeDeleted.Load(); fn != nil {
-		(*fn)(node.ID())
+	if outcome == deleteDroppedRow {
+		s.finishNodeDeletion(fresh)
 	}
 
 	return nil
 }
 
+// deleteNodeRow re-reads the node under the row write's lock and drops the
+// row, reporting what it found. The re-read is what makes the teardown free
+// the addresses the delete actually saw: the caller's view can go stale
+// behind the lock (an address backfill landing in between would otherwise be
+// freed from the stale addresses and leak until restart). The lock is scoped
+// with a deferred unlock, so a panic in the driver or a callback cannot leak
+// it for the life of the process. The outcome is meaningful only when the
+// error is nil.
+func (s *State) deleteNodeRow(node types.NodeView) (deleteOutcome, types.NodeView, error) {
+	defer s.rows.lock(node.ID())()
+
+	current, ok := s.GetNodeByID(node.ID())
+	if !ok {
+		// The world node is gone while the row may not be (test setups and
+		// duplicate deletes); the row write still goes through the caller's view.
+		current = node
+	}
+
+	err := s.db.DeleteNode(current.AsStruct())
+	if err != nil {
+		// Both spellings mean another delete already dropped the row: its
+		// caller owns the teardown, and this one must not run it again.
+		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, hsdb.ErrNodeNotFound) {
+			return deleteAlreadyGone, types.NodeView{}, nil
+		}
+
+		return deleteRefused, types.NodeView{}, err
+	}
+
+	return deleteDroppedRow, current, nil
+}
+
+// deleteOutcome says what a delete's row write found. It is meaningful only
+// when the accompanying error is nil.
+type deleteOutcome int
+
+const (
+	// deleteRefused: nothing was written — the lifetime re-check refused,
+	// or the row write failed. The zero value, so a caller that reads the
+	// outcome before the error can never be told it owns a teardown.
+	deleteRefused deleteOutcome = iota
+	// deleteDroppedRow: this caller deleted the row and owns the teardown.
+	deleteDroppedRow
+	// deleteAlreadyGone: another delete had already dropped the row.
+	deleteAlreadyGone
+)
+
+// DeleteEphemeralNode removes a node only if it is still ephemeral and idle.
+func (s *State) DeleteEphemeralNode(id types.NodeID) (bool, error) {
+	// Phase 1 — decide under the row lock alone. A registration whose SQL this
+	// GC queued behind may publish the node's new lifetime (permanent, or
+	// reconnected) before the lock arrives, so the check must see what that
+	// registration published; and this wait must not block session
+	// admission, so connectMu is not held here.
+	node, err := s.ephemeralDeleteCandidate(id)
+	if err != nil || !node.Valid() {
+		return false, err
+	}
+
+	// Phase 2 — delete under session admission, excluding Connect until the
+	// node is gone from memory too. connectMu is never taken under
+	// a row lock: a session parked on its batched world write must not have
+	// every persist stall behind this delete while it is waited out.
+	s.connectMu.Lock()
+	defer s.connectMu.Unlock()
+
+	outcome, fresh, err := s.deleteEphemeralRow(node)
+	if err != nil {
+		return false, err
+	}
+
+	if outcome == deleteRefused {
+		return false, nil
+	}
+
+	// Keep session admission excluded until the node is gone from memory
+	// too. This completes a dead winner's world removal as well: the world
+	// delete is idempotent, and the node would otherwise orphan in peers'
+	// maps until restart.
+	s.world.DeleteNode(id)
+
+	if outcome == deleteAlreadyGone {
+		return false, nil
+	}
+
+	s.finishNodeDeletion(fresh)
+
+	return true, nil
+}
+
+// ephemeralDeleteCandidate re-checks the node's lifetime under its row lock and
+// returns the node to delete, or an invalid view if it is gone, no longer
+// ephemeral, or has a live session.
+func (s *State) ephemeralDeleteCandidate(id types.NodeID) (types.NodeView, error) {
+	defer s.rows.lock(id)()
+
+	node, ok := s.GetNodeByID(id)
+	if !ok || !node.IsEphemeral() || node.ActiveSessions() > 0 {
+		return types.NodeView{}, nil
+	}
+
+	return node, nil
+}
+
+// deleteEphemeralRow re-checks the lifetime under the row lock — the node may
+// have changed since the candidate was picked — and writes the durable
+// delete, returning the view the re-check read for the teardown. The lock is
+// scoped to the row write with a deferred unlock, so a panic in the driver
+// or a callback cannot leak it for the life of the process. The outcome is
+// meaningful only when the error is nil.
+func (s *State) deleteEphemeralRow(candidate types.NodeView) (deleteOutcome, types.NodeView, error) {
+	defer s.rows.lock(candidate.ID())()
+
+	node, ok := s.GetNodeByID(candidate.ID())
+	if !ok || !node.IsEphemeral() || node.ActiveSessions() > 0 {
+		return deleteRefused, types.NodeView{}, nil
+	}
+
+	err := s.db.DeleteNode(node.AsStruct())
+	if err != nil {
+		// Both spellings mean another delete already dropped the row.
+		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, hsdb.ErrNodeNotFound) {
+			return deleteAlreadyGone, types.NodeView{}, nil
+		}
+
+		return deleteRefused, types.NodeView{}, err
+	}
+
+	return deleteDroppedRow, node, nil
+}
+
+func (s *State) finishNodeDeletion(node types.NodeView) {
+	s.ipAlloc.FreeIPs(node.IPs())
+
+	if fn := s.onNodeDeleted.Load(); fn != nil {
+		(*fn)(node.ID())
+	}
+}
+
 // OnNodeDeleted sets fn to run after each node deletion, with the deleted
-// node's ID; every delete path goes through [State.DeleteNode].
+// node's ID, including conditional ephemeral garbage collection.
 func (s *State) OnNodeDeleted(fn func(types.NodeID)) {
 	s.onNodeDeleted.Store(&fn)
 }
@@ -925,6 +1084,9 @@ func (s *State) OnNodeDeleted(fn func(types.NodeID)) {
 // exactly one [State.Disconnect] call once the session ends (see poll.go).
 // An expired key can keep polling control, but cannot make the node online.
 func (s *State) Connect(id types.NodeID) uint64 {
+	s.connectMu.RLock()
+	defer s.connectMu.RUnlock()
+
 	// Reconnecting clears Unhealthy: the node just proved basic
 	// connectivity by completing the Noise handshake.
 	var epoch uint64
@@ -996,6 +1158,15 @@ func (s *State) Disconnect(id types.NodeID, epoch uint64) error {
 	// Persist LastSeen best-effort: memory already reflects offline.
 	_, err := s.persistNode(node)
 	if err != nil {
+		// A node whose row a lifetime delete already dropped still clears
+		// its session here; the delete finishes removing the node
+		// microseconds later, so this is the expected race, not a fault.
+		if errors.Is(err, ErrNodeNotInNodeStore) {
+			log.Debug().Err(err).EmbedObject(node).Msg("node vanished before last seen persist")
+
+			return nil
+		}
+
 		log.Error().Err(err).EmbedObject(node).Msg("failed to update last seen in database")
 	}
 
@@ -1154,6 +1325,75 @@ func (s *State) ListEphemeralNodes() views.Slice[types.NodeView] {
 	return views.SliceOf(ephemeralNodes)
 }
 
+// LogoutNode applies a client logout only to its still-current registration.
+// The initial checks run unlocked for the early returns; the expiry write
+// re-reads the node under its row lock and re-decides (logoutExpiry), so an
+// admin write landing between the two cannot be stamped over.
+func (s *State) LogoutNode(node types.NodeView, expiry *time.Time) (types.NodeView, error) {
+	defer s.lockRegistration(node.MachineKey())()
+
+	current, ok := s.GetNodeByID(node.ID())
+	if !ok {
+		return types.NodeView{}, ErrNodeNotInNodeStore
+	}
+
+	if current.NodeKey() != node.NodeKey() || current.MachineKey() != node.MachineKey() {
+		return types.NodeView{}, ErrNodeKeyChanged
+	}
+
+	if current.IsExpired() {
+		return current, nil
+	}
+
+	if current.IsEphemeral() {
+		// The delete spans row and memory; keep session admission excluded
+		// across all of it, as the ephemeral GC does. connectMu is taken
+		// here, not the row lock: DeleteNode takes the row lock itself. Both are
+		// released by defers, so a panicking delete cannot wedge admission
+		// or the rest of the control plane.
+		s.connectMu.Lock()
+		defer s.connectMu.Unlock()
+
+		return types.NodeView{}, s.DeleteNode(current)
+	}
+	// Client logout cannot expire a tagged device; admin expiry remains supported.
+	if current.IsTagged() {
+		return current, nil
+	}
+
+	// beforeLogoutWrite, for tests, interposes an admin write between the
+	// unlocked checks above and the locked re-decision below.
+	if fn := s.beforeLogoutWrite; fn != nil {
+		fn()
+	}
+
+	return s.logoutExpiry(current, expiry)
+}
+
+// logoutExpiry stamps the logout expiry in one locked section: the node is
+// re-read under the row lock and the tagged/expired guards re-decided against
+// what the lock sees, so an admin retag landing between LogoutNode's read
+// and this write cannot leave a tagged node expired by a client logout —
+// #3371 territory, where a stale past stamp used to lock a node out for good.
+func (s *State) logoutExpiry(stale types.NodeView, expiry *time.Time) (types.NodeView, error) {
+	defer s.rows.lock(stale.ID())()
+
+	current, ok := s.GetNodeByID(stale.ID())
+	if !ok {
+		return types.NodeView{}, ErrNodeNotInNodeStore
+	}
+
+	if current.NodeKey() != stale.NodeKey() || current.MachineKey() != stale.MachineKey() {
+		return types.NodeView{}, ErrNodeKeyChanged
+	}
+
+	if current.IsExpired() || current.IsTagged() {
+		return current, nil
+	}
+
+	return s.setNodeExpiryLocked(current.ID(), expiry)
+}
+
 // SetNodeExpiry updates the expiration time for a node.
 // If expiry is nil, the node's expiry is disabled (node will never expire).
 func (s *State) SetNodeExpiry(nodeID types.NodeID, expiry *time.Time) (types.NodeView, error) {
@@ -1168,11 +1408,18 @@ func (s *State) SetNodeExpiry(nodeID types.NodeID, expiry *time.Time) (types.Nod
 		expiry = &utc
 	}
 
-	// A re-auth writes the whole row from its own memory write, under the
-	// row lock: an expiry landing between the two would stay in memory
-	// but be overwritten in the row, and come back on restart.
+	// A re-auth stages and persists a whole row under the row lock: an
+	// expiry must not land between staging and publication and be
+	// overwritten.
 	defer s.rows.lock(nodeID)()
 
+	return s.setNodeExpiryLocked(nodeID, expiry)
+}
+
+// setNodeExpiryLocked is [State.SetNodeExpiry] for a caller holding
+// the node's row lock. Callers re-reading the node under the same lock may re-decide
+// against what they see; this helper only writes.
+func (s *State) setNodeExpiryLocked(nodeID types.NodeID, expiry *time.Time) (types.NodeView, error) {
 	// Memory first: it is what clients are served. The database update must
 	// make the exact same change; if it fails, memory keeps the new expiry.
 	n, ok := s.world.UpdateNode(nodeID, func(node *types.Node) {
@@ -1189,6 +1436,10 @@ func (s *State) SetNodeExpiry(nodeID types.NodeID, expiry *time.Time) (types.Nod
 	// Persist expiry directly: persistNode omits it.
 	err := s.db.NodeSetExpiry(nodeID, expiry)
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return types.NodeView{}, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, nodeID)
+		}
+
 		return types.NodeView{}, fmt.Errorf("setting node expiry in database: %w", err)
 	}
 
@@ -1235,8 +1486,8 @@ func (s *State) SetNodeTags(nodeID types.NodeID, tags []string) (types.NodeView,
 	// Log the operation
 	logTagOperation(existingNode, validatedTags)
 
-	// Held across both writes, as by SetNodeExpiry: a re-auth that fails
-	// rolls ownership back, and must not take a retag for its own write.
+	// Held across both writes, as by SetNodeExpiry: a re-auth must not
+	// publish staged ownership over a later admin retag.
 	defer s.rows.lock(nodeID)()
 
 	n, ok := s.world.UpdateNode(nodeID, func(node *types.Node) {
@@ -1746,6 +1997,17 @@ func (s *State) DeleteNodeFromStoreForTest(id types.NodeID) {
 	s.world.DeleteNode(id)
 }
 
+// SetBeforeLogoutWriteForTest runs fn between [State.LogoutNode]'s unlocked
+// checks and its locked write, so handler tests can land a concurrent write in
+// that window. Set it before the logout runs.
+func (s *State) SetBeforeLogoutWriteForTest(fn func()) {
+	if !testing.Testing() {
+		panic("SetBeforeLogoutWriteForTest can only be called during tests")
+	}
+
+	s.beforeLogoutWrite = fn
+}
+
 // UpdatePolicyManagerNodesForTest is a no-op kept for tests: the policy is
 // recompiled whenever a node it reads changes.
 func (s *State) UpdatePolicyManagerNodesForTest() error {
@@ -1879,6 +2141,11 @@ func (s *State) GetAuthCacheEntry(id types.AuthID) (*types.AuthRequest, bool) {
 	return s.authCache.Peek(id)
 }
 
+// DeleteAuthCacheEntry releases a consumed authentication transaction.
+func (s *State) DeleteAuthCacheEntry(id types.AuthID) {
+	s.authCache.Remove(id)
+}
+
 // SetAuthCacheEntry admits a pending authentication without displacing
 // existing transactions. Regular (unauthenticated registration) entries
 // fill only their allocation; dead entries are dropped first, so a full
@@ -1936,11 +2203,6 @@ func (s *State) SetAuthCacheEntry(id types.AuthID, entry *types.AuthRequest) err
 	s.authCache.Add(id, entry)
 
 	return nil
-}
-
-// DeleteAuthCacheEntry releases a consumed authentication transaction.
-func (s *State) DeleteAuthCacheEntry(id types.AuthID) {
-	s.authCache.Remove(id)
 }
 
 // DeleteAuthCacheEntryForTest drops a pending auth request from the cache,
@@ -2023,7 +2285,8 @@ type authNodeUpdateParams struct {
 	Expiry *time.Time
 	// Only used when IsConvertFromTag=true.
 	RegisterMethod string
-	// Set true for tagged->user conversion. Affects RegisterMethod and expiry.
+	// Set true for tagged->user conversion. Affects RegisterMethod only;
+	// expiry follows the resulting tagged status of the staged candidate.
 	IsConvertFromTag bool
 }
 
@@ -2057,8 +2320,8 @@ func applyReauthExpiryTransition(
 }
 
 // applyAuthNodeUpdate applies common update logic for re-authenticating or converting
-// an existing node. It updates the node in memory, processes RequestTags, and
-// persists changes to the database.
+// an existing node. It authorises a private candidate, persists it, then
+// publishes its registration fields without replacing concurrent map updates.
 func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView, error) {
 	regData := params.RegData
 
@@ -2086,11 +2349,28 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 
 	oldTags := params.ExistingNode.Tags().AsSlice()
 
-	// Tags are authorised inside the write below, against the policy the
-	// write commits under, so a policy change cannot slip between a check
-	// and the write. A tag-owned node carries no user and its IP is not in
+	// Tags are authorised when staging below, against the current policy.
+	// A later policy change does not undo that authorisation, as with a new
+	// registration. A tag-owned node carries no user and its IP is not in
 	// any tag owner's set, so checking the node alone rejects every tag on
 	// re-auth (#3374); the authenticating user is checked too.
+
+	// Stage without editing the graph: a failed row write must never expose
+	// a provisional identity to readers or wake map streams.
+	var (
+		prior, candidate *types.Node
+		rejectedTags     []string
+	)
+
+	// Held through publication so a concurrent persistNode cannot overwrite
+	// the durable registration with the old identity still in memory.
+	defer s.rows.lock(params.ExistingNode.ID())()
+
+	// Claim the rotated key across the staged write: a fresh registration
+	// claiming it must finish its insert first, so the check below sees it.
+	defer s.lockNodeKey(regData.NodeKey)()
+
+	s.beforeAuthWrite()
 
 	// Re-auth rotates the NodeKey to the client-supplied value. Enforce the
 	// same 1:1 NodeKey<->MachineKey binding createAndSaveNewNode applies at
@@ -2098,28 +2378,27 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 	// already bound to a different machine must not be claimed here, or a
 	// re-authenticating node could rotate its key to a victim's and poison
 	// the NodeKey index (denying the victim service).
+	// Check under the row lock and the keyed claim, after earlier claims of this
+	// key — re-authentications and fresh inserts alike — have published.
 	if existing, ok := s.Snapshot().GetNodeByNodeKey(regData.NodeKey); ok &&
 		existing.MachineKey() != regData.MachineKey {
 		return types.NodeView{}, ErrNodeKeyInUse
 	}
 
-	// prior is the node the writer replaced, the rollback target if the
-	// database write below fails or a tag is rejected.
-	var (
-		prior, wrote *types.Node
-		rejectedTags []string
-		hostinfoErr  error
-	)
+	var hostinfoErr error
 
-	// Held from the memory write through the row write and any rollback, so
-	// a concurrent persistNode cannot save the registration half done.
-	defer s.rows.lock(params.ExistingNode.ID())()
+	s.world.update(func(nodes *nodeEdit) {
+		var ok bool
 
-	s.beforeAuthWrite()
+		// A retried batch runs this again: set every result on each run.
+		candidate, hostinfoErr, rejectedTags = nil, nil, nil
 
-	// Update existing node in memory - validation passed, safe to mutate
-	updatedNodeView, ok := s.world.UpdateNode(params.ExistingNode.ID(), func(node *types.Node) {
-		prior, wrote, rejectedTags, hostinfoErr = node.Clone(), nil, nil, nil
+		prior, ok = nodes.Get(params.ExistingNode.ID())
+		if !ok {
+			return
+		}
+
+		node := prior.Clone()
 		node.NodeKey = regData.NodeKey
 		// A pending registration carries no disco key; the live one stays
 		// until the node reports a new one.
@@ -2140,8 +2419,6 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 
 		hostinfoErr = types.ValidateHostinfo(node.Hostinfo)
 		if hostinfoErr != nil {
-			*node = *prior
-
 			return
 		}
 
@@ -2165,11 +2442,9 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 		wasTagged := node.IsTagged()
 
 		// Process tags - may change node.Tags and node.UserID. A rejected
-		// tag puts the node back as it was: nothing of this write commits.
+		// tag discards the candidate: nothing of this write commits.
 		rejectedTags = s.processReauthTags(node, requestTags, params.User, oldTags)
 		if len(rejectedTags) > 0 {
-			*node = *prior
-
 			return
 		}
 
@@ -2189,10 +2464,10 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 			node.Expiry = &exp
 		}
 
-		wrote = node.Clone()
+		candidate = node
 	})
 
-	if !ok {
+	if prior == nil {
 		return types.NodeView{}, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, params.ExistingNode.ID())
 	}
 
@@ -2220,21 +2495,28 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 	// the column only in that clearing case; the other transitions keep the
 	// #2862-safe column set untouched.
 	updateColumns := nodeUpdateColumns
-	if !updatedNodeView.AuthKeyID().Valid() {
+	if candidate.AuthKeyID == nil {
 		updateColumns = append(slices.Clone(nodeUpdateColumns), "AuthKeyID")
 	}
 
 	_, err := hsdb.Write(s.db.DB, func(tx *gorm.DB) (*types.Node, error) {
-		err := tx.Select(updateColumns).Updates(updatedNodeView.AsStruct()).Error
-		if err != nil {
-			return nil, fmt.Errorf("saving node: %w", err)
+		result := tx.Select(updateColumns).Updates(candidate)
+		if result.Error != nil {
+			return nil, fmt.Errorf("saving node: %w", result.Error)
+		}
+
+		if result.RowsAffected == 0 {
+			return nil, ErrNodeNotInNodeStore
 		}
 
 		return nil, nil //nolint:nilnil // side-effect only write
 	})
 	if err != nil {
-		s.restoreRegistration(prior, wrote)
+		return types.NodeView{}, err
+	}
 
+	updatedNodeView, err := s.publishRegistration(prior, candidate)
+	if err != nil {
 		return types.NodeView{}, err
 	}
 
@@ -2252,78 +2534,68 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 	return updatedNodeView, nil
 }
 
-// restoreRegistration puts back the registration fields of prior, the node
-// a re-registration replaced in memory, after its database write failed:
-// memory then holds the registration a restart would load. wrote is the
-// node as the re-registration left it, not as its commit published it: a
-// write batched with it, such as a map request's Hostinfo, or one landing
-// since, keeps its value. The disco key and endpoints the
-// write set are kept, as they are the client's live ones; so are sessions,
-// health and LastSeen, as the node did contact us.
-func (s *State) restoreRegistration(prior, w *types.Node) {
-	// prior's copy of its owner misses a rename landing since, which
-	// nothing would refresh again; take it from the users under usersMu,
-	// so no refresh slips between reading and writing it.
-	s.usersMu.Lock()
-	defer s.usersMu.Unlock()
+// publishRegistration merges a durable registration into the latest node.
+// The caller holds the node's row lock: expiry, ownership and row deletion cannot race,
+// but map updates, sessions and user refreshes remain live during the SQL write.
+func (s *State) publishRegistration(prior, candidate *types.Node) (types.NodeView, error) {
+	node, ok := s.world.UpdateNode(prior.ID, func(n *types.Node) {
+		n.NodeKey = candidate.NodeKey
+		n.RegisterMethod = candidate.RegisterMethod
+		n.Tags, n.UserID = candidate.Tags, candidate.UserID
+		n.AuthKey, n.AuthKeyID = candidate.AuthKey, candidate.AuthKeyID
+		n.Expiry = candidate.Expiry
+		n.IsOnline = new(n.ShouldBeOnline())
 
-	owner := prior.User
-	if prior.UserID != nil {
-		for _, u := range s.Snapshot().Users() {
-			if u.ID == *prior.UserID {
-				owner = &u
+		// An unchanged owner already includes concurrent user refreshes.
+		if n.UserID == nil {
+			n.User = nil
+		} else if n.User == nil || n.User.ID != *n.UserID {
+			n.User = candidate.User
+			for _, u := range s.Snapshot().Users() {
+				if u.ID == *n.UserID {
+					n.User = &u
 
-				break
+					break
+				}
 			}
 		}
-	}
 
-	s.world.UpdateNode(prior.ID, func(n *types.Node) {
-		if n.NodeKey == w.NodeKey {
-			n.NodeKey = prior.NodeKey
+		if n.Hostinfo.Equal(prior.Hostinfo) {
+			n.Hostname = candidate.Hostname
+			n.Hostinfo = candidate.Hostinfo
 		}
 
-		if n.Hostname == w.Hostname {
-			n.Hostname = prior.Hostname
+		if n.DiscoKey == prior.DiscoKey {
+			n.DiscoKey = candidate.DiscoKey
 		}
 
-		if n.Hostinfo.Equal(w.Hostinfo) {
-			n.Hostinfo = prior.Hostinfo
+		if slices.Equal(n.Endpoints, prior.Endpoints) {
+			n.Endpoints = candidate.Endpoints
 		}
 
-		if n.RegisterMethod == w.RegisterMethod {
-			n.RegisterMethod = prior.RegisterMethod
-		}
-
-		// Ownership is tags and user together. A node keeping its owner
-		// keeps the user it holds, which renames keep current.
-		if slices.Equal(n.Tags, w.Tags) && samePtr(n.UserID, w.UserID) {
-			if !samePtr(n.UserID, prior.UserID) {
-				n.User = owner
-			}
-
-			n.Tags, n.UserID = prior.Tags, prior.UserID
-		}
-
-		if n.Expiry == w.Expiry || (n.Expiry != nil && w.Expiry != nil && n.Expiry.Equal(*w.Expiry)) {
-			n.Expiry = prior.Expiry
-			n.IsOnline = new(n.ShouldBeOnline())
-		}
-
-		if samePtr(n.AuthKeyID, w.AuthKeyID) {
-			n.AuthKey, n.AuthKeyID = prior.AuthKey, prior.AuthKeyID
+		if n.LastSeen == nil || n.LastSeen.Before(*candidate.LastSeen) {
+			n.LastSeen = candidate.LastSeen
 		}
 	})
-}
+	if !ok {
+		return types.NodeView{}, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, prior.ID)
+	}
 
-// samePtr reports whether a and b are both nil or point to equal values.
-func samePtr[T comparable](a, b *T) bool {
-	return a == b || (a != nil && b != nil && *a == *b)
+	return node, nil
 }
 
 // createAndSaveNewNode creates a new node, allocates IPs, saves to DB, and adds it to memory.
 // It preserves netinfo from an existing node if one is provided (for faster DERP connectivity).
 func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, error) {
+	// A NodeKey claim is exclusive per key, held until the row is inserted
+	// and published: a re-auth rotating onto this key (applyAuthNodeUpdate,
+	// reregisterNodeWithPAK, which claim it under the row lock) must not have
+	// its index poisoned by a duplicate. The row lock is deliberately absent —
+	// it would serialise every join behind every other and defeat the
+	// group-commit batching; a staged re-auth is invisible to the snapshot
+	// below, which is exactly why the claim has to cover the whole write.
+	defer s.lockNodeKey(params.NodeKey)()
+
 	// Preserve NetInfo from existing node if available
 	if params.Hostinfo != nil {
 		params.Hostinfo.NetInfo = preserveNetInfo(
@@ -2640,9 +2912,10 @@ func (s *State) HandleNodeFromAuthPath(
 
 	regData := regEntry.RegistrationData()
 
-	// Hostname was already validated/normalised at producer time. Build
-	// the initial Hostinfo from the cached client-supplied Hostinfo (or
-	// an empty stub if the client did not send one).
+	// Hostname is the raw hostname the registering node reported, as
+	// [registrationDataFromRequest] cached it. Build the initial Hostinfo
+	// from the cached client-supplied Hostinfo (or an empty stub if the
+	// client did not send one).
 	hostname := regData.Hostname
 
 	hostinfo := &tailcfg.Hostinfo{}
@@ -2881,8 +3154,10 @@ func loginNode(all map[types.UserID]types.NodeView, userID types.UserID) (types.
 //   - a node key rotation;
 //   - an expired node, including a tagged node expired by an admin;
 //   - a tagged key converting a user-owned node to tagged;
-//   - a tagged key other than the one the node last authed with, which retags
-//     it.
+//   - a different credential, which can change tags or ephemeral lifetime.
+//
+// A key that does not speak for a tagged node only wakes it and binds
+// nothing, so it is held only to the node key and expiry.
 //
 // It is a pure function of the node so the writer can decide again
 // on the node it actually replaces.
@@ -2893,6 +3168,15 @@ func pakSkipsValidation(n types.NodeView, pak *types.PreAuthKey, nodeKey key.Nod
 
 	isNodeKeyRotation := n.NodeKey() != nodeKey
 	isExpired := n.IsExpiredAt(now)
+
+	if !pak.CanReauthenticate(n) {
+		return n.IsTagged() && !isNodeKeyRotation && !isExpired
+	}
+
+	if !n.AuthKeyID().Valid() || n.AuthKeyID().Get() != pak.ID {
+		return false
+	}
+
 	isOwnershipConversion := pak.ConvertsNodeToTagged(n)
 	isRetag := pak.RetagsNode(n)
 	ownershipMatches := n.IsTagged() ||
@@ -3096,7 +3380,8 @@ func (s *State) HandleNodeFromPreAuthKey(
 }
 
 // reregisterNodeWithPAK updates an existing node in place for a pre-auth key
-// re-registration: memory first, then the database.
+// re-registration: authorise a private candidate, persist it and consume the
+// key in one transaction, then publish the committed identity.
 //
 // The caller's lookup view goes stale before the writer runs: an
 // admin or logout expiry, a node key reconcile, a retag or a deletion can land
@@ -3121,36 +3406,48 @@ func (s *State) reregisterNodeWithPAK(
 		Str(zf.UserName, pak.Username()).
 		Msg("Node re-registering with existing machine key and user, updating in place")
 
+	// prior is the staging baseline for preserving concurrent map updates.
+	var (
+		prior, candidate *types.Node
+		authErr          error
+		reauth           bool
+	)
+
+	// Held through publication so a concurrent persistNode cannot overwrite
+	// the durable registration with the old identity still in memory.
+	defer s.rows.lock(existingNodeSameUser.ID())()
+
+	// Claim the rotated key across the staged write: a fresh registration
+	// claiming it must finish its insert first, so the check below sees it.
+	defer s.lockNodeKey(regReq.NodeKey)()
+
 	// Re-registration rotates the NodeKey to the client-supplied value.
 	// Enforce the same 1:1 NodeKey<->MachineKey binding the auth path
 	// (applyAuthNodeUpdate) and poll-time validation enforce: a NodeKey
 	// already bound to a different machine must not be claimed here, or a
 	// re-registering node could rotate its key to a victim's and poison the
 	// NodeKey index, denying the victim service.
+	// Check under the row lock and the keyed claim, after earlier claims of this
+	// key — re-authentications and fresh inserts alike — have published.
 	if existing, ok := s.Snapshot().GetNodeByNodeKey(regReq.NodeKey); ok &&
 		existing.MachineKey() != machineKey {
 		return types.NodeView{}, ErrNodeKeyInUse
 	}
 
-	// prior is the node the writer replaced: the NetInfo source and the
-	// rollback target if the database write below fails.
-	var (
-		prior   *types.Node
-		wrote   *types.Node
-		authErr error
-		reauth  bool
-	)
+	s.world.update(func(nodes *nodeEdit) {
+		var ok bool
 
-	// Held from the memory write through the row write and any rollback, so
-	// a concurrent persistNode cannot save the registration half done.
-	defer s.rows.lock(existingNodeSameUser.ID())()
+		// A retried batch runs this again: set every result on each run.
+		candidate, authErr, reauth = nil, nil, false
 
-	// Update existing node - memory first, then database
-	updatedNodeView, ok := s.world.UpdateNode(existingNodeSameUser.ID(), func(node *types.Node) {
+		prior, ok = nodes.Get(existingNodeSameUser.ID())
+		if !ok {
+			return
+		}
+
+		node := prior.Clone()
 		// One clock read, so the whole mutation is decided at one instant.
 		now := time.Now()
-
-		prior, wrote = node.Clone(), nil
 
 		reauth, authErr = pakReregister(node.View(), pak, regReq.NodeKey, now)
 		if authErr != nil {
@@ -3174,7 +3471,7 @@ func (s *State) reregisterNodeWithPAK(
 		node.LastSeen = new(now)
 
 		if !reauth {
-			wrote = node.Clone()
+			candidate = node
 
 			return
 		}
@@ -3236,7 +3533,8 @@ func (s *State) reregisterNodeWithPAK(
 		// did not request a specific expiry. If neither is set,
 		// clear the expiry so the database holds NULL instead of
 		// a pointer to zero time.
-		if !node.IsTagged() {
+		// A spent-key restart resumes existing authorization, never extends it.
+		if !node.IsTagged() && pak.ValidAt(now) == nil {
 			if !regReq.Expiry.IsZero() {
 				node.Expiry = &regReq.Expiry
 			} else if s.cfg.Node.Expiry > 0 {
@@ -3245,18 +3543,17 @@ func (s *State) reregisterNodeWithPAK(
 			} else {
 				node.Expiry = nil
 			}
-		} else if node.IsExpiredAt(now) {
-			// A valid key re-authenticated this expired tagged node. A future
-			// administrative expiry has not taken effect and stays untouched.
+		} else if node.IsTagged() && node.IsExpiredAt(now) {
+			// Expired nodes reached here only after fresh authorization.
 			node.Expiry = nil
 		}
 
-		wrote = node.Clone()
+		candidate = node
 	})
 
 	// A nil prior means the writer never saw the node (deleted), so nothing
 	// was decided and nothing may be persisted.
-	if !ok || prior == nil {
+	if prior == nil {
 		return types.NodeView{}, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, existingNodeSameUser.ID())
 	}
 
@@ -3272,6 +3569,32 @@ func (s *State) reregisterNodeWithPAK(
 		return types.NodeView{}, authErr
 	}
 
+	err := s.persistPAKReregistration(candidate, pak, reauth)
+	if err != nil {
+		return types.NodeView{}, fmt.Errorf("writing node to database: %w", err)
+	}
+
+	updatedNodeView, err := s.publishRegistration(prior, candidate)
+	if err != nil {
+		return types.NodeView{}, err
+	}
+
+	log.Trace().
+		Caller().
+		Str(zf.NodeName, updatedNodeView.Hostname()).
+		Uint64(zf.NodeID, updatedNodeView.ID().Uint64()).
+		Str(zf.MachineKey, machineKey.ShortString()).
+		Str(zf.NodeKey, updatedNodeView.NodeKey().ShortString()).
+		Str(zf.UserName, pak.Username()).
+		Msg("Node re-authorized")
+
+	return updatedNodeView, nil
+}
+
+// persistPAKReregistration writes a staged pre-auth key re-registration in
+// one transaction: the node row, its key reference when the key
+// re-authenticated it, and a single-use key's consumption.
+func (s *State) persistPAKReregistration(candidate *types.Node, pak *types.PreAuthKey, reauth bool) error {
 	_, err := hsdb.Write(s.db.DB, func(tx *gorm.DB) (*types.Node, error) {
 		// Explicitly select all node columns so GORM includes nil/zero-value fields
 		// (see nodeUpdateColumns comment). AuthKeyID is excluded on MapRequest
@@ -3285,9 +3608,13 @@ func (s *State) reregisterNodeWithPAK(
 			reregColumns = append(slices.Clone(nodeUpdateColumns), "AuthKeyID")
 		}
 
-		err := tx.Select(reregColumns).Updates(updatedNodeView.AsStruct()).Error
-		if err != nil {
-			return nil, fmt.Errorf("saving node: %w", err)
+		result := tx.Select(reregColumns).Updates(candidate)
+		if result.Error != nil {
+			return nil, fmt.Errorf("saving node: %w", result.Error)
+		}
+
+		if result.RowsAffected == 0 {
+			return nil, ErrNodeNotInNodeStore
 		}
 
 		// Only mark the key used on the *first* registration. On
@@ -3296,7 +3623,7 @@ func (s *State) reregisterNodeWithPAK(
 		// reject it as "authkey already used", locking out containers
 		// that restart with the same one-shot key.
 		if reauth && !pak.Reusable && !pak.Used {
-			err = hsdb.UsePreAuthKey(tx, pak)
+			err := hsdb.UsePreAuthKey(tx, pak)
 			if err != nil {
 				return nil, fmt.Errorf("using pre auth key: %w", err)
 			}
@@ -3304,22 +3631,8 @@ func (s *State) reregisterNodeWithPAK(
 
 		return nil, nil //nolint:nilnil // intentional: transaction success
 	})
-	if err != nil {
-		s.restoreRegistration(prior, wrote)
 
-		return types.NodeView{}, fmt.Errorf("writing node to database: %w", err)
-	}
-
-	log.Trace().
-		Caller().
-		Str(zf.NodeName, updatedNodeView.Hostname()).
-		Uint64(zf.NodeID, updatedNodeView.ID().Uint64()).
-		Str(zf.MachineKey, machineKey.ShortString()).
-		Str(zf.NodeKey, updatedNodeView.NodeKey().ShortString()).
-		Str(zf.UserName, pak.Username()).
-		Msg("Node re-authorized")
-
-	return updatedNodeView, nil
+	return err
 }
 
 // UpdatePolicyManagerUsersForTest loads the database's users into memory,
@@ -3389,6 +3702,13 @@ func (s *State) autoApproveNodes() (int, error) {
 
 		_, err := s.persistNode(fresh)
 		if err != nil {
+			// A node whose row a lifetime delete already dropped is on its
+			// way out of the graph too; its approval has nowhere to persist,
+			// and one vanished node must not hold the rest hostage.
+			if errors.Is(err, ErrNodeNotInNodeStore) {
+				continue
+			}
+
 			return len(approvedByID), err
 		}
 	}
@@ -3435,6 +3755,7 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 		delta              mapRequestDelta
 		routeChange        bool
 		autoApprovedRoutes []netip.Prefix
+		updateErr          error
 	)
 
 	// Only for the debug line below; a concurrent writer can move it too.
@@ -3442,9 +3763,22 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 
 	// We need to ensure we update the node as it is in memory at the time of
 	// the request.
-	updatedNode, ok := s.world.UpdateNode(id, func(currentNode *types.Node) {
-		delta, routeChange, autoApprovedRoutes = mapRequestDelta{}, false, nil
+	snap := s.world.update(func(nodes *nodeEdit) {
+		// A retried batch runs this again: set every result on each run.
+		updateErr, delta, routeChange, autoApprovedRoutes = nil, mapRequestDelta{}, false, nil
 
+		stored, ok := nodes.Get(id)
+		if !ok {
+			updateErr = fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, id)
+			return
+		}
+		// Noise authentication precedes this write; reauthentication may have replaced its key.
+		if stored.NodeKey != req.NodeKey {
+			updateErr = ErrNodeKeyChanged
+			return
+		}
+
+		currentNode := stored.Clone()
 		// Capture the raw wire-level peer change; LastSeen is always
 		// stamped.
 		delta.peerChange = currentNode.PeerChangeFromMapRequest(req)
@@ -3500,19 +3834,10 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 
 		hostinfoToStore := delta.hostinfoChanged || delta.derpChanged
 
-		var hasNewRoutes bool
-		if hi := req.Hostinfo; hi != nil {
-			hasNewRoutes = len(hi.RoutableIPs) > 0
-		}
-
 		needsRouteApproval := delta.hostinfoChanged &&
-			(delta.routesChanged || (hasNewRoutes && len(currentNode.ApprovedRoutes) == 0))
+			(delta.routesChanged || (len(newHostinfo.RoutableIPs) > 0 && len(currentNode.ApprovedRoutes) == 0))
 		if needsRouteApproval {
-			// Extract announced routes from request
-			var announcedRoutes []netip.Prefix
-			if req.Hostinfo != nil {
-				announcedRoutes = req.Hostinfo.RoutableIPs
-			}
+			announcedRoutes := newHostinfo.RoutableIPs
 
 			// Apply policy-based auto-approval if routes are announced. The
 			// latest snapshot is the one this write builds on: no other
@@ -3529,16 +3854,14 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 
 		// Log when routes change but approval doesn't
 		if delta.routesChanged && !routeChange {
-			if hi := req.Hostinfo; hi != nil {
-				log.Debug().
-					Caller().
-					Uint64(zf.NodeID, id.Uint64()).
-					Strs(zf.OldAnnouncedRoutes, util.PrefixesToString(currentNode.AnnouncedRoutes())).
-					Strs(zf.NewAnnouncedRoutes, util.PrefixesToString(hi.RoutableIPs)).
-					Strs(zf.ApprovedRoutes, util.PrefixesToString(currentNode.ApprovedRoutes)).
-					Bool(zf.RouteChanged, routeChange).
-					Msg("announced routes changed but approved routes did not")
-			}
+			log.Debug().
+				Caller().
+				Uint64(zf.NodeID, id.Uint64()).
+				Strs(zf.OldAnnouncedRoutes, util.PrefixesToString(currentNode.AnnouncedRoutes())).
+				Strs(zf.NewAnnouncedRoutes, util.PrefixesToString(newHostinfo.RoutableIPs)).
+				Strs(zf.ApprovedRoutes, util.PrefixesToString(currentNode.ApprovedRoutes)).
+				Bool(zf.RouteChanged, routeChange).
+				Msg("announced routes changed but approved routes did not")
 		}
 
 		currentNode.ApplyPeerChange(&delta.peerChange)
@@ -3560,7 +3883,6 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 			currentNode.Hostname = newHostinfo.Hostname
 			if autoDerived {
 				currentNode.GivenName = dnsname.SanitizeHostname(newHostinfo.Hostname)
-				// [world.UpdateNode] auto-bumps GivenName on collision.
 			}
 		}
 
@@ -3585,8 +3907,19 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 		if len(currentNode.AllApprovedRoutes()) == 0 {
 			currentNode.Unhealthy = false
 		}
+
+		if currentNode.GivenName != stored.GivenName {
+			currentNode.GivenName = uniqueGivenName(nodes, id, currentNode.GivenName)
+		}
+
+		nodes.Set(id, currentNode)
 	})
 
+	if updateErr != nil {
+		return updateErr
+	}
+
+	updatedNode, ok := snap.GetNode(id)
 	if !ok {
 		return fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, id)
 	}

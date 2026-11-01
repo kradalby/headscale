@@ -199,7 +199,6 @@ func (h *Headscale) handleLogout(
 	if node.IsExpired() {
 		log.Trace().
 			EmbedObject(node).
-			Interface("reg.req", req).
 			Bool("unexpected", true).
 			Msg("Node key expired, forcing re-authentication")
 
@@ -221,54 +220,6 @@ func (h *Headscale) handleLogout(
 		return nil, NewHTTPError(http.StatusBadRequest, "extending key is not allowed", nil)
 	}
 
-	// If the request expiry is in the past, we consider it a logout.
-	// Zero expiry is handled in [Headscale.handleRegister] before calling this function.
-	if req.Expiry.Before(time.Now()) {
-		log.Debug().
-			EmbedObject(node).
-			Bool("is_ephemeral", node.IsEphemeral()).
-			Bool("has_authkey", node.AuthKey().Valid()).
-			Time("req.expiry", req.Expiry).
-			Msg("Processing logout request with past expiry")
-
-		if node.IsEphemeral() {
-			log.Info().
-				EmbedObject(node).
-				Msg("Deleting ephemeral node during logout")
-
-			err := h.state.DeleteNode(node)
-			if err != nil {
-				return nil, fmt.Errorf("deleting ephemeral node: %w", err)
-			}
-
-			return &tailcfg.RegisterResponse{
-				NodeKeyExpired:    true,
-				MachineAuthorized: false,
-			}, nil
-		}
-
-		log.Debug().
-			EmbedObject(node).
-			Msg("Node is not ephemeral, setting expiry instead of deleting")
-	}
-
-	// Tagged nodes have key expiry permanently disabled (they are owned by
-	// their tags, not a user, and never expire - KB 1068). Logging one out has
-	// no expiry semantics, so do not stamp an expiry on it: doing so leaves the
-	// node IsExpired() forever and it can never re-authenticate (#3371). The
-	// admin path `headscale nodes expire` remains free to set a deliberate
-	// expiry via SetNodeExpiry; only the logout path is guarded here.
-	if node.IsTagged() {
-		log.Debug().
-			EmbedObject(node).
-			Msg("Tagged node logout: not stamping expiry (tagged nodes never expire)")
-
-		return nodeToRegisterResponse(node), nil
-	}
-
-	// Update the internal state with the nodes new expiry, meaning it is
-	// logged out.
-	//
 	// Clamp the client-supplied value to now: Tailscale sends the
 	// sentinel time.Unix(123, 0) on logout (controlclient/direct.go),
 	// and storing it verbatim propagates a 1970 KeyExpiry to every
@@ -279,9 +230,17 @@ func (h *Headscale) handleLogout(
 		expiry = now
 	}
 
-	updatedNode, err := h.state.SetNodeExpiry(node.ID(), &expiry)
+	updatedNode, err := h.state.LogoutNode(node, &expiry)
 	if err != nil {
-		return nil, fmt.Errorf("setting node expiry: %w", err)
+		if errors.Is(err, state.ErrNodeKeyChanged) || errors.Is(err, state.ErrNodeNotInNodeStore) {
+			return nil, NewHTTPError(http.StatusUnauthorized, "node registration changed", err)
+		}
+
+		return nil, fmt.Errorf("logging out node: %w", err)
+	}
+
+	if !updatedNode.Valid() {
+		return &tailcfg.RegisterResponse{NodeKeyExpired: true, MachineAuthorized: false}, nil
 	}
 
 	return nodeToRegisterResponse(updatedNode), nil
@@ -509,7 +468,6 @@ func (h *Headscale) handleRegisterWithAuthKey(
 	log.Trace().
 		Caller().
 		Interface("reg.resp", resp).
-		Interface("reg.req", req).
 		EmbedObject(node).
 		Msg("RegisterResponse")
 

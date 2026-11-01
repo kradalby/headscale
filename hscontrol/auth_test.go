@@ -3,9 +3,11 @@ package hscontrol
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"runtime/pprof"
@@ -19,6 +21,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
@@ -4720,6 +4723,323 @@ func TestFollowupWaitPrefersCompletedAuthOverExpiredContext(t *testing.T) {
 	assert.Equal(t, iterations, authorized, "every completed registration must be returned as authorized")
 }
 
+func TestInteractiveRegistrationCompactsDecodedHostinfo(t *testing.T) {
+	for _, path := range []string{"initial", "followup"} {
+		t.Run(path, func(t *testing.T) {
+			app := createTestApp(t)
+
+			followup := ""
+			if path == "followup" {
+				followup = app.authProvider.RegisterURL(types.MustAuthID())
+			}
+
+			body := fmt.Sprintf(`{"Version":%d,"NodeKey":%q,"Followup":%q,"Hostinfo":{
+				"Hostname":"compact","Services":[%s{}],"Services":[{"Port":80}],
+				"RequestTags":["tag:keep",%q],"RequestTags":["tag:keep"]}}`,
+				tailcfg.CurrentCapabilityVersion, key.NewNode().Public().String(), followup,
+				strings.Repeat("{},", 4096), strings.Repeat("x", 128<<10))
+			ns := noiseServer{headscale: app, machineKey: key.NewMachine().Public()}
+			response := httptest.NewRecorder()
+			ns.RegistrationHandler(response, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/machine/register", strings.NewReader(body)))
+			require.Equal(t, http.StatusOK, response.Code)
+
+			var reply tailcfg.RegisterResponse
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &reply))
+			require.Empty(t, reply.Error)
+			authID, err := extractRegistrationIDFromAuthURL(reply.AuthURL)
+			require.NoError(t, err)
+
+			entry, ok := app.state.GetAuthCacheEntry(authID)
+			require.True(t, ok)
+
+			hi := entry.RegistrationData().Hostinfo
+			require.NotNil(t, hi)
+			assert.Equal(t, "compact", hi.Hostname)
+			// A pending registration keeps only the auth-relevant fields:
+			// duplicate-key services never enter the cache at all.
+			assert.Empty(t, hi.Services)
+			assert.Equal(t, []string{"tag:keep"}, hi.RequestTags)
+			// Compact, not exact: what matters is no discarded backing
+			// array survives the clone, so cap must not exceed len.
+			assert.LessOrEqual(t, cap(hi.RequestTags), len(hi.RequestTags), "cached payload must not retain discarded strings")
+		})
+	}
+}
+
+func TestInteractiveRegistrationHostinfoWireError(t *testing.T) {
+	for _, path := range []string{"initial", "followup"} {
+		t.Run(path, func(t *testing.T) {
+			app := createTestApp(t)
+
+			req := tailcfg.RegisterRequest{
+				Version: tailcfg.CurrentCapabilityVersion, NodeKey: key.NewNode().Public(),
+				Hostinfo: &tailcfg.Hostinfo{Hostname: "large", OS: strings.Repeat("x", types.MaxHostinfoSize-128)},
+			}
+			require.NoError(t, types.ValidateHostinfo(req.Hostinfo), "only the payload cap may refuse it")
+
+			if path == "followup" {
+				req.Followup = app.authProvider.RegisterURL(types.MustAuthID())
+			}
+
+			body, err := json.Marshal(req)
+			require.NoError(t, err)
+
+			ns := noiseServer{headscale: app, machineKey: key.NewMachine().Public()}
+			response := httptest.NewRecorder()
+			ns.RegistrationHandler(response, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/machine/register", bytes.NewReader(body)))
+			require.Equal(t, http.StatusOK, response.Code, "registration errors use the protocol response envelope")
+
+			var reply tailcfg.RegisterResponse
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &reply))
+			assert.Contains(t, reply.Error, types.ErrRegistrationPayloadTooLarge.Error())
+			assert.Empty(t, reply.AuthURL)
+			assert.False(t, reply.MachineAuthorized)
+			assert.Equal(t, 0, app.state.DebugRegistrationCache()["current_len"])
+		})
+	}
+}
+
+func TestInteractiveRegistrationRejectsOversizedHostinfo(t *testing.T) {
+	for _, followup := range []bool{false, true} {
+		name := "initial"
+		if followup {
+			name = "followup"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			app := createTestApp(t)
+			req := tailcfg.RegisterRequest{
+				NodeKey:  key.NewNode().Public(),
+				Hostinfo: &tailcfg.Hostinfo{Hostname: "large-hostinfo", OS: strings.Repeat("x", types.MaxHostinfoSize-128)},
+			}
+
+			register := app.handleRegisterInteractive
+			if followup {
+				register = func(r tailcfg.RegisterRequest, mk key.MachinePublic) (*tailcfg.RegisterResponse, error) {
+					return app.reqToNewRegisterResponse(registrationDataFromRequest(r, mk))
+				}
+			}
+
+			resp, err := register(req, key.NewMachine().Public())
+			require.Error(t, err, "oversized unauthenticated payload must not enter the auth cache")
+			assert.Nil(t, resp)
+
+			var httpErr HTTPError
+			require.ErrorAs(t, err, &httpErr)
+			assert.Equal(t, http.StatusRequestEntityTooLarge, httpErr.Code)
+
+			req.Hostinfo.OS = "linux"
+			resp, err = register(req, key.NewMachine().Public())
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			assert.NotEmpty(t, resp.AuthURL)
+		})
+	}
+}
+
+// TestRegistrationPayloadCapCountsRetainedFields pins that the pending
+// registration cap measures what the auth cache keeps, not what the client
+// sent: a router announcing the most routes a Hostinfo may carry or a host
+// with large services is accepted, while oversized retained fields are still
+// refused before they reach the cache. Each registration first passes
+// [types.ValidateHostinfo], so only the cap can refuse it, and would exceed
+// the cap untrimmed. "handler" calls [Headscale.handleRegister] directly, the
+// owner every Noise request reaches.
+func TestRegistrationPayloadCapCountsRetainedFields(t *testing.T) {
+	routes := make([]netip.Prefix, types.MaxRoutableIPs)
+	for i := range routes {
+		routes[i] = netip.PrefixFrom(netip.AddrFrom16([16]byte{0xfd, 0, 0xab, 0xcd, 0xef, 0x01, byte(i >> 8), byte(i)}), 64)
+	}
+
+	services := make([]tailcfg.Service, 64)
+	for i := range services {
+		services[i] = tailcfg.Service{Proto: tailcfg.TCP, Port: uint16(1000 + i), Description: strings.Repeat("s", 512)}
+	}
+
+	// Requested tags filling the wire validator's Hostinfo bound exactly.
+	tags := make([]string, 200)
+	for i := range tags {
+		tags[i] = fmt.Sprintf("tag:%03d-%s", i, strings.Repeat("t", 300))
+	}
+
+	tagged := tailcfg.Hostinfo{Hostname: "tagged", OS: "linux", RequestTags: tags}
+	encoded, err := json.Marshal(&tagged)
+	require.NoError(t, err)
+
+	tags[len(tags)-1] += strings.Repeat("t", types.MaxHostinfoSize-len(encoded))
+
+	cases := []struct {
+		name  string
+		hi    tailcfg.Hostinfo
+		admit bool
+	}{
+		{"routes", tailcfg.Hostinfo{Hostname: "router", OS: "linux", RoutableIPs: routes}, true},
+		{"services", tailcfg.Hostinfo{Hostname: "server", OS: "linux", Services: services, RoutableIPs: routes}, true},
+		{"request-tags", tagged, false},
+	}
+
+	for _, tc := range cases {
+		untrimmed, err := json.Marshal(&types.RegistrationData{Hostname: tc.hi.Hostname, Hostinfo: &tc.hi})
+		require.NoError(t, err)
+		require.Greater(t, len(untrimmed), types.MaxRegistrationPayloadBytes, "%s: the untrimmed registration must exceed the cap", tc.name)
+		require.NoError(t, types.ValidateHostinfo(&tc.hi), "%s: only the cap may refuse it", tc.name)
+
+		for _, via := range []string{"wire", "handler"} {
+			for _, path := range []string{"initial", "followup"} {
+				t.Run(tc.name+"/"+via+"/"+path, func(t *testing.T) {
+					app := createTestApp(t)
+
+					hi := tc.hi
+
+					req := tailcfg.RegisterRequest{
+						Version: tailcfg.CurrentCapabilityVersion, NodeKey: key.NewNode().Public(),
+						Hostinfo: &hi,
+					}
+					if path == "followup" {
+						req.Followup = app.authProvider.RegisterURL(types.MustAuthID())
+					}
+
+					var (
+						reply   *tailcfg.RegisterResponse
+						errText string
+					)
+
+					machine := key.NewMachine().Public()
+					if via == "wire" {
+						ns := &noiseServer{headscale: app, machineKey: machine}
+						rec := serveRegister(t, ns, req)
+						require.Equal(t, http.StatusOK, rec.Code, "registration errors use the protocol response envelope")
+
+						reply = &tailcfg.RegisterResponse{}
+						require.NoError(t, json.Unmarshal(rec.Body.Bytes(), reply))
+						errText = reply.Error
+					} else {
+						var err error
+
+						reply, err = app.handleRegister(t.Context(), req, machine)
+						if err != nil {
+							var httpErr HTTPError
+							require.ErrorAs(t, err, &httpErr)
+							assert.Equal(t, http.StatusRequestEntityTooLarge, httpErr.Code)
+
+							errText = err.Error()
+						}
+					}
+
+					if !tc.admit {
+						assert.Contains(t, errText, types.ErrRegistrationPayloadTooLarge.Error(), "oversized retained fields must be refused")
+						assert.Zero(t, app.state.DebugRegistrationCache()["current_len"], "a refused registration must not enter the auth cache")
+
+						return
+					}
+
+					require.Empty(t, errText, "fields the pending registration drops must not count against the cap")
+					require.NotNil(t, reply)
+
+					authID, err := extractRegistrationIDFromAuthURL(reply.AuthURL)
+					require.NoError(t, err)
+
+					entry, ok := app.state.GetAuthCacheEntry(authID)
+					require.True(t, ok)
+
+					cached := entry.RegistrationData().Hostinfo
+					require.NotNil(t, cached)
+					assert.Equal(t, tailcfg.Hostinfo{Hostname: tc.hi.Hostname, OS: tc.hi.OS}, *cached, "only retained fields enter the cache")
+				})
+			}
+		}
+	}
+}
+
+func TestDelayedLogoutCannotModifyReauthentication(t *testing.T) {
+	for _, ephemeral := range []bool{false, true} {
+		name := "permanent"
+		if ephemeral {
+			name = "ephemeral"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			app := createTestApp(t)
+			user := app.state.CreateUserForTest("logout-owner")
+			oldKey, err := app.state.CreatePreAuthKey(user.TypedID(), true, ephemeral, nil, nil)
+			require.NoError(t, err)
+
+			machine := key.NewMachine().Public()
+			req := tailcfg.RegisterRequest{
+				Auth: &tailcfg.RegisterResponseAuth{AuthKey: oldKey.Key}, NodeKey: key.NewNode().Public(),
+				Hostinfo: &tailcfg.Hostinfo{Hostname: "logout-node"},
+			}
+			stale, err := app.state.HandleNodeFromPreAuthKey(req, machine)
+			require.NoError(t, err)
+
+			logout := tailcfg.RegisterRequest{NodeKey: req.NodeKey, Expiry: time.Unix(123, 0)}
+			freshKey, err := app.state.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+			require.NoError(t, err)
+
+			req.Auth = &tailcfg.RegisterResponseAuth{AuthKey: freshKey.Key}
+			req.NodeKey = key.NewNode().Public()
+			fresh, err := app.state.HandleNodeFromPreAuthKey(req, machine)
+			require.NoError(t, err)
+			require.Equal(t, stale.ID(), fresh.ID())
+
+			before := app.state.Snapshot().Rev()
+			_, err = app.handleLogout(stale, logout, machine)
+			require.Error(t, err, "an old-key logout must not modify the replacement registration")
+			assert.Equal(t, before, app.state.Snapshot().Rev())
+			live, ok := app.state.GetNodeByID(fresh.ID())
+			require.True(t, ok)
+			assert.Equal(t, fresh.AsStruct(), live.AsStruct())
+			durable, err := app.state.DB().GetNodeByID(fresh.ID())
+			require.NoError(t, err)
+			assert.False(t, durable.IsExpired())
+			assert.Equal(t, fresh.NodeKey(), durable.NodeKey)
+		})
+	}
+}
+
+func TestRegistrationTraceDoesNotExposeAuthKey(t *testing.T) {
+	app := createTestApp(t)
+	user := app.state.CreateUserForTest("trace-owner")
+	pak, err := app.state.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+	require.NoError(t, err)
+
+	previousLogger, previousLevel := log.Logger, zerolog.GlobalLevel()
+
+	t.Cleanup(func() {
+		log.Logger = previousLogger
+
+		zerolog.SetGlobalLevel(previousLevel)
+	})
+
+	var output bytes.Buffer
+
+	log.Logger = zerolog.New(&output)
+
+	zerolog.SetGlobalLevel(zerolog.TraceLevel)
+
+	machine := key.NewMachine().Public()
+	req := tailcfg.RegisterRequest{
+		Auth: &tailcfg.RegisterResponseAuth{AuthKey: pak.Key}, NodeKey: key.NewNode().Public(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "trace-node"},
+	}
+	_, err = app.handleRegisterWithAuthKey(req, machine)
+	require.NoError(t, err)
+	assert.Contains(t, output.String(), "RegisterResponse")
+	assert.NotContains(t, output.String(), pak.Key, "registration trace exposed the credential")
+
+	node, ok := app.state.GetNodeByNodeKey(req.NodeKey)
+	require.True(t, ok)
+
+	node, err = app.state.SetNodeExpiry(node.ID(), new(time.Now().Add(-time.Hour)))
+	require.NoError(t, err)
+	output.Reset()
+
+	_, err = app.handleLogout(node, req, machine)
+	require.NoError(t, err)
+	assert.Contains(t, output.String(), "forcing re-authentication")
+	assert.NotContains(t, output.String(), pak.Key, "expired-node trace exposed the credential")
+}
+
 // labelFollowup marks the calling goroutine as a followup of the test
 // named name, so parkedFollowups counts it and no other test's.
 func labelFollowup(name string) {
@@ -4760,6 +5080,83 @@ func waitFollowupsParked(t *testing.T, n int) {
 
 	require.Eventually(t, func() bool { return parkedFollowups(t.Name()) >= n },
 		2*time.Second, 5*time.Millisecond, "followup request never parked")
+}
+
+// TestRegistrationPayloadBoundaryIsExactly64KiB pins the documented boundary:
+// a pending registration whose serialized payload is exactly the cap is
+// accepted and one byte over is rejected. OS carries the size because it is
+// retained and, unlike the hostname, passes [types.ValidateHostinfo] at this
+// size; the routes pin that fields a pending registration drops do not count.
+func TestRegistrationPayloadBoundaryIsExactly64KiB(t *testing.T) {
+	app := createTestApp(t)
+
+	machine, nodeKey := key.NewMachine().Public(), key.NewNode().Public()
+
+	routes := make([]netip.Prefix, 1024)
+	for i := range routes {
+		routes[i] = netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 0}), 24)
+	}
+
+	mk := func(n int) tailcfg.RegisterRequest {
+		return tailcfg.RegisterRequest{
+			NodeKey:  nodeKey,
+			Hostinfo: &tailcfg.Hostinfo{Hostname: "node", OS: strings.Repeat("x", n), RoutableIPs: routes},
+		}
+	}
+
+	// Measure the serialized overhead around a one-byte OS so the exact-cap
+	// payload can be constructed instead of guessed.
+	probe, err := json.Marshal(registrationDataFromRequest(mk(1), machine))
+	require.NoError(t, err)
+
+	exact := types.MaxRegistrationPayloadBytes - (len(probe) - 1)
+
+	require.NoError(t, types.ValidateHostinfo(mk(exact+1).Hostinfo), "the wire validator must not decide this boundary")
+
+	_, err = app.handleRegisterInteractive(mk(exact), machine)
+	require.NoError(t, err, "a payload of exactly the cap is accepted")
+
+	_, err = app.handleRegisterInteractive(mk(exact+1), machine)
+	require.ErrorIs(t, err, types.ErrRegistrationPayloadTooLarge, "one byte over the cap is rejected")
+}
+
+// TestLogoutWithUnresolvableKeyStartsRegistration pins the common case the
+// registration reference documents: a logout still signed with a replaced
+// node key no longer resolves to any node, so the request is an ordinary
+// interactive registration with a fresh auth URL — not the error envelope
+// the matched-key race produces.
+func TestLogoutWithUnresolvableKeyStartsRegistration(t *testing.T) {
+	app := createTestApp(t)
+
+	user := app.state.CreateUserForTest("logout-gone")
+	pak, err := app.state.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+	require.NoError(t, err)
+
+	machine := key.NewMachine().Public()
+	oldKey := key.NewNode().Public()
+	_, err = app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+		Auth: &tailcfg.RegisterResponseAuth{AuthKey: pak.Key}, NodeKey: oldKey,
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "logout-gone"},
+	}, machine)
+	require.NoError(t, err)
+
+	// A reauthentication rotates the node onto a new key.
+	_, err = app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+		Auth: &tailcfg.RegisterResponseAuth{AuthKey: pak.Key}, NodeKey: key.NewNode().Public(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "logout-gone"},
+	}, machine)
+	require.NoError(t, err)
+
+	// The logout with the replaced key: both lookups miss, and the client
+	// gets a fresh registration instead of an error.
+	resp, err := app.handleRegister(t.Context(), tailcfg.RegisterRequest{
+		NodeKey: oldKey, Expiry: time.Unix(123, 0),
+	}, machine)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.NotEmpty(t, resp.AuthURL, "an unresolvable logout key starts a fresh registration")
+	assert.Empty(t, resp.Error)
+	assert.False(t, resp.NodeKeyExpired)
 }
 
 // TestRegisterRejectsUnencodableExpiry proves a registration cannot store a key
