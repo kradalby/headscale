@@ -74,7 +74,7 @@ make dev
 
 # Individual targets
 make build           # build the headscale binary
-make test            # go test ./...
+make test            # go test -race ./...
 make fmt             # format Go, docs, proto
 make lint            # lint Go, proto
 make generate        # regenerate protobuf code (after changes to proto/)
@@ -144,19 +144,22 @@ headscale/
 
 ### `hscontrol/` packages
 
-- `app.go`, `handlers.go`, `grpcv1.go`, `noise.go`, `auth.go`, `oidc.go`,
+- `app.go`, `handlers.go`, `noise.go`, `auth.go`, `oidc.go`,
   `poll.go`, `metrics.go`, `debug.go`, `tailsql.go`, `platform_config.go`
   — top-level server files
-- `state/` — central coordinator (`state.go`) and the copy-on-write
-  `NodeStore` (`node_store.go`). All cross-subsystem operations go
+- `graph/` — small typed dataflow graph: input cells, derived cells with
+  equality cutoff, immutable snapshots, coalescing subscriptions, and
+  `Map`, a persistent map that remembers its recent edits.
+- `state/` — central coordinator (`state.go`) and the world (`world.go`),
+  the control plane as a `graph.Graph`. All cross-subsystem operations go
   through `State`.
 - `db/` — GORM layer, migrations, schema. `node.go`, `users.go`,
   `ip.go`, `policy.go`; credentials (API keys, pre-auth keys, OAuth) share
   one table: `secret.go` (generate/verify), `api_key.go`,
   `preauth_keys.go`, `oauth.go`, `migrate_credentials.go`.
-- `mapper/` — streaming batcher that distributes MapResponses to
-  clients: `batcher.go`, `node_conn.go`, `builder.go`, `mapper.go`.
-  Performance-critical.
+- `mapper/` — per-session map streams: `stream.go` (`Hub`, `Route`,
+  `Stream`), `netmap.go` (render), `diff.go` (render to MapResponses),
+  `mapper.go` (DNS, profiles, debug dumps). Performance-critical.
 - `policy/` — `policy/v2/` is **the** policy implementation. The
   top-level `policy.go` is thin wrappers. There is no v1 directory.
 - `routes/`, `dns/`, `derp/`, `types/`, `util/`, `templates/`, `capver/`
@@ -169,23 +172,29 @@ headscale/
 ### `cmd/hi/` files
 
 `main.go`, `run.go`, `doctor.go`, `docker.go`, `cleanup.go`, `stats.go`,
-`README.md`. **Read `cmd/hi/README.md` before running any `hi` command.**
+`listversions.go`, `README.md`. **Read `cmd/hi/README.md` before running any `hi` command.**
 
 ## Architecture Essentials
 
 - **`hscontrol/state/state.go`** is the central coordinator. Cross-cutting
   operations (node updates, policy evaluation, IP allocation) go through
   the `State` type, not directly to the database.
-- **`NodeStore`** in `hscontrol/state/node_store.go` is a copy-on-write
-  in-memory cache backed by `atomic.Pointer[Snapshot]`. Every read is a
-  pointer load; writes rebuild a new snapshot and atomically swap. It is
-  the hot path for `MapRequest` processing and peer visibility.
+- **The world** (`hscontrol/state/world.go`) holds nodes, users, the
+  policy source, the DERP map and extra DNS records as graph inputs, and
+  derives the node index, the compiled policy, peer classes and primary
+  routes from them. A derived cell recomputes only when a cell it read
+  changed. Every read takes one immutable `Snapshot`; node writes go
+  through `world.update`, which commits writes arriving together in one
+  transaction.
 - **The map-request sync point** is
   `State.UpdateNodeFromMapRequest()` in `hscontrol/state/state.go`. This
   is where Hostinfo changes, endpoint updates, and route advertisements
-  land in the NodeStore.
-- **Mapper subsystem** streams MapResponses via `batcher.go` and
-  `node_conn.go`. Changes here affect all connected clients.
+  land in the world.
+- **Mapper subsystem**: `Hub` subscribes to the graph, and `Route` picks
+  the sessions a commit can reach. Each woken `Stream` renders its node's
+  map from the latest snapshot and sends the diff against what it last
+  sent, so a session always converges on what a fresh one would get.
+  Changes here affect all connected clients.
 - **Node registration flow**: noise handshake (`noise.go`) → auth
   (`auth.go`) → state/DB persistence (`state/`, `db/`) → initial map
   (`mapper/`).
@@ -222,7 +231,7 @@ both. This is a load-bearing architectural rule.
 - `SetTags` validation is enforced by `validateNodeOwnership()` in
   `hscontrol/state/tags.go`.
 - Examples and edge cases live in `hscontrol/types/node_tags_test.go`
-  and `hscontrol/grpcv1_test.go` (`TestSetTags_*`).
+  and the API tests `TestAPIV1NodeSetTags` and `TestAPIv2Device_SetTags`.
 
 **Don't do this**:
 
@@ -343,8 +352,14 @@ a broken one.
 - **Database**: SQLite for local dev, PostgreSQL for integration-heavy
   tests (`go run ./cmd/hi run "..." --postgres`). Some race conditions
   only surface on one backend.
-- **NodeStore writes** rebuild a full snapshot. Measure before changing
-  hot-path code.
+- **Cost must follow what changed**, not tailnet size: a commit and the
+  sessions it wakes are the hot path. Measure before changing `world.go`,
+  `mapper/` or the policy compile: `BenchmarkScalingWrites` and
+  `BenchmarkFirstMap` (`hscontrol/mapper`, `HEADSCALE_SCALE_NODES=10000`
+  for one size), `BenchmarkWorldEndpointWrite` (`hscontrol/state`).
+- **Incremental policy compiles** reuse what a node change cannot reach.
+  `HEADSCALE_DEBUG_POLICY_AUDIT=1` (on in integration tests) compiles from
+  scratch as well and logs any difference; a mismatch fails the test.
 - **`.claude/agents/` is deprecated.** Do not create new agent files
   there. Put behavioural guidance in this file and procedural guidance
   in the nearest README.

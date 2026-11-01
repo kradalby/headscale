@@ -1,7 +1,7 @@
 # Server stress tests
 
 `TestScale` exercises a real Headscale server, SQLite, policy compilation,
-the NodeStore, mapper workers, Noise, and Tailscale control clients over the
+the world and its map sessions, Noise, and Tailscale control clients over the
 existing in-memory network. Every registered node has a live control client.
 The test cases and their policies are together in `scale_test.go`.
 
@@ -20,10 +20,9 @@ Nothing large is enabled by `go test ./...` or by omitting `-short`.
 Each case enrolls its clients, sends three Hostinfo bursts, revokes access,
 restores access, and reconnects one client per user. Bursts change one node
 per ten-node user; the final user can have fewer nodes. Registration uses
-batches of at most 32 concurrent logins. Mapper workers are
-`min(4, GOMAXPROCS)`, with the harness's 50 ms mapper delay, 30-frame session
-buffer. Explicit scale runs use the server's default NodeStore batching;
-the routine 12-node smoke run shortens its batch wait to 10 ms.
+batches of at most 32 concurrent logins. Map sessions coalesce changes for
+the harness's 50 ms batch delay. Explicit scale runs do not hold writes
+during an HA outage; the routine 12-node smoke run holds them for 10 ms.
 
 Completion means the intended state reached every affected client, with the
 exact permitted peer IDs, fresh OS markers, and online peers. Bounded
@@ -33,9 +32,9 @@ same-user principal addresses. After reconnecting, a new policy generation
 broadcast checks delivery on every recovered stream, including isolated nodes.
 Policy changes carry a new node attribute so an old map cannot satisfy a
 policy wait. Revocation also checks that packet filter rules are empty.
-Each phase checks both client streams and server connections and rejects
-mapper work errors. Convergence has a shared two-minute deadline per wait,
-and existing login helpers retain their ten-second registration timeout.
+Each phase checks both client streams and server connections. Convergence
+has a shared two-minute deadline per wait, and existing login helpers retain
+their ten-second registration timeout.
 There are no sleep-based completion checks or automatic reconnect retries.
 
 ## Run
@@ -59,7 +58,7 @@ HEADSCALE_STRESS_NODES=10000 GOMAXPROCS=4 \
   go test ./hscontrol/servertest -run '^TestScale/10000_nodes/personal_devices$' \
   -count=1 -v -timeout=60m
 
-# A compute-constrained run: one Go execution thread and one mapper worker.
+# A compute-constrained run: one Go execution thread.
 HEADSCALE_STRESS_NODES=500 GOMAXPROCS=1 GOMEMLIMIT=512MiB \
   go test ./hscontrol/servertest -run '^TestScale/500_nodes/personal_devices$' \
   -count=1 -v -timeout=30m

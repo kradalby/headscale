@@ -80,28 +80,21 @@ of Headscale:
 
     - nodes move often, e.g. switching from home to office
 
-Headscale calculates a map of all nodes that need to talk to each other,
-creating this "world map" requires a lot of CPU time. When an event that
-requires changes to this map happens, the whole "world" is recalculated, and a
-new "world map" is created for every node in the network.
+Headscale derives each node's network map from a shared graph. Updates recompute
+affected graph values and wake sessions whose maps may change. Endpoint-only
+changes can reuse compiled policy; broad policy or topology changes can reach
+many nodes.
 
-This means that under certain conditions, Headscale can likely handle 100s
-of devices (maybe more), if there is _little to no change_ happening in the
-network. For example, in Scenario 1, the process of computing the world map is
-extremely demanding due to the size of the network, but when the map has been
-created and the nodes are not changing, the Headscale instance will likely
-return to a very low resource usage until the next time there is an event
-requiring the new map.
+Cost depends on what changes and how many peers each client sees, not node count
+alone. In Scenario 1, an idle network does little work after initial maps, but
+dense peer visibility still costs memory and bandwidth. In Scenario 2, frequent
+endpoint changes create steady work even with fewer devices. An all-to-all
+tailnet can require quadratic total peer output.
 
-In the case of Scenario 2, the process of computing the world map is less
-demanding due to the smaller size of the network, however, the type of nodes
-will likely change frequently, which would lead to a constant resource usage.
-
-Headscale will start to struggle when the two scenarios overlap, e.g. many nodes
-with frequent changes will cause the resource usage to remain constantly high.
-In the worst case scenario, the queue of nodes waiting for their map will grow
-to a point where Headscale never will be able to catch up, and nodes will never
-learn about the current state of the world.
+Notifications coalesce, so a slow session renders newer state rather than
+queuing a response for every intermediate change. This does not bound all
+retained history or guarantee convergence under sustained load. Frequent broad
+changes and dense peer sets can still exhaust CPU, memory or network capacity.
 
 We expect that the performance will improve over time as we improve the code
 base, but it is not a focus. In general, we will never make the tradeoff to make
