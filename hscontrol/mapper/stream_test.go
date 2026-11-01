@@ -1018,6 +1018,9 @@ func retainedPerPair(tb testing.TB, cfg *types.Config, s *state.State, iter uint
 		streams = append(streams, st)
 	}
 
+	updated := 0
+
+	// The port wraps harmlessly.
 	for round := range uint16(10) {
 		port := 1 + iter*10 + round
 		for i := int(round); i < ids.Len(); i += 10 {
@@ -1027,9 +1030,17 @@ func retainedPerPair(tb testing.TB, cfg *types.Config, s *state.State, iter uint
 		}
 
 		for _, st := range streams {
-			_, err := st.Update(s.Snapshot())
+			out, err := st.Update(s.Snapshot())
 			require.NoError(tb, err)
+
+			if len(out) > 0 {
+				updated++
+			}
 		}
+	}
+
+	if updated == 0 {
+		tb.Fatal("a call updated no session")
 	}
 
 	runtime.GC()
@@ -1634,6 +1645,9 @@ func requireOracleConverged(t *testing.T, step int, cfg *types.Config, snap *sta
 
 // scalingPolicies are the policy shapes the scaling benchmarks run under,
 // for a tailnet of 10 users whose nodes, for "tags", carry one of 20 tags.
+// For "via", every tenth node is an online tag:r router sharing an HA
+// subnet with the next one, reached through a via grant, so every peer
+// render resolves via routes.
 var scalingPolicies = map[string]string{
 	"allow-all": "",
 	"users": func() string {
@@ -1654,6 +1668,57 @@ var scalingPolicies = map[string]string{
 		return `{"tagOwners":{` + strings.Join(owners, ",") + `},"acls":[` + strings.Join(acls, ",") + `]}`
 	}(),
 	"self": `{"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`,
+	// The plain grant reaches nodes, not subnets, so a member sees a
+	// subnet only through the router its via grant elects.
+	"via": `{"tagOwners":{"tag:r":["u0@"]},"grants":[
+		{"src":["*"],"dst":["autogroup:member","autogroup:tagged"],"ip":["*"]},
+		{"src":["autogroup:member"],"dst":["10.0.0.0/8"],"ip":["*"],"via":["tag:r"]}]}`,
+}
+
+// scalingRouters makes every tenth node an online router for the "via"
+// shape: consecutive routers pair up on one subnet, so each subnet has a
+// primary and a standby.
+func scalingRouters(tb testing.TB, s *state.State) {
+	tb.Helper()
+
+	for i, nv := range s.ListNodes().All() {
+		if i%10 != 0 {
+			continue
+		}
+
+		pair := i / 20
+		route := netip.MustParsePrefix(fmt.Sprintf("10.%d.%d.0/24", pair/256, pair%256))
+
+		_, err := s.SetNodeTags(nv.ID(), []string{"tag:r"})
+		require.NoError(tb, err)
+
+		node := mustNode(tb, s, nv.ID()).AsStruct()
+		node.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+		s.PutNodeInStoreForTest(*node)
+
+		_, err = s.SetApprovedRoutes(nv.ID(), []netip.Prefix{route})
+		require.NoError(tb, err)
+
+		s.Connect(nv.ID())
+	}
+
+	// The shape must exercise via elections: a member sees the first
+	// subnet through the router the grant elected, and not through its
+	// standby.
+	snap := s.Snapshot()
+	viewer, router, standby := s.ListNodes().At(1), s.ListNodes().At(0), s.ListNodes().At(10)
+	matchers, err := snap.Policy().MatchersForNode(viewer)
+	require.NoError(tb, err)
+
+	subnet := netip.MustParsePrefix("10.0.0.0/24")
+	require.Contains(tb, snap.RoutesForPeer(viewer, mustNode(tb, s, router.ID()), matchers), subnet)
+	require.NotContains(tb, snap.RoutesForPeer(viewer, mustNode(tb, s, standby.ID()), matchers), subnet)
+
+	// And it is the via grant that serves it, not HA primaries under a
+	// plain grant.
+	via := snap.Policy().ViaRoutesForPeer(viewer, mustNode(tb, s, router.ID()))
+	require.Contains(tb, via.Include, subnet, "the via grant steers the subnet")
+	require.NotContains(tb, via.UsePrimary, subnet, "a plain grant covers the subnet")
 }
 
 // scalingTailnet returns a tailnet of n nodes spread over 10 users under
@@ -1707,6 +1772,10 @@ func scalingTailnet(tb testing.TB, n int, shape string) (*state.State, []*Stream
 	_, err = s.SetPolicy([]byte(scalingPolicies[shape]))
 	require.NoError(tb, err)
 
+	if shape == "via" {
+		scalingRouters(tb, s)
+	}
+
 	hub := NewHub()
 	streams := make([]*Stream, 0, n)
 
@@ -1714,6 +1783,7 @@ func scalingTailnet(tb testing.TB, n int, shape string) (*state.State, []*Stream
 		st := NewStream(cfg, hub, nv.ID(), capVer)
 		_, err := st.Initial(s.Snapshot())
 		require.NoError(tb, err)
+		st.Delivered()
 
 		streams = append(streams, st)
 	}
@@ -1721,24 +1791,24 @@ func scalingTailnet(tb testing.TB, n int, shape string) (*state.State, []*Stream
 	return s, streams
 }
 
-// scalingWrites are the writes the scaling benchmarks measure; each makes
-// one change through State, given the iteration number.
-var scalingWrites = map[string]func(tb testing.TB, s *state.State, i int){
-	"endpoint": func(_ testing.TB, s *state.State, i int) {
-		nodes := s.ListNodes()
-		scalingEndpoint(s, nodes.At(i%nodes.Len()), i)
-	},
+// scalingWrites are the operations the scaling benchmarks measure,
+// given a node ID and the iteration number.
+var scalingWrites = map[string]func(tb testing.TB, s *state.State, id types.NodeID, i int){
+	"endpoint": scalingEndpoint,
 	// endpoints writes 16 nodes, which the hub routes as one change, as it
 	// does commits that coalesce under load.
-	"endpoints-x16": func(_ testing.TB, s *state.State, i int) {
+	"endpoints-x16": func(tb testing.TB, s *state.State, _ types.NodeID, i int) {
+		tb.Helper()
+
 		nodes := s.ListNodes()
 		for j := range 16 {
-			scalingEndpoint(s, nodes.At((i*16+j)%nodes.Len()), i)
+			scalingEndpoint(tb, s, nodes.At((i*16+j)%nodes.Len()).ID(), i)
 		}
 	},
-	"online": func(_ testing.TB, s *state.State, i int) {
-		nodes := s.ListNodes()
-		nv := nodes.At(i % nodes.Len())
+	"online": func(tb testing.TB, s *state.State, id types.NodeID, _ int) {
+		tb.Helper()
+
+		nv := mustNode(tb, s, id)
 
 		if nv.IsOnline().Valid() && nv.IsOnline().Get() {
 			_ = s.Disconnect(nv.ID(), nv.SessionEpoch())
@@ -1748,43 +1818,85 @@ var scalingWrites = map[string]func(tb testing.TB, s *state.State, i int){
 	},
 	// rejoin is two commits the hub routes as one, so it wakes every
 	// session; see [state.Snapshot.Since].
-	"rejoin": func(_ testing.TB, s *state.State, i int) {
-		nodes := s.ListNodes()
-		node := nodes.At(i % nodes.Len()).AsStruct()
+	"rejoin": func(tb testing.TB, s *state.State, id types.NodeID, _ int) {
+		tb.Helper()
+
+		node := mustNode(tb, s, id).AsStruct()
 		s.DeleteNodeFromStoreForTest(node.ID)
 		s.PutNodeInStoreForTest(*node)
 	},
-	"rename": func(tb testing.TB, s *state.State, i int) {
+	"rename": func(tb testing.TB, s *state.State, id types.NodeID, i int) {
 		tb.Helper()
 
-		nodes := s.ListNodes()
-		_, err := s.RenameNode(nodes.At(i%nodes.Len()).ID(), fmt.Sprintf("renamed-%d", i))
+		_, err := s.RenameNode(id, fmt.Sprintf("renamed-%d", i))
 		require.NoError(tb, err)
 	},
-	"policy": func(tb testing.TB, s *state.State, i int) {
+	"policy": func(tb testing.TB, s *state.State, _ types.NodeID, i int) {
 		tb.Helper()
 
 		_, err := s.SetPolicy([]byte(fmt.Sprintf(`{"acls":[{"action":"accept","src":["*"],"dst":["*:%d"]}]}`, 1+i%2)))
 		require.NoError(tb, err)
 	},
-	// hidden flips the health of a node without routes, which no client
-	// is sent.
-	"hidden": func(_ testing.TB, s *state.State, i int) {
-		nodes := s.ListNodes()
-		_ = s.SetNodeHealth(nodes.At(i%nodes.Len()).ID(), i%2 == 0)
+	// Offline, unrouted nodes ignore unhealthy reports; healthy reports
+	// already match their state. This measures requests, not health changes.
+	"ignored-health": func(_ testing.TB, s *state.State, id types.NodeID, i int) {
+		_ = s.SetNodeHealth(id, i%2 == 0)
 	},
-	"derp": func(_ testing.TB, s *state.State, i int) {
+	"derp": func(_ testing.TB, s *state.State, _ types.NodeID, i int) {
 		s.SetDERPMap(&tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
 			tailcfg.DERPRegionID(900 + i%2): {RegionID: tailcfg.DERPRegionID(900 + i%2)},
 		}})
 	},
 }
 
+func TestScalingEndpointWrite(t *testing.T) {
+	cfg, s, ids := streamTestState(t, ownUserOnly)
+	before := s.Snapshot()
+	node := mustNode(t, s, ids[0])
+	st := NewStream(cfg, NewHub(), ids[1], capVer)
+	_, err := st.Initial(before)
+	require.NoError(t, err)
+	st.Delivered()
+
+	scalingWrites["endpoint"](t, s, ids[0], 1234)
+
+	want := []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1234")}
+	after := s.Snapshot()
+	updated := mustNode(t, s, ids[0])
+	require.Equal(t, want, updated.Endpoints().AsSlice())
+	require.Equal(t, node.NodeKey(), updated.NodeKey())
+	require.Equal(t, node.DiscoKey(), updated.DiscoKey())
+	require.Equal(t, node.GivenName(), updated.GivenName())
+	require.Equal(t, before.PolicyRev(), after.PolicyRev())
+	require.Equal(t, before.PeersRev(), after.PeersRev())
+
+	row, err := s.DB().GetNodeByID(ids[0])
+	require.NoError(t, err)
+	require.Empty(t, row.Endpoints.List(), "the endpoint workload measures the control plane, not SQLite")
+
+	all, wake := Route(before, after, after.Since(before))
+	require.False(t, all)
+	require.Contains(t, wake, ids[1])
+	require.NotContains(t, wake, ids[2])
+
+	responses, err := st.Update(after)
+	require.NoError(t, err)
+	require.Len(t, responses, 1)
+	require.Len(t, responses[0].PeersChangedPatch, 1)
+	require.Equal(t, ids[0].NodeID(), responses[0].PeersChangedPatch[0].NodeID)
+	require.Equal(t, want, responses[0].PeersChangedPatch[0].Endpoints)
+}
+
 // BenchmarkScalingWrites measures one write and the updates, encoded, of
 // the sessions the hub routes it to, across write kinds, policy shapes and
 // tailnet sizes. woken/op counts the sessions routed, updates/op those
 // with something to send: the work a write needs. peer-renders/op counts
-// the peers they rendered.
+// added or changed peer references per session, not shared TailNode calls.
+// For policy writes, shape is the starting policy: setup opens visibility
+// to every node, and the loop only alternates its port. The endpoint write
+// takes the persistent MapRequest path, database write included, and every
+// session confirms delivery, so ns/op is not comparable with a harness
+// that skips either; compare B/op, allocs/op and the counts instead.
 func BenchmarkScalingWrites(b *testing.B) {
 	sizes := []int{100, 400, 1000}
 	if testing.Short() {
@@ -1806,12 +1918,19 @@ func BenchmarkScalingWrites(b *testing.B) {
 					s, streams := scalingTailnet(b, n, shape)
 					sc := newScalingRun(s, streams)
 
+					write := scalingWrites[kind]
+
+					sc.warm(b, kind)
+					sc.woken, sc.updates, sc.rendered, sc.quiet = 0, 0, 0, 0
+
 					var i int
 
 					for b.Loop() {
-						sc.step(b, scalingWrites[kind], i)
+						sc.step(b, write, i)
 						i++
 					}
+
+					sc.requireSettled(b, kind)
 
 					b.ReportMetric(float64(sc.woken)/float64(i), "woken/op")
 					b.ReportMetric(float64(sc.updates)/float64(i), "updates/op")
@@ -1822,10 +1941,13 @@ func BenchmarkScalingWrites(b *testing.B) {
 	}
 }
 
-// scalingEndpoint moves a node to the endpoint port i.
-func scalingEndpoint(s *state.State, nv types.NodeView, i int) {
-	node := nv.AsStruct()
-	node.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(i))} //nolint:gosec // small
+// scalingEndpoint moves node id to endpoint port i in the store: the
+// benchmarks measure the control plane's work for the write, not SQLite.
+func scalingEndpoint(tb testing.TB, s *state.State, id types.NodeID, i int) {
+	tb.Helper()
+
+	node := mustNode(tb, s, id).AsStruct()
+	node.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(i))} //nolint:gosec // benchmark cycles ports
 	s.PutNodeInStoreForTest(*node)
 }
 
@@ -1839,6 +1961,9 @@ type scalingRun struct {
 	last    *state.Snapshot
 
 	woken, updates, rendered int
+
+	// quiet counts writes that woke no session.
+	quiet int
 }
 
 func newScalingRun(s *state.State, streams []*Stream) *scalingRun {
@@ -1850,11 +1975,24 @@ func newScalingRun(s *state.State, streams []*Stream) *scalingRun {
 	return sc
 }
 
-// step makes write i and updates, and encodes for, the sessions it wakes.
-func (sc *scalingRun) step(tb testing.TB, write func(testing.TB, *state.State, int), i int) {
+// warm performs the policy workload's first write, which expands
+// visibility to every node, so the writes after it measure steady port
+// alternation instead of one cold expansion amortized over b.N. It lands
+// on port 2, so the first write after it, port 1, is a change too.
+func (sc *scalingRun) warm(tb testing.TB, kind string) {
 	tb.Helper()
 
-	write(tb, sc.s, i)
+	if kind == "policy" {
+		sc.step(tb, scalingWrites[kind], 1)
+	}
+}
+
+// step makes write i on the i-th session's node and updates, encodes for
+// and confirms delivery to the sessions it wakes.
+func (sc *scalingRun) step(tb testing.TB, write func(testing.TB, *state.State, types.NodeID, int), i int) {
+	tb.Helper()
+
+	write(tb, sc.s, sc.streams[i%len(sc.streams)].nodeID, i)
 
 	snap := sc.s.Snapshot()
 	all, wake := Route(sc.last, snap, snap.Since(sc.last))
@@ -1870,6 +2008,10 @@ func (sc *scalingRun) step(tb testing.TB, write func(testing.TB, *state.State, i
 				targets = append(targets, st)
 			}
 		}
+	}
+
+	if len(targets) == 0 {
+		sc.quiet++
 	}
 
 	for _, st := range targets {
@@ -1892,52 +2034,98 @@ func (sc *scalingRun) step(tb testing.TB, write func(testing.TB, *state.State, i
 			}
 		}
 
+		st.Delivered()
+
 		sc.rendered += st.r.rendered - before
 	}
 }
 
-// TestScalingWriteWork bounds the work each write kind costs at one size,
-// what [BenchmarkScalingWrites] reports but no CI lane runs: a change that
-// wakes, sends or renders more than a write needs fails here.
+// requireSettled checks, outside any timed loop, what the steps must
+// leave behind: every delivery confirmed, and for the policy workload a
+// session woken by every write. A reflection-based assert per step would
+// be timed work.
+func (sc *scalingRun) requireSettled(tb testing.TB, kind string) {
+	tb.Helper()
+
+	for _, st := range sc.streams {
+		require.Nil(tb, st.pending, "successful writes confirm delivery even when attempts would fold")
+		require.Empty(tb, st.hub.sentPeers[st.nodeID].attempts, "successful writes leave no failed-write history")
+	}
+
+	// A policy write that repeats the previous port rewrites the identical
+	// document and wakes nothing, whatever the benchtime.
+	if kind == "policy" {
+		require.Zero(tb, sc.quiet, "every policy write wakes work")
+	}
+}
+
+// TestScalingWriteWork pins the work each write kind costs at one size,
+// what [BenchmarkScalingWrites] reports but no CI lane runs. The counts are
+// exact, so a change doing more fails and one doing less must lower them.
+// Rows above what the write needs say so, with the item that would lower
+// them.
 func TestScalingWriteWork(t *testing.T) {
 	const n, writes = 100, 4
 
 	// Sessions woken, sessions sent an update and peers rendered, over the
 	// writes. A session sees its own class of ten nodes under the self and
 	// users shapes, and the two tags its tag reaches under tags.
+	//
+	// Policy rows add the setup write that expands visibility, which every
+	// session renders, to the writes that only alternate its port.
+	//
+	// Rejoin is two commits the hub routes as one, which wakes every
+	// session (Snapshot.Since escalation, N2): above need.
+	//
+	// The via shape sees what allow-all does, plus routes that differ per
+	// viewer: a write that moves the policy or a via election, as policy
+	// and rejoin writes and a router going offline do, re-renders every
+	// routed peer in every session (renderPeers), five primary routers
+	// here, where only the routers the election steers to or from need it:
+	// above need, as the renderer cannot tell which those are. The first
+	// online and rejoin writes hit a router, whose route fails over, and
+	// rejoin's sessions are sent that move.
 	ceilings := map[string][3]int{
-		"derp/allow-all":          {400, 400, 0},
-		"derp/self":               {400, 400, 0},
-		"derp/tags":               {400, 400, 0},
-		"derp/users":              {400, 400, 0},
-		"endpoint/allow-all":      {400, 400, 396},
-		"endpoint/self":           {40, 40, 36},
-		"endpoint/tags":           {44, 44, 40},
-		"endpoint/users":          {40, 40, 36},
-		"endpoints-x16/allow-all": {400, 400, 6336},
-		"endpoints-x16/self":      {100, 100, 576},
-		"endpoints-x16/tags":      {360, 360, 640},
-		"endpoints-x16/users":     {100, 100, 576},
-		"hidden/allow-all":        {0, 0, 0},
-		"hidden/self":             {0, 0, 0},
-		"hidden/tags":             {0, 0, 0},
-		"hidden/users":            {0, 0, 0},
-		"online/allow-all":        {400, 400, 396},
-		"online/self":             {40, 40, 36},
-		"online/tags":             {44, 44, 40},
-		"online/users":            {40, 40, 36},
-		"policy/allow-all":        {400, 400, 0},
-		"policy/self":             {400, 400, 9000},
-		"policy/tags":             {400, 400, 8900},
-		"policy/users":            {400, 400, 9000},
-		"rejoin/allow-all":        {400, 0, 396},
-		"rejoin/self":             {400, 0, 36},
-		"rejoin/tags":             {400, 0, 40},
-		"rejoin/users":            {400, 0, 36},
-		"rename/allow-all":        {400, 400, 396},
-		"rename/self":             {40, 40, 36},
-		"rename/tags":             {44, 44, 40},
-		"rename/users":            {40, 40, 36},
+		"derp/allow-all":           {400, 400, 0},
+		"derp/self":                {400, 400, 0},
+		"derp/tags":                {400, 400, 0},
+		"derp/users":               {400, 400, 0},
+		"derp/via":                 {400, 400, 0},
+		"endpoint/allow-all":       {400, 400, 396},
+		"endpoint/self":            {40, 40, 36},
+		"endpoint/tags":            {44, 44, 40},
+		"endpoint/users":           {40, 40, 36},
+		"endpoint/via":             {400, 400, 396},
+		"endpoints-x16/allow-all":  {400, 400, 6336},
+		"endpoints-x16/self":       {100, 100, 576},
+		"endpoints-x16/tags":       {360, 360, 640},
+		"endpoints-x16/users":      {100, 100, 576},
+		"endpoints-x16/via":        {400, 400, 6336},
+		"ignored-health/allow-all": {0, 0, 0},
+		"ignored-health/self":      {0, 0, 0},
+		"ignored-health/tags":      {0, 0, 0},
+		"ignored-health/users":     {0, 0, 0},
+		"ignored-health/via":       {0, 0, 0},
+		"online/allow-all":         {400, 400, 396},
+		"online/self":              {40, 40, 36},
+		"online/tags":              {44, 44, 40},
+		"online/users":             {40, 40, 36},
+		"online/via":               {400, 400, 891},
+		"policy/allow-all":         {500, 500, 0},
+		"policy/self":              {500, 500, 9000},
+		"policy/tags":              {500, 500, 8900},
+		"policy/users":             {500, 500, 9000},
+		"policy/via":               {500, 500, 2475},
+		"rejoin/allow-all":         {400, 0, 396},
+		"rejoin/self":              {400, 0, 36},
+		"rejoin/tags":              {400, 0, 40},
+		"rejoin/users":             {400, 0, 36},
+		"rejoin/via":               {400, 100, 2376},
+		"rename/allow-all":         {400, 400, 396},
+		"rename/self":              {40, 40, 36},
+		"rename/tags":              {44, 44, 40},
+		"rename/users":             {40, 40, 36},
+		"rename/via":               {400, 400, 396},
 	}
 
 	for _, kind := range slices.Sorted(maps.Keys(scalingWrites)) {
@@ -1945,16 +2133,19 @@ func TestScalingWriteWork(t *testing.T) {
 			t.Run(kind+"/"+shape, func(t *testing.T) {
 				s, streams := scalingTailnet(t, n, shape)
 				sc := newScalingRun(s, streams)
+				sc.warm(t, kind)
 
 				for i := range writes {
 					sc.step(t, scalingWrites[kind], i)
 				}
 
+				sc.requireSettled(t, kind)
+
 				limit, ok := ceilings[kind+"/"+shape]
 				require.True(t, ok, "no ceiling for %s/%s", kind, shape)
-				assert.LessOrEqual(t, sc.woken, limit[0], "sessions woken")
-				assert.LessOrEqual(t, sc.updates, limit[1], "sessions updated")
-				assert.LessOrEqual(t, sc.rendered, limit[2], "peers rendered")
+
+				got := [3]int{sc.woken, sc.updates, sc.rendered}
+				assert.Equal(t, limit, got, "sessions woken, updated, peers rendered")
 			})
 		}
 	}
@@ -2680,7 +2871,7 @@ func TestSharedFramesEncodeOnceAndIdentically(t *testing.T) {
 
 // benchEncode encodes a response as the poll loop sends it.
 func benchEncode(resp *tailcfg.MapResponse, compress bool) ([]byte, error) {
-	b, err := json.Marshal(resp)
+	b, err := Marshal(resp)
 	if err != nil || !compress {
 		return b, err
 	}
@@ -2985,9 +3176,72 @@ func TestFramesReleasedByCommitsWithoutPatches(t *testing.T) {
 	assert.Zero(t, frames(), "a later commit releases the frames of an earlier one")
 }
 
-// BenchmarkFirstMap renders and encodes a reconnecting node's first map
-// in a full mesh: the read every node does at once after a restart, which
-// walks every peer.
+// TestFirstMapDeliveryAfterFoldedAttempts checks a reconnect after folded
+// attempts: a peer that joined after the last delivery, was folded into the
+// node's history by failed attempts, then left, is announced as removed —
+// a failed attempt may have shown it.
+func TestFirstMapDeliveryAfterFoldedAttempts(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	hub := NewHub()
+	t.Cleanup(hub.Close)
+
+	// The delivered view holds neither the joining peer nor the node itself.
+	joined := mustNode(t, s, ids[1]).AsStruct()
+	s.DeleteNodeFromStoreForTest(ids[1])
+
+	delivered := s.Snapshot()
+	setup := NewStream(cfg, hub, ids[0], capVer)
+	_, err := setup.Initial(delivered)
+	require.NoError(t, err)
+	setup.Delivered()
+
+	// The peer joins: reconnect attempts at the newer snapshot fold its
+	// view into the node's history.
+	s.PutNodeInStoreForTest(*joined)
+	seen := s.Snapshot()
+
+	var last *Stream
+
+	for range maxPeerAttempts + 1 {
+		last = NewStream(cfg, hub, ids[0], capVer)
+		_, err = last.Initial(seen)
+		require.NoError(t, err)
+	}
+
+	require.Empty(t, hub.sentPeers[ids[0]].attempts, "folding does not mean a reconnect was delivered")
+	require.Nil(t, setup.pending, "the setup stream cannot report reconnect delivery")
+	require.NotNil(t, last.pending)
+
+	// The peer leaves: the reconnect must announce its removal, because a
+	// folded attempt may have shown it.
+	s.DeleteNodeFromStoreForTest(ids[1])
+	folded := s.Snapshot()
+
+	reconnect := NewStream(cfg, hub, ids[0], capVer)
+	resps, err := reconnect.Initial(folded)
+	require.NoError(t, err)
+
+	require.Len(t, resps, 2, "the reconnect announces the removed peer")
+	require.Equal(t, []tailcfg.NodeID{ids[1].NodeID()}, resps[1].PeersRemoved, "the folded history is what a reconnect removes")
+
+	reconnect.Delivered()
+	require.Nil(t, reconnect.pending)
+
+	// The delivered reconnect records the peers the snapshot says it sees:
+	// the hub's delivery record against the truth, not against itself.
+	require.Equal(t, folded.PeerView(ids[0]), hub.lastPeers(ids[0]), "the delivered reconnect records the snapshot's peers")
+
+	// The response decodes into the same model a fresh stream of the same
+	// snapshot would build.
+	fresh, err := NewStream(cfg, NewHub(), ids[0], capVer).Initial(folded)
+	require.NoError(t, err)
+	require.Empty(t, newModelClient(resps[0]).sameAs(newModelClient(fresh[0])))
+}
+
+// BenchmarkFirstMap separates a reconnect on a warm hub from the first
+// render on a cold hub and from reopening state (including Close). The last
+// includes DB load, policy compile and peer construction, but not process
+// startup, HTTP/Noise, or a concurrent reconnect storm.
 func BenchmarkFirstMap(b *testing.B) {
 	for _, n := range []int{1000, 10000} {
 		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) {
@@ -2995,19 +3249,65 @@ func BenchmarkFirstMap(b *testing.B) {
 			st := streams[len(streams)/2]
 			snap := s.Snapshot()
 
-			b.ReportAllocs()
+			for _, cache := range []string{"warm-hub", "cold-hub", "new-state"} {
+				for _, encoding := range []string{"json", "zstd"} {
+					b.Run(cache+"/"+encoding, func(b *testing.B) {
+						if cache == "warm-hub" {
+							first := NewStream(st.cfg, st.hub, st.nodeID, capVer)
+							resps, err := first.Initial(snap)
+							require.NoError(b, err)
+							_, err = st.hub.Encode(resps[0], encoding == "zstd", benchEncode)
+							require.NoError(b, err)
+							first.Delivered()
+						}
 
-			for b.Loop() {
-				first := NewStream(st.cfg, st.hub, st.nodeID, capVer)
+						b.ReportAllocs()
 
-				resps, err := first.Initial(snap)
-				if err != nil {
-					b.Fatal(err)
-				}
+						var (
+							first *Stream
+							size  int
+						)
 
-				_, err = Marshal(resps[0])
-				if err != nil {
-					b.Fatal(err)
+						for b.Loop() {
+							hub, current := st.hub, snap
+							if cache != "warm-hub" {
+								hub = NewHub()
+							}
+
+							var reopened *state.State
+
+							if cache == "new-state" {
+								var err error
+
+								reopened, err = state.NewState(st.cfg)
+								require.NoError(b, err)
+
+								current = reopened.Snapshot()
+							}
+
+							first = NewStream(st.cfg, hub, st.nodeID, capVer)
+							resps, err := first.Initial(current)
+							require.NoError(b, err)
+							data, err := hub.Encode(resps[0], encoding == "zstd", benchEncode)
+							require.NoError(b, err)
+							first.Delivered()
+
+							size = len(data)
+
+							if reopened != nil {
+								require.NoError(b, reopened.Close())
+							}
+						}
+
+						require.NotNil(b, first)
+						require.Nil(b, first.pending, "successful reconnects confirm delivery even when attempts would fold")
+
+						if cache == "warm-hub" {
+							require.Empty(b, st.hub.sentPeers[st.nodeID].attempts, "successful reconnects leave no failed-write history")
+						}
+
+						b.ReportMetric(float64(size), "encoded-bytes/op")
+					})
 				}
 			}
 		})
