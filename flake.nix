@@ -46,7 +46,7 @@
       };
 
       overlays.default =
-        _: prev:
+        final: prev:
         let
           pkgs = nixpkgs.legacyPackages.${prev.stdenv.hostPlatform.system};
           # Tracks the newest Go in nixpkgs so a Go release bump is a
@@ -73,6 +73,18 @@
               mainProgram = "headscale";
             };
           };
+
+          debug-graph = pkgs.callPackage ./hscontrol/assets/debug-graph { };
+
+          headscale-debug = final.headscale.overrideAttrs (old: {
+            pname = "headscale-debug";
+            tags = (old.tags or [ ]) ++ [ "headscale_debug" ];
+            # Share vendoring without pulling the frontend into that derivation.
+            goModules = final.headscale.goModules;
+            postConfigure = (old.postConfigure or "") + ''
+              install -m644 ${final.debug-graph}/elm.js hscontrol/assets/debug-graph/elm.js
+            '';
+          });
 
           hi = buildGo {
             pname = "hi";
@@ -124,9 +136,17 @@
           go_latest
           gnumake
         ];
+        elmDeps = with pkgs; [
+          elmPackages.elm
+          elmPackages.elm-format
+          elm2nix
+          nixfmt
+        ];
+        debug-graph = pkgs.debug-graph;
         devDeps =
           with pkgs;
           buildDeps
+          ++ elmDeps
           ++ [
             golangci-lint
             golangci-lint-langserver
@@ -205,9 +225,37 @@
             ./hscontrol/db/testdata
             ./hscontrol/policy/v2/testdata
           ];
+          treefmtExtra.settings.global.excludes = [
+            "hscontrol/assets/debug-graph/elm.js"
+            "hscontrol/assets/debug-graph/elm-stuff/**"
+            "hscontrol/assets/debug-graph/.elm/**"
+          ];
         };
         goChecks = {
           build = fc.goBuild (common // { subPackages = [ "cmd/headscale" ]; });
+
+          # Tagged builds embed elm.js, which only Nix produces (never
+          # committed): these checks build it first, and outside Nix
+          # `make debug-graph` installs it for go build and go test.
+          debug-build = pkgs.headscale-debug;
+
+          debug-gotest = fc.goTest (
+            common
+            // {
+              name = "headscale-debug-gotest";
+              goTags = [ "headscale_debug" ];
+              goRace = true;
+              testPackages = "./hscontrol ./hscontrol/state ./hscontrol/graph";
+              testFlags = [
+                "-run='Test(DebugGraph|Inspect)'"
+                "-p=2"
+              ];
+              testEnv = ''
+                export CGO_ENABLED=1
+                install -m644 ${debug-graph}/elm.js hscontrol/assets/debug-graph/elm.js
+              '';
+            }
+          );
 
           # The pure unit subset. The root ./integration package (Docker) and
           # ./hscontrol/servertest (slow: 10s+ convergence plus race/stress/HA
@@ -249,8 +297,14 @@
           );
 
           # Full-tree golangci-lint (gofumpt, gci, etc.); uses the overlay's
-          # golangci-lint built against the pinned Go.
-          golangci-lint = fc.goLint common;
+          # golangci-lint built against the pinned Go. The headscale_debug
+          # pass needs only a file for go:embed, not the Elm build.
+          golangci-lint = (fc.goLint common).overrideAttrs (old: {
+            buildPhase = old.buildPhase + ''
+              : > hscontrol/assets/debug-graph/elm.js
+              golangci-lint run --build-tags=headscale_debug ./...
+            '';
+          });
 
           # nixfmt + prettier, excluding generated output. goFmt = "off":
           # Go formatting (gofumpt, gci) is enforced by the golangci-lint
@@ -392,6 +446,10 @@
             '';
       in
       {
+        devShells.debug-graph = pkgs.mkShell {
+          packages = elmDeps ++ [ pkgs.gnumake ];
+        };
+
         # `nix develop`
         devShells.default = pkgs.mkShell {
           buildInputs = devDeps ++ [
@@ -414,8 +472,9 @@
 
         # `nix build`
         packages = with pkgs; {
-          inherit headscale;
+          inherit headscale headscale-debug;
           inherit headscale-docker;
+          inherit debug-graph;
           default = headscale;
         };
 
@@ -440,7 +499,26 @@
 
         # Gated to Linux: parts of the tree are Linux-specific, and the VM
         # tests need KVM.
-        checks = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
+        checks = {
+          debug-graph =
+            pkgs.runCommand "headscale-debug-graph-check"
+              {
+                nativeBuildInputs = [
+                  pkgs.elmPackages.elm-format
+                  pkgs.nodejs
+                ];
+              }
+              ''
+                cp ${./hscontrol/assets/debug-graph/app.js} app.js
+                cp ${./hscontrol/assets/debug-graph/index.html} index.html
+                cp ${./hscontrol/assets/debug-graph/bridge-check.js} bridge-check.js
+                node bridge-check.js
+                elm-format --validate ${./hscontrol/assets/debug-graph/src}
+                test -s ${debug-graph}/elm.js
+                touch "$out"
+              '';
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
           goChecks
           // {
             headscale = pkgs.testers.runNixOSTest (import ./nix/tests/headscale.nix self);

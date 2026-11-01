@@ -288,6 +288,7 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 		ReadTimeout:  types.HTTPTimeout,
 		WriteTimeout: 0,
 	}
+	h.registerDebugGraph(debugMux, debug, debugHTTPServer)
 
 	return debugHTTPServer
 }
