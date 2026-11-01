@@ -29,6 +29,8 @@ func TestRenameNodeRejectsNameExceedingFQDNLimit(t *testing.T) {
 	s, err := NewState(cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
+	// Validation must use the same frozen domain as map rendering.
+	cfg.BaseDomain = "changed.test"
 
 	// Valid 63-char DNS label, but the resulting FQDN exceeds 255 chars.
 	_, err = s.RenameNode(node.ID, strings.Repeat("a", 63))

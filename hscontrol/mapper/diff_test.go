@@ -334,12 +334,12 @@ func TestWithRoutesMatchesTailNode(t *testing.T) {
 
 	cfg := &types.Config{BaseDomain: "example.com"}
 
-	want, err := peer.TailNode(capVer, func(types.NodeID) []netip.Prefix { return routes }, cfg, nil)
+	want, err := peer.TailNode(capVer, func(types.NodeID) []netip.Prefix { return routes }, cfg, cfg.DNSView(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	base, err := (&peerRenders{}).render(cfg, capVer, 1, 1, peer, nil)
+	base, err := (&peerRenders{}).render(cfg, cfg.DNSView(), capVer, 1, 1, peer, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,14 +544,14 @@ func TestPatchSendsExpiryInUTC(t *testing.T) {
 	}
 	cfg := &types.Config{BaseDomain: "example.com"}
 
-	before, err := (&peerRenders{}).render(cfg, capVer, 1, 1, node.View(), nil)
+	before, err := (&peerRenders{}).render(cfg, cfg.DNSView(), capVer, 1, 1, node.View(), nil)
 	require.NoError(t, err)
 
 	// A relogin rotates the key and sets the expiry.
 	node.NodeKey = key.NewNode().Public()
 	node.Expiry = &loaded
 
-	after, err := (&peerRenders{}).render(cfg, capVer, 2, 1, node.View(), nil)
+	after, err := (&peerRenders{}).render(cfg, cfg.DNSView(), capVer, 2, 1, node.View(), nil)
 	require.NoError(t, err)
 
 	responses := diff(testNetMap(before), testNetMap(after), nil)

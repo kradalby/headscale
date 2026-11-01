@@ -248,7 +248,13 @@ func (s *State) DebugRegistrationCache() map[string]any {
 
 // DebugConfig returns debug information about the current configuration.
 func (s *State) DebugConfig() *types.Config {
-	return s.cfg
+	dns := s.Snapshot().DNS()
+	cfg := *s.cfg
+	cfg.BaseDomain = dns.BaseDomain()
+	cfg.DNSConfig = dns.DebugConfig()
+	cfg.TailcfgDNSConfig = dns.AsStruct()
+
+	return &cfg
 }
 
 // DebugPolicy returns the current policy data as a string.

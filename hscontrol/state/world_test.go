@@ -26,6 +26,95 @@ import (
 	"tailscale.com/types/key"
 )
 
+func TestWorldDNSNoOpPublication(t *testing.T) {
+	cfg := &types.Config{TailcfgDNSConfig: &tailcfg.DNSConfig{}}
+	w, err := newWorld(nil, nil, nil, cfg.DNSView())
+	require.NoError(t, err)
+
+	sub := w.g.Subscribe()
+	t.Cleanup(sub.Close)
+
+	before := w.snapshot()
+
+	for _, records := range [][]tailcfg.DNSRecord{nil, {}} {
+		w.SetExtraRecords(records)
+		assert.Equal(t, before.Rev(), w.snapshot().Rev())
+		assert.Equal(t, before.DNSRev(), w.snapshot().DNSRev())
+
+		select {
+		case <-sub.C:
+			t.Fatal("empty no-op publication woke subscribers")
+		default:
+		}
+	}
+
+	records := []tailcfg.DNSRecord{{Name: "Service.Example.COM", Type: "A", Value: "100.64.0.99"}}
+	w.SetExtraRecords(records)
+	after := w.snapshot()
+	require.Greater(t, after.DNSRev(), before.DNSRev())
+	assert.Equal(t, before.PolicyRev(), after.PolicyRev())
+	assert.Equal(t, before.PeerPolicyRev(), after.PeerPolicyRev())
+	assert.Equal(t, before.PeersRev(), after.PeersRev())
+
+	select {
+	case <-sub.C:
+	default:
+		t.Fatal("changed DNS publication did not wake subscribers")
+	}
+
+	records[0].Name = "service.example.com"
+	w.SetExtraRecords(records)
+	assert.Equal(t, after.Rev(), w.snapshot().Rev())
+	assert.Equal(t, after.DNSRev(), w.snapshot().DNSRev())
+
+	select {
+	case <-sub.C:
+		t.Fatal("case-normalized no-op publication woke subscribers")
+	default:
+	}
+
+	records[0].Name = "changed.example.com"
+	assert.Equal(t, "service.example.com", after.DNS().ExtraRecords().At(0).Name)
+}
+
+func TestWorldDNSReorderRetainsRevision(t *testing.T) {
+	cfg := &types.Config{TailcfgDNSConfig: &tailcfg.DNSConfig{}}
+	w, err := newWorld(nil, nil, nil, cfg.DNSView())
+	require.NoError(t, err)
+
+	sub := w.g.Subscribe()
+	t.Cleanup(sub.Close)
+
+	w.SetExtraRecords([]tailcfg.DNSRecord{
+		{Name: "a.example.com", Type: "A", Value: "100.64.0.1"},
+		{Name: "b.example.com", Type: "A", Value: "100.64.0.2"},
+	})
+	before := w.snapshot()
+
+	select {
+	case <-sub.C:
+	default:
+		t.Fatal("first publication must wake subscribers")
+	}
+
+	// The records manager republishes sets in map order; a reordered set is
+	// a no-op and must retain its revision.
+	w.SetExtraRecords([]tailcfg.DNSRecord{
+		{Name: "b.example.com", Type: "A", Value: "100.64.0.2"},
+		{Name: "a.example.com", Type: "A", Value: "100.64.0.1"},
+	})
+	after := w.snapshot()
+
+	assert.Equal(t, before.Rev(), after.Rev())
+	assert.Equal(t, before.DNSRev(), after.DNSRev())
+
+	select {
+	case <-sub.C:
+		t.Fatal("reordered no-op publication woke subscribers")
+	default:
+	}
+}
+
 func worldNode(id types.NodeID, user *types.User, ip string) *types.Node {
 	addr := netip.MustParseAddr(ip)
 	uid := user.ID
@@ -52,7 +141,7 @@ func testWorld(t *testing.T, nodes ...*types.Node) (*world, []types.User) {
 	users := []types.User{{Name: "alice"}, {Name: "bob"}}
 	users[0].ID, users[1].ID = 1, 2
 
-	w, err := newWorld(nodes, users, []byte(ownUserPolicy))
+	w, err := newWorld(nodes, users, []byte(ownUserPolicy), types.DNSView{})
 	require.NoError(t, err)
 
 	return w, users
@@ -341,7 +430,7 @@ func createTestNode(id types.NodeID, userID uint, username, hostname string) typ
 func newTestWorld(t *testing.T, nodes ...types.Node) *world {
 	t.Helper()
 
-	w, err := newWorld(nil, nil, nil)
+	w, err := newWorld(nil, nil, nil, types.DNSView{})
 	require.NoError(t, err)
 
 	for _, n := range nodes {
@@ -960,7 +1049,7 @@ func TestWorldPeersMatchFullBuild(t *testing.T) {
 					nodes = append(nodes, &n)
 				}
 
-				w, err := newWorld(nodes, users, []byte(tc.pol))
+				w, err := newWorld(nodes, users, []byte(tc.pol), types.DNSView{})
 				if err != nil {
 					rt.Fatalf("world: %v", err)
 				}
@@ -1122,7 +1211,7 @@ func TestPolicyCachesSurviveStaleView(t *testing.T) {
 				nodes = append(nodes, &n)
 			}
 
-			w, err := newWorld(nodes, users, []byte(pol))
+			w, err := newWorld(nodes, users, []byte(pol), types.DNSView{})
 			require.NoError(t, err)
 
 			before, ok := w.snapshot().GetNode(1)
@@ -1207,7 +1296,7 @@ func BenchmarkWorldEndpointWrite(b *testing.B) {
 
 			users := []types.User{*alice}
 
-			w, err := newWorld(nodes, users, []byte(ownUserPolicy))
+			w, err := newWorld(nodes, users, []byte(ownUserPolicy), types.DNSView{})
 			require.NoError(b, err)
 
 			port := uint16(0)
@@ -1247,7 +1336,7 @@ func BenchmarkWorldEndpointWrite(b *testing.B) {
 						router.ApprovedRoutes = append(router.ApprovedRoutes, prefix)
 					}
 
-					w, err := newWorld(types.Nodes{worldNode(1, alice, "100.64.0.1"), router}, []types.User{*alice}, []byte(ownUserPolicy))
+					w, err := newWorld(types.Nodes{worldNode(1, alice, "100.64.0.1"), router}, []types.User{*alice}, []byte(ownUserPolicy), types.DNSView{})
 					require.NoError(b, err)
 
 					if batching {
@@ -1298,7 +1387,7 @@ func BenchmarkWorldPutNode(b *testing.B) {
 				nodes[i].GivenName = fmt.Sprintf("node-%d", i)
 			}
 
-			w, err := newWorld(nodes, []types.User{*alice}, []byte(ownUserPolicy))
+			w, err := newWorld(nodes, []types.User{*alice}, []byte(ownUserPolicy), types.DNSView{})
 			require.NoError(b, err)
 
 			joiner := *worldNode(1<<20, alice, "100.127.0.1")
@@ -1336,7 +1425,7 @@ func BenchmarkWorldSetUsers(b *testing.B) {
 			nodes = append(nodes, worldNode(1<<20, bob, "100.127.0.1"))
 			users := []types.User{*alice, *bob}
 
-			w, err := newWorld(nodes, users, []byte(ownUserPolicy))
+			w, err := newWorld(nodes, users, []byte(ownUserPolicy), types.DNSView{})
 			require.NoError(b, err)
 
 			flip := 0
@@ -1368,7 +1457,7 @@ func TestWorldIndexMatchesFullBuild(t *testing.T) {
 		nodes[i].ApprovedRoutes = []netip.Prefix{route}
 	}
 
-	w, err := newWorld(nodes, []types.User{*alice, *bob}, nil)
+	w, err := newWorld(nodes, []types.User{*alice, *bob}, nil, types.DNSView{})
 	require.NoError(t, err)
 
 	r := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // deterministic test input
@@ -1597,7 +1686,7 @@ func TestNewWorldRejectsInvalidPolicy(t *testing.T) {
 		"invalid reference": `{"acls":[{"action":"accept","src":["nobody@"],"dst":["*:*"]}],"nodeAttrs":[{"target":["group:missing"],"attr":["custom:x"]}]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := newWorld([]*types.Node{worldNode(1, alice, "100.64.0.1")}, []types.User{*alice}, []byte(pol))
+			_, err := newWorld([]*types.Node{worldNode(1, alice, "100.64.0.1")}, []types.User{*alice}, []byte(pol), types.DNSView{})
 			require.Error(t, err)
 		})
 	}
@@ -1687,7 +1776,7 @@ func TestWorldConcurrentWritesDeletesAndUserRenames(t *testing.T) {
 
 	users := []types.User{*alice, *bob}
 
-	w, err := newWorld(nodes, users, nil)
+	w, err := newWorld(nodes, users, nil, types.DNSView{})
 	require.NoError(t, err)
 
 	deleted := func(id types.NodeID) bool { return id <= n && id%4 == 1 }
@@ -2115,7 +2204,7 @@ func TestDuplicateUserNameKeepsNodeChangesCompiling(t *testing.T) {
 	bobLaptop := worldNode(5, bob, "100.64.0.5")
 
 	users := []types.User{*alice, *bob}
-	w, err := newWorld(types.Nodes{dev, prod, aliceLaptop, bobLaptop}, users, []byte(pol))
+	w, err := newWorld(types.Nodes{dev, prod, aliceLaptop, bobLaptop}, users, []byte(pol), types.DNSView{})
 	require.NoError(t, err)
 
 	allows := func(src string) bool {
@@ -2172,6 +2261,7 @@ func TestWorldNodeCapsForgetDeletedNodes(t *testing.T) {
 		types.Nodes{worldNode(1, alice, "100.64.0.1"), worldNode(2, alice, "100.64.0.2")},
 		[]types.User{*alice},
 		[]byte(`{"acls":[{"action":"accept","src":["alice@"],"dst":["alice@:*"]}],"nodeAttrs":[{"target":["alice@"],"attr":["custom:probe"]}]}`),
+		types.DNSView{},
 	)
 	require.NoError(t, err)
 
