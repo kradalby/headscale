@@ -330,6 +330,7 @@ See [the routes reference](docs/ref/routes.md) for the failover rules.
 - Peers are rendered for at most the server's current capability version, so a client newer than the server sees each peer's `Cap` as the server's current version, not its own [#37](https://github.com/kradalby/headscale/pull/37)
 - MagicDNS reverse zones for IPv4 prefixes whose configured address has host bits set, and for IPv6 prefixes whose mask is not nibble-aligned, are enumerated from the masked prefix, so tailnets with such custom prefixes advertise the correct set of reverse zones [#40](https://github.com/kradalby/headscale/pull/40)
 - Split-DNS zones with an empty resolver list are now sent as an empty route — handled by the client's built-in resolver — instead of `null` [#40](https://github.com/kradalby/headscale/pull/40)
+- Debug builds (`nix build .#headscale-debug`) serve a graph explorer at `/debug/graph/` on the metrics and debug listener, gated like `/debug/policy`; release builds omit it. See [the debugging reference](docs/ref/debug.md#graph-explorer) for its access gate and per-viewer cost [#38](https://github.com/kradalby/headscale/pull/38)
 
 ## 0.29.7 (2026-10-30)
 

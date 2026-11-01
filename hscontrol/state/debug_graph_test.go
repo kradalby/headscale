@@ -381,6 +381,7 @@ func TestDebugGraphSafeDeviceMetadata(t *testing.T) {
 	n.Expiry = new(time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC))
 	n.LastSeen = new(time.Date(2020, 1, 1, 3, 4, 5, 0, time.UTC))
 	n.AuthKey = &types.Credential{Ephemeral: true, Identifier: "private-credential"}
+	n.Ephemeral = true
 	prefix := netip.MustParsePrefix("10.1.0.0/16")
 	n.Hostinfo.RoutableIPs = []netip.Prefix{prefix}
 	n.ApprovedRoutes = []netip.Prefix{prefix}
@@ -395,7 +396,7 @@ func TestDebugGraphSafeDeviceMetadata(t *testing.T) {
 
 	for key, expected := range map[string]string{
 		"os": "linux", "expiry": "2020-01-02T03:04:05Z", "expired": "true", "ephemeral": "true",
-		"lastSeen": "2020-01-01T03:04:05Z", "announcedRoutes": "10.1.0.0/16", "approvedRoutes": "10.1.0.0/16", "primaryRoutes": "",
+		"lastSeen": "2020-01-01T03:04:05Z", "announcedRoutes": "10.1.0.0/16", "approvedRoutes": "10.1.0.0/16", "primaryRoutes": "10.1.0.0/16",
 	} {
 		value, exists := props[key]
 		assert.True(t, exists, key)
