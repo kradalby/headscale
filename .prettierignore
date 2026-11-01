@@ -5,3 +5,8 @@ docs/
 hscontrol/testdata/
 hscontrol/config/testdata/bad/
 hscontrol/config/testdata/compat/
+
+# Elm compiler output and local dependency/build caches.
+hscontrol/assets/debug-graph/elm.js
+hscontrol/assets/debug-graph/elm-stuff/
+hscontrol/assets/debug-graph/.elm/
