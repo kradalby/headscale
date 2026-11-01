@@ -35,6 +35,12 @@ import (
 
 const capVer = tailcfg.CurrentCapabilityVersion
 
+// preNetmapRemovalsVer is one below the capability version of Tailscale v1.104,
+// the first release whose clients also derived removals from a full netmap
+// (tailscale/tailscale#15660): these clients still need explicit
+// PeersRemoved frames. The hub emits them for every capability version.
+const preNetmapRemovalsVer = capver.FullNetmapRemovalsCapVer - 1
+
 // streamTestState returns a State with users u1, u2 and nodes n1, n1b
 // (u1) and n2 (u2), under policy (allow-all when empty).
 func streamTestState(tb testing.TB, policy string, configure ...func(*types.Config)) (*types.Config, *state.State, [3]types.NodeID) {
@@ -4299,5 +4305,587 @@ func TestStreamAppOnlyViaFollowsPolicy(t *testing.T) {
 			step("endpoint")
 			assert.Equal(t, rendered+1, streams[viewer].r.rendered, "an endpoint update renders only the changed peer")
 		})
+	}
+}
+
+// TestOfflinePeerHistorySurvivesPartialReconnect keeps clients at different
+// generations of one peer class, then loses the removal frame on a reconnect:
+// the next reconnect replays the removal. Removals a client holds only from a
+// failed write are pinned by TestHubFoldsUnconfirmedViews and
+// TestStreamAnnouncesRemovalOfAPeerOnlyAFailedInitialCarried; policy-driven
+// removal of a still-live peer is pinned by the random-writes oracle test.
+func TestOfflinePeerHistorySurvivesPartialReconnect(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	hub := NewHub()
+	u1, err := s.GetUserByName("u1")
+	require.NoError(t, err)
+
+	clients := make(map[types.NodeID]*modelClient)
+
+	for i := range 12 {
+		n := s.CreateRegisteredNodeForTest(u1, fmt.Sprintf("offline-%d", i))
+		n.User = u1
+		s.PutNodeInStoreForTest(*n)
+		sess := hub.Join(n.ID, func() {})
+		st := NewStream(cfg, hub, n.ID, preNetmapRemovalsVer)
+		st.Attach(sess)
+		resps, err := st.Initial(s.Snapshot())
+		require.NoError(t, err)
+		require.Len(t, resps, 1)
+		clients[n.ID] = newModelClient(resps[0])
+
+		st.Delivered()
+		require.False(t, hub.Leave(sess))
+	}
+
+	// Every client pinned the generation it left: distinct revisions, one
+	// current class.
+	hub.mu.Lock()
+
+	generations := make([]uint64, 0, len(clients))
+	for id := range clients {
+		generations = append(generations, hub.sentPeers[id].rev)
+	}
+	hub.mu.Unlock()
+
+	distinct := make(map[uint64]bool, len(generations))
+	for _, rev := range generations {
+		distinct[rev] = true
+	}
+
+	require.Len(t, distinct, len(clients), "every client pinned its own generation")
+
+	require.Len(t, s.Snapshot().PeerViews(), 1, "one current class can leave many historical views")
+	require.NoError(t, s.DeleteNode(mustNode(t, s, ids[1])))
+
+	for id, client := range clients {
+		sess := hub.Join(id, func() {})
+		st := NewStream(cfg, hub, id, preNetmapRemovalsVer)
+		st.Attach(sess)
+		resps, err := st.Initial(s.Snapshot())
+		require.NoError(t, err)
+		require.Len(t, resps, 2)
+
+		// The full frame arrives without the removed peer, but the
+		// removal frame that would clear the delta consumer fails.
+		require.NotContains(t, peerSet(resps[0]), ids[1].NodeID())
+		client.apply(resps[0])
+		require.Contains(t, client.deltaPeers, ids[1].NodeID())
+		require.False(t, hub.Leave(sess))
+
+		sess = hub.Join(id, func() {})
+		st = NewStream(cfg, hub, id, preNetmapRemovalsVer)
+		st.Attach(sess)
+		resps, err = st.Initial(s.Snapshot())
+		require.NoError(t, err)
+		require.Len(t, resps, 2)
+		require.Equal(t, []tailcfg.NodeID{ids[1].NodeID()}, resps[1].PeersRemoved)
+
+		for _, resp := range resps {
+			client.apply(resp)
+		}
+
+		st.Delivered()
+		require.False(t, hub.Leave(sess))
+
+		resps, err = NewStream(cfg, hub, id, preNetmapRemovalsVer).Initial(s.Snapshot())
+		require.NoError(t, err)
+		require.Len(t, resps, 1, "a delivered removal needs no replay")
+
+		// The delta consumer now holds exactly a fresh map's peer set.
+		assert.Equal(t, peerSet(resps[0]), client.deltaPeers)
+		assert.NotContains(t, client.deltaPeers, ids[1].NodeID())
+	}
+}
+
+// leaveAfterInitial connects id, delivers its initial map and disconnects
+// it, returning the client that map built.
+func leaveAfterInitial(
+	t *testing.T,
+	cfg *types.Config,
+	s *state.State,
+	hub *Hub,
+	id types.NodeID,
+	cv tailcfg.CapabilityVersion,
+) *modelClient {
+	t.Helper()
+
+	sess := hub.Join(id, func() {})
+	st := NewStream(cfg, hub, id, cv)
+	st.Attach(sess)
+
+	resps, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	client := newModelClient(resps[0])
+	for _, resp := range resps[1:] {
+		client.apply(resp)
+	}
+
+	st.Delivered()
+	require.False(t, hub.Leave(sess))
+
+	return client
+}
+
+// historyCost is what hub's histories of offline nodes cost by its own
+// measure, counted independently: each entry, and each distinct backing
+// array its views pin, whole.
+func historyCost(hub *Hub) int {
+	cost := 0
+	for _, view := range historyArrays(hub) {
+		cost += cap(view)
+	}
+
+	hub.mu.Lock()
+	defer hub.mu.Unlock()
+
+	return cost + len(hub.offlineAt)
+}
+
+// historyArrays returns the distinct views hub's histories retain, by
+// backing array.
+func historyArrays(hub *Hub) map[*types.NodeID][]types.NodeID {
+	hub.mu.Lock()
+	defer hub.mu.Unlock()
+
+	arrays := make(map[*types.NodeID][]types.NodeID, len(hub.sentPeers))
+
+	for _, history := range hub.sentPeers {
+		for _, view := range append([][]types.NodeID{history.ids}, history.attempts...) {
+			if len(view) > 0 {
+				arrays[&view[0]] = view
+			}
+		}
+	}
+
+	return arrays
+}
+
+// TestHubDropsOfflinePeerHistoryAfterTTL lets two nodes leave a minute
+// apart: each history outlives its node's last session by the TTL, and a
+// node back within it is still told what was removed while away. A live
+// node's history never expires.
+func TestHubDropsOfflinePeerHistoryAfterTTL(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	hub := NewHub()
+	now := time.Unix(1, 0)
+	hub.now = func() time.Time { return now }
+
+	leaveAfterInitial(t, cfg, s, hub, ids[0], capVer)
+
+	now = now.Add(time.Minute)
+
+	leaveAfterInitial(t, cfg, s, hub, ids[2], capVer)
+	require.NoError(t, s.DeleteNode(mustNode(t, s, ids[1])))
+
+	now = now.Add(peerHistoryTTL - time.Minute - time.Nanosecond)
+
+	hub.expireHistory()
+	require.True(t, hub.HasPeerHistoryForTest(ids[0]), "history lives for the TTL")
+
+	now = now.Add(time.Nanosecond)
+
+	hub.expireHistory()
+	require.False(t, hub.HasPeerHistoryForTest(ids[0]), "history is dropped once the TTL passed")
+	require.True(t, hub.HasPeerHistoryForTest(ids[2]), "a later leave expires later")
+
+	sess := hub.Join(ids[2], func() {})
+	st := NewStream(cfg, hub, ids[2], capVer)
+	st.Attach(sess)
+	resps, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+	require.Len(t, resps, 2, "within the TTL a reconnect is told about removals")
+	require.Equal(t, []tailcfg.NodeID{ids[1].NodeID()}, resps[1].PeersRemoved)
+	st.Delivered()
+
+	now = now.Add(2 * peerHistoryTTL)
+
+	hub.expireHistory()
+	require.True(t, hub.HasPeerHistoryForTest(ids[2]), "a connected node keeps its history")
+}
+
+// TestHubCapsOfflinePeerHistory disconnects one new node per membership
+// generation, so every offline node pins its own array, under a cap a few
+// of them fill: the retained IDs stay under it, and the nodes that left
+// first lose their history first.
+func TestHubCapsOfflinePeerHistory(t *testing.T) {
+	cfg, s, _ := streamTestState(t, "")
+	hub := NewHub()
+	hub.maxHistoryIDs = 40
+
+	u1, err := s.GetUserByName("u1")
+	require.NoError(t, err)
+
+	const leaves = 24
+
+	left := make([]types.NodeID, 0, leaves)
+
+	for i := range leaves {
+		n := s.CreateRegisteredNodeForTest(u1, fmt.Sprintf("offline-%d", i))
+		n.User = u1
+		s.PutNodeInStoreForTest(*n)
+		leaveAfterInitial(t, cfg, s, hub, n.ID, capVer)
+		left = append(left, n.ID)
+
+		retained := historyCost(hub)
+		require.LessOrEqual(t, retained, hub.maxHistoryIDs, "after %d leaves", i+1)
+
+		hub.mu.Lock()
+		counted := hub.retained
+		hub.mu.Unlock()
+		require.Equal(t, retained, counted, "the hub counts what its histories hold")
+	}
+
+	kept := slices.DeleteFunc(slices.Clone(left), func(id types.NodeID) bool { return !hub.HasPeerHistoryForTest(id) })
+	require.NotEmpty(t, kept, "the cap keeps the latest histories")
+	require.Less(t, len(kept), len(left), "the cap dropped histories")
+	require.Equal(t, left[len(left)-len(kept):], kept, "the oldest offline histories go first")
+}
+
+// leaveWithHistory gives id the history v, then connects and disconnects it.
+func leaveWithHistory(t *testing.T, hub *Hub, id types.NodeID, v sentView) {
+	t.Helper()
+
+	hub.mu.Lock()
+	hub.sentPeers[id] = v
+	hub.mu.Unlock()
+
+	require.False(t, hub.Leave(hub.Join(id, func() {})))
+}
+
+func retainedOf(hub *Hub) int {
+	hub.mu.Lock()
+	defer hub.mu.Unlock()
+
+	return hub.retained
+}
+
+// TestHubCapsEmptyOfflineHistories disconnects more isolated nodes, whose
+// histories hold no IDs, than the cap: the entries themselves are bounded,
+// oldest first.
+func TestHubCapsEmptyOfflineHistories(t *testing.T) {
+	hub := NewHub()
+	hub.maxHistoryIDs = 4
+
+	for i := range 12 {
+		leaveWithHistory(t, hub, types.NodeID(100+i), sentView{rev: uint64(i + 1)})
+
+		hub.mu.Lock()
+		entries := len(hub.offlineAt)
+		hub.mu.Unlock()
+
+		require.LessOrEqual(t, entries, hub.maxHistoryIDs, "after %d leaves", i+1)
+		require.Equal(t, historyCost(hub), retainedOf(hub), "the hub counts what its histories hold")
+	}
+
+	require.False(t, hub.HasPeerHistoryForTest(100), "the oldest history goes first")
+	require.True(t, hub.HasPeerHistoryForTest(111), "the latest history stays")
+}
+
+// TestHubCapsFailedAttemptsOfOfflineNodes disconnects nodes whose history
+// is only views written but never confirmed: they count against the cap
+// like delivered ones.
+func TestHubCapsFailedAttemptsOfOfflineNodes(t *testing.T) {
+	hub := NewHub()
+	hub.maxHistoryIDs = 20
+
+	for i := range 10 {
+		id := types.NodeID(100 + i)
+		attempt := []types.NodeID{id + 1, id + 2, id + 3, id + 4}
+		leaveWithHistory(t, hub, id, sentView{rev: uint64(i + 1), attempts: [][]types.NodeID{attempt}})
+
+		require.LessOrEqual(t, historyCost(hub), hub.maxHistoryIDs, "after %d leaves", i+1)
+		require.Equal(t, historyCost(hub), retainedOf(hub))
+	}
+
+	require.False(t, hub.HasPeerHistoryForTest(100), "failed attempts are evicted like deliveries")
+}
+
+// TestHubCountsASharedViewOnce lets two nodes that were sent the same
+// snapshot view go offline: the view pins one array, counted once.
+func TestHubCountsASharedViewOnce(t *testing.T) {
+	hub := NewHub()
+	view := []types.NodeID{1, 2, 3, 4, 5}
+
+	leaveWithHistory(t, hub, 10, sentView{ids: view, rev: 1})
+	leaveWithHistory(t, hub, 11, sentView{ids: view, rev: 1})
+
+	require.Equal(t, cap(view)+2, retainedOf(hub), "one array and two entries")
+	require.Equal(t, historyCost(hub), retainedOf(hub))
+}
+
+// TestHubTTLRestartsOnRejoin brings a node back within the TTL and lets it
+// leave again: its history then lives a TTL from the second leave.
+func TestHubTTLRestartsOnRejoin(t *testing.T) {
+	hub := NewHub()
+	now := time.Unix(1, 0)
+	hub.now = func() time.Time { return now }
+
+	leaveWithHistory(t, hub, 10, sentView{ids: []types.NodeID{1}, rev: 1})
+
+	now = now.Add(peerHistoryTTL - time.Minute)
+
+	require.False(t, hub.Leave(hub.Join(10, func() {})))
+
+	now = now.Add(peerHistoryTTL - time.Nanosecond)
+
+	hub.expireHistory()
+	require.True(t, hub.HasPeerHistoryForTest(10), "the TTL counts from the last leave")
+
+	now = now.Add(time.Nanosecond)
+
+	hub.expireHistory()
+	require.False(t, hub.HasPeerHistoryForTest(10))
+	require.Zero(t, retainedOf(hub))
+}
+
+// TestHubBoundsFailedHistoryOfAConnectedNode keeps a node connected through
+// overlapping sessions while its writes fail, each attempt carrying a peer
+// that then goes away: the folded union of its attempts must stay under
+// the cap though the node never leaves. Confirmed deliveries keep it to the
+// last view.
+func TestHubBoundsFailedHistoryOfAConnectedNode(t *testing.T) {
+	for _, delivered := range []bool{false, true} {
+		t.Run(fmt.Sprintf("delivered=%v", delivered), func(t *testing.T) {
+			hub := NewHub()
+			hub.maxHistoryIDs = 8
+
+			const id = types.NodeID(1)
+
+			sessions := []*Session{hub.Join(id, func() {}), hub.Join(id, func() {})}
+
+			for i := range 48 {
+				v := sentView{ids: []types.NodeID{types.NodeID(1000 + i)}, rev: uint64(i + 1)}
+				by := sessions[i%2]
+
+				hub.mayHavePeers(by, id, v)
+
+				if delivered {
+					hub.setLastPeers(by, id, v)
+				}
+
+				require.LessOrEqual(t, retainedOf(hub), hub.maxHistoryIDs, "after %d attempts", i+1)
+				require.LessOrEqual(t, len(hub.lastPeers(id)), hub.maxHistoryIDs+maxPeerAttempts,
+					"after %d attempts: peers of failed writes accumulate", i+1)
+			}
+
+			if delivered {
+				require.Equal(t, []types.NodeID{1047}, hub.lastPeers(id), "deliveries keep the last view")
+			}
+
+			require.True(t, hub.Leave(sessions[0]))
+			require.False(t, hub.Leave(sessions[1]))
+			require.Equal(t, historyCost(hub), retainedOf(hub))
+		})
+	}
+}
+
+// TestFoldedHistoryIsRightSized folds attempts that repeat the same peers:
+// the union kept must not pin the concatenation it was built from, and is
+// counted by what it pins.
+func TestFoldedHistoryIsRightSized(t *testing.T) {
+	hub := NewHub()
+
+	const id = types.NodeID(1)
+
+	sess := hub.Join(id, func() {})
+
+	for i := range maxPeerAttempts + 1 {
+		hub.mayHavePeers(sess, id, sentView{ids: []types.NodeID{2, 3, 4, 5, 6}, rev: uint64(i + 1)})
+	}
+
+	hub.mu.Lock()
+	cur := hub.sentPeers[id]
+	hub.mu.Unlock()
+
+	require.True(t, cur.folded, "test sanity: the attempts folded")
+	require.Equal(t, []types.NodeID{2, 3, 4, 5, 6}, cur.ids)
+	require.Equal(t, len(cur.ids), cap(cur.ids), "the union pins the concatenation it was built from")
+	require.Equal(t, cap(cur.ids), retainedOf(hub), "a connected node's folded union is counted")
+}
+
+// TestStreamReturningAfterHistoryExpiryConvergesOnAFreshMap brings a node
+// back after its history expired, with no sweep in between: the reconnect
+// itself must not replay the expired history, and the client converges on
+// exactly what a fresh session gets. A consumer that learns removals only
+// from PeersRemoved keeps a peer deleted while it was away: the price of
+// bounding history, as upstream paid after its 15 minutes.
+func TestStreamReturningAfterHistoryExpiryConvergesOnAFreshMap(t *testing.T) {
+	for _, cv := range []tailcfg.CapabilityVersion{preNetmapRemovalsVer, capVer} {
+		t.Run(fmt.Sprintf("cap=%d", cv), func(t *testing.T) {
+			cfg, s, ids := streamTestState(t, "")
+			hub := NewHub()
+			now := time.Unix(1, 0)
+			hub.now = func() time.Time { return now }
+
+			client := leaveAfterInitial(t, cfg, s, hub, ids[0], cv)
+			require.Contains(t, client.peers, ids[1].NodeID())
+
+			require.NoError(t, s.DeleteNode(mustNode(t, s, ids[1])))
+
+			u2, err := s.GetUserByName("u2")
+			require.NoError(t, err)
+
+			joined := s.CreateRegisteredNodeForTest(u2, "joined-while-away")
+			joined.User = u2
+			s.PutNodeInStoreForTest(*joined)
+
+			now = now.Add(peerHistoryTTL)
+
+			sess := hub.Join(ids[0], func() {})
+			st := NewStream(cfg, hub, ids[0], cv)
+			st.Attach(sess)
+			resps, err := st.Initial(s.Snapshot())
+			require.NoError(t, err)
+			require.Len(t, resps, 1, "expired history announces no removals")
+
+			client.apply(resps[0])
+			st.Delivered()
+
+			fresh, err := NewStream(cfg, NewHub(), ids[0], cv).Initial(s.Snapshot())
+			require.NoError(t, err)
+			require.Empty(t, client.sameAs(newModelClient(fresh[0])))
+			require.Contains(t, client.peers, joined.ID.NodeID())
+			require.Contains(t, client.deltaPeers, ids[1].NodeID(), "a delta-only consumer misses the removal")
+		})
+	}
+}
+
+// BenchmarkOfflinePeerHistory measures retained peer-ID storage after all
+// sessions leave. Growing views differ by one join per disconnect; shared
+// views all come from one snapshot; growing-sparse keeps the growing counts
+// while spacing the IDs apart, a control for the ID-compressed designs the
+// docs weigh, where raw slices still retain by array, not by ID value. Every
+// simulated delivery succeeds, so the counts cover confirmed views: a write
+// that fails part way keeps the same arrays as unconfirmed attempts. Counts
+// deduplicate backing arrays but exclude maps, render caches and heap slack.
+// No clock advances, so only [maxPeerHistoryIDs] drops history.
+func BenchmarkOfflinePeerHistory(b *testing.B) {
+	for _, n := range []int{64, 256, 1024} {
+		for _, shape := range []string{"shared", "growing", "growing-sparse"} {
+			for _, version := range []tailcfg.CapabilityVersion{preNetmapRemovalsVer, capver.FullNetmapRemovalsCapVer} {
+				b.Run(fmt.Sprintf("%s/cap=%d/offline=%d", shape, version, n), func(b *testing.B) {
+					initial := 3
+					if shape == "shared" {
+						initial += n
+					}
+
+					cfg, s := benchState(b, initial, 1)
+					base := s.ListNodes()
+					nodes := make(types.Nodes, n)
+					ip4, ip6 := base.At(2).IPv4().Get().Next(), base.At(2).IPv6().Get().Next()
+
+					for i := range nodes {
+						if shape == "shared" {
+							nodes[i] = base.At(i + 3).AsStruct()
+
+							continue
+						}
+
+						node := base.At(0).AsStruct()
+
+						node.ID = types.NodeID(i + 4) //nolint:gosec // bounded benchmark size
+						if shape == "growing-sparse" {
+							node.ID <<= 20
+						}
+
+						node.Hostname = fmt.Sprintf("offline-%d", i)
+						node.GivenName = node.Hostname
+						node.NodeKey = key.NewNode().Public()
+						v4, v6 := ip4, ip6
+						node.IPv4, node.IPv6 = &v4, &v6
+						nodes[i] = node
+						ip4, ip6 = ip4.Next(), ip6.Next()
+					}
+
+					for b.Loop() {
+						hub := NewHub()
+
+						for _, node := range nodes {
+							if shape != "shared" {
+								// Membership writes are not what is
+								// measured; keep shapes comparable.
+								b.StopTimer()
+								s.PutNodeInStoreForTest(*node)
+								b.StartTimer()
+							}
+
+							sess := hub.Join(node.ID, func() {})
+							st := NewStream(cfg, hub, node.ID, version)
+							st.Attach(sess)
+
+							_, err := st.Initial(s.Snapshot())
+							if err != nil {
+								b.Fatal(err)
+							}
+
+							st.Delivered()
+
+							if hub.Leave(sess) {
+								b.Fatal("unexpected second session")
+							}
+						}
+
+						b.StopTimer()
+
+						hub.mu.Lock()
+						histories := len(hub.sentPeers)
+						hub.mu.Unlock()
+
+						arrays := historyArrays(hub)
+
+						var retained, capacity int
+						for _, view := range arrays {
+							retained += len(view)
+							capacity += cap(view)
+						}
+
+						// The table in docs/ref/debug.md restates these counts;
+						// they are asserted whenever the benchmark runs, and no
+						// CI lane runs benchmarks. Only the counts are asserted:
+						// bytes report allocator-dependent capacity, which the
+						// doc anchors to its toolchain.
+						switch {
+						case shape == "shared":
+							require.Equal(b, n, histories, "one history per offline node")
+							require.Len(b, arrays, 1, "one class pins one array")
+							require.Equal(b, n+3, retained)
+						case n*(n+7)/2 <= maxPeerHistoryIDs:
+							require.Equal(b, n, histories, "one history per offline node")
+							require.Len(b, arrays, n, "one array per generation")
+							require.Equal(b, n*(n+7)/2, retained)
+						default:
+							require.Less(b, histories, n, "the cap dropped the oldest histories")
+							require.Len(b, arrays, histories, "one array per generation")
+							require.LessOrEqual(b, retained, maxPeerHistoryIDs)
+						}
+
+						views := s.Snapshot().PeerViews()
+						b.ReportMetric(float64(len(views)), "current-classes")
+
+						// The published view count: the one class holds
+						// every offline node and itself.
+						require.Len(b, views, 1, "one current class")
+						require.Len(b, views[0], n+3)
+						b.ReportMetric(float64(len(views[0])), "view-IDs")
+
+						b.ReportMetric(float64(histories), "histories")
+						b.ReportMetric(float64(len(arrays)), "history-arrays")
+						b.ReportMetric(float64(retained), "retained-IDs")
+						b.ReportMetric(float64(capacity*8), "history-ID-bytes")
+						runtime.KeepAlive(hub)
+
+						if shape != "shared" {
+							for _, node := range nodes {
+								s.DeleteNodeFromStoreForTest(node.ID)
+							}
+						}
+
+						b.StartTimer()
+					}
+				})
+			}
+		}
 	}
 }

@@ -1,6 +1,7 @@
 package mapper
 
 import (
+	"container/list"
 	jsonv1 "encoding/json"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
@@ -58,7 +59,8 @@ func NewStream(cfg *types.Config, hub *Hub, nodeID types.NodeID, capVer tailcfg.
 
 // Initial returns the responses that open the stream: the full map, then
 // the peers removed while the node had no stream, which clients that only
-// learn removals from deltas would otherwise miss.
+// learn removals from deltas would otherwise miss. A node whose history the
+// hub dropped (see [Hub.Join]) gets the full map alone.
 func (st *Stream) Initial(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) {
 	nm, err := st.r.render(snap)
 	if err != nil {
@@ -198,8 +200,10 @@ type Hub struct {
 	// sentPeers is the peer view each node was last sent, kept across its
 	// sessions so a reconnect can announce peers removed in between. Views
 	// are the snapshot's, shared by every node seeing the same peers, so
-	// this costs no copy per node, and an offline node's entry can wait for
-	// the node's deletion instead of an offline timeout.
+	// this costs no copy per node within one generation. Offline nodes can
+	// pin different generations, O(nodes²) in aggregate, so their entries
+	// are bounded (see offline): a node back after its entry was dropped
+	// gets the full map alone.
 	sentPeers map[types.NodeID]sentView
 
 	// versions indexes the render caches by the version they render for,
@@ -210,12 +214,179 @@ type Hub struct {
 	// snapshot cannot admit a node or class cleanup already dropped.
 	rev, peersRev uint64
 
+	// offline lists, oldest first, the nodes whose history outlived their
+	// last session, and offlineAt indexes it. Their history is dropped
+	// after peerHistoryTTL, or oldest first while retained exceeds
+	// maxHistoryIDs.
+	offline   list.List
+	offlineAt map[types.NodeID]*list.Element
+	// views counts the offline histories holding each view, so a view
+	// shared by many nodes counts once in retained.
+	views map[viewKey]int
+	// retained is what the history beyond each connected node's shared
+	// views costs, in IDs of backing arrays: one per offline history and
+	// the views it holds, and the folded attempts of connected nodes, which
+	// no snapshot shares.
+	retained int
+
 	// frames is shared by every session's encoder.
 	frames frameCache
 
 	closed bool
 	// done ends [Hub.Watch].
 	done chan struct{}
+
+	now           func() time.Time
+	maxHistoryIDs int
+}
+
+// peerHistoryTTL is how long a node's peer history outlives its last
+// session, as upstream kept a disconnected node's sent peers.
+const peerHistoryTTL = 15 * time.Minute
+
+// peerHistorySweep is how often [Hub.Watch] drops expired history when no
+// reconnect does, as often as upstream swept.
+const peerHistorySweep = 5 * time.Minute
+
+// maxPeerHistoryIDs bounds the peer IDs offline histories retain: the TTL
+// alone lets a burst of churn pin one generation per offline node.
+const maxPeerHistoryIDs = 1 << 19
+
+// offlineHistory is the history of a node with no session, and the views
+// it was counted with.
+type offlineHistory struct {
+	id    types.NodeID
+	since time.Time
+	views [][]types.NodeID
+}
+
+// viewKey identifies a view by its backing array.
+type viewKey struct {
+	first *types.NodeID
+	n     int
+}
+
+// expireHistory drops the peer history of nodes offline for longer than
+// [peerHistoryTTL].
+func (h *Hub) expireHistory() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.expireLocked()
+}
+
+func (h *Hub) expireLocked() {
+	now := h.now()
+	for e := h.offline.Front(); e != nil; e = h.offline.Front() {
+		o, _ := e.Value.(*offlineHistory)
+		if now.Sub(o.since) < peerHistoryTTL {
+			return
+		}
+
+		h.dropHistoryLocked(o.id)
+	}
+}
+
+// offlineLocked starts bounding nodeID's history: its last session left.
+func (h *Hub) offlineLocked(nodeID types.NodeID) {
+	h.expireLocked()
+
+	cur, ok := h.sentPeers[nodeID]
+	if _, listed := h.offlineAt[nodeID]; !ok || listed {
+		return
+	}
+
+	// Its folded attempts are counted as a view now.
+	h.retained -= foldedCost(cur)
+
+	o := &offlineHistory{id: nodeID, since: h.now(), views: append([][]types.NodeID{cur.ids}, cur.attempts...)}
+	for _, v := range o.views {
+		h.holdView(v, 1)
+	}
+
+	// The entry itself costs, so histories with no IDs are bounded too.
+	h.retained++
+	h.offlineAt[nodeID] = h.offline.PushBack(o)
+
+	h.boundLocked(nodeID)
+}
+
+// boundLocked drops histories, oldest offline first, while retained is
+// over the cap; when none is offline, nodeID's goes, as the node whose
+// history just grew. A node whose history is dropped gets its next full
+// map alone.
+func (h *Hub) boundLocked(nodeID types.NodeID) {
+	for h.retained > h.maxHistoryIDs {
+		e := h.offline.Front()
+		if e == nil {
+			if _, ok := h.sentPeers[nodeID]; ok {
+				h.dropHistoryLocked(nodeID)
+			}
+
+			return
+		}
+
+		oldest, _ := e.Value.(*offlineHistory)
+		h.dropHistoryLocked(oldest.id)
+	}
+}
+
+// foldedCost is what v's folded attempts cost while its node is connected:
+// their union is the node's own, unlike the snapshot views attempts share.
+func foldedCost(v sentView) int {
+	if !v.folded {
+		return 0
+	}
+
+	return cap(v.ids)
+}
+
+// onlineLocked stops bounding nodeID's history: it has a session again,
+// or its history goes.
+func (h *Hub) onlineLocked(nodeID types.NodeID) {
+	e, ok := h.offlineAt[nodeID]
+	if !ok {
+		return
+	}
+
+	h.offline.Remove(e)
+	delete(h.offlineAt, nodeID)
+
+	o, _ := e.Value.(*offlineHistory)
+	for _, v := range o.views {
+		h.holdView(v, -1)
+	}
+
+	h.retained--
+	h.retained += foldedCost(h.sentPeers[nodeID])
+}
+
+func (h *Hub) dropHistoryLocked(nodeID types.NodeID) {
+	h.onlineLocked(nodeID)
+	h.retained -= foldedCost(h.sentPeers[nodeID])
+	delete(h.sentPeers, nodeID)
+}
+
+// holdView adds delta offline holders to v, counting its backing array in
+// retained while it has any: a view pins all of it.
+func (h *Hub) holdView(v []types.NodeID, delta int) {
+	if len(v) == 0 {
+		return
+	}
+
+	k := viewKey{first: &v[0], n: len(v)}
+	before := h.views[k]
+
+	switch after := before + delta; {
+	case after == 0:
+		delete(h.views, k)
+		h.retained -= cap(v)
+	case before == 0:
+		h.views[k] = after
+		h.retained += cap(v)
+	default:
+		h.views[k] = after
+	}
 }
 
 // Session is one live map stream of a node.
@@ -251,8 +422,13 @@ func NewHub() *Hub {
 		sessions:  make(map[types.NodeID]map[*Session]struct{}),
 		sentPeers: make(map[types.NodeID]sentView),
 		versions:  make(map[tailcfg.CapabilityVersion]weak.Pointer[versionCache]),
+		offlineAt: make(map[types.NodeID]*list.Element),
+		views:     make(map[viewKey]int),
 		done:      make(chan struct{}),
 		firstMaps: make(chan struct{}, runtime.GOMAXPROCS(0)),
+
+		now:           time.Now,
+		maxHistoryIDs: maxPeerHistoryIDs,
 	}
 }
 
@@ -287,10 +463,17 @@ func (h *Hub) Watch(s *state.State) {
 func (h *Hub) watch(s *state.State, sub *graph.Subscription, last *state.Snapshot) {
 	defer sub.Close()
 
+	expire := time.NewTicker(peerHistorySweep)
+	defer expire.Stop()
+
 	for {
 		select {
 		case <-h.done:
 			return
+		case <-expire.C:
+			h.expireHistory()
+
+			continue
 		case <-sub.C:
 		}
 
@@ -528,7 +711,7 @@ func (h *Hub) forget(id types.NodeID) {
 		stops = append(stops, s.stop)
 	}
 
-	delete(h.sentPeers, id)
+	h.dropHistoryLocked(id)
 	h.mu.Unlock()
 
 	for _, vc := range h.caches() {
@@ -540,8 +723,9 @@ func (h *Hub) forget(id types.NodeID) {
 	}
 }
 
-// Join registers a session of nodeID. stop ends the session; the hub calls
-// it on shutdown. It returns nil once the hub is closed.
+// Join registers a session of nodeID, keeping its peer history unless the
+// node was offline longer than [peerHistoryTTL]. stop ends the session;
+// the hub calls it on shutdown. It returns nil once the hub is closed.
 func (h *Hub) Join(nodeID types.NodeID, stop func()) *Session {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -549,6 +733,10 @@ func (h *Hub) Join(nodeID types.NodeID, stop func()) *Session {
 	if h.closed {
 		return nil
 	}
+
+	// Expired first: a node back after the TTL must not replay it.
+	h.expireLocked()
+	h.onlineLocked(nodeID)
 
 	s := &Session{
 		NodeID: nodeID,
@@ -579,6 +767,7 @@ func (h *Hub) Leave(s *Session) bool {
 
 	if len(set) == 0 {
 		delete(h.sessions, s.NodeID)
+		h.offlineLocked(s.NodeID)
 
 		return false
 	}
@@ -692,10 +881,12 @@ func (h *Hub) setLastPeers(by *Session, nodeID types.NodeID, v sentView) {
 	// Only an older render is refused. Two renders of one revision carry
 	// the same view (a snapshot's views are fixed), so an equal one is the
 	// same history, and its delivery must still clear the attempts.
-	if cur, ok := h.sentPeers[nodeID]; ok && cur.rev > v.rev {
+	cur, ok := h.sentPeers[nodeID]
+	if ok && cur.rev > v.rev {
 		return
 	}
 
+	h.retained -= foldedCost(cur)
 	h.sentPeers[nodeID] = v
 }
 
@@ -717,9 +908,17 @@ func (h *Hub) mayHavePeers(by *Session, nodeID types.NodeID, v sentView) {
 	cur.attempts = append(slices.Clip(cur.attempts), v.ids)
 	cur.rev = max(cur.rev, v.rev)
 
-	// A node that keeps failing folds its attempts into one view.
+	// A node that keeps failing folds its attempts into one view. The
+	// union is its own and only grows while nothing is delivered, though
+	// the node never leaves, so it counts against the cap.
 	if len(cur.attempts) > maxPeerAttempts {
-		cur.ids, cur.attempts = mergeViews(cur), nil
+		h.retained -= foldedCost(cur)
+		cur.ids, cur.attempts, cur.folded = mergeViews(cur), nil, true
+		h.retained += foldedCost(cur)
+		h.sentPeers[nodeID] = cur
+		h.boundLocked(nodeID)
+
+		return
 	}
 
 	h.sentPeers[nodeID] = cur
@@ -728,12 +927,17 @@ func (h *Hub) mayHavePeers(by *Session, nodeID types.NodeID, v sentView) {
 // maxPeerAttempts bounds the unconfirmed views kept per node.
 const maxPeerAttempts = 8
 
-// mergeViews returns the sorted union of v's confirmed and attempted views.
+// mergeViews returns the sorted union of v's confirmed and attempted views,
+// in an array of its own size: a kept union must not pin the concatenation.
 func mergeViews(v sentView) []types.NodeID {
 	union := slices.Concat(append([][]types.NodeID{v.ids}, v.attempts...)...)
 	slices.Sort(union)
+	union = slices.Compact(union)
 
-	return slices.Compact(union)
+	out := make([]types.NodeID, len(union))
+	copy(out, union)
+
+	return out
 }
 
 // sentView is a peer view delivered to a node, and the snapshot revision
@@ -744,6 +948,9 @@ type sentView struct {
 	// attempts are the views written since ids was confirmed, which a
 	// failed write may have delivered in part.
 	attempts [][]types.NodeID
+	// folded is set when ids is the union of attempts, not a delivered
+	// snapshot view.
+	folded bool
 }
 
 // Delivered records that the responses the stream last returned were

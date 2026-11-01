@@ -173,3 +173,96 @@ This checks policy-derived results, including filters, route matchers and peer v
 revalidate policy tests, audit endpoint-only commits that skip recompilation, or check DNS rendering, notification
 routing, response diffs, network writes or client state. Fresh peer scans are quadratic, so this diagnostic can add
 substantial cost on large tailnets.
+
+### Offline peer-history memory
+
+The map-session hub keeps peer IDs across disconnects so a reconnect can announce
+peers removed while a client was away. Clients before capability version 148 —
+the version Tailscale v1.104, the first release whose clients also derive
+removals from a full netmap (tailscale/tailscale#15660), reports — need explicit
+`PeersRemoved` responses for consumers that only process peer deltas. A full map
+alone does not clear those consumers' old peers.
+
+Clients sent the same snapshot's peer view share its backing array, and a
+rebuild hands a class whose view did not change the previous generation's
+array, as long as it keeps a member whose previous class saw the same peers;
+a rebuild that keeps no such member shares a fresh array. Sharing ends where
+a class's view changes: with one new node joining, receiving its map and
+disconnecting at each generation, `H` offline nodes retain `H` arrays even
+when the current policy has only one peer class. Starting with three nodes,
+those arrays contain `H × (H + 7) / 2` IDs, so unbounded history would grow
+quadratically with tailnet growth; current class count alone is not a memory
+bound.
+
+History is therefore bounded once a node's last session ends, as upstream bounded
+its per-node sent-peer state:
+
+- it is dropped 15 minutes after the node's last session left, checked when a
+  node connects or disconnects and every 5 minutes;
+- history beyond what connected nodes are being sent costs at most 524,288 (2¹⁹)
+  units: one per offline node, the peer-ID arrays its history pins (a view shared
+  by several nodes counted once), and the union of the failed writes of a
+  connected node whose writes keep failing. Past that, the nodes that left first
+  lose their history first, then the node whose history just grew.
+
+A node back after its history was dropped gets the full map alone, the map a new
+session gets. Clients at capability version 148 or later derive every removal from
+it. A pre-148 consumer that only processes peer deltas keeps peers deleted while it
+was away; that is the cost of the bound, which upstream paid after its 15 minutes
+too. A node back in time keeps its history and is sent its removals. A connected
+node's history is otherwise the view it is being sent. Deleted peers can remain in
+a surviving node's history until its reconnect or the bound drops it.
+
+Reproduce the retained storage measurement from the repository's Nix shell:
+
+```console
+go test ./hscontrol/mapper -run '^$' -bench '^BenchmarkOfflinePeerHistory$' -benchtime=1x -count=1
+```
+
+The benchmark drives real map-stream objects, simulates successful delivery with
+`Delivered`, and removes every session with `Leave`. It performs no transport
+writes and advances no clock, so only the ID bound applies. `shared` disconnects
+all clients from one snapshot; `growing` disconnects one per membership
+generation. `growing-sparse` keeps the growing counts while spacing the new node
+IDs by 2²⁰: a control for ID-compressed designs, which raw ID slices ignore, and
+where spacing would start paying for tree nodes. The hub never gates history on
+the capability a client reports, so no capability version avoids it.
+
+Every count the benchmark emits is a metric of the run you just made, so read
+them from your own output rather than from a table: counts such as
+`retained-IDs` follow from the shape alone, but `history-ID-bytes` includes slice
+capacity, which depends on the Go toolchain's allocator and growth policy.
+What scales with what:
+
+- `shared`: one view serves every offline node, so `view-IDs` and
+  `history-arrays` stay constant while `histories` grows with the offline node
+  count. Storage grows roughly with the current class size plus one slice
+  header per node.
+- `growing`: each offline node holds its own generation, so `retained-IDs`
+  grows quadratically with the offline node count until the ID bound drops the
+  oldest histories. Past the bound, `retained-IDs` stays below it while
+  `histories` and `history-arrays` fall short of the offline node count.
+- `growing-sparse` reports the same counts as `growing`; compare it against
+  `growing` only to see what an ID-compressed design would change.
+
+Every simulated delivery succeeds, so the counts cover confirmed views; a write
+that fails part way keeps the same arrays as unconfirmed attempts, and they count
+against the same bound. Bytes exclude map entries, slice headers, render caches
+and allocator overhead; they are not total process heap. Elapsed time covers the
+session lifecycle (joining, rendering and the delivery bookkeeping the hub
+records) and excludes store membership writes, so it is not an isolated
+history-update latency measurement. To size a deployment, run the benchmark at
+the node counts you expect and compare `retained-IDs` against the bound above.
+
+History is in memory and does not survive a server restart: a peer deleted while a
+pre-148 client was offline across a restart is never announced as removed, and the
+full map it reconnects with does not clear those consumers' stale peers.
+
+Compact persistent sets could share unchanged portions of historical generations,
+and so keep more history under the same bound, but need a connection between class
+generations and shared construction to avoid rebuilding a set per session. Dense
+ID chunks help sequential IDs; sparse views can spend more space on tree nodes
+than the current ID slices. Retention based on client capability would also need
+proof across failed writes, overlapping sessions, upgrades and downgrades; the
+capability of the last connection alone does not establish what a future client
+retains.
