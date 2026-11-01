@@ -3,3 +3,8 @@ docs/
 
 # Golden fixtures are byte-compared; a formatter must not rewrite them.
 hscontrol/testdata/
+
+# Elm compiler output and local dependency/build caches.
+hscontrol/assets/debug-graph/elm.js
+hscontrol/assets/debug-graph/elm-stuff/
+hscontrol/assets/debug-graph/.elm/
