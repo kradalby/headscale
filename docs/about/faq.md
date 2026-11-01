@@ -146,13 +146,13 @@ Headscale checks if the policy is valid during startup and refuses to start if i
 indicates which part of the policy is invalid. Follow these steps to fix your policy:
 
 - Dump the policy to a file: `headscale policy get --bypass-server-and-access-database-directly > policy.json`
-- Edit and fixup `policy.json`. Use the command `headscale policy check --file policy.json` to validate the policy.
+- Edit and fixup `policy.json`. Use the command `headscale policy check --bypass-server-and-access-database-directly --file policy.json` to validate the policy.
 - Load the modified policy: `headscale policy set --bypass-server-and-access-database-directly --file policy.json`
 - Start Headscale as usual.
 
 !!! warning "Full server configuration required"
 
-    The above commands to get/set the policy require a complete server configuration file including database settings. A
+    The above commands require a complete server configuration file including database settings. A
     minimal config to [control Headscale via remote CLI](../ref/api.md#remote-control) is not sufficient. You may use
     `headscale -c /path/to/config.yaml` to specify the path to an alternative configuration file.
 

@@ -105,6 +105,12 @@ Setting or reloading the byte-identical live document skips compilation and its
 `tests`/`sshTests`, even if changed users or nodes would now make them fail.
 Use `headscale policy check --file policy.json` to explicitly revalidate against
 the running server's current users and nodes without publishing a change.
+`headscale policy set --bypass-server-and-access-database-directly` now evaluates
+the document's `tests`/`sshTests` and one node's SSH rules against the persisted
+users and nodes before storing it, as the running server's set does, and refuses
+unless the configured unix socket shows no headscale runs; `--force` does not
+override that refusal. `policy get` and `policy check` keep their read-only
+bypass behaviour against a running server.
 
 [#37](https://github.com/kradalby/headscale/pull/37)
 
