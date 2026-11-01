@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math/bits"
 	"net/netip"
 	"reflect"
 	"slices"
@@ -1111,15 +1112,19 @@ func (pm *PolicyManager) Filter() ([]tailcfg.FilterRule, []matcher.Match) {
 	return pm.filter, pm.matchers
 }
 
-// PeerClasses holds who sees whom. Nodes that see the same nodes share a
-// class, and each class holds one sorted view: every node its members
-// see, which includes the members themselves when the class sees itself.
-// Under a global filter nodes fall into a few classes by which rules they
-// match, so the views cost O(nodes × classes), not O(nodes²); under
-// per-node rules each node is its own class.
+// PeerClasses holds who sees whom. Nodes in a class share one sorted
+// view of every node they see, including the members themselves when
+// the class sees itself.
+// Classes group nodes by which rules they match; per-node rules can split
+// them further. Views cost O(nodes × classes), which can reach O(nodes²)
+// when identities and rules grow with the tailnet.
 type PeerClasses struct {
 	classOf map[types.NodeID]int
 	views   [][]types.NodeID
+	// joined records the build joined classes on opposite sides of each
+	// matcher instead of scanning every pair: both compute the same
+	// relation, so it only says which path ran.
+	joined bool
 
 	// sides keeps what the build learnt of each node, for the next.
 	sides *sideCache
@@ -1306,12 +1311,84 @@ func (pm *PolicyManager) BuildPeerClasses(nodes views.Slice[types.NodeView], pre
 		c.classOf[n.ID()] = ci
 	}
 
+	// Join only classes on opposite sides of a rule when that visits
+	// fewer pairs. Diverse sparse policies otherwise scan C² pairs of
+	// matcher bitsets even when every class sees just one other class.
+	indexed := len(members) > 1
+	if indexed {
+		// A posting costs a word too. Do not transpose dense sides into
+		// larger lists just to discover that the pair scan was cheaper.
+		var words, postings int
+
+		for _, classes := range [2][][]uint64{srcs, dsts} {
+			for _, mask := range classes {
+				words += len(mask)
+				for _, word := range mask {
+					postings += bits.OnesCount64(word)
+				}
+			}
+		}
+
+		indexed = postings <= words
+	}
+
+	var byRule [][2][]int
+	if indexed {
+		byRule = make([][2][]int, len(matchers))
+
+		for side, classes := range [2][][]uint64{srcs, dsts} {
+			for ci, mask := range classes {
+				for w, word := range mask {
+					for word != 0 {
+						k := 64*w + bits.TrailingZeros64(word) //nolint:mnd
+						byRule[k][side] = append(byRule[k][side], ci)
+						word &= word - 1
+					}
+				}
+			}
+		}
+
+		// Repeated dense rules can join the same pair many times. Keep
+		// the short-circuit pair scan when joining would do more work.
+		budget := len(members) * len(members) / 2
+		for _, sides := range byRule {
+			budget -= len(sides[0]) * len(sides[1])
+			if budget < 0 {
+				indexed = false
+				break
+			}
+		}
+	}
+
+	var seenAt []int
+	if indexed {
+		seenAt = make([]int, len(members))
+	}
+
 	for a := range members {
 		var seen [][]types.NodeID
 
-		for b := range members {
-			if canAccessSides(srcs[a], dsts[b]) || canAccessSides(srcs[b], dsts[a]) {
-				seen = append(seen, members[b])
+		if indexed {
+			for side, mask := range [2][]uint64{srcs[a], dsts[a]} {
+				for w, word := range mask {
+					for word != 0 {
+						k := 64*w + bits.TrailingZeros64(word) //nolint:mnd
+						for _, b := range byRule[k][1-side] {
+							if seenAt[b] != a+1 {
+								seenAt[b] = a + 1
+								seen = append(seen, members[b])
+							}
+						}
+
+						word &= word - 1
+					}
+				}
+			}
+		} else {
+			for b := range members {
+				if canAccessSides(srcs[a], dsts[b]) || canAccessSides(srcs[b], dsts[a]) {
+					seen = append(seen, members[b])
+				}
 			}
 		}
 
@@ -1319,6 +1396,8 @@ func (pm *PolicyManager) BuildPeerClasses(nodes views.Slice[types.NodeView], pre
 		slices.Sort(view)
 		c.views = append(c.views, view)
 	}
+
+	c.joined = indexed
 
 	if pm.needsPerNodeFilter {
 		pm.addNodeOnlyPeers(c, nodes)
