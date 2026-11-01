@@ -17,6 +17,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/policy"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -24,6 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 	"pgregory.net/rapid"
+	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -149,8 +151,9 @@ func testWorld(t *testing.T, nodes ...*types.Node) (*world, []types.User) {
 	return w, users
 }
 
-// worldCommitCount reads the package-global counter, so the metric tests
-// below compare deltas and this package's tests must stay serial (no
+// worldCommitCount reads the package-global metric counters, and the
+// panic tests below read worldCommitPanics the same way, so those tests
+// compare deltas and this package's tests must stay serial (no
 // t.Parallel anywhere in it).
 func worldCommitCount(t *testing.T) float64 {
 	t.Helper()
@@ -1516,6 +1519,1204 @@ func TestWorldGroupCommitsQueuedWrites(t *testing.T) {
 	assert.Len(t, after.ListPeerIDs(1), burst)
 }
 
+func viaElectionWorld(tb testing.TB, scopes int, affected bool) *world {
+	tb.Helper()
+
+	alice := &types.User{Name: "alice"}
+	alice.ID = 1
+	ordinary, scoped := netip.MustParsePrefix("10.1.0.0/24"), netip.MustParsePrefix("10.2.0.0/24")
+	nodes := make(types.Nodes, 0, 5)
+
+	for i := range 5 {
+		n := worldNode(types.NodeID(i+1), alice, fmt.Sprintf("100.64.0.%d", i+1))
+		if i < 4 {
+			route := ordinary
+			if i >= 2 {
+				route = scoped
+				n.Tags = []string{"tag:via"}
+			} else if affected {
+				n.Tags = []string{"tag:target"}
+			}
+
+			n.Hostinfo.RoutableIPs = []netip.Prefix{route}
+			n.ApprovedRoutes = []netip.Prefix{route}
+		}
+
+		nodes = append(nodes, n)
+	}
+
+	grants := make([]string, scopes)
+	for i := range grants {
+		grants[i] = `{"src":["100.64.0.5"],"dst":["10.2.0.0/24"],"ip":["*"],"via":["tag:via"]}`
+	}
+
+	if affected {
+		grants = append(grants, `{"src":["100.64.0.5"],"dst":["10.1.0.0/24"],"ip":["*"],"via":["tag:target"]}`)
+	}
+
+	w, err := newWorld(nodes, []types.User{*alice}, []byte(`{"tagOwners":{"tag:via":["alice@"],"tag:target":["alice@"]},"grants":[`+strings.Join(grants, ",")+`]}`), types.DNSView{})
+	require.NoError(tb, err)
+	require.Len(tb, w.snapshot().PrimaryRoutes(), 2)
+
+	return w
+}
+
+func changeViaElectionHealth(w *world, affected bool) *Snapshot {
+	return w.update(func(e *nodeEdit) {
+		n, _ := e.Get(2)
+		n = n.Clone()
+		n.Unhealthy = !n.Unhealthy
+		e.Set(2, n)
+
+		if affected {
+			other, _ := e.Get(1)
+			other = other.Clone()
+			other.Unhealthy = !other.Unhealthy
+			e.Set(1, other)
+		}
+	})
+}
+
+func TestWorldViaElectionAllocationGrowth(t *testing.T) {
+	for _, affected := range []bool{false, true} {
+		t.Run(fmt.Sprintf("affected=%t", affected), func(t *testing.T) {
+			allocations := make([]float64, 0, 2)
+
+			for _, scopes := range []int{1, 128} {
+				w := viaElectionWorld(t, scopes, affected)
+				before := w.snapshot()
+				after := changeViaElectionHealth(w, affected)
+				oldNode, _ := before.nodes().Get(2)
+				newNode, _ := after.nodes().Get(2)
+
+				require.False(t, oldNode.Unhealthy)
+				require.True(t, newNode.Unhealthy)
+				require.Equal(t, before.PolicyRev(), after.PolicyRev())
+
+				if !affected {
+					require.Equal(t, before.PrimariesRev(), after.PrimariesRev())
+				}
+
+				allocations = append(allocations, testing.AllocsPerRun(20, func() { changeViaElectionHealth(w, affected) }))
+
+				require.Equal(t, map[netip.Prefix]types.NodeID{
+					netip.MustParsePrefix("10.1.0.0/24"): 1,
+					netip.MustParsePrefix("10.2.0.0/24"): 3,
+				}, before.PrimaryRoutes(), "old snapshot retains its elections")
+
+				if !affected {
+					require.Equal(t, before.PrimaryRoutes(), w.snapshot().PrimaryRoutes())
+				}
+			}
+
+			t.Logf("scopes=1 %.0f allocs/write; scopes=128 %.0f allocs/write", allocations[0], allocations[1])
+			assert.LessOrEqual(t, allocations[1], allocations[0]+32, "unrelated via scopes must not be rebuilt on a health write")
+		})
+	}
+}
+
+// TestWorldViaElectionRecompileScopes joins a node unrelated to every via
+// scope and checks the same-document recompile keeps every winner and wakes
+// none of their viewers.
+func TestWorldViaElectionRecompileScopes(t *testing.T) {
+	for _, scopes := range []int{1, 128} {
+		t.Run(fmt.Sprintf("scopes=%d", scopes), func(t *testing.T) {
+			w := viaElectionWorld(t, scopes, false)
+			before := w.snapshot()
+
+			alice := &types.User{Name: "alice"}
+			alice.ID = 1
+
+			w.update(func(e *nodeEdit) { e.Set(7, worldNode(7, alice, "100.64.0.7")) })
+			after := w.snapshot()
+
+			require.Greater(t, after.PolicyRev(), before.PolicyRev(), "the join recompiles the policy")
+			require.Equal(t, before.PrimariesRev(), after.PrimariesRev(), "an unrelated join must not move the election")
+			require.Equal(t, before.PrimaryRoutes(), after.PrimaryRoutes())
+
+			was := before.s.Get(w.primaries).via
+			require.Empty(t, after.s.Get(w.primaries).via.ChangedNodes(was), "an unrelated join must not change via winners")
+			require.False(t, after.Since(before).Global, "an unrelated join must not broadcast")
+		})
+	}
+}
+
+// TestWorldTouchedNoMoveClones pins the touched-prefix commit that elects
+// the same winner structurally: it must not clone the routes map, and a
+// commit that moves a winner clones it exactly once. An allocation bound
+// cannot tell those apart from unrelated commit cost; the clone count can.
+func TestWorldTouchedNoMoveClones(t *testing.T) {
+	w := viaElectionWorld(t, 1, false)
+	before := w.snapshot()
+
+	// Toggling the spare 10.1 router touches its prefix but keeps the
+	// primary: node 1 keeps the route.
+	after := changeViaElectionHealth(w, false)
+	require.Equal(t, before.PrimaryRoutes(), after.PrimaryRoutes(), "the toggle moves no winner")
+
+	clones := w.routesClones.Load()
+
+	changeViaElectionHealth(w, false)
+	assert.Equal(t, clones, w.routesClones.Load(), "a touched commit that moves no winner clones no routes map")
+
+	// Failing over moves the winner: the map is cloned for the change,
+	// whatever the number of touched prefixes. The latch clones once.
+	route := netip.MustParsePrefix("10.2.0.0/24")
+
+	clones = w.routesClones.Load()
+
+	w.UpdateNode(3, func(n *types.Node) { n.IsOnline = new(false) })
+	require.Equal(t, types.NodeID(4), w.snapshot().PrimaryRoutes()[route], "the failover moves the winner")
+	assert.Equal(t, clones+1, w.routesClones.Load(), "a commit that moves a winner clones the routes map exactly once")
+
+	// Two winners moving in one commit share the latch: still one clone.
+	double := w.snapshot()
+
+	clones = w.routesClones.Load()
+
+	w.update(func(e *nodeEdit) {
+		for _, id := range []types.NodeID{1, 4} {
+			n, _ := e.Get(id)
+			c := n.Clone()
+			c.IsOnline = new(false)
+			e.Set(id, c)
+		}
+	})
+	moved := w.snapshot()
+	require.NotEqual(t, double.PrimaryRoutes(), moved.PrimaryRoutes(), "the double failover moves two winners")
+	assert.Equal(t, clones+1, w.routesClones.Load(), "a commit that moves many winners clones the routes map once")
+}
+
+// TestWorldCountersAreWorldOwned pins the isolation the strict-delta
+// oracles above rely on: one world's writers never move another world's
+// counters, so a test's deltas are its own however many worlds run.
+func TestWorldCountersAreWorldOwned(t *testing.T) {
+	a := viaElectionWorld(t, 1, false)
+	a.batchTimeout = time.Millisecond
+
+	b := viaElectionWorld(t, 1, false)
+
+	aClones, aStores := a.routesClones.Load(), a.outageStores.Load()
+	bClones, bStores := b.routesClones.Load(), b.outageStores.Load()
+
+	// A failover on a clones its routes map and stores its outage state.
+	a.UpdateNode(3, func(n *types.Node) { n.IsOnline = new(false) })
+
+	assert.Greater(t, a.routesClones.Load(), aClones, "the failover clones a's routes map")
+	assert.Greater(t, a.outageStores.Load(), aStores, "the gated write stores a's outage state")
+	assert.Equal(t, bClones, b.routesClones.Load(), "no other world's clone can move a test's delta")
+	assert.Equal(t, bStores, b.outageStores.Load(), "no other world's store can move a test's delta")
+}
+
+// TestWorldGateCostProfile pins the gate's cost at the gate itself: the
+// only difference between the two arms is the changed node's route shape,
+// so the bound guards the gate's own budget — the ordered compare and
+// the policy-fact walk — not the commit around it. The routed router
+// carries many approved routes, so a shape that materializes election
+// routes on the equal path — the cost the gate lost once — widens the
+// difference well past a one-alloc margin.
+func TestWorldGateCostProfile(t *testing.T) {
+	w := viaElectionWorld(t, 1, false)
+
+	pair := func(id types.NodeID, change func(n *types.Node)) (*nodeMap, *nodeMap) {
+		t.Helper()
+
+		before := w.snapshot().nodes()
+		w.UpdateNode(id, change)
+
+		return before, w.snapshot().nodes()
+	}
+
+	// Amplify the router's approved set: materializing it must cost more
+	// than the fixture's one-alloc margin.
+	w.UpdateNode(3, func(n *types.Node) {
+		prefixes := make([]netip.Prefix, 64)
+		for i := range prefixes {
+			prefixes[i] = netip.MustParsePrefix(fmt.Sprintf("10.64.%d.0/24", i))
+		}
+
+		n.Hostinfo.RoutableIPs = prefixes
+		n.ApprovedRoutes = prefixes
+	})
+
+	routedBefore, routedAfter := pair(3, func(n *types.Node) {
+		n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), 1)}
+	})
+	plainBefore, plainAfter := pair(5, func(n *types.Node) {
+		n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), 1)}
+	})
+
+	routed := testing.AllocsPerRun(20, func() { electionInputChanged(routedBefore, routedAfter) })
+	routeless := testing.AllocsPerRun(20, func() { electionInputChanged(plainBefore, plainAfter) })
+	t.Logf("gate cost: routed %.0f, route-less %.0f allocs/call", routed, routeless)
+
+	// An endpoint write keeps a router's route facts, so the gate builds no
+	// route list for it and costs what it does for a route-less node.
+	assert.LessOrEqual(t, routed, routeless, "the gate builds route lists for a write that kept the route facts")
+}
+
+// TestWorldRoutedWriteCostProfile is a routed-cost smoke over the whole
+// commit path: an endpoint write on a router must cost about what one on a
+// route-less node does. The gate's own cost is pinned directly by
+// [TestWorldGateCostProfile]; this test guards the rest of the routed
+// commit path.
+func TestWorldRoutedWriteCostProfile(t *testing.T) {
+	w := viaElectionWorld(t, 1, false)
+	w.batchTimeout = time.Millisecond
+
+	endpoint := func(id types.NodeID) {
+		t.Helper()
+
+		w.UpdateNode(id, func(n *types.Node) {
+			n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), 1)}
+		})
+	}
+
+	// Warm both shapes: the first commit builds the policy and the peers.
+	endpoint(3)
+	endpoint(5)
+
+	routed := testing.AllocsPerRun(20, func() { endpoint(3) })
+	routeless := testing.AllocsPerRun(20, func() { endpoint(5) })
+	t.Logf("routed write cost: %.0f routed, %.0f route-less allocs/write", routed, routeless)
+
+	// A router's endpoint write keeps its route facts, so it costs about
+	// what a route-less node's does; the margin absorbs the routed node's
+	// larger render inputs, not route lists rebuilt per write.
+	assert.LessOrEqual(t, routed-routeless, float64(4), "a routed endpoint write rebuilds what its route facts kept")
+}
+
+func TestWorldViaIrrelevantElectionAllocationGrowth(t *testing.T) {
+	for _, destination := range []string{"10.2.0.0/24", "autogroup:internet"} {
+		t.Run(destination, func(t *testing.T) {
+			allocations := make([]float64, 0, 2)
+
+			for _, scopes := range []int{1, 128} {
+				alice := &types.User{ID: 1, Name: "alice"}
+				route := netip.MustParsePrefix("10.1.0.0/24")
+				nodes := make(types.Nodes, 0, 4)
+
+				for i := range 4 {
+					n := worldNode(types.NodeID(i+1), alice, fmt.Sprintf("100.64.0.%d", i+1))
+					if i < 3 {
+						n.Hostinfo.RoutableIPs = []netip.Prefix{route}
+
+						n.ApprovedRoutes = []netip.Prefix{route}
+						if i > 0 {
+							n.Tags = []string{"tag:via"}
+						}
+					}
+
+					nodes = append(nodes, n)
+				}
+
+				grants := make([]string, scopes)
+				for i := range grants {
+					grants[i] = fmt.Sprintf(`{"src":["100.64.0.4"],"dst":[%q],"ip":["*"],"via":["tag:via"]}`, destination)
+				}
+
+				w, err := newWorld(nodes, []types.User{*alice}, []byte(`{"tagOwners":{"tag:via":["alice@"]},"grants":[`+strings.Join(grants, ",")+`]}`), types.DNSView{})
+				require.NoError(t, err)
+
+				before := w.snapshot()
+				require.Equal(t, map[netip.Prefix]types.NodeID{route: 1}, before.PrimaryRoutes())
+
+				changeHealth := func() *Snapshot {
+					return w.update(func(e *nodeEdit) {
+						first, _ := e.Get(2)
+						first = first.Clone()
+						first.Unhealthy = !first.Unhealthy
+						e.Set(2, first)
+						second, _ := e.Get(3)
+						second = second.Clone()
+						second.Unhealthy = !second.Unhealthy
+						e.Set(3, second)
+					})
+				}
+				after := changeHealth()
+				oldNode, _ := before.nodes().Get(2)
+				newNode, _ := after.nodes().Get(2)
+
+				require.False(t, oldNode.Unhealthy)
+				require.True(t, newNode.Unhealthy)
+				require.Same(t, before.Policy(), after.Policy())
+				assert.Equal(t, before.PolicyRev(), after.PolicyRev())
+				assert.Equal(t, before.PrimariesRev(), after.PrimariesRev())
+				assert.Empty(t, after.s.Get(w.primaries).via.ChangedNodes(before.s.Get(w.primaries).via))
+				assert.Empty(t, after.Since(before).Primaries, "irrelevant winners must not wake their viewers")
+				assert.Equal(t, before.PrimaryRoutes(), after.PrimaryRoutes(), "outside-tag incumbent stays unchanged")
+
+				allocations = append(allocations, testing.AllocsPerRun(20, func() { changeHealth() }))
+
+				assert.Equal(t, before.PrimariesRev(), w.snapshot().PrimariesRev())
+				assert.False(t, w.snapshot().Since(before).Global, "coalesced irrelevant elections must not broadcast")
+				assert.Equal(t, map[netip.Prefix]types.NodeID{route: 1}, before.PrimaryRoutes(), "retained snapshot stays unchanged")
+			}
+
+			t.Logf("scopes=1 %.0f allocs/write; scopes=128 %.0f allocs/write", allocations[0], allocations[1])
+			assert.LessOrEqual(t, allocations[1], allocations[0]+32, "destination-irrelevant grants must not add election work")
+		})
+	}
+}
+
+func TestWorldViaPolicyLifecycle(t *testing.T) {
+	w := viaElectionWorld(t, 1, false)
+	route := netip.MustParsePrefix("10.2.0.0/24")
+	check := func(snap *Snapshot) error { return snap.PolicyErr() }
+	winners := func(snap *Snapshot) []types.NodeID {
+		t.Helper()
+
+		viewer, _ := snap.GetNode(5)
+		matchers, err := snap.Policy().MatchersForNode(viewer)
+		require.NoError(t, err)
+
+		var ids []types.NodeID
+
+		for _, id := range []types.NodeID{3, 4} {
+			peer, ok := snap.GetNode(id)
+			if ok && slices.Contains(snap.RoutesForPeer(viewer, peer, matchers), route) {
+				ids = append(ids, id)
+			}
+		}
+
+		return ids
+	}
+	initial := w.snapshot()
+	require.Equal(t, []types.NodeID{3}, winners(initial))
+	w.UpdateNode(3, func(n *types.Node) { n.IsOnline = new(false) })
+	failed := w.snapshot()
+	require.Equal(t, []types.NodeID{4}, winners(failed))
+	w.UpdateNode(3, func(n *types.Node) { n.IsOnline = new(true) })
+
+	alice := &types.User{Name: "alice"}
+	alice.ID = 1
+
+	w.update(func(e *nodeEdit) { e.Set(6, worldNode(6, alice, "100.64.0.6")) })
+	recompiled := w.snapshot()
+	require.NotSame(t, initial.Policy(), recompiled.Policy())
+	require.Equal(t, []types.NodeID{4}, winners(recompiled), "same-document compilation preserves sticky recovery")
+	require.Equal(t, []types.NodeID{3}, winners(initial), "old policy and election stay bound")
+
+	_, err := w.SetPolicy([]byte(`{"tagOwners":{"tag:via":["alice@"]},"grants":[
+		{"src":["100.64.0.5"],"dst":["10.2.0.0/24"],"ip":["tcp:443"],"via":["tag:via"]}]}`), check)
+	require.NoError(t, err)
+
+	replaced := w.snapshot()
+	require.Equal(t, []types.NodeID{4}, winners(replaced), "a document keeping the via tags and route keeps the incumbent")
+
+	_, err = w.SetPolicy([]byte(`{"tagOwners":{"tag:via":["alice@"]},"grants":[
+		{"src":["100.64.0.6"],"dst":["10.2.0.0/24"],"ip":["tcp:443"],"via":["tag:via"]}]}`), check)
+	require.NoError(t, err)
+
+	revoked := w.snapshot()
+	require.Equal(t, replaced.PrimariesRev(), revoked.PrimariesRev(), "same winners keep the election cutoff")
+	require.Greater(t, revoked.PolicyRev(), replaced.PolicyRev())
+	require.Empty(t, winners(revoked), "equal winners must not retain old source authorization")
+	require.Equal(t, []types.NodeID{4}, winners(replaced))
+
+	_, err = w.SetPolicy([]byte(`{"grants":[]}`), check)
+	require.NoError(t, err)
+	require.Empty(t, winners(w.snapshot()))
+	require.Equal(t, []types.NodeID{4}, winners(failed))
+
+	_, err = w.SetPolicy([]byte(`{"tagOwners":{"tag:via":["alice@"]},"grants":[
+		{"src":["100.64.0.5"],"dst":["10.2.0.0/24"],"ip":["*"],"via":["tag:via"]}]}`), check)
+	require.NoError(t, err)
+	w.UpdateNode(3, func(n *types.Node) { n.Tags = nil })
+	require.Equal(t, []types.NodeID{4}, winners(w.snapshot()), "removed tag revokes candidate eligibility")
+	w.update(func(e *nodeEdit) { e.Delete(4) })
+	require.Empty(t, winners(w.snapshot()), "empty live election must not use static fallback")
+	require.Equal(t, []types.NodeID{4}, winners(failed))
+}
+
+// TestWorldViaElectionCoalescedDrop pins the no-route rule for one coalesced
+// write: the incumbent going offline while its only spare turns unhealthy
+// leaves nobody to carry the route, even though a candidate is online.
+func TestWorldViaElectionCoalescedDrop(t *testing.T) {
+	w := viaElectionWorld(t, 1, false)
+	route := netip.MustParsePrefix("10.2.0.0/24")
+	before := w.snapshot()
+
+	after := w.update(func(e *nodeEdit) {
+		incumbent, _ := e.Get(3)
+		incumbent = incumbent.Clone()
+		incumbent.IsOnline = new(false)
+		e.Set(3, incumbent)
+
+		spare, _ := e.Get(4)
+		spare = spare.Clone()
+		spare.Unhealthy = true
+		e.Set(4, spare)
+	})
+
+	viewer, _ := after.GetNode(5)
+	router, _ := after.GetNode(3)
+	result := after.s.Get(w.primaries).via.ForPeer(viewer, router)
+
+	assert.Empty(t, result.Include, "an offline incumbent with an unhealthy spare carries no route")
+	assert.Contains(t, result.Exclude, route)
+	assert.Equal(t, []types.NodeID{3}, after.s.Get(w.primaries).via.ChangedNodes(before.s.Get(w.primaries).via))
+}
+
+// TestElectionRoutesMatchSubnetRoutes pins the invariant the touched-prefix
+// computation and via candidacy both rely on: a node's election routes are
+// exactly its announced-and-approved subnet routes, exits aside, with an
+// approved-but-unannounced route in none of them.
+func TestElectionRoutesMatchSubnetRoutes(t *testing.T) {
+	alice := &types.User{Name: "alice"}
+	alice.ID = 1
+
+	subnet := netip.MustParsePrefix("10.2.0.0/24")
+	unannounced := netip.MustParsePrefix("10.3.0.0/24")
+	exits := []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")}
+
+	n := worldNode(3, alice, "100.64.0.3")
+	n.Tags = []string{"tag:via"}
+
+	n.Hostinfo.RoutableIPs = append([]netip.Prefix{subnet}, exits...)
+	n.ApprovedRoutes = append([]netip.Prefix{subnet, unannounced}, exits...)
+
+	w, err := newWorld(types.Nodes{n}, []types.User{*alice}, []byte(`{"tagOwners":{"tag:via":["alice@"]},"grants":[
+		{"src":["alice@"],"dst":["10.2.0.0/24"],"ip":["*"],"via":["tag:via"]}]}`), types.DNSView{})
+	require.NoError(t, err)
+
+	node, _ := w.snapshot().nodes().Get(3)
+
+	assert.Equal(t, node.SubnetRoutes(), electionRoutes(node), "election routes are the announced-and-approved subnet routes")
+}
+
+// TestWorldOutageStoreSites pins every writer of the outage flag through
+// the ordered store: reverting any call site to a raw store leaves the
+// count behind, and a change that moves no election stores nothing.
+func TestWorldOutageStoreSites(t *testing.T) {
+	w := viaElectionWorld(t, 1, false)
+	w.batchTimeout = time.Millisecond
+
+	flip := func(id types.NodeID) {
+		t.Helper()
+
+		w.update(func(e *nodeEdit) {
+			n, _ := e.Get(id)
+			c := n.Clone()
+			c.Unhealthy = !c.Unhealthy
+			e.Set(id, c)
+		})
+	}
+
+	// A route-less node's availability moves no election, so its flip
+	// must not store the outage state at all.
+	stores := w.outageStores.Load()
+
+	flip(5)
+	assert.Equal(t, stores, w.outageStores.Load(), "a route-less flip stores no outage state")
+
+	stores = w.outageStores.Load()
+
+	flip(3)
+	assert.Greater(t, w.outageStores.Load(), stores, "a gated node write stores the outage state")
+
+	stores = w.outageStores.Load()
+
+	_, err := w.SetPolicy([]byte(`{"grants":[]}`), func(s *Snapshot) error { return s.PolicyErr() })
+	require.NoError(t, err)
+	assert.Greater(t, w.outageStores.Load(), stores, "a changed policy stores the outage state")
+
+	stores = w.outageStores.Load()
+
+	require.NoError(t, w.SetUsers([]types.User{{ID: 1, Name: "alice-renamed"}}))
+	assert.Greater(t, w.outageStores.Load(), stores, "a changed user list stores the outage state")
+}
+
+// TestWorldStoreOutageOrdering pins the outage store's guard: a state
+// computed from an older snapshot must not overwrite one from a newer
+// snapshot, whichever of two concurrent writers finishes first.
+func TestWorldStoreOutageOrdering(t *testing.T) {
+	w := viaElectionWorld(t, 1, false)
+	w.batchTimeout = time.Millisecond
+
+	quiet := w.snapshot()
+
+	w.update(func(e *nodeEdit) {
+		for _, id := range []types.NodeID{3, 4} {
+			n, _ := e.Get(id)
+			n = n.Clone()
+			n.Unhealthy = true
+			e.Set(id, n)
+		}
+	})
+
+	outage := w.snapshot()
+
+	require.False(t, hasOutage(quiet))
+	require.True(t, hasOutage(outage))
+
+	// A late writer on the old snapshot must not un-arm the outage, and a
+	// refused store must not count: only the outage store landed.
+	landed := w.outageStores.Load()
+
+	w.storeOutage(outage)
+	w.storeOutage(quiet)
+
+	require.True(t, w.inOutage.Load(), "a stale writer must not un-arm the outage")
+	assert.Equal(t, landed+1, w.outageStores.Load(), "a refused store does not count")
+
+	// Two concurrent writers, either order: under the guard the newer
+	// snapshot's state wins whatever the interleaving, deterministically.
+	// (The sequential assert above already fails first without the guard;
+	// this block's own value is proving the concurrent stores race-free
+	// and the guard ordering holds under contention.)
+	var wg sync.WaitGroup
+
+	for range 20 {
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+
+			w.storeOutage(quiet)
+		}()
+
+		go func() {
+			defer wg.Done()
+
+			w.storeOutage(outage)
+		}()
+	}
+
+	wg.Wait()
+
+	require.True(t, w.inOutage.Load(), "the newer snapshot's state wins whatever the order")
+}
+
+// TestElectionInputChanged pins the outage gate to the election inputs:
+// a change fires it only when a router's prefixes or a policy fact can
+// move. A route-less node's availability — a plain client, an exit-only
+// router — moves nothing, and neither does an endpoint.
+func TestElectionInputChanged(t *testing.T) {
+	alice := &types.User{Name: "alice"}
+	alice.ID = 1
+
+	route := netip.MustParsePrefix("10.1.0.0/24")
+	pol := []byte(`{"tagOwners":{"tag:via":["alice@"]},"grants":[
+		{"src":["alice@"],"dst":["10.1.0.0/24"],"ip":["*"],"via":["tag:via"]}]}`)
+
+	router := worldNode(2, alice, "100.64.0.2")
+	router.Tags = []string{"tag:via"}
+	router.Hostinfo.RoutableIPs = []netip.Prefix{route}
+	router.ApprovedRoutes = []netip.Prefix{route}
+
+	route2 := netip.MustParsePrefix("10.1.1.0/24")
+	reorderRouter := worldNode(5, alice, "100.64.0.5")
+	reorderRouter.Hostinfo.RoutableIPs = []netip.Prefix{route, route2}
+	reorderRouter.ApprovedRoutes = []netip.Prefix{route, route2}
+
+	exitOnly := worldNode(4, alice, "100.64.0.4")
+	exitOnly.Hostinfo.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}
+	exitOnly.ApprovedRoutes = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}
+
+	nodes := types.Nodes{worldNode(1, alice, "100.64.0.1"), router, exitOnly, reorderRouter}
+
+	for _, tt := range []struct {
+		name   string
+		change func(e *nodeEdit)
+		want   bool
+	}{
+		{"routeless availability", func(e *nodeEdit) {
+			n, _ := e.Get(1)
+			c := n.Clone()
+			c.IsOnline = new(false)
+			e.Set(1, c)
+		}, false},
+		{"exit-only availability", func(e *nodeEdit) {
+			n, _ := e.Get(4)
+			c := n.Clone()
+			c.IsOnline = new(false)
+			e.Set(4, c)
+		}, false},
+		{"router availability", func(e *nodeEdit) {
+			n, _ := e.Get(2)
+			c := n.Clone()
+			c.Unhealthy = true
+			e.Set(2, c)
+		}, true},
+		{"router online flip", func(e *nodeEdit) {
+			n, _ := e.Get(2)
+			c := n.Clone()
+			c.IsOnline = new(false)
+			e.Set(2, c)
+		}, true},
+		{"join", func(e *nodeEdit) { e.Set(3, worldNode(3, alice, "100.64.0.3")) }, true},
+		{"leave", func(e *nodeEdit) { e.Delete(1) }, true},
+		{"tags only", func(e *nodeEdit) {
+			n, _ := e.Get(2)
+			c := n.Clone()
+			c.Tags = []string{"tag:other"}
+			e.Set(2, c)
+		}, true},
+		{"endpoint only", func(e *nodeEdit) {
+			n, _ := e.Get(2)
+			c := n.Clone()
+			c.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1")}
+			e.Set(2, c)
+		}, false},
+		{"route reorder only", func(e *nodeEdit) {
+			n, _ := e.Get(5)
+			c := n.Clone()
+			c.Hostinfo.RoutableIPs = []netip.Prefix{route2, route}
+			e.Set(5, c)
+		}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			w, err := newWorld(slices.Clone(nodes), []types.User{*alice}, pol, types.DNSView{})
+			require.NoError(t, err)
+
+			before := w.snapshot().nodes()
+			w.update(tt.change)
+			after := w.snapshot().nodes()
+
+			// The gate is a fused copy of the two walks below; it has
+			// drifted once. Each row pins it to their union, not just to
+			// the table: the ordered route compare catches a same-set
+			// reorder that [types.NodeView.HasPolicyChange] (order-
+			// insensitive on routes) does not.
+			want := len(electionPrefixes(before, after)) > 0 || policyFactsChanged(before, after)
+			require.Equal(t, tt.want, want, "the table's expected value is the union's")
+			assert.Equal(t, want, electionInputChanged(before, after), "the fused gate equals the walks it fused")
+		})
+	}
+}
+
+// TestWorldViaElectionOutageRefresh checks the linger follows the outage
+// state when nothing the availability diff sees changed: a policy document
+// replacement and a tag revocation can both end an outage without touching
+// online state, health or routes.
+func TestWorldViaElectionOutageRefresh(t *testing.T) {
+	// An untagged router keeps the global election healthy, so only the
+	// via scope can be in outage.
+	setup := func() *world {
+		w := viaElectionWorld(t, 1, false)
+		w.batchTimeout = time.Millisecond
+
+		alice := &types.User{Name: "alice"}
+		alice.ID = 1
+
+		plain := worldNode(7, alice, "100.64.0.7")
+		plain.Hostinfo.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.2.0.0/24")}
+		plain.ApprovedRoutes = []netip.Prefix{netip.MustParsePrefix("10.2.0.0/24")}
+
+		w.update(func(e *nodeEdit) { e.Set(7, plain) })
+
+		return w
+	}
+
+	unhealthyBoth := func(w *world) *Snapshot {
+		return w.update(func(e *nodeEdit) {
+			for _, id := range []types.NodeID{3, 4} {
+				n, _ := e.Get(id)
+				n = n.Clone()
+				n.Unhealthy = true
+				e.Set(id, n)
+			}
+		})
+	}
+
+	t.Run("policy replacement", func(t *testing.T) {
+		w := setup()
+
+		require.True(t, hasOutage(unhealthyBoth(w)))
+		require.True(t, w.inOutage.Load(), "the via outage arms the linger")
+
+		_, err := w.SetPolicy([]byte(`{"grants":[]}`), func(s *Snapshot) error { return s.PolicyErr() })
+		require.NoError(t, err)
+
+		require.False(t, hasOutage(w.snapshot()), "the scope is gone")
+		require.False(t, w.inOutage.Load(), "a policy-only commit refreshes the outage state")
+	})
+
+	t.Run("tag revocation", func(t *testing.T) {
+		w := setup()
+
+		require.True(t, hasOutage(unhealthyBoth(w)))
+		require.True(t, w.inOutage.Load(), "the via outage arms the linger")
+
+		w.update(func(e *nodeEdit) {
+			for _, id := range []types.NodeID{3, 4} {
+				n, _ := e.Get(id)
+				n = n.Clone()
+				n.Tags = nil
+				e.Set(id, n)
+			}
+		})
+
+		require.False(t, hasOutage(w.snapshot()), "no candidate carries the tag")
+		require.False(t, w.inOutage.Load(), "a tag-only write refreshes the outage state")
+	})
+}
+
+// TestWorldViaElectionOutage arms the outage linger for a via scope: with
+// the global election healthy through an untagged router, both of a scope's
+// tagged routers going unhealthy is still an outage, because the routers
+// coming back should be elected together.
+func TestWorldViaElectionOutage(t *testing.T) {
+	w := viaElectionWorld(t, 1, false)
+	route := netip.MustParsePrefix("10.2.0.0/24")
+
+	alice := &types.User{Name: "alice"}
+	alice.ID = 1
+
+	plain := worldNode(7, alice, "100.64.0.7")
+	plain.Hostinfo.RoutableIPs = []netip.Prefix{route}
+	plain.ApprovedRoutes = []netip.Prefix{route}
+
+	w.update(func(e *nodeEdit) { e.Set(7, plain) })
+
+	before := w.snapshot()
+	require.False(t, hasOutage(before), "sanity: every global primary is healthy")
+
+	after := w.update(func(e *nodeEdit) {
+		for _, id := range []types.NodeID{3, 4} {
+			n, _ := e.Get(id)
+			n = n.Clone()
+			n.Unhealthy = true
+			e.Set(id, n)
+		}
+	})
+
+	require.True(t, hasOutage(after), "a via scope whose routers are all unavailable is an outage")
+}
+
+// TestWorldViaElectionAudit runs the via election under the policy audit
+// and checks the from-scratch reference agrees with every incremental
+// election: no audit failures across joins, failovers, sticky recovery and
+// deletions.
+func TestWorldViaElectionAudit(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+
+	w := viaElectionWorld(t, 1, false)
+	route := netip.MustParsePrefix("10.2.0.0/24")
+	failures, runs := PolicyAuditFailures(), PolicyAuditRuns()
+
+	alice := &types.User{Name: "alice"}
+	alice.ID = 1
+
+	n := worldNode(6, alice, "100.64.0.6")
+	n.Tags = []string{"tag:via"}
+	n.Hostinfo.RoutableIPs = []netip.Prefix{route}
+	n.ApprovedRoutes = slices.Clone(n.Hostinfo.RoutableIPs)
+
+	w.update(func(e *nodeEdit) { e.Set(6, n) })
+	w.UpdateNode(3, func(node *types.Node) { node.IsOnline = new(false) })
+	w.UpdateNode(3, func(node *types.Node) { node.IsOnline = new(true) })
+	w.UpdateNode(4, func(node *types.Node) { node.IsOnline = new(false) })
+	w.update(func(e *nodeEdit) { e.Delete(3) })
+
+	require.Greater(t, PolicyAuditRuns(), runs, "every commit electing via routes runs the audit")
+	require.Zero(t, PolicyAuditFailures()-failures, "every incremental election must agree with a full one")
+	require.Equal(t, []types.NodeID{6}, w.snapshot().s.Get(w.primaries).via.ChangedNodes(nil), "the surviving router carries the route")
+}
+
+func TestWorldViaElectionHistory(t *testing.T) {
+	w := viaElectionWorld(t, 1, false)
+	alice := &types.User{Name: "alice"}
+	alice.ID = 1
+	n := worldNode(6, alice, "100.64.0.6")
+	n.Tags = []string{"tag:via"}
+	n.Hostinfo.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.2.0.0/24")}
+	n.ApprovedRoutes = slices.Clone(n.Hostinfo.RoutableIPs)
+
+	w.update(func(e *nodeEdit) { e.Set(6, n) })
+	before := w.snapshot()
+	w.UpdateNode(3, func(n *types.Node) { n.IsOnline = new(false) })
+	first := w.snapshot()
+	require.Equal(t, []types.NodeID{3, 4}, first.s.Get(w.primaries).via.ChangedNodes(before.s.Get(w.primaries).via))
+	w.UpdateNode(4, func(n *types.Node) { n.IsOnline = new(false) })
+	second := w.snapshot()
+	require.Equal(t, []types.NodeID{3, 6}, second.s.Get(w.primaries).via.ChangedNodes(before.s.Get(w.primaries).via))
+	require.True(t, second.Since(before).Global, "coalesced transitions wake viewers of intermediate winners")
+
+	for i := range 601 {
+		w.update(func(e *nodeEdit) {
+			for _, id := range []types.NodeID{3, 6} {
+				n, _ := e.Get(id)
+				n = n.Clone()
+				n.IsOnline = new((id == 3) == (i%2 != 0))
+				e.Set(id, n)
+			}
+		})
+	}
+
+	current := w.snapshot()
+
+	// Beyond the edit-log retention depth, ChangedNodes falls back to
+	// comparing the retained maps.
+	require.Equal(t, []types.NodeID{4, 6}, current.s.Get(w.primaries).via.ChangedNodes(first.s.Get(w.primaries).via))
+	require.Equal(t, []types.NodeID{3, 6}, current.s.Get(w.primaries).via.ChangedNodes(before.s.Get(w.primaries).via))
+
+	w.UpdateNode(3, func(n *types.Node) { n.IsOnline = new(true) })
+	w.UpdateNode(6, func(n *types.Node) { n.IsOnline = new(false) })
+	returned := w.snapshot()
+	require.Empty(t, returned.s.Get(w.primaries).via.ChangedNodes(before.s.Get(w.primaries).via))
+	require.True(t, returned.Since(before).Global, "changed-back winners still invalidate skipped snapshots")
+
+	_, err := w.SetPolicy([]byte(`{"grants":[]}`), func(s *Snapshot) error { return s.PolicyErr() })
+	require.NoError(t, err)
+	require.Equal(t, []types.NodeID{3}, w.snapshot().s.Get(w.primaries).via.ChangedNodes(returned.s.Get(w.primaries).via))
+}
+
+// TestWorldViaGrantReordering pins content identity under a reorder: each
+// grant's healthy incumbent keeps its route. Positional identity would
+// hand each grant the other's winner, which is no candidate of its, and
+// elect the lowest IDs instead.
+func TestWorldViaGrantReordering(t *testing.T) {
+	w := viaElectionWorld(t, 1, true)
+	w.UpdateNode(1, func(n *types.Node) { n.IsOnline = new(false) })
+	w.UpdateNode(3, func(n *types.Node) { n.IsOnline = new(false) })
+	w.UpdateNode(1, func(n *types.Node) { n.IsOnline = new(true) })
+	w.UpdateNode(3, func(n *types.Node) { n.IsOnline = new(true) })
+	before := w.snapshot()
+	_, err := w.SetPolicy([]byte(`{"tagOwners":{"tag:via":["alice@"],"tag:target":["alice@"]},"grants":[
+		{"src":["100.64.0.5"],"dst":["10.1.0.0/24"],"ip":["*"],"via":["tag:target"]},
+		{"src":["100.64.0.5"],"dst":["10.2.0.0/24"],"ip":["*"],"via":["tag:via"]}]}`), func(s *Snapshot) error { return s.PolicyErr() })
+	require.NoError(t, err)
+
+	after := w.snapshot()
+	for _, snap := range []*Snapshot{before, after} {
+		viewer, _ := snap.GetNode(5)
+		for _, id := range []types.NodeID{1, 2, 3, 4} {
+			peer, _ := snap.GetNode(id)
+			included := snap.s.Get(w.primaries).via.ForPeer(viewer, peer).Include
+			want := id == 2 || id == 4
+			require.Equal(t, want, len(included) == 1, "snapshot %d router %d", snap.Rev(), id)
+		}
+	}
+}
+
+// TestWorldViaUnrelatedPolicyEditKeepsIncumbent pins election identity
+// across documents: an election is its via tags and route, so a policy
+// edit that leaves both alone must not hand a healthy incumbent's route
+// back to the lowest-ID router.
+func TestWorldViaUnrelatedPolicyEditKeepsIncumbent(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+
+	w := viaElectionWorld(t, 1, false)
+	failures := PolicyAuditFailures()
+	route := netip.MustParsePrefix("10.2.0.0/24")
+	via := func(snap *Snapshot) *policyv2.ViaRoutes { return snap.s.Get(w.primaries).via }
+	winner := func(snap *Snapshot) types.NodeID {
+		t.Helper()
+
+		viewer, _ := snap.GetNode(5)
+
+		for _, id := range []types.NodeID{3, 4} {
+			peer, _ := snap.GetNode(id)
+			if slices.Contains(via(snap).ForPeer(viewer, peer).Include, route) {
+				return id
+			}
+		}
+
+		return 0
+	}
+
+	w.UpdateNode(3, func(n *types.Node) { n.IsOnline = new(false) })
+	w.UpdateNode(3, func(n *types.Node) { n.IsOnline = new(true) })
+
+	before := w.snapshot()
+	require.Equal(t, types.NodeID(4), winner(before), "the healthy incumbent keeps the route when 3 recovers")
+
+	_, err := w.SetPolicy([]byte(`{"tagOwners":{"tag:via":["alice@"],"tag:target":["alice@"]},"grants":[
+		{"src":["100.64.0.1"],"dst":["100.64.0.2"],"ip":["*"]},
+		{"src":["100.64.0.5"],"dst":["10.2.0.0/24"],"ip":["*"],"via":["tag:via"]}]}`), func(s *Snapshot) error { return s.PolicyErr() })
+	require.NoError(t, err)
+
+	after := w.snapshot()
+	require.Greater(t, after.PolicyRev(), before.PolicyRev())
+	assert.Equal(t, types.NodeID(4), winner(after), "an unrelated grant must not restart the via election")
+	assert.Empty(t, via(after).ChangedNodes(via(before)), "no winner moved")
+	assert.Zero(t, PolicyAuditFailures()-failures, "the carried election must agree with a full one")
+}
+
+func BenchmarkWorldViaElection(b *testing.B) {
+	for _, affected := range []bool{false, true} {
+		for _, scopes := range []int{1, 128} {
+			b.Run(fmt.Sprintf("affected=%t/scopes=%d", affected, scopes), func(b *testing.B) {
+				w := viaElectionWorld(b, scopes, affected)
+				b.ReportAllocs()
+
+				for b.Loop() {
+					changeViaElectionHealth(w, affected)
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkWorldPrimaryMove measures one HA prefix's election among many
+// unchanged prefixes, with the [Snapshot.Since] a consumer derives from
+// it. stable touches the prefix without moving its winner; failover
+// moves the winner every iteration. The cost should follow the one
+// prefix, not the routes around it.
+// broadHAWorld is two routers sharing count prefixes, router 2 elected,
+// and step, which fails every prefix over to the other router.
+func broadHAWorld(tb testing.TB, count int) (*world, func(i int)) {
+	tb.Helper()
+
+	alice := &types.User{Name: "alice"}
+	alice.ID = 1
+
+	nodes := make(types.Nodes, 0, 2)
+
+	for _, id := range []types.NodeID{2, 3} {
+		n := worldNode(id, alice, fmt.Sprintf("100.64.0.%d", id))
+
+		for i := range count {
+			prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 0}), 24)
+			n.Hostinfo.RoutableIPs = append(n.Hostinfo.RoutableIPs, prefix)
+			n.ApprovedRoutes = append(n.ApprovedRoutes, prefix)
+		}
+
+		nodes = append(nodes, n)
+	}
+
+	w, err := newWorld(nodes, []types.User{*alice}, []byte(ownUserPolicy), types.DNSView{})
+	require.NoError(tb, err)
+
+	step := func(i int) {
+		w.update(func(e *nodeEdit) {
+			for _, id := range []types.NodeID{2, 3} {
+				n, _ := e.Get(id)
+				n = n.Clone()
+				n.IsOnline = new((id == 3) == (i%2 == 0))
+				e.Set(id, n)
+			}
+		})
+	}
+
+	return w, step
+}
+
+// TestWorldBroadFailoverMatchesFullBuild fails every prefix of one router
+// over to another and back: each router's primaries must be exactly the
+// sorted prefixes it won.
+func TestWorldBroadFailoverMatchesFullBuild(t *testing.T) {
+	const count = 300
+
+	w, step := broadHAWorld(t, count)
+
+	for i := range 4 {
+		step(i)
+
+		winner, loser := types.NodeID(3), types.NodeID(2)
+		if i%2 == 1 {
+			winner, loser = loser, winner
+		}
+
+		snap := w.snapshot()
+		got := snap.PrimaryRoutesForNode(winner)
+		require.Len(t, got, count, "step %d", i)
+		require.True(t, slices.IsSortedFunc(got, netip.Prefix.Compare), "step %d: unsorted", i)
+		require.Empty(t, snap.PrimaryRoutesForNode(loser), "step %d", i)
+
+		for _, p := range got {
+			id, ok := snap.PrimaryRouteFor(p)
+			require.True(t, ok)
+			require.Equal(t, winner, id, "step %d: %s", i, p)
+		}
+	}
+}
+
+// TestPrimaryPatchWorkFollowsNodes moves all of a router's prefixes, and
+// one, at two sizes: a patch allocates per node whose list it rebuilds, so
+// its allocations must not grow with the prefixes moved. Editing lists
+// prefix by prefix grows them, as it shifts each list once per prefix.
+//
+// It counts allocations, not time: a patch that presizes and shifts lists in
+// place would pass. BenchmarkPrimaryPatch covers time; nothing enforces it.
+func TestPrimaryPatchWorkFollowsNodes(t *testing.T) {
+	allocs := func(count, moved int) float64 {
+		p, after, prefixes := primaryPatchCase(count, moved)
+
+		return testing.AllocsPerRun(5, func() { p.patch(after, prefixes, nil) })
+	}
+
+	small, large := allocs(64, 64), allocs(4096, 4096)
+	assert.LessOrEqual(t, large, small, "a broad move allocates per prefix: %v at 4096 vs %v at 64", large, small)
+	assert.LessOrEqual(t, allocs(4096, 1), allocs(64, 1), "a one-prefix move allocates with the list it leaves")
+
+	// The moved prefixes land in order, old lists untouched.
+	p, after, prefixes := primaryPatchCase(300, 120)
+	held := slices.Clone(p.byNode[1])
+	next := p.patch(after, prefixes, nil)
+	require.Equal(t, held, p.byNode[1], "the patch edited a published list")
+	require.Equal(t, prefixes, next.byNode[2])
+	require.Equal(t, held[120:], next.byNode[1])
+}
+
+// TestMergePrefixesIgnoresAbsentDrops pins that a drop the list lacks is
+// ignored, not a panic from the capacity hint going negative.
+func TestMergePrefixesIgnoresAbsentDrops(t *testing.T) {
+	has := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}
+	drop := []netip.Prefix{
+		netip.MustParsePrefix("10.0.1.0/24"),
+		netip.MustParsePrefix("10.0.2.0/24"),
+		netip.MustParsePrefix("10.0.3.0/24"),
+	}
+
+	require.NotPanics(t, func() {
+		require.Equal(t, has, mergePrefixes(has, drop, nil))
+	})
+}
+
+// BenchmarkPrimaryPatch moves k prefixes off a router holding count: the
+// patch's cost must follow the prefixes moved, a one-prefix move off a large
+// router included, and never their square.
+func BenchmarkPrimaryPatch(b *testing.B) {
+	for _, tc := range []struct{ count, moved int }{{10000, 1}, {10000, 16}, {10000, 10000}, {1000, 1000}} {
+		b.Run(fmt.Sprintf("prefixes=%d/moved=%d", tc.count, tc.moved), func(b *testing.B) {
+			p, after, moved := primaryPatchCase(tc.count, tc.moved)
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				p.patch(after, moved, nil)
+			}
+		})
+	}
+}
+
+// primaryPatchCase is an election where node 1 holds count prefixes, and
+// the routes after moving the first moved of them to node 2.
+func primaryPatchCase(count, moved int) (primaryRoutes, map[netip.Prefix]types.NodeID, []netip.Prefix) {
+	before := make(map[netip.Prefix]types.NodeID, count)
+	after := make(map[netip.Prefix]types.NodeID, count)
+	movedPrefixes := make([]netip.Prefix, 0, moved)
+
+	for i := range count {
+		prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 0}), 24)
+		before[prefix], after[prefix] = 1, 1
+
+		if i < moved {
+			after[prefix] = 2
+			movedPrefixes = append(movedPrefixes, prefix)
+		}
+	}
+
+	return newPrimaryRoutes(before, nil, primaryRoutes{}), after, movedPrefixes
+}
+
+// BenchmarkWorldBroadFailover moves every prefix of a router to another:
+// the cost must grow with the prefixes moved, not with their square.
+func BenchmarkWorldBroadFailover(b *testing.B) {
+	for _, count := range []int{1024, 4096, 16384} {
+		b.Run(fmt.Sprintf("prefixes=%d", count), func(b *testing.B) {
+			w, step := broadHAWorld(b, count)
+			step(0)
+
+			i := 1
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				step(i)
+				i++
+			}
+
+			require.Len(b, w.snapshot().PrimaryRoutes(), count)
+		})
+	}
+}
+
+func BenchmarkWorldPrimaryMove(b *testing.B) {
+	ha := netip.MustParsePrefix("10.255.255.0/24")
+
+	for _, count := range []int{0, 1000, 10000} {
+		for _, failover := range []bool{false, true} {
+			for _, timeout := range []time.Duration{0, time.Millisecond} {
+				name := fmt.Sprintf("prefixes=%d/failover=%t/batchTimeout=%s", count, failover, timeout)
+				b.Run(name, func(b *testing.B) {
+					alice := &types.User{Name: "alice"}
+					alice.ID = 1
+
+					// Node 1 carries the unchanged prefixes; 2 and 3 share the
+					// HA prefix, 2 elected first.
+					bulk := worldNode(1, alice, "100.64.0.1")
+
+					for i := range count {
+						prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 0}), 24)
+						bulk.Hostinfo.RoutableIPs = append(bulk.Hostinfo.RoutableIPs, prefix)
+						bulk.ApprovedRoutes = append(bulk.ApprovedRoutes, prefix)
+					}
+
+					nodes := append(make(types.Nodes, 0, 3), bulk)
+
+					for _, id := range []types.NodeID{2, 3} {
+						n := worldNode(id, alice, fmt.Sprintf("100.64.0.%d", id))
+						n.Hostinfo.RoutableIPs = []netip.Prefix{ha}
+						n.ApprovedRoutes = []netip.Prefix{ha}
+						nodes = append(nodes, n)
+					}
+
+					w, err := newWorld(nodes, []types.User{*alice}, []byte(ownUserPolicy), types.DNSView{})
+					require.NoError(b, err)
+
+					w.batchTimeout = timeout
+					require.Len(b, w.snapshot().PrimaryRoutes(), count+1)
+
+					step := func(i int) {
+						w.update(func(e *nodeEdit) {
+							if !failover {
+								// The spare flaps health: the prefix is touched,
+								// node 2 keeps it.
+								n, _ := e.Get(3)
+								n = n.Clone()
+								n.Unhealthy = !n.Unhealthy
+								e.Set(3, n)
+
+								return
+							}
+
+							// One router goes offline as the other returns, so
+							// every step moves the winner.
+							for _, id := range []types.NodeID{2, 3} {
+								n, _ := e.Get(id)
+								n = n.Clone()
+								n.IsOnline = new((id == 3) == (i%2 == 0))
+								e.Set(id, n)
+							}
+						})
+					}
+
+					step(0)
+
+					prev := w.snapshot()
+					want := prev.PrimaryRoutes()[ha]
+					i := 1
+
+					b.ReportAllocs()
+
+					for b.Loop() {
+						step(i)
+
+						next := w.snapshot()
+						c := next.Since(prev)
+
+						if failover {
+							want = 5 - want
+							if next.PrimaryRoutes()[ha] != want || len(c.Primaries) != 2 {
+								b.Fatalf("step %d: primary %d, want %d; changed %v", i, next.PrimaryRoutes()[ha], want, c.Primaries)
+							}
+						} else if next.PrimariesRev() != prev.PrimariesRev() {
+							b.Fatalf("step %d: a stable touch moved the election", i)
+						}
+
+						prev = next
+						i++
+					}
+				})
+			}
+		}
+	}
+}
+
 // BenchmarkWorldEndpointWrite measures one endpoint update, the most common
 // write: it must not recompile the policy or rebuild peers.
 func BenchmarkWorldEndpointWrite(b *testing.B) {
@@ -1683,25 +2884,44 @@ func TestWorldIndexMatchesFullBuild(t *testing.T) {
 	alice, bob := &types.User{Name: "alice"}, &types.User{Name: "bob"}
 	alice.ID, bob.ID = 1, 2
 
-	route := netip.MustParsePrefix("10.0.0.0/24")
+	route, second := netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("10.0.1.0/24")
+
+	// Even nodes also serve a second prefix: a winner then holds several
+	// prefixes, and a move patches one out of its list.
+	routesOf := func(id types.NodeID) []netip.Prefix {
+		if id%2 == 0 {
+			return []netip.Prefix{route, second}
+		}
+
+		return []netip.Prefix{route}
+	}
 
 	nodes := make(types.Nodes, 8)
 	for i := range nodes {
-		nodes[i] = worldNode(types.NodeID(i+1), alice, fmt.Sprintf("100.64.0.%d", i+1))
-		nodes[i].Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
-		nodes[i].ApprovedRoutes = []netip.Prefix{route}
+		id := types.NodeID(i + 1)
+		nodes[i] = worldNode(id, alice, fmt.Sprintf("100.64.0.%d", i+1))
+		nodes[i].Hostinfo = &tailcfg.Hostinfo{RoutableIPs: routesOf(id)}
+		nodes[i].ApprovedRoutes = routesOf(id)
 	}
 
 	w, err := newWorld(nodes, []types.User{*alice, *bob}, nil, types.DNSView{})
 	require.NoError(t, err)
 
 	r := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // deterministic test input
-	prevRoutes := w.snapshot().PrimaryRoutes()
+	prevSnap := w.snapshot()
+	prevRoutes := prevSnap.PrimaryRoutes()
 
 	for step := range 400 {
 		id := types.NodeID(r.IntN(10) + 1) //nolint:gosec // small test IDs
 
-		switch r.IntN(8) {
+		// What the published election holds before this step; no later
+		// patch may change it.
+		published := maps.Clone(prevSnap.s.Get(w.primaries).byNode)
+		for k, v := range published {
+			published[k] = slices.Clone(v)
+		}
+
+		switch r.IntN(9) {
 		case 0:
 			w.UpdateNode(id, func(n *types.Node) { n.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1")} })
 		case 1:
@@ -1718,10 +2938,24 @@ func TestWorldIndexMatchesFullBuild(t *testing.T) {
 			w.UpdateNode(id, func(n *types.Node) { n.Unhealthy = !n.Unhealthy })
 		case 7:
 			w.UpdateNode(id, func(n *types.Node) {
-				n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
-				n.ApprovedRoutes = []netip.Prefix{route}
+				n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: routesOf(id)}
+				n.ApprovedRoutes = routesOf(id)
+			})
+		case 8:
+			// Swap the one prefix served for the other: a winner's list
+			// can change while keeping its length.
+			w.UpdateNode(id, func(n *types.Node) {
+				swapped := []netip.Prefix{second}
+				if slices.Contains(n.ApprovedRoutes, second) {
+					swapped = []netip.Prefix{route}
+				}
+
+				n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: swapped}
+				n.ApprovedRoutes = swapped
 			})
 		}
+
+		require.Equal(t, published, prevSnap.s.Get(w.primaries).byNode, "step %d: a patch edited a published list", step)
 
 		snap := w.snapshot()
 		got, want := snap.index(), updateIndex(nil, snap.nodes())
@@ -1738,7 +2972,26 @@ func TestWorldIndexMatchesFullBuild(t *testing.T) {
 
 		// Electing only the touched prefixes equals electing all of them.
 		require.Equal(t, electPrimaryRoutes(snap.nodes(), prevRoutes), snap.PrimaryRoutes(), "step %d", step)
-		prevRoutes = snap.PrimaryRoutes()
+
+		// The patched inversion and the change it reports equal building
+		// both from the routes.
+		was := newPrimaryRoutes(prevRoutes, nil, primaryRoutes{}).byNode
+		is := newPrimaryRoutes(snap.PrimaryRoutes(), nil, primaryRoutes{}).byNode
+		require.Equal(t, is, snap.s.Get(w.primaries).byNode, "step %d", step)
+
+		moved := changedKeys(was, is, slices.Equal[[]netip.Prefix])
+		slices.Sort(moved)
+		require.Equal(t, moved, snap.Since(prevSnap).Primaries, "step %d", step)
+
+		// The patched outages equal scanning every primary.
+		full := patchOutages(nil, snap.nodes(), snap.index().advertisers.Groups, snap.PrimaryRoutes(), snap.PrimaryRoutes())
+		require.Len(t, snap.s.Get(w.primaries).outages, len(full), "step %d", step)
+
+		for p := range full {
+			require.Contains(t, snap.s.Get(w.primaries).outages, p, "step %d", step)
+		}
+
+		prevSnap, prevRoutes = snap, snap.PrimaryRoutes()
 
 		for _, primary := range snap.PrimaryRoutes() {
 			n, _ := snap.GetNode(primary)

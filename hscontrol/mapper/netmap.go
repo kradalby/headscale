@@ -129,9 +129,11 @@ type renderer struct {
 	// last overlay restores the shared class map.
 	overlays int
 	// routedPrimaries are the primary routes each routed peer's routes were
-	// rendered with: a primary move renders again only the routers whose
-	// primaries moved.
+	// rendered with, and routedVia the via elections: a primary move that
+	// keeps the elections renders again only the routers whose primaries
+	// moved.
 	routedPrimaries map[tailcfg.NodeID][]netip.Prefix
+	routedVia       *policyv2.ViaRoutes
 
 	// dns is reused while its inputs, the node and the policy's capability
 	// map and the extra records, are unchanged.
@@ -560,16 +562,20 @@ func (r *renderer) renderPeers(
 func (r *renderer) routedCandidates(snap *state.Snapshot, self types.NodeView, key renderKey, first bool) []tailcfg.NodeID {
 	var out []tailcfg.NodeID
 
+	via := snap.ViaElection()
+
 	switch {
-	case first || key.policy != r.lastKey.policy || !sameRouteFacts(r.lastSelf, self):
-		r.routedPrimaries = nil
+	case first || key.policy != r.lastKey.policy || !sameRouteFacts(r.lastSelf, self) || via != r.routedVia:
+		// A moved via election can steer any router's routes for this
+		// viewer.
+		r.routedPrimaries, r.routedVia = nil, via
 
 		for _, id := range snap.RoutedNodes() {
 			out = append(out, id.NodeID())
 		}
 	case key.primaries != r.lastKey.primaries:
-		// A peer's routes read the policy, the viewer and the peer's own
-		// primaries; only the last moved.
+		// A peer's routes read the policy, the viewer, the via elections
+		// and the peer's own primaries; only the last moved.
 		for _, id := range snap.RoutedNodes() {
 			if was, ok := r.routedPrimaries[id.NodeID()]; !ok || !slices.Equal(was, snap.PrimaryRoutesForNode(id)) {
 				out = append(out, id.NodeID())

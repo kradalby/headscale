@@ -80,11 +80,16 @@ var (
 	// where the incremental compile differs.
 	policyAudit         = envknob.RegisterBool("HEADSCALE_DEBUG_POLICY_AUDIT")
 	policyAuditFailures atomic.Uint64
+	policyAuditRuns     atomic.Uint64
 )
 
 // PolicyAuditFailures counts the compiles the policy audit found to
 // differ from a compile from scratch.
 func PolicyAuditFailures() uint64 { return policyAuditFailures.Load() }
+
+// PolicyAuditRuns counts the from-scratch via election audits that ran,
+// so a test can prove the audit is wired, not merely quiet.
+func PolicyAuditRuns() uint64 { return policyAuditRuns.Load() }
 
 // nodeMap is the set of nodes. A stored node is never mutated: a write
 // stores a modified copy, so a [types.NodeView] taken from a snapshot stays
@@ -174,7 +179,7 @@ func (e *nodeEdit) nameTaken(self types.NodeID, name string) bool {
 //	nodes ──► index ──► policyNodes ─┬─► policy ──► peers
 //	users ───────────────────────────┤
 //	policySrc ───────────────────────┘
-//	index ──► primaries
+//	index, nodes, policy ──► primaries
 //
 // The nodes, users and policySrc inputs are written only through the
 // methods below, which serialise on the graph.
@@ -199,6 +204,18 @@ type world struct {
 
 	// servesRoute is [types.Config.ServesRoute]; nil serves every route.
 	servesRoute func(netip.Prefix) bool
+
+	// outageMu and outageRev order the outage stores: a state computed
+	// from an older snapshot than the one already stored must not win,
+	// whichever of two concurrent writers finished first.
+	outageMu  sync.Mutex
+	outageRev uint64
+
+	// outageStores and routesClones are test oracles, world-owned so a
+	// test reads exact deltas from its own synchronous writes and no
+	// other test's world can interfere.
+	outageStores atomic.Uint64
+	routesClones atomic.Uint64
 
 	// beforePolicyCommit, for tests, runs just before [world.SetPolicy]
 	// takes the graph's lock: the last point a write can land between a
@@ -374,7 +391,7 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 
 	w.nodeCaps = graph.NewDerived(g, "node-caps", graph.Same[*capsMap], w.deriveNodeCaps)
 	w.peers = graph.NewDerived(g, "peers", (*policyv2.PeerClasses).Same, w.derivePeers)
-	w.primaries = graph.NewDerived(g, "primaries", samePrimaries, w.derivePrimaries)
+	w.primaries = graph.NewDerived(g, "primaries", samePrimaries, w.electPrimaries)
 
 	snap, err := g.Update(func(*graph.Tx) error { return nil })
 	if err != nil {
@@ -447,37 +464,6 @@ func (w *world) derivePeers(s *graph.Snapshot, prev *policyv2.PeerClasses) *poli
 	next.Reuse(prev)
 
 	return next
-}
-
-// derivePrimaries is the primaries cell: the elected primary route per
-// prefix, re-electing only the prefixes a changed router names.
-func (w *world) derivePrimaries(s *graph.Snapshot, prev primaryRoutes) primaryRoutes {
-	nodes := s.Get(w.nodes)
-	if prev.from == nil {
-		return newPrimaryRoutes(electPrimaryRoutes(nodes, nil), nodes, prev)
-	}
-
-	// Only the prefixes a changed router names can elect anew.
-	touched := electionPrefixes(prev.from, nodes)
-	if len(touched) == 0 {
-		prev.from = nodes
-
-		return prev
-	}
-
-	groups := s.Get(w.index).advertisers.Groups
-	routes := maps.Clone(prev.routes)
-
-	for p := range touched {
-		candidates, _ := groups.Get(p)
-		if primary, ok := electPrimary(nodes, candidates, prev.routes, p); ok {
-			routes[p] = primary
-		} else {
-			delete(routes, p)
-		}
-	}
-
-	return newPrimaryRoutes(routes, nodes, prev)
 }
 
 // updateIndex returns the index of nodes, moving only the nodes changed
@@ -652,6 +638,42 @@ func policyFactsChanged(from, to *nodeMap) bool {
 	return false
 }
 
+// electionInputChanged reports whether a change between from and to can
+// move an election: a router's availability moves the prefixes it names,
+// and a policy fact — a join, a leave, tags, addresses, routes — can move
+// more. One walk decides exactly what [electionPrefixes] and
+// [policyFactsChanged] decide separately. The arms run cheapest first:
+// presence, then availability guarded by routes, then the policy facts.
+func electionInputChanged(from, to *nodeMap) bool {
+	for _, id := range graph.Changes(from, to) {
+		old, wasOK := from.Get(id)
+		n, isOK := to.Get(id)
+
+		if wasOK != isOK {
+			// A join or a leave is a policy fact change.
+			return true
+		}
+
+		// Availability moves only the prefixes a changed router names: a
+		// node without election routes — a plain client, an exit-only
+		// router — moves none. Equal route facts, as an endpoint write
+		// keeps them, need no route lists built.
+		if old.Online() != n.Online() ||
+			old.Unhealthy != n.Unhealthy ||
+			!old.SameRouteFacts(n) && !slices.Equal(old.AllApprovedRoutes(), n.AllApprovedRoutes()) {
+			if len(electionRoutes(old))+len(electionRoutes(n)) > 0 {
+				return true
+			}
+		}
+
+		if old.View().HasPolicyChange(n.View()) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // sameUserForNodes reports whether a node holding user a needs no copy of
 // b: they differ at most in timestamps, which no map or policy reads. A
 // login bumping UpdatedAt then rewrites none of the user's nodes.
@@ -661,25 +683,130 @@ func sameUserForNodes(a, b types.User) bool {
 	return a == b
 }
 
-// primaryRoutes is the prefix→primary election and the nodes it was held
-// against.
+// electPrimaries re-elects the prefixes a change can move. prev is a
+// per-commit copy of the cell's boxed value, so fields may be reassigned
+// here, but maps shared with published snapshots (routes, byNode) must
+// never be mutated in place.
+func (w *world) electPrimaries(s *graph.Snapshot, prev primaryRoutes) primaryRoutes {
+	nodes := s.Get(w.nodes)
+	pm := s.Get(w.policy).pm
+
+	var (
+		touched map[netip.Prefix]struct{}
+		next    primaryRoutes
+	)
+
+	groups := s.Get(w.index).advertisers.Groups
+
+	if prev.from == nil {
+		next = newPrimaryRoutes(electPrimaryRoutes(nodes, nil), nodes, prev)
+		next.outages = patchOutages(nil, nodes, groups, next.routes, next.routes)
+	} else {
+		// Only the prefixes a changed router names can elect anew.
+		touched = electionPrefixes(prev.from, nodes)
+		if len(touched) == 0 && pm == prev.policy {
+			prev.from = nodes
+
+			return prev
+		}
+
+		// The touched prefixes elect anew; the rest keep their winners.
+		// The map is cloned only when a winner actually moves, so a
+		// touched commit that re-elects everyone allocates nothing.
+		routes := prev.routes
+
+		var moved []netip.Prefix
+
+		for p := range touched {
+			candidates, _ := groups.Get(p)
+			primary, ok := electPrimary(nodes, views.SliceOf(candidates), prev.routes[p])
+
+			cur, had := prev.routes[p]
+			if (ok && (!had || cur != primary)) || (!ok && had) {
+				if moved == nil {
+					routes = maps.Clone(prev.routes)
+
+					w.routesClones.Add(1)
+				}
+
+				moved = append(moved, p)
+
+				if ok {
+					routes[p] = primary
+				} else {
+					delete(routes, p)
+				}
+			}
+		}
+
+		// Unmoved winners keep the election as it was; moved ones patch
+		// it, so the cost follows the moves, not every route.
+		next = prev
+		next.from = nodes
+
+		if moved != nil {
+			next = prev.patch(routes, moved, nodes)
+		}
+
+		// A prefix's outage reads only its primary and advertisers, and a
+		// change to either touches the prefix: the rest keep their state.
+		next.outages = patchOutages(prev.outages, nodes, groups, routes, touched)
+	}
+
+	var via *policyv2.ViaRoutes
+
+	// The seed only survives the pm == nil path: no policy means the last
+	// via binding must be dropped.
+	changed := pm == nil && prev.via != nil
+	if pm != nil {
+		electRoute := func(candidates views.Slice[types.NodeID], incumbent types.NodeID) (types.NodeID, bool) {
+			return electPrimary(nodes, candidates, incumbent)
+		}
+
+		via, changed = pm.ElectViaRoutes(prev.via, touched, electRoute)
+
+		// The from-scratch reference for the incremental election above:
+		// seeded with the same incumbents, it must agree with what the
+		// world adopted.
+		if policyAudit() {
+			if pmv2, ok := pm.(*policyv2.PolicyManager); ok {
+				policyAuditRuns.Add(1)
+
+				if !pmv2.AuditViaElections(prev.via, via, electRoute) {
+					policyAuditFailures.Add(1)
+					log.Error().Msg("policy audit: via election differs from a full one")
+				}
+			}
+		}
+	}
+
+	if changed {
+		next.gen++
+	}
+
+	next.via, next.policy = via, pm
+
+	return next
+}
+
+// primaryRoutes holds global and via-scoped elections from the same snapshot.
 type primaryRoutes struct {
 	routes map[netip.Prefix]types.NodeID
+	via    *policyv2.ViaRoutes
+	policy policy.PolicyManager
 	// byNode is routes inverted, each node's prefixes sorted.
 	byNode map[types.NodeID][]netip.Prefix
-	from   *nodeMap
+	// outages are the prefixes whose primary is unhealthy while no
+	// advertiser is healthy, see [hasOutage].
+	outages map[netip.Prefix]struct{}
+	from    *nodeMap
 	// gen changes only when the election result changes, so endpoint
 	// writes reach the equality cutoff without comparing every prefix.
 	gen uint64
 }
 
+// newPrimaryRoutes builds a first election.
 func newPrimaryRoutes(routes map[netip.Prefix]types.NodeID, from *nodeMap, prev primaryRoutes) primaryRoutes {
-	if prev.from != nil && maps.Equal(prev.routes, routes) {
-		prev.from = from
-
-		return prev
-	}
-
 	byNode := make(map[types.NodeID][]netip.Prefix)
 	for p, id := range routes {
 		byNode[id] = append(byNode[id], p)
@@ -690,6 +817,165 @@ func newPrimaryRoutes(routes map[netip.Prefix]types.NodeID, from *nodeMap, prev 
 	}
 
 	return primaryRoutes{routes: routes, byNode: byNode, from: from, gen: prev.gen + 1}
+}
+
+// patch returns p with routes, whose winners differ from p's at exactly
+// moved. Only the nodes losing or gaining a prefix get new byNode slices;
+// the rest share p's, which are never mutated.
+func (p primaryRoutes) patch(routes map[netip.Prefix]types.NodeID, moved []netip.Prefix, from *nodeMap) primaryRoutes {
+	// Each node losing or gaining prefixes gets its list rebuilt once:
+	// editing it prefix by prefix shifts the list for each, which a router
+	// failing over all its prefixes pays quadratically. The edits are sized
+	// first, so a move allocates per node, not per prefix.
+	sizes := make(map[types.NodeID][2]int)
+
+	for _, prefix := range moved {
+		if id, ok := p.routes[prefix]; ok {
+			n := sizes[id]
+			n[0]++
+			sizes[id] = n
+		}
+
+		if id, ok := routes[prefix]; ok {
+			n := sizes[id]
+			n[1]++
+			sizes[id] = n
+		}
+	}
+
+	type edit struct{ lost, won []netip.Prefix }
+
+	edits := make(map[types.NodeID]*edit, len(sizes))
+	for id, n := range sizes {
+		edits[id] = &edit{lost: make([]netip.Prefix, 0, n[0]), won: make([]netip.Prefix, 0, n[1])}
+	}
+
+	for _, prefix := range moved {
+		if id, ok := p.routes[prefix]; ok {
+			edits[id].lost = append(edits[id].lost, prefix)
+		}
+
+		if id, ok := routes[prefix]; ok {
+			edits[id].won = append(edits[id].won, prefix)
+		}
+	}
+
+	byNode := maps.Clone(p.byNode)
+
+	for id, e := range edits {
+		ps := mergePrefixes(p.byNode[id], e.lost, e.won)
+		if len(ps) == 0 {
+			delete(byNode, id)
+		} else {
+			byNode[id] = ps
+		}
+	}
+
+	return primaryRoutes{routes: routes, byNode: byNode, from: from, gen: p.gen + 1}
+}
+
+// mergePrefixes returns sorted has without drop and with add, in a new
+// slice; has is shared with older snapshots and never modified. It copies
+// the runs of has between edits whole, finding each edit by binary search,
+// so a few edits to a long list cost one copy of it. drop should name
+// prefixes of has; one it lacks is ignored, and only the capacity hint
+// assumes otherwise.
+func mergePrefixes(has, drop, add []netip.Prefix) []netip.Prefix {
+	slices.SortFunc(drop, netip.Prefix.Compare)
+	slices.SortFunc(add, netip.Prefix.Compare)
+
+	out := make([]netip.Prefix, 0, max(0, len(has)-len(drop)+len(add)))
+	rest := has
+
+	for len(drop) > 0 || len(add) > 0 {
+		// The next edit in order; a prefix both dropped and added is
+		// dropped first.
+		dropping := len(add) == 0 || len(drop) > 0 && drop[0].Compare(add[0]) <= 0
+
+		next := add
+		if dropping {
+			next = drop
+		}
+
+		at, found := slices.BinarySearchFunc(rest, next[0], netip.Prefix.Compare)
+		out = append(out, rest[:at]...)
+		rest = rest[at:]
+
+		switch {
+		case dropping:
+			if found {
+				rest = rest[1:]
+			}
+
+			drop = drop[1:]
+		case found:
+			// Already held; kept with the run that follows.
+			add = add[1:]
+		default:
+			out = append(out, add[0])
+			add = add[1:]
+		}
+	}
+
+	return append(out, rest...)
+}
+
+// inOutage reports whether p is elected to an unhealthy primary while no
+// advertiser is healthy.
+func inOutage(
+	nodes *nodeMap,
+	groups *graph.Map[netip.Prefix, []types.NodeID],
+	routes map[netip.Prefix]types.NodeID,
+	p netip.Prefix,
+) bool {
+	healthy := func(id types.NodeID) bool {
+		n, ok := nodes.Get(id)
+
+		return ok && !n.Unhealthy
+	}
+
+	id, ok := routes[p]
+	if !ok || healthy(id) {
+		return false
+	}
+
+	candidates, _ := groups.Get(p)
+
+	return !slices.ContainsFunc(candidates, healthy)
+}
+
+// patchOutages returns prev with the outage state of prefixes recomputed,
+// sharing prev when none moved: it is shared with published snapshots.
+func patchOutages[V any](
+	prev map[netip.Prefix]struct{},
+	nodes *nodeMap,
+	groups *graph.Map[netip.Prefix, []types.NodeID],
+	routes map[netip.Prefix]types.NodeID,
+	prefixes map[netip.Prefix]V,
+) map[netip.Prefix]struct{} {
+	out, cloned := prev, false
+
+	for p := range prefixes {
+		_, was := prev[p]
+		if is := inOutage(nodes, groups, routes, p); was == is {
+			continue
+		}
+
+		if !cloned {
+			cloned, out = true, maps.Clone(prev)
+			if out == nil {
+				out = make(map[netip.Prefix]struct{})
+			}
+		}
+
+		if was {
+			delete(out, p)
+		} else {
+			out[p] = struct{}{}
+		}
+	}
+
+	return out
 }
 
 func samePrimaries(a, b primaryRoutes) bool { return a.gen == b.gen }
@@ -873,8 +1159,10 @@ func (w *world) commitBatch(batch []*nodeWrite) (out *Snapshot, p any, stack []b
 		}
 
 		if w.batchTimeout > 0 {
-			// Health can change without moving the primary.
-			checkOutage = len(electionPrefixes(cur, next)) > 0
+			// Health can change without moving the primary, and policy
+			// facts — tags, routes — can move elections without touching
+			// anything the availability diff sees. One walk decides.
+			checkOutage = electionInputChanged(cur, next)
 		}
 
 		graph.Set(tx, w.nodes, next)
@@ -893,10 +1181,30 @@ func (w *world) commitBatch(batch []*nodeWrite) (out *Snapshot, p any, stack []b
 
 	out = &Snapshot{s: snap, w: w}
 	if checkOutage {
-		w.inOutage.Store(hasOutage(out))
+		w.storeOutage(out)
 	}
 
 	return out, nil, nil
+}
+
+// storeOutage records the outage state of snap, refusing a state computed
+// from an older snapshot than the one already stored: whichever of two
+// concurrent writers finished first, the newer snapshot's state wins.
+func (w *world) storeOutage(snap *Snapshot) {
+	// The state is a pure function of an immutable snapshot: compute it
+	// outside the lock and hold the lock only to order the stores.
+	rev, out := snap.Rev(), hasOutage(snap)
+
+	w.outageMu.Lock()
+	defer w.outageMu.Unlock()
+
+	if rev < w.outageRev {
+		return
+	}
+
+	w.outageRev = rev
+	w.inOutage.Store(out)
+	w.outageStores.Add(1)
 }
 
 // handOff ends the commit loop when no writes are queued, or starts the
@@ -1133,6 +1441,12 @@ func (w *world) SetUsers(users []types.User) error {
 
 	if changed {
 		worldCommits.Inc()
+
+		// A user change can move elections like a policy change can,
+		// without any node availability changing.
+		if w.batchTimeout > 0 {
+			w.storeOutage(w.snapshot())
+		}
 	}
 
 	return snap.Get(w.policy).err
@@ -1166,6 +1480,12 @@ func (w *world) SetPolicy(src []byte, check func(*Snapshot) error) (bool, error)
 	}
 
 	worldCommits.Inc()
+
+	// A policy change can move elections without any node availability
+	// changing; the outage state follows it.
+	if w.batchTimeout > 0 {
+		w.storeOutage(w.snapshot())
+	}
 
 	return true, nil
 }
@@ -1258,26 +1578,21 @@ func onlineAdvertisers(nodes *nodeMap) map[netip.Prefix][]types.NodeID {
 // route then, and the routers coming back should be elected together.
 func hasOutage(s *Snapshot) bool {
 	nodes := s.nodes()
-	groups := s.s.Get(s.w.index).advertisers.Groups
 
-	healthy := func(id types.NodeID) bool {
+	if len(s.s.Get(s.w.primaries).outages) > 0 {
+		return true
+	}
+
+	// Via scopes count too: their candidates are not the global advertisers,
+	// so a scope can lose every router while the global election stays
+	// healthy through an untagged one.
+	available := func(id types.NodeID) bool {
 		n, ok := nodes.Get(id)
 
-		return ok && !n.Unhealthy
+		return ok && n.Online() && !n.Unhealthy
 	}
 
-	for p, id := range s.s.Get(s.w.primaries).routes {
-		if healthy(id) {
-			continue
-		}
-
-		candidates, _ := groups.Get(p)
-		if !slices.ContainsFunc(candidates, healthy) {
-			return true
-		}
-	}
-
-	return false
+	return s.s.Get(s.w.primaries).via.HasOutage(available)
 }
 
 // electPrimaryRoutes elects every prefix from scratch, keeping prev's
@@ -1290,7 +1605,7 @@ func electPrimaryRoutes(
 	routes := make(map[netip.Prefix]types.NodeID, len(advertisers))
 
 	for prefix, candidates := range advertisers {
-		if primary, ok := electPrimary(nodes, candidates, prev, prefix); ok {
+		if primary, ok := electPrimary(nodes, views.SliceOf(candidates), prev[prefix]); ok {
 			routes[prefix] = primary
 		}
 	}
@@ -1298,31 +1613,40 @@ func electPrimaryRoutes(
 	return routes
 }
 
-// electPrimary picks the primary for prefix among candidates, its online
-// advertisers in ID order: a healthy incumbent keeps it, otherwise the
-// lowest healthy candidate takes it; when none is healthy, the incumbent
-// keeps it rather than flap.
+// electPrimary picks among candidates in ID order: a healthy online
+// incumbent keeps the route, otherwise the lowest healthy candidate takes
+// it. With no healthy candidate an online incumbent retains the route
+// rather than flap; an offline one drops it.
 func electPrimary(
 	nodes *nodeMap,
-	candidates []types.NodeID,
-	prev map[netip.Prefix]types.NodeID,
-	prefix netip.Prefix,
+	candidates views.Slice[types.NodeID],
+	cur types.NodeID,
 ) (types.NodeID, bool) {
-	healthy := func(id types.NodeID) bool {
-		n, _ := nodes.Get(id)
+	var firstHealthy types.NodeID
 
-		return !n.Unhealthy
+	incumbent := false
+
+	for _, id := range candidates.All() {
+		n, ok := nodes.Get(id)
+		if !ok || !n.Online() {
+			continue
+		}
+
+		if id == cur {
+			incumbent = true
+
+			if !n.Unhealthy {
+				return cur, true
+			}
+		}
+
+		if !n.Unhealthy && firstHealthy == 0 {
+			firstHealthy = id
+		}
 	}
 
-	cur, hadPrimary := prev[prefix]
-	incumbent := hadPrimary && slices.Contains(candidates, cur)
-
-	if incumbent && healthy(cur) {
-		return cur, true
-	}
-
-	if i := slices.IndexFunc(candidates, healthy); i >= 0 {
-		return candidates[i], true
+	if firstHealthy != 0 {
+		return firstHealthy, true
 	}
 
 	return cur, incumbent
@@ -1519,13 +1843,20 @@ func (s *Snapshot) PrimaryRoutesString() string {
 	return b.String()
 }
 
+// ViaElection identifies the via elections [Snapshot.RoutesForPeer]
+// steers by: equal pointers steer every viewer alike. Compare it only by
+// identity.
+func (s *Snapshot) ViaElection() *policyv2.ViaRoutes {
+	return s.s.Get(s.w.primaries).via
+}
+
 // RoutesForPeer returns the routes peer carries in viewer's AllowedIPs:
 // the primary routes it holds and its approved exit routes that viewer's
 // matchers allow, adjusted by via grants. A viewer advertising a prefix
 // the peer is primary for always sees it, so HA secondaries know the
 // primary.
 func (s *Snapshot) RoutesForPeer(viewer, peer types.NodeView, matchers []matcher.Match) []netip.Prefix {
-	via := s.Policy().ViaRoutesForPeer(viewer, peer)
+	via := s.s.Get(s.w.primaries).via.ForPeer(viewer, peer)
 	primaries := s.PrimaryRoutesForNode(peer.ID())
 	candidates := slices.Concat(primaries, peer.ExitRoutes())
 
@@ -1594,7 +1925,7 @@ type Change struct {
 	// Nodes includes nodes changed back or deleted between snapshots
 	// when commits coalesced: a session may have rendered them meanwhile.
 	Nodes []types.NodeID
-	// Primaries are the nodes that gained or lost a primary route.
+	// Primaries are the nodes that gained or lost a global or via-scoped route.
 	Primaries []types.NodeID
 	// PeerSets are the nodes whose set of peers differs.
 	PeerSets []types.NodeID
@@ -1652,11 +1983,21 @@ func (s *Snapshot) Since(old *Snapshot) Change {
 	}
 
 	if s.PrimariesRev() != old.PrimariesRev() {
+		// A patched election shares every slice it did not move, so an
+		// identical slice is equal without walking its prefixes.
 		c.Primaries = changedKeys(
 			old.s.Get(old.w.primaries).byNode,
 			s.s.Get(s.w.primaries).byNode,
-			slices.Equal[[]netip.Prefix],
+			func(a, b []netip.Prefix) bool {
+				return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0] || slices.Equal(a, b))
+			},
 		)
+
+		was, now := old.s.Get(old.w.primaries).via, s.s.Get(s.w.primaries).via
+		c.Primaries = append(c.Primaries, now.ChangedNodes(was)...)
+
+		slices.Sort(c.Primaries)
+		c.Primaries = slices.Compact(c.Primaries)
 	}
 
 	if s.PeersRev() != old.PeersRev() {
@@ -1732,7 +2073,7 @@ func (s *Snapshot) PolicyRev() uint64 { return graph.ChangedAt(s.s, s.w.policy) 
 // PeersRev is the revision of the latest change to peer visibility.
 func (s *Snapshot) PeersRev() uint64 { return graph.ChangedAt(s.s, s.w.peers) }
 
-// PrimariesRev is the revision of the latest primary route change.
+// PrimariesRev is the revision of the latest global or via-scoped route change.
 func (s *Snapshot) PrimariesRev() uint64 { return graph.ChangedAt(s.s, s.w.primaries) }
 
 // DNSRev is the revision of the latest extra DNS records change.
