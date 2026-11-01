@@ -4,6 +4,7 @@ go 1.27.3
 
 require (
 	github.com/arl/statsviz v0.8.2
+	github.com/benbjohnson/immutable v0.4.3
 	github.com/caddyserver/certmagic v0.25.6
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/chasefleming/elem-go v0.37.0
