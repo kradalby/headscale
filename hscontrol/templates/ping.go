@@ -27,7 +27,7 @@ type PingResult struct {
 	Message string
 }
 
-// ConnectedNode is a node currently connected to the [mapper.Batcher],
+// ConnectedNode is a node currently connected to the [mapper.Hub],
 // displayed as a quick-ping link on the debug ping page.
 type ConnectedNode struct {
 	ID       types.NodeID

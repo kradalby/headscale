@@ -265,7 +265,7 @@ func TestCompileOtherDestsMatchesReference(t *testing.T) {
 		"mixed", "repeated", "wildcard", "nil-destinations", "empty-destinations",
 		"nil-protocols", "empty-protocols", "app-only", "single-protocol",
 		"single-protocol-app", "nil-sources", "empty-sources", "empty-app",
-		"empty-group", "missing-user", "missing-host", "partial-group",
+		"empty-group", "missing-user", "missing-host", "ambiguous-member",
 	} {
 		t.Run(name, func(t *testing.T) {
 			pol, users, nodes := compileOtherDestsFixture(t, 4, 24)
@@ -319,15 +319,15 @@ func TestCompileOtherDestsMatchesReference(t *testing.T) {
 					hp("host4"),
 					hp("undefined"),
 				}
-			case "partial-group":
+			case "ambiguous-member":
 				users = append(users, types.User{ID: 100, Name: users[0].Name})
 				ips, err := grant.Destinations[0].Resolve(pol, users, nodes.ViewSlice())
-				require.Error(t, err)
+				require.NoError(t, err, "an ambiguous member resolves to nobody")
 				require.NotNil(t, ips)
 				require.False(
 					t,
 					ips.Empty(),
-					"exercise a partial result alongside the error",
+					"the group's other members keep resolving",
 				)
 			}
 

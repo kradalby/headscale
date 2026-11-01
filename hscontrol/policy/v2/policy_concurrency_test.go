@@ -11,11 +11,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestPolicyManagerConcurrentReads is the correctness guard for the #3346 fix:
-// PolicyManager read methods take a shared RLock and populate their per-node
-// caches (filterRulesMap, matchersForNodeMap) concurrently. This test hammers
-// those reads from many goroutines while a writer mutates the node set, so the
-// race detector catches any unsafe access to the shared caches or policy state.
+// TestPolicyManagerConcurrentReads hammers PolicyManager reads from many
+// goroutines. Reads take no lock and fill the per-node caches
+// (filterRulesMap, matchersForNodeMap) concurrently, so the race detector
+// catches any unsafe access to the shared caches or policy state.
 //
 // It uses an autogroup:self policy so reads take the per-node filter slow path
 // — the same path that made #3346's reconnect storm expensive — which is where
@@ -55,15 +54,14 @@ func TestPolicyManagerConcurrentReads(t *testing.T) {
 	require.NoError(t, err)
 
 	const (
-		readers        = 16
-		iterations     = 60
-		mutatorReloads = 30
+		readers    = 16
+		iterations = 60
 	)
 
 	var wg sync.WaitGroup
 
-	// Concurrent readers exercise every converted RLock read path, including
-	// the two lazily populated per-node caches. Assertions inside the
+	// Concurrent readers exercise every read path, including the two
+	// lazily populated per-node caches. Assertions inside the
 	// goroutines use assert (not require) so a failure does not call
 	// t.FailNow from a non-test goroutine.
 	for r := range readers {
@@ -81,8 +79,8 @@ func TestPolicyManagerConcurrentReads(t *testing.T) {
 				pm.Filter()
 				pm.NodeCapMap(nv.ID())
 
-				// BuildPeerMap is the O(n^2) writer-side read; exercise it
-				// under RLock too, but not every iteration.
+				// BuildPeerMap is O(n^2); exercise it, but not every
+				// iteration.
 				if i%8 == 0 {
 					assert.NotNil(t, pm.BuildPeerMap(nodes.ViewSlice()))
 				}
@@ -90,21 +88,12 @@ func TestPolicyManagerConcurrentReads(t *testing.T) {
 		})
 	}
 
-	// A writer repeatedly re-sets the node set, invalidating and racing the
-	// caches the readers are populating.
-	wg.Go(func() {
-		for range mutatorReloads {
-			_, err := pm.SetNodes(nodes.ViewSlice())
-			assert.NoError(t, err) //nolint:testifylint // assert (not require) is correct off the test goroutine
-		}
-	})
-
 	wg.Wait()
 }
 
 // TestViaRoutesForPeerDoesNotWritePolicyGrants guards against
 // ViaRoutesForPeer appending ACL-derived grants into the backing array of
-// pm.pol.Grants. Readers hold only the shared RLock, so any spare capacity
+// pm.pol.Grants. Readers share pm.pol without a lock, so any spare capacity
 // in that slice becomes a write/write race between concurrent callers.
 func TestViaRoutesForPeerDoesNotWritePolicyGrants(t *testing.T) {
 	users := types.Users{{Name: "user1", Email: "user1@headscale.net"}}

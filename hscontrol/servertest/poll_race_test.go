@@ -13,7 +13,7 @@ import (
 )
 
 // TestPollRace targets logical race conditions specifically in the
-// poll.go session lifecycle and the [mapper.Batcher]'s handling of concurrent
+// poll.go session lifecycle and the [mapper.Hub]'s handling of concurrent
 // sessions for the same node.
 
 func TestPollRace(t *testing.T) {
@@ -195,7 +195,7 @@ func TestPollRace(t *testing.T) {
 		}
 	})
 
-	// The [mapper.Batcher]'s IsConnected check: when the grace period
+	// The [mapper.Hub.IsConnected] check: when the grace period
 	// goroutine calls IsConnected, it should return true if
 	// a new session has been added for the same node.
 	t.Run("batcher_knows_reconnected_during_grace", func(t *testing.T) {
@@ -348,10 +348,9 @@ func TestPollRace(t *testing.T) {
 
 		// While c1 is disconnected, approve a route for it.
 		route := netip.MustParsePrefix("10.55.0.0/24")
-		_, routeChange, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			nodeID1, []netip.Prefix{route})
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 
 		// Reconnect c1.
 		c1.Reconnect(t)

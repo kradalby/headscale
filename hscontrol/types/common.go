@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -324,23 +323,4 @@ type AuthVerdict struct {
 
 func (v AuthVerdict) Accept() bool {
 	return v.Err == nil
-}
-
-// DefaultBatcherWorkers returns the default number of batcher workers.
-// Default to 3/4 of CPU cores, minimum 1, no maximum.
-func DefaultBatcherWorkers() int {
-	return DefaultBatcherWorkersFor(runtime.NumCPU())
-}
-
-// DefaultBatcherWorkersFor returns the default number of batcher workers for a given CPU count.
-// Default to 3/4 of CPU cores, minimum 1, no maximum.
-func DefaultBatcherWorkersFor(cpuCount int) int {
-	const (
-		workerNumerator   = 3
-		workerDenominator = 4
-	)
-
-	defaultWorkers := max((cpuCount*workerNumerator)/workerDenominator, 1)
-
-	return defaultWorkers
 }

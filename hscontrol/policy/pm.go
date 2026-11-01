@@ -11,6 +11,8 @@ import (
 	"tailscale.com/types/views"
 )
 
+// PolicyManager is a policy compiled against fixed users and nodes. It is
+// only read; a change to any of its inputs compiles a new one.
 type PolicyManager interface {
 	// Filter returns the current filter rules for the entire tailnet and the associated matchers.
 	Filter() ([]tailcfg.FilterRule, []matcher.Match)
@@ -20,20 +22,14 @@ type PolicyManager interface {
 	MatchersForNode(node types.NodeView) ([]matcher.Match, error)
 	// BuildPeerMap constructs peer relationship maps for the given nodes
 	BuildPeerMap(nodes views.Slice[types.NodeView]) map[types.NodeID][]types.NodeID
+	// BuildPeerClasses works out who sees whom, grouping nodes that see
+	// the same nodes.
+	BuildPeerClasses(nodes views.Slice[types.NodeView], prev *policyv2.PeerClasses) *policyv2.PeerClasses
 	SSHPolicy(baseURL string, node types.NodeView) (*tailcfg.SSHPolicy, error)
 	// SSHCheckParams resolves the SSH check period for src logging in to
 	// dst as localUser from the current policy, avoiding trust of
 	// client-provided URL params.
 	SSHCheckParams(srcNodeID, dstNodeID types.NodeID, localUser string) (time.Duration, bool)
-	SetPolicy(pol []byte) (bool, error)
-	// SetUsers replaces the user list. policyChanged reports whether clients
-	// need a policy refresh; peerMapChanged reports whether user-derived peer
-	// adjacency may have changed. Both are false when the list is unchanged.
-	SetUsers(users []types.User) (policyChanged, peerMapChanged bool, err error)
-	SetNodes(nodes views.Slice[types.NodeView]) (bool, error)
-	// NodesGeneration counts SetNodes calls that reported a change; see
-	// [policyv2.PolicyManager.NodesGeneration].
-	NodesGeneration() uint64
 	// NodeCanHaveTag reports whether the given node can have the given tag.
 	NodeCanHaveTag(node types.NodeView, tag string) bool
 
@@ -55,14 +51,6 @@ type PolicyManager interface {
 	// NodeCanApproveRoute reports whether the given node can approve the given route.
 	NodeCanApproveRoute(node types.NodeView, route netip.Prefix) bool
 
-	// NodeNeedsPeerRecompute reports whether peers must recompute their
-	// netmap when the node's online state changes. True for subnet
-	// routers, relay targets (tailscale.com/cap/relay), and via targets;
-	// false for ordinary nodes, which only need a lightweight online or
-	// offline peer patch. [State.Connect] and [State.Disconnect] use it to
-	// avoid a tailnet-wide recompute on every ordinary reconnect.
-	NodeNeedsPeerRecompute(node types.NodeView) bool
-
 	// ViaRoutesForPeer computes via grant effects for a viewer-peer pair.
 	// It returns which routes should be included (peer is via-designated for viewer)
 	// and excluded (steered to a different peer). When no via grants apply,
@@ -75,28 +63,26 @@ type PolicyManager interface {
 	// not a per-viewer view.
 	NodeCapMap(id types.NodeID) tailcfg.NodeCapMap
 
-	// NodeCapMaps snapshots every node's policy CapMap. The outer map is
-	// caller-owned; inner maps are shared with the manager and read-only.
-	// NodeCapMapsForPeers limits copying when fewer peers are requested.
+	// NodeCapMaps returns the per-node policy CapMap. It is shared with
+	// the manager, which never changes it, and must not be modified:
+	// every map render reads it.
 	NodeCapMaps() map[types.NodeID]tailcfg.NodeCapMap
-
-	// NodeCapMapsForPeers snapshots requested peer caps under one lock. It may
-	// include unselected entries when copying the whole compiled table is less work.
-	// The outer map is caller-owned; inner maps are shared and read-only.
-	// Empty selections or no compiled policy capabilities return nil; missing IDs read nil.
-	NodeCapMapsForPeers(peers views.Slice[types.NodeView]) map[types.NodeID]tailcfg.NodeCapMap
-
-	// NodesWithChangedCapMap returns the IDs of nodes whose nodeAttrs
-	// CapMap shifted during recent updateLocked calls. The buffer
-	// drains on read; callers consume it once per update cycle to
-	// decide which nodes need a self-targeted MapResponse.
-	// refreshNodeAttrsLocked appends to the buffer rather than
-	// overwriting, so a SetUsers/SetNodes between SetPolicy and the
-	// drain cannot lose the policy-reload diff.
-	NodesWithChangedCapMap() []types.NodeID
 
 	Version() int
 	DebugString() string
+}
+
+// NewPolicyManagerFrom is [NewPolicyManager] reusing what prev compiled
+// that the change of nodes since cannot have moved.
+func NewPolicyManagerFrom(prev PolicyManager, pol []byte, users []types.User, nodes views.Slice[types.NodeView]) (PolicyManager, error) {
+	last, _ := prev.(*policyv2.PolicyManager)
+
+	pm, err := policyv2.NewPolicyManagerFrom(last, pol, users, nodes)
+	if err != nil {
+		return nil, err
+	}
+
+	return pm, nil
 }
 
 // NewPolicyManager returns a new [PolicyManager].

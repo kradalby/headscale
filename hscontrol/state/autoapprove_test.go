@@ -12,15 +12,15 @@ import (
 
 // TestAutoApproveBatchApprovesRoutes verifies the batched autoApproveNodes still
 // approves a node's advertised route when policy auto-approvers permit it. The
-// batching collapses the per-node SetApprovedRoutes calls into one NodeStore
-// update and one policy rebuild; this guards that correctness is preserved.
+// batching collapses the per-node SetApprovedRoutes calls into one commit
+// and one policy rebuild; this guards that correctness is preserved.
 func TestAutoApproveBatchApprovesRoutes(t *testing.T) {
 	_, s, nodeID := persistTestSetup(t)
 	t.Cleanup(func() { _ = s.Close() })
 
 	route := netip.MustParsePrefix("10.0.0.0/24")
 
-	_, ok := s.nodeStore.UpdateNode(nodeID, func(n *types.Node) {
+	_, ok := s.world.UpdateNode(nodeID, func(n *types.Node) {
 		n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
 	})
 	require.True(t, ok)
@@ -32,7 +32,7 @@ func TestAutoApproveBatchApprovesRoutes(t *testing.T) {
 	_, err := s.SetPolicy([]byte(pol))
 	require.NoError(t, err)
 
-	_, err = s.ReloadPolicy()
+	err = s.ReloadPolicy()
 	require.NoError(t, err)
 
 	nv, ok := s.GetNodeByID(nodeID)

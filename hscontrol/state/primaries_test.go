@@ -16,26 +16,23 @@ func mp(prefix string) netip.Prefix {
 	return netip.MustParsePrefix(prefix)
 }
 
-// primariesFixture builds a NodeStore with the requested node IDs
+// primariesFixture builds a world with the requested node IDs
 // pre-registered (offline, no routes) and provides terse helpers for
 // driving the kinds of state transitions the algorithm cares about.
 type primariesFixture struct {
-	t  *testing.T
-	ns *NodeStore
+	t *testing.T
+	w *world
 }
 
 func newPrimariesFixture(t *testing.T, ids ...types.NodeID) *primariesFixture {
 	t.Helper()
 
-	ns := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
-	ns.Start()
-	t.Cleanup(ns.Stop)
-
+	w := newTestWorld(t)
 	for _, id := range ids {
-		ns.PutNode(nodeForRapid(id))
+		w.PutNode(nodeForRapid(id))
 	}
 
-	return &primariesFixture{t: t, ns: ns}
+	return &primariesFixture{t: t, w: w}
 }
 
 // advertise mirrors State.Connect: marks the node online, clears
@@ -43,7 +40,7 @@ func newPrimariesFixture(t *testing.T, ids ...types.NodeID) *primariesFixture {
 // prefs argument leaves the node online but advertising nothing.
 func (f *primariesFixture) advertise(id types.NodeID, prefs ...netip.Prefix) {
 	f.t.Helper()
-	f.ns.UpdateNode(id, func(n *types.Node) {
+	f.w.UpdateNode(id, func(n *types.Node) {
 		n.IsOnline = new(true)
 		n.Unhealthy = false
 		n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: prefs}
@@ -56,7 +53,7 @@ func (f *primariesFixture) advertise(id types.NodeID, prefs ...netip.Prefix) {
 // Unhealthy.
 func (f *primariesFixture) approveRoutes(id types.NodeID, prefs ...netip.Prefix) {
 	f.t.Helper()
-	f.ns.UpdateNode(id, func(n *types.Node) {
+	f.w.UpdateNode(id, func(n *types.Node) {
 		n.IsOnline = new(true)
 		n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: prefs}
 		n.ApprovedRoutes = prefs
@@ -64,10 +61,10 @@ func (f *primariesFixture) approveRoutes(id types.NodeID, prefs ...netip.Prefix)
 }
 
 // disconnect mirrors State.Disconnect: marks the node offline. The
-// snapshot rebuild treats an offline node as a non-advertiser.
+// election treats an offline node as a non-advertiser.
 func (f *primariesFixture) disconnect(id types.NodeID) {
 	f.t.Helper()
-	f.ns.UpdateNode(id, func(n *types.Node) {
+	f.w.UpdateNode(id, func(n *types.Node) {
 		n.IsOnline = new(false)
 	})
 }
@@ -75,7 +72,7 @@ func (f *primariesFixture) disconnect(id types.NodeID) {
 // unhealthy mirrors State.SetNodeHealth(id, false).
 func (f *primariesFixture) unhealthy(id types.NodeID) {
 	f.t.Helper()
-	f.ns.UpdateNode(id, func(n *types.Node) {
+	f.w.UpdateNode(id, func(n *types.Node) {
 		n.Unhealthy = true
 	})
 }
@@ -83,7 +80,7 @@ func (f *primariesFixture) unhealthy(id types.NodeID) {
 // healthy mirrors State.SetNodeHealth(id, true).
 func (f *primariesFixture) healthy(id types.NodeID) {
 	f.t.Helper()
-	f.ns.UpdateNode(id, func(n *types.Node) {
+	f.w.UpdateNode(id, func(n *types.Node) {
 		n.Unhealthy = false
 	})
 }
@@ -91,7 +88,7 @@ func (f *primariesFixture) healthy(id types.NodeID) {
 // requirePrimary asserts that prefix has node id as its primary.
 func (f *primariesFixture) requirePrimary(prefix netip.Prefix, id types.NodeID) {
 	f.t.Helper()
-	got, ok := f.ns.PrimaryRouteFor(prefix)
+	got, ok := f.w.snapshot().PrimaryRouteFor(prefix)
 	require.True(f.t, ok, "expected a primary for %s, got none", prefix)
 	require.Equal(f.t, id, got, "primary for %s", prefix)
 }
@@ -99,7 +96,7 @@ func (f *primariesFixture) requirePrimary(prefix netip.Prefix, id types.NodeID) 
 // requireNoPrimary asserts that prefix has no primary at all.
 func (f *primariesFixture) requireNoPrimary(prefix netip.Prefix) {
 	f.t.Helper()
-	_, ok := f.ns.PrimaryRouteFor(prefix)
+	_, ok := f.w.snapshot().PrimaryRouteFor(prefix)
 	require.False(f.t, ok, "expected no primary for %s", prefix)
 }
 
@@ -107,7 +104,7 @@ func (f *primariesFixture) requireNoPrimary(prefix netip.Prefix) {
 // primary, regardless of order.
 func (f *primariesFixture) requireNodeRoutes(id types.NodeID, want ...netip.Prefix) {
 	f.t.Helper()
-	got := f.ns.PrimaryRoutesForNode(id)
+	got := f.w.snapshot().PrimaryRoutesForNode(id)
 
 	gotSorted := slices.Clone(got)
 	wantSorted := slices.Clone(want)
@@ -213,7 +210,7 @@ func TestPrimaries_AllUnhealthyKeepsAPrimary(t *testing.T) {
 	f.unhealthy(1)
 	f.unhealthy(2)
 
-	_, ok := f.ns.PrimaryRouteFor(prefix)
+	_, ok := f.w.snapshot().PrimaryRouteFor(prefix)
 	require.True(t, ok, "all-unhealthy must still produce some primary")
 }
 
@@ -249,9 +246,9 @@ func TestPrimaries_ExitRouteNotElected(t *testing.T) {
 
 func TestPrimaries_BothOfflineThenOneReturns(t *testing.T) {
 	// With two HA advertisers, dropping both then bringing one back
-	// used to leave the prefix without any primary. The snapshot
-	// recomputes primaries on every NodeStore write, so the
-	// returning advertiser must be elected.
+	// used to leave the prefix without any primary. The election
+	// reruns on every node write, so the returning advertiser must be
+	// elected.
 	prefix := mp("10.0.0.0/24")
 	f := newPrimariesFixture(t, 1, 2)
 	f.advertise(1, prefix)
@@ -334,7 +331,7 @@ func TestPrimaries_HANodes(t *testing.T) {
 			f := newPrimariesFixture(t, 1, 2, 3)
 			tt.setup(f)
 
-			got := f.ns.HANodes()
+			got := f.w.snapshot().HANodes()
 			assert.Equal(t, tt.want, got)
 		})
 	}

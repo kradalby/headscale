@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,11 +28,13 @@ import (
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/dns/dnstest"
+	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 	"tailscale.com/control/ts2021"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netutil"
@@ -664,8 +667,8 @@ func newSSHActionRequest(t *testing.T, src, dst types.NodeID) *http.Request {
 }
 
 // putTestNodeInStore creates a node via the database test helper and
-// also stages it into the in-memory [state.NodeStore] so handlers that read
-// [state.NodeStore]-backed APIs (e.g. [state.State.GetNodeByID]) can see it.
+// also stages it in memory so handlers that read the snapshot (e.g.
+// [state.State.GetNodeByID]) can see it.
 func putTestNodeInStore(t *testing.T, app *Headscale, user *types.User, hostname string) *types.Node {
 	t.Helper()
 
@@ -1088,10 +1091,8 @@ func newSSHVerdictFixture(t *testing.T) *sshVerdictFixture {
 		// autogroup:self compares hydrated users.
 		node.User = user
 
-		// SaveNode refreshes the policy manager's nodes, which
-		// SSHCheckParams resolves against.
-		_, _, err := app.state.SaveNode(node.View())
-		require.NoError(t, err)
+		// SSHCheckParams resolves against the nodes in memory.
+		app.state.PutNodeInStoreForTest(*node)
 
 		ids[i] = node.ID
 	}
@@ -1486,7 +1487,7 @@ func TestPollNetMapHandler_DeletedNodeGetsExpiredSelf(t *testing.T) {
 			nodeView, ok := app.state.GetNodeByID(node.ID)
 			require.True(t, ok)
 
-			_, err := app.state.DeleteNode(nodeView)
+			err := app.state.DeleteNode(nodeView)
 			require.NoError(t, err)
 
 			ns := &noiseServer{headscale: app, machineKey: node.MachineKey}
@@ -1877,7 +1878,9 @@ func TestPollNetMapHandler_AcceptsClientReport(t *testing.T) {
 
 	app := createTestApp(t)
 	user := app.state.CreateUserForTest("report-map-user")
-	node := putTestNodeInStore(t, app, user, "report-map-node")
+	// Registered, so it has addresses and its peer below sees it.
+	node := app.state.CreateRegisteredNodeForTest(user, "report-map-node")
+	app.state.PutNodeInStoreForTest(*node)
 
 	endpoints := make([]netip.AddrPort, types.MaxEndpoints+1)
 	for i := range endpoints {
@@ -1915,10 +1918,33 @@ func TestPollNetMapHandler_AcceptsClientReport(t *testing.T) {
 	assert.True(t, report.Hostinfo.Equal(stored.Hostinfo().AsStruct()),
 		"accepted Hostinfo must remain unchanged, including lists longer than 256 entries")
 
-	c, err := app.state.UpdateNodeFromMapRequest(node.ID, report)
+	// Online, as a reporting client is: a disconnected node's render
+	// carries the LastSeen every report stamps.
+	app.state.Connect(node.ID)
+
+	peer := app.state.CreateRegisteredNodeForTest(user, "report-map-peer")
+	app.state.PutNodeInStoreForTest(*peer)
+
+	stream := mapper.NewStream(app.cfg, app.MapHub(), peer.ID, tailcfg.CurrentCapabilityVersion)
+	_, err := stream.Initial(app.state.Snapshot())
 	require.NoError(t, err)
-	assert.True(t, c.IsEmpty(),
-		"an unchanged report must not be a change, got %s", c.Type())
+
+	var rowWrites atomic.Int32
+
+	require.NoError(t, app.state.DB().DB.Callback().Update().Before("gorm:update").
+		Register("count_node_update", func(tx *gorm.DB) {
+			if tx.Statement.Table == "nodes" {
+				rowWrites.Add(1)
+			}
+		}))
+
+	err = app.state.UpdateNodeFromMapRequest(node.ID, report)
+	require.NoError(t, err)
+
+	resps, err := stream.Update(app.state.Snapshot())
+	require.NoError(t, err)
+	assert.Empty(t, resps, "an unchanged report must not be a change")
+	assert.Zero(t, rowWrites.Load(), "an unchanged report must not rewrite the row")
 }
 
 func TestPollNetMapHandler_RejectsOversizedClientReport(t *testing.T) {

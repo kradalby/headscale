@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,21 +36,13 @@ func createTestAppWithNodeExpiry(t *testing.T, nodeExpiry time.Duration) *Headsc
 		},
 		Tuning: types.Tuning{
 			BatchChangeDelay: 100 * time.Millisecond,
-			BatcherWorkers:   1,
 		},
 	}
 
 	app, err := NewHeadscale(&cfg)
 	require.NoError(t, err)
 
-	app.mapBatcher = mapper.NewBatcherAndMapper(&cfg, app.state)
-	app.mapBatcher.Start()
-
-	t.Cleanup(func() {
-		if app.mapBatcher != nil {
-			app.mapBatcher.Close()
-		}
-	})
+	t.Cleanup(app.mapHub.Close)
 
 	return app
 }
@@ -219,7 +210,7 @@ func TestCannotRemoveAllTags(t *testing.T) {
 	require.True(t, node.IsTagged())
 
 	// Attempt to remove all tags by setting empty array
-	_, _, err = app.state.SetNodeTags(node.ID(), []string{})
+	_, err = app.state.SetNodeTags(node.ID(), []string{})
 	require.Error(t, err, "Should not be able to remove all tags")
 	require.ErrorIs(t, err, types.ErrCannotRemoveAllTags, "Error should be ErrCannotRemoveAllTags")
 
@@ -849,7 +840,7 @@ func TestExpiryDuringPersonalToTaggedConversion(t *testing.T) {
 	})
 	require.NoError(t, app.state.SetAuthCacheEntry(registrationID1, regEntry1))
 
-	node, _, err := app.state.HandleNodeFromAuthPath(
+	node, err := app.state.HandleNodeFromAuthPath(
 		registrationID1, types.UserID(user.ID), nil, "webauth",
 	)
 	require.NoError(t, err)
@@ -871,7 +862,7 @@ func TestExpiryDuringPersonalToTaggedConversion(t *testing.T) {
 	})
 	require.NoError(t, app.state.SetAuthCacheEntry(registrationID2, regEntry2))
 
-	nodeAfter, _, err := app.state.HandleNodeFromAuthPath(
+	nodeAfter, err := app.state.HandleNodeFromAuthPath(
 		registrationID2, types.UserID(user.ID), nil, "webauth",
 	)
 	require.NoError(t, err)
@@ -920,7 +911,7 @@ func TestExpiryDuringTaggedToPersonalConversion(t *testing.T) {
 	})
 	require.NoError(t, app.state.SetAuthCacheEntry(registrationID1, regEntry1))
 
-	node, _, err := app.state.HandleNodeFromAuthPath(
+	node, err := app.state.HandleNodeFromAuthPath(
 		registrationID1, types.UserID(user.ID), nil, "webauth",
 	)
 	require.NoError(t, err)
@@ -943,7 +934,7 @@ func TestExpiryDuringTaggedToPersonalConversion(t *testing.T) {
 	})
 	require.NoError(t, app.state.SetAuthCacheEntry(registrationID2, regEntry2))
 
-	nodeAfter, _, err := app.state.HandleNodeFromAuthPath(
+	nodeAfter, err := app.state.HandleNodeFromAuthPath(
 		registrationID2, types.UserID(user.ID), nil, "webauth",
 	)
 	require.NoError(t, err)
@@ -1651,7 +1642,7 @@ func TestIssue3371_TaggedNodeFutureExpirySurvivesRelogin(t *testing.T) {
 
 	// Admin sets a deliberate future expiry (`headscale nodes expire`).
 	future := time.Now().Add(24 * time.Hour)
-	_, _, err = app.state.SetNodeExpiry(node.ID(), &future)
+	_, err = app.state.SetNodeExpiry(node.ID(), &future)
 	require.NoError(t, err)
 
 	withFuture, found := app.state.GetNodeByNodeKey(nodeKey.Public())

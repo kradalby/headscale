@@ -2,7 +2,6 @@ package v2
 
 import (
 	"net/netip"
-	"slices"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -311,56 +310,4 @@ func TestNodeAttrsIPPoolValidator(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
-}
-
-func TestNodesWithChangedCapMap(t *testing.T) {
-	t.Parallel()
-
-	users := nodeAttrsTestUsers()
-	nodes := nodeAttrsTestNodes(users)
-
-	policyA := `{
-		"tagOwners": {` + nodeAttrsTagOwners + `},
-		"nodeAttrs": [{
-			"target": ["tag:server"],
-			"attr":   ["randomize-client-port"]
-		}]
-	}`
-
-	pm, err := NewPolicyManager([]byte(policyA), users, nodes.ViewSlice())
-	require.NoError(t, err)
-
-	initial := pm.NodesWithChangedCapMap()
-	slices.Sort(initial)
-	assert.Equal(t, []types.NodeID{3}, initial,
-		"first build reports every node with a non-empty CapMap")
-
-	// Swap targets: server loses the attr, client and prod gain it.
-	policyB := `{
-		"tagOwners": {` + nodeAttrsTagOwners + `},
-		"nodeAttrs": [{
-			"target": ["tag:client", "tag:prod"],
-			"attr":   ["randomize-client-port"]
-		}]
-	}`
-
-	changed, err := pm.SetPolicy([]byte(policyB))
-	require.NoError(t, err)
-	require.True(t, changed)
-
-	delta := pm.NodesWithChangedCapMap()
-	slices.Sort(delta)
-	assert.Equal(t, []types.NodeID{3, 4, 5}, delta,
-		"server lost the cap, client and prod gained it -- diff is the symmetric difference")
-
-	assert.Empty(t, pm.NodesWithChangedCapMap(),
-		"NodesWithChangedCapMap drains its buffer on read")
-
-	// Reload the same bytes. updateLocked still runs, but no node's
-	// CapMap hash should change.
-	_, err = pm.SetPolicy([]byte(policyB))
-	require.NoError(t, err)
-
-	assert.Empty(t, pm.NodesWithChangedCapMap(),
-		"reloading the same policy must not produce CapMap diffs")
 }

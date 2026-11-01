@@ -1,8 +1,6 @@
 package state
 
 import (
-	"fmt"
-
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/rs/zerolog/log"
@@ -32,7 +30,7 @@ var givenNameMapsToValidFQDN = nodeHealthCheck{
 	check: func(nv types.NodeView, cfg *types.Config) (string, string, bool) {
 		err := types.ValidateGivenName(nv.GivenName(), cfg.BaseDomain)
 		if err != nil {
-			return err.Error(), fmt.Sprintf("headscale nodes rename %d <name>", nv.ID()), false
+			return err.Error(), types.StoredDataFixHint(nv.ID(), err), false
 		}
 
 		return "", "", true
@@ -50,10 +48,7 @@ var expiryIsEncodable = nodeHealthCheck{
 
 		_, err := types.ValidateExpiry(expiry)
 		if err != nil {
-			return err.Error(), fmt.Sprintf(
-				"headscale nodes expire --identifier %d",
-				nv.ID(),
-			), false
+			return err.Error(), types.StoredDataFixHint(nv.ID(), err), false
 		}
 
 		return "", "", true
@@ -76,7 +71,7 @@ type nodeHealthFinding struct {
 func (s *State) scanNodeHealth() []nodeHealthFinding {
 	var findings []nodeHealthFinding
 
-	for _, nv := range s.nodeStore.ListNodes().All() {
+	for _, nv := range s.Snapshot().ListNodes().All() {
 		for _, c := range nodeHealthChecks {
 			problem, fixHint, ok := c.check(nv, s.cfg)
 			if ok {

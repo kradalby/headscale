@@ -1,7 +1,6 @@
 package types
 
 import (
-	"net/netip"
 	"time"
 
 	"tailscale.com/tailcfg"
@@ -47,11 +46,6 @@ type RegistrationData struct {
 	// confirmation page. Other fields arrive in the first MapRequest.
 	// It may be nil when the registration did not include Hostinfo.
 	Hostinfo *tailcfg.Hostinfo
-
-	// Endpoints is the initial set of WireGuard endpoints the node
-	// reported. The first [tailcfg.MapRequest] after registration overwrites
-	// this with the live set.
-	Endpoints []netip.AddrPort
 
 	// Expiry is the optional client-requested expiry for this node.
 	// May be nil if the client did not request a specific expiry.

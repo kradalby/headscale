@@ -734,8 +734,8 @@ func (ns *noiseServer) sshActionFollowUp(
 // This is the busiest endpoint, as it keeps the HTTP long poll that updates
 // the clients when something in the network changes.
 //
-// The clients POST stuff like [tailcfg.Hostinfo] and their Endpoints here, but
-// only after their first request (marked with the [tailcfg.MapRequest.ReadOnly] field).
+// The clients POST stuff like [tailcfg.Hostinfo] and their Endpoints here in
+// non-streaming updates; streaming requests are read-only (capability 68).
 //
 // At this moment the updates are sent in a quite horrendous way, but they kinda work.
 func (ns *noiseServer) PollNetMapHandler(
@@ -826,6 +826,10 @@ func (ns *noiseServer) PollNetMapHandler(
 	// A repeated JSON key can leave a short slice backed by a larger array.
 	mapRequest.Hostinfo = mapRequest.Hostinfo.Clone()
 	mapRequest.DebugFlags = nil
+
+	if hook := ns.headscale.beforeMapRequest.Load(); hook != nil {
+		(*hook)(nv.ID(), mapRequest)
+	}
 
 	sess := ns.headscale.newMapSession(req.Context(), mapRequest, writer, nv.AsStruct())
 	sess.log.Trace().Caller().Msg("a node sending a MapRequest with Noise protocol")
@@ -1059,7 +1063,7 @@ func (ns *noiseServer) RegistrationHandler(
 // means the node is gone and its client should re-authenticate.
 var errNodeNotInStore = errors.New("node not found")
 
-// getAndValidateNode retrieves the node from the in-memory NodeStore using the
+// getAndValidateNode retrieves the node from the latest snapshot using the
 // NodeKey and validates that it matches the MachineKey from the Noise session.
 func (ns *noiseServer) getAndValidateNode(mapRequest tailcfg.MapRequest) (types.NodeView, error) {
 	nv, ok := ns.headscale.state.GetNodeByNodeKey(mapRequest.NodeKey)

@@ -1574,6 +1574,33 @@ func TestPostgresConfigDSN(t *testing.T) {
 	}
 }
 
+// TestInertTuningKeysStillLoad sets the tuning keys nothing reads any more:
+// configs that carry them must keep loading, with a warning, not fail.
+func TestInertTuningKeysStillLoad(t *testing.T) {
+	viper.Reset()
+
+	tmpDir := t.TempDir()
+	cfg := `---
+server_url: https://example.com
+listen_addr: 0.0.0.0:8080
+noise:
+  private_key_path: noise_private.key
+database:
+  type: sqlite3
+dns:
+  magic_dns: false
+  override_local_dns: false
+tuning:
+  batcher_workers: 4
+  notifier_send_timeout: 800ms
+  node_mapsession_buffered_chan_size: 30
+`
+	require.NoError(t, os.WriteFile(
+		filepath.Join(tmpDir, "config.yaml"), []byte(cfg), 0o600))
+	require.NoError(t, LoadConfig(tmpDir, false))
+	require.NoError(t, validateServerConfig(), "inert tuning keys must warn, not fail")
+}
+
 func TestServesRoute(t *testing.T) {
 	v4 := netip.MustParsePrefix("100.64.0.0/10")
 	v6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")

@@ -31,10 +31,10 @@ func TestRenameNodeRejectsNameExceedingFQDNLimit(t *testing.T) {
 	t.Cleanup(func() { _ = s.Close() })
 
 	// Valid 63-char DNS label, but the resulting FQDN exceeds 255 chars.
-	_, _, err = s.RenameNode(node.ID, strings.Repeat("a", 63))
+	_, err = s.RenameNode(node.ID, strings.Repeat("a", 63))
 	require.Error(t, err, "rename to a name whose FQDN exceeds the limit must be rejected")
 
 	// A short, valid name is still accepted.
-	_, _, err = s.RenameNode(node.ID, "short")
+	_, err = s.RenameNode(node.ID, "short")
 	require.NoError(t, err)
 }

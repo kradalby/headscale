@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -210,6 +211,11 @@ type Node struct {
 	// returned by Connect as a "Connect ran" sentinel for its cleanup,
 	// and Disconnect logs it. Runtime-only.
 	SessionEpoch uint64 `gorm:"-"`
+
+	// ReportGen orders the map reports applied to the node: each report
+	// worth persisting takes a new, increasing value, published with it, so
+	// a row write can say which reports it made durable. Memory only.
+	ReportGen uint64 `gorm:"-"`
 }
 
 type Nodes []*Node
@@ -249,7 +255,7 @@ func (node *Node) Online() bool {
 // ShouldBeOnline derives what [Node.IsOnline] must hold from its two inputs:
 // a live control session and an unexpired node key. An expired client keeps
 // polling control to receive auth updates, so a session alone is not enough.
-// Call it only from a NodeStore write closure, where ActiveSessions is
+// Call it only from a node write closure, where ActiveSessions is
 // stable; elsewhere read [Node.Online].
 func (node *Node) ShouldBeOnline() bool {
 	return node.ActiveSessions > 0 && !node.IsExpired()
@@ -340,15 +346,54 @@ func (node *Node) Prefixes() []netip.Prefix {
 // viewer uses an exit node; excluded from [Node.CanAccessRoute] which only
 // handles non-exit routing.
 func (node *Node) ExitRoutes() []netip.Prefix {
+	return node.approvedAnnounced(tsaddr.IsExitRoute)
+}
+
+// smallRouteList is the approval-list length up to which a scan beats
+// building a set.
+const smallRouteList = 16
+
+// approvedAnnounced returns the announced routes keep selects that are
+// also approved. A router can carry thousands of routes, so a long
+// approval list is looked up through a set rather than scanned per route.
+func (node *Node) approvedAnnounced(keep func(netip.Prefix) bool) []netip.Prefix {
+	announced := node.AnnouncedRoutes()
+	if len(announced) == 0 || len(node.ApprovedRoutes) == 0 {
+		return nil
+	}
+
+	approved := func(p netip.Prefix) bool { return slices.Contains(node.ApprovedRoutes, p) }
+
+	if len(node.ApprovedRoutes) > smallRouteList {
+		set := make(map[netip.Prefix]struct{}, len(node.ApprovedRoutes))
+		for _, p := range node.ApprovedRoutes {
+			set[p] = struct{}{}
+		}
+
+		approved = func(p netip.Prefix) bool {
+			_, ok := set[p]
+
+			return ok
+		}
+	}
+
 	var routes []netip.Prefix
 
-	for _, route := range node.AnnouncedRoutes() {
-		if tsaddr.IsExitRoute(route) && slices.Contains(node.ApprovedRoutes, route) {
+	for _, route := range announced {
+		if keep(route) && approved(route) {
 			routes = append(routes, route)
 		}
 	}
 
 	return routes
+}
+
+// SameRouteFacts reports whether node and other announce and approve the
+// same routes in the same order, so every route derived from them agrees
+// without being computed.
+func (node *Node) SameRouteFacts(other *Node) bool {
+	return slices.Equal(node.AnnouncedRoutes(), other.AnnouncedRoutes()) &&
+		slices.Equal(node.ApprovedRoutes, other.ApprovedRoutes)
 }
 
 // IsExitNode reports whether the node has any approved exit routes.
@@ -577,6 +622,17 @@ func ValidateExpiry(expiry time.Time) (time.Time, error) {
 	return utc, nil
 }
 
+// StoredDataFixHint returns the command that repairs the column of node id
+// that err, from [ValidateGivenName] or [ValidateExpiry], names. The boot
+// scan and the map renderer both log it, so one place maps error to command.
+func StoredDataFixHint(id NodeID, err error) string {
+	if errors.Is(err, ErrExpiryOutOfRange) {
+		return fmt.Sprintf("headscale nodes expire --identifier %d", id)
+	}
+
+	return fmt.Sprintf("headscale nodes rename %d <name>", id)
+}
+
 // AnnouncedRoutes returns the list of routes the node announces, as
 // reported by the client in [tailcfg.Hostinfo.RoutableIPs]. Announcement alone
 // does not grant visibility — see [Node.SubnetRoutes] for approval-gated
@@ -597,19 +653,7 @@ func (node *Node) AnnouncedRoutes() []netip.Prefix {
 // responses that need the routes actively served by the node must
 // populate SubnetRoutes from the primary-route election instead.
 func (node *Node) SubnetRoutes() []netip.Prefix {
-	var routes []netip.Prefix
-
-	for _, route := range node.AnnouncedRoutes() {
-		if tsaddr.IsExitRoute(route) {
-			continue
-		}
-
-		if slices.Contains(node.ApprovedRoutes, route) {
-			routes = append(routes, route)
-		}
-	}
-
-	return routes
+	return node.approvedAnnounced(func(p netip.Prefix) bool { return !tsaddr.IsExitRoute(p) })
 }
 
 // IsSubnetRouter reports if the node has any subnet routes.
@@ -760,7 +804,7 @@ func (node *Node) ApplyPeerChange(change *tailcfg.PeerChange) {
 	// This might technically not be useful as we replace
 	// the whole hostinfo blob when it has changed.
 	if change.DERPRegion != 0 {
-		// [NodeStore] publishes snapshots that share the *Hostinfo /
+		// Published snapshots share the *Hostinfo /
 		// *NetInfo pointers, so writing PreferredDERP in place would race
 		// readers of an already-published snapshot. Clone to fresh pointers
 		// and assign, leaving the previous snapshot untouched.
@@ -1206,6 +1250,12 @@ func (nv NodeView) HasNetworkChanges(other NodeView) bool {
 		return true
 	}
 
+	// An endpoint update leaves the route facts alone; skipping the
+	// derived routes keeps it linear in a router's route count.
+	if nv.Valid() && other.Valid() && nv.ж.SameRouteFacts(other.ж) {
+		return false
+	}
+
 	if !equalPrefixesUnordered(nv.SubnetRoutes(), other.SubnetRoutes()) {
 		return true
 	}
@@ -1264,6 +1314,12 @@ func (nv NodeView) HasPolicyChange(other NodeView) bool {
 
 	if !slices.Equal(nv.IPs(), other.IPs()) {
 		return true
+	}
+
+	// An endpoint update leaves the route facts alone; skipping the
+	// derived routes keeps it linear in a router's route count.
+	if nv.Valid() && other.Valid() && nv.ж.SameRouteFacts(other.ж) {
+		return false
 	}
 
 	if !equalPrefixesUnordered(nv.SubnetRoutes(), other.SubnetRoutes()) {
@@ -1441,4 +1497,37 @@ func (nv NodeView) TailNode(
 	}
 
 	return &tNode, nil
+}
+
+// SameRender reports whether nv and o differ only in fields no map
+// renders (Unhealthy, read by the election; ActiveSessions, SessionEpoch,
+// ReportGen and UpdatedAt, kept for sessions and the database),
+// and in LastSeen while online in both, so no map, the node's own or a
+// peer's, can differ between them: [NodeView.TailNode] renders LastSeen
+// only for an offline node. A map request stamping LastSeen then wakes
+// nobody.
+//
+// An expired node is never the same: its render reads the clock, so the
+// expiry tick rewriting it unchanged is what tells its viewers. Every
+// other write to it, a reconnect included, wakes them too.
+func (nv NodeView) SameRender(o NodeView) bool {
+	if !nv.Valid() || !o.Valid() {
+		return nv.Valid() == o.Valid()
+	}
+
+	if nv.IsExpired() || o.IsExpired() {
+		return false
+	}
+
+	a, b := *nv.ж, *o.ж
+	online := a.IsOnline != nil && *a.IsOnline && b.IsOnline != nil && *b.IsOnline
+
+	for _, n := range []*Node{&a, &b} {
+		n.Unhealthy, n.ActiveSessions, n.SessionEpoch, n.ReportGen, n.UpdatedAt = false, 0, 0, 0, time.Time{}
+		if online {
+			n.LastSeen = nil
+		}
+	}
+
+	return reflect.DeepEqual(a, b)
 }
