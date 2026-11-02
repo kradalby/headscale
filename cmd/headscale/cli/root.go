@@ -28,7 +28,7 @@ func init() {
 	rootCmd.PersistentFlags().
 		StringP("output", "o", "", "Output format. Empty for human-readable, 'json', 'json-line' or 'yaml'")
 	rootCmd.PersistentFlags().
-		Bool("force", false, "Disable prompts and forces the execution")
+		Bool("force", false, "Disable prompts and force the execution; the policy set bypass guard is not a prompt and still applies")
 
 	// Re-enable usage output only for flag-parsing errors; runtime errors
 	// from [cobra.Command.RunE] should never dump usage text.

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -419,6 +421,19 @@ func TestNodeFQDN(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestStoredDataFixHint pins the command each kind of invalid stored node
+// data is repaired with; the boot scan and the map renderer both log it.
+func TestStoredDataFixHint(t *testing.T) {
+	_, expiryErr := ValidateExpiry(time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC))
+	nameErr := ValidateGivenName("", "example.test")
+
+	require.ErrorIs(t, expiryErr, ErrExpiryOutOfRange)
+	require.Error(t, nameErr)
+
+	assert.Equal(t, "headscale nodes expire --identifier 7", StoredDataFixHint(7, expiryErr))
+	assert.Equal(t, "headscale nodes rename 7 <name>", StoredDataFixHint(7, nameErr))
 }
 
 func TestValidateGivenName(t *testing.T) {
@@ -1046,6 +1061,32 @@ func TestHasPolicyChangeFields(t *testing.T) {
 	}
 }
 
+// nodePolicyInputs classifies every Node field: true when the policy
+// reads it, so HasPolicyChange must compare it. ID is read too, but a
+// changed ID is another node, which the node table reports on its own.
+var nodePolicyInputs = map[string]bool{
+	"IPv4": true, "IPv6": true, "UserID": true, "User": true, "Tags": true,
+	"ApprovedRoutes": true, "Hostinfo": true,
+	"ID": false, "MachineKey": false, "NodeKey": false, "DiscoKey": false,
+	"Endpoints": false, "Hostname": false, "GivenName": false,
+	"RegisterMethod": false, "AuthKeyID": false, "AuthKey": false,
+	"Expiry": false, "LastSeen": false, "CreatedAt": false, "UpdatedAt": false,
+	"DeletedAt": false, "IsOnline": false, "Unhealthy": false,
+	"ActiveSessions": false, "SessionEpoch": false, "ReportGen": false,
+}
+
+// TestHasPolicyChangeCoversEveryNodeField fails on a Node field nobody
+// classified: a policy input HasPolicyChange misses is a policy that is
+// never recompiled when it changes.
+func TestHasPolicyChangeCoversEveryNodeField(t *testing.T) {
+	for f := range reflect.TypeFor[Node]().Fields() {
+		if _, ok := nodePolicyInputs[f.Name]; f.IsExported() && !ok {
+			t.Errorf("Node.%s is not in nodePolicyInputs; if the policy reads it, "+
+				"teach HasPolicyChange and TestHasPolicyChangeFields", f.Name)
+		}
+	}
+}
+
 func TestNodeIsExpiredAt(t *testing.T) {
 	now := time.Now()
 	zero := time.Time{}
@@ -1074,6 +1115,49 @@ func TestNodeIsExpiredAt(t *testing.T) {
 		require.True(t, NodeView{}.IsExpiredAt(now),
 			"an invalid view counts as expired, like IsExpired")
 	})
+}
+
+// unrenderedFields are the [Node] fields SameRender ignores.
+var unrenderedFields = []string{"Unhealthy", "ActiveSessions", "SessionEpoch", "ReportGen", "UpdatedAt"}
+
+// TestSameRenderIgnoresOnlyUnrenderedFields changes each unrendered field
+// and a rendered one, and checks every unrendered name is a Node field, so
+// a rename cannot silently widen what SameRender ignores.
+func TestSameRenderIgnoresOnlyUnrenderedFields(t *testing.T) {
+	typ := reflect.TypeFor[Node]()
+	for _, name := range unrenderedFields {
+		_, ok := typ.FieldByName(name)
+		require.True(t, ok, "Node has no field %s", name)
+	}
+
+	base := &Node{ID: 1, Hostname: "a", Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")}}
+
+	hidden := *base
+	hidden.Unhealthy, hidden.ActiveSessions, hidden.SessionEpoch, hidden.ReportGen, hidden.UpdatedAt = true, 2, 7, 9, time.Now()
+	assert.True(t, base.View().SameRender(hidden.View()))
+
+	moved := *base
+	moved.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.2:41641")}
+	assert.False(t, base.View().SameRender(moved.View()))
+
+	online := *base
+	online.IsOnline = new(true)
+	assert.False(t, base.View().SameRender(online.View()))
+
+	// LastSeen renders only for an offline node.
+	seen := online
+	seen.LastSeen = new(time.Now())
+	assert.True(t, online.View().SameRender(seen.View()), "LastSeen of an online node is not rendered")
+
+	offline, offlineSeen := *base, *base
+	offline.IsOnline, offlineSeen.IsOnline = new(false), new(false)
+	offlineSeen.LastSeen = new(time.Now())
+	assert.False(t, offline.View().SameRender(offlineSeen.View()), "LastSeen of an offline node is")
+
+	// An expired node renders from the clock, so no two records are the same.
+	expired := *base
+	expired.Expiry = new(time.Now().Add(-time.Minute))
+	assert.False(t, expired.View().SameRender(expired.View()), "an expired node always renders anew")
 }
 
 func TestValidateHostinfo(t *testing.T) {
@@ -1133,4 +1217,34 @@ func TestValidateHostinfo(t *testing.T) {
 			require.True(t, want.Equal(tt.hostinfo), "validation must not change the report")
 		})
 	}
+}
+
+// TestApprovedRoutesLongLists checks the set lookup a long approval list
+// takes keeps the announced order and drops what is not approved.
+func TestApprovedRoutesLongLists(t *testing.T) {
+	announced := make([]netip.Prefix, 0, 3*smallRouteList+2)
+
+	var approved, wantSubnets []netip.Prefix
+
+	for i := range 3 * smallRouteList {
+		p := netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(i), 0, 0}), 16)
+		announced = append(announced, p)
+
+		if i%3 != 0 {
+			approved = append(approved, p)
+			wantSubnets = append(wantSubnets, p)
+		}
+	}
+
+	exit := netip.MustParsePrefix("0.0.0.0/0")
+	announced = append(announced, exit, netip.MustParsePrefix("::/0"))
+
+	slices.Reverse(approved)
+	approved = append(approved, exit, netip.MustParsePrefix("192.0.2.0/24"))
+
+	n := &Node{Hostinfo: &tailcfg.Hostinfo{RoutableIPs: announced}, ApprovedRoutes: approved}
+	require.Greater(t, len(n.ApprovedRoutes), smallRouteList)
+
+	assert.Equal(t, wantSubnets, n.SubnetRoutes())
+	assert.Equal(t, []netip.Prefix{exit}, n.ExitRoutes())
 }

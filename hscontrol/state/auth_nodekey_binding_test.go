@@ -14,7 +14,7 @@ import (
 // rotation path enforces the same 1:1 NodeKey<->MachineKey binding the other
 // registration paths do. NodeKeys are public (peers learn them from the
 // netmap), so an authenticated attacker must not be able to rotate their own
-// node's NodeKey onto a victim's NodeKey: doing so poisons the NodeStore
+// node's NodeKey onto a victim's NodeKey: doing so poisons the
 // NodeKey index and denies the victim service.
 func TestPreAuthKeyReauthRejectsVictimNodeKey(t *testing.T) {
 	dbPath := t.TempDir() + "/headscale.db"
@@ -62,12 +62,12 @@ func TestPreAuthKeyReauthRejectsVictimNodeKey(t *testing.T) {
 		},
 	}
 
-	_, _, err = s.HandleNodeFromPreAuthKey(regReq, attackerMachineKey)
+	_, err = s.HandleNodeFromPreAuthKey(regReq, attackerMachineKey)
 	require.ErrorIs(t, err, ErrNodeKeyInUse,
 		"attacker must not be able to claim the victim's NodeKey via PAK re-registration")
 
 	// The victim's NodeKey index must still resolve to the victim's node.
-	resolved, ok := s.nodeStore.GetNodeByNodeKey(victimNodeKey)
+	resolved, ok := s.GetNodeByNodeKey(victimNodeKey)
 	require.True(t, ok, "victim NodeKey must still be present in the index")
 	require.Equal(t, victimNode.MachineKey, resolved.MachineKey(),
 		"victim NodeKey must remain bound to the victim's MachineKey")

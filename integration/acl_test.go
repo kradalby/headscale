@@ -318,8 +318,10 @@ func TestACLHostsInNetMapTable(t *testing.T) {
 
 			for _, client := range allClients {
 				assert.EventuallyWithT(t, func(c *assert.CollectT) {
-					status, err := client.Status()
-					assert.NoError(c, err)
+					status := assertClientStatus(c, client)
+					if status == nil {
+						return
+					}
 
 					user := status.User[status.Self.UserID].LoginName
 
@@ -1145,8 +1147,10 @@ func TestACLAutogroupMember(t *testing.T) {
 		var clientIsUntagged bool
 
 		assert.EventuallyWithT(t, func(c *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(c, err)
+			status := assertClientStatus(c, client)
+			if status == nil {
+				return
+			}
 
 			clientIsUntagged = status.Self.Tags == nil || status.Self.Tags.Len() == 0
 			assert.True(c, clientIsUntagged, "Expected client %s to be untagged for autogroup:member test", client.Hostname())
@@ -1164,8 +1168,10 @@ func TestACLAutogroupMember(t *testing.T) {
 			var peerIsUntagged bool
 
 			assert.EventuallyWithT(t, func(c *assert.CollectT) {
-				status, err := peer.Status()
-				assert.NoError(c, err)
+				status := assertClientStatus(c, peer)
+				if status == nil {
+					return
+				}
 
 				peerIsUntagged = status.Self.Tags == nil || status.Self.Tags.Len() == 0
 				assert.True(c, peerIsUntagged, "Expected peer %s to be untagged for autogroup:member test", peer.Hostname())
@@ -1321,8 +1327,10 @@ func TestACLAutogroupTagged(t *testing.T) {
 		hostname := client.Hostname()
 
 		assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(ct, err)
+			status := assertClientStatus(ct, client)
+			if status == nil {
+				return
+			}
 
 			if status.Self.Tags != nil && status.Self.Tags.Len() > 0 {
 				// This is a tagged node
@@ -1369,8 +1377,11 @@ func TestACLAutogroupTagged(t *testing.T) {
 	// Explicitly verify tags on tagged nodes
 	for _, client := range taggedClients {
 		assert.EventuallyWithT(t, func(c *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(c, err)
+			status := assertClientStatus(c, client)
+			if status == nil {
+				return
+			}
+
 			assert.NotNil(c, status.Self.Tags, "tagged node %s should have tags", client.Hostname())
 			assert.Positive(c, status.Self.Tags.Len(), "tagged node %s should have at least one tag", client.Hostname())
 		}, integrationutil.ScaledTimeout(10*time.Second), integrationutil.FastPoll, "Waiting for tags to be applied to tagged nodes")
@@ -1379,8 +1390,10 @@ func TestACLAutogroupTagged(t *testing.T) {
 	// Verify untagged nodes have no tags
 	for _, client := range untaggedClients {
 		assert.EventuallyWithT(t, func(c *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(c, err)
+			status := assertClientStatus(c, client)
+			if status == nil {
+				return
+			}
 
 			if status.Self.Tags != nil {
 				assert.Equal(c, 0, status.Self.Tags.Len(), "untagged node %s should have no tags", client.Hostname())
@@ -2583,8 +2596,10 @@ func TestACLTagPropagation(t *testing.T) {
 			// Step 1b: Verify initial NetMap visibility
 			t.Logf("Step 1b: Verifying initial NetMap visibility (expect visible=%v)", tt.initialAccess)
 			assert.EventuallyWithT(t, func(c *assert.CollectT) {
-				status, err := sourceClient.Status()
-				assert.NoError(c, err)
+				status := assertClientStatus(c, sourceClient)
+				if status == nil {
+					return
+				}
 
 				targetHostname := targetClient.Hostname()
 				found := false
@@ -2629,8 +2644,10 @@ func TestACLTagPropagation(t *testing.T) {
 			// base timeout.
 			t.Logf("Step 3: Verifying final NetMap visibility (expect visible=%v)", tt.finalAccess)
 			assert.EventuallyWithT(t, func(c *assert.CollectT) {
-				status, err := sourceClient.Status()
-				assert.NoError(c, err)
+				status := assertClientStatus(c, sourceClient)
+				if status == nil {
+					return
+				}
 
 				targetHostname := targetClient.Hostname()
 				found := false
@@ -2836,8 +2853,10 @@ func TestACLTagPropagationPortSpecific(t *testing.T) {
 	// Step 3: Verify peer is still visible in NetMap (partial access, not full removal)
 	t.Log("Step 3: Verifying peer remains visible in NetMap after tag change")
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		status, err := user2Node.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, user2Node)
+		if status == nil {
+			return
+		}
 
 		targetHostname := user1Node.Hostname()
 		found := false

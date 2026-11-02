@@ -270,6 +270,54 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 	return tc, nil
 }
 
+// NewAutoClient starts the control client tailscaled runs, a
+// [controlclient.Auto], logged in with a pre-auth key for user on the
+// server's in-memory network. Unlike a [TestClient], it decides itself when
+// to send lite updates and when to restart its stream. observer, which may
+// be nil, sees its status as tailscaled's backend does. It is shut down
+// when tb ends.
+func NewAutoClient(
+	tb testing.TB,
+	server *TestServer,
+	user *types.User,
+	hi *tailcfg.Hostinfo,
+	observer controlclient.Observer,
+) *controlclient.Auto {
+	tb.Helper()
+
+	bus := eventbus.New()
+	dialer := tsdial.NewDialer(netmon.NewStatic())
+	dialer.SetBus(bus)
+	dialer.SetSystemDialerForTest(server.MemNet().Dial)
+
+	machineKey := key.NewMachine()
+
+	auto, err := controlclient.New(controlclient.Options{
+		GetMachinePrivateKey: func() (key.MachinePrivate, error) { return machineKey, nil },
+		ServerURL:            server.URL,
+		AuthKey:              server.CreatePreAuthKey(tb, types.UserID(user.ID)),
+		Hostinfo:             hi,
+		DiscoPublicKey:       key.NewDisco().Public(),
+		Logf:                 tb.Logf,
+		HealthTracker:        health.NewTracker(bus),
+		Dialer:               dialer,
+		Bus:                  bus,
+		Observer:             observer,
+	})
+	if err != nil {
+		tb.Fatalf("servertest: controlclient.New: %v", err)
+	}
+
+	tb.Cleanup(func() {
+		auto.Shutdown()
+		bus.Close()
+	})
+
+	auto.Login(controlclient.LoginDefault)
+
+	return auto
+}
+
 // newDirect builds a [controlclient.Direct] for the client's machine.
 func (c *TestClient) newDirect(
 	p persist.Persist,
@@ -321,9 +369,12 @@ func (c *TestClient) tryLogin(ctx context.Context, flags controlclient.LoginFlag
 		c.mu.Lock()
 		c.registers = append(c.registers, testcapture.RegisterAttempt{Err: err.Error()})
 		c.mu.Unlock()
+
+		return err
 	}
 
-	return err
+	// Direct lacks Auto's post-login update loop; streams are read-only.
+	return c.direct.SendUpdate(ctx)
 }
 
 // waitLogin waits on the auth URL while approve completes the login it names.
@@ -566,6 +617,11 @@ func (c *TestClient) ReloginAndPoll(ctx context.Context) error {
 
 	if url != "" {
 		return fmt.Errorf("servertest: TryLogin(%s): unexpected auth URL %q (expected auto-auth with preauth key)", c.Name, url) //nolint:err113
+	}
+
+	err = c.direct.SendUpdate(ctx)
+	if err != nil {
+		return fmt.Errorf("servertest: SendUpdate(%s): %w", c.Name, err)
 	}
 
 	c.resetNetmapState()

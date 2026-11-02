@@ -430,10 +430,13 @@ func (u *Username) resolve(_ *Policy, users types.Users, nodes views.Slice[types
 	)
 
 	user, err := u.resolveUser(users)
-	if errors.Is(err, ErrUserNotFound) {
+	if errors.Is(err, ErrUserNotFound) || errors.Is(err, ErrMultipleUsersFound) {
 		// A policy may name users before they register (#2863). Report it
 		// as an empty set, not an error: callers that bail on error would
 		// otherwise drop a whole group for one missing member (#3513).
+		// A name several users answer to likewise grants nobody, and
+		// nobody else loses access for it; writing the document refuses
+		// it (validateUserReferences).
 		return &netipx.IPSet{}, nil
 	}
 
@@ -1559,8 +1562,8 @@ func resolveAutoApprovers(p *Policy, users types.Users, nodes views.Slice[types.
 				return nil, nil, fmt.Errorf("%w: %v", ErrAutoApproverNotAlias, autoApprover)
 			}
 			// If it does not resolve, that means the autoApprover is not associated with any IP addresses.
-			ips, _ := aa.resolve(p, users, nodes)
-			routes[prefix].AddSet(ips)
+			ips, _ := p.resolveAlias(aa, users, nodes)
+			addResolved(routes[prefix], ips)
 		}
 	}
 
@@ -1574,8 +1577,8 @@ func resolveAutoApprovers(p *Policy, users types.Users, nodes views.Slice[types.
 				return nil, nil, fmt.Errorf("%w: %v", ErrAutoApproverNotAlias, autoApprover)
 			}
 			// If it does not resolve, that means the autoApprover is not associated with any IP addresses.
-			ips, _ := aa.resolve(p, users, nodes)
-			exitNodeSetBuilder.AddSet(ips)
+			ips, _ := p.resolveAlias(aa, users, nodes)
+			addResolved(&exitNodeSetBuilder, ips)
 		}
 	}
 
@@ -1973,6 +1976,10 @@ type Policy struct {
 	// nodesByTag is set only on the copy [Policy.withNodesByTag] makes for
 	// one compile, and indexes the nodes that compile resolves against.
 	nodesByTag map[string][]types.NodeView
+
+	// aliases, also only on that copy, holds what each alias resolved to
+	// in this compile; see [Policy.resolveAlias].
+	aliases aliasCache
 }
 
 // withNodesByTag returns a copy of pol to resolve against nodes, and only

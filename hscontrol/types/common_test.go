@@ -1,6 +1,7 @@
 package types
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -9,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
@@ -81,12 +84,10 @@ func TestAuthRequestPrepareForCacheOwnsRegistration(t *testing.T) {
 			Location: &tailcfg.Location{Country: "Norway", City: "Tromsø", Latitude: 69.65, Longitude: 18.96},
 			TPM:      &tailcfg.TPMInfo{Manufacturer: "MSFT", Model: 1},
 		},
-		Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641"), netip.MustParseAddrPort("[2001:db8::1]:41641")},
-		Expiry:    &expiry,
+		Expiry: &expiry,
 	}
 	want := *data
 	want.Hostinfo = data.Hostinfo.Clone()
-	want.Endpoints = append([]netip.AddrPort(nil), data.Endpoints...)
 	wantExpiry := expiry
 	want.Expiry = &wantExpiry
 
@@ -104,7 +105,6 @@ func TestAuthRequestPrepareForCacheOwnsRegistration(t *testing.T) {
 	data.Hostinfo.NetInfo.DERPLatency["1-v4"] = 1
 	data.Hostinfo.Location.City = "changed"
 	data.Hostinfo.TPM.Manufacturer = "changed"
-	data.Endpoints[0] = netip.MustParseAddrPort("192.0.2.2:1")
 	*data.Expiry = time.Time{}
 
 	assert.Equal(t, &want, req.RegistrationData(), "the producer must not retain ownership of cached data")
@@ -114,7 +114,6 @@ func TestAuthRequestPrepareForCacheOwnsRegistration(t *testing.T) {
 	got.Hostinfo.RequestTags[0] = "tag:consumer"
 	got.Hostinfo.Services[0].Description = "changed by consumer"
 	got.Hostinfo.NetInfo.DERPLatency["1-v4"] = 2
-	got.Endpoints[0] = netip.MustParseAddrPort("192.0.2.3:1")
 	*got.Expiry = time.Time{}
 
 	require.NoError(t, req.PrepareForCache())
@@ -159,6 +158,48 @@ func TestAuthRequestPrepareForCachePayloadLimit(t *testing.T) {
 			assert.Equal(t, data, req.RegistrationData())
 		})
 	}
+}
+
+// TestAuthRequestPrepareForCacheLogsOversizeOnce pins the operator-visible
+// signal for a rejected registration: the rejection is otherwise
+// indistinguishable from a server bug, and the size says whether a real client
+// is hitting the limit.
+func TestAuthRequestPrepareForCacheLogsOversizeOnce(t *testing.T) {
+	previous, previousLevel := log.Logger, zerolog.GlobalLevel()
+
+	t.Cleanup(func() {
+		log.Logger = previous
+
+		zerolog.SetGlobalLevel(previousLevel)
+	})
+
+	var output bytes.Buffer
+
+	log.Logger = zerolog.New(&output)
+
+	// Test binaries default to error level, which hides the warning.
+	zerolog.SetGlobalLevel(zerolog.WarnLevel)
+
+	data := &RegistrationData{Hostname: strings.Repeat("x", MaxRegistrationPayloadBytes)}
+	encoded, err := json.Marshal(data)
+	require.NoError(t, err)
+
+	err = NewRegisterAuthRequest(data).PrepareForCache()
+	require.ErrorIs(t, err, ErrRegistrationPayloadTooLarge)
+
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	require.Len(t, lines, 1, "one rejection logs once")
+
+	var entry map[string]any
+	require.NoError(t, json.Unmarshal([]byte(lines[0]), &entry))
+	assert.Equal(t, "warn", entry["level"])
+	assert.InDelta(t, len(encoded), entry["payload_bytes"], 0)
+	assert.InDelta(t, MaxRegistrationPayloadBytes, entry["payload_limit"], 0)
+
+	output.Reset()
+
+	require.NoError(t, NewRegisterAuthRequest(&RegistrationData{Hostname: "ok"}).PrepareForCache())
+	assert.Empty(t, output.String(), "an admitted registration logs nothing")
 }
 
 func TestAuthRequestPrepareForCacheRouteAndServiceMetadata(t *testing.T) {
@@ -221,7 +262,6 @@ func TestAuthRequestPrepareForCacheNilValues(t *testing.T) {
 		{Hostinfo: &tailcfg.Hostinfo{}},
 		{Hostinfo: &tailcfg.Hostinfo{NetInfo: &tailcfg.NetInfo{}}},
 		{Expiry: &time.Time{}},
-		{Endpoints: []netip.AddrPort{}},
 	} {
 		req := NewRegisterAuthRequest(data)
 		require.NoError(t, req.PrepareForCache())
@@ -273,35 +313,4 @@ func TestPendingRegistrationConfirmation(t *testing.T) {
 	require.NotNil(t, got, "PendingConfirmation must return the stored value")
 	assert.Equal(t, uint(42), got.UserID)
 	assert.Equal(t, "csrf-marker", got.CSRF)
-}
-
-func TestDefaultBatcherWorkersFor(t *testing.T) {
-	tests := []struct {
-		cpuCount int
-		expected int
-	}{
-		{1, 1},   // (1*3)/4 = 0, should be minimum 1
-		{2, 1},   // (2*3)/4 = 1
-		{4, 3},   // (4*3)/4 = 3
-		{8, 6},   // (8*3)/4 = 6
-		{12, 9},  // (12*3)/4 = 9
-		{16, 12}, // (16*3)/4 = 12
-		{20, 15}, // (20*3)/4 = 15
-		{24, 18}, // (24*3)/4 = 18
-	}
-
-	for _, test := range tests {
-		result := DefaultBatcherWorkersFor(test.cpuCount)
-		if result != test.expected {
-			t.Errorf("DefaultBatcherWorkersFor(%d) = %d, expected %d", test.cpuCount, result, test.expected)
-		}
-	}
-}
-
-func TestDefaultBatcherWorkers(t *testing.T) {
-	// Just verify it returns a valid value (>= 1)
-	result := DefaultBatcherWorkers()
-	if result < 1 {
-		t.Errorf("DefaultBatcherWorkers() = %d, expected value >= 1", result)
-	}
 }

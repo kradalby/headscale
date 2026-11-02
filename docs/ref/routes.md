@@ -345,6 +345,19 @@ availability](https://tailscale.com/docs/how-to/set-up-high-availability#subnet-
 This feature is enabled by default when at least two nodes advertise the same prefix. See the configuration options
 `node.routes.ha` in the [configuration file](configuration.md) for details.
 
+For a grant with `via`, subnet failover elects among online routers carrying one of that grant's tags and advertising an
+approved route overlapping the grant's destination. A healthy incumbent keeps the route when another router recovers. If no
+candidate is healthy, an online incumbent retains it; without an online incumbent, the grant provides no subnet route.
+Grants with the same `via` tags share one election per route; grants with different tags elect separately before their
+route contributions are combined. An overlapping grant without `via` uses the ordinary tailnet-wide election instead.
+
+Node and policy changes preserve an eligible incumbent: an election is identified by its `via` tags and route, not by the
+grant's position, so adding, removing or reordering other grants moves no route. A source can match through its Tailscale addresses or
+an advertised-and-approved source subnet. This route selection does not widen the grant's destination or port access.
+
+Exit-node grants use per-node steering, not subnet-primary elections. An approved exit node carrying a matching `via` tag
+remains an exit candidate independently of subnet failover; the client selects its exit node.
+
 ## Troubleshooting
 
 ### Enable IP forwarding

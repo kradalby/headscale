@@ -17,9 +17,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -40,7 +40,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/hscontrol/util/zlog"
 	"github.com/mholt/acmez/v3/acme"
@@ -50,9 +49,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
-	"tailscale.com/util/dnsname"
 )
 
 var (
@@ -103,11 +100,15 @@ type Headscale struct {
 	// Things that generate changes
 	extraRecordMan *dns.ExtraRecordsMan
 	authProvider   AuthProvider
-	mapBatcher     *mapper.Batcher
+	mapHub         *mapper.Hub
 
 	// One per long-poll session, held through its Disconnect cleanup, so
 	// shutdown can close state after waiting on it.
 	clientStreamsOpen sync.WaitGroup
+
+	// beforeMapRequest, for tests, sees each map request before its
+	// session starts.
+	beforeMapRequest atomic.Pointer[func(types.NodeID, tailcfg.MapRequest)]
 }
 
 var (
@@ -141,7 +142,11 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		noisePrivateKey:   noisePrivateKey,
 		clientStreamsOpen: sync.WaitGroup{},
 		state:             s,
+		mapHub:            mapper.NewHub(),
 	}
+
+	// The hub ends a deleted node's sessions; Close stops it.
+	app.mapHub.Watch(s)
 
 	if cfg.DNSConfig.Certificates.Enabled {
 		app.challenges = dns.NewChallenges(
@@ -161,47 +166,23 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 
 	// Initialize ephemeral garbage collector
 	ephemeralGC := db.NewEphemeralGarbageCollector(func(ni types.NodeID) {
-		node, ok := app.state.GetNodeByID(ni)
-		if !ok {
-			// A delete that raced this timer already did its job.
-			log.Debug().Caller().Uint64("node.id", ni.Uint64()).Msg("ephemeral node already deleted, skipping garbage collection")
-
-			return
-		}
-
-		// Re-registering with a permanent key cancels nothing, and the poll
-		// path only cancels for ephemeral nodes, so the old timer still fires.
-		if !node.IsEphemeral() {
-			log.Debug().Caller().EmbedObject(node).Msg("node is no longer ephemeral, skipping garbage collection")
-
-			return
-		}
-
 		// Schedule and Cancel run outside the session transition, so a
 		// disconnecting session can arm a timer after a reconnect already
-		// cancelled it. The session count is authoritative; a stale timer
-		// is dropped and the next disconnect arms a fresh one. Not Online():
-		// an expired node keeps polling while offline.
-		// ponytail: a Connect between this check and DeleteNode still loses
-		// the node; only reachable after a full inactivity timeout. Needs a
-		// delete-if-idle in State if that edge matters.
-		if node.ActiveSessions() > 0 {
-			log.Debug().Caller().EmbedObject(node).Msg("ephemeral node has a live session, skipping garbage collection")
-
-			return
-		}
-
-		changes, err := app.state.DeleteNode(node)
-		app.Change(changes...)
-
+		// cancelled it. State rechecks lifetime and sessions against deletion.
+		deleted, err := app.state.DeleteEphemeralNode(ni)
 		if err != nil {
-			log.Error().Err(err).EmbedObject(node).Msg("ephemeral node deletion failed")
+			log.Error().Err(err).Uint64("node.id", ni.Uint64()).Msg("ephemeral node deletion failed")
 			return
 		}
 
-		log.Debug().Caller().EmbedObject(node).Msg("ephemeral node deleted because garbage collection timeout reached")
+		if deleted {
+			log.Debug().Caller().Uint64("node.id", ni.Uint64()).Msg("ephemeral node deleted because garbage collection timeout reached")
+		}
 	})
 	app.ephemeralGC = ephemeralGC
+
+	// A deleted node's inactivity timer has nothing left to collect.
+	app.state.OnNodeDeleted(ephemeralGC.Cancel)
 
 	var authProvider AuthProvider
 
@@ -228,44 +209,6 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 	}
 
 	app.authProvider = authProvider
-
-	if app.cfg.TailcfgDNSConfig != nil && app.cfg.TailcfgDNSConfig.Proxied { // if MagicDNS
-		// TODO(kradalby): revisit why this takes a list.
-		var magicDNSDomains []dnsname.FQDN
-		if cfg.PrefixV4 != nil {
-			magicDNSDomains = append(
-				magicDNSDomains,
-				util.GenerateIPv4DNSRootDomain(*cfg.PrefixV4)...,
-			)
-		}
-
-		if cfg.PrefixV6 != nil {
-			magicDNSDomains = append(
-				magicDNSDomains,
-				util.GenerateIPv6DNSRootDomain(*cfg.PrefixV6)...,
-			)
-		}
-
-		// we might have routes already from Split DNS
-		if app.cfg.TailcfgDNSConfig.Routes == nil {
-			app.cfg.TailcfgDNSConfig.Routes = make(map[string][]*dnstype.Resolver)
-		}
-
-		for _, d := range magicDNSDomains {
-			// Empty non-nil slice rather than nil: tailcfg.DNSConfig.Clone
-			// and dns.Config.Clone in tailscale drop map entries whose
-			// value is nil (see tailscale.com/tailcfg/tailcfg_clone.go and
-			// tailscale.com/net/dns/dns_clone.go: `if sv == nil { continue }`).
-			// Sending nil here caused the client's wgengine LinkChange:major
-			// handler to clobber /etc/resolv.conf on every tunnel-IP rebind
-			// — the handler reapplies a Clone of lastDNSConfig and the magic
-			// DNS routes vanish, taking the resolver with them for ~6 min
-			// until the next route-changing netmap. Empty slice survives
-			// Clone and carries the same "resolve locally" semantics
-			// ([tailcfg.DNSConfig.Routes] documents the empty-resolver form).
-			app.cfg.TailcfgDNSConfig.Routes[d.WithoutTrailingDot()] = []*dnstype.Resolver{}
-		}
-	}
 
 	if cfg.DERP.ServerEnabled {
 		derpServerKey, err := readOrCreatePrivateKey(cfg.DERP.ServerPrivateKeyPath)
@@ -338,7 +281,8 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 			h.state,
 			h.cfg.Node.Routes.HA,
 			h.cfg.ServerURL,
-			h.mapBatcher.IsConnected,
+			h.mapHub.IsConnected,
+			h.mapHub.Ping,
 		)
 
 		haTicker := time.NewTicker(h.cfg.Node.Routes.HA.ProbeInterval)
@@ -391,21 +335,7 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 			}
 
 		case <-expireTicker.C:
-			var (
-				expiredNodeChanges []change.Change
-				changed            bool
-			)
-
-			lastExpiryCheck, expiredNodeChanges, changed = h.state.ExpireExpiredNodes(lastExpiryCheck)
-
-			if changed {
-				log.Trace().Interface("changes", expiredNodeChanges).Msgf("expiring nodes")
-
-				// Send the changes directly since they're already in the new format
-				for _, nodeChange := range expiredNodeChanges {
-					h.Change(nodeChange)
-				}
-			}
+			lastExpiryCheck, _ = h.state.ExpireExpiredNodes(lastExpiryCheck)
 
 		case <-derpTickerChan:
 			log.Info().Msg("fetching DERPMap updates")
@@ -434,19 +364,15 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 
 			h.state.SetDERPMap(derpMap)
 
-			h.Change(change.DERPMap())
-
 		case records, ok := <-extraRecordsUpdate:
 			if !ok {
 				continue
 			}
 
-			h.cfg.SetExtraRecords(records)
-
-			h.Change(change.ExtraRecords())
+			h.state.SetExtraRecords(records)
 
 		case <-haHealthChan:
-			haProber.ProbeOnce(ctx, h.Change)
+			haProber.ProbeOnce(ctx)
 		}
 	}
 }
@@ -579,7 +505,9 @@ func (h *Headscale) Serve() error {
 	}
 
 	if dumpConfig {
-		spew.Dump(h.cfg)
+		// The served DNS lives in the frozen snapshot; the raw startup
+		// builder no longer carries the MagicDNS reverse routes.
+		spew.Dump(h.state.DebugConfig())
 	}
 
 	versionInfo := types.GetVersionInfo()
@@ -588,10 +516,7 @@ func (h *Headscale) Serve() error {
 		Str("minimum_version", capver.TailscaleVersion(capver.MinSupportedCapabilityVersion)).
 		Msg("Clients with a lower minimum version will be rejected")
 
-	h.mapBatcher = mapper.NewBatcherAndMapper(h.cfg, h.state)
-
-	h.mapBatcher.Start()
-	defer h.mapBatcher.Close()
+	defer h.mapHub.Close()
 
 	if h.cfg.DERP.ServerEnabled {
 		// When embedded DERP is enabled we always need a STUN server
@@ -633,13 +558,13 @@ func (h *Headscale) Serve() error {
 		h.ephemeralGC.Schedule(node.ID(), h.cfg.Node.Ephemeral.InactivityTimeout)
 	}
 
-	if h.cfg.DNSConfig.ExtraRecordsPath != "" {
-		h.extraRecordMan, err = dns.NewExtraRecordsManager(h.cfg.DNSConfig.ExtraRecordsPath)
+	if path := h.state.Snapshot().DNS().ExtraRecordsPath(); path != "" {
+		h.extraRecordMan, err = dns.NewExtraRecordsManager(path)
 		if err != nil {
 			return fmt.Errorf("setting up extrarecord manager: %w", err)
 		}
 
-		h.cfg.SetExtraRecords(h.extraRecordMan.Records())
+		h.state.SetExtraRecords(h.extraRecordMan.Records())
 
 		go h.extraRecordMan.Run()
 		defer h.extraRecordMan.Close()
@@ -691,9 +616,8 @@ func (h *Headscale) Serve() error {
 	// the local unix socket (served without authentication, local trust)
 	// and the remote TCP router (served behind the API-key middleware).
 	humaMux, _ := apiv1.Handler(apiv1.Backend{
-		State:  h.state,
-		Change: h.Change,
-		Cfg:    h.cfg,
+		State: h.state,
+		Cfg:   h.cfg,
 	})
 
 	// The Headscale v2 API. Served behind Basic/Bearer auth on the remote
@@ -701,9 +625,8 @@ func (h *Headscale) Serve() error {
 	// manage OAuth clients through the same v2 keys handler the Tailscale
 	// ecosystem uses.
 	humaV2Mux, _ := apiv2.Handler(apiv2.Backend{
-		State:  h.state,
-		Change: h.Change,
-		Cfg:    h.cfg,
+		State: h.state,
+		Cfg:   h.cfg,
 	})
 
 	// Serve both Huma APIs over the unix socket without TLS or auth: socket
@@ -902,9 +825,7 @@ func (h *Headscale) Serve() error {
 					continue
 				}
 
-				changes, err := h.state.ReloadPolicy()
-				h.Change(changes...)
-
+				err := h.state.ReloadPolicy()
 				if err != nil {
 					log.Error().Err(err).Msgf("reloading policy")
 					continue
@@ -972,11 +893,8 @@ func (h *Headscale) Serve() error {
 					h.challenges.Close() //nolint:contextcheck // each delete has its own bounded context
 				}
 
-				info("closing batcher")
-				h.mapBatcher.Close()
-
-				info("waiting for netmap stream to close")
-				h.clientStreamsOpen.Wait()
+				info("closing map sessions and waiting for stream cleanup")
+				h.DrainMapSessions()
 
 				info("shutting down api server (socket)")
 
@@ -1285,35 +1203,18 @@ func readOrCreatePrivateKey(path string) (*key.MachinePrivate, error) {
 	return &machineKey, nil
 }
 
-// Change is used to send changes to nodes.
-// All change should be enqueued here and empty will be automatically
-// ignored.
-func (h *Headscale) Change(cs ...change.Change) {
-	// Every delete path publishes its removal here; a deleted node's
-	// inactivity timer has nothing left to collect.
-	for _, c := range cs {
-		for _, id := range c.DeletedNodes {
-			h.ephemeralGC.Cancel(id)
-		}
-	}
-
-	h.mapBatcher.AddWork(slices.Concat(cs, h.state.DrainSelfRefreshes())...)
-}
-
 // HTTPHandler returns an [http.Handler] for the [Headscale] control server.
 // The handler serves the Tailscale control protocol including the /key
 // endpoint and /ts2021 Noise upgrade path.
 func (h *Headscale) HTTPHandler() http.Handler {
 	humaMux, _ := apiv1.Handler(apiv1.Backend{
-		State:  h.state,
-		Change: h.Change,
-		Cfg:    h.cfg,
+		State: h.state,
+		Cfg:   h.cfg,
 	})
 
 	humaV2Mux, _ := apiv2.Handler(apiv2.Backend{
-		State:  h.state,
-		Change: h.Change,
-		Cfg:    h.cfg,
+		State: h.state,
+		Cfg:   h.cfg,
 	})
 
 	return h.createRouter(humaMux, humaV2Mux)
@@ -1340,23 +1241,26 @@ func (h *Headscale) SetServerURLForTest(tb testing.TB, url string) {
 	h.cfg.ServerURL = url
 }
 
-// StartBatcherForTest initialises and starts the map response batcher.
-// It registers a cleanup function on tb to stop the batcher and wait for map sessions.
-// It panics when called outside of tests.
-func (h *Headscale) StartBatcherForTest(tb testing.TB) {
+// SetBeforeMapRequestForTest runs fn with each map request, before its
+// session starts, so a test can hold a request back. It registers a cleanup
+// on tb removing fn.
+func (h *Headscale) SetBeforeMapRequestForTest(tb testing.TB, fn func(types.NodeID, tailcfg.MapRequest)) {
 	tb.Helper()
 
-	h.mapBatcher = mapper.NewBatcherAndMapper(h.cfg, h.state)
-	h.mapBatcher.Start()
-	tb.Cleanup(func() {
-		h.mapBatcher.Close()
-		h.clientStreamsOpen.Wait()
-	})
+	h.beforeMapRequest.Store(&fn)
+	tb.Cleanup(func() { h.beforeMapRequest.Store(nil) })
 }
 
-// MapBatcher returns the map response batcher (for test use).
-func (h *Headscale) MapBatcher() *mapper.Batcher {
-	return h.mapBatcher
+// DrainMapSessions stops map streams and waits for their final persistence.
+// Call after stopping request admission and before closing State.
+func (h *Headscale) DrainMapSessions() {
+	h.mapHub.Close()
+	h.clientStreamsOpen.Wait()
+}
+
+// MapHub returns the registry of live map sessions (for test use).
+func (h *Headscale) MapHub() *mapper.Hub {
+	return h.mapHub
 }
 
 // StartEphemeralGCForTest starts the ephemeral node garbage collector.

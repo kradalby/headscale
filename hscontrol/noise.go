@@ -734,8 +734,8 @@ func (ns *noiseServer) sshActionFollowUp(
 // This is the busiest endpoint, as it keeps the HTTP long poll that updates
 // the clients when something in the network changes.
 //
-// The clients POST stuff like [tailcfg.Hostinfo] and their Endpoints here, but
-// only after their first request (marked with the [tailcfg.MapRequest.ReadOnly] field).
+// The clients POST stuff like [tailcfg.Hostinfo] and their Endpoints here in
+// non-streaming updates; streaming requests are read-only (capability 68).
 //
 // At this moment the updates are sent in a quite horrendous way, but they kinda work.
 func (ns *noiseServer) PollNetMapHandler(
@@ -827,6 +827,10 @@ func (ns *noiseServer) PollNetMapHandler(
 	mapRequest.Hostinfo = mapRequest.Hostinfo.Clone()
 	mapRequest.DebugFlags = nil
 
+	if hook := ns.headscale.beforeMapRequest.Load(); hook != nil {
+		(*hook)(nv.ID(), mapRequest)
+	}
+
 	sess := ns.headscale.newMapSession(req.Context(), mapRequest, writer, nv.AsStruct())
 	sess.log.Trace().Caller().Msg("a node sending a MapRequest with Noise protocol")
 
@@ -867,7 +871,9 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	nv, ok := ns.headscale.state.GetNodeByNodeKey(setDNS.NodeKey)
+	snap := ns.headscale.state.Snapshot()
+
+	nv, ok := snap.GetNodeByNodeKey(setDNS.NodeKey)
 	if !ok {
 		httpError(writer, NewHTTPError(http.StatusNotFound, "node not found", errNodeNotInStore))
 
@@ -881,7 +887,7 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	name, err := validateSetDNS(setDNS, nv, ns.headscale.cfg)
+	name, err := validateSetDNS(setDNS, nv, snap.DNS())
 	if err != nil {
 		httpError(writer, err)
 
@@ -922,12 +928,12 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 // machine key and the client's LocalAPI forwards any name and value, so
 // this is what stops a node from writing arbitrary records into the
 // operator's zone.
-func validateSetDNS(req tailcfg.SetDNSRequest, nv types.NodeView, cfg *types.Config) (string, error) {
+func validateSetDNS(req tailcfg.SetDNSRequest, nv types.NodeView, dns types.DNSView) (string, error) {
 	if nv.IsExpired() {
 		return "", NewHTTPError(http.StatusForbidden, "node is expired", nil)
 	}
 
-	domain, ok := nv.CertDomain(cfg)
+	domain, ok := nv.CertDomain(dns)
 	if !ok {
 		return "", NewHTTPError(http.StatusForbidden, "node has no certificate name", nil)
 	}
@@ -1059,7 +1065,7 @@ func (ns *noiseServer) RegistrationHandler(
 // means the node is gone and its client should re-authenticate.
 var errNodeNotInStore = errors.New("node not found")
 
-// getAndValidateNode retrieves the node from the in-memory NodeStore using the
+// getAndValidateNode retrieves the node from the latest snapshot using the
 // NodeKey and validates that it matches the MachineKey from the Noise session.
 func (ns *noiseServer) getAndValidateNode(mapRequest tailcfg.MapRequest) (types.NodeView, error) {
 	nv, ok := ns.headscale.state.GetNodeByNodeKey(mapRequest.NodeKey)

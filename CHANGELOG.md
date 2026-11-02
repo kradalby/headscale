@@ -84,6 +84,55 @@ clients, and how to run the same setup without Nix.
 the ACME DNS-01 challenge through a built-in DNS provider: `acmedns`,
 `cloudflare`, `gigahost`, `hetzner`, `powerdns` or `rfc2136`. `dns.base_domain` must be a public domain you control. [#3554](https://github.com/juanfont/headscale/pull/3554)
 
+### Control plane scales with what changes, not tailnet size
+
+A change now reaches only the nodes that see it, and costs about what those
+nodes are sent: an endpoint update, a join or a policy edit no longer
+reworks every node's map, and a change no node sees costs almost nothing.
+Policy recompiles reuse what a node change cannot reach, connected nodes
+that see the same peers share one copy of them, and a peer is encoded once
+for every map that carries it. Node writes no longer wait to be batched
+except during an HA subnet route outage, which is what
+`tuning.node_store_batch_timeout` and `tuning.node_store_batch_size` now
+bound. Large tailnets use less CPU and memory, and joins and failovers
+reach clients sooner.
+`HEADSCALE_DEBUG_POLICY_AUDIT=1` checks every policy recompile against a
+compile from scratch and logs any difference. A changed policy document's tests run
+against the users and nodes it is published with; if those change while the
+tests run, the write is tested again, up to three times, the last time
+holding other writes until the tests finish.
+Setting or reloading the byte-identical live document skips compilation and its
+`tests`/`sshTests`, even if changed users or nodes would now make them fail.
+Use `headscale policy check --file policy.json` to explicitly revalidate against
+the running server's current users and nodes without publishing a change.
+`headscale policy set --bypass-server-and-access-database-directly` now evaluates
+the document's `tests`/`sshTests` and one node's SSH rules against the persisted
+users and nodes before storing it, as the running server's set does, and refuses
+unless the configured unix socket shows no headscale runs; `--force` does not
+override that refusal. `policy get` and `policy check` keep their read-only
+bypass behaviour against a running server.
+
+[#37](https://github.com/kradalby/headscale/pull/37)
+
+### Via-scoped subnet failover elects live routers
+
+Subnet failover for a grant with `via` now elects from the routers that are
+actually serving: an online, healthy router carrying one of the grant's tags
+and advertising an approved route overlapping the grant's destination. A healthy
+incumbent keeps the route when another router recovers, and the route moves
+when the incumbent goes offline; with no online incumbent and no healthy
+candidate, the grant provides no subnet route. Grants with different `via`
+tags elect separately before their route contributions are combined, so one
+group's failure no longer cancels another group's authorization, and exit-node
+grants steer per node instead of entering the subnet election. A grant source
+can match through an advertised-and-approved source subnet as well as its
+Tailscale addresses; the selection does not widen the grant's destination or
+port access. An election is identified by its `via` tags and route, so a policy
+edit that keeps both keeps the healthy incumbent.
+See [the routes reference](docs/ref/routes.md) for the failover rules.
+
+[#44](https://github.com/kradalby/headscale/pull/44)
+
 ### BREAKING
 
 #### Database
@@ -109,6 +158,14 @@ the ACME DNS-01 challenge through a built-in DNS provider: `acmedns`,
 - `tls_cert_path`, `tls_key_path`, `tls_letsencrypt_*`, `acme_url` and `acme_email` are deprecated in favour of `tls.cert_path`, `tls.key_path` and `tls.acme.*` [#3554](https://github.com/juanfont/headscale/pull/3554)
   - The old keys continue to work, with a warning, but will be removed in a future release
 - Headscale's own ACME certificate is managed by CertMagic instead of autocert; the first start registers a new ACME account and obtains a new certificate in `tls.acme.cache_dir`, which now defaults to `/var/lib/headscale/cache` [#3554](https://github.com/juanfont/headscale/pull/3554)
+- `tuning.batcher_workers`, `tuning.notifier_send_timeout` and `tuning.node_mapsession_buffered_chan_size` have no effect and log a deprecation warning when set [#37](https://github.com/kradalby/headscale/pull/37)
+
+#### Observability
+
+- The `headscale_nodestore_*` metrics are removed. `headscale_world_nodes` replaces `headscale_nodestore_nodes`, `headscale_world_commits_total` counts published graph transactions after the initial snapshot (including DNS/DERP changes; transactions that stage no edit, refusals and panicking batches are excluded, and a panicking batch's surviving write-by-write retries each count separately), and `headscale_world_write_batch_size` records completed node batch sizes (including batches that stage no edit). A changed node batch counts as one graph transaction; neither metric proves database persistence or client delivery [#37](https://github.com/kradalby/headscale/pull/37)
+- `headscale_mapper_changes_dropped_total` is removed: each map session renders from the latest state, so no change is dropped [#37](https://github.com/kradalby/headscale/pull/37)
+- `headscale_mapresponse_generated_total` counts the responses rendered for each session, by response type, instead of each change once [#37](https://github.com/kradalby/headscale/pull/37)
+- New: `headscale_policy_compiles_total` by result (the graph's compiles at boot and on each change to the document, the users, or a node field the policy reads, published or refused; a document refused before it reaches the graph, a write's test candidate and the audit's compile are not counted), `headscale_world_commit_panics_total` and `headscale_graph_map_log_misses_total` [#37](https://github.com/kradalby/headscale/pull/37)
 
 #### CLI
 
@@ -137,6 +194,8 @@ the ACME DNS-01 challenge through a built-in DNS provider: `acmedns`,
 - A registration request from a client below the minimum supported version is now rejected before it can log a node out, use a pre-auth key or start a login [#3519](https://github.com/juanfont/headscale/pull/3519)
 
 - A node re-registering with a spent, expired or revoked pre-auth key is now rejected if it expired or changed node key while the re-registration was in flight [#3525](https://github.com/juanfont/headscale/pull/3525)
+- An expired node — including a tagged node expired by an admin — now requires fresh, valid authorization before it can re-register: restarting with the node's own spent, expired or revoked key no longer resumes the old authorization, and a different credential must be valid to change tags or ephemeral lifetime [#43](https://github.com/kradalby/headscale/pull/43)
+- A logout or non-streaming map request that still resolves to its node after a reauthentication replaced the node key is rejected instead of modifying the newer registration; the logout reaches the client as an error. A logout whose key no longer resolves starts a fresh registration instead [#43](https://github.com/kradalby/headscale/pull/43)
 - DERP client verification (the embedded DERP server and the `/verify` endpoint) looks up the node key directly instead of scanning every node on each connection [#3520](https://github.com/juanfont/headscale/pull/3520)
 - Renaming a node now stores the name in lowercase; a node renamed with uppercase letters before gets no certificate name until it is renamed again [#3554](https://github.com/juanfont/headscale/pull/3554)
 - Add `dns.certificates.enabled` and `dns.certificates.zone` to let nodes get TLS certificates [#3554](https://github.com/juanfont/headscale/pull/3554)
@@ -153,6 +212,12 @@ the ACME DNS-01 challenge through a built-in DNS provider: `acmedns`,
 - Improve config and bind-failure errors: every violation reported in one pass, named YAML keys, actionable operator hints [#3236](https://github.com/juanfont/headscale/pull/3236)
 - Ephemeral nodes that register but never connect are removed after `node.ephemeral.inactivity_timeout` instead of staying until restart [#3545](https://github.com/juanfont/headscale/pull/3545)
 - A node re-registered with a permanent key is no longer deleted by a timer armed while it was ephemeral [#3545](https://github.com/juanfont/headscale/pull/3545)
+- Streaming map requests no longer update the node's Hostinfo, endpoints or disco key, as Tailscale capability version 68 specifies; Tailscale clients report these in a separate update, which is applied. A stream delivered after a newer update no longer rolls the node back to its older state [#37](https://github.com/kradalby/headscale/pull/37)
+- Every endpoint change a node reports reaches its peers, STUN-only ones included. Peers are rendered from the stored node, so the stored endpoints are what they get; withholding STUN-only additions, as 0.29 did, would need endpoint types stored alongside them [#37](https://github.com/kradalby/headscale/pull/37)
+- A user created or renamed so that a policy's `user@` name matches several users no longer fails the user write or the boot: that name grants nothing, every other entry (other members of its groups included) still applies, and a warning names it. Setting a policy that names such a user is still refused, now in grants too [#37](https://github.com/kradalby/headscale/pull/37)
+- Peers are rendered for at most the server's current capability version, so a client newer than the server sees each peer's `Cap` as the server's current version, not its own [#37](https://github.com/kradalby/headscale/pull/37)
+- MagicDNS reverse zones for IPv4 prefixes whose configured address has host bits set, and for IPv6 prefixes whose mask is not nibble-aligned, are enumerated from the masked prefix, so tailnets with such custom prefixes advertise the correct set of reverse zones [#40](https://github.com/kradalby/headscale/pull/40)
+- Split-DNS zones with an empty resolver list are now sent as an empty route — handled by the client's built-in resolver — instead of `null` [#40](https://github.com/kradalby/headscale/pull/40)
 
 ## 0.29.7 (2026-10-30)
 
@@ -344,7 +409,7 @@ named sources and destinations and cover the whole policy — both `acls` and `g
 contribute. They run on user-initiated writes via `headscale policy set`, on SIGHUP reload
 (`systemctl reload headscale` / `kill -HUP $(pidof headscale)`), and on `headscale policy check`.
 A failing test rejects the write before it is applied, with the same error message Tailscale SaaS
-would return for the same policy.
+would return for the same policy. Tests run against the users and nodes the policy is published with.
 
 At boot a stored policy whose tests no longer pass — for example because a referenced user was
 deleted while the server was offline — logs a warning and the server keeps running. Fix the
@@ -363,7 +428,7 @@ reach any destination, and `check` requires reachability specifically through a 
 rule. Tests run on `headscale policy set`, on SIGHUP reload (`systemctl reload headscale` /
 `kill -HUP $(pidof headscale)`), and on `headscale policy check`. A failing test rejects the
 write before it is applied, with the same error message Tailscale SaaS would return for the same
-policy.
+policy. Tests run against the users and nodes the policy is published with.
 
 At boot a stored policy whose sshTests no longer pass — for example because a referenced user was
 deleted while the server was offline — logs a warning and the server keeps running. Fix the

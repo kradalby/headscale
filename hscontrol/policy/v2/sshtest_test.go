@@ -1,13 +1,13 @@
 package v2
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/util/multierr"
 )
 
 // sshTestUsers/sshTestNodes are reused across the table below to keep
@@ -83,10 +83,8 @@ func sshTestNodes(users types.Users) types.Nodes {
 }
 
 // TestRunSSHTests covers the engine's per-test outcome reporting. Each
-// row constructs a PolicyManager (whose SetPolicy sandbox also exercises
-// evaluateSSHTests) and asserts on the resulting RunSSHTests behaviour.
-// SetPolicy gating is exercised separately in
-// TestSetPolicyRejectsFailingSSHTests below.
+// row constructs a PolicyManager and asserts on the resulting RunSSHTests
+// behaviour.
 func TestRunSSHTests(t *testing.T) {
 	users := sshTestUsers()
 	nodes := sshTestNodes(users)
@@ -813,108 +811,12 @@ func TestRunSSHTestsBothTestsPassSSHTestsFail(t *testing.T) {
 		"ACL test sentinel must not appear on SSH-only failure")
 }
 
-// TestSetPolicyRejectsFailingSSHTests asserts SetPolicy is the user-write
-// boundary: a policy whose sshTests fail is rejected without mutating
-// the live PolicyManager. SSHPolicy() output must remain the prior
-// rules.
-func TestSetPolicyRejectsFailingSSHTests(t *testing.T) {
-	users := sshTestUsers()
-	nodes := sshTestNodes(users)
-
-	good := `{
-		"tagOwners": { "tag:server": ["alice@headscale.net"] },
-		"ssh": [{
-			"action": "accept",
-			"src":    ["alice@headscale.net"],
-			"dst":    ["tag:server"],
-			"users":  ["root"]
-		}],
-		"sshTests": [{
-			"src":    "alice@headscale.net",
-			"dst":    ["tag:server"],
-			"accept": ["root"]
-		}]
-	}`
-
-	bad := `{
-		"tagOwners": { "tag:server": ["alice@headscale.net"] },
-		"ssh": [{
-			"action": "accept",
-			"src":    ["alice@headscale.net"],
-			"dst":    ["tag:server"],
-			"users":  ["root"]
-		}],
-		"sshTests": [{
-			"src":    "bob@headscale.net",
-			"dst":    ["tag:server"],
-			"accept": ["root"]
-		}]
-	}`
-
-	pm, err := NewPolicyManager([]byte(good), users, nodes.ViewSlice())
-	require.NoError(t, err)
-
-	// Snapshot SSHPolicy output for alice-laptop before the rejected
-	// write — the live PolicyManager state must still describe the
-	// previous (good) rules afterwards. JSON-marshal the snapshot so
-	// the comparison sees rule content, not just object identity: a
-	// hypothetical mutation that preserves the slice length but
-	// rewrites principals or SSHUsers would slip past a count-only
-	// assertion.
-	aliceView := nodes.ViewSlice().At(0)
-
-	beforePol, err := pm.SSHPolicy("", aliceView)
-	require.NoError(t, err)
-
-	beforeJSON, err := json.Marshal(beforePol)
-	require.NoError(t, err)
-
-	changed, err := pm.SetPolicy([]byte(bad))
-	require.Error(t, err, "SetPolicy must reject a policy whose sshTests fail")
-	require.False(t, changed, "SetPolicy must report no change when rejected")
-	require.ErrorIs(t, err, errSSHPolicyTestsFailed)
-	require.Contains(t, err.Error(), "expected ALLOWED")
-
-	afterPol, err := pm.SSHPolicy("", aliceView)
-	require.NoError(t, err)
-
-	afterJSON, err := json.Marshal(afterPol)
-	require.NoError(t, err)
-
-	require.JSONEq(t, string(beforeJSON), string(afterJSON),
-		"live SSH policy must not change after a rejected SetPolicy")
-}
-
-// TestSetPolicyAggregatesACLAndSSHTestFailures exercises the multierr
-// aggregation: when both layers fail, the returned error wraps both
+// TestTestFailuresAggregate exercises the multierr aggregation the write
+// boundary applies: when both layers fail, the joined error wraps both
 // sentinels so operators see every failure in a single round trip.
-func TestSetPolicyAggregatesACLAndSSHTestFailures(t *testing.T) {
+func TestTestFailuresAggregate(t *testing.T) {
 	users := sshTestUsers()
 	nodes := sshTestNodes(users)
-
-	good := `{
-		"tagOwners": { "tag:server": ["alice@headscale.net"] },
-		"acls": [{
-			"action": "accept",
-			"src":    ["alice@headscale.net"],
-			"dst":    ["tag:server:22"]
-		}],
-		"ssh": [{
-			"action": "accept",
-			"src":    ["alice@headscale.net"],
-			"dst":    ["tag:server"],
-			"users":  ["root"]
-		}],
-		"tests": [{
-			"src":    "alice@headscale.net",
-			"accept": ["tag:server:22"]
-		}],
-		"sshTests": [{
-			"src":    "alice@headscale.net",
-			"dst":    ["tag:server"],
-			"accept": ["root"]
-		}]
-	}`
 
 	// Both blocks fail: acls only allow alice but tests assert bob;
 	// ssh only allows alice but sshTests assert bob.
@@ -942,10 +844,10 @@ func TestSetPolicyAggregatesACLAndSSHTestFailures(t *testing.T) {
 		}]
 	}`
 
-	pm, err := NewPolicyManager([]byte(good), users, nodes.ViewSlice())
+	pm, err := NewPolicyManager([]byte(bad), users, nodes.ViewSlice())
 	require.NoError(t, err)
 
-	_, err = pm.SetPolicy([]byte(bad))
+	err = multierr.New(pm.RunTests(), pm.RunSSHTests())
 	require.Error(t, err)
 	require.ErrorIs(t, err, errPolicyTestsFailed,
 		"aggregated error must wrap the ACL test sentinel")
@@ -987,9 +889,8 @@ func TestNewPolicyManagerWarnsOnSSHTestsFailure(t *testing.T) {
 	require.NoError(t, err, "boot must not error on sshTests failure")
 	require.NotNil(t, pm)
 
-	// A subsequent SetPolicy of the same body must reject — that's
-	// the user-write path.
-	_, err = pm.SetPolicy([]byte(stale))
+	// The write boundary runs the sshTests and must reject the same body.
+	err = pm.RunSSHTests()
 	require.Error(t, err)
 	require.ErrorIs(t, err, errSSHPolicyTestsFailed)
 }

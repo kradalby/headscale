@@ -177,9 +177,9 @@ func TestPolicyCheckCommand(t *testing.T) {
 
 					cmd := []string{"headscale", "policy", "check", "-f", policyFilePath} //nolint:goconst // CLI invocation
 					if tt.bypass {
-						// --force suppresses the "is the server running?"
-						// confirmation prompt so the command can run
-						// non-interactively under the test harness.
+						// --force suppresses the confirmation prompt so
+						// the command can run non-interactively under the
+						// test harness.
 						cmd = append(cmd, "--bypass-server-and-access-database-directly", "--force")
 					}
 

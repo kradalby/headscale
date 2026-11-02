@@ -71,11 +71,15 @@ type AuthProviderOIDC struct {
 	serverURL string
 	cfg       *types.OIDCConfig
 
+	// authCache holds auth information between the auth and the callback
+	// steps, keyed by OIDC state. Admission refuses new state at capacity
+	// instead of evicting; reads use Peek to preserve insertion order, so the
+	// oldest entry expires first.
+	authCache *expirable.LRU[string, AuthInfo]
+
 	// authCacheMu serializes non-evicting admission and single-use consumption.
-	// Reads use Peek to preserve insertion order, so the oldest entry expires first.
 	authCacheMu            sync.Mutex
 	authCacheRegistrations atomic.Int64
-	authCache              *expirable.LRU[string, AuthInfo]
 
 	oidcProvider *oidc.Provider
 	oauth2Config *oauth2.Config
@@ -236,6 +240,8 @@ func (a *AuthProviderOIDC) authHandler(
 
 	extras = append(extras, oidc.Nonce(nonce))
 
+	// Cache the registration info; a full cache refuses rather than
+	// evicting a live session to admit another.
 	if !a.addAuthInfoToState(state, registrationInfo) {
 		writer.Header().Set("Retry-After", "10")
 		httpUserError(writer, NewHTTPError(http.StatusServiceUnavailable, "too many pending OIDC logins, try again later", nil))
@@ -281,13 +287,16 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 	}
 
 	// A cookie-bound callback spends its state even if authentication fails;
-	// retrying then requires a fresh login flow rather than reusing the callback.
+	// retrying then requires a fresh login flow rather than reusing the
+	// callback, and a failed exchange must release the pending-state slot.
 	authInfo := a.getAuthInfoFromState(state)
 	if authInfo == nil {
 		httpUserError(writer, NewHTTPError(http.StatusGone, "login session expired, try again", nil))
 		return
 	}
 
+	// A provider-reported failure spends the callback's state too; the
+	// provider's own description is not echoed to the browser.
 	if req.URL.Query().Get("error") != "" {
 		httpUserError(writer, NewHTTPError(http.StatusForbidden, "OIDC authentication failed", nil))
 		return
@@ -470,7 +479,10 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 	}
 }
 
-// mergeEmailClaims keeps each verification flag with the address it describes.
+// mergeEmailClaims keeps each verification flag with the address it
+// describes: the id-token flag only certifies the id-token address, and the
+// userinfo flag only certifies the userinfo address. A different address
+// takes its own flag; the same address takes either.
 func mergeEmailClaims(
 	claims *types.OIDCClaims,
 	userinfo *types.OIDCUserInfo,
@@ -501,6 +513,8 @@ func extractCodeAndStateParamFromRequest(
 	code := query.Get("code")
 	state := query.Get("state")
 
+	// A provider-reported error arrives without a code; it is consumed as
+	// the callback's own failure, so only a request with neither is empty.
 	if (code == "" && query.Get("error") == "") || state == "" {
 		return "", "", NewHTTPError(http.StatusBadRequest, "missing code or state parameter", errEmptyOIDCCallbackParams)
 	}
@@ -651,6 +665,23 @@ func doOIDCAuthorization(
 	return nil
 }
 
+// getAuthInfoFromState retrieves and consumes the auth info for a state. The
+// entry is removed on read so a state is single-use: a replayed callback cannot
+// resolve the same auth session twice, even within the cache TTL.
+func (a *AuthProviderOIDC) getAuthInfoFromState(state string) *AuthInfo {
+	a.authCacheMu.Lock()
+	defer a.authCacheMu.Unlock()
+
+	authInfo, ok := a.authCache.Peek(state)
+	a.authCache.Remove(state)
+
+	if !ok {
+		return nil
+	}
+
+	return &authInfo
+}
+
 func (a *AuthProviderOIDC) addAuthInfoToState(state string, info AuthInfo) bool {
 	a.authCacheMu.Lock()
 	defer a.authCacheMu.Unlock()
@@ -687,33 +718,10 @@ func (a *AuthProviderOIDC) addAuthInfoToState(state string, info AuthInfo) bool 
 	return true
 }
 
-// getAuthInfoFromState retrieves and consumes the auth info for a state. The
-// entry is removed on read so a state is single-use: a replayed callback cannot
-// resolve the same auth session twice, even within the cache TTL.
-func (a *AuthProviderOIDC) getAuthInfoFromState(state string) *AuthInfo {
-	a.authCacheMu.Lock()
-	defer a.authCacheMu.Unlock()
-
-	authInfo, ok := a.authCache.Peek(state)
-	a.authCache.Remove(state)
-
-	if !ok {
-		return nil
-	}
-
-	return &authInfo
-}
-
 func (a *AuthProviderOIDC) createOrUpdateUserFromClaim(
 	claims *types.OIDCClaims,
 ) (*types.User, error) {
-	var (
-		user    *types.User
-		err     error
-		newUser bool
-	)
-
-	user, err = a.h.state.GetUserByOIDCIdentifier(claims.Identifier())
+	user, err := a.h.state.GetUserByOIDCIdentifier(claims.Identifier())
 	if err != nil && !errors.Is(err, db.ErrUserNotFound) {
 		return nil, fmt.Errorf("creating or updating user: %w", err)
 	}
@@ -721,26 +729,28 @@ func (a *AuthProviderOIDC) createOrUpdateUserFromClaim(
 	// if the user is still not found, create a new empty user.
 	// TODO(kradalby): This context is not inherited from the request, which is probably not ideal.
 	// However, we need a context to use the OIDC provider.
-	if user == nil {
-		newUser = true
+	newUser := user == nil
+	if newUser {
 		user = &types.User{}
 	}
 
 	user.FromClaim(claims, a.cfg.EmailVerifiedRequired)
 
 	if newUser {
-		user, _, err = a.h.state.CreateUser(*user)
+		user, err = a.h.state.CreateUser(*user)
 		if err != nil {
 			return nil, fmt.Errorf("creating user: %w", err)
 		}
-	} else {
-		_, _, err = a.h.state.UpdateUser(types.UserID(user.ID), func(u *types.User) error {
-			*u = *user
-			return nil
-		})
-		if err != nil {
-			return nil, fmt.Errorf("updating user: %w", err)
-		}
+
+		return user, nil
+	}
+
+	_, err = a.h.state.UpdateUser(types.UserID(user.ID), func(u *types.User) error {
+		*u = *user
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("updating user: %w", err)
 	}
 
 	return user, nil
@@ -1059,15 +1069,13 @@ func (a *AuthProviderOIDC) handleRegistration(
 	registrationID types.AuthID,
 	expiry *time.Time,
 ) (bool, error) {
-	node, nodeChange, err := a.h.state.HandleNodeFromAuthPath(
+	node, err := a.h.state.HandleNodeFromAuthPath(
 		registrationID,
 		types.UserID(user.ID),
 		expiry,
 		util.RegisterMethodOIDC,
 	)
 	if err != nil {
-		a.h.Change(nodeChange)
-
 		if errors.Is(err, types.ErrHostinfoTooLarge) {
 			return false, newHTTPUserError(http.StatusBadRequest, "node report too large",
 				"This device reports too much data. Ask your administrator to reduce its reported metadata, then sign in again.", err)
@@ -1087,16 +1095,14 @@ func (a *AuthProviderOIDC) handleRegistration(
 	// ensure we send an update.
 	// This works, but might be another good candidate for doing some sort of
 	// eventbus.
-	routesChange, err := a.h.state.AutoApproveRoutes(node)
-
-	// Send both changes. Empty changes are ignored by Change().
-	a.h.Change(nodeChange, routesChange)
-
+	err = a.h.state.AutoApproveRoutes(node)
 	if err != nil {
 		return false, fmt.Errorf("auto approving routes: %w", err)
 	}
 
-	return !nodeChange.IsEmpty(), nil
+	// Every registration that gets here registered or re-authenticated a
+	// node the client is waiting on.
+	return true, nil
 }
 
 func renderRegistrationSuccessTemplate(

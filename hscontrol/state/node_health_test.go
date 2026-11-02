@@ -1,6 +1,7 @@
 package state
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -9,22 +10,43 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestScanNodeHealthUsesFrozenDNSDomain(t *testing.T) {
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+	cfg.BaseDomain = strings.Repeat("b", 200) + ".example.com"
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(t, err)
+
+	user := database.CreateUserForTest("scan-user")
+	node := database.CreateRegisteredNodeForTest(user, "scan-node")
+	require.NoError(t, database.DB.Model(&types.Node{}).Where("id = ?", node.ID).
+		Update("given_name", strings.Repeat("a", 63)).Error)
+	require.NoError(t, database.Close())
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	cfg.BaseDomain = "changed.test"
+
+	findings := s.scanNodeHealth()
+	require.Len(t, findings, 1)
+	require.Equal(t, node.ID, findings[0].nodeID)
+}
+
 func TestGivenNameMapsToValidFQDNCheck(t *testing.T) {
 	cfg := &types.Config{BaseDomain: "example.com"}
 
-	_, _, ok := givenNameMapsToValidFQDN.check((&types.Node{ID: 1, GivenName: "valid"}).View(), cfg)
+	_, _, ok := givenNameMapsToValidFQDN.check((&types.Node{ID: 1, GivenName: "valid"}).View(), cfg.DNSView())
 	require.True(t, ok, "a valid given name must pass the check")
 
-	problem, fixHint, ok := givenNameMapsToValidFQDN.check((&types.Node{ID: 7, GivenName: ""}).View(), cfg)
+	problem, fixHint, ok := givenNameMapsToValidFQDN.check((&types.Node{ID: 7, GivenName: ""}).View(), cfg.DNSView())
 	require.False(t, ok, "an empty given name must fail the check")
 	require.NotEmpty(t, problem)
 	require.Contains(t, fixHint, "rename 7", "fix hint must name the offending node")
 }
 
 func TestExpiryIsEncodableCheck(t *testing.T) {
-	cfg := &types.Config{}
-
-	_, _, ok := expiryIsEncodable.check((&types.Node{ID: 1}).View(), cfg)
+	_, _, ok := expiryIsEncodable.check((&types.Node{ID: 1}).View(), types.DNSView{})
 	require.True(t, ok, "a node without expiry must pass the check")
 
 	earliest := time.Date(0, time.January, 1, 0, 0, 0, 0, time.UTC)
@@ -40,7 +62,7 @@ func TestExpiryIsEncodableCheck(t *testing.T) {
 		{latest.Add(time.Second), false},
 	} {
 		node := &types.Node{ID: 7, Expiry: &tt.expiry}
-		problem, fixHint, ok := expiryIsEncodable.check(node.View(), cfg)
+		problem, fixHint, ok := expiryIsEncodable.check(node.View(), types.DNSView{})
 		require.Equal(t, tt.ok, ok, "expiry %s", tt.expiry)
 
 		if !ok {
@@ -98,17 +120,15 @@ func TestScanNodeHealthReportsInvalidNameWithoutMutating(t *testing.T) {
 }
 
 // TestBatchSetNodeHealthUnchangedSkipsWrite ensures asking for the health
-// value already stored publishes no snapshot — no peersFunc invocation, no
-// peer-map rebuild.
+// value already stored commits nothing, so no map stream wakes for it.
 func TestBatchSetNodeHealthUnchangedSkipsWrite(t *testing.T) {
 	_, s, nodeID := persistTestSetup(t)
 	t.Cleanup(func() { _ = s.Close() })
 
-	// Use the State's nodeStore directly to confirm the node exists.
-	_, exists := s.nodeStore.GetNode(nodeID)
+	_, exists := s.GetNodeByID(nodeID)
 	require.True(t, exists)
 
-	initialSnapshot := s.nodeStore.data.Load()
+	rev := s.Snapshot().Rev()
 
 	// The node starts with Unhealthy=false. Asking for "healthy=true"
 	// means Unhealthy stays false — no change.
@@ -116,7 +136,7 @@ func TestBatchSetNodeHealthUnchangedSkipsWrite(t *testing.T) {
 		changed := s.BatchSetNodeHealth(map[types.NodeID]bool{nodeID: true})
 		require.False(t, changed,
 			"unchanged health write must not report a route-primary change")
-		require.Same(t, initialSnapshot, s.nodeStore.data.Load(),
+		require.Equal(t, rev, s.Snapshot().Rev(),
 			"unchanged health write must not publish a new snapshot")
 	}
 }

@@ -12,7 +12,6 @@ import (
 	"go4.org/netipx"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
-	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/views"
 	"tailscale.com/util/set"
 )
@@ -107,7 +106,7 @@ func resolveViaDestinations(
 			continue
 		}
 
-		ips, err := d.Resolve(pol, users, nodes)
+		ips, err := pol.resolveAlias(d, users, nodes)
 		if err != nil || ips == nil {
 			continue
 		}
@@ -119,9 +118,7 @@ func resolveViaDestinations(
 }
 
 // userNodeIndex maps user IDs to their untagged nodes. Built once per
-// policy or node-set change and read from many goroutines under
-// [PolicyManager.mu]; readers must hold the lock (or the snapshot
-// returned to them).
+// policy or node-set change and shared by readers of that immutable compile.
 type userNodeIndex map[uint][]types.NodeView
 
 func buildUserNodeIndex(
@@ -149,6 +146,20 @@ func (pol *Policy) compileNodeAttrs(
 	users types.Users,
 	nodes views.Slice[types.NodeView],
 ) (map[types.NodeID]tailcfg.NodeCapMap, error) {
+	return pol.compileNodeAttrsFrom(nil, nil, users, nodes)
+}
+
+// compileNodeAttrsFrom is [Policy.compileNodeAttrs] reusing prev, the
+// result of a compile of the same document and users over prevNodes, for
+// every node whose record did not change: a node's attributes follow only
+// from itself once the document and users are fixed. prev is nil to
+// compile every node.
+func (pol *Policy) compileNodeAttrsFrom(
+	prev map[types.NodeID]tailcfg.NodeCapMap,
+	prevNodes map[types.NodeID]types.NodeView,
+	users types.Users,
+	nodes views.Slice[types.NodeView],
+) (map[types.NodeID]tailcfg.NodeCapMap, error) {
 	empty := map[types.NodeID]tailcfg.NodeCapMap{}
 
 	if pol == nil {
@@ -159,66 +170,77 @@ func (pol *Policy) compileNodeAttrs(
 		return empty, nil
 	}
 
-	result := make(map[types.NodeID]tailcfg.NodeCapMap)
-	stamp := func(id types.NodeID, attr nodecap.Cap) {
-		capMap, ok := result[id]
-		if !ok {
-			capMap = tailcfg.NodeCapMap{}
-			result[id] = capMap
-		}
-
-		// nil [tailcfg.RawMessage] matches the wire format from a
-		// Tailscale-hosted control plane: capabilities without companion
-		// data marshal as null rather than []. Storing nil keeps the
-		// merge stable and lets the compat test diff cleanly against
-		// captured netmaps.
-		if _, exists := capMap[attr]; !exists {
-			capMap[attr] = nil
-		}
+	type target struct {
+		ips   ResolvedAddresses
+		attrs []nodecap.Cap
 	}
 
-	// Cache each node's IPs once per call. Without the cache, the
-	// node-attr inner loop would call [types.NodeView.IPs] once per attr
-	// per node — O(grants × nodes) allocations of a 2-element slice
-	// for what is invariant per node within a single policy compile.
-	type nodeIPs struct {
-		id  types.NodeID
-		ips []netip.Addr
-	}
-
-	nodeList := make([]nodeIPs, 0, nodes.Len())
-	for _, n := range nodes.All() {
-		nodeList = append(nodeList, nodeIPs{id: n.ID(), ips: n.IPs()})
-	}
-
-	if pol.RandomizeClientPort {
-		for _, ni := range nodeList {
-			stamp(ni.id, nodecap.RandomizeClientPort)
-		}
-	}
+	// Every target resolves, so a compile fails on the same target as one
+	// from scratch.
+	targets := make([]target, 0, len(pol.NodeAttrs))
 
 	for _, na := range pol.NodeAttrs {
 		if len(na.Attrs) == 0 {
 			continue
 		}
 
-		resolved, err := na.Targets.Resolve(pol, users, nodes)
+		resolved, err := pol.resolveAliases(na.Targets, users, nodes)
 		if err != nil {
 			return nil, fmt.Errorf("nodeAttrs target %s: %w", na.Targets, err)
 		}
 
-		if resolved == nil {
+		if resolved != nil {
+			targets = append(targets, target{ips: resolved, attrs: na.Attrs})
+		}
+	}
+
+	// capsFor stamps n's attributes in policy order. nil
+	// [tailcfg.RawMessage] matches the wire format from a Tailscale-hosted
+	// control plane: capabilities without companion data marshal as null
+	// rather than [].
+	capsFor := func(n types.NodeView) tailcfg.NodeCapMap {
+		var capMap tailcfg.NodeCapMap
+
+		stamp := func(attr nodecap.Cap) {
+			if capMap == nil {
+				capMap = tailcfg.NodeCapMap{}
+			}
+
+			if _, exists := capMap[attr]; !exists {
+				capMap[attr] = nil
+			}
+		}
+
+		if pol.RandomizeClientPort {
+			stamp(nodecap.RandomizeClientPort)
+		}
+
+		ips := n.IPs()
+
+		for _, t := range targets {
+			if slices.ContainsFunc(ips, t.ips.Contains) {
+				for _, attr := range t.attrs {
+					stamp(attr)
+				}
+			}
+		}
+
+		return capMap
+	}
+
+	result := make(map[types.NodeID]tailcfg.NodeCapMap, len(prev))
+
+	for _, n := range nodes.All() {
+		if old, ok := prevNodes[n.ID()]; ok && prev != nil && old == n {
+			if c, ok := prev[n.ID()]; ok {
+				result[n.ID()] = c
+			}
+
 			continue
 		}
 
-		for _, ni := range nodeList {
-			if !slices.ContainsFunc(ni.ips, resolved.Contains) {
-				continue
-			}
-
-			for _, attr := range na.Attrs {
-				stamp(ni.id, attr)
-			}
+		if c := capsFor(n); c != nil {
+			result[n.ID()] = c
 		}
 	}
 
@@ -234,32 +256,281 @@ func (pol *Policy) compileGrants(
 	users types.Users,
 	nodes views.Slice[types.NodeView],
 ) []compiledGrant {
-	if pol == nil || (pol.ACLs == nil && pol.Grants == nil) {
-		return nil
-	}
+	compiled, _ := pol.compileGrantsFrom(nil, nil, users, nodes)
 
-	grants := pol.Grants
+	return compiled
+}
+
+// allGrants is the policy's grants and its ACLs as grants, in compile
+// order.
+func (pol *Policy) allGrants() []Grant {
+	grants := slices.Clip(pol.Grants)
 	for _, acl := range pol.ACLs {
 		grants = append(grants, aclToGrants(acl)...)
 	}
 
+	return grants
+}
+
+// compiledGrantResult is one grant's compile, kept for the next compile:
+// cg is nil for a grant that compiled to nothing or failed.
+type compiledGrantResult struct {
+	cg *compiledGrant
+}
+
+// compileGrantsFrom compiles every grant, reusing prev, the results of a
+// compile of the same policy and users, for each grant the change since
+// cannot reach. prev and change are nil for a compile from scratch.
+func (pol *Policy) compileGrantsFrom(
+	prev []compiledGrantResult,
+	change *nodeChange,
+	users types.Users,
+	nodes views.Slice[types.NodeView],
+) ([]compiledGrant, []compiledGrantResult) {
+	if pol == nil || (pol.ACLs == nil && pol.Grants == nil) {
+		return nil, nil
+	}
+
+	grants := pol.allGrants()
+
+	if len(prev) != len(grants) {
+		prev, change = nil, nil
+	}
+
+	results := make([]compiledGrantResult, len(grants))
 	compiled := make([]compiledGrant, 0, len(grants))
 	srcs := sourceCache{}
 
-	for _, grant := range grants {
-		cg, err := pol.compileOneGrant(grant, users, nodes, srcs)
-		if err != nil {
-			log.Trace().Err(err).Msg("compiling grant")
+	for i, grant := range grants {
+		if change != nil && !change.reaches(grant) {
+			results[i] = prev[i]
+		} else {
+			cg, err := pol.compileOneGrant(grant, users, nodes, srcs)
+			if err != nil {
+				log.Trace().Err(err).Msg("compiling grant")
+			}
+
+			results[i] = compiledGrantResult{cg: cg}
+		}
+
+		if results[i].cg != nil {
+			compiled = append(compiled, *results[i].cg)
+		}
+	}
+
+	return compiled, results
+}
+
+// nodeChange summarises what changed in the nodes between two compiles,
+// as grant compilation reads them: which tags and users gained or lost a
+// node or one of its addresses or routes, whether an untagged node
+// changed, and whether approved routes changed.
+type nodeChange struct {
+	tags     map[Tag]struct{}
+	users    map[uint]struct{}
+	routes   bool // a node's approved routes changed
+	untagged bool // an untagged node, an autogroup:member, changed
+}
+
+// movesSSH reports whether the change can alter how rule prepares. SSH
+// sources are identities only, and every changed node moves the
+// identities it belongs to, so a rule listing nodes one by one changes
+// only when one of its aliases moved.
+func (c *nodeChange) movesSSH(rule SSH) bool {
+	return slices.ContainsFunc(rule.Sources, c.moves) || slices.ContainsFunc(rule.Destinations, c.moves)
+}
+
+func diffNodes(prev map[types.NodeID]types.NodeView, nodes views.Slice[types.NodeView]) *nodeChange {
+	c := &nodeChange{tags: map[Tag]struct{}{}, users: map[uint]struct{}{}}
+
+	note := func(n types.NodeView) {
+		for _, t := range n.Tags().All() {
+			c.tags[Tag(t)] = struct{}{}
+		}
+
+		// By UserID, not User: a node can carry one without the other,
+		// and autogroup:member takes every untagged node either way.
+		if !n.IsTagged() {
+			c.untagged = true
+
+			if uid := n.UserID(); uid.Valid() {
+				c.users[uid.Get()] = struct{}{}
+			}
+		}
+	}
+
+	seen := make(map[types.NodeID]struct{}, nodes.Len())
+
+	for _, n := range nodes.All() {
+		seen[n.ID()] = struct{}{}
+
+		old, ok := prev[n.ID()]
+		if ok && old == n {
+			continue
+		}
+
+		note(n)
+
+		if !ok {
+			c.routes = c.routes || len(n.AllApprovedRoutes()) > 0
 
 			continue
 		}
 
-		if cg != nil {
-			compiled = append(compiled, *cg)
+		note(old)
+
+		if !slices.Equal(old.AllApprovedRoutes(), n.AllApprovedRoutes()) {
+			c.routes = true
 		}
 	}
 
-	return compiled
+	for id, old := range prev {
+		if _, ok := seen[id]; !ok {
+			note(old)
+
+			c.routes = c.routes || len(old.AllApprovedRoutes()) > 0
+		}
+	}
+
+	return c
+}
+
+// reaches reports whether the change can alter grant's compile: one of
+// its aliases resolves differently, see [nodeChange.moves], or a via tag
+// gained or lost a node.
+func (c *nodeChange) reaches(grant Grant) bool {
+	for _, t := range grant.Via {
+		if _, ok := c.tags[t]; ok {
+			return true
+		}
+	}
+
+	return slices.ContainsFunc(slices.Concat(grant.Sources, grant.Destinations), c.moves)
+}
+
+// moves reports whether the change can alter what a resolves to: a tag or
+// user it names gained or lost a node or address, its autogroup's members
+// moved, or, for a wildcard, which carries every approved subnet, routes
+// changed. Groups and users are checked against any user-owned change;
+// addresses and hosts never change with nodes.
+func (c *nodeChange) moves(a Alias) bool {
+	switch a := a.(type) {
+	case *Tag:
+		_, ok := c.tags[*a]
+
+		return ok
+	case *Username, *Group:
+		return len(c.users) > 0
+	case *AutoGroup:
+		// member and self are untagged nodes, recorded by owner; tagged
+		// ones by tag; internet and danger-all are fixed.
+		switch *a {
+		case AutoGroupMember, AutoGroupSelf:
+			return c.untagged
+		case AutoGroupTagged:
+			return len(c.tags) > 0
+		case AutoGroupInternet, AutoGroupDangerAll, AutoGroupNonRoot:
+			return false
+		}
+
+		return true
+	case Asterix:
+		return c.routes
+	case *Host, *Prefix:
+		return false
+	default:
+		return true
+	}
+}
+
+// aliasCache holds what aliases resolved to in a compile, for the grants
+// naming them and for the next compile: a CI join recompiles every grant
+// listing the joiner's tag, and each lists dozens of tags that did not
+// change.
+type aliasCache map[aliasKey]aliasResult
+
+type aliasKey struct {
+	kind string
+	name string
+}
+
+type aliasResult struct {
+	alias Alias
+	ips   ResolvedAddresses
+	err   error
+}
+
+func keyOf(a Alias) aliasKey { return aliasKey{kind: fmt.Sprintf("%T", a), name: a.String()} }
+
+// resolveAlias is a.Resolve, once per alias in a compile.
+func (pol *Policy) resolveAlias(a Alias, users types.Users, nodes views.Slice[types.NodeView]) (ResolvedAddresses, error) {
+	if pol == nil || pol.aliases == nil {
+		return a.Resolve(pol, users, nodes)
+	}
+
+	key := keyOf(a)
+	if r, ok := pol.aliases[key]; ok {
+		return r.ips, r.err
+	}
+
+	ips, err := a.Resolve(pol, users, nodes)
+	pol.aliases[key] = aliasResult{alias: a, ips: ips, err: err}
+
+	return ips, err
+}
+
+// resolveAliases is [Aliases.Resolve] through [Policy.resolveAlias].
+func (pol *Policy) resolveAliases(as Aliases, users types.Users, nodes views.Slice[types.NodeView]) (ResolvedAddresses, error) {
+	var (
+		ips  netipx.IPSetBuilder
+		errs []error
+	)
+
+	for _, a := range as {
+		r, err := pol.resolveAlias(a, users, nodes)
+		if err != nil {
+			errs = append(errs, err)
+		}
+
+		addResolved(&ips, r)
+	}
+
+	return newResolvedAddresses(buildIPSetMultiErr(&ips, errs))
+}
+
+// addResolved adds r's addresses to b; r may be nil.
+func addResolved(b *netipx.IPSetBuilder, r ResolvedAddresses) {
+	switch r := r.(type) {
+	case nil:
+	case resolved:
+		b.AddSet(&r.ips)
+	default:
+		for _, p := range r.Prefixes() {
+			b.AddPrefix(p)
+		}
+	}
+}
+
+// aliasesOrNil returns pol's alias cache; pol may be nil.
+func (pol *Policy) aliasesOrNil() aliasCache {
+	if pol == nil {
+		return nil
+	}
+
+	return pol.aliases
+}
+
+// carry returns the entries of c the change cannot have moved.
+func (c aliasCache) carry(change *nodeChange) aliasCache {
+	next := make(aliasCache, len(c))
+
+	for k, r := range c {
+		if !change.moves(r.alias) {
+			next[k] = r
+		}
+	}
+
+	return next
 }
 
 // compileOneGrant resolves a single grant into a [compiledGrant].
@@ -493,7 +764,7 @@ func resolveSources(
 			return nil, nil, errSelfInSources
 		}
 
-		ips, err := src.Resolve(pol, users, nodes)
+		ips, err := pol.resolveAlias(src, users, nodes)
 		if err != nil {
 			log.Trace().Caller().Err(err).
 				Msg("resolving source ips")
@@ -588,7 +859,7 @@ func (pol *Policy) compileOtherDests(
 				continue
 			}
 
-			addresses, err := dst.Resolve(pol, users, nodes)
+			addresses, err := pol.resolveAlias(dst, users, nodes)
 			resolvedDests[i] = resolvedDestination{
 				Alias:     dst,
 				addresses: addresses,
@@ -631,7 +902,7 @@ func (pol *Policy) compileOtherDests(
 		)
 
 		for _, dst := range otherDests {
-			ips, err := dst.Resolve(pol, users, nodes)
+			ips, err := pol.resolveAlias(dst, users, nodes)
 			if err != nil {
 				continue
 			}
@@ -689,58 +960,6 @@ func hasPerNodeGrants(grants []compiledGrant) bool {
 	return false
 }
 
-// collectRelayTargetIPs returns the set of IPs that are destinations of a
-// tailscale.com/cap/relay grant. A node whose IP is in this set is a relay
-// target: when it goes offline, peers holding a PeerRelay allocation through
-// it must recompute their netmap to drop the now-dead allocation. The relay
-// cap is carried on each grant's [tailcfg.CapGrant] with Dsts set to the
-// resolved relay destinations (see [Policy.compileOtherDests]); the reversed
-// companion rule carries [tailcfg.PeerCapabilityRelayTarget] instead and is
-// intentionally skipped.
-func collectRelayTargetIPs(grants []compiledGrant) (*netipx.IPSet, error) {
-	var b netipx.IPSetBuilder
-
-	for i := range grants {
-		for _, rule := range grants[i].rules {
-			for _, cg := range rule.CapGrant {
-				if _, ok := cg.CapMap[peercap.Relay]; !ok {
-					continue
-				}
-
-				for _, dst := range cg.Dsts {
-					b.AddPrefix(dst)
-				}
-			}
-		}
-	}
-
-	return b.IPSet()
-}
-
-// collectViaTargetTags returns the set of tags used as via targets across all
-// grants. A node carrying any of these tags is a via target: peers steering
-// traffic through it must recompute when it goes offline. Returns nil when no
-// via grants exist.
-func collectViaTargetTags(grants []compiledGrant) map[Tag]struct{} {
-	tags := make(map[Tag]struct{})
-
-	for i := range grants {
-		if grants[i].via == nil {
-			continue
-		}
-
-		for _, t := range grants[i].via.viaTags {
-			tags[t] = struct{}{}
-		}
-	}
-
-	if len(tags) == 0 {
-		return nil
-	}
-
-	return tags
-}
-
 // globalFilterRules extracts global filter rules from [compiledGrant]s.
 // Via grants produce no global rules (they are per-node only); regular
 // grants contribute their full pre-compiled ruleset; self grants
@@ -772,31 +991,50 @@ func filterRulesForNode(
 	var rules []tailcfg.FilterRule
 
 	for i := range grants {
-		cg := &grants[i]
-
 		// Pre-compiled rules apply to all grant categories
 		// (empty for via-only grants).
-		rules = append(rules, cg.rules...)
-
-		switch cg.category {
-		case grantCategoryRegular:
-			// Nothing more to do.
-
-		case grantCategorySelf:
-			rules = append(
-				rules,
-				compileAutogroupSelf(cg, node, userIdx)...,
-			)
-
-		case grantCategoryVia:
-			rules = append(
-				rules,
-				compileViaForNode(cg, node)...,
-			)
-		}
+		rules = append(rules, grants[i].rules...)
+		rules = append(rules, grantRulesForNode(&grants[i], node, userIdx)...)
 	}
 
 	return mergeFilterRules(rules)
+}
+
+// sharedRules returns the pre-compiled rules of every grant: what
+// [filterRulesForNode] gives every node before its own rules.
+func sharedRules(grants []compiledGrant) []tailcfg.FilterRule {
+	var rules []tailcfg.FilterRule
+	for i := range grants {
+		rules = append(rules, grants[i].rules...)
+	}
+
+	return mergeFilterRules(rules)
+}
+
+// nodeOnlyRules returns the rules [filterRulesForNode] adds for node alone
+// (autogroup:self, via), unmerged.
+func (pm *PolicyManager) nodeOnlyRules(node types.NodeView) []tailcfg.FilterRule {
+	rules := make([]tailcfg.FilterRule, 0, len(pm.compiledGrants))
+	for i := range pm.compiledGrants {
+		rules = append(rules, pm.grantRulesFor(i, node)...)
+	}
+
+	return rules
+}
+
+// grantRulesForNode returns the rules a per-node grant category adds for
+// node.
+func grantRulesForNode(cg *compiledGrant, node types.NodeView, userIdx userNodeIndex) []tailcfg.FilterRule {
+	switch cg.category {
+	case grantCategorySelf:
+		return compileAutogroupSelf(cg, node, userIdx)
+	case grantCategoryVia:
+		return compileViaForNode(cg, node)
+	case grantCategoryRegular:
+		return nil
+	}
+
+	return nil
 }
 
 // compileAutogroupSelf produces filter rules for autogroup:self

@@ -128,8 +128,11 @@ func TestTailscaleCert(t *testing.T) {
 		fqdn = strings.TrimSuffix(fqdn, ".")
 
 		assert.EventuallyWithT(t, func(c *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(c, err)
+			status := assertClientStatus(c, client)
+			if status == nil {
+				return
+			}
+
 			assert.Contains(c, status.CertDomains, fqdn)
 		}, 30*time.Second, 500*time.Millisecond, "%s should be offered a certificate name", client.Hostname())
 

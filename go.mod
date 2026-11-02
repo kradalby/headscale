@@ -4,6 +4,7 @@ go 1.27.3
 
 require (
 	github.com/arl/statsviz v0.8.2
+	github.com/benbjohnson/immutable v0.4.3
 	github.com/caddyserver/certmagic v0.25.6
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/chasefleming/elem-go v0.37.0
@@ -180,6 +181,7 @@ require (
 	github.com/klauspost/compress v1.20.3 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.1 // indirect
 	github.com/kradalby/gigahost-go/client v0.0.0-20261014144355-025b38b667ed // indirect
+	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/letsencrypt/challtestsrv v1.4.2 // indirect
 	github.com/lib/pq v1.12.3 // indirect
 	github.com/lithammer/fuzzysearch v1.1.8 // indirect

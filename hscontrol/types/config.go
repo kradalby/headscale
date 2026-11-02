@@ -13,7 +13,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -147,8 +146,8 @@ type Config struct {
 	// not directly converted into a [tailcfg.DNSConfig].
 	DNSConfig DNSConfig
 
-	// TailcfgDNSConfig is the tailcfg representation of the DNS configuration,
-	// it can be used directly when sending Netmaps to clients.
+	// TailcfgDNSConfig is a startup builder, frozen by [Config.DNSView].
+	// Runtime DNS readers require the snapshot's [DNSView] instead.
 	TailcfgDNSConfig *tailcfg.DNSConfig
 
 	DNSChallenge DNSChallengeConfig
@@ -442,21 +441,9 @@ type LogConfig struct {
 // need adjustment. Changes to these values can significantly impact performance
 // and resource usage.
 type Tuning struct {
-	// NotifierSendTimeout is the maximum time to wait when sending notifications
-	// to connected clients about network changes.
-	NotifierSendTimeout time.Duration
-
 	// BatchChangeDelay controls how long to wait before sending batched updates
 	// to clients when multiple changes occur in rapid succession.
 	BatchChangeDelay time.Duration
-
-	// NodeMapSessionBufferedChanSize sets the buffer size for the channel that
-	// queues map updates to be sent to connected clients.
-	NodeMapSessionBufferedChanSize int
-
-	// BatcherWorkers controls the number of parallel workers processing map
-	// updates for connected clients.
-	BatcherWorkers int
 
 	// RegisterCacheExpiration is how long registration cache entries remain
 	// valid before being eligible for eviction.
@@ -468,32 +455,13 @@ type Tuning struct {
 	// A value of 0 falls back to defaultRegisterCacheMaxEntries (1024).
 	RegisterCacheMaxEntries int
 
-	// NodeStoreBatchSize controls how many write operations are accumulated
-	// before rebuilding the in-memory node snapshot.
-	//
-	// The NodeStore batches write operations (add/update/delete nodes) before
-	// rebuilding its in-memory data structures. Rebuilding involves recalculating
-	// peer relationships between all nodes based on the current ACL policy, which
-	// is computationally expensive and scales with the square of the number of nodes.
-	//
-	// By batching writes, Headscale can process N operations but only rebuild once,
-	// rather than rebuilding N times. This significantly reduces CPU usage during
-	// bulk operations like initial sync or policy updates.
-	//
-	// Trade-off: Higher values reduce CPU usage from rebuilds but increase latency
-	// for individual operations waiting for their batch to complete.
-	NodeStoreBatchSize int
-
-	// NodeStoreBatchTimeout is the maximum time to wait before processing a
-	// partial batch of node operations.
-	//
-	// When [Tuning.NodeStoreBatchSize] operations haven't accumulated, this timeout ensures
-	// writes don't wait indefinitely. The batch processes when either the size
-	// threshold is reached OR this timeout expires, whichever comes first.
-	//
-	// Trade-off: Lower values provide faster response for individual operations
-	// but trigger more frequent (expensive) peer map rebuilds. Higher values
-	// optimize for bulk throughput at the cost of individual operation latency.
+	// NodeStoreBatchSize and NodeStoreBatchTimeout bound how node writes
+	// batch during an HA outage, while a subnet route has an unhealthy
+	// primary and no healthy router: a write waits up to the timeout, or
+	// until the size is queued, so routers coming back together are
+	// elected together. Otherwise writes commit at once, and those arriving
+	// during a commit share the next one.
+	NodeStoreBatchSize    int
 	NodeStoreBatchTimeout time.Duration
 }
 
@@ -639,9 +607,7 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("node.routes.ha.probe_interval", "10s")
 	viper.SetDefault("node.routes.ha.probe_timeout", "5s")
 
-	viper.SetDefault("tuning.notifier_send_timeout", "800ms")
 	viper.SetDefault("tuning.batch_change_delay", "800ms")
-	viper.SetDefault("tuning.node_mapsession_buffered_chan_size", 30)
 	viper.SetDefault("tuning.node_store_batch_size", defaultNodeStoreBatchSize)
 	viper.SetDefault("tuning.node_store_batch_timeout", "500ms")
 
@@ -759,6 +725,12 @@ func validateServerConfigInto(v *configValidator) {
 
 	// Removed: oidc.expiry -> node.expiry
 	depr.fatalIfSet("oidc.expiry", "node.expiry")
+
+	// Nothing reads these since each session renders its own map updates;
+	// they stay accepted so existing configs still load.
+	depr.warn("tuning.batcher_workers")
+	depr.warn("tuning.notifier_send_timeout")
+	depr.warn("tuning.node_mapsession_buffered_chan_size")
 
 	// OIDC is activated by setting oidc.issuer (see app.go), not by a
 	// dedicated oidc.enabled key. Gate validation on the real activation
@@ -1767,18 +1739,7 @@ func LoadServerConfig() (*Config, error) {
 		Log: logConfig,
 
 		Tuning: Tuning{
-			NotifierSendTimeout: viper.GetDuration("tuning.notifier_send_timeout"),
-			BatchChangeDelay:    viper.GetDuration("tuning.batch_change_delay"),
-			NodeMapSessionBufferedChanSize: viper.GetInt(
-				"tuning.node_mapsession_buffered_chan_size",
-			),
-			BatcherWorkers: func() int {
-				if workers := viper.GetInt("tuning.batcher_workers"); workers > 0 {
-					return workers
-				}
-
-				return DefaultBatcherWorkers()
-			}(),
+			BatchChangeDelay:        viper.GetDuration("tuning.batch_change_delay"),
 			RegisterCacheExpiration: viper.GetDuration("tuning.register_cache_expiration"),
 			RegisterCacheMaxEntries: viper.GetInt("tuning.register_cache_max_entries"),
 			NodeStoreBatchSize:      viper.GetInt("tuning.node_store_batch_size"),
@@ -1955,8 +1916,6 @@ func (d *deprecator) warnNoAlias(newKey, oldKey string) {
 
 // warn records a non-blocking warning when oldKey is set, with no
 // replacement to point at.
-//
-//nolint:unused
 func (d *deprecator) warn(oldKey string) {
 	if viper.IsSet(oldKey) {
 		d.addWarn(deprecation{OldKey: oldKey})
@@ -2003,46 +1962,6 @@ func (d *deprecator) Apply(v *configValidator) {
 	}
 }
 
-// tailcfgDNSMu guards concurrent access to the mutable ExtraRecords of
-// [Config.TailcfgDNSConfig] between the extra-records file watcher (writer)
-// and the per-client map builds that clone it (readers). It is a package-level
-// lock so [Config] stays freely copyable during construction.
-var tailcfgDNSMu sync.RWMutex
-
-// CloneTailcfgDNSConfig returns a deep copy of [Config.TailcfgDNSConfig], or
-// nil if none is set. Safe for concurrent use with [Config.SetExtraRecords].
-func (c *Config) CloneTailcfgDNSConfig() *tailcfg.DNSConfig {
-	tailcfgDNSMu.RLock()
-	defer tailcfgDNSMu.RUnlock()
-
-	if c.TailcfgDNSConfig == nil {
-		return nil
-	}
-
-	return c.TailcfgDNSConfig.Clone()
-}
-
-// extraRecordAtOrBelow reports whether an extra DNS record is name or a
-// subdomain of it. Case is ignored, as in TLS name matching; name is
-// lowercase.
-func (c *Config) extraRecordAtOrBelow(name string) bool {
-	tailcfgDNSMu.RLock()
-	defer tailcfgDNSMu.RUnlock()
-
-	if c.TailcfgDNSConfig == nil {
-		return false
-	}
-
-	for _, r := range c.TailcfgDNSConfig.ExtraRecords {
-		rn := strings.ToLower(strings.TrimSuffix(r.Name, "."))
-		if rn == name || strings.HasSuffix(rn, "."+name) {
-			return true
-		}
-	}
-
-	return false
-}
-
 // TailcfgDebug returns the [tailcfg.Debug] for full map responses: nil when
 // logtail is enabled, leaving client log uploads as the client set them,
 // otherwise an instruction to stop uploading logs.
@@ -2054,22 +1973,11 @@ func (c *Config) TailcfgDebug() *tailcfg.Debug {
 	return &tailcfg.Debug{DisableLogTail: true}
 }
 
-// SetExtraRecords replaces the ExtraRecords of [Config.TailcfgDNSConfig]. Safe
-// for concurrent use with [Config.CloneTailcfgDNSConfig].
-func (c *Config) SetExtraRecords(records []tailcfg.DNSRecord) {
-	tailcfgDNSMu.Lock()
-	defer tailcfgDNSMu.Unlock()
-
-	if c.TailcfgDNSConfig != nil {
-		c.TailcfgDNSConfig.ExtraRecords = lowercaseRecordNames(records)
-	}
-}
-
 // lowercaseRecordNames normalizes DNS record names to lowercase, as DNS names
 // are case-insensitive and clients match extra records by exact name.
 func lowercaseRecordNames(records []tailcfg.DNSRecord) []tailcfg.DNSRecord {
-	if len(records) == 0 {
-		return records
+	if records == nil {
+		return nil
 	}
 
 	normalized := make([]tailcfg.DNSRecord, len(records))

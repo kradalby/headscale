@@ -220,7 +220,12 @@
               name = "headscale-gorace";
               goRace = true;
               testEnv = "export CGO_ENABLED=1";
-              testFlags = [ "-p=2" ];
+              # -race slows the policy suites past go test's default 10m
+              # per-package timeout on a loaded builder.
+              testFlags = [
+                "-p=2"
+                "-timeout=30m"
+              ];
               goSkip = [ "TestPostgres" ];
               testPackages = "./hscontrol/...";
               testExclude = [ "/hscontrol/servertest" ];

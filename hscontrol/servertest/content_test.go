@@ -1,6 +1,8 @@
 package servertest_test
 
 import (
+	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -8,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/envknob"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/netmap"
 )
 
@@ -55,6 +58,30 @@ func TestContentVerification(t *testing.T) {
 			_, ok := nm.DERPMap.Regions[900]
 			assert.True(t, ok, "DERPMap should contain test region 900")
 		})
+	})
+
+	// A client drops a HomeDERP clear from a patch or a changed peer, so
+	// the server must send the whole peer list for its peers to apply it.
+	t.Run("home_derp_clear_reaches_peers", func(t *testing.T) {
+		t.Parallel()
+		h := servertest.NewHarness(t, 2)
+		node, peer := h.Client(0), h.Client(1)
+
+		for _, region := range []tailcfg.DERPRegionID{900, 0} {
+			node.Direct().SetNetInfo(&tailcfg.NetInfo{PreferredDERP: region})
+
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			_ = node.Direct().SendUpdate(ctx)
+
+			cancel()
+
+			peer.WaitForCondition(t, fmt.Sprintf("peer home DERP %d", region), 10*time.Second,
+				func(nm *netmap.NetworkMap) bool {
+					p, ok := peerByHostname(nm, node.Name)
+
+					return ok && p.HomeDERP() == region
+				})
+		}
 	})
 
 	t.Run("peers", func(t *testing.T) {

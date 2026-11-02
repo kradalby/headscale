@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,7 +20,9 @@ import (
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/control/controlclient"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
 )
@@ -154,10 +157,9 @@ func TestRoutes(t *testing.T) {
 		// Step 2: Approve the route on the server.
 		nodeID := findNodeID(t, srv, "fullrt-advertiser")
 
-		_, routeChange, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			nodeID, []netip.Prefix{route})
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 
 		// Step 3: Observer should see the route in AllowedIPs.
 		c2.WaitForCondition(t, "approved route in AllowedIPs",
@@ -233,8 +235,8 @@ func TestRoutes(t *testing.T) {
 	//   R1 — server-side primary route state restores after reconnect.
 	//   R2 — observer's [netmap.NetworkMap] shows the reconnected router online with
 	//        the route in its primary set.
-	// If R1 fails the bug is in [state.State.Connect] / primaryRoutes; if R1 passes
-	// and R2 fails the bug is in change broadcast / [mapper.Batcher].
+	// If R1 fails the bug is in [state.State.Connect] / the primary election; if
+	// R1 passes and R2 fails the bug is in change broadcast / [mapper.Hub].
 	//
 	// Caveat: [TestClient.Reconnect] re-registers via [controlclient.Direct.TryLogin] in addition
 	// to starting a new poll session. Production reconnects after a brief
@@ -282,9 +284,8 @@ func TestRoutes(t *testing.T) {
 			t.Helper()
 			id := findNodeID(t, srv, name)
 
-			_, ch, err := srv.State().SetApprovedRoutes(id, []netip.Prefix{route})
+			_, err := srv.State().SetApprovedRoutes(id, []netip.Prefix{route})
 			require.NoError(t, err)
-			srv.App.Change(ch)
 		}
 		approve("ha3203-router1")
 		approve("ha3203-router2")
@@ -675,9 +676,8 @@ func TestRoutesNodeRangeSingleNotServed(t *testing.T) {
 			require.NoError(t, err)
 
 			if changed {
-				changes, err := srv.State().ReloadPolicy()
+				err := srv.State().ReloadPolicy()
 				require.NoError(t, err)
-				srv.App.Change(changes...)
 			}
 
 			router := servertest.NewClient(t, srv, "router",
@@ -691,9 +691,8 @@ func TestRoutesNodeRangeSingleNotServed(t *testing.T) {
 			viewer.WaitForPeers(t, 1, 15*time.Second)
 
 			routerID := findNodeID(t, srv, "router")
-			_, routeChange, err := srv.State().SetApprovedRoutes(routerID, routes)
+			_, err = srv.State().SetApprovedRoutes(routerID, routes)
 			require.NoError(t, err)
-			srv.App.Change(routeChange)
 
 			viewer.WaitForCondition(t, "viewer is served the subnet", 15*time.Second,
 				func(nm *netmap.NetworkMap) bool {
@@ -723,4 +722,344 @@ func TestRoutesNodeRangeSingleNotServed(t *testing.T) {
 			assert.ElementsMatch(t, routes, node.ApprovedRoutes().AsSlice())
 		})
 	}
+}
+
+// TestRoutesViaAppOnlyGrantFollowsPolicy checks that a via grant carrying
+// only app capabilities moves the router's route in a viewer's AllowedIPs
+// both ways. Such a grant compiles to no filter rule, so a recompile that
+// adds or removes it leaves the filter unchanged; the route must still
+// follow it, as a fresh map would.
+func TestRoutesViaAppOnlyGrantFollowsPolicy(t *testing.T) {
+	t.Parallel()
+
+	subnet := netip.MustParsePrefix("10.9.0.0/24")
+
+	srv := servertest.NewServer(t)
+	user := srv.CreateUser(t, "routes-user")
+
+	setPolicy := func(viaApp bool) {
+		t.Helper()
+
+		grants := `{"src": ["tag:client"], "dst": ["tag:router"], "ip": ["*"]},
+			{"src": ["tag:router"], "dst": ["*"], "ip": ["*"]}`
+		if viaApp {
+			grants += `, {"src": ["tag:client"], "dst": ["10.9.0.0/24"], "via": ["tag:router"],
+				"app": {"example.com/cap/routes": [{}]}}`
+		}
+
+		changed, err := srv.State().SetPolicy([]byte(`{
+			"tagOwners": {"tag:client": ["routes-user@"], "tag:router": ["routes-user@"]},
+			"grants": [` + grants + `]
+		}`))
+		require.NoError(t, err)
+		require.True(t, changed)
+		require.NoError(t, srv.State().ReloadPolicy())
+	}
+
+	setPolicy(true)
+
+	servertest.NewClient(t, srv, "router",
+		servertest.WithUser(user), servertest.WithTags("tag:router"),
+		servertest.WithHostinfo(&tailcfg.Hostinfo{
+			BackendLogID: "servertest-router", Hostname: "router", RoutableIPs: []netip.Prefix{subnet},
+		}))
+	viewer := servertest.NewClient(t, srv, "viewer",
+		servertest.WithUser(user), servertest.WithTags("tag:client"))
+
+	viewer.WaitForPeers(t, 1, 15*time.Second)
+
+	routerID := findNodeID(t, srv, "router")
+	_, err := srv.State().SetApprovedRoutes(routerID, []netip.Prefix{subnet})
+	require.NoError(t, err)
+
+	served := func(*netmap.NetworkMap) bool {
+		p, ok := viewer.PeerByName("router")
+
+		return ok && views.SliceContains(p.AllowedIPs(), subnet)
+	}
+
+	viewer.WaitForCondition(t, "app-only via grant serves the subnet", 15*time.Second, served)
+
+	setPolicy(false)
+	viewer.WaitForCondition(t, "removing the grant withdraws the subnet", 15*time.Second,
+		func(nm *netmap.NetworkMap) bool { return !served(nm) })
+
+	setPolicy(true)
+	viewer.WaitForCondition(t, "restoring the grant serves the subnet again", 15*time.Second, served)
+}
+
+// TestAutoClientDelayedStreamKeepsLiteUpdate runs tailscaled's own control
+// client against a stream request the network delays: the client restarts
+// its stream, the request is held at the server, and meanwhile the client
+// reports new routes in the lite update it sends by itself. The held
+// stream then arrives carrying the Hostinfo from before the change. Streams
+// are read-only (capver 68), so the node keeps the lite update's routes; a
+// server applying stream payloads would roll them back.
+func TestAutoClientDelayedStreamKeepsLiteUpdate(t *testing.T) {
+	t.Parallel()
+
+	srv := servertest.NewServer(t)
+	user := srv.CreateUser(t, "auto-router")
+	route := netip.MustParsePrefix("10.77.0.0/16")
+
+	var (
+		holdNext          atomic.Bool
+		held, release     = make(chan struct{}), make(chan struct{})
+		liteUpdates       atomic.Int32
+		streamsWithRoutes atomic.Int32
+	)
+
+	srv.App.SetBeforeMapRequestForTest(t, func(_ types.NodeID, req tailcfg.MapRequest) {
+		if !req.Stream && req.OmitPeers {
+			liteUpdates.Add(1)
+		}
+
+		if req.Stream && req.Hostinfo != nil && slices.Contains(req.Hostinfo.RoutableIPs, route) {
+			streamsWithRoutes.Add(1)
+		}
+
+		if req.Stream && holdNext.CompareAndSwap(true, false) {
+			close(held)
+			<-release
+		}
+	})
+
+	var netmaps atomic.Int32
+
+	hi := &tailcfg.Hostinfo{BackendLogID: "servertest-auto-router", Hostname: "auto-router"}
+	auto := servertest.NewAutoClient(t, srv, user, hi.Clone(), netmapCounter(func() { netmaps.Add(1) }))
+
+	node := func() (types.NodeView, bool) {
+		for _, nv := range srv.State().ListNodes().All() {
+			if nv.Hostname() == "auto-router" {
+				return nv, true
+			}
+		}
+
+		return types.NodeView{}, false
+	}
+	online := func() bool {
+		nv, ok := node()
+		return ok && nv.IsOnline().Valid() && nv.IsOnline().Get()
+	}
+
+	require.Eventually(t, online, 10*time.Second, 10*time.Millisecond, "the client registers and streams")
+
+	// Restart the stream and hold its request: it carries the Hostinfo
+	// without the route.
+	holdNext.Store(true)
+	auto.SetPaused(true)
+	auto.SetPaused(false)
+
+	select {
+	case <-held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the client did not restart its stream")
+	}
+
+	before := liteUpdates.Load()
+	withRoute := hi.Clone()
+	withRoute.RoutableIPs = []netip.Prefix{route}
+	auto.SetHostinfo(withRoute)
+
+	require.Eventually(t, func() bool {
+		nv, ok := node()
+		return ok && slices.Contains(nv.AnnouncedRoutes(), route)
+	}, 10*time.Second, 10*time.Millisecond, "the client's lite update reports the route")
+	require.Greater(t, liteUpdates.Load(), before, "the route came in a lite update the client sent itself")
+
+	// The held stream's first map is sent after its session connected, so
+	// once the client has it, whatever the stream changed has landed.
+	maps := netmaps.Load()
+
+	close(release)
+	require.Eventually(t, func() bool { return netmaps.Load() > maps }, 10*time.Second, 10*time.Millisecond,
+		"the held stream delivers its map")
+
+	nv, _ := node()
+	assert.Contains(t, nv.AnnouncedRoutes(), route, "the stale stream rolled back the lite update")
+	assert.Zero(t, streamsWithRoutes.Load(), "test sanity: only the lite update carried the route before release")
+}
+
+// netmapCounter is a [controlclient.Observer] calling seen for each
+// network map the client receives.
+type netmapCounter func()
+
+func (seen netmapCounter) SetControlClientStatus(_ controlclient.Client, st controlclient.Status) {
+	if st.NetMap != nil {
+		seen()
+	}
+}
+
+// TestStreamOnlyRouterStateConvergesOnLiteUpdate reconnects an HA router
+// whose new routes, disco key and endpoints reach the server only through
+// its streaming request and tailscaled's follow-up lite update, which race.
+// Streams are read-only (capver 68), so the lite update alone must elect
+// primaries and converge peers to what a fresh session sees.
+func TestStreamOnlyRouterStateConvergesOnLiteUpdate(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name          string
+		streamFirst   bool
+		primaryOnline bool
+	}{
+		{"stream_first/primary_online", true, true},
+		{"lite_first/primary_online", false, true},
+		{"stream_first/all_offline", true, false},
+		{"lite_first/all_offline", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := servertest.NewServer(t)
+			user := srv.CreateUser(t, "stream-only-user")
+			route := netip.MustParsePrefix("10.77.0.0/24")
+
+			r1 := servertest.NewClient(t, srv, "so-router1", servertest.WithUser(user))
+			r2 := servertest.NewClient(t, srv, "so-router2", servertest.WithUser(user))
+			obs := servertest.NewClient(t, srv, "so-observer", servertest.WithUser(user))
+			obs.WaitForPeers(t, 2, 10*time.Second)
+
+			advertiseRoutes(t, r1, obs, []netip.Prefix{route})
+
+			r1ID := findNodeID(t, srv, r1.Name)
+			r2ID := findNodeID(t, srv, r2.Name)
+
+			for _, id := range []types.NodeID{r1ID, r2ID} {
+				_, err := srv.State().SetApprovedRoutes(id, []netip.Prefix{route})
+				require.NoError(t, err)
+			}
+
+			primary := func(id types.NodeID) bool {
+				return slices.Contains(srv.State().GetNodePrimaryRoutes(id), route)
+			}
+			online := func(id types.NodeID) bool {
+				nv, ok := srv.State().GetNodeByID(id)
+				if !ok {
+					return false
+				}
+
+				on, known := nv.IsOnline().GetOk()
+
+				return known && on
+			}
+
+			require.Eventually(t, func() bool { return primary(r1ID) }, 10*time.Second, 50*time.Millisecond)
+
+			r2.Disconnect(t)
+
+			if !tc.primaryOnline {
+				r1.Disconnect(t)
+			}
+
+			require.Eventually(t, func() bool { return !online(r2ID) && online(r1ID) == tc.primaryOnline },
+				20*time.Second, 100*time.Millisecond)
+
+			// What tailscaled learns while its stream is down: Auto records
+			// it in Direct and queues a lite update.
+			disco := key.NewDisco().Public()
+			endpoint := netip.MustParseAddrPort("192.0.2.77:41641")
+
+			r2.Direct().SetHostinfo(&tailcfg.Hostinfo{
+				BackendLogID: "servertest-" + r2.Name,
+				Hostname:     r2.Name,
+				RoutableIPs:  []netip.Prefix{route},
+			})
+			r2.Direct().SetDiscoPublicKey(disco)
+			r2.Direct().SetEndpoints([]tailcfg.Endpoint{{Addr: endpoint, Type: tailcfg.EndpointExplicitConf}})
+
+			liteUpdate := func() {
+				t.Helper()
+
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+
+				require.NoError(t, r2.Direct().SendUpdate(ctx))
+			}
+			restartStream := func() {
+				t.Helper()
+
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+
+				before := r2.UpdateCount()
+
+				require.NoError(t, r2.RestartPoll(ctx))
+				require.Eventually(t, func() bool { return online(r2ID) && r2.UpdateCount() > before },
+					5*time.Second, 10*time.Millisecond, "r2's new stream connects and gets its initial map")
+			}
+
+			if tc.streamFirst {
+				restartStream()
+
+				nv, ok := srv.State().GetNodeByID(r2ID)
+				require.True(t, ok)
+				t.Logf("PROBE before lite: announced=%v newDisco=%v endpoints=%v primary(r1)=%v primary(r2)=%v",
+					nv.AnnouncedRoutes(), nv.DiscoKey() == disco, nv.Endpoints().AsSlice(), primary(r1ID), primary(r2ID))
+
+				liteUpdate()
+			} else {
+				liteUpdate()
+				restartStream()
+			}
+
+			// The lite update's own write decides the election: no wait.
+			nv, ok := srv.State().GetNodeByID(r2ID)
+			require.True(t, ok)
+			assert.Equal(t, []netip.Prefix{route}, nv.AnnouncedRoutes())
+			assert.Equal(t, disco, nv.DiscoKey())
+			assert.Equal(t, []netip.AddrPort{endpoint}, nv.Endpoints().AsSlice())
+			assert.Equal(t, tc.primaryOnline, primary(r1ID), "HA keeps an online primary")
+			assert.Equal(t, !tc.primaryOnline, primary(r2ID), "r2 is elected when no other router is online")
+
+			obs.WaitForCondition(t, "observer sees r2's lite update", 5*time.Second,
+				func(nm *netmap.NetworkMap) bool {
+					p, ok := peerByHostname(nm, r2.Name)
+
+					return ok && p.DiscoKey() == disco &&
+						p.Hostinfo().RoutableIPs().Len() == 1 &&
+						slices.Contains(p.Endpoints().AsSlice(), endpoint)
+				})
+
+			if tc.primaryOnline {
+				// r2 must be eligible for failover without another update.
+				r1.Disconnect(t)
+				require.Eventually(t, func() bool { return primary(r2ID) && !primary(r1ID) },
+					20*time.Second, 100*time.Millisecond, "r2 takes over from r1")
+			}
+
+			obs.WaitForCondition(t, "observer sees r2 as primary", 5*time.Second,
+				func(nm *netmap.NetworkMap) bool {
+					p, ok := peerByHostname(nm, r2.Name)
+
+					return ok && slices.Contains(p.PrimaryRoutes().AsSlice(), route) &&
+						slices.Contains(p.AllowedIPs().AsSlice(), route)
+				})
+
+			fresh := servertest.NewClient(t, srv, "so-fresh", servertest.WithUser(user))
+			fresh.WaitForPeers(t, 3, 10*time.Second)
+
+			want, ok := peerByHostname(fresh.Netmap(), r2.Name)
+			require.True(t, ok)
+
+			obs.WaitForCondition(t, "observer's r2 matches a fresh session's", 5*time.Second,
+				func(nm *netmap.NetworkMap) bool {
+					got, ok := peerByHostname(nm, r2.Name)
+
+					return ok && peerStateEqual(got, want)
+				})
+		})
+	}
+}
+
+// peerStateEqual compares the parts of a peer a reconnecting router reports
+// or the server derives from its report.
+func peerStateEqual(a, b tailcfg.NodeView) bool {
+	return a.DiscoKey() == b.DiscoKey() &&
+		slices.Equal(a.Endpoints().AsSlice(), b.Endpoints().AsSlice()) &&
+		slices.Equal(a.AllowedIPs().AsSlice(), b.AllowedIPs().AsSlice()) &&
+		slices.Equal(a.PrimaryRoutes().AsSlice(), b.PrimaryRoutes().AsSlice()) &&
+		slices.Equal(a.Hostinfo().RoutableIPs().AsSlice(), b.Hostinfo().RoutableIPs().AsSlice()) &&
+		a.Online().Get() == b.Online().Get()
 }

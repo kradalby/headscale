@@ -125,6 +125,15 @@ Registration with a pre authenticated key (or auth key) is a non-interactive way
 administrator creates a preauthkey upfront and this preauthkey can then be used to register a node non-interactively.
 Its best suited for automation.
 
+An unexpired node can restart with its unchanged node key and its previously used, expired or revoked auth key, provided
+it does not change ownership or tags. A different auth key must be valid, including when changing ephemeral lifetime.
+This compatibility path preserves the existing node expiry; extending or removing
+expiry requires a valid auth key. An expired node, including an admin-expired tagged node, requires fresh authorization.
+A logout or registration update that still resolves to its node after a reauthentication replaced the node key is
+rejected instead of modifying the newer registration: the logout reaches the client as an error in
+`RegisterResponse.Error`, a non-streaming map request as HTTP 404. A logout whose node key no longer resolves at all
+starts a fresh interactive registration and gets a new `AuthURL`.
+
 === "Personal devices"
 
     A personal node is always assigned to a Headscale user. Use the `headscale users` command to create a new user[^1]:

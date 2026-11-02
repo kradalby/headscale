@@ -281,7 +281,12 @@ func (v NodeView) ActiveSessions() int { return v.ж.ActiveSessions }
 // returned by Connect as a "Connect ran" sentinel for its cleanup,
 // and Disconnect logs it. Runtime-only.
 func (v NodeView) SessionEpoch() uint64 { return v.ж.SessionEpoch }
-func (v NodeView) String() string       { return v.ж.String() }
+
+// ReportGen orders the map reports applied to the node: each report
+// worth persisting takes a new, increasing value, published with it, so
+// a row write can say which reports it made durable. Memory only.
+func (v NodeView) ReportGen() uint64 { return v.ж.ReportGen }
+func (v NodeView) String() string    { return v.ж.String() }
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _NodeViewNeedsRegeneration = Node(struct {
@@ -311,6 +316,7 @@ var _NodeViewNeedsRegeneration = Node(struct {
 	Unhealthy      bool
 	ActiveSessions int
 	SessionEpoch   uint64
+	ReportGen      uint64
 }{})
 
 // View returns a read-only view of PreAuthKey.

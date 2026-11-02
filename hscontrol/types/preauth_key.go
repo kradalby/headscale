@@ -102,7 +102,7 @@ func (pak *PreAuthKey) Validate() error {
 }
 
 // ValidAt is [PreAuthKey.Validate] at a caller-chosen instant, without
-// logging, so a NodeStore writer can decide at its own clock.
+// logging, so a node writer can decide at its own clock.
 func (pak *PreAuthKey) ValidAt(now time.Time) error {
 	if pak == nil {
 		return PAKError("invalid authkey")

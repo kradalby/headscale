@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
+	"tailscale.com/util/multierr"
 )
 
 // setupSSHDataCompatUsers returns three users straddling two email
@@ -196,7 +197,7 @@ func TestSSHDataCompat(t *testing.T) {
 				case parseErr != nil:
 					got = parseErr
 				default:
-					_, setErr := pm.SetPolicy(policyJSON)
+					setErr := multierr.New(pm.RunTests(), pm.RunSSHTests())
 					got = setErr
 				}
 
