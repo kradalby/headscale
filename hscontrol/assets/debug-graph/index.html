@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Graph · Headscale</title>
+  </head>
+  <body>
+    <div id="app"><p>Loading the Headscale graph explorer…</p></div>
+    <noscript>This graph explorer requires JavaScript. The raw debug endpoints remain available.</noscript>
+    <script>
+      (() => {
+        const key = new URL(location.href).searchParams.get("debugkey");
+        const asset = (name) => {
+          const url = new URL(`/debug/graph/${name}`, location.origin);
+          if (key !== null) url.searchParams.set("debugkey", key);
+          return url.href;
+        };
+        const style = document.createElement("link");
+        style.rel = "stylesheet";
+        style.href = asset("style.css");
+        document.head.appendChild(style);
+        const favicon = document.createElement("link");
+        favicon.rel = "icon";
+        favicon.type = "image/png";
+        favicon.href = asset("favicon.png");
+        document.head.appendChild(favicon);
+        const load = (name, done) => {
+          const script = document.createElement("script");
+          script.src = asset(name);
+          script.onload = done;
+          script.onerror = () => {
+            document.getElementById("app").textContent =
+              "Could not load the graph explorer. Check debug access and reload.";
+          };
+          document.head.appendChild(script);
+        };
+        load("elm.js", () => load("app.js", () => {}));
+      })();
+    </script>
+  </body>
+</html>

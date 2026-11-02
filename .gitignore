@@ -57,5 +57,8 @@ integration_test/etc/config.dump.yaml
 __debug_bin
 
 node_modules/
+/hscontrol/assets/debug-graph/elm-stuff/
+/hscontrol/assets/debug-graph/.elm/
+/hscontrol/assets/debug-graph/elm.js
 package-lock.json
 package.json
