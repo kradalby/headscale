@@ -29,8 +29,9 @@ keys remain all-access.
 An OAuth client secret also joins nodes: `tailscale up`, the container image,
 `tsnet` and the Tailscale GitHub Action take it as an auth key
 (`tskey-client-…?baseURL=<headscale>`) and mint a tagged key per node. Pre-auth
-key registrations now accept `--advertise-tags` that are a subset of the key's
-tags; any other tag is rejected, for new and re-registering nodes alike. See
+key registrations accept `--advertise-tags` that are a subset of the key's
+tags without changing the assigned tags. Other requested tags replace the key's
+tags only when its tags or user directly own every requested tag. See
 [the API docs](https://headscale.net/stable/ref/api/).
 
 [#3351](https://github.com/juanfont/headscale/pull/3351)
@@ -93,12 +94,54 @@ the ACME DNS-01 challenge through a built-in DNS provider: `acmedns`,
 - API key IDs are renumbered, as all credential kinds now share one ID sequence; scripts using `headscale apikeys expire|delete --id` should look IDs up again or use `--prefix` [#3352](https://github.com/juanfont/headscale/pull/3352)
 - Deleting a user now clears the owner of its API keys and OAuth clients instead of leaving a dangling reference [#3352](https://github.com/juanfont/headscale/pull/3352)
 
+- Policy writes now keep only the current policy row and permanently remove older rows. Export any policy history you need before the next write; keep policy files in version control. Take a database backup before upgrading [#3619](https://github.com/juanfont/headscale/pull/3619)
+- Migrations add `nodes.auto_approved_routes`, `nodes.ephemeral` and `credentials.created_by_token`. Existing route approvals are treated as manual because their origin cannot be recovered. Existing nodes inherit ephemerality from the key they still reference; a key deleted before the upgrade cannot be used to recover that flag [#3619](https://github.com/juanfont/headscale/pull/3619)
+
+#### Policy
+
+- Tag ownership is no longer transitive. A user or group can claim only tags that name it directly in `tagOwners`; a credential's tags can grant only tags that name one of them directly. List the intended user, group or owning tag on every delegated tag before upgrading [#3619](https://github.com/juanfont/headscale/pull/3619)
+- A grant's `ip` entry accepts one port or port range. Replace `"tcp:80,443"` with `"tcp:80", "tcp:443"` [#3619](https://github.com/juanfont/headscale/pull/3619)
+- Policies declaring more than 100,000 destination/port-range combinations across ACLs and grants are rejected at load and write. Split or simplify the rules before upgrading; `autogroup:internet` counts its resolved prefixes [#3619](https://github.com/juanfont/headscale/pull/3619)
+- SSH `check` rules with a tag or `autogroup:tagged` in `src` are rejected. Use a user-owned source for reauthentication, or an `accept` rule for tagged sources. Numeric SSH login `0` is no longer treated as `root` [#3619](https://github.com/juanfont/headscale/pull/3619)
+- Policy `tests` now require an `accept` destination to be allowed for every node it resolves to, and reject an address range as the source. `sshTests` also reject address-range sources and `autogroup:member` destinations. Fix assertions that relied on partial matches or use specific source addresses and destinations. Offline `policy set` runs the same user-reference, `tests` and `sshTests` validation as an online write [#3619](https://github.com/juanfont/headscale/pull/3619)
+- User references match provider identifier first, then email, then username. When one user's email equals another user's username, the email owner wins. Ambiguous references are rejected on writes, including in grants and `nodeAttrs`; on startup or user updates they match no nodes and log an error. A bare `@` matches no user. Use stable provider identifiers to avoid access changing when an identity provider changes usernames or email addresses [#3619](https://github.com/juanfont/headscale/pull/3619)
+- A zero-byte policy write is rejected; use `{}` to allow all [#3619](https://github.com/juanfont/headscale/pull/3619)
+
+#### Nodes and routes
+
+- Deleting a user no longer deletes tagged pre-auth keys that user created: those keys belong to their tags and remain usable, with the creator reference cleared. Revoke them separately when deprovisioning the creator [#3619](https://github.com/juanfont/headscale/pull/3619)
+- Ephemerality is stored on the node and taken from its creation key. Re-registering with another key, including a permanent key, no longer changes it; deleting its key no longer makes it permanent. A user claiming a tagged node clears ephemerality. Delete and register a node again to change its lifetime otherwise [#3619](https://github.com/juanfont/headscale/pull/3619)
+- A client's earlier requested expiry is now stored, including for a tagged node without an expiry, and logging out expires tagged nodes too. A login keeping the same node key preserves the existing expiry; an expired node is asked to rotate that key before reauthentication. A spent, expired or revoked pre-auth key can only wake its existing live node; it cannot change its ownership, tags, key or expiry. SSH check approvals no longer survive node expiry or a change of source owner [#3619](https://github.com/juanfont/headscale/pull/3619)
+- Routes granted only by auto-approval lose that approval when the node withdraws them; advertising them again requires the current auto-approver policy or an administrator's approval. Existing approvals and explicit administrator approvals remain. Re-registering with the same node key and unchanged advertised routes no longer restores routes an administrator removed; a new node key or changed advertisement re-evaluates auto-approval [#3619](https://github.com/juanfont/headscale/pull/3619)
+- Route approval APIs and `autoApprovers.routes` reject prefixes with host bits set. Use the network address, for example `10.0.0.0/24` instead of `10.0.0.1/24` [#3619](https://github.com/juanfont/headscale/pull/3619)
+- Exit routes are offered only when a source's policy reaches the internet; an unrelated rule to a tailnet node or private subnet no longer exposes exit routes. Grant `autogroup:internet` access where exit-node use is intended [#3619](https://github.com/juanfont/headscale/pull/3619)
+- Subnet-route HA, including `via` groups, elects the online, healthy router with the oldest continuous control session. A reconnecting router returns as standby; a recovering router that kept its session may take its routes back [#3619](https://github.com/juanfont/headscale/pull/3619)
+- Duplicate stored node names are disambiguated in memory at startup, with the lowest node ID keeping the original name. New registrations and renames also reserve names held by extra DNS records, and collision suffixes fit within 63 bytes. Check affected nodes' MagicDNS names after upgrading; startup disambiguation is not written back to the database [#3619](https://github.com/juanfont/headscale/pull/3619)
+
+#### OIDC
+
+- Every login replaces the stored email with the provider's latest valid, verified email, or clears it when absent, malformed or unverified. With `oidc.email_verified_required: false`, verification is optional but absent or malformed email still clears the old value. Review policies using email addresses before upgrading [#3619](https://github.com/juanfont/headscale/pull/3619)
+- Logins whose subject would be changed by provider-identifier cleaning are rejected, rather than merged with another identifier. This includes subjects containing repeated or trailing slashes or surrounding whitespace; configure the provider to issue stable, unambiguous subjects [#3619](https://github.com/juanfont/headscale/pull/3619)
+- An OIDC SSH check requires confirmation on the displayed page before it is approved; completing the identity-provider callback alone no longer approves the session [#3619](https://github.com/juanfont/headscale/pull/3619)
+
+#### Control protocol
+
+- Netmaps expose a smaller `Hostinfo`: peers receive hostname, OS, services other than `peerapi-dns-proxy`, SSH host keys and AppConnector; the node's own entry receives hostname, requested tags, advertised routes and services. Other client-reported fields, including `ExitNodeID` and location, remain server-side [#3619](https://github.com/juanfont/headscale/pull/3619)
+- A connected expired peer can appear online, but its endpoints and DERP are withheld. Its own entry remains authorized and reports expiry through `KeyExpiry`, rather than the `Expired` flag. Consumers should use expiry to determine authorization [#3619](https://github.com/juanfont/headscale/pull/3619)
+- Each node may hold four map streams; opening a fifth closes its oldest stream [#3619](https://github.com/juanfont/headscale/pull/3619)
+
 #### API
 
 - The gRPC API is removed; all programmatic access now goes through the HTTP API at `/api/v1` [#3324](https://github.com/juanfont/headscale/pull/3324)
 - API errors are now RFC 7807 `application/problem+json`, including authentication failures, instead of the previous gRPC-status JSON shape [#3324](https://github.com/juanfont/headscale/pull/3324)
 - Errors that previously returned HTTP 500 — unknown users or nodes, malformed input, duplicate names — now return the correct 404, 400 or 409 [#3324](https://github.com/juanfont/headscale/pull/3324)
 - The OpenAPI document is OpenAPI 3.1 at `/api/v1/openapi.yaml` (docs at `/api/v1/docs`), replacing Swagger 2.0 at `/swagger` [#3324](https://github.com/juanfont/headscale/pull/3324)
+
+- The v2 key list omits spent, expired and revoked auth keys. An OAuth token without `all=true` lists only valid auth keys created through OAuth tokens, regardless of their tags; pass `all=true` to list all valid auth keys. The v1 list and `headscale preauthkeys list` omit revoked keys. Deleting an in-use ephemeral key revokes it and retains its row while referenced [#3619](https://github.com/juanfont/headscale/pull/3619)
+- A tagged OAuth client with the `all` scope can mint tokens only within its own tags. An OAuth token retagging a device must be allowed to assign every current tag as well as every requested tag; the operation replaces the tag set. Unpermitted tags return HTTP 400 [#3619](https://github.com/juanfont/headscale/pull/3619)
+- Each OAuth client retains its newest 1,000 access tokens; minting another invalidates the oldest even if it has not expired. Give long-lived integrations separate clients [#3619](https://github.com/juanfont/headscale/pull/3619)
+- V2 device `name` is the MagicDNS FQDN without the trailing dot. A tagged device's `user` names the creator of its join key when available, rather than the synthetic tagged-devices user, and admin-created tagged keys include `userId`. With `fields=all`, empty route lists are returned as `[]` [#3619](https://github.com/juanfont/headscale/pull/3619)
+- V2 requests with a schema-validated body are limited to 64 KiB. ACL writes and validation accept at most 1 MiB and have a five-second body-read timeout. Unknown `keyType` values now return HTTP 400 instead of creating an auth key. Error details omit submitted values and list at most 20 entries [#3619](https://github.com/juanfont/headscale/pull/3619)
 
 #### Configuration
 
@@ -109,6 +152,9 @@ the ACME DNS-01 challenge through a built-in DNS provider: `acmedns`,
 - `tls_cert_path`, `tls_key_path`, `tls_letsencrypt_*`, `acme_url` and `acme_email` are deprecated in favour of `tls.cert_path`, `tls.key_path` and `tls.acme.*` [#3554](https://github.com/juanfont/headscale/pull/3554)
   - The old keys continue to work, with a warning, but will be removed in a future release
 - Headscale's own ACME certificate is managed by CertMagic instead of autocert; the first start registers a new ACME account and obtains a new certificate in `tls.acme.cache_dir`, which now defaults to `/var/lib/headscale/cache` [#3554](https://github.com/juanfont/headscale/pull/3554)
+
+- Boolean configuration values that cannot be parsed as booleans now prevent startup or CLI initialization instead of silently becoming false. Use `true` and `false`. `database.gorm.prepare_stmt` is ignored with a warning and can be removed [#3619](https://github.com/juanfont/headscale/pull/3619)
+- Debug endpoints reject an unknown HTTP Host name. Use localhost, an IP address, or the configured `server_url` or `metrics_listen_addr` host; `/metrics` is exempt [#3619](https://github.com/juanfont/headscale/pull/3619)
 
 #### CLI
 
@@ -152,7 +198,11 @@ the ACME DNS-01 challenge through a built-in DNS provider: `acmedns`,
 - Reject overlapping TCP listener bindings (e.g. `listen_addr` vs ACME HTTP-01 on port 80) at config load [#3236](https://github.com/juanfont/headscale/pull/3236)
 - Improve config and bind-failure errors: every violation reported in one pass, named YAML keys, actionable operator hints [#3236](https://github.com/juanfont/headscale/pull/3236)
 - Ephemeral nodes that register but never connect are removed after `node.ephemeral.inactivity_timeout` instead of staying until restart [#3545](https://github.com/juanfont/headscale/pull/3545)
-- A node re-registered with a permanent key is no longer deleted by a timer armed while it was ephemeral [#3545](https://github.com/juanfont/headscale/pull/3545)
+- A stale ephemeral cleanup timer no longer deletes a tagged node claimed by a user. Ephemerality otherwise stays as set at creation, including after re-registration with another key [#3545](https://github.com/juanfont/headscale/pull/3545), [#3619](https://github.com/juanfont/headscale/pull/3619)
+
+- Deleting an ephemeral pre-auth key no longer makes its existing nodes permanent [#3640](https://github.com/juanfont/headscale/issues/3640), [#3619](https://github.com/juanfont/headscale/pull/3619)
+- User renames and OIDC profile updates refresh cached node users and connected clients without restarting headscale [#3471](https://github.com/juanfont/headscale/issues/3471), [#3619](https://github.com/juanfont/headscale/pull/3619)
+- A subnet router receives all of its own approved routes regardless of the policy granting it access to them [#3626](https://github.com/juanfont/headscale/issues/3626), [#3619](https://github.com/juanfont/headscale/pull/3619)
 
 ## 0.29.7 (2026-10-30)
 
