@@ -25,12 +25,14 @@ import (
 	"maps"
 	"net/http"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/servertest"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
@@ -44,46 +46,11 @@ import (
 // <test_id>/<step>/<node>/<check>. A listed check that matches fails, so a
 // fix must delete its entry.
 var mapStreamSkipReasons = map[string]string{
-	"map-delivery/S1.1/appc/frames":   policyResponseToEveryNode,
-	"map-delivery/S1.1/router/frames": policyResponseToEveryNode,
-	"map-delivery/S1.1/sshd/frames":   policyResponseToEveryNode,
-	"map-delivery/S1.2/appc/frames":   policyResponseToEveryNode,
-	"map-delivery/S1.2/router/frames": policyResponseToEveryNode,
-	"map-delivery/S1.2/sshd/frames":   policyResponseToEveryNode,
-	"map-delivery/S1.3/appc/frames":   policyResponseToEveryNode,
-	"map-delivery/S1.3/router/frames": policyResponseToEveryNode,
-	"map-delivery/S1.3/sshd/frames":   policyResponseToEveryNode,
-	"map-delivery/S1.4/appc/frames":   policyResponseToEveryNode,
-	"map-delivery/S1.4/router/frames": policyResponseToEveryNode,
-	"map-delivery/S1.4/sshd/frames":   policyResponseToEveryNode,
-
-	"map-delivery/S3.5-remove/db1/frames":  policyResponseToEveryNode,
-	"map-delivery/S3.5-restore/db1/frames": policyResponseToEveryNode,
-
 	"map-delivery/S2.5/laptop/endpoints-gap-bystander": restartEndpointsKept,
 	"map-delivery/S2.5/laptop/endpoints-gap-svc":       restartEndpointsKept,
-
-	"hidden-peers/S2/witness/presence":   policyResponseToEveryNode,
-	"hidden-peers/S8/observer/presence":  policyResponseToEveryNode,
-	"hidden-peers/S9/observer/presence":  policyResponseToEveryNode,
-	"hidden-peers/S10/observer/presence": policyResponseToEveryNode,
-	"hidden-peers/S13/observer/presence": policyResponseToEveryNode,
-	"route-announce/RA3/srv/presence":    policyResponseToEveryNode,
-	"route-announce/RA3/wit/presence":    policyResponseToEveryNode,
-	"route-announce/RA4/srv/presence":    policyResponseToEveryNode,
-	"route-announce/RA4/wit/presence":    policyResponseToEveryNode,
-	"route-announce/RA6/rtr/presence":    policyResponseToEveryNode,
-	"route-announce/RA6/srv/presence":    policyResponseToEveryNode,
-	"route-announce/RA6/wit/presence":    policyResponseToEveryNode,
-	"route-announce/RA9/rtr/presence":    policyResponseToEveryNode,
-	"route-announce/RA9/srv/presence":    policyResponseToEveryNode,
-	"route-announce/RA9/wit/presence":    policyResponseToEveryNode,
 }
 
-const (
-	policyResponseToEveryNode = "POLICY_RESPONSE_TO_EVERY_NODE: headscale sends every connected node a policy response when the policy, a node's tags or approved routes, or the set of nodes change; SaaS sends only the nodes whose peers or filter change"
-	restartEndpointsKept      = "RESTART_ENDPOINTS_KEPT: headscale keeps a restarted node's last endpoints at its peers until it reports new ones; SaaS sends peers the node without endpoints until then"
-)
+const restartEndpointsKept = "RESTART_ENDPOINTS_KEPT: headscale keeps a restarted node's last endpoints at its peers until it reports new ones; SaaS sends peers the node without endpoints until then"
 
 // mapStreamNotCompared lists, by key prefix, checks left out: SaaS's answer
 // there is in doubt, so it is no reference.
@@ -814,13 +781,38 @@ func deliveryChecks(d *deliveryStep) []stepCheck {
 
 		// A client without delta handling rebuilds its netmap, so its update
 		// count moves, on every map response but a keep-alive.
-		checks = append(checks, stepCheck{x + "/frames", saasDelivered(d.step.Frames[x]), func() string {
+		wantFrames := saasDelivered(d.step.Frames[x])
+		fresh := false
+
+		switch d.step.Name {
+		case "S2.1", "S2.3":
+			if x == "laptop" {
+				// Graph streams converge to current self DERP, including the
+				// reporting node; SaaS leaves its own entry unchanged.
+				wantFrames, fresh = "frame", true
+			}
+		case "S2.5":
+			fresh = x == "laptop"
+		case "S3.5-restore":
+			if x == "appc" || x == "router" || x == "sshd" {
+				// The restored grant changes none of these rendered views.
+				// Equality cutoff suppresses SaaS's redundant policy frames.
+				wantFrames, fresh = "silent", true
+			}
+		}
+
+		checks = append(checks, stepCheck{x + "/frames", wantFrames, func() string {
 			if cl.UpdateCount() > d.updates[x] {
 				return "frame"
 			}
 
 			return "silent"
 		}})
+		if fresh {
+			checks = append(checks, stepCheck{x + "/fresh-map", "equal", func() string {
+				return d.freshMapDifference(x)
+			}})
+		}
 	}
 
 	captured := slices.Sorted(maps.Keys(d.caps))
@@ -831,11 +823,41 @@ func deliveryChecks(d *deliveryStep) []stepCheck {
 			continue
 		}
 
+		wantEndpoints := selfEndpoints(saas)
+
+		if x == "laptop" && slices.Contains([]string{"S2.1", "S2.3", "S2.5"}, d.step.Name) {
+			// Expectations come from the replayed requests, not live State.
+			// In S2.5 the final request has port46245, while SaaS's self
+			// capture still has the pre-restart port38091.
+			var derp tailcfg.DERPRegionID
+
+			for _, f := range d.step.Frames[x] {
+				if req := f.Request; req != nil && !req.Stream {
+					if req.Hostinfo != nil && req.Hostinfo.NetInfo != nil {
+						derp = req.Hostinfo.NetInfo.PreferredDERP
+					}
+
+					if len(req.Endpoints) > 0 {
+						eps := make([]string, len(req.Endpoints))
+						for i, ap := range req.Endpoints {
+							eps[i] = ap.String()
+						}
+
+						wantEndpoints = sortedStrings(eps)
+					}
+				}
+			}
+
+			checks = append(checks, stepCheck{x + "/self-derp", strconv.FormatInt(int64(derp), 10), func() string {
+				return strconv.FormatInt(int64(cl.Netmap().SelfNode.HomeDERP()), 10)
+			}})
+		}
+
 		checks = append(checks,
 			stepCheck{x + "/peers", peerAliases(saas, r.saasAlias), func() string { return peerAliases(cl.Netmap(), r.hsAlias) }},
 			stepCheck{x + "/filter", renderMatches(saas, saasNames), func() string { return renderMatches(cl.Netmap(), r.addrNames()) }},
 			stepCheck{x + "/tags", selfTags(saas), func() string { return selfTags(cl.Netmap()) }},
-			stepCheck{x + "/self-endpoints", selfEndpoints(saas), func() string { return selfEndpoints(cl.Netmap()) }},
+			stepCheck{x + "/self-endpoints", wantEndpoints, func() string { return selfEndpoints(cl.Netmap()) }},
 		)
 	}
 
@@ -848,6 +870,87 @@ func deliveryChecks(d *deliveryStep) []stepCheck {
 	}
 
 	return checks
+}
+
+// freshMapDifference checks convergence independently of the running stream and
+// its render caches. Input-derived and captured checks above pin the content.
+func (d *deliveryStep) freshMapDifference(alias string) string {
+	nodes := d.r.machineNodes(alias)
+	if len(nodes) != 1 {
+		return fmt.Sprintf("devices %d", len(nodes))
+	}
+
+	hub := mapper.NewHub()
+	defer hub.Close()
+
+	fresh, err := mapper.NewStream(d.r.srv.State().DebugConfig(), hub, nodes[0].ID(), tailcfg.CurrentCapabilityVersion).Initial(d.r.srv.State().Snapshot())
+	if err != nil {
+		return err.Error()
+	}
+
+	if len(fresh) != 1 {
+		return fmt.Sprintf("initial frames %d", len(fresh))
+	}
+	// Compare the same raw-render -> wire -> client representations: the
+	// production server uses mapper.Marshal and controlclient uses json.Unmarshal.
+	// In particular, omitzero may omit an empty slice before Node.Equal sees it.
+	wire, err := mapper.Marshal(fresh[0])
+	if err != nil {
+		return err.Error()
+	}
+
+	var want tailcfg.MapResponse
+
+	err = json.Unmarshal(wire, &want)
+	if err != nil {
+		return err.Error()
+	}
+
+	got := d.r.clients[alias].Netmap()
+	// Match controlclient.initDisplayNames (control/controlclient/direct.go).
+	// These display names are computed after receipt, never sent by control.
+	suffix := netmap.MagicDNSSuffixOfNodeName(want.Node.Name)
+	self := want.Node.Clone()
+	self.InitDisplayNames(suffix)
+
+	if got == nil || !self.View().Equal(got.SelfNode) {
+		return "self differs"
+	}
+
+	if len(want.Peers) != len(got.Peers) {
+		return "peer count differs"
+	}
+
+	for i, p := range want.Peers {
+		peer := p.Clone()
+		peer.InitDisplayNames(suffix)
+
+		received := got.Peers[i].AsStruct()
+		// Match mapper's effective-node oracle (stream_test.go): clients
+		// retain LastSeen through Online=true patches but do not act on it.
+		// Offline LastSeen and every other field remain exact.
+		if peer.Online != nil && *peer.Online && received.Online != nil && *received.Online {
+			received.LastSeen = nil
+		}
+
+		if !peer.View().Equal(received.View()) {
+			return fmt.Sprintf("peer %d differs", p.ID)
+		}
+	}
+
+	if !slices.EqualFunc(want.PacketFilters["base"], got.PacketFilterRules.AsSlice(), func(a, b tailcfg.FilterRule) bool { return reflect.DeepEqual(a, b) }) {
+		return "packet filter differs"
+	}
+
+	if !reflect.DeepEqual(want.SSHPolicy, got.SSHPolicy) {
+		return "SSH policy differs"
+	}
+
+	if !reflect.DeepEqual(*want.DNSConfig, got.DNS) || !reflect.DeepEqual(want.DERPMap, got.DERPMap) || want.Domain != got.Domain {
+		return "DNS, DERP or domain differs"
+	}
+
+	return "equal"
 }
 
 // subjectChecks compares how v sees x: online, last seen while offline, its

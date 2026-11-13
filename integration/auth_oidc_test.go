@@ -552,7 +552,11 @@ func TestOIDCReloginSameNodeNewUser(t *testing.T) {
 	var nodeID uint64
 
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status := ts.MustStatus()
+		status := assertClientStatus(ct, ts)
+		if status == nil || !assert.NotNil(ct, status.Self, "Missing self in status for client %s", ts.Hostname()) {
+			return
+		}
+
 		assert.NotEmpty(ct, status.Self.ID, "Node ID should be populated in status")
 
 		var err error
@@ -564,7 +568,7 @@ func TestOIDCReloginSameNodeNewUser(t *testing.T) {
 	expectedNodes = append(expectedNodes, types.NodeID(nodeID))
 
 	// Validate initial connection state for user1
-	validateInitialConnection(t, headscale, expectedNodes)
+	validateInitialConnection(t, headscale, []TailscaleClient{ts}, expectedNodes)
 
 	// Log out user1 and log in user2, this should create a new node
 	// for user2, the node should have the same machine key and
@@ -582,8 +586,11 @@ func TestOIDCReloginSameNodeNewUser(t *testing.T) {
 	t.Logf("Waiting for user1 logout completion at %s", time.Now().Format(TimestampFormat))
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
 		// Check that the first logout completed
-		status, err := ts.Status()
-		assert.NoError(ct, err, "Failed to get client status during logout validation")
+		status := assertClientStatus(ct, ts)
+		if status == nil {
+			return
+		}
+
 		assert.Equal(ct, "NeedsLogin", status.BackendState, "Expected NeedsLogin state after logout, got %s", status.BackendState)
 	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for user1 logout to complete before user2 login")
 
@@ -718,8 +725,11 @@ func TestOIDCReloginSameNodeNewUser(t *testing.T) {
 	t.Logf("Waiting for user2 logout completion at %s", time.Now().Format(TimestampFormat))
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
 		// Check that the first logout completed
-		status, err := ts.Status()
-		assert.NoError(ct, err, "Failed to get client status during user2 logout validation")
+		status := assertClientStatus(ct, ts)
+		if status == nil {
+			return
+		}
+
 		assert.Equal(ct, "NeedsLogin", status.BackendState, "Expected NeedsLogin state after user2 logout, got %s", status.BackendState)
 	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for user2 logout to complete before user1 relogin")
 
@@ -753,8 +763,11 @@ func TestOIDCReloginSameNodeNewUser(t *testing.T) {
 
 	t.Logf("Waiting for user1 relogin completion at %s", time.Now().Format(TimestampFormat))
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := ts.Status()
-		assert.NoError(ct, err, "Failed to get client status during user1 relogin validation")
+		status := assertClientStatus(ct, ts)
+		if status == nil {
+			return
+		}
+
 		assert.Equal(ct, "Running", status.BackendState, "Expected Running state after user1 relogin, got %s", status.BackendState)
 	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for user1 relogin to complete (final login)")
 
@@ -929,11 +942,16 @@ func TestOIDCFollowUpUrl(t *testing.T) {
 	var newUrl *url.URL
 
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		st, err := ts.Status()
-		assert.NoError(c, err)
+		st := assertClientStatus(c, ts)
+		if st == nil {
+			return
+		}
+
 		assert.Equal(c, "NeedsLogin", st.BackendState)
 
 		// get new AuthURL from daemon
+		var err error
+
 		newUrl, err = url.Parse(st.AuthURL)
 		assert.NoError(c, err)
 
@@ -1204,7 +1222,11 @@ func TestOIDCReloginSameNodeSameUser(t *testing.T) {
 	var nodeID uint64
 
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status := ts.MustStatus()
+		status := assertClientStatus(ct, ts)
+		if status == nil || !assert.NotNil(ct, status.Self, "Missing self in status for client %s", ts.Hostname()) {
+			return
+		}
+
 		assert.NotEmpty(ct, status.Self.ID, "Node ID should be populated in status")
 
 		var err error
@@ -1216,7 +1238,7 @@ func TestOIDCReloginSameNodeSameUser(t *testing.T) {
 	expectedNodes = append(expectedNodes, types.NodeID(nodeID))
 
 	// Validate initial connection state for user1
-	validateInitialConnection(t, headscale, expectedNodes)
+	validateInitialConnection(t, headscale, []TailscaleClient{ts}, expectedNodes)
 
 	// Store initial node keys for comparison
 	initialMachineKey := initialNodes[0].MachineKey
@@ -1237,8 +1259,11 @@ func TestOIDCReloginSameNodeSameUser(t *testing.T) {
 	t.Logf("Waiting for user1 logout completion at %s", time.Now().Format(TimestampFormat))
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
 		// Check that the logout completed
-		status, err := ts.Status()
-		assert.NoError(ct, err, "Failed to get client status during logout validation")
+		status := assertClientStatus(ct, ts)
+		if status == nil {
+			return
+		}
+
 		assert.Equal(ct, "NeedsLogin", status.BackendState, "Expected NeedsLogin state after logout, got %s", status.BackendState)
 	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for user1 logout to complete before same-user relogin")
 
@@ -1259,8 +1284,11 @@ func TestOIDCReloginSameNodeSameUser(t *testing.T) {
 
 	t.Logf("Waiting for user1 relogin completion at %s", time.Now().Format(TimestampFormat))
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := ts.Status()
-		assert.NoError(ct, err, "Failed to get client status during relogin validation")
+		status := assertClientStatus(ct, ts)
+		if status == nil {
+			return
+		}
+
 		assert.Equal(ct, "Running", status.BackendState, "Expected Running state after user1 relogin, got %s", status.BackendState)
 	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for user1 relogin to complete (same user)")
 
@@ -1631,8 +1659,10 @@ func TestOIDCACLPolicyOnJoin(t *testing.T) {
 	t.Logf("Verifying OIDC user can immediately see advertised routes at %s", time.Now().Format(TimestampFormat))
 
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := oidcClient.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, oidcClient)
+		if status == nil || !assert.NotNil(ct, status.Self, "Missing self in status for client %s", oidcClient.Hostname()) {
+			return
+		}
 
 		// Find the gateway peer in the OIDC user's peer list
 		var gatewayPeer *ipnstate.PeerStatus
@@ -1672,8 +1702,10 @@ func TestOIDCACLPolicyOnJoin(t *testing.T) {
 	// Verify that the Gateway node sees the OIDC node's advertised route (AutoApproveRoutes check)
 	t.Logf("Verifying Gateway user can immediately see OIDC advertised routes at %s", time.Now().Format(TimestampFormat))
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := gatewayClient.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, gatewayClient)
+		if status == nil || !assert.NotNil(ct, status.Self, "Missing self in status for client %s", gatewayClient.Hostname()) {
+			return
+		}
 
 		// Find the OIDC peer in the Gateway user's peer list
 		var oidcPeer *ipnstate.PeerStatus
@@ -1834,8 +1866,11 @@ func TestOIDCReloginSameUserRoutesPreserved(t *testing.T) {
 
 	// Wait for client to be running
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := ts.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, ts)
+		if status == nil {
+			return
+		}
+
 		assert.Equal(ct, "Running", status.BackendState)
 	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for initial login to complete")
 
@@ -1876,8 +1911,11 @@ func TestOIDCReloginSameUserRoutesPreserved(t *testing.T) {
 
 	// Wait for logout to complete
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := ts.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, ts)
+		if status == nil {
+			return
+		}
+
 		assert.Equal(ct, "NeedsLogin", status.BackendState, "Expected NeedsLogin state after logout")
 	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for logout to complete")
 
@@ -1901,8 +1939,11 @@ func TestOIDCReloginSameUserRoutesPreserved(t *testing.T) {
 
 	// Wait for client to be running
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := ts.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, ts)
+		if status == nil {
+			return
+		}
+
 		assert.Equal(ct, "Running", status.BackendState, "Expected Running state after relogin")
 	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for relogin to complete")
 

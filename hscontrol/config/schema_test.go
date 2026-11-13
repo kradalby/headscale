@@ -261,14 +261,29 @@ func TestExamples(t *testing.T) {
 
 			l, err := Load(writeConfig(t, string(file)), true, nil)
 			require.NoError(t, err)
-			require.Empty(t, l.Warnings)
+
+			if slices.Contains([]string{"tuning.batcher_workers", "tuning.node_mapsession_buffered_chan_size"}, k.Path) {
+				require.Len(t, l.Warnings, 1)
+				require.Contains(t, l.Warnings[0], k.Path)
+				require.Contains(t, l.Warnings[0], l.File)
+				require.Contains(t, l.Warnings[0], "has no effect with graph map streams")
+			} else {
+				require.Empty(t, l.Warnings)
+			}
+
 			require.JSONEq(t, example, jsonText(t, plainFields(l.Config, false)[k.Path]), "file layer:\n%s", file)
 
 			env := k.Env + "=" + envValue(k.Example)
 
 			l, err = Load(empty, true, []string{env})
 			require.NoError(t, err)
-			require.Empty(t, l.Warnings)
+
+			if slices.Contains([]string{"tuning.batcher_workers", "tuning.node_mapsession_buffered_chan_size"}, k.Path) {
+				require.Equal(t, []string{k.Path + " (env " + k.Env + ") has no effect with graph map streams; remove it from the configuration"}, l.Warnings)
+			} else {
+				require.Empty(t, l.Warnings)
+			}
+
 			require.JSONEq(t, example, jsonText(t, plainFields(l.Config, false)[k.Path]), "env layer: %s", env)
 		})
 	}
@@ -335,7 +350,13 @@ func TestEnvValue(t *testing.T) {
 			for _, key := range tt.keys {
 				l, err := Load(empty, true, []string{configEnvName(key) + "=" + got})
 				require.NoError(t, err)
-				require.Empty(t, l.Warnings)
+
+				if key == "tuning.batcher_workers" {
+					require.Equal(t, []string{key + " (env " + configEnvName(key) + ") has no effect with graph map streams; remove it from the configuration"}, l.Warnings)
+				} else {
+					require.Empty(t, l.Warnings)
+				}
+
 				require.JSONEq(t, jsonText(t, tt.v), jsonText(t, plainFields(l.Config, false)[key]), key)
 			}
 		})

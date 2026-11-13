@@ -1,9 +1,11 @@
 package types
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -422,6 +424,19 @@ func TestNodeFQDN(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestStoredDataFixHint pins the command each kind of invalid stored node
+// data is repaired with; the boot scan and the map renderer both log it.
+func TestStoredDataFixHint(t *testing.T) {
+	_, expiryErr := ValidateExpiry(time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC))
+	nameErr := ValidateGivenName("", "example.test")
+
+	require.ErrorIs(t, expiryErr, ErrExpiryOutOfRange)
+	require.Error(t, nameErr)
+
+	assert.Equal(t, "headscale nodes expire --identifier 7", StoredDataFixHint(7, expiryErr))
+	assert.Equal(t, "headscale nodes rename 7 <name>", StoredDataFixHint(7, nameErr))
 }
 
 func TestValidateGivenName(t *testing.T) {
@@ -988,6 +1003,12 @@ func TestHasPolicyChangeFields(t *testing.T) {
 		want   bool
 	}{
 		{name: "no change", mutate: func(*Node) {}, want: false},
+		{name: "unannounced manual approval", mutate: func(n *Node) { n.ApprovedRoutes = []netip.Prefix{subnet} }, want: true},
+		{name: "unannounced exit approval", mutate: func(n *Node) { n.ApprovedRoutes = []netip.Prefix{exit} }, want: false},
+		{name: "automatic approval metadata", mutate: func(n *Node) { n.AutoApprovedRoutes = []netip.Prefix{subnet} }, want: false},
+		{name: "control address", mutate: func(n *Node) { n.LastControlAddress = new(netip.MustParseAddr("192.0.2.1")) }, want: false},
+		{name: "ephemeral", mutate: func(n *Node) { n.Ephemeral = true }, want: false},
+		{name: "session start", mutate: func(n *Node) { n.SessionStart = time.Now() }, want: false},
 		{name: "last seen", mutate: func(n *Node) { n.LastSeen = new(time.Now()) }, want: false},
 		{name: "expiry", mutate: func(n *Node) { n.Expiry = new(time.Now()) }, want: false},
 		{name: "hostname", mutate: func(n *Node) { n.Hostname = "other" }, want: false},
@@ -1046,6 +1067,33 @@ func TestHasPolicyChangeFields(t *testing.T) {
 
 			require.Equal(t, tt.want, other.View().HasPolicyChange(base.View()))
 		})
+	}
+}
+
+// nodePolicyInputs classifies every Node field: true when the policy
+// reads it, so HasPolicyChange must compare it. ID is read too, but a
+// changed ID is another node, which the node table reports on its own.
+var nodePolicyInputs = map[string]bool{
+	"IPv4": true, "IPv6": true, "UserID": true, "User": true, "Tags": true,
+	"ApprovedRoutes": true, "Hostinfo": true,
+	"ID": false, "MachineKey": false, "NodeKey": false, "DiscoKey": false,
+	"Endpoints": false, "Hostname": false, "GivenName": false,
+	"RegisterMethod": false, "AuthKeyID": false, "AuthKey": false,
+	"Expiry": false, "LastSeen": false, "CreatedAt": false, "UpdatedAt": false,
+	"DeletedAt": false, "IsOnline": false, "Unhealthy": false,
+	"ActiveSessions": false, "SessionEpoch": false, "ReportGen": false,
+	"LastControlAddress": false, "Ephemeral": false, "AutoApprovedRoutes": false, "SessionStart": false,
+}
+
+// TestHasPolicyChangeCoversEveryNodeField fails on a Node field nobody
+// classified: a policy input HasPolicyChange misses is a policy that is
+// never recompiled when it changes.
+func TestHasPolicyChangeCoversEveryNodeField(t *testing.T) {
+	for f := range reflect.TypeFor[Node]().Fields() {
+		if _, ok := nodePolicyInputs[f.Name]; f.IsExported() && !ok {
+			t.Errorf("Node.%s is not in nodePolicyInputs; if the policy reads it, "+
+				"teach HasPolicyChange and TestHasPolicyChangeFields", f.Name)
+		}
 	}
 }
 
@@ -1392,6 +1440,50 @@ func canAccessRouteReference(
 	return false
 }
 
+// unrenderedFields are the [Node] fields SameRender ignores.
+var unrenderedFields = []string{"Unhealthy", "ActiveSessions", "SessionEpoch", "ReportGen", "UpdatedAt", "SessionStart", "LastControlAddress", "Ephemeral", "AutoApprovedRoutes"}
+
+// TestSameRenderIgnoresOnlyUnrenderedFields changes each unrendered field
+// and a rendered one, and checks every unrendered name is a Node field, so
+// a rename cannot silently widen what SameRender ignores.
+func TestSameRenderIgnoresOnlyUnrenderedFields(t *testing.T) {
+	typ := reflect.TypeFor[Node]()
+	for _, name := range unrenderedFields {
+		_, ok := typ.FieldByName(name)
+		require.True(t, ok, "Node has no field %s", name)
+	}
+
+	base := &Node{ID: 1, Hostname: "a", Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")}}
+
+	hidden := *base
+	hidden.Unhealthy, hidden.ActiveSessions, hidden.SessionEpoch, hidden.ReportGen, hidden.UpdatedAt = true, 2, 7, 9, time.Now()
+	hidden.SessionStart, hidden.LastControlAddress, hidden.Ephemeral, hidden.AutoApprovedRoutes = time.Now(), new(netip.MustParseAddr("192.0.2.3")), true, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}
+	assert.True(t, base.View().SameRender(hidden.View()))
+
+	moved := *base
+	moved.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.2:41641")}
+	assert.False(t, base.View().SameRender(moved.View()))
+
+	online := *base
+	online.IsOnline = new(true)
+	assert.False(t, base.View().SameRender(online.View()))
+
+	// LastSeen renders only for an offline node.
+	seen := online
+	seen.LastSeen = new(time.Now())
+	assert.True(t, online.View().SameRender(seen.View()), "LastSeen of an online node is not rendered")
+
+	offline, offlineSeen := *base, *base
+	offline.IsOnline, offlineSeen.IsOnline = new(false), new(false)
+	offlineSeen.LastSeen = new(time.Now())
+	assert.False(t, offline.View().SameRender(offlineSeen.View()), "LastSeen of an offline node is")
+
+	// An expired node renders from the clock, so no two records are the same.
+	expired := *base
+	expired.Expiry = new(time.Now().Add(-time.Minute))
+	assert.False(t, expired.View().SameRender(expired.View()), "an expired node always renders anew")
+}
+
 func TestValidateHostinfo(t *testing.T) {
 	t.Parallel()
 
@@ -1449,4 +1541,118 @@ func TestValidateHostinfo(t *testing.T) {
 			require.True(t, want.Equal(tt.hostinfo), "validation must not change the report")
 		})
 	}
+}
+
+// TestApprovedRoutesLongLists checks the set lookup a long approval list
+// takes keeps the announced order and drops what is not approved.
+func TestApprovedRoutesLongLists(t *testing.T) {
+	const smallRouteList = 16
+
+	announced := make([]netip.Prefix, 0, 3*smallRouteList+2)
+
+	var approved, wantSubnets []netip.Prefix
+
+	for i := range 3 * smallRouteList {
+		p := netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(i), 0, 0}), 16)
+		announced = append(announced, p)
+
+		if i%3 != 0 {
+			approved = append(approved, p)
+			wantSubnets = append(wantSubnets, p)
+		}
+	}
+
+	exit := netip.MustParsePrefix("0.0.0.0/0")
+	announced = append(announced, exit, netip.MustParsePrefix("::/0"))
+
+	slices.Reverse(approved)
+	approved = append(approved, exit, netip.MustParsePrefix("192.0.2.0/24"))
+
+	n := &Node{Hostinfo: &tailcfg.Hostinfo{RoutableIPs: announced}, ApprovedRoutes: approved}
+	require.Greater(t, len(n.ApprovedRoutes), smallRouteList)
+
+	assert.Equal(t, wantSubnets, n.SubnetRoutes())
+	assert.Equal(t, []netip.Prefix{exit}, n.ExitRoutes())
+}
+
+func TestSameRenderComparesOwnerWireProfile(t *testing.T) {
+	user := &User{ID: 1, Name: "owner", Provider: "cli", DisplayName: "Owner", ProfilePicURL: "avatar"}
+	base := &Node{ID: 1, UserID: new(user.ID), User: user, AuthKeyID: new(uint64(1)), AuthKey: &Credential{UserID: new(user.ID), User: user}}
+
+	for _, tt := range []struct {
+		name   string
+		mutate func(*Node)
+		same   bool
+	}{
+		{"provider-only", func(n *Node) { n.User.Provider = "oidc" }, true},
+		{"user-updated-at", func(n *Node) { n.User.UpdatedAt = time.Now() }, true},
+		{"credential-creator-profile", func(n *Node) { n.AuthKey.User.Name = "creator-renamed" }, true},
+		{"credential-id", func(n *Node) { n.AuthKeyID = new(uint64(2)) }, true},
+		{"owner-name", func(n *Node) { n.User.Name = "renamed" }, false},
+		{"owner-email", func(n *Node) { n.User.Email = "owner@example.com" }, false},
+		{"owner-display-name", func(n *Node) { n.User.DisplayName = "Renamed" }, false},
+		{"owner-avatar", func(n *Node) { n.User.ProfilePicURL = "new-avatar" }, false},
+		{"owner-id", func(n *Node) { n.User.ID = 2; n.UserID = new(uint(2)) }, false},
+		{"owner-missing", func(n *Node) { n.User = nil }, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			changed := base.Clone()
+			tt.mutate(changed)
+			assert.Equal(t, tt.same, base.View().SameRender(changed.View()))
+		})
+	}
+
+	fallback := base.Clone()
+	fallback.User.Name = ""
+	fallback.User.DisplayName = ""
+	changed := fallback.Clone()
+	changed.User.ProviderIdentifier = sql.NullString{String: "https://issuer.test/owner", Valid: true}
+	assert.False(t, fallback.View().SameRender(changed.View()), "provider identifier participates in the login-name fallback")
+
+	tagged := base.Clone()
+	tagged.Tags = []string{"tag:server"}
+	changed = tagged.Clone()
+	changed.User.Name = "creator-name"
+	changed.AuthKey.User.Provider = "creator-provider"
+	assert.True(t, tagged.View().SameRender(changed.View()), "tagged maps use the fixed tagged owner, while creator metadata stays administrative")
+}
+
+func TestSameRenderComparesHostinfoWireFields(t *testing.T) {
+	base := &Node{ID: 1, Hostinfo: &tailcfg.Hostinfo{Hostname: "node", OS: "linux"}}
+
+	for _, tt := range []struct {
+		name   string
+		mutate func(*tailcfg.Hostinfo)
+		same   bool
+	}{
+		{"device-model", func(hi *tailcfg.Hostinfo) { hi.DeviceModel = "new model" }, true},
+		{"os-version", func(hi *tailcfg.Hostinfo) { hi.OSVersion = "new version" }, true},
+		{"netinfo-metadata", func(hi *tailcfg.Hostinfo) {
+			hi.NetInfo = &tailcfg.NetInfo{DERPLatency: map[string]float64{"1-v4": 0.02}}
+		}, true},
+		{"app-connector-false", func(hi *tailcfg.Hostinfo) { hi.AppConnector.Set(false) }, true},
+		{"hostname", func(hi *tailcfg.Hostinfo) { hi.Hostname = "renamed" }, false},
+		{"os", func(hi *tailcfg.Hostinfo) { hi.OS = "windows" }, false},
+		{"request-tags", func(hi *tailcfg.Hostinfo) { hi.RequestTags = []string{"tag:server"} }, false},
+		{"routable-ips", func(hi *tailcfg.Hostinfo) { hi.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")} }, false},
+		{"services", func(hi *tailcfg.Hostinfo) { hi.Services = []tailcfg.Service{{Proto: tailcfg.PeerAPIDNS, Port: 1}} }, false},
+		{"ssh-host-keys", func(hi *tailcfg.Hostinfo) { hi.SSH_HostKeys = []string{"ssh-key"} }, false},
+		{"app-connector-true", func(hi *tailcfg.Hostinfo) { hi.AppConnector.Set(true) }, false},
+		{"preferred-derp", func(hi *tailcfg.Hostinfo) { hi.NetInfo = &tailcfg.NetInfo{PreferredDERP: 1} }, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			changed := base.Clone()
+			tt.mutate(changed.Hostinfo)
+			assert.Equal(t, tt.same, base.View().SameRender(changed.View()))
+
+			if tt.same {
+				assert.True(t, SelfHostinfo(base.Hostinfo.View()).Equal(SelfHostinfo(changed.Hostinfo.View())))
+				assert.True(t, PeerHostinfo(base.Hostinfo.View()).Equal(PeerHostinfo(changed.Hostinfo.View())))
+			}
+		})
+	}
+
+	missing := base.Clone()
+	missing.Hostinfo = nil
+	assert.False(t, base.View().SameRender(missing.View()))
 }

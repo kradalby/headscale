@@ -19,18 +19,20 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/iotest"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/juanfont/headscale/hscontrol/capver"
-	"github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/dns/dnstest"
+	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 	"tailscale.com/control/ts2021"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netutil"
@@ -537,6 +539,61 @@ func requireBelowFloorRejected(t *testing.T, rec *httptest.ResponseRecorder) {
 	assert.Contains(t, rec.Body.String(), ErrUnsupportedClientVersion.Error())
 }
 
+// TestRegistrationHandler_LogoutOfAChangedRegistration pins the wire shape of
+// a logout refused because its node changed under it: HTTP 200 with the
+// refusal in RegisterResponse.Error, which controlclient surfaces, and nothing
+// a client could act on — no AuthURL, no authorization, no cache entry.
+func TestRegistrationHandler_LogoutOfAChangedRegistration(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(t *testing.T, app *Headscale, node types.NodeView)
+	}{
+		{"deleted", func(t *testing.T, app *Headscale, node types.NodeView) {
+			t.Helper()
+			require.NoError(t, app.state.DeleteNode(node))
+		}},
+		{"rekeyed", func(t *testing.T, app *Headscale, node types.NodeView) {
+			t.Helper()
+
+			rekeyed := node.AsStruct()
+			rekeyed.NodeKey = key.NewNode().Public()
+			app.state.PutNodeInStoreForTest(*rekeyed)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := createTestApp(t)
+			defer func() { require.NoError(t, app.state.Close()) }()
+
+			user := app.state.CreateUserForTest("logout-wire")
+			pak, err := app.state.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+			require.NoError(t, err)
+
+			machine := key.NewMachine().Public()
+			nodeKey := key.NewNode().Public()
+			node, err := app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+				Auth: &tailcfg.RegisterResponseAuth{AuthKey: pak.Key}, NodeKey: nodeKey,
+				Hostinfo: &tailcfg.Hostinfo{Hostname: "logout-wire"},
+			}, machine)
+			require.NoError(t, err)
+
+			app.state.SetBeforeLogoutWriteForTest(func() { tc.change(t, app, node) })
+
+			ns := &noiseServer{headscale: app, machineKey: machine}
+			rec := serveRegister(t, ns, tailcfg.RegisterRequest{
+				Version: capver.MinSupportedCapabilityVersion,
+				NodeKey: nodeKey,
+				Expiry:  time.Unix(123, 0),
+			})
+			require.Equal(t, http.StatusOK, rec.Code, "controlclient only surfaces RegisterResponse.Error with HTTP 200")
+
+			var response tailcfg.RegisterResponse
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+			assert.Equal(t, tailcfg.RegisterResponse{Error: "node registration changed"}, response)
+			assert.Zero(t, app.state.DebugRegistrationCache()["current_len"], "a refused logout must not start a registration")
+		})
+	}
+}
+
 // TestRegistrationHandler_BelowFloorLeavesNoStateChange pins that the
 // capability floor is checked before [Headscale.handleRegister]. A logout,
 // pre-auth key use or auth-cache write that ran first would not be undone by
@@ -773,8 +830,8 @@ func newSSHActionRequest(t *testing.T, src, dst types.NodeID) *http.Request {
 }
 
 // putTestNodeInStore creates a node via the database test helper and
-// also stages it into the in-memory [state.NodeStore] so handlers that read
-// [state.NodeStore]-backed APIs (e.g. [state.State.GetNodeByID]) can see it.
+// also stages it in memory so handlers that read the snapshot (e.g.
+// [state.State.GetNodeByID]) can see it.
 func putTestNodeInStore(t *testing.T, app *Headscale, user *types.User, hostname string) *types.Node {
 	t.Helper()
 
@@ -1197,10 +1254,8 @@ func newSSHVerdictFixture(t *testing.T) *sshVerdictFixture {
 		// autogroup:self compares hydrated users.
 		node.User = user
 
-		// SaveNode refreshes the policy manager's nodes, which
-		// SSHCheckParams resolves against.
-		_, _, err := app.state.SaveNode(node.View())
-		require.NoError(t, err)
+		// SSHCheckParams resolves against the nodes in memory.
+		app.state.PutNodeInStoreForTest(*node)
 
 		ids[i] = node.ID
 	}
@@ -1560,7 +1615,7 @@ func TestPollNetMapHandler_DeletedNodeGetsNotFound(t *testing.T) {
 			nodeView, ok := app.state.GetNodeByID(node.ID)
 			require.True(t, ok)
 
-			_, err := app.state.DeleteNode(nodeView)
+			err := app.state.DeleteNode(nodeView)
 			require.NoError(t, err)
 
 			ns := &noiseServer{headscale: app, machineKey: node.MachineKey}
@@ -1615,12 +1670,14 @@ func challengeValue(seed string) string {
 func setDNSTestApp(t *testing.T) (*Headscale, *dnstest.Provider) {
 	t.Helper()
 
-	app := createTestApp(t)
-	app.cfg.DNSConfig.BaseDomain = setDNSZone
-	app.cfg.DNSConfig.Certificates = types.CertificatesConfig{Enabled: true, Zone: setDNSZone}
-
 	provider := &dnstest.Provider{}
-	app.challenges = dns.NewChallenges(provider, setDNSZone, nil, 0)
+	app := createTestApp(t, func(cfg *types.Config) {
+		cfg.DNSConfig.BaseDomain = setDNSZone
+		cfg.DNSConfig.Certificates = types.CertificatesConfig{Enabled: true, Zone: setDNSZone}
+		cfg.DNSConfig.Challenge.Provider = provider
+		cfg.DNSConfig.Challenge.PropagationTimeout = 0
+		cfg.DNSConfig.MagicDNS = true
+	})
 	t.Cleanup(app.challenges.Close)
 
 	return app, provider
@@ -1841,6 +1898,34 @@ func TestSetDNSHandler(t *testing.T) {
 	}
 }
 
+func TestSetDNSHandlerExtraRecordsReload(t *testing.T) {
+	app, provider := setDNSTestApp(t)
+	app.cfg.DNSConfig.BaseDomain = "changed.example.com"
+	app.cfg.DNSConfig.Certificates.Enabled = false
+	user := app.state.CreateUserForTest("set-dns-reload")
+	laptop := putCertNode(t, app, user, "laptop")
+	ns := &noiseServer{headscale: app, machineKey: laptop.MachineKey}
+	req := tailcfg.SetDNSRequest{
+		Version: tailcfg.CurrentCapabilityVersion,
+		NodeKey: laptop.NodeKey,
+		Name:    "_acme-challenge.laptop." + setDNSZone,
+		Type:    "TXT",
+		Value:   challengeValue("reload"),
+	}
+
+	app.state.SetExtraRecords([]tailcfg.DNSRecord{{Name: "www.LAPTOP." + setDNSZone + ".", Type: "A", Value: "100.64.0.99"}})
+
+	denied := setDNS(t, ns, req)
+	require.Equal(t, http.StatusForbidden, denied.Code, denied.Body.String())
+	assert.Empty(t, provider.Calls())
+
+	app.state.SetExtraRecords(nil)
+
+	allowed := setDNS(t, ns, req)
+	require.Equal(t, http.StatusOK, allowed.Code, allowed.Body.String())
+	assert.Equal(t, []string{req.Value}, provider.Values(req.Name+"."))
+}
+
 // TestSetDNSHandlerProviderErrors pins the status codes the client shows
 // when publishing fails after validation passed.
 func TestSetDNSHandlerProviderErrors(t *testing.T) {
@@ -1940,7 +2025,9 @@ func TestPollNetMapHandler_AcceptsClientReport(t *testing.T) {
 
 	app := createTestApp(t)
 	user := app.state.CreateUserForTest("report-map-user")
-	node := putTestNodeInStore(t, app, user, "report-map-node")
+	// Registered, so it has addresses and its peer below sees it.
+	node := app.state.CreateRegisteredNodeForTest(user, "report-map-node")
+	app.state.PutNodeInStoreForTest(*node)
 
 	endpoints := make([]netip.AddrPort, types.MaxEndpoints+1)
 	for i := range endpoints {
@@ -1978,10 +2065,33 @@ func TestPollNetMapHandler_AcceptsClientReport(t *testing.T) {
 	assert.True(t, report.Hostinfo.Equal(stored.Hostinfo().AsStruct()),
 		"accepted Hostinfo must remain unchanged, including lists longer than 256 entries")
 
-	c, err := app.state.UpdateNodeFromMapRequest(node.ID, report)
+	// Online, as a reporting client is: a disconnected node's render
+	// carries the LastSeen every report stamps.
+	app.state.Connect(node.ID)
+
+	peer := app.state.CreateRegisteredNodeForTest(user, "report-map-peer")
+	app.state.PutNodeInStoreForTest(*peer)
+
+	stream := mapper.NewStream(app.cfg, app.MapHub(), peer.ID, tailcfg.CurrentCapabilityVersion)
+	_, err := stream.Initial(app.state.Snapshot())
 	require.NoError(t, err)
-	assert.True(t, c.IsEmpty(),
-		"an unchanged report must not be a change, got %s", c.Type())
+
+	var rowWrites atomic.Int32
+
+	require.NoError(t, app.state.DB().DB.Callback().Update().Before("gorm:update").
+		Register("count_node_update", func(tx *gorm.DB) {
+			if tx.Statement.Table == "nodes" {
+				rowWrites.Add(1)
+			}
+		}))
+
+	err = app.state.UpdateNodeFromMapRequest(node.ID, report)
+	require.NoError(t, err)
+
+	resps, err := stream.Update(app.state.Snapshot())
+	require.NoError(t, err)
+	assert.Empty(t, resps, "an unchanged report must not be a change")
+	assert.Zero(t, rowWrites.Load(), "an unchanged report must not rewrite the row")
 }
 
 func TestPollNetMapHandler_RejectsOversizedClientReport(t *testing.T) {

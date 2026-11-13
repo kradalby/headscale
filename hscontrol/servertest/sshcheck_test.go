@@ -259,9 +259,8 @@ func TestSSHCheckApprovalDroppedAfterSourceTagConversion(t *testing.T) {
 "ssh":[{"action":"check","src":["harness-default@"],
 "dst":["tag:server"],"users":["autogroup:nonroot"],"checkPeriod":"1h"}]}`))
 
-	_, c, err := h.Server.State().SetNodeTags(dstID, []string{"tag:server"})
+	_, err := h.Server.State().SetNodeTags(dstID, []string{"tag:server"})
 	require.NoError(t, err)
-	h.Server.App.Change(c)
 
 	initial := pollSSHAction(t, h.Server.URL, h.Client(1), srcID, dstID, "")
 	require.NotEmpty(t, initial.HoldAndDelegate)
@@ -275,9 +274,9 @@ func TestSSHCheckApprovalDroppedAfterSourceTagConversion(t *testing.T) {
 	cached := pollSSHAction(t, h.Server.URL, h.Client(1), srcID, dstID, "")
 	require.True(t, cached.Accept)
 
-	_, c, err = h.Server.State().SetNodeTags(srcID, []string{"tag:ci"})
+	_, err = h.Server.State().SetNodeTags(srcID, []string{"tag:ci"})
 	require.NoError(t, err)
-	h.Server.App.Change(c)
+
 	_, checkFound := h.Server.State().SSHCheckParams(srcID, dstID, sshCheckLocalUser)
 	require.False(t, checkFound)
 	after := pollSSHAction(t, h.Server.URL, h.Client(1), srcID, dstID, "")

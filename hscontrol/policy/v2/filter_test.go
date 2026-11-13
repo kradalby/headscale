@@ -4516,3 +4516,113 @@ func mergeFilterRules(rules []tailcfg.FilterRule) []tailcfg.FilterRule {
 
 	return mergeKeyedRules(rules, ruleKeys(rules))
 }
+
+func TestSrcIPsWithRoutes(t *testing.T) {
+	t.Parallel()
+
+	// Build a resolved address set for a single IP.
+	var b netipx.IPSetBuilder
+	b.AddPrefix(netip.MustParsePrefix("100.64.0.1/32"))
+
+	resolved, err := newResolvedAddresses(b.IPSet())
+	require.NoError(t, err)
+
+	// Node with approved subnet route.
+	nodeWithRoutes := types.Nodes{
+		&types.Node{
+			IPv4: ap("100.64.0.5"),
+			Hostinfo: &tailcfg.Hostinfo{
+				RoutableIPs: []netip.Prefix{
+					mp("10.0.0.0/24"),
+				},
+			},
+			ApprovedRoutes: []netip.Prefix{
+				mp("10.0.0.0/24"),
+			},
+		},
+	}.ViewSlice()
+
+	emptyNodes := types.Nodes{}.ViewSlice()
+
+	tests := []struct {
+		name         string
+		resolved     ResolvedAddresses
+		hasWildcard  bool
+		hasDangerAll bool
+		nodes        func() []string
+		want         []string
+	}{
+		{
+			name:         "danger-all returns star regardless",
+			resolved:     resolved,
+			hasWildcard:  false,
+			hasDangerAll: true,
+			want:         []string{"*"},
+		},
+		{
+			name:         "danger-all takes precedence over wildcard",
+			resolved:     resolved,
+			hasWildcard:  true,
+			hasDangerAll: true,
+			want:         []string{"*"},
+		},
+		{
+			name:         "wildcard appends approved subnet routes",
+			resolved:     resolved,
+			hasWildcard:  true,
+			hasDangerAll: false,
+		},
+		{
+			name:         "neither returns resolved addrs only",
+			resolved:     resolved,
+			hasWildcard:  false,
+			hasDangerAll: false,
+			want:         []string{"100.64.0.1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			nodes := emptyNodes
+			if tt.hasWildcard && !tt.hasDangerAll {
+				nodes = nodeWithRoutes
+			}
+
+			got := srcIPsWithRoutes(tt.resolved, tt.hasWildcard, tt.hasDangerAll, nodes)
+
+			if tt.hasDangerAll {
+				assert.Equal(t, []string{"*"}, got)
+			} else if tt.hasWildcard {
+				assert.Contains(t, got, "100.64.0.1", "should contain the resolved IP")
+				assert.Contains(t, got, "10.0.0.0/24", "should contain approved subnet route")
+			} else {
+				assert.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
+
+func TestMergeFilterRulesSharesUnmergedDstPorts(t *testing.T) {
+	ports := func(ips ...string) []tailcfg.NetPortRange {
+		out := make([]tailcfg.NetPortRange, 0, len(ips)+1) // spare capacity
+		for _, ip := range ips {
+			out = append(out, tailcfg.NetPortRange{IP: ip, Ports: tailcfg.PortRangeAny})
+		}
+
+		return out
+	}
+
+	a := tailcfg.FilterRule{SrcIPs: []string{"100.64.0.1"}, DstPorts: ports("100.64.0.2")}
+	b := tailcfg.FilterRule{SrcIPs: []string{"100.64.0.3"}, DstPorts: ports("100.64.0.4")}
+	c := tailcfg.FilterRule{SrcIPs: []string{"100.64.0.1"}, DstPorts: ports("100.64.0.5")}
+
+	got := mergeFilterRules([]tailcfg.FilterRule{a, b, c})
+	require.Len(t, got, 2)
+
+	assert.Same(t, &b.DstPorts[0], &got[1].DstPorts[0], "unmerged rule copied its DstPorts")
+	assert.Len(t, got[0].DstPorts, 2)
+	assert.NotSame(t, &a.DstPorts[0], &got[0].DstPorts[0], "merge reused the first rule's DstPorts")
+	assert.Empty(t, a.DstPorts[:cap(a.DstPorts)][1].IP, "merge wrote into the first rule's array")
+}

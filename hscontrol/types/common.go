@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	"tailscale.com/util/rands"
 )
 
@@ -200,6 +201,14 @@ func (rn *AuthRequest) PrepareForCache() error {
 	}
 
 	if len(data) > MaxRegistrationPayloadBytes {
+		// The rejection reaches the client as an error only; without this
+		// it looks like a server bug to operators, and the size says
+		// whether a real client is hitting the limit.
+		log.Warn().
+			Int("payload_bytes", len(data)).
+			Int("payload_limit", MaxRegistrationPayloadBytes).
+			Msg("registration payload too large, rejecting")
+
 		return fmt.Errorf("%w: limit %d bytes", ErrRegistrationPayloadTooLarge, MaxRegistrationPayloadBytes)
 	}
 

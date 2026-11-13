@@ -1684,8 +1684,8 @@ func resolveAutoApprovers(p *Policy, users types.Users, nodes views.Slice[types.
 				return nil, nil, fmt.Errorf("%w: %v", ErrAutoApproverNotAlias, autoApprover)
 			}
 			// If it does not resolve, that means the autoApprover is not associated with any IP addresses.
-			ips, _ := aa.resolve(p, users, nodes)
-			routes[prefix].AddSet(ips)
+			ips, _ := p.resolveAlias(aa, users, nodes)
+			addResolved(routes[prefix], ips)
 		}
 	}
 
@@ -2124,6 +2124,8 @@ func uniqueDestinations(dsts []AliasWithPorts) []AliasWithPorts {
 // Everything referred to in [ACL]s exists in other
 // entities.
 type Policy struct {
+	aliases aliasCache
+
 	// validated is set if the policy has been validated.
 	// It is not safe to use before it is validated, and
 	// callers using it should panic if not

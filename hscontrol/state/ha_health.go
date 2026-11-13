@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog/log"
@@ -23,6 +22,7 @@ type HAHealthProber struct {
 	cfg         types.HARouteConfig
 	serverURL   string
 	isConnected func(types.NodeID) bool
+	ping        func(types.NodeID, *tailcfg.PingRequest) bool
 
 	// lastStableSession defers a timeout-driven unhealthy decision
 	// for sessions younger than one probe cycle, giving wgengine
@@ -32,18 +32,22 @@ type HAHealthProber struct {
 
 // NewHAHealthProber creates a prober that uses the given [State] for
 // ping tracking and primary route management.
-// isConnected should return true if a node has an active map session.
+// isConnected should return true if a node has an active map session;
+// ping delivers a ping request to the node's sessions and reports whether
+// one took it.
 func NewHAHealthProber(
 	s *State,
 	cfg types.HARouteConfig,
 	serverURL string,
 	isConnected func(types.NodeID) bool,
+	ping func(types.NodeID, *tailcfg.PingRequest) bool,
 ) *HAHealthProber {
 	return &HAHealthProber{
 		state:             s,
 		cfg:               cfg,
 		serverURL:         serverURL,
 		isConnected:       isConnected,
+		ping:              ping,
 		lastStableSession: xsync.NewMap[types.NodeID, uint64](),
 	}
 }
@@ -61,15 +65,16 @@ func (p *HAHealthProber) forgetSession(id types.NodeID) {
 	p.lastStableSession.Delete(id)
 }
 
-// ProbeOnce applies HA probe results in one batch to avoid transient elections.
-// Fresh or reconnected sessions defer their whole group of routers linked
-// through shared prefixes, giving wgengine time to apply the new netmap.
-// Other groups can still apply their complete results.
-func (p *HAHealthProber) ProbeOnce(
-	ctx context.Context,
-	dispatch func(...change.Change),
-) {
-	haNodes := p.state.nodeStore.HANodes()
+// ProbeOnce pings every HA subnet router and applies the cycle's
+// results in one batch so the election sees a single transition.
+// Per-result snapshots could otherwise elect a node that the next
+// snapshot demotes again, flipping primary onto an unreachable peer.
+// A timeout that fires after the node reconnected, or against a
+// session younger than one probe cycle, is dropped so wgengine has
+// time to apply the new netmap before silence is read as
+// unreachability.
+func (p *HAHealthProber) ProbeOnce(ctx context.Context) {
+	haNodes := p.state.Snapshot().HANodes()
 
 	// Build the deduplicated node-ID set and slice in one pass.
 	var nodeIDs []types.NodeID
@@ -133,9 +138,12 @@ func (p *HAHealthProber) ProbeOnce(
 		pingID, responseCh := p.state.RegisterPing(id)
 		callbackURL := p.serverURL + "/machine/ping-response?id=" + pingID
 
-		dispatch(change.PingNode(id, &tailcfg.PingRequest{
-			URL: callbackURL,
-		}))
+		if !p.ping(id, &tailcfg.PingRequest{URL: callbackURL}) {
+			// The timeout below decides, as for a ping lost in flight.
+			log.Debug().
+				Uint64(zf.NodeID, id.Uint64()).
+				Msg("HA probe: no session took the ping")
+		}
 
 		wg.Go(func() {
 			timer := time.NewTimer(p.cfg.ProbeTimeout)
@@ -204,7 +212,6 @@ func (p *HAHealthProber) ProbeOnce(
 
 	wg.Wait()
 
-	// Withhold incomplete HA groups; independent groups can apply their results.
 	undecided := undecidedHANodes(haNodes, deferred)
 
 	healthByNode := make(map[types.NodeID]bool, results.Size())
@@ -217,16 +224,12 @@ func (p *HAHealthProber) ProbeOnce(
 	})
 
 	if p.state.BatchSetNodeHealth(healthByNode) {
-		dispatch(change.PolicyChange())
-
 		log.Info().
 			Int("haNodes", len(healthByNode)).
 			Msg("HA probe: health changed, triggering failover/recovery")
 	}
 }
 
-// undecidedHANodes follows shared prefixes because one node's health affects
-// every prefix it advertises. Each remaining group must have a complete batch.
 func undecidedHANodes(
 	haNodes map[netip.Prefix][]types.NodeID,
 	deferred *xsync.Map[types.NodeID, struct{}],

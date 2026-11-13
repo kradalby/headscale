@@ -103,18 +103,19 @@ type TestClient struct {
 type ClientOption func(*clientConfig)
 
 type clientConfig struct {
-	ephemeral    bool
-	hostname     string
-	tags         []string
-	user         *types.User
-	authKey      string
-	deltaUpdates bool
-	noHistory    bool
-	hostinfo     *tailcfg.Hostinfo
-	approve      func(authID string) error
-	loginFlags   controlclient.LoginFlags
-	endpoints    []tailcfg.Endpoint
-	c2nHandler   http.Handler
+	deferFirstMap bool
+	ephemeral     bool
+	hostname      string
+	tags          []string
+	user          *types.User
+	authKey       string
+	deltaUpdates  bool
+	noHistory     bool
+	hostinfo      *tailcfg.Hostinfo
+	approve       func(authID string) error
+	loginFlags    controlclient.LoginFlags
+	endpoints     []tailcfg.Endpoint
+	c2nHandler    http.Handler
 }
 
 // WithoutNetmapHistory retains only the latest netmap and one queued update.
@@ -188,6 +189,12 @@ func WithC2NHandler(handler http.Handler) ClientOption {
 // creates a default user.
 func WithUser(user *types.User) ClientOption {
 	return func(c *clientConfig) { c.user = user }
+}
+
+// WithoutInitialMapWait returns once polling starts, for tests holding the first map.
+// The caller must release its gate and wait for a map before checking client state.
+func WithoutInitialMapWait() ClientOption {
+	return func(c *clientConfig) { c.deferFirstMap = true }
 }
 
 // NewClient creates a [TestClient], registers it with the [TestServer]
@@ -324,6 +331,10 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 	// Start long-polling in the background.
 	tc.startPoll(tb)
 
+	if cc.deferFirstMap {
+		return tc, nil
+	}
+
 	// The first map follows [state.State.Connect], so clients created in
 	// turn open their control sessions in that order: the HA election
 	// ranks routers by session age.
@@ -335,6 +346,54 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 	}
 
 	return tc, nil
+}
+
+// NewAutoClient starts the control client tailscaled runs, a
+// [controlclient.Auto], logged in with a pre-auth key for user on the
+// server's in-memory network. Unlike a [TestClient], it decides itself when
+// to send lite updates and when to restart its stream. observer, which may
+// be nil, sees its status as tailscaled's backend does. It is shut down
+// when tb ends.
+func NewAutoClient(
+	tb testing.TB,
+	server *TestServer,
+	user *types.User,
+	hi *tailcfg.Hostinfo,
+	observer controlclient.Observer,
+) *controlclient.Auto {
+	tb.Helper()
+
+	bus := eventbus.New()
+	dialer := tsdial.NewDialer(netmon.NewStatic())
+	dialer.SetBus(bus)
+	dialer.SetSystemDialerForTest(server.MemNet().Dial)
+
+	machineKey := key.NewMachine()
+
+	auto, err := controlclient.New(controlclient.Options{
+		GetMachinePrivateKey: func() (key.MachinePrivate, error) { return machineKey, nil },
+		ServerURL:            server.URL,
+		AuthKey:              server.CreatePreAuthKey(tb, types.UserID(user.ID)),
+		Hostinfo:             hi,
+		DiscoPublicKey:       key.NewDisco().Public(),
+		Logf:                 tb.Logf,
+		HealthTracker:        health.NewTracker(bus),
+		Dialer:               dialer,
+		Bus:                  bus,
+		Observer:             observer,
+	})
+	if err != nil {
+		tb.Fatalf("servertest: controlclient.New: %v", err)
+	}
+
+	tb.Cleanup(func() {
+		auto.Shutdown()
+		bus.Close()
+	})
+
+	auto.Login(controlclient.LoginDefault)
+
+	return auto
 }
 
 // newDirect builds a [controlclient.Direct] for the client's machine.
@@ -394,9 +453,12 @@ func (c *TestClient) tryLogin(ctx context.Context, flags controlclient.LoginFlag
 		c.mu.Lock()
 		c.registers = append(c.registers, testcapture.RegisterAttempt{Err: err.Error()})
 		c.mu.Unlock()
+
+		return err
 	}
 
-	return err
+	// Direct lacks Auto's post-login update loop; streams are read-only.
+	return c.direct.SendUpdate(ctx)
 }
 
 // waitLogin waits on the auth URL while approve completes the login it names.
@@ -677,6 +739,11 @@ func (c *TestClient) ReloginAndPoll(ctx context.Context) error {
 
 	if url != "" {
 		return fmt.Errorf("servertest: TryLogin(%s): unexpected auth URL %q (expected auto-auth with preauth key)", c.Name, url) //nolint:err113
+	}
+
+	err = c.direct.SendUpdate(ctx)
+	if err != nil {
+		return fmt.Errorf("servertest: SendUpdate(%s): %w", c.Name, err)
 	}
 
 	c.resetNetmapState()

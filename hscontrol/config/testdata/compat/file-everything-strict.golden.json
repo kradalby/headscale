@@ -1,3 +1,7 @@
 {
+  "warnings": [
+    "tuning.batcher_workers ($DIR/config.yaml:139:3) has no effect with graph map streams; remove it from the configuration",
+    "tuning.node_mapsession_buffered_chan_size ($DIR/config.yaml:138:3) has no effect with graph map streams; remove it from the configuration"
+  ],
   "error": "Fatal config error: configuration key tuning.notifier_send_timeout was removed in 0.30 ($DIR/config.yaml:136:3)\n  hint: remove it: it had no effect\n"
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/libdns/cloudflare"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.yaml.in/yaml/v3"
@@ -37,6 +38,7 @@ func TestAPIV1Config(t *testing.T) {
 		{
 			name: "dns provider",
 			set: func(c *types.Config) {
+				c.DNSConfig.Challenge.Provider = &cloudflare.Provider{}
 				c.DNSConfig.Challenge.ProviderSettings = map[string]any{ //nolint:gosec // test markers, not credentials
 					"name":       "cloudflare",
 					"api_token":  "marker-api-token",
@@ -55,10 +57,11 @@ func TestAPIV1Config(t *testing.T) {
 		},
 	}
 
-	h := newAPIV1Harness(t)
-	for _, s := range secrets {
-		s.set(h.app.cfg)
-	}
+	h := newAPIV1Harness(t, func(cfg *types.Config) {
+		for _, s := range secrets {
+			s.set(cfg)
+		}
+	})
 
 	expiry := time.Now().Add(time.Hour)
 	apiKey, _, err := h.app.state.CreateAPIKey(&expiry)

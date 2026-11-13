@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/mail"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -113,6 +114,12 @@ func (u *User) PolicyEqual(o *User) bool {
 		u.Name == o.Name &&
 		u.Email == o.Email &&
 		u.ProviderIdentifier == o.ProviderIdentifier
+}
+
+// SamePolicyUsers reports whether the policy resolves a and b the same, so
+// a field it does not read, such as a login's UpdatedAt, costs no compile.
+func SamePolicyUsers(a, b []User) bool {
+	return slices.EqualFunc(a, b, func(x, y User) bool { return x.PolicyEqual(&y) })
 }
 
 // TypedID returns a pointer to the user's ID as a [UserID] type.

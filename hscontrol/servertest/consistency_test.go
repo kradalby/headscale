@@ -6,6 +6,7 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
 	"github.com/stretchr/testify/assert"
+	"tailscale.com/types/netmap"
 )
 
 // TestConsistency verifies that all nodes converge to the same
@@ -86,15 +87,8 @@ func TestConsistency(t *testing.T) {
 		c6 := h.AddClient(t)
 		c7 := h.AddClient(t)
 
-		// Wait for new nodes to see at least all other connected
-		// clients (they may also see the disconnected nodes during
-		// the grace period, so we check >= not ==).
 		connected := h.ConnectedClients()
-		minPeers := len(connected) - 1
-
-		for _, c := range connected {
-			c.WaitForPeers(t, minPeers, 30*time.Second)
-		}
+		waitForMutualVisibility(t, connected, 30*time.Second)
 
 		// Verify the new nodes can see each other.
 		for _, a := range []*servertest.TestClient{c5, c6, c7} {
@@ -112,4 +106,25 @@ func TestConsistency(t *testing.T) {
 		// Verify all connected clients see each other (consistent state).
 		servertest.AssertConsistentState(t, connected)
 	})
+}
+
+// waitForMutualVisibility waits until every client sees every other one.
+// A peer count cannot tell: departed nodes stay in the peer list, offline,
+// so a client can reach the count before it learns of a newcomer.
+func waitForMutualVisibility(t *testing.T, clients []*servertest.TestClient, timeout time.Duration) {
+	t.Helper()
+
+	for _, a := range clients {
+		for _, b := range clients {
+			if a == b {
+				continue
+			}
+
+			a.WaitForCondition(t, "sees "+b.Name, timeout, func(nm *netmap.NetworkMap) bool {
+				_, ok := peerByHostname(nm, b.Name)
+
+				return ok
+			})
+		}
+	}
 }

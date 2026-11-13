@@ -46,7 +46,7 @@ func TestExtraRecordsConcurrentUpdateNoRace(t *testing.T) {
 	for range readers {
 		wg.Go(func() {
 			for range iterations {
-				if d := generateDNSConfig(cfg, node, nil); d != nil {
+				if d := generateDNSConfig(cfg.DNSView(), node, nil); d != nil {
 					_ = len(d.ExtraRecords)
 				}
 			}

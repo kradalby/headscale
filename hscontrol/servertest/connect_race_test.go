@@ -14,17 +14,16 @@ import (
 	"tailscale.com/tailcfg"
 )
 
-// TestConnectDisconnectRace targets the residual TOCTOU window in
-// [state.State.Disconnect]: the connectGeneration check at state.go:644 is not
-// atomic with the subsequent [state.NodeStore.UpdateNode] and
-// primaryRoutes.SetRoutes calls. A new [state.State.Connect] that runs between the
-// gen check and the mutations can have its effects overwritten by the
-// stale [state.State.Disconnect]'s SetRoutes(empty).
+// TestConnectDisconnectRace races a new [state.State.Connect] against a
+// stale [state.State.Disconnect] of the same node. Disconnect releases a
+// session and marks the node offline in one world write, and the primary
+// route election derives from that write, so a Connect landing on either
+// side must leave the node online and its route primary.
 //
-// The poll.go grace-period flow protects against the most common case
-// ([state.State.RemoveNode] + stillConnected). Connect/Disconnect on [state.State] directly
-// bypasses that protection and should still leave the state consistent
-// — if it doesn't, that is the bug behind the original race issue.
+// The poll.go reconnect grace covers the common case. Connect/Disconnect
+// on [state.State] directly bypass it and must still leave the state
+// consistent — if they don't, that is the bug behind the original race
+// issue.
 //
 // Run with -race to also catch any data race exposed.
 func TestConnectDisconnectRace(t *testing.T) {
@@ -34,8 +33,8 @@ func TestConnectDisconnectRace(t *testing.T) {
 	route := netip.MustParsePrefix("10.0.0.0/24")
 
 	// Use [servertest.NewClient] to get a node fully registered + Connected via the
-	// real noise/poll path. After this, [state.NodeStore] + primaryRoutes already
-	// have the node, and [state.State.Connect] has been called once.
+	// real noise/poll path. After this the snapshot holds the node and its
+	// route election, and [state.State.Connect] has been called once.
 	//
 	// Only c2 advertises the route. The election keeps a route on the
 	// router with the oldest control session, so if both nodes were
@@ -60,9 +59,8 @@ func TestConnectDisconnectRace(t *testing.T) {
 
 	r2ID := findNodeID(t, srv, "race-r2")
 
-	_, ch, err := srv.State().SetApprovedRoutes(r2ID, []netip.Prefix{route})
+	_, err := srv.State().SetApprovedRoutes(r2ID, []netip.Prefix{route})
 	require.NoError(t, err)
-	srv.App.Change(ch)
 
 	// Wait for advertisement + approval to be reflected as a primary
 	// route assignment in [tailcfg.NodeView.PrimaryRoutes]; otherwise we'd be racing the
@@ -90,7 +88,7 @@ func TestConnectDisconnectRace(t *testing.T) {
 
 	for i := range iterations {
 		// Establish a "current session" with a known gen for r2.
-		_, gen := srv.State().Connect(r2ID)
+		gen := srv.State().Connect(r2ID)
 
 		var wg sync.WaitGroup
 
@@ -99,12 +97,12 @@ func TestConnectDisconnectRace(t *testing.T) {
 		wg.Go(func() {
 			<-start
 
-			_, _ = srv.State().Disconnect(r2ID, gen)
+			_ = srv.State().Disconnect(r2ID, gen)
 		})
 		wg.Go(func() {
 			<-start
 
-			_, _ = srv.State().Connect(r2ID)
+			_ = srv.State().Connect(r2ID)
 		})
 
 		close(start)

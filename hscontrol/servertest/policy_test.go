@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
-	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,6 +36,11 @@ func TestPolicyChanges(t *testing.T) {
 	t.Run("explicit_allow_all_policy", func(t *testing.T) {
 		t.Parallel()
 		h := servertest.NewHarness(t, 2)
+		h.ChangePolicy(t, []byte(`{"acls":[]}`))
+
+		for _, client := range h.Clients() {
+			client.WaitForCondition(t, "deny baseline delivered", 10*time.Second, func(nm *netmap.NetworkMap) bool { return len(nm.PacketFilter) == 0 })
+		}
 
 		// Record update counts before policy change.
 		countBefore := h.Client(0).UpdateCount()
@@ -71,9 +75,8 @@ func TestPolicyChanges(t *testing.T) {
 		require.NoError(t, err)
 
 		if changed {
-			changes, err := srv.State().ReloadPolicy()
+			err := srv.State().ReloadPolicy()
 			require.NoError(t, err)
-			srv.App.Change(changes...)
 		}
 
 		c := servertest.NewClient(t, srv, "pf-node", servertest.WithUser(user))
@@ -91,6 +94,11 @@ func TestPolicyChanges(t *testing.T) {
 	t.Run("policy_change_triggers_update_on_all_nodes", func(t *testing.T) {
 		t.Parallel()
 		h := servertest.NewHarness(t, 3)
+		h.ChangePolicy(t, []byte(`{"acls":[]}`))
+
+		for _, client := range h.Clients() {
+			client.WaitForCondition(t, "deny baseline delivered", 10*time.Second, func(nm *netmap.NetworkMap) bool { return len(nm.PacketFilter) == 0 })
+		}
 
 		counts := make([]int, len(h.Clients()))
 		for i, c := range h.Clients() {
@@ -117,16 +125,23 @@ func TestPolicyChanges(t *testing.T) {
 	t.Run("multiple_policy_changes", func(t *testing.T) {
 		t.Parallel()
 		h := servertest.NewHarness(t, 2)
+		h.ChangePolicy(t, []byte(`{"acls":[]}`))
 
-		// Apply policy twice and verify updates arrive both times.
-		for round := range 2 {
+		for _, client := range h.Clients() {
+			client.WaitForCondition(t, "deny baseline delivered", 10*time.Second, func(nm *netmap.NetworkMap) bool { return len(nm.PacketFilter) == 0 })
+		}
+
+		// Apply two different policies in turn and verify an update
+		// arrives for each. A client is only sent what changed, so each
+		// round changes the packet filter.
+		for round, dst := range []string{"*:*", "*:22"} {
 			countBefore := h.Client(0).UpdateCount()
 
-			h.ChangePolicy(t, []byte(`{
+			h.ChangePolicy(t, fmt.Appendf(nil, `{
 				"acls": [
-					{"action": "accept", "src": ["*"], "dst": ["*:*"]}
+					{"action": "accept", "src": ["*"], "dst": [%q]}
 				]
-			}`))
+			}`, dst))
 
 			h.Client(0).WaitForCondition(t, "update after policy change",
 				10*time.Second,
@@ -172,20 +187,21 @@ func TestPolicyChanges(t *testing.T) {
 		t.Parallel()
 		h := servertest.NewHarness(t, 2)
 
-		withSSH := func(group string) []byte {
+		// Only the ACL destination differs, so the second policy reaches
+		// the client as a packet-filter change without an SSHPolicy.
+		withSSH := func(dst string) []byte {
 			return fmt.Appendf(nil, `{
-				"groups": {%q: []},
-				"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}],
+				"acls": [{"action": "accept", "src": ["*"], "dst": [%q]}],
 				"ssh": [{
 					"action": "accept",
 					"src":    ["autogroup:member"],
 					"dst":    ["autogroup:self"],
 					"users":  ["root"]
 				}]
-			}`, "group:"+group)
+			}`, dst)
 		}
 
-		h.ChangePolicy(t, withSSH("a"))
+		h.ChangePolicy(t, withSSH("*:*"))
 		h.Client(0).WaitForCondition(t, "SSH rules present", 10*time.Second,
 			func(nm *netmap.NetworkMap) bool {
 				return nm.SSHPolicy != nil && len(nm.SSHPolicy.Rules) > 0
@@ -193,7 +209,7 @@ func TestPolicyChanges(t *testing.T) {
 
 		countBefore := h.Client(0).UpdateCount()
 
-		h.ChangePolicy(t, withSSH("b"))
+		h.ChangePolicy(t, withSSH("*:22"))
 		h.Client(0).WaitForCondition(t, "policy update with SSH rules kept", 10*time.Second,
 			func(nm *netmap.NetworkMap) bool {
 				return h.Client(0).UpdateCount() > countBefore &&
@@ -252,9 +268,8 @@ func TestIPv6OnlyPrefixACL(t *testing.T) {
 	require.NoError(t, err)
 
 	if changed {
-		changes, err := srv.State().ReloadPolicy()
+		err := srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 	}
 
 	c1 := servertest.NewClient(t, srv, "test1",
@@ -390,7 +405,7 @@ func rejectedPolicyServer(t *testing.T, c *testcapture.Capture) (*servertest.Tes
 
 	// Every staged node waits out a NodeStore batch; with no streams to
 	// coalesce, the default wait only adds time.
-	srv := servertest.NewServer(t, servertest.WithNodeStoreBatchTimeout(state.TestBatchTimeout))
+	srv := servertest.NewServer(t)
 	users := createCaptureUsers(t, srv)
 
 	owners := map[string][]string{}

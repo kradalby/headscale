@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
-	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/assert"
@@ -275,9 +274,8 @@ func TestViaGrantSourceLossCompat(t *testing.T) {
 	user, err := srv.State().GetUserByName("thor")
 	require.NoError(t, err)
 
-	_, userChange, err := srv.State().RenameUser(types.UserID(user.ID), "thor-renamed")
+	_, err = srv.State().RenameUser(types.UserID(user.ID), "thor-renamed")
 	require.NoError(t, err)
-	srv.App.Change(userChange)
 
 	saasAddrs := saasAddrsByNode(after, clients)
 
@@ -433,9 +431,7 @@ func startCaptureClients(
 ) (*servertest.TestServer, map[string]*servertest.TestClient) {
 	t.Helper()
 
-	// Setup writes land one NodeStore batch at a time, and the checks hold
-	// the netmaps they reach, so the default batch wait only adds time.
-	srv := servertest.NewServer(t, servertest.WithNodeStoreBatchTimeout(state.TestBatchTimeout))
+	srv := servertest.NewServer(t)
 	tagUser := srv.CreateUser(t, "tag-user")
 	users := createCaptureUsers(t, srv)
 
@@ -445,9 +441,8 @@ func startCaptureClients(
 	require.NoError(t, err, "failed to set policy")
 
 	if changed {
-		changes, err := srv.State().ReloadPolicy()
+		err := srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 	}
 
 	// Create clients matching the golden topology: tagged nodes under
@@ -538,11 +533,10 @@ func startCaptureClients(
 		}
 
 		nodeID := findNodeID(t, srv, name)
-		_, routeChange, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			nodeID, nodeApproved[name],
 		)
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 	}
 
 	for name, cl := range clients {

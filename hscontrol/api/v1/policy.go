@@ -114,9 +114,7 @@ func registerPolicy(api huma.API, b Backend) {
 			)
 		}
 
-		updated, cs, err := b.State.UpdatePolicy([]byte(in.Body.Policy))
-		b.Change(cs...)
-
+		updated, err := b.State.UpdatePolicy(ctx, []byte(in.Body.Policy))
 		if err != nil {
 			return nil, mapError("setting policy", err)
 		}

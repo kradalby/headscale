@@ -3276,7 +3276,7 @@ How often queued changes are sent to clients as one update; must be positive.
 - **Default:** `30`
 - **Env:** `HEADSCALE_TUNING_NODE_MAPSESSION_BUFFERED_CHAN_SIZE`
 
-How many map updates are queued per connected client.
+Accepted for compatibility but has no effect. Graph map streams do not use this queue size.
 
 === "YAML"
 
@@ -3303,7 +3303,7 @@ How many map updates are queued per connected client.
 - **Default:** `0` (three quarters of the CPU cores, at least one)
 - **Env:** `HEADSCALE_TUNING_BATCHER_WORKERS`
 
-The number of workers building map updates for connected clients. Zero picks the number from the CPU count.
+Accepted for compatibility but has no effect. Each graph map stream renders its own updates.
 
 === "YAML"
 
@@ -3384,7 +3384,7 @@ Bounds pending registrations. At capacity, new registrations are refused without
 - **Default:** `100`
 - **Env:** `HEADSCALE_TUNING_NODE_STORE_BATCH_SIZE`
 
-How many node changes are batched before the in-memory node state, peer relationships included, is rebuilt; must be positive. Higher values save CPU on bulk changes but delay each change until its batch is full or [`tuning.node_store_batch_timeout`](#tuning.node_store_batch_timeout) passes.
+The maximum number of writes a graph commit waits to collect during an HA route outage; must be positive. Outside an outage, commits do not wait for a batch. Writes arriving during a commit can share the next one, with affected graph inputs and derived values updated together.
 
 === "YAML"
 
@@ -3411,7 +3411,7 @@ How many node changes are batched before the in-memory node state, peer relation
 - **Default:** `500ms`
 - **Env:** `HEADSCALE_TUNING_NODE_STORE_BATCH_TIMEOUT`
 
-The longest a partial batch of node changes waits before the rebuild; must be positive. Lower values answer single changes faster at the cost of more rebuilds.
+The longest a graph commit waits to collect writes during an HA route outage; must be positive. Outside an outage, commits do not wait for this timeout.
 
 === "YAML"
 

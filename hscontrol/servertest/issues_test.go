@@ -12,7 +12,6 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/ipn"
@@ -161,7 +160,6 @@ func TestIssuesMapContent(t *testing.T) {
 		node2.User = user2
 		srv.State().PutNodeInStoreForTest(*node2)
 
-		srv.App.Change(change.PolicyChange())
 		c1.WaitForPeers(t, 1, 5*time.Second)
 
 		nm := c1.Netmap()
@@ -170,6 +168,65 @@ func TestIssuesMapContent(t *testing.T) {
 		require.True(t, ok,
 			"peer is visible but nm.UserProfiles[%d] is missing", peer.User())
 		assert.Equal(t, "pc-user2", profile.LoginName())
+	})
+
+	// A connected peer learns a user's new name: profiles are sent only for
+	// self's owner and the peers a map changes, so a rename must change
+	// the owner's peers.
+	t.Run("peer_profile_follows_a_rename", func(t *testing.T) {
+		t.Parallel()
+
+		srv := servertest.NewServer(t)
+		user1 := srv.CreateUser(t, "rename-user1")
+		user2 := srv.CreateUser(t, "rename-user2")
+
+		c1 := servertest.NewClient(t, srv, "rename-node1", servertest.WithUser(user1))
+		c2 := servertest.NewClient(t, srv, "rename-node2", servertest.WithUser(user2))
+
+		c1.WaitForPeers(t, 1, 10*time.Second)
+		c2.WaitForPeers(t, 1, 10*time.Second)
+
+		_, err := srv.State().RenameUser(types.UserID(user2.ID), "rename-user2-new")
+		require.NoError(t, err)
+
+		c1.WaitForCondition(t, "the peer's profile carries the new name", 10*time.Second,
+			func(nm *netmap.NetworkMap) bool {
+				if len(nm.Peers) != 1 {
+					return false
+				}
+
+				p, ok := nm.UserProfiles[nm.Peers[0].User()]
+
+				return ok && p.LoginName() == "rename-user2-new"
+			})
+	})
+
+	// A peer that logs out and back in on the same machine keeps its node
+	// with a new node key, which a connected peer must be sent.
+	t.Run("peer_key_follows_a_relogin", func(t *testing.T) {
+		t.Parallel()
+
+		h := servertest.NewHarness(t, 2)
+		h.WaitForMeshComplete(t, 10*time.Second)
+
+		c1, c2 := h.Client(0), h.Client(1)
+		oldKey := c2.Netmap().SelfNode.Key()
+
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+
+		require.NoError(t, c2.LogoutAndDisconnect(ctx))
+		require.NoError(t, c2.ReloginAndPoll(ctx))
+
+		c2.WaitForCondition(t, "c2 runs with a new key", 10*time.Second,
+			func(nm *netmap.NetworkMap) bool { return nm.SelfNode.Valid() && nm.SelfNode.Key() != oldKey })
+
+		newKey := c2.Netmap().SelfNode.Key()
+
+		c1.WaitForCondition(t, "the peer carries c2's new key", 10*time.Second,
+			func(nm *netmap.NetworkMap) bool {
+				return len(nm.Peers) == 1 && nm.Peers[0].Key() == newKey
+			})
 	})
 }
 
@@ -201,10 +258,9 @@ func TestIssuesRoutes(t *testing.T) {
 
 		// The API should accept the approval without error — the route
 		// is stored but dormant because the node is not advertising it.
-		_, routeChange, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			nodeID, []netip.Prefix{route})
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 
 		// Wait for any updates triggered by the route change to propagate,
 		// then verify the route does NOT appear in AllowedIPs.
@@ -247,10 +303,9 @@ func TestIssuesRoutes(t *testing.T) {
 		exit.WaitForPeers(t, 1, 10*time.Second)
 		advertiseRoutes(t, exit, tsaddr.ExitRoutes())
 
-		_, c, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			findNodeID(t, srv, "selfexit-node"), tsaddr.ExitRoutes())
 		require.NoError(t, err)
-		srv.App.Change(c)
 
 		obs.WaitForCondition(t, "peer offers exit node", 10*time.Second,
 			peerOffersExit("selfexit-node"))
@@ -274,15 +329,52 @@ func TestIssuesRoutes(t *testing.T) {
 
 		exit.WaitForPeers(t, 1, 10*time.Second)
 
-		_, c, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			findNodeID(t, srv, "preexit-node"), tsaddr.ExitRoutes())
 		require.NoError(t, err)
-		srv.App.Change(c)
 
 		advertiseRoutes(t, exit, tsaddr.ExitRoutes())
 
 		obs.WaitForCondition(t, "peer offers exit node", 10*time.Second,
 			peerOffersExit("preexit-node"))
+		exit.WaitForCondition(t, "self offers exit node", 10*time.Second,
+			selfOffersExit)
+	})
+
+	// A policy reload that auto-approves an advertised exit route goes
+	// through autoApproveNodes, a third producer of the same change.
+	t.Run("exit_route_auto_approved_on_reload_reaches_self", func(t *testing.T) {
+		t.Parallel()
+
+		srv := servertest.NewServer(t)
+		user := srv.CreateUser(t, "reloadexit-user")
+
+		exit := servertest.NewClient(t, srv, "reloadexit-node",
+			servertest.WithUser(user))
+		obs := servertest.NewClient(t, srv, "reloadexit-obs",
+			servertest.WithUser(user))
+
+		exit.WaitForPeers(t, 1, 10*time.Second)
+		advertiseRoutes(t, exit, tsaddr.ExitRoutes())
+
+		_, err := srv.State().SetPolicyInDB(`{
+			"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}],
+			"autoApprovers": {"exitNode": ["reloadexit-user@"]}
+		}`)
+		require.NoError(t, err)
+
+		err = srv.State().ReloadPolicy()
+		require.NoError(t, err)
+
+		id := findNodeID(t, srv, exit.Name)
+		current, ok := srv.State().GetNodeByID(id)
+		require.True(t, ok)
+		require.Empty(t, current.ApprovedRoutes().AsSlice(), "reload does not retroactively auto-approve unchanged announcements")
+		advertiseRoutes(t, exit, nil)
+		advertiseRoutes(t, exit, tsaddr.ExitRoutes())
+
+		obs.WaitForCondition(t, "peer offers exit node", 10*time.Second,
+			peerOffersExit("reloadexit-node"))
 		exit.WaitForCondition(t, "self offers exit node", 10*time.Second,
 			selfOffersExit)
 	})
@@ -301,9 +393,8 @@ func TestIssuesRoutes(t *testing.T) {
 		}`)
 		require.NoError(t, err)
 
-		changes, err := srv.State().ReloadPolicy()
+		err = srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 
 		exit := servertest.NewClient(t, srv, "advexit-node",
 			servertest.WithUser(user))
@@ -387,9 +478,8 @@ func TestIssuesRoutes(t *testing.T) {
 		require.NoError(t, err)
 
 		if changed {
-			changes, err := srv.State().ReloadPolicy()
+			err := srv.State().ReloadPolicy()
 			require.NoError(t, err)
-			srv.App.Change(changes...)
 		}
 
 		adminNode := servertest.NewClient(t, srv, "via3408-admin-node",
@@ -412,10 +502,9 @@ func TestIssuesRoutes(t *testing.T) {
 		require.NoError(t, exitNode.Direct().SendUpdate(ctx))
 
 		exitID := findNodeID(t, srv, "via3408-exit")
-		_, routeChange, err := srv.State().SetApprovedRoutes(
+		_, err = srv.State().SetApprovedRoutes(
 			exitID, tsaddr.ExitRoutes())
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 
 		seesExitNode := func(nm *netmap.NetworkMap) bool {
 			for _, p := range nm.Peers {
@@ -571,9 +660,8 @@ func TestIssuesServerMutations(t *testing.T) {
 
 		nodeID := findNodeID(t, srv, "rename-node1")
 
-		_, renameChange, err := srv.State().RenameNode(nodeID, "renamed-node1")
+		_, err := srv.State().RenameNode(nodeID, "renamed-node1")
 		require.NoError(t, err)
-		srv.App.Change(renameChange)
 
 		c2.WaitForCondition(t, "renamed peer visible", 10*time.Second,
 			func(nm *netmap.NetworkMap) bool {
@@ -607,9 +695,8 @@ func TestIssuesServerMutations(t *testing.T) {
 		node2View, ok := srv.State().GetNodeByID(nodeID2)
 		require.True(t, ok)
 
-		deleteChange, err := srv.State().DeleteNode(node2View)
+		err := srv.State().DeleteNode(node2View)
 		require.NoError(t, err)
-		srv.App.Change(deleteChange...)
 
 		c1.WaitForCondition(t, "deleted peer gone", 10*time.Second,
 			func(nm *netmap.NetworkMap) bool {
@@ -678,11 +765,12 @@ func TestIssuesServerMutations(t *testing.T) {
 	})
 }
 
-// TestIssuesNodeStoreConsistency tests [state.NodeStore] + DB consistency.
-func TestIssuesNodeStoreConsistency(t *testing.T) {
+// TestIssuesNodeStateConsistency tests that in-memory nodes and the
+// database agree.
+func TestIssuesNodeStateConsistency(t *testing.T) {
 	t.Parallel()
 
-	// [state.NodeStore] and DB should agree after mutations.
+	// Memory and DB should agree after mutations.
 	t.Run("nodestore_db_consistency_after_operations", func(t *testing.T) {
 		t.Parallel()
 
@@ -699,10 +787,9 @@ func TestIssuesNodeStoreConsistency(t *testing.T) {
 		nodeID1 := findNodeID(t, srv, "consist-node1")
 
 		route := netip.MustParsePrefix("10.50.0.0/24")
-		_, routeChange, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			nodeID1, []netip.Prefix{route})
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 
 		nsView, ok := srv.State().GetNodeByID(nodeID1)
 		require.True(t, ok, "node should be in NodeStore")
@@ -717,7 +804,7 @@ func TestIssuesNodeStoreConsistency(t *testing.T) {
 			"NodeStore and DB should agree on approved routes")
 	})
 
-	// After rapid reconnect, [state.NodeStore] should reflect correct state.
+	// After rapid reconnect, memory should reflect correct state.
 	t.Run("nodestore_correct_after_rapid_reconnect", func(t *testing.T) {
 		t.Parallel()
 
@@ -1029,9 +1116,8 @@ func TestIssuesIdentity(t *testing.T) {
 		require.NoError(t, err)
 
 		if changed {
-			changes, err := srv.State().ReloadPolicy()
+			err := srv.State().ReloadPolicy()
 			require.NoError(t, err)
-			srv.App.Change(changes...)
 		}
 
 		c2 := servertest.NewClient(t, srv, "polcon-node2",
@@ -1093,9 +1179,8 @@ func TestPeerRemovedAsDelta(t *testing.T) {
 		node2, ok := srv.State().GetNodeByID(nodeID2)
 		require.True(t, ok)
 
-		changes, err := srv.State().DeleteNode(node2)
+		err := srv.State().DeleteNode(node2)
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 
 		assertRemovedAsDelta(t, c1, nodeID2)
 	})
@@ -1112,9 +1197,8 @@ func TestPeerRemovedAsDelta(t *testing.T) {
 
 		c1.Disconnect(t)
 
-		changes, err := srv.State().DeleteNode(node2)
+		err := srv.State().DeleteNode(node2)
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 
 		c1.Reconnect(t)
 
@@ -1135,9 +1219,8 @@ func TestPeerRemovedAsDelta(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, changed)
 
-		changes, err := srv.State().ReloadPolicy()
+		err = srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 
 		assertRemovedAsDelta(t, c1, nodeID2)
 	})
@@ -1174,9 +1257,8 @@ func TestDeletedNodeNotAnnouncedToHiddenPeers(t *testing.T) {
 	dbView, ok := srv.State().GetNodeByID(db)
 	require.True(t, ok)
 
-	changes, err := srv.State().DeleteNode(dbView)
+	err = srv.State().DeleteNode(dbView)
 	require.NoError(t, err)
-	srv.App.Change(changes...)
 
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		assert.Contains(c, laptop.DeltaRemovedPeers(), db.NodeID())
@@ -1255,10 +1337,8 @@ func TestUserProfileFollowsRename(t *testing.T) {
 	ownerClient.WaitForPeers(t, 1, 5*time.Second)
 	peerClient.WaitForPeers(t, 1, 5*time.Second)
 
-	_, c, err := srv.State().RenameUser(types.UserID(owner.ID), "profile-renamed")
+	_, err := srv.State().RenameUser(types.UserID(owner.ID), "profile-renamed")
 	require.NoError(t, err)
-
-	srv.App.Change(c)
 
 	for _, client := range []*servertest.TestClient{ownerClient, peerClient} {
 		client.WaitForCondition(t, "renamed user profile", 5*time.Second,
@@ -1317,9 +1397,8 @@ func TestIssue3688DeletedNodeDoesNotSpinMapRequests(t *testing.T) {
 	nodeView, ok := srv.State().GetNodeByID(findNodeID(t, srv, "spin-node"))
 	require.True(t, ok)
 
-	changes, err := srv.State().DeleteNode(nodeView)
+	err = srv.State().DeleteNode(nodeView)
 	require.NoError(t, err)
-	srv.App.Change(changes...)
 
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		st, err := lc.StatusWithoutPeers(ctx)

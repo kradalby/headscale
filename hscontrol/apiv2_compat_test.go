@@ -26,7 +26,6 @@ import (
 	"time"
 
 	apiv2 "github.com/juanfont/headscale/hscontrol/api/v2"
-	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/assert"
@@ -282,7 +281,7 @@ func newAPIReplay(t *testing.T, c *testcapture.Capture, useV1 bool) *apiReplay {
 
 	r.admin = admin
 
-	r.v2, _ = apiv2.Handler(apiv2.Backend{State: app.state, Change: app.Change, Cfg: app.cfg})
+	r.v2, _ = apiv2.Handler(apiv2.Backend{State: app.state, Cfg: app.cfg, Connected: app.mapHub.IsConnected, Ping: app.mapHub.Ping})
 
 	return r
 }
@@ -297,9 +296,8 @@ func newAddressedTestApp(t *testing.T) *Headscale {
 	app, err := NewHeadscale(&cfg)
 	require.NoError(t, err)
 
-	app.mapBatcher = mapper.NewBatcherAndMapper(&cfg, app.state)
-	app.mapBatcher.Start()
-	t.Cleanup(app.mapBatcher.Close)
+	t.Cleanup(app.DrainMapSessions)
+	t.Cleanup(func() { require.NoError(t, app.state.Close()) })
 
 	return app
 }
@@ -397,13 +395,12 @@ func (r *apiReplay) join(t *testing.T, step testcapture.Step, a testcapture.Acti
 		hi.RoutableIPs = append(hi.RoutableIPs, netip.MustParsePrefix(route))
 	}
 
-	node, change, err := r.app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+	node, err := r.app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
 		Auth:     &tailcfg.RegisterResponseAuth{AuthKey: secret},
 		NodeKey:  key.NewNode().Public(),
 		Hostinfo: hi,
 		Expiry:   time.Now().Add(24 * time.Hour),
 	}, key.NewMachine().Public())
-	r.app.Change(change)
 
 	got := "accepted"
 	if err != nil {
@@ -1227,7 +1224,7 @@ func (r *apiReplay) enforcedNow(t *testing.T) string {
 		nv, ok := r.app.state.GetNodeByID(types.NodeID(id))
 		require.True(t, ok, label)
 
-		rules, err := r.app.state.FilterForNode(nv)
+		rules, err := r.app.state.Snapshot().Policy().FilterForNode(nv)
 		require.NoError(t, err)
 
 		ssh, err := r.app.state.SSHPolicy(nv)

@@ -79,7 +79,7 @@ func registerUsers(api huma.API, b Backend) {
 			}
 		}
 
-		user, policyChanged, err := b.State.CreateUser(types.User{
+		user, err := b.State.CreateUser(types.User{
 			Name:          in.Body.Name,
 			DisplayName:   in.Body.DisplayName,
 			Email:         in.Body.Email,
@@ -88,8 +88,6 @@ func registerUsers(api huma.API, b Backend) {
 		if err != nil {
 			return nil, mapError("creating user", err)
 		}
-
-		b.Change(policyChanged)
 
 		out := &userOutput{}
 		out.Body.User = userFromView(user.View())
@@ -115,12 +113,10 @@ func registerUsers(api huma.API, b Backend) {
 			return nil, mapError("renaming user", err)
 		}
 
-		_, c, err := b.State.RenameUser(types.UserID(oldUser.ID), in.NewName)
+		_, err = b.State.RenameUser(types.UserID(oldUser.ID), in.NewName)
 		if err != nil {
 			return nil, mapError("renaming user", err)
 		}
-
-		b.Change(c)
 
 		newUser, err := b.State.GetUserByName(in.NewName)
 		if err != nil {
@@ -151,12 +147,10 @@ func registerUsers(api huma.API, b Backend) {
 			return nil, mapError("deleting user", err)
 		}
 
-		policyChanged, err := b.State.DeleteUser(types.UserID(user.ID))
+		err = b.State.DeleteUser(types.UserID(user.ID))
 		if err != nil {
 			return nil, mapError("deleting user", err)
 		}
-
-		b.Change(policyChanged)
 
 		return &deleteUserOutput{}, nil
 	})

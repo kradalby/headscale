@@ -15,7 +15,7 @@ import (
 )
 
 // TestPollRace targets logical race conditions specifically in the
-// poll.go session lifecycle and the [mapper.Batcher]'s handling of concurrent
+// poll.go session lifecycle and the [mapper.Hub]'s handling of concurrent
 // sessions for the same node.
 
 func TestPollRace(t *testing.T) {
@@ -102,7 +102,7 @@ func TestPollRace(t *testing.T) {
 	// grace period goroutine should have checked IsConnected
 	// and found the node connected, so should NOT have called
 	// [state.State.Disconnect].
-	t.Run("server_state_online_12s_after_reconnect", func(t *testing.T) {
+	t.Run("server_state_online_16s_after_reconnect", func(t *testing.T) {
 		t.Parallel()
 
 		srv := servertest.NewServer(t)
@@ -122,7 +122,7 @@ func TestPollRace(t *testing.T) {
 		c1.WaitForPeers(t, 1, 15*time.Second)
 
 		// Wait past the full grace period.
-		timer := time.NewTimer(12 * time.Second)
+		timer := time.NewTimer(16 * time.Second)
 		defer timer.Stop()
 
 		<-timer.C
@@ -197,7 +197,7 @@ func TestPollRace(t *testing.T) {
 		}
 	})
 
-	// The [mapper.Batcher]'s IsConnected check: when the grace period
+	// The [mapper.Hub.IsConnected] check: when the grace period
 	// goroutine calls IsConnected, it should return true if
 	// a new session has been added for the same node.
 	t.Run("batcher_knows_reconnected_during_grace", func(t *testing.T) {
@@ -350,10 +350,9 @@ func TestPollRace(t *testing.T) {
 
 		// While c1 is disconnected, approve a route for it.
 		route := netip.MustParsePrefix("10.55.0.0/24")
-		_, routeChange, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			nodeID1, []netip.Prefix{route})
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 
 		// Reconnect c1.
 		c1.Reconnect(t)
@@ -429,7 +428,7 @@ func TestMapSessionsCappedPerNode(t *testing.T) {
 			assert.Equal(ct, 4, node.ActiveSessions())
 		}
 
-		assert.Equal(ct, 4, srv.App.MapBatcher().Debug()[id].ActiveConnections)
+		assert.Equal(ct, 4, srv.App.MapHub().Connected()[id])
 	}, 10*time.Second, 50*time.Millisecond, "a node keeps at most four map sessions")
 
 	select {

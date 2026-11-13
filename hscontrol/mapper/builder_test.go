@@ -5,365 +5,74 @@ import (
 	"testing"
 	"time"
 
-	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 )
 
-func TestMapResponseBuilder_Basic(t *testing.T) {
-	cfg := &types.Config{
-		DNSConfig: types.DNSConfig{BaseDomain: "example.com"},
-		LogTail: types.LogTailConfig{
-			Enabled: true,
-		},
-	}
-
-	mockState := &state.State{}
-	m := &mapper{
-		cfg:   cfg,
-		state: mockState,
-	}
-
-	nodeID := types.NodeID(1)
-
-	builder := m.NewMapResponseBuilder(nodeID)
-
-	// Test basic builder creation
-	assert.NotNil(t, builder)
-	assert.Equal(t, nodeID, builder.nodeID)
-	assert.NotNil(t, builder.resp)
-	assert.False(t, builder.resp.KeepAlive)
-	assert.NotNil(t, builder.resp.ControlTime)
-	assert.WithinDuration(t, time.Now(), *builder.resp.ControlTime, time.Second)
-}
-
-func TestMapResponseBuilder_WithCapabilityVersion(t *testing.T) {
-	cfg := &types.Config{}
-	mockState := &state.State{}
-	m := &mapper{
-		cfg:   cfg,
-		state: mockState,
-	}
-
-	nodeID := types.NodeID(1)
-	capVer := tailcfg.CapabilityVersion(42)
-
-	builder := m.NewMapResponseBuilder(nodeID).
-		WithCapabilityVersion(capVer)
-
-	assert.Equal(t, capVer, builder.capVer)
-	assert.False(t, builder.hasErrors())
-}
-
-func TestMapResponseBuilder_WithDomain(t *testing.T) {
-	domain := "test.example.com"
-	cfg := &types.Config{
-		ServerURL: "https://test.example.com",
-		DNSConfig: types.DNSConfig{BaseDomain: domain},
-	}
-
-	mockState := &state.State{}
-	m := &mapper{
-		cfg:   cfg,
-		state: mockState,
-	}
-
-	nodeID := types.NodeID(1)
-
-	builder := m.NewMapResponseBuilder(nodeID).
-		WithDomain()
-
-	assert.Equal(t, domain, builder.resp.Domain)
-	assert.False(t, builder.hasErrors())
-}
-
-func TestMapResponseBuilder_WithCollectServicesDisabled(t *testing.T) {
-	cfg := &types.Config{}
-	mockState := &state.State{}
-	m := &mapper{
-		cfg:   cfg,
-		state: mockState,
-	}
-
-	nodeID := types.NodeID(1)
-
-	builder := m.NewMapResponseBuilder(nodeID).
-		WithCollectServicesDisabled()
-
-	value, isSet := builder.resp.CollectServices.Get()
-	assert.True(t, isSet)
-	assert.False(t, value)
-	assert.False(t, builder.hasErrors())
-}
-
-func TestMapResponseBuilder_WithDebugConfig(t *testing.T) {
-	tests := []struct {
-		name           string
-		logTailEnabled bool
-		expected       *tailcfg.Debug
-	}{
-		{
-			// Enabled sends no Debug, so the wire matches a server that never
-			// touches client logging.
-			name:           "LogTail enabled",
-			logTailEnabled: true,
-			expected:       nil,
-		},
-		{
-			name:           "LogTail disabled",
-			logTailEnabled: false,
-			expected:       &tailcfg.Debug{DisableLogTail: true},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := &types.Config{
-				LogTail: types.LogTailConfig{
-					Enabled: tt.logTailEnabled,
-				},
-			}
-			mockState := &state.State{}
-			m := &mapper{
-				cfg:   cfg,
-				state: mockState,
-			}
-
-			nodeID := types.NodeID(1)
-
-			builder := m.NewMapResponseBuilder(nodeID).
-				WithDebugConfig()
-
-			assert.Equal(t, tt.expected, builder.resp.Debug)
-			assert.False(t, builder.hasErrors())
-		})
-	}
-}
-
-func TestMapResponseBuilder_WithPeerChangedPatch(t *testing.T) {
-	cfg := &types.Config{}
-	mockState := &state.State{}
-	m := &mapper{
-		cfg:   cfg,
-		state: mockState,
-	}
-
-	nodeID := types.NodeID(1)
-	changes := []*tailcfg.PeerChange{
-		{
-			NodeID:     123,
-			DERPRegion: 1,
-		},
-		{
-			NodeID:     456,
-			DERPRegion: 2,
-		},
-	}
-
-	builder := m.NewMapResponseBuilder(nodeID).
-		WithPeerChangedPatch(changes)
-
-	assert.Equal(t, changes, builder.resp.PeersChangedPatch)
-	assert.False(t, builder.hasErrors())
-}
-
-// TestMapResponseBuilder_WithPeerChangedPatchDropsUnencodableExpiry proves a
-// patch whose key expiry json.Marshal refuses is left out, as buildTailPeers
-// leaves out such a peer, instead of failing the viewer's whole response.
-func TestMapResponseBuilder_WithPeerChangedPatchDropsUnencodableExpiry(t *testing.T) {
-	m := &mapper{cfg: &types.Config{}, state: &state.State{}}
-
-	latest := time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC)
-	beyond := latest.Add(time.Second)
-	changes := []*tailcfg.PeerChange{
-		{NodeID: 123, KeyExpiry: &beyond},
-		{NodeID: 456, KeyExpiry: &latest},
-	}
-
-	builder := m.NewMapResponseBuilder(types.NodeID(1)).WithPeerChangedPatch(changes)
-	assert.Equal(t, changes[1:], builder.resp.PeersChangedPatch)
-
-	_, err := json.Marshal(builder.resp)
+func TestStreamFullMapFields(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "", func(c *types.Config) { c.LogTail.Enabled = false })
+	st := NewStream(cfg, NewHub(), ids[0], capVer)
+	out, err := st.Initial(s.Snapshot())
 	require.NoError(t, err)
+	require.Len(t, out, 1)
+	full := out[0]
+
+	for _, tt := range []struct {
+		name  string
+		check func(*testing.T)
+	}{
+		{"TestMapResponseBuilder_Basic", func(t *testing.T) {
+			t.Helper()
+			require.NotNil(t, full)
+			require.False(t, full.KeepAlive)
+			require.NotNil(t, full.ControlTime)
+			require.WithinDuration(t, time.Now(), *full.ControlTime, time.Second)
+		}},
+		{"TestMapResponseBuilder_WithCapabilityVersion", func(t *testing.T) {
+			t.Helper()
+			require.Equal(t, capVer, st.r.capVer)
+
+			for _, peer := range full.Peers {
+				require.Equal(t, capVer, peer.Cap)
+			}
+		}},
+		{"TestMapResponseBuilder_WithDomain", func(t *testing.T) {
+			t.Helper()
+			require.Equal(t, "headscale.test", full.Domain)
+		}},
+		{"TestMapResponseBuilder_WithCollectServicesDisabled", func(t *testing.T) {
+			t.Helper()
+
+			value, set := full.CollectServices.Get()
+			require.True(t, set)
+			require.False(t, value)
+		}},
+		{"TestMapResponseBuilder_WithDebugConfig", func(t *testing.T) {
+			t.Helper()
+			require.Equal(t, &tailcfg.Debug{DisableLogTail: true}, full.Debug)
+		}},
+		{"TestMapResponseBuilder_ChainedCalls", func(t *testing.T) {
+			t.Helper()
+			require.NotNil(t, full.Node)
+			require.NotNil(t, full.DERPMap)
+			require.NotNil(t, full.SSHPolicy)
+			require.NotNil(t, full.DNSConfig)
+			require.NotNil(t, full.PacketFilters)
+			require.NotEmpty(t, full.Peers)
+			_, err := json.Marshal(full)
+			require.NoError(t, err)
+		}},
+	} {
+		t.Run(tt.name, tt.check)
+	}
 }
 
-func TestMapResponseBuilder_WithPeersRemoved(t *testing.T) {
-	cfg := &types.Config{}
-	mockState := &state.State{}
-	m := &mapper{
-		cfg:   cfg,
-		state: mockState,
+func TestStreamMissingNodeReturnsErrorWithoutFrames(t *testing.T) {
+	cfg, s, _ := streamTestState(t, "")
+	for _, id := range []types.NodeID{0, 999} {
+		out, err := NewStream(cfg, NewHub(), id, capVer).Initial(s.Snapshot())
+		require.ErrorIs(t, err, ErrNodeGone)
+		require.Nil(t, out, "failed rendering must not write a partial map")
 	}
-
-	nodeID := types.NodeID(1)
-	removedID1 := types.NodeID(123)
-	removedID2 := types.NodeID(456)
-
-	builder := m.NewMapResponseBuilder(nodeID).
-		WithPeersRemoved(removedID1, removedID2)
-
-	expected := []tailcfg.NodeID{
-		removedID1.NodeID(),
-		removedID2.NodeID(),
-	}
-	assert.Equal(t, expected, builder.resp.PeersRemoved)
-	assert.False(t, builder.hasErrors())
-}
-
-func TestMapResponseBuilder_ErrorHandling(t *testing.T) {
-	cfg := &types.Config{}
-	mockState := &state.State{}
-	m := &mapper{
-		cfg:   cfg,
-		state: mockState,
-	}
-
-	nodeID := types.NodeID(1)
-
-	// Simulate an error in the builder
-	builder := m.NewMapResponseBuilder(nodeID)
-	builder.addError(assert.AnError)
-
-	// All subsequent calls should continue to work and accumulate errors
-	result := builder.
-		WithDomain().
-		WithCollectServicesDisabled().
-		WithDebugConfig()
-
-	assert.True(t, result.hasErrors())
-	assert.Len(t, result.errs, 1)
-	assert.Equal(t, assert.AnError, result.errs[0])
-
-	// Build should return the error
-	data, err := result.Build()
-	assert.Nil(t, data)
-	assert.Error(t, err)
-}
-
-func TestMapResponseBuilder_ChainedCalls(t *testing.T) {
-	domain := "chained.example.com"
-	cfg := &types.Config{
-		ServerURL: "https://chained.example.com",
-		DNSConfig: types.DNSConfig{BaseDomain: domain},
-		LogTail: types.LogTailConfig{
-			Enabled: false,
-		},
-	}
-
-	mockState := &state.State{}
-	m := &mapper{
-		cfg:   cfg,
-		state: mockState,
-	}
-
-	nodeID := types.NodeID(1)
-	capVer := tailcfg.CapabilityVersion(99)
-
-	builder := m.NewMapResponseBuilder(nodeID).
-		WithCapabilityVersion(capVer).
-		WithDomain().
-		WithCollectServicesDisabled().
-		WithDebugConfig()
-
-	// Verify all fields are set correctly
-	assert.Equal(t, capVer, builder.capVer)
-	assert.Equal(t, domain, builder.resp.Domain)
-	value, isSet := builder.resp.CollectServices.Get()
-	assert.True(t, isSet)
-	assert.False(t, value)
-	assert.NotNil(t, builder.resp.Debug)
-	assert.True(t, builder.resp.Debug.DisableLogTail)
-	assert.False(t, builder.hasErrors())
-}
-
-func TestMapResponseBuilder_MultipleWithPeersRemoved(t *testing.T) {
-	cfg := &types.Config{}
-	mockState := &state.State{}
-	m := &mapper{
-		cfg:   cfg,
-		state: mockState,
-	}
-
-	nodeID := types.NodeID(1)
-	removedID1 := types.NodeID(100)
-	removedID2 := types.NodeID(200)
-
-	// Test calling WithPeersRemoved multiple times
-	builder := m.NewMapResponseBuilder(nodeID).
-		WithPeersRemoved(removedID1).
-		WithPeersRemoved(removedID2)
-
-	// Second call should overwrite the first
-	expected := []tailcfg.NodeID{removedID2.NodeID()}
-	assert.Equal(t, expected, builder.resp.PeersRemoved)
-	assert.False(t, builder.hasErrors())
-}
-
-func TestMapResponseBuilder_EmptyPeerChangedPatch(t *testing.T) {
-	cfg := &types.Config{}
-	mockState := &state.State{}
-	m := &mapper{
-		cfg:   cfg,
-		state: mockState,
-	}
-
-	nodeID := types.NodeID(1)
-
-	builder := m.NewMapResponseBuilder(nodeID).
-		WithPeerChangedPatch([]*tailcfg.PeerChange{})
-
-	assert.Empty(t, builder.resp.PeersChangedPatch)
-	assert.False(t, builder.hasErrors())
-}
-
-func TestMapResponseBuilder_NilPeerChangedPatch(t *testing.T) {
-	cfg := &types.Config{}
-	mockState := &state.State{}
-	m := &mapper{
-		cfg:   cfg,
-		state: mockState,
-	}
-
-	nodeID := types.NodeID(1)
-
-	builder := m.NewMapResponseBuilder(nodeID).
-		WithPeerChangedPatch(nil)
-
-	assert.Nil(t, builder.resp.PeersChangedPatch)
-	assert.False(t, builder.hasErrors())
-}
-
-func TestMapResponseBuilder_MultipleErrors(t *testing.T) {
-	cfg := &types.Config{}
-	mockState := &state.State{}
-	m := &mapper{
-		cfg:   cfg,
-		state: mockState,
-	}
-
-	nodeID := types.NodeID(1)
-
-	// Create a builder and add multiple errors
-	builder := m.NewMapResponseBuilder(nodeID)
-	builder.addError(assert.AnError)
-	builder.addError(assert.AnError)
-	builder.addError(nil) // This should be ignored
-
-	// All subsequent calls should continue to work
-	result := builder.
-		WithDomain().
-		WithCollectServicesDisabled()
-
-	assert.True(t, result.hasErrors())
-	assert.Len(t, result.errs, 2) // nil error should be ignored
-
-	// Build should return a multierr
-	data, err := result.Build()
-	require.Nil(t, data)
-	require.Error(t, err)
-
-	// The error should contain information about multiple errors
-	assert.Contains(t, err.Error(), "multiple errors")
 }

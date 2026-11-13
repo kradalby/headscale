@@ -187,5 +187,9 @@
       "NodeStoreBatchSize": 100,
       "NodeStoreBatchTimeout": 500000000
     }
-  }
+  },
+  "warnings": [
+    "tuning.batcher_workers ($DIR/config.yaml:125:3) has no effect with graph map streams; remove it from the configuration",
+    "tuning.node_mapsession_buffered_chan_size ($DIR/config.yaml:126:3) has no effect with graph map streams; remove it from the configuration"
+  ]
 }

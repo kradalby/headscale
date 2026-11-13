@@ -27,21 +27,21 @@ import (
 	"github.com/juanfont/headscale/hscontrol/scope"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
+	"tailscale.com/tailcfg"
 )
 
 // Backend is the dependency surface the v2 API needs from the control plane:
-// the state layer, the change-notification sink that distributes node/policy
-// updates to connected clients, and the config (Policy.Mode/Path, Node.Expiry,
+// the state layer and the config (Policy.Mode/Path, Node.Expiry,
 // and TLS are read by the ACL and settings handlers).
 type Backend struct {
-	State  *state.State
-	Change func(...change.Change)
-	Cfg    *types.Config
+	State *state.State
+	Cfg   *types.Config
 	// Connected reports whether a node has a live map stream. A node stays
 	// online through the disconnect grace period, but only a stream can
 	// carry a c2n request.
 	Connected func(types.NodeID) bool
+	// Ping carries a control request to one live map stream.
+	Ping func(types.NodeID, *tailcfg.PingRequest) bool
 }
 
 // security is the requirement applied to authenticated operations: an API key

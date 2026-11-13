@@ -4462,7 +4462,12 @@ func TestEnvNames(t *testing.T) {
 
 			l, err := Load(path, true, []string{configEnvName(k.Path) + "=" + val})
 			require.NoError(t, err)
-			assert.Empty(t, l.Warnings)
+
+			if slices.Contains([]string{"tuning.batcher_workers", "tuning.node_mapsession_buffered_chan_size"}, k.Path) {
+				assert.Equal(t, []string{k.Path + " (env " + configEnvName(k.Path) + ") has no effect with graph map streams; remove it from the configuration"}, l.Warnings)
+			} else {
+				assert.Empty(t, l.Warnings)
+			}
 
 			for j, f := range types.ConfigFields(l.Config) {
 				same := reflect.DeepEqual(f.Value.Interface(), defaults[j].Value.Interface())
@@ -4616,4 +4621,76 @@ func TestMapKeyCollision(t *testing.T) {
 			requireHidden(t, err, "marker")
 		})
 	}
+}
+
+// TestInertTuningKeysStillLoad keeps accepted tuning keys compatible after
+// graph streams replace the batcher. The already removed notifier key stays refused.
+func TestInertTuningKeysStillLoad(t *testing.T) {
+	path := writeConfig(t, "server_url: https://example.com\ntuning:\n  batcher_workers: 4\n  node_mapsession_buffered_chan_size: 30\n")
+	loaded, err := Load(path, true, nil)
+	require.NoError(t, err)
+	require.NoError(t, Validate(loaded.Config))
+	assert.Equal(t, 4, loaded.Config.Tuning.BatcherWorkers)
+	assert.Equal(t, 30, loaded.Config.Tuning.NodeMapSessionBufferedChanSize)
+	require.Len(t, loaded.Warnings, 2)
+	assert.Contains(t, loaded.Warnings[0], "tuning.batcher_workers")
+	assert.Contains(t, loaded.Warnings[1], "tuning.node_mapsession_buffered_chan_size")
+
+	for _, warning := range loaded.Warnings {
+		assert.Contains(t, warning, path)
+		assert.Contains(t, warning, "has no effect with graph map streams")
+	}
+
+	for _, tt := range []struct {
+		name string
+		file string
+		env  []string
+		err  string
+	}{
+		{name: "defaults"},
+		{name: "environment", env: []string{"HEADSCALE_TUNING_BATCHER_WORKERS=4", "HEADSCALE_TUNING_NODE_MAPSESSION_BUFFERED_CHAN_SIZE=30"}},
+		{name: "override once", file: "tuning:\n  batcher_workers: 8\n  node_mapsession_buffered_chan_size: 60\n", env: []string{"HEADSCALE_TUNING_BATCHER_WORKERS=4", "HEADSCALE_TUNING_NODE_MAPSESSION_BUFFERED_CHAN_SIZE=30"}},
+		{name: "dotted", file: "tuning.batcher_workers: 4\ntuning.node_mapsession_buffered_chan_size: 30\n"},
+		{name: "warnings survive error", file: "tuning:\n  batcher_workers: 4\n  node_mapsession_buffered_chan_size: 30\nunknown_key: true\n", err: "unknown configuration key unknown_key"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeConfig(t, "server_url: https://example.com\n"+tt.file)
+
+			loaded, err := Load(path, true, tt.env)
+			if tt.err != "" {
+				require.ErrorContains(t, err, tt.err)
+			} else {
+				require.NoError(t, err)
+				require.NoError(t, Validate(loaded.Config))
+			}
+
+			if tt.name == "defaults" {
+				assert.Empty(t, loaded.Warnings)
+				return
+			}
+
+			require.Len(t, loaded.Warnings, 2, "each explicitly configured inert key warns once")
+
+			for i, key := range []string{"tuning.batcher_workers", "tuning.node_mapsession_buffered_chan_size"} {
+				assert.Contains(t, loaded.Warnings[i], key)
+				assert.Contains(t, loaded.Warnings[i], "has no effect with graph map streams")
+
+				if len(tt.env) > 0 {
+					assert.Contains(t, loaded.Warnings[i], "env "+configEnvName(key))
+				} else {
+					assert.Contains(t, loaded.Warnings[i], path)
+				}
+			}
+
+			if tt.err == "" {
+				assert.Equal(t, 4, loaded.Config.Tuning.BatcherWorkers)
+				assert.Equal(t, 30, loaded.Config.Tuning.NodeMapSessionBufferedChanSize)
+			}
+		})
+	}
+
+	removed := writeConfig(t, "server_url: https://example.com\ntuning:\n  notifier_send_timeout: 800ms\n")
+	_, err = Load(removed, true, nil)
+	require.ErrorContains(t, err, "tuning.notifier_send_timeout")
+	require.ErrorContains(t, err, "removed")
 }

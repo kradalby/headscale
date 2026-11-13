@@ -42,6 +42,11 @@ func TestSetDNS(t *testing.T) {
 				hasCap(nm, nodecap.HTTPS)
 		})
 
+	// Standard Tailscale reverse zones are answered by clients without explicit routes.
+	for _, zone := range []string{"64.100.in-addr.arpa", "0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa"} {
+		require.NotContains(t, laptop.Netmap().DNS.Routes, zone)
+	}
+
 	value := func(seed string) string {
 		sum := sha256.Sum256([]byte(seed))
 
@@ -77,9 +82,8 @@ func TestSetDNS(t *testing.T) {
 
 	// The certificate name follows a rename, lowercased; the client only
 	// runs ACME for a name it finds in CertDomains.
-	_, renameChange, err := srv.State().RenameNode(findNodeID(t, srv, "laptop"), "NoteBook")
+	_, err := srv.State().RenameNode(findNodeID(t, srv, "laptop"), "NoteBook")
 	require.NoError(t, err)
-	srv.App.Change(renameChange)
 
 	laptop.WaitForCondition(t, "cert domain follows rename", 10*time.Second,
 		func(nm *netmap.NetworkMap) bool {

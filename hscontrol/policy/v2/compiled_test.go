@@ -550,3 +550,22 @@ func BenchmarkCompileOtherDests(b *testing.B) {
 		})
 	}
 }
+
+func TestMixedViaGrantKeepsAppFilterOrder(t *testing.T) {
+	pm, err := NewPolicyManager([]byte(`{
+		"tagOwners":{"tag:via":[]},
+		"grants":[
+			{"src":["*"],"dst":["10.0.0.0/24"],"ip":["*"],"via":["tag:via"],"app":{"example.com/cap/test":[{}]}},
+			{"src":["*"],"dst":["10.1.0.0/24"],"ip":["tcp:80"]}
+		]
+	}`), nil, types.Nodes{}.ViewSlice())
+	require.NoError(t, err)
+
+	filter, _ := pm.Filter()
+	require.Len(t, filter, 2)
+	require.NotEmpty(t, filter[0].CapGrant, "the first grant's app part precedes the next grant")
+	require.Empty(t, filter[0].DstPorts)
+	require.Equal(t, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}, filter[0].CapGrant[0].Dsts)
+	require.Empty(t, filter[1].CapGrant)
+	require.Equal(t, []tailcfg.NetPortRange{{IP: "10.1.0.0/24", Ports: tailcfg.PortRange{First: 80, Last: 80}}}, filter[1].DstPorts)
+}
