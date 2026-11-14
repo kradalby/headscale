@@ -49,6 +49,279 @@ func TestScale(t *testing.T) { testScale(t, false) }
 // transport reconnects and authenticated relogins separately from node churn.
 func TestScaleChurn(t *testing.T) { testScale(t, true) }
 
+// TestScalePartialTailnet keeps offline registrations while replacing connected
+// clients. Unlike TestScaleChurn, registered nodes outnumber live clients.
+func TestScalePartialTailnet(t *testing.T) {
+	registered, connected := 20, 10
+	for name, target := range map[string]*int{
+		"HEADSCALE_STRESS_REGISTERED": &registered,
+		"HEADSCALE_STRESS_CONNECTED":  &connected,
+	} {
+		if value, ok := os.LookupEnv(name); ok {
+			var err error
+
+			*target, err = strconv.Atoi(value)
+			require.NoError(t, err, "%s must be an integer", name)
+		}
+	}
+
+	require.GreaterOrEqual(t, connected, scaleDevicesPerUser)
+	require.GreaterOrEqual(t, registered-connected, scaleDevicesPerUser, "need an offline user group")
+	require.Zero(t, registered%scaleDevicesPerUser, "registered nodes must fill whole user groups")
+	require.Zero(t, connected%scaleDevicesPerUser, "connected clients must fill whole user groups")
+
+	grants := make([]string, 0, registered/scaleDevicesPerUser)
+	for i := range registered / scaleDevicesPerUser {
+		grants = append(grants, fmt.Sprintf(`{"src":["scale-user-%d@"],"dst":["scale-user-%d@"],"ip":["tcp:443"]}`, i, i))
+	}
+
+	for _, tc := range []scaleCase{
+		{
+			name:   "self",
+			policy: `{"grants":[{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["tcp:443"]}]}`,
+		},
+		{
+			name:   "per_user",
+			policy: `{"grants":[` + strings.Join(grants, ",") + `]}`,
+		},
+	} {
+		tc.canSend = func(a, b int) bool { return a/scaleDevicesPerUser == b/scaleDevicesPerUser }
+		t.Run(fmt.Sprintf("%d_registered/%d_connected/%s", registered, connected, tc.name), func(t *testing.T) {
+			runPartialTailnet(t, registered, connected, tc)
+		})
+	}
+}
+
+func runPartialTailnet(t *testing.T, registered, connected int, tc scaleCase) {
+	t.Helper()
+
+	srv := NewServer(t)
+	clients := make([]*TestClient, connected)
+	selfNodes := make([]tailcfg.NodeView, registered)
+	indices := make(map[tailcfg.NodeID]int, registered)
+	users := make([]*types.User, registered/scaleDevicesPerUser)
+	seenIDs := make(map[tailcfg.NodeID]bool)
+	seenKeys := make(map[key.NodePublic]bool)
+	retired := make([]weak.Pointer[TestClient], 0, registered)
+	oldPolicies := make([]weak.Pointer[policyv2.PolicyManager], 0, scaleDevicesPerUser)
+	generation := "example.com/partial-initial"
+	revoked := false
+
+	t.Logf("registered_target=%d connected_target=%d gomaxprocs=%d gomemlimit=%q go=%s database_path=%q",
+		registered, connected, runtime.GOMAXPROCS(0), os.Getenv("GOMEMLIMIT"), runtime.Version(), srv.cfg.Database.Sqlite.Path)
+
+	setPolicy := func() {
+		policy := tc.policy
+		if revoked {
+			policy = `{"acls":[]}`
+		}
+
+		var document map[string]any
+		require.NoError(t, json.Unmarshal([]byte(policy), &document))
+		document["nodeAttrs"] = []any{map[string]any{"target": []string{"*"}, "attr": []string{generation}}}
+		data, err := json.Marshal(document)
+		require.NoError(t, err)
+		_, err = srv.State().SetPolicyInDB(string(data))
+		require.NoError(t, err)
+		require.NoError(t, srv.State().ReloadPolicy())
+	}
+
+	register := func(slots []int, round int, keep bool) {
+		for first := 0; first < len(slots); first += 32 {
+			batch := slots[first:min(first+32, len(slots))]
+			fresh := make([]*TestClient, len(batch))
+
+			var logins sync.WaitGroup
+			for j, i := range batch {
+				logins.Go(func() {
+					fresh[j] = NewClient(quietScaleTB{t}, srv, fmt.Sprintf("partial-%05d-%02d", i, round),
+						WithUser(users[i/scaleDevicesPerUser]), WithoutNetmapHistory())
+				})
+			}
+
+			logins.Wait()
+
+			if t.Failed() {
+				t.FailNow()
+			}
+
+			for j, i := range batch {
+				c := fresh[j]
+				node := c.Netmap().SelfNode
+				require.True(t, node.Valid())
+				require.False(t, seenIDs[node.ID()], "reused node ID %d", node.ID())
+				require.False(t, seenKeys[node.Key()], "reused node key %s", node.Key())
+				seenIDs[node.ID()], seenKeys[node.Key()] = true, true
+
+				selfNodes[i], indices[node.ID()] = node, i
+				if keep {
+					clients[i] = c
+				} else {
+					retired = append(retired, weak.Make(c))
+					c.cleanupOnce()
+				}
+			}
+		}
+	}
+
+	collectRetired := func() {
+		require.Eventually(t, func() bool {
+			runtime.GC()
+
+			for _, old := range retired {
+				if old.Value() != nil {
+					return false
+				}
+			}
+
+			for _, old := range oldPolicies {
+				if old.Value() != nil {
+					return false
+				}
+			}
+
+			return true
+		}, 10*time.Second, 100*time.Millisecond, "retired clients and policies must be collectible")
+
+		var live runtime.MemStats
+		runtime.ReadMemStats(&live)
+		t.Logf("released_clients=%d released_policies=%d heap_bytes=%d goroutines=%d registered_nodes=%d connected_clients=%d",
+			len(retired), len(oldPolicies), live.HeapAlloc, runtime.NumGoroutine(), len(indices), len(srv.App.MapHub().Connected()))
+	}
+
+	check := func() {
+		active := make(map[tailcfg.NodeID]int, connected)
+
+		for i, c := range clients {
+			if c != nil {
+				active[selfNodes[i].ID()] = i
+			}
+		}
+
+		checkScaleStreams(t, srv, clients, active)
+		waitForScaleState(t, tc, clients, selfNodes, indices, generation, revoked, "")
+		require.EventuallyWithT(t, func(ct *assert.CollectT) {
+			nodes := srv.State().ListNodes()
+			assert.Equal(ct, len(indices), nodes.Len())
+
+			for _, node := range nodes.All() {
+				i, ok := indices[node.ID().NodeID()]
+				if assert.True(ct, ok, "unexpected registered node %s", node.ID()) {
+					assert.Equal(ct, selfNodes[i].Key(), node.NodeKey())
+					assert.Equal(ct, i < connected && clients[i] != nil, node.Online(), "node %s", node.ID())
+				}
+			}
+		}, scaleConvergenceTimeout, 20*time.Millisecond, "offline registrations must survive active churn")
+
+		durable, err := srv.State().DB().ListNodes()
+		require.NoError(t, err)
+		require.Len(t, durable, len(indices))
+
+		for _, node := range durable {
+			i, ok := indices[node.ID.NodeID()]
+			require.True(t, ok, "unexpected durable node %d", node.ID)
+			require.Equal(t, selfNodes[i].Key(), node.NodeKey)
+			require.False(t, node.IsTagged())
+			require.Equal(t, types.UserID(users[i/scaleDevicesPerUser].ID), node.TypedUserID())
+		}
+	}
+
+	phase := func(name string, operations int, mutate func()) {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+
+		started := time.Now()
+
+		mutate()
+
+		mutated := time.Since(started)
+
+		check()
+		runtime.ReadMemStats(&after)
+		t.Logf("phase=%s operations=%d mutation_elapsed=%s convergence_elapsed=%s allocated_bytes=%d heap_bytes=%d gc_cycles=%d goroutines=%d registered_nodes=%d connected_clients=%d",
+			name, operations, mutated, time.Since(started)-mutated, after.TotalAlloc-before.TotalAlloc,
+			after.HeapAlloc, after.NumGC-before.NumGC, runtime.NumGoroutine(), len(indices), len(srv.App.MapHub().Connected()))
+	}
+
+	phase("enroll_offline", registered-connected, func() {
+		for i := range users {
+			users[i] = srv.CreateUser(t, fmt.Sprintf("scale-user-%d", i))
+		}
+
+		setPolicy()
+
+		slots := make([]int, registered-connected)
+		for i := range slots {
+			slots[i] = connected + i
+		}
+
+		register(slots, 0, false)
+	})
+	collectRetired()
+	phase("enroll_active", connected, func() {
+		slots := make([]int, connected)
+		for i := range slots {
+			slots[i] = i
+		}
+
+		register(slots, 0, true)
+	})
+
+	for round := range scaleDevicesPerUser {
+		var cohort []int
+		for i := round; i < connected; i += scaleDevicesPerUser {
+			cohort = append(cohort, i)
+		}
+
+		pm, ok := srv.State().Snapshot().Policy().(*policyv2.PolicyManager)
+		require.True(t, ok)
+
+		oldPolicies = append(oldPolicies, weak.Make(pm))
+
+		phase(fmt.Sprintf("churn_%02d_remove", round), len(cohort), func() {
+			for first := 0; first < len(cohort); first += 32 {
+				var removals sync.WaitGroup
+				for _, i := range cohort[first:min(first+32, len(cohort))] {
+					removals.Go(func() {
+						node, ok := srv.State().GetNodeByNodeKey(selfNodes[i].Key())
+						if assert.True(t, ok) {
+							assert.NoError(t, srv.State().DeleteNode(node))
+						}
+
+						clients[i].cleanupOnce()
+					})
+				}
+
+				removals.Wait()
+
+				if t.Failed() {
+					t.FailNow()
+				}
+			}
+
+			for _, i := range cohort {
+				retired = append(retired, weak.Make(clients[i]))
+				delete(indices, selfNodes[i].ID())
+				clients[i], selfNodes[i] = nil, tailcfg.NodeView{}
+			}
+		})
+		phase(fmt.Sprintf("churn_%02d_replace", round), len(cohort), func() {
+			if round == 4 || round == 5 {
+				revoked = round == 4
+				generation = fmt.Sprintf("example.com/partial-%d", round)
+
+				setPolicy()
+			}
+
+			register(cohort, round+1, true)
+		})
+	}
+
+	collectRetired()
+	runtime.KeepAlive(clients)
+	runtime.KeepAlive(srv)
+}
+
 func testScale(t *testing.T, churn bool) {
 	t.Helper()
 
