@@ -63,6 +63,13 @@ Do not create new files unless strictly necessary. Do not generate helper
 abstractions, wrapper utilities, or "just in case" configuration. Three
 similar lines of code is better than a premature abstraction.
 
+### Integrate branches by rebase only
+
+Rebase feature branches onto the target branch before integration. Use
+GitHub rebase integration (`gh pr merge --rebase`) for pull requests.
+Never use `git merge` or `gh pr merge --merge` for branch integration.
+Do not introduce merge commits.
+
 ## Quick Start
 
 ```bash
