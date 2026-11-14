@@ -1483,10 +1483,8 @@ func (pm *PolicyManager) addNodeOnlyPeers(c *PeerClasses, nodes views.Slice[type
 		}
 	}
 
-	// Without via grants a node's own rules are its user's self rules,
-	// the same for every untagged node of the user: compile them once.
-	hasVia := slices.ContainsFunc(pm.compiledGrants, func(g compiledGrant) bool { return g.category == grantCategoryVia })
-
+	// Untagged nodes cannot be via targets, so their own rules are their
+	// user's self rules. Apply them once per user, even with via grants.
 	var (
 		users []uint
 		owned = map[uint][]types.NodeID{}
@@ -1494,7 +1492,7 @@ func (pm *PolicyManager) addNodeOnlyPeers(c *PeerClasses, nodes views.Slice[type
 	)
 
 	for _, n := range nodes.All() {
-		if uid := n.User(); !hasVia && !n.IsTagged() && uid.Valid() {
+		if uid := n.User(); !n.IsTagged() && uid.Valid() {
 			if _, seen := owned[uid.ID()]; !seen {
 				users = append(users, uid.ID())
 				first[uid.ID()] = n
