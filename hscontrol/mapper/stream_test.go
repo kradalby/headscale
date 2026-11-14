@@ -6581,3 +6581,125 @@ func BenchmarkOfflinePeerHistory(b *testing.B) {
 		}
 	}
 }
+
+// TestClassMapsBuildAndEdit checks bulk owner counts before incremental
+// transfers and removals consume them, while retained maps remain immutable.
+func TestClassMapsBuildAndEdit(t *testing.T) {
+	for _, kind := range []string{"user", "tagged", "ownerless", "invalid-peer"} {
+		t.Run(kind, func(t *testing.T) {
+			cfg, s, ids := streamTestState(t, "")
+			n := mustNode(t, s, ids[2]).AsStruct()
+			firstOwner := mustNode(t, s, ids[0]).Owner().TailscaleUserProfile()
+			lastOwner := n.View().Owner().TailscaleUserProfile()
+			wantPeers := 3
+			wantOwners := map[tailcfg.NodeID]tailcfg.UserID{
+				ids[0].NodeID(): firstOwner.ID,
+				ids[1].NodeID(): firstOwner.ID,
+				ids[2].NodeID(): lastOwner.ID,
+			}
+			wantCounts := map[tailcfg.UserID]int{firstOwner.ID: 2, lastOwner.ID: 1}
+			wantProfiles := map[tailcfg.UserID]tailcfg.UserProfile{firstOwner.ID: firstOwner, lastOwner.ID: lastOwner}
+
+			switch kind {
+			case "tagged":
+				n.Tags = []string{"tag:service"}
+				p := types.TaggedDevices.TailscaleUserProfile()
+				wantOwners[ids[2].NodeID()] = p.ID
+				delete(wantCounts, lastOwner.ID)
+				wantCounts[p.ID] = 1
+				delete(wantProfiles, lastOwner.ID)
+				wantProfiles[p.ID] = p
+			case "ownerless", "invalid-peer":
+				if kind == "ownerless" {
+					n.UserID, n.User = nil, nil
+				} else {
+					n.Expiry = new(time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC))
+					wantPeers = 2
+				}
+
+				delete(wantOwners, ids[2].NodeID())
+				delete(wantCounts, lastOwner.ID)
+				delete(wantProfiles, lastOwner.ID)
+			}
+
+			s.PutNodeInStoreForTest(*n)
+
+			var (
+				cm      classMaps
+				renders peerRenders
+			)
+
+			before := s.Snapshot()
+			view := before.PeerView(ids[0])
+			peers, profiles := cm.get(cfg, &renders, before, view, capVer, before.PeerPolicyRev(), nil)
+			entry := cm.m[classKey{view: &view[0], n: len(view)}]
+			require.NotNil(t, entry)
+			owners := entry.cur.owners
+
+			require.Equal(t, wantPeers, peers.Len())
+			require.Equal(t, wantOwners, maps.Collect(owners.of.All()))
+			require.Equal(t, wantCounts, maps.Collect(owners.nodes.All()))
+			require.Equal(t, wantProfiles, maps.Collect(profiles.All()))
+			oldPeers := maps.Collect(peers.All())
+			oldSequence := peers.All()
+
+			// Transfer the first owner's second node to the last owner,
+			// then orphan its first: the first owner's count must reach zero.
+			moved := mustNode(t, s, ids[1]).AsStruct()
+			moved.UserID, moved.User = n.UserID, n.User
+			moved.Tags = slices.Clone(n.Tags)
+			s.PutNodeInStoreForTest(*moved)
+			after := s.Snapshot()
+			require.Same(t, &view[0], &after.PeerView(ids[0])[0], "ownership preserves the allow-all class")
+			cm.get(cfg, &renders, after, view, capVer, after.PeerPolicyRev(), nil)
+
+			orphan := mustNode(t, s, ids[0]).AsStruct()
+			orphan.UserID, orphan.User = nil, nil
+			s.PutNodeInStoreForTest(*orphan)
+			after = s.Snapshot()
+			require.Same(t, &view[0], &after.PeerView(ids[0])[0], "orphaning preserves the allow-all class")
+			updated, updatedProfiles := cm.get(cfg, &renders, after, view, capVer, after.PeerPolicyRev(), nil)
+
+			var fresh classMaps
+
+			expected, expectedProfiles := fresh.get(cfg, &renders, after, view, capVer, after.PeerPolicyRev(), nil)
+			require.Equal(t, maps.Collect(expected.All()), maps.Collect(updated.All()))
+			require.Equal(t, maps.Collect(expectedProfiles.All()), maps.Collect(updatedProfiles.All()))
+
+			freshOwners := fresh.m[classKey{view: &view[0], n: len(view)}].cur.owners
+			require.Equal(t, maps.Collect(freshOwners.of.All()), maps.Collect(entry.cur.owners.of.All()))
+			require.Equal(t, maps.Collect(freshOwners.nodes.All()), maps.Collect(entry.cur.owners.nodes.All()))
+			require.Equal(t, oldPeers, maps.Collect(peers.All()), "retained map changed")
+			require.Equal(t, oldPeers, maps.Collect(oldSequence), "retained sequence changed")
+			require.Equal(t, wantOwners, maps.Collect(owners.of.All()), "retained ownership changed")
+			require.Equal(t, wantCounts, maps.Collect(owners.nodes.All()), "retained counts changed")
+			require.Equal(t, wantProfiles, maps.Collect(profiles.All()), "retained profiles changed")
+		})
+	}
+}
+
+// TestClassMapsBuildAllocationWork bounds cold construction separately from
+// peer rendering, so persistent path copies per insertion cannot return.
+func TestClassMapsBuildAllocationWork(t *testing.T) {
+	const n = 1000
+
+	cfg, s := benchState(t, n, 10)
+	snap := s.Snapshot()
+	view := snap.PeerViews()[0]
+	require.Len(t, view, n)
+
+	var (
+		renders peerRenders
+		warm    classMaps
+	)
+	warm.get(cfg, &renders, snap, view, capVer, 0, nil)
+
+	allocs := testing.AllocsPerRun(5, func() {
+		var cm classMaps
+
+		peers, profiles := cm.get(cfg, &renders, snap, view, capVer, 0, nil)
+		require.Equal(t, n, peers.Len())
+		require.Equal(t, 10, profiles.Len())
+	})
+	require.Less(t, allocs, float64(10*n), "bulk construction must not copy HAMT paths for every peer")
+}
