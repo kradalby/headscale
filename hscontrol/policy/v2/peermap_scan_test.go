@@ -2070,3 +2070,105 @@ func TestUserAliasIncrementalIdentities(t *testing.T) {
 		})
 	}
 }
+
+// TestPeerClassesMixedSelfVia compares grouped peers with the per-node
+// reference, including user-owned routers with source-specific reachability.
+func TestPeerClassesMixedSelfVia(t *testing.T) {
+	for _, source := range []string{"autogroup:member", "u1@", "group:a"} {
+		for _, appOnly := range []bool{false, true} {
+			for _, reverse := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/app=%t/reverse=%t", source, appOnly, reverse), func(t *testing.T) {
+					traffic := `"ip":["tcp:443"]`
+					if appOnly {
+						traffic = `"app":{"example.com/via":[{}]}`
+					}
+
+					grants := []string{
+						fmt.Sprintf(`{"src":[%q],"dst":["autogroup:self"],"ip":["tcp:443"]}`, source),
+						`{"src":["u2@"],"dst":["autogroup:self"],"app":{"example.com/self":[{}]}}`,
+						fmt.Sprintf(`{"src":["u1@"],"dst":["10.2.0.0/24","fd00:2::/64"],"via":["tag:router"],%s}`, traffic),
+						`{"src":["100.64.0.2"],"dst":["10.2.0.0/25"],"via":["tag:router"],"ip":["tcp:80"]}`,
+					}
+					if reverse {
+						slices.Reverse(grants)
+					}
+
+					pol := []byte(`{"groups":{"group:a":["u1@"]},"tagOwners":{"tag:router":[],"tag:source":[],"tag:exit":[]},"grants":[` + strings.Join(grants, ",") + `]}`)
+					u1, u2 := &scanUsers[0], &scanUsers[1]
+					nodes := types.Nodes{
+						ownRulesNode(1, u1, nil, "100.64.0.3/32", "fd7a:115c:a1e0::3/128"),
+						ownRulesNode(2, u1, nil, "10.1.0.0/24"),
+						ownRulesNode(3, u2, nil),
+						ownRulesNode(4, u2, nil),
+						ownRulesNode(5, u1, []string{"tag:router"}, "10.2.0.0/24", "fd00:2::/64"),
+						ownRulesNode(6, u1, []string{"tag:router"}, "10.2.0.0/24", "fd00:2::/64"),
+						ownRulesNode(7, u2, []string{"tag:source"}, "100.64.0.2/32", "fd7a:115c:a1e0::2/128"),
+						ownRulesNode(8, u1, []string{"tag:exit"}, "0.0.0.0/0", "::/0"),
+						ownRulesNode(9, u1, nil),
+					}
+					nodes[8].User = nil // A creator ID alone does not carry self rules.
+
+					var (
+						previous *PolicyManager
+						classes  *PeerClasses
+					)
+
+					for step := range 7 {
+						pm, err := NewPolicyManagerFrom(previous, pol, scanUsers, nodes.ViewSlice())
+						require.NoError(t, err)
+
+						oldPeers := map[types.NodeID][]types.NodeID{}
+
+						if classes != nil {
+							for _, node := range previous.nodes.All() {
+								oldPeers[node.ID()] = slices.Clone(classes.Peers(node.ID()))
+							}
+						}
+
+						built := pm.BuildPeerClasses(nodes.ViewSlice(), classes)
+
+						want := buildPeerMapPairScan(pm, nodes.ViewSlice())
+						for _, node := range nodes {
+							require.Equalf(t, nilIfEmpty(slices.Sorted(slices.Values(want[node.ID]))), nilIfEmpty(built.Peers(node.ID)), "step %d node %d", step, node.ID)
+						}
+
+						if step == 0 {
+							require.Contains(t, built.Peers(1), types.NodeID(3), "the source router reaches u2")
+							require.NotContains(t, built.Peers(2), types.NodeID(3), "its sibling must not inherit that source route")
+							require.Equal(t, built.classOf[3], built.classOf[4], "u2 devices share one peer view")
+						}
+
+						require.NoError(t, pm.Audit(pol, scanUsers, nodes.ViewSlice()))
+						require.NoError(t, pm.AuditPeers(built, nodes.ViewSlice()))
+
+						for id, peers := range oldPeers {
+							require.Equal(t, peers, classes.Peers(id), "old peer snapshot")
+						}
+
+						previous, classes = pm, built
+						nodes = slices.Clone(nodes)
+
+						switch step {
+						case 0:
+							nodes = append(nodes, ownRulesNode(10, u1, nil))
+						case 1:
+							nodes = slices.Delete(nodes, 1, 2)
+						case 2:
+							nodes[3] = nodes[3].Clone()
+							nodes[3].Hostinfo = &tailcfg.Hostinfo{}
+						case 3:
+							nodes[0] = nodes[0].Clone()
+							nodes[0].Hostinfo = &tailcfg.Hostinfo{}
+						case 4:
+							nodes[0] = nodes[0].Clone()
+							nodes[0].Tags = []string{"tag:router"}
+						case 5:
+							nodes[1] = nodes[1].Clone()
+							nodes[1].User, nodes[1].UserID = u1, &u1.ID
+						}
+					}
+				})
+			}
+		}
+	}
+}
