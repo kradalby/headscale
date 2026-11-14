@@ -1105,6 +1105,74 @@ func BenchmarkPeerClassesDiversity(b *testing.B) {
 	}
 }
 
+// BenchmarkSelfRuleChurn includes the incremental compile and peer build after
+// one user's membership changes; users/grants is a non-self diversity control.
+func BenchmarkSelfRuleChurn(b *testing.B) {
+	for _, shape := range []string{"self", "users"} {
+		for _, size := range []int{100, 500, 1000, 2000} {
+			for _, change := range []string{"unchanged", "join", "leave"} {
+				b.Run(fmt.Sprintf("%s/nodes=%d/%s", shape, size, change), func(b *testing.B) {
+					nodes := scanManyRulesNodes(size)
+					users := make([]types.User, size/10)
+
+					var grants []string
+
+					for i := range users {
+						users[i] = types.User{ID: uint(i + 1), Name: fmt.Sprintf("u%d", i)} //nolint:gosec // bounded fixture
+						if shape == "users" {
+							grants = append(grants, fmt.Sprintf(`{"src":[%q],"dst":[%q],"ip":["tcp:443"]}`, users[i].Name+"@", users[i].Name+"@"))
+						}
+					}
+
+					for i, n := range nodes {
+						n.Tags = nil
+						n.User, n.UserID = &users[i/10], &users[i/10].ID
+					}
+
+					if shape == "self" {
+						grants = append(grants, `{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["tcp:443"]}`)
+					}
+
+					pol := []byte(`{"grants":[` + strings.Join(grants, ",") + `]}`)
+					before := nodes.ViewSlice()
+					prev, err := NewPolicyManager(pol, users, before)
+					require.NoError(b, err)
+
+					classes := prev.BuildPeerClasses(before, nil)
+					after := slices.Clone(nodes)
+
+					switch change {
+					case "join":
+						joined := nodes[0].Clone()
+						joined.ID = types.NodeID(size + 1) //nolint:gosec // bounded fixture
+						joined.IPv4, joined.IPv6 = ap("100.127.255.254"), ap("fd7a:115c:a1e0::ffff")
+						after = append(after, joined)
+					case "leave":
+						after = after[1:]
+					}
+
+					in := after.ViewSlice()
+
+					var builds int
+
+					b.ReportAllocs()
+
+					for b.Loop() {
+						pm, err := NewPolicyManagerFrom(prev, pol, users, in)
+						require.NoError(b, err)
+
+						carried := pm.selfRules.Size()
+						pm.BuildPeerClasses(in, classes)
+						builds += pm.selfRules.Size() - carried
+					}
+
+					b.ReportMetric(float64(builds)/float64(b.N), "self-builds/op")
+				})
+			}
+		}
+	}
+}
+
 func TestFilterChangedNodesWithoutACompile(t *testing.T) {
 	pm, err := NewPolicyManager([]byte(`{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`), scanUsers, views.Slice[types.NodeView]{})
 	require.NoError(t, err)

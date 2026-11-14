@@ -376,6 +376,10 @@ func NewPolicyManagerFrom(prev *PolicyManager, b []byte, users []types.User, nod
 		matchersForNodeMap: xsync.NewMap[types.NodeID, []matcher.Match](),
 	}
 
+	if change != nil {
+		pm.inheritSelfRules(prev)
+	}
+
 	// Prepare SSH for every server URL prev served, from prev when only
 	// nodes changed, so the change to each node's SSH policy is known.
 	if prev != nil {
@@ -3543,6 +3547,49 @@ func uniquePrefixes(in []netip.Prefix) []netip.Prefix {
 	}
 
 	return out
+}
+
+// inheritSelfRules copies only answers whose inputs still match. The new cache
+// owns its entries and never retains prev or a deleted user's devices.
+func (pm *PolicyManager) inheritSelfRules(prev *PolicyManager) {
+	prev.selfRules.Range(func(k selfRulesKey, rules keyedRules) bool {
+		if k.grant < len(pm.compiledGrants) && sameSelfInputs(
+			prev.compiledGrants[k.grant].self, pm.compiledGrants[k.grant].self,
+			prev.userNodeIdx[k.user], pm.userNodeIdx[k.user],
+		) {
+			pm.selfRules.Store(k, rules)
+			pm.dsts.Prime(rules.rules)
+		}
+
+		return true
+	})
+}
+
+// sameSelfInputs compares exactly what compileSelfForUser reads: ordered
+// device addresses and each source alias's membership, plus traffic and caps.
+func sameSelfInputs(a, b *selfGrantData, before, after []types.NodeView) bool {
+	if a == nil || b == nil || len(after) == 0 || len(before) != len(after) ||
+		len(a.resolvedSrcs) != len(b.resolvedSrcs) ||
+		!reflect.DeepEqual(a.internetProtocols, b.internetProtocols) || !reflect.DeepEqual(a.app, b.app) {
+		return false
+	}
+
+	for i, n := range after {
+		if !slices.Equal(before[i].IPs(), n.IPs()) {
+			return false
+		}
+	}
+
+	for i, src := range a.resolvedSrcs {
+		for _, n := range after {
+			ips := n.IPs()
+			if slices.ContainsFunc(ips, src.Contains) != slices.ContainsFunc(ips, b.resolvedSrcs[i].Contains) {
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 func (pm *PolicyManager) selfFor(i int, uid uint) keyedRules {
