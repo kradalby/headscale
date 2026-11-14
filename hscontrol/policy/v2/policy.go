@@ -2723,6 +2723,16 @@ type ViaRoutes struct {
 	winners *graph.Map[viaKey, types.NodeID]
 }
 
+// WithoutPolicy retains election winners for change tracking without owning the
+// compiled policy. The result supports ChangedNodes, not policy-based rendering.
+func (v *ViaRoutes) WithoutPolicy() *ViaRoutes {
+	if v == nil {
+		return nil
+	}
+
+	return &ViaRoutes{winners: v.winners}
+}
+
 // ElectViaRoutes revisits only scopes a change can move: those reached by
 // touched prefixes, and — when the policy binding changed — those whose
 // candidate membership moved with it. Scopes are keyed by content, so a

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"weak"
 
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/graph"
@@ -134,8 +135,10 @@ type renderer struct {
 	// rendered with, and routedVia the via elections: a primary move that
 	// keeps the elections renders again only the routers whose primaries
 	// moved.
+	// Weak identity lets idle streams release obsolete compiled policies.
 	routedPrimaries map[tailcfg.NodeID][]netip.Prefix
-	routedVia       *policyv2.ViaRoutes
+	routedVia       weak.Pointer[policyv2.ViaRoutes]
+	routedWinners   *policyv2.ViaRoutes
 
 	// dns is reused while its inputs, the node and the policy's capability
 	// map and the extra records, are unchanged.
@@ -617,7 +620,7 @@ func (nm *netMap) recordPeerChanges(base *netMap, candidates []tailcfg.NodeID, s
 func (r *renderer) routedCandidates(snap *state.Snapshot, self types.NodeView, key renderKey, first bool) []tailcfg.NodeID {
 	var out []tailcfg.NodeID
 
-	via := snap.ViaElection()
+	via := weak.Make(snap.ViaElection())
 
 	switch {
 	case first || key.policy != r.lastKey.policy || !sameRouteFacts(r.lastSelf, self):
@@ -645,7 +648,7 @@ func (r *renderer) routedCandidates(snap *state.Snapshot, self types.NodeView, k
 		// With the same policy and viewer, a via election changes only
 		// whether the peer is its winner: revisit both losing and gaining
 		// routers, independently of the global primary moves above.
-		for _, id := range via.ChangedNodes(r.routedVia) {
+		for _, id := range snap.ViaElection().ChangedNodes(r.routedWinners) {
 			out = append(out, id.NodeID())
 		}
 	}
@@ -664,7 +667,12 @@ func sameRouteFacts(a, b types.NodeView) bool {
 func (r *renderer) markRendered(snap *state.Snapshot, key renderKey, self types.NodeView, class *peerMap) {
 	r.lastClass, r.lastKey = class, key
 	r.lastPeerIDs, r.lastSelf = snap.PeerView(r.nodeID), self
-	r.routedVia = snap.ViaElection()
+
+	via := weak.Make(snap.ViaElection())
+	if via != r.routedVia {
+		r.routedWinners = snap.ViaElection().WithoutPolicy()
+		r.routedVia = via
+	}
 }
 
 // classMaps holds the peer maps shared by the sessions of a class: nodes

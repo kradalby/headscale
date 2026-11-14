@@ -17,9 +17,11 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"weak"
 
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/db"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
@@ -7289,4 +7291,58 @@ func BenchmarkSelfCache(b *testing.B) {
 			})
 		}
 	}
+}
+
+func TestStreamDoesNotRetainObsoletePolicy(t *testing.T) {
+	cfg, s, ids := streamTestState(t, ownUserOnly)
+	hub := NewHub()
+	t.Cleanup(hub.Close)
+	st := NewStream(cfg, hub, ids[0], capVer)
+	old := func() weak.Pointer[policyv2.PolicyManager] {
+		pm, ok := s.Snapshot().Policy().(*policyv2.PolicyManager)
+		require.True(t, ok)
+
+		_, err := st.Initial(s.Snapshot())
+		require.NoError(t, err)
+		st.Delivered()
+
+		return weak.Make(pm)
+	}()
+	// An invisible enrollment recompiles policy without waking this stream.
+	u2 := mustNode(t, s, ids[2]).User().AsStruct()
+	n := s.DB().CreateRegisteredNodeForTest(u2, "unrelated-enrollment")
+	s.PutNodeInStoreForTest(*n)
+	hub.advance(s.Snapshot())
+	pm, ok := s.Snapshot().Policy().(*policyv2.PolicyManager)
+	require.True(t, ok)
+
+	current := weak.Make(pm)
+	require.NotEqual(t, old, current)
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		return old.Value() == nil
+	}, time.Second, 10*time.Millisecond, "idle stream must not own an obsolete compiled policy")
+	require.NotNil(t, current.Value(), "live world must retain its current policy")
+	runtime.KeepAlive(st)
+	runtime.KeepAlive(s)
+}
+
+func TestRoutedCandidatesAfterElectionCollection(t *testing.T) {
+	s, streams := scalingTailnet(t, 30, "via")
+	st := streams[1]
+	old := st.r.routedVia
+	winner := streams[0].nodeID
+	require.NoError(t, s.Disconnect(winner, mustNode(t, s, winner).SessionEpoch()))
+	s.Connect(winner)
+	st.hub.advance(s.Snapshot())
+	require.NotEqual(t, old, weak.Make(s.Snapshot().ViaElection()), "fixture must move the election binding")
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		return old.Value() == nil
+	}, time.Second, 10*time.Millisecond, "streams must not retain the old election binding")
+
+	snap := s.Snapshot()
+	got := st.r.routedCandidates(snap, mustNode(t, s, st.nodeID), st.r.lastKey, false)
+	want := []tailcfg.NodeID{winner.NodeID(), streams[10].nodeID.NodeID()}
+	require.ElementsMatch(t, want, got, "collected history must include exactly the losing and gaining routers")
 }
