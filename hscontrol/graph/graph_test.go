@@ -518,6 +518,113 @@ func TestGroupByMatchesRebuild(t *testing.T) {
 	}
 }
 
+func TestGroupByPreservesMembershipSnapshots(t *testing.T) {
+	groups := func(_ int, v int) []int { return []int{v % 2, v % 2, 2} }
+	in := NewMap(Same[int], map[int]int{3: 0, 1: 0, 2: 1})
+	initial := GroupBy(Grouped[int, int, int]{}, in, groups, nil)
+
+	want := map[int][]int{0: {1, 3}, 1: {2}, 2: {1, 2, 3}}
+	if got := toNative(initial.Groups); !maps.EqualFunc(got, want, slices.Equal[[]int]) {
+		t.Fatalf("initial groups = %v, want %v", got, want)
+	}
+
+	e := in.Edit()
+	e.Set(1, 1)
+	e.Delete(2)
+	e.Delete(3)
+	e.Set(4, 0)
+	next := GroupBy(initial, e.Done(), groups, nil)
+
+	wantNext := map[int][]int{0: {4}, 1: {1}, 2: {1, 4}}
+	if got := toNative(next.Groups); !maps.EqualFunc(got, wantNext, slices.Equal[[]int]) {
+		t.Fatalf("changed groups = %v, want %v", got, wantNext)
+	}
+
+	if got := toNative(initial.Groups); !maps.EqualFunc(got, want, slices.Equal[[]int]) {
+		t.Fatalf("old groups changed to %v, want %v", got, want)
+	}
+
+	e = next.In.Edit()
+	e.Set(1, 3)
+
+	cutoff := GroupBy(next, e.Done(), func(int, int) []int {
+		t.Fatal("sameGroups must skip groupsOf")
+
+		return nil
+	}, func(a, b int) bool { return a%2 == b%2 })
+	if cutoff.Groups != next.Groups || cutoff.In == next.In {
+		t.Fatal("sameGroups must advance the input without changing groups")
+	}
+
+	empty := GroupBy(next, NewMap(Same[int], map[int]int{}), groups, nil)
+	if empty.Groups.Len() != 0 {
+		t.Fatalf("deleted all members, groups = %v", toNative(empty.Groups))
+	}
+
+	if got := toNative(next.Groups); !maps.EqualFunc(got, wantNext, slices.Equal[[]int]) {
+		t.Fatalf("deleted members changed old groups to %v, want %v", got, wantNext)
+	}
+}
+
+func TestGroupByEmptyInput(t *testing.T) {
+	groups := func(int, int) []int {
+		t.Fatal("empty input must not call groupsOf")
+
+		return nil
+	}
+	for _, in := range []*Map[int, int]{nil, NewMap[int, int](Same[int], nil)} {
+		initial := GroupBy(Grouped[int, int, int]{}, in, groups, nil)
+		if initial.In != in || initial.Groups == nil || initial.Groups.Len() != 0 {
+			t.Fatal("empty input must produce empty groups")
+		}
+
+		if next := GroupBy(initial, in, groups, nil); next.Groups != initial.Groups {
+			t.Fatal("unchanged empty input must preserve groups")
+		}
+	}
+}
+
+func BenchmarkGroupBy(b *testing.B) {
+	for _, size := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprintf("keys=%d", size), func(b *testing.B) {
+			entries := make(map[int]int, size)
+			for k := range size {
+				entries[k] = 0
+			}
+
+			in := NewMap(Same[int], entries)
+			groups := func(_ int, v int) []int { return []int{v} }
+			initial := GroupBy(Grouped[int, int, int]{}, in, groups, nil)
+			one := in.Edit()
+			one.Set(0, 1)
+
+			bulk := in.Edit()
+			for k := range size {
+				bulk.Set(k, 1)
+			}
+
+			for _, scenario := range []struct {
+				name string
+				prev Grouped[int, int, int]
+				in   *Map[int, int]
+			}{
+				{"initial", Grouped[int, int, int]{}, in},
+				{"one-member", initial, one.Done()},
+				{"all-members", initial, bulk.Done()},
+			} {
+				b.Run(scenario.name, func(b *testing.B) {
+					b.ReportAllocs()
+
+					for b.Loop() {
+						result := GroupBy(scenario.prev, scenario.in, groups, nil)
+						runtime.KeepAlive(result)
+					}
+				})
+			}
+		})
+	}
+}
+
 // TestUpdateCheckedRefusalPublishesNothing refuses a built snapshot: the
 // graph must keep its last one, wake no subscriber, and return the error.
 func TestUpdateCheckedRefusalPublishesNothing(t *testing.T) {
