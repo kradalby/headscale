@@ -72,7 +72,7 @@ func (c *DstCache) Reduce(node types.NodeView, rules []tailcfg.FilterRule) []tai
 		}
 	}
 
-	return reduceRules(node, rules, func(i, j int) parsedDst {
+	return reduceRules(node, rules, node.SubnetRoutes(), node.ExitRoutes(), func(i, j int) parsedDst {
 		if parsed[i] != nil {
 			return parsed[i][j]
 		}
@@ -90,7 +90,7 @@ func (c *DstCache) Reduce(node types.NodeView, rules []tailcfg.FilterRule) []tai
 // both cases.
 func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcfg.FilterRule {
 	// One node: parse as we go rather than build an index to read once.
-	return reduceRules(node, rules, func(i, j int) parsedDst {
+	return reduceRules(node, rules, node.SubnetRoutes(), node.ExitRoutes(), func(i, j int) parsedDst {
 		return parseDst(rules[i].DstPorts[j].IP)
 	})
 }
@@ -170,7 +170,7 @@ func (red *Reducer) Reduce(node types.NodeView) []tailcfg.FilterRule {
 
 	// A route can overlap any destination, so routers scan them all.
 	if len(subnetRoutes) > 0 || len(exitRoutes) > 0 {
-		return red.reduceAll(node)
+		return reduceRules(node, red.rules, subnetRoutes, exitRoutes, func(i, j int) parsedDst { return red.dsts[i][j] })
 	}
 
 	var refs []dstRef
@@ -180,7 +180,7 @@ func (red *Reducer) Reduce(node types.NodeView) []tailcfg.FilterRule {
 	}
 
 	for _, ref := range red.wide {
-		if red.dsts[ref.rule][ref.dst].reaches(nodeIPs, nil, nil) {
+		if red.dsts[ref.rule][ref.dst].reaches(nodeIPs, nil, false) {
 			refs = append(refs, ref)
 		}
 	}
@@ -230,19 +230,40 @@ func (red *Reducer) Reduce(node types.NodeView) []tailcfg.FilterRule {
 	return ret
 }
 
-// reduceAll reduces by checking every destination, for a node whose routes
-// may overlap any of them.
-func (red *Reducer) reduceAll(node types.NodeView) []tailcfg.FilterRule {
-	return reduceRules(node, red.rules, func(i, j int) parsedDst { return red.dsts[i][j] })
-}
-
 // reduceRules keeps the rules and destinations that reach node, reading
 // each destination through dst.
-func reduceRules(node types.NodeView, rules []tailcfg.FilterRule, dst func(rule, entry int) parsedDst) []tailcfg.FilterRule {
+func reduceRules(node types.NodeView, rules []tailcfg.FilterRule, subnetRoutes, exitRoutes []netip.Prefix, dst func(rule, entry int) parsedDst) []tailcfg.FilterRule {
 	ret := []tailcfg.FilterRule{}
 	nodeIPs := node.IPs()
-	subnetRoutes := node.SubnetRoutes()
-	exitRoutes := node.ExitRoutes()
+	hasRoutes := len(subnetRoutes) > 0 || len(exitRoutes) > 0
+
+	var routes []netipx.IPRange
+
+	if hasRoutes {
+		routes = make([]netipx.IPRange, 0, len(subnetRoutes)+len(exitRoutes))
+		for _, prefixes := range [2][]netip.Prefix{subnetRoutes, exitRoutes} {
+			for _, prefix := range prefixes {
+				if r := netipx.RangeOfPrefix(prefix); r.IsValid() {
+					routes = append(routes, r)
+				}
+			}
+		}
+
+		slices.SortFunc(routes, func(a, b netipx.IPRange) int { return a.From().Compare(b.From()) })
+
+		// Merge in place: overlapping prefixes otherwise have unordered ends.
+		merged := routes[:0]
+		for _, r := range routes {
+			last := len(merged) - 1
+			if last < 0 || !merged[last].Overlaps(r) {
+				merged = append(merged, r)
+			} else if r.To().Compare(merged[last].To()) > 0 {
+				merged[last] = netipx.IPRangeFrom(merged[last].From(), r.To())
+			}
+		}
+
+		routes = merged
+	}
 
 	for i, rule := range rules {
 		// Handle CapGrant rules separately — they use CapGrant[].Dsts
@@ -258,7 +279,7 @@ func reduceRules(node types.NodeView, rules []tailcfg.FilterRule, dst func(rule,
 		var dests []tailcfg.NetPortRange
 
 		for j, dest := range rule.DstPorts {
-			if dst(i, j).reaches(nodeIPs, subnetRoutes, exitRoutes) {
+			if dst(i, j).reaches(nodeIPs, routes, hasRoutes) {
 				dests = append(dests, dest)
 			}
 		}
@@ -287,25 +308,30 @@ func parseDst(ip string) parsedDst {
 
 // reaches reports whether the destination targets the node: one of its
 // addresses, or a route it serves.
-func (d parsedDst) reaches(nodeIPs []netip.Addr, subnetRoutes, exitRoutes []netip.Prefix) bool {
+func (d parsedDst) reaches(nodeIPs []netip.Addr, routes []netipx.IPRange, hasRoutes bool) bool {
 	if !d.valid {
 		return false
 	}
 
 	if d.any {
-		return len(nodeIPs) > 0 || len(subnetRoutes) > 0 || len(exitRoutes) > 0
+		return len(nodeIPs) > 0 || hasRoutes
 	}
-
-	overlaps := func(p netip.Prefix) bool { return d.r.Overlaps(netipx.RangeOfPrefix(p)) }
 
 	// [types.NodeView.SubnetRoutes] holds only approved, non-exit routes:
 	// Tailscale SaaS generates no rules for advertised-but-unapproved
 	// routes. Approved exit routes count like subnet routes. They contain
 	// every destination, so SaaS sends an exit node every rule, not only
 	// internet ones.
-	return slices.ContainsFunc(nodeIPs, d.r.Contains) ||
-		slices.ContainsFunc(subnetRoutes, overlaps) ||
-		slices.ContainsFunc(exitRoutes, overlaps)
+	if slices.ContainsFunc(nodeIPs, d.r.Contains) {
+		return true
+	}
+
+	// Sorted, disjoint ranges have increasing endpoints, including across families.
+	i, _ := slices.BinarySearchFunc(routes, d.r.From(), func(r netipx.IPRange, ip netip.Addr) int {
+		return r.To().Compare(ip)
+	})
+
+	return i < len(routes) && routes[i].Overlaps(d.r)
 }
 
 // reduceCapGrantRule filters a [tailcfg.CapGrant] rule to only include
