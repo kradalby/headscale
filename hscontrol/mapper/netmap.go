@@ -617,21 +617,33 @@ func (r *renderer) routedCandidates(snap *state.Snapshot, self types.NodeView, k
 	via := snap.ViaElection()
 
 	switch {
-	case first || key.policy != r.lastKey.policy || !sameRouteFacts(r.lastSelf, self) || via != r.routedVia:
-		// A moved via election can steer any router's routes for this
+	case first || key.policy != r.lastKey.policy || !sameRouteFacts(r.lastSelf, self):
+		// A policy or viewer change can steer any router's routes for this
 		// viewer.
-		r.routedPrimaries, r.routedVia = nil, via
+		r.routedPrimaries = nil
 
 		for _, id := range snap.RoutedNodes() {
 			out = append(out, id.NodeID())
 		}
+
+		return out
 	case key.primaries != r.lastKey.primaries:
 		// A peer's routes read the policy, the viewer, the via elections
-		// and the peer's own primaries; only the last moved.
+		// and the peer's own primaries; check the latter independently
+		// of the via election changes below.
 		for _, id := range snap.RoutedNodes() {
 			if was, ok := r.routedPrimaries[id.NodeID()]; !ok || !slices.Equal(was, snap.PrimaryRoutesForNode(id)) {
 				out = append(out, id.NodeID())
 			}
+		}
+	}
+
+	if via != r.routedVia {
+		// With the same policy and viewer, a via election changes only
+		// whether the peer is its winner: revisit both losing and gaining
+		// routers, independently of the global primary moves above.
+		for _, id := range via.ChangedNodes(r.routedVia) {
+			out = append(out, id.NodeID())
 		}
 	}
 
@@ -649,6 +661,7 @@ func sameRouteFacts(a, b types.NodeView) bool {
 func (r *renderer) markRendered(snap *state.Snapshot, key renderKey, self types.NodeView, class *peerMap) {
 	r.lastClass, r.lastKey = class, key
 	r.lastPeerIDs, r.lastSelf = snap.PeerView(r.nodeID), self
+	r.routedVia = snap.ViaElection()
 }
 
 // classMaps holds the peer maps shared by the sessions of a class: nodes
