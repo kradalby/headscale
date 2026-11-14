@@ -1105,6 +1105,158 @@ func BenchmarkPeerClassesDiversity(b *testing.B) {
 	}
 }
 
+func BenchmarkCachedMatcherSidesChanges(b *testing.B) {
+	for _, shape := range []string{"pairs", "tag-pairs", "dense", "self", "allow-all"} {
+		for _, n := range []int{100, 500, 1000, 2000} {
+			b.Run(fmt.Sprintf("%s/nodes=%d", shape, n), func(b *testing.B) {
+				nodes, users, pol := diversePeerPolicy(n, shape)
+				pm, err := NewPolicyManager(pol, users, nodes.ViewSlice())
+				require.NoError(b, err)
+
+				matchers := pm.matchers
+				if pm.needsPerNodeFilter {
+					matchers = matcher.MatchesFromFilterRules(sharedRules(pm.compiledGrants))
+				}
+
+				_, _, prev := cachedMatcherSides(matchers, nodes.ViewSlice(), nil)
+				changed := slices.Clone(nodes)
+				changed[0] = nodes[0].Clone()
+				ip := netip.MustParseAddr("100.127.255.254")
+				changed[0].IPv4, changed[0].IPv6 = &ip, nil
+				reordered := slices.Clone(matchers)
+				slices.Reverse(reordered)
+
+				for _, phase := range []string{"unchanged", "one-node", "reordered"} {
+					b.Run(phase, func(b *testing.B) {
+						in, ms := nodes.ViewSlice(), matchers
+
+						switch phase {
+						case "one-node":
+							in = changed.ViewSlice()
+						case "reordered":
+							ms = reordered
+						}
+
+						wantSrc, wantDst := matcherSides(ms, in)
+						src, dst, _ := cachedMatcherSides(ms, in, prev)
+						require.Equal(b, wantSrc, src)
+						require.Equal(b, wantDst, dst)
+						b.ReportAllocs()
+
+						for b.Loop() {
+							cachedMatcherSides(ms, in, prev)
+						}
+					})
+				}
+			})
+		}
+	}
+}
+
+func TestCachedMatcherSides(t *testing.T) {
+	nodes := scanManyRulesNodes(130)
+	nodes = append(nodes, ownRulesNode(131, nil, nil, "10.1.0.0/24"),
+		ownRulesNode(132, nil, nil, "0.0.0.0/0", "::/0"), &types.Node{ID: 133})
+
+	var rules []tailcfg.FilterRule
+	for i := 0; i < 130; i += 2 {
+		rules = append(rules, tailcfg.FilterRule{
+			SrcIPs:   []string{nodes[i].IPv4.String()},
+			DstPorts: []tailcfg.NetPortRange{{IP: nodes[i+1].IPv4.String(), Ports: tailcfg.PortRangeAny}},
+		})
+	}
+
+	rules = append(rules, tailcfg.FilterRule{
+		SrcIPs:   []string{"10.1.0.0/24"},
+		DstPorts: []tailcfg.NetPortRange{{IP: "10.2.0.0/24", Ports: tailcfg.PortRangeAny}},
+	}, tailcfg.FilterRule{
+		SrcIPs:   []string{nodes[0].IPv4.String()},
+		DstPorts: []tailcfg.NetPortRange{{IP: "0.0.0.0/0", Ports: tailcfg.PortRangeAny}},
+	}, rules[0])
+	ms := matcher.MatchesFromFilterRules(rules)
+	_, _, prev := cachedMatcherSides(ms, nodes.ViewSlice(), nil)
+
+	frozen := &sideCache{keys: slices.Clone(prev.keys), nodes: make(map[types.NodeID]cachedSides)}
+	for id, old := range prev.nodes {
+		frozen.nodes[id] = cachedSides{node: old.node, src: slices.Clone(old.src), dst: slices.Clone(old.dst)}
+	}
+
+	reordered := slices.Clone(ms)
+	slices.Reverse(reordered)
+
+	added := matcher.MatchFromFilterRule(tailcfg.FilterRule{
+		SrcIPs:   []string{nodes[0].IPv4.String()},
+		DstPorts: []tailcfg.NetPortRange{{IP: nodes[2].IPv4.String(), Ports: tailcfg.PortRangeAny}},
+	})
+	changed := slices.Clone(nodes)
+	changed[0] = nodes[0].Clone()
+	ip := netip.MustParseAddr("100.127.255.254")
+	changed[0].IPv4, changed[0].IPv6 = &ip, nil
+	changed[130] = ownRulesNode(131, nil, nil, "10.2.0.0/24")
+	changed[131] = ownRulesNode(132, nil, nil)
+
+	for _, tc := range []struct {
+		name     string
+		matchers []matcher.Match
+		nodes    types.Nodes
+		share    bool
+	}{
+		{"unchanged", ms, nodes, true},
+		{"equivalent matchers", matcher.MatchesFromFilterRules(rules), nodes, true},
+		{"reordered", reordered, nodes, false},
+		{"inserted", slices.Insert(slices.Clone(ms), 1, added), nodes, false},
+		{"deleted", ms[2:], nodes, false},
+		{"duplicates", append(slices.Clone(ms), ms[0]), nodes, false},
+		{"no matchers", nil, nodes, false},
+		{"no nodes", ms, nil, true},
+		{"changed addresses routes and exit", ms, changed, true},
+		{"node removed", ms, nodes[1:], true},
+		{"node added", ms, append(slices.Clone(nodes), ownRulesNode(134, nil, nil, "10.1.0.0/24")), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := tc.nodes.ViewSlice()
+			wantSrc, wantDst := matcherSides(tc.matchers, in)
+			src, dst, next := cachedMatcherSides(tc.matchers, in, prev)
+			require.Equal(t, wantSrc, src)
+			require.Equal(t, wantDst, dst)
+			require.Len(t, next.nodes, len(tc.nodes))
+			require.Equal(t, frozen, prev, "previous snapshot changed")
+
+			for i, node := range in.All() {
+				old, ok := prev.lookup(node)
+				if !tc.share || !ok {
+					continue
+				}
+
+				if len(old.src) > 0 {
+					require.Same(t, &old.src[0], &src[i][0], "source mask copied")
+				}
+
+				if len(old.dst) > 0 {
+					require.Same(t, &old.dst[0], &dst[i][0], "destination mask copied")
+				}
+			}
+
+			// A later reorder and insertion must never write shared masks.
+			cachedMatcherSides(append(slices.Clone(reordered), added), in, next)
+			require.Equal(t, frozen, prev, "later build changed previous snapshot")
+			require.Equal(t, wantSrc, src, "later build changed source masks")
+			require.Equal(t, wantDst, dst, "later build changed destination masks")
+		})
+	}
+
+	in := nodes.ViewSlice()
+	_, _, empty := cachedMatcherSides(nil, in, nil)
+	src, dst, _ := cachedMatcherSides([]matcher.Match{}, in, empty)
+	wantSrc, wantDst := matcherSides(nil, in)
+	require.Equal(t, wantSrc, src)
+	require.Equal(t, wantDst, dst)
+	src, dst, _ = cachedMatcherSides(ms, in, empty)
+	wantSrc, wantDst = matcherSides(ms, in)
+	require.Equal(t, wantSrc, src)
+	require.Equal(t, wantDst, dst)
+}
+
 func TestFilterChangedNodesWithoutACompile(t *testing.T) {
 	pm, err := NewPolicyManager([]byte(`{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`), scanUsers, views.Slice[types.NodeView]{})
 	require.NoError(t, err)

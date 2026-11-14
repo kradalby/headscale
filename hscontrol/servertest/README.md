@@ -166,6 +166,9 @@ Each shape separates policy compilation, class construction without previous
 sides (`fresh`), and construction reusing unchanged nodes and rules
 (`reuse`). These are individual stages, not registration latency. In
 particular, `reuse` does not include a policy edit or a joining node.
+`BenchmarkCachedMatcherSidesChanges` isolates side construction with unchanged
+inputs, one changed node address, or reversed matcher order; its compiled
+matchers stay fixed, so it does not measure policy compilation.
 Construction phases report `classes/op`: the class views the phase's own
 build produced, including a shared base view that per-node rules may
 supersede. Compilation does not build or report class views.
@@ -189,9 +192,10 @@ afterwards. An unchanged visibility relation includes self edges inside a
 class; `Peers` removes the requesting node.
 
 This does not make the entire build linear. Fresh side evaluation still
-checks N nodes against M matchers. Reuse remaps matcher bits per node, also
-O(NM). Stored side bitsets cost O(N ceil(M/64)); views can cost O(NC) for C
-classes, reaching O(N²). Policy diversity and dense output remain
+checks N nodes against M matchers. Reuse shares immutable masks for unchanged
+nodes when matcher contents and order agree; changed matcher sequences still
+remap bits per node, O(NM). Stored side bitsets cost O(N ceil(M/64)); views can
+cost O(NC) for C classes, reaching O(N²). Policy diversity and dense output remain
 architectural limits: measurements of this join live in the pull request
 that introduced it, and new hardware deserves new measurements, not these.
 
