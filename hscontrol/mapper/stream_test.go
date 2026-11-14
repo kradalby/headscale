@@ -1960,8 +1960,17 @@ func BenchmarkScalingWrites(b *testing.B) {
 // wins and keeps its election when the former winner returns. Every operation
 // transfers the route, rather than amortizing one failover over ordinary writes.
 func BenchmarkViaOnlineWrites(b *testing.B) {
+	sizes := []int{100, 400, 1000}
+
+	if value, ok := os.LookupEnv("HEADSCALE_SCALE_NODES"); ok {
+		n, err := strconv.Atoi(value)
+		require.NoError(b, err)
+
+		sizes = []int{n}
+	}
+
 	for _, kind := range []string{"router-failover", "member-online", "unrelated-user"} {
-		for _, n := range []int{100, 400, 1000} {
+		for _, n := range sizes {
 			b.Run(fmt.Sprintf("%s/nodes=%d", kind, n), func(b *testing.B) {
 				shape := "via"
 				if kind == "unrelated-user" {
@@ -2005,6 +2014,68 @@ func BenchmarkViaOnlineWrites(b *testing.B) {
 					require.Positive(b, sc.updates, "each failover must send route changes")
 				}
 
+				b.ReportMetric(float64(sc.woken)/float64(i), "woken/op")
+				b.ReportMetric(float64(sc.updates)/float64(i), "updates/op")
+				b.ReportMetric(float64(sc.rendered)/float64(i), "peer-renders/op")
+			})
+		}
+	}
+}
+
+// BenchmarkViaMixedOnlineWrites isolates election moves under per-user peer
+// views. The sparse case steers only u0, leaving other users' classes unrelated.
+func BenchmarkViaMixedOnlineWrites(b *testing.B) {
+	for _, shape := range []string{"self", "users", "sparse"} {
+		for _, n := range []int{100, 400, 1000} {
+			b.Run(fmt.Sprintf("%s/nodes=%d", shape, n), func(b *testing.B) {
+				s, streams := scalingTailnet(b, n, "via")
+
+				plain := `{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["*"]}`
+				if shape == "users" {
+					plain = `{"src":["u0@"],"dst":["u0@"],"ip":["*"]}`
+				}
+
+				source := "autogroup:member"
+				if shape == "sparse" {
+					source = "u0@"
+				}
+
+				_, err := s.SetPolicy([]byte(`{"tagOwners":{"tag:r":["u0@"]},"grants":[` + plain + `,
+					{"src":["` + source + `"],"dst":["10.0.0.0/8"],"ip":["*"],"via":["tag:r"]}]}`))
+				require.NoError(b, err)
+
+				for _, st := range streams {
+					_, err := st.Update(s.Snapshot())
+					require.NoError(b, err)
+					st.Delivered()
+				}
+
+				sc := newScalingRun(s, streams)
+				write := func(tb testing.TB, s *state.State, _ types.NodeID, i int) {
+					tb.Helper()
+
+					id := streams[(i%2)*10].nodeID
+					scalingWrites["online"](tb, s, id, i)
+					scalingWrites["online"](tb, s, id, i)
+				}
+
+				b.ReportAllocs()
+
+				i := 0
+				for b.Loop() {
+					sc.step(b, write, i)
+					i++
+				}
+
+				sc.requireSettled(b, "online")
+
+				snap := s.Snapshot()
+				viewer := mustNode(b, s, streams[1].nodeID)
+				matchers, err := snap.Policy().MatchersForNode(viewer)
+				require.NoError(b, err)
+				winner := mustNode(b, s, streams[(i%2)*10].nodeID)
+				require.Contains(b, snap.RoutesForPeer(viewer, winner, matchers), netip.MustParsePrefix("10.0.0.0/24"))
+				require.Positive(b, sc.updates)
 				b.ReportMetric(float64(sc.woken)/float64(i), "woken/op")
 				b.ReportMetric(float64(sc.updates)/float64(i), "updates/op")
 				b.ReportMetric(float64(sc.rendered)/float64(i), "peer-renders/op")
@@ -2150,12 +2221,11 @@ func TestScalingWriteWork(t *testing.T) {
 	// session (Snapshot.Since escalation, N2): above need.
 	//
 	// The via shape sees what allow-all does, plus routes that differ per
-	// viewer: a write that moves the policy or a via election, as policy
-	// and rejoin writes and a router going offline do, re-renders every
-	// routed peer in every session (renderPeers), five primary routers
-	// here, where only the routers the election steers to or from need it:
-	// above need, as the renderer cannot tell which those are. The first
-	// online write also changes the router's own PrimaryRoutes. Rejoin
+	// viewer: a write that moves the policy, as policy and rejoin writes
+	// do, re-renders every routed peer in every session (renderPeers),
+	// five primary routers here: above need. A via election move renders
+	// only the routers the election steers to or from. The first online
+	// write also changes the router's own PrimaryRoutes. Rejoin
 	// restores its original SessionStart, so final wire state is unchanged.
 	ceilings := map[string][3]int{
 		"derp/allow-all":           {400, 400, 0},
@@ -2182,7 +2252,7 @@ func TestScalingWriteWork(t *testing.T) {
 		"online/self":              {40, 36, 36},
 		"online/tags":              {44, 40, 40},
 		"online/users":             {40, 36, 36},
-		"online/via":               {400, 397, 891},
+		"online/via":               {400, 397, 495},
 		"policy/allow-all":         {500, 500, 0},
 		"policy/self":              {500, 500, 9000},
 		"policy/tags":              {500, 500, 8900},
@@ -2857,6 +2927,105 @@ func TestPrimaryMoveRendersOnlyTheMovedRouters(t *testing.T) {
 	fresh, err := NewStream(cfg, NewHub(), viewer, capVer).Initial(s.Snapshot())
 	require.NoError(t, err)
 	assert.Empty(t, client.sameAs(newModelClient(fresh[0])), "the session converges on a fresh map")
+}
+
+func TestViaMoveRendersOnlyChangedRouters(t *testing.T) {
+	t.Parallel()
+
+	for _, shape := range []string{"via", "self", "users", "sparse"} {
+		t.Run(shape, func(t *testing.T) {
+			t.Parallel()
+
+			s, streams := scalingTailnet(t, 100, "via")
+			policy := scalingPolicies["via"]
+
+			if shape != "via" {
+				plain := `{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["*"]}`
+				if shape == "users" {
+					plain = `{"src":["u0@"],"dst":["u0@"],"ip":["*"]}`
+				}
+
+				source := "autogroup:member"
+				if shape == "sparse" {
+					source = "u0@"
+				}
+
+				policy = `{"tagOwners":{"tag:r":["u0@"]},"grants":[` + plain + `,
+					{"src":["` + source + `"],"dst":["10.0.0.0/8"],"ip":["*"],"via":["tag:r"]}]}`
+			}
+
+			_, err := s.SetPolicy([]byte(policy))
+			require.NoError(t, err)
+
+			before := s.Snapshot()
+			reference := make([]*Stream, len(streams))
+			clients := make([]*modelClient, len(streams))
+
+			hub, referenceHub := NewHub(), NewHub()
+			for i, st := range streams {
+				streams[i] = NewStream(st.cfg, hub, st.nodeID, capVer)
+				initial, err := streams[i].Initial(before)
+				require.NoError(t, err)
+
+				clients[i] = newModelClient(initial[0])
+				streams[i].Delivered()
+				reference[i] = NewStream(st.cfg, referenceHub, st.nodeID, capVer)
+				_, err = reference[i].Initial(before)
+				require.NoError(t, err)
+				reference[i].Delivered()
+			}
+
+			for step := range 4 {
+				winner := streams[(step%2)*10].nodeID
+				require.NoError(t, s.Disconnect(winner, mustNode(t, s, winner).SessionEpoch()))
+				s.Connect(winner)
+				snap := s.Snapshot()
+				require.Equal(t, before.PeerPolicyRev(), snap.PeerPolicyRev(), "only availability changes")
+
+				renders := 0
+
+				for i, st := range streams {
+					old := st.sent
+					count := st.r.rendered
+					responses, err := st.Update(snap)
+					require.NoError(t, err)
+
+					renders += st.r.rendered - count
+					// Force the reference to revisit every routed peer, as before
+					// election invalidation was narrowed to its changed winners.
+					reference[i].r.lastKey.policy = ^uint64(0)
+					want, err := reference[i].Update(snap)
+					require.NoError(t, err)
+					require.Equal(t, want, responses, "step %d viewer %d: identical wire deltas", step, st.nodeID)
+
+					for _, response := range responses {
+						clients[i].apply(response)
+					}
+
+					st.Delivered()
+					reference[i].Delivered()
+
+					fresh, err := NewStream(st.cfg, NewHub(), st.nodeID, capVer).Initial(snap)
+					require.NoError(t, err)
+					require.Empty(t, clients[i].sameAs(newModelClient(fresh[0])))
+
+					for _, unrelated := range streams[20:] {
+						was, _ := old.peer(unrelated.nodeID.NodeID())
+						now, _ := st.sent.peer(unrelated.nodeID.NodeID())
+						require.Same(t, was, now, "step %d viewer %d: unrelated peer %d", step, st.nodeID, unrelated.nodeID)
+					}
+				}
+
+				if shape == "via" {
+					assert.Equal(t, 198, renders, "only the losing and gaining routers change")
+				}
+			}
+
+			old, err := NewStream(streams[1].cfg, NewHub(), streams[1].nodeID, capVer).Initial(before)
+			require.NoError(t, err)
+			require.Empty(t, clients[1].sameAs(newModelClient(old[0])), "four failovers restore the original wire map")
+		})
+	}
 }
 
 // TestRendererForgetsRoutersItNoLongerRenders keeps one session through
