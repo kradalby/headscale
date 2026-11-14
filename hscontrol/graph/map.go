@@ -161,6 +161,16 @@ func (m *Map[K, V]) Cursor() *Map[K, V] {
 // once. It reads the edit log when it can and compares every key when it
 // cannot, so it is always correct; old may be nil.
 func Changes[K comparable, V any](old, m *Map[K, V]) []K {
+	if m == old {
+		return nil
+	}
+
+	// Done already records unique, exact differences for its base Map.
+	// Cursors hold no entries and are only ChangedSince tokens.
+	if m != nil && m.log != nil && old != nil && old.items != nil && m.log.from == old.id {
+		return slices.Clone(m.log.keys)
+	}
+
 	eq := m.eqOr(old)
 
 	if logged, ok := m.ChangedSince(old); ok {

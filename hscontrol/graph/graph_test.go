@@ -781,3 +781,140 @@ func TestInitialValuesReleaseAfterPublication(t *testing.T) {
 		}
 	}
 }
+
+func TestMapChangesDirectParent(t *testing.T) {
+	comparisons := 0
+	base := NewMap(func(a, b int) bool { comparisons++; return a == b }, map[int]int{1: 1, 2: 2, 4: 4})
+	e := base.Edit()
+	e.Set(1, 10)
+	e.Set(1, 11)
+	e.Delete(2)
+	e.Set(3, 3)
+	e.Set(4, 40)
+	e.Set(4, 4)
+	e.Set(5, 5)
+	e.Delete(5)
+	next := e.Done()
+	comparisons = 0
+
+	got := Changes(base, next)
+	if !slices.Equal(sortedUnique(got), []int{1, 2, 3}) || len(got) != 3 {
+		t.Fatalf("Changes = %v, want [1 2 3]", got)
+	}
+
+	if comparisons != 0 {
+		t.Fatalf("direct edit rechecked %d values", comparisons)
+	}
+	// A caller owns its result; changing it must not corrupt the shared log.
+	got[0] = 99
+
+	if keys, ok := next.ChangedSince(base); !ok || !slices.Equal(sortedUnique(keys), []int{1, 2, 3}) {
+		t.Fatalf("mutated log = %v, %t", keys, ok)
+	}
+
+	if v, ok := base.Get(1); !ok || v != 1 {
+		t.Fatalf("retained base = %d, %t", v, ok)
+	}
+	// Coalescing can restore a value or cancel an earlier addition.
+	e = next.Edit()
+	e.Set(1, 1)
+	e.Delete(3)
+
+	later := e.Done()
+	if keys := Changes(base, later); !slices.Equal(keys, []int{2}) {
+		t.Fatalf("coalesced Changes = %v, want [2]", keys)
+	}
+}
+
+func TestMapChangesEmptyAndCursor(t *testing.T) {
+	var absent *Map[int, int]
+
+	empty := NewMap[int, int](Same[int], nil)
+	zero := new(Map[int, int])
+	base := NewMap(Same[int], map[int]int{1: 1, 2: 2})
+	e := base.Edit()
+	e.Delete(1)
+	e.Set(2, 20)
+	e.Set(3, 3)
+
+	next := e.Done()
+	for _, tc := range []struct {
+		name      string
+		old, next *Map[int, int]
+		want      []int
+	}{
+		{"nil", absent, absent, nil},
+		{"same", base, base, nil},
+		{"empty", empty, empty, nil},
+		{"zero", zero, zero, nil},
+		{"nil_to_empty", absent, empty, nil},
+		{"nil_to_map", absent, base, []int{1, 2}},
+		{"map_to_nil", base, absent, []int{1, 2}},
+		// Cursor is only a ChangedSince token; other reads see an empty map.
+		{"cursor", base.Cursor(), next, []int{2, 3}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Changes(tc.old, tc.next); !slices.Equal(sortedUnique(got), tc.want) {
+				t.Fatalf("Changes = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func BenchmarkMapChanges(b *testing.B) {
+	for _, size := range []int{100, 1000, 10000} {
+		entries := make(map[int]int, size)
+		for k := range size {
+			entries[k] = k
+		}
+
+		base := NewMap(Same[int], entries)
+		for _, delta := range []int{1, 10, size / 2} {
+			e := base.Edit()
+			for k := range delta {
+				e.Set(k, -1)
+			}
+
+			direct := e.Done()
+			e = direct.Edit()
+			e.Set(size, size)
+			coalesced := e.Done()
+
+			fallback := NewMap(Same[int], toNative(direct))
+			for _, tc := range []struct {
+				name      string
+				old, next *Map[int, int]
+				want      int
+			}{
+				{"direct", base, direct, delta},
+				{"coalesced", base, coalesced, delta + 1},
+				{"fallback", base, fallback, delta},
+			} {
+				b.Run(fmt.Sprintf("nodes=%d/delta=%d/%s", size, delta, tc.name), func(b *testing.B) {
+					b.ReportAllocs()
+
+					for b.Loop() {
+						if got := Changes(tc.old, tc.next); len(got) != tc.want {
+							b.Fatal(len(got))
+						}
+					}
+				})
+			}
+		}
+
+		for _, tc := range []struct {
+			name string
+			m    *Map[int, int]
+		}{{"same", base}, {"nil", nil}} {
+			b.Run(fmt.Sprintf("nodes=%d/%s", size, tc.name), func(b *testing.B) {
+				b.ReportAllocs()
+
+				for b.Loop() {
+					if got := Changes(tc.m, tc.m); len(got) != 0 {
+						b.Fatal(got)
+					}
+				}
+			})
+		}
+	}
+}
