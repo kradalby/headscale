@@ -706,9 +706,47 @@ func (s *State) refreshUsers() error {
 		s.beforeUsersPublish()
 	}
 
+	return s.publishUsersLocked(users)
+}
+
+// refreshUser reads after taking usersMu so a registration's earlier user
+// copy cannot overwrite a concurrent user change.
+func (s *State) refreshUser(userID types.UserID) error {
+	s.usersMu.Lock()
+	defer s.usersMu.Unlock()
+
+	user, err := s.db.GetUserByID(userID)
+	if err != nil {
+		return fmt.Errorf("loading user for policy update: %w", err)
+	}
+
+	if s.beforeUsersPublish != nil {
+		s.beforeUsersPublish()
+	}
+
 	before := s.world.snapshot().Users()
 
-	err = s.world.SetUsers(users)
+	i := slices.IndexFunc(before, func(u types.User) bool { return u.ID == user.ID })
+	if i >= 0 && before[i] == *user {
+		return s.world.SetUsers(before)
+	}
+
+	users := slices.Clone(before)
+	if i >= 0 {
+		users[i] = *user
+	} else {
+		users = append(users, *user)
+	}
+
+	return s.publishUsersLocked(users)
+}
+
+// publishUsersLocked publishes the loaded users and checks changed policy
+// identities. The caller holds usersMu from the query through publication.
+func (s *State) publishUsersLocked(users []types.User) error {
+	before := s.world.snapshot().Users()
+
+	err := s.world.SetUsers(users)
 	if err != nil {
 		return err
 	}
@@ -3171,7 +3209,7 @@ func (s *State) HandleNodeFromAuthPath(
 	s.authCache.Remove(authID)
 
 	// The login may have created the user (OIDC), which the policy must see.
-	s.refreshUsersAfterRegistration(finalNode)
+	s.refreshUsersAfterRegistration(finalNode, types.UserID(user.ID))
 
 	err = s.approveRoutesAfterRegistration(replacedNode, finalNode)
 	if err != nil {
@@ -3186,8 +3224,8 @@ func (s *State) HandleNodeFromAuthPath(
 // node exists, so failing the request would have the client retry a
 // registration that already happened (D29). The next user change refreshes
 // again.
-func (s *State) refreshUsersAfterRegistration(node types.NodeView) {
-	err := s.refreshUsers()
+func (s *State) refreshUsersAfterRegistration(node types.NodeView, userID types.UserID) {
+	err := s.refreshUser(userID)
 	if err != nil {
 		log.Error().Err(err).EmbedObject(node).Msg("refreshing policy users after registration; the policy sees the new user on the next user change")
 	}
@@ -3480,7 +3518,9 @@ func (s *State) HandleNodeFromPreAuthKey(
 		}
 	}
 
-	s.refreshUsersAfterRegistration(finalNode)
+	if pak.User != nil {
+		s.refreshUsersAfterRegistration(finalNode, types.UserID(pak.User.ID))
+	}
 
 	err = s.approveRoutesAfterRegistration(replacedNode, finalNode)
 	if err != nil {
