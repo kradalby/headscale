@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"maps"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
-	hsdns "github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
@@ -234,6 +234,11 @@ type Node struct {
 	// overlapping reconnect keeps it. Primary election prefers the
 	// oldest. Runtime-only.
 	SessionStart time.Time `gorm:"-"`
+
+	// ReportGen orders the map reports applied to the node: each report
+	// worth persisting takes a new, increasing value, published with it, so
+	// a row write can say which reports it made durable. Memory only.
+	ReportGen uint64 `gorm:"-"`
 }
 
 type Nodes []*Node
@@ -273,7 +278,7 @@ func (node *Node) Online() bool {
 // ShouldBeOnline derives what [Node.IsOnline] must hold from its two inputs:
 // a live control session and an unexpired node key. An expired client keeps
 // polling control to receive auth updates, so a session alone is not enough.
-// Call it only from a NodeStore write closure, where ActiveSessions is
+// Call it only from a node write closure, where ActiveSessions is
 // stable; elsewhere read [Node.Online].
 func (node *Node) ShouldBeOnline() bool {
 	return node.ActiveSessions > 0 && !node.IsExpired()
@@ -364,6 +369,14 @@ func (node *Node) Prefixes() []netip.Prefix {
 // rules reach the internet.
 func (node *Node) ExitRoutes() []netip.Prefix {
 	return node.approvedRoutes(true)
+}
+
+// SameRouteFacts reports whether node and other announce and approve the
+// same routes in the same order, so every route derived from them agrees
+// without being computed.
+func (node *Node) SameRouteFacts(other *Node) bool {
+	return sameSlice(node.AnnouncedRoutes(), other.AnnouncedRoutes()) &&
+		sameSlice(node.ApprovedRoutes, other.ApprovedRoutes)
 }
 
 // IsExitNode reports whether the node has any approved exit routes.
@@ -628,6 +641,17 @@ func ValidateExpiry(expiry time.Time) (time.Time, error) {
 	return utc, nil
 }
 
+// StoredDataFixHint returns the command that repairs the column of node id
+// that err, from [ValidateGivenName] or [ValidateExpiry], names. The boot
+// scan and the map renderer both log it, so one place maps error to command.
+func StoredDataFixHint(id NodeID, err error) string {
+	if errors.Is(err, ErrExpiryOutOfRange) {
+		return fmt.Sprintf("headscale nodes expire --identifier %d", id)
+	}
+
+	return fmt.Sprintf("headscale nodes rename %d <name>", id)
+}
+
 // AnnouncedRoutes returns the list of routes the node announces, as
 // reported by the client in [tailcfg.Hostinfo.RoutableIPs]. Announcement alone
 // does not grant visibility — see [Node.SubnetRoutes] for approval-gated
@@ -823,7 +847,7 @@ func (node *Node) ApplyPeerChange(change *tailcfg.PeerChange) {
 	// This might technically not be useful as we replace
 	// the whole hostinfo blob when it has changed.
 	if change.DERPRegion != 0 {
-		// [NodeStore] publishes snapshots that share the *Hostinfo /
+		// Published snapshots share the *Hostinfo /
 		// *NetInfo pointers, so writing PreferredDERP in place would race
 		// readers of an already-published snapshot. Clone to fresh pointers
 		// and assign, leaving the previous snapshot untouched.
@@ -915,12 +939,12 @@ func (nv NodeView) MarshalZerologObject(e *zerolog.Event) {
 // CertDomain returns the name the node may get a TLS certificate for with
 // `tailscale cert`: its MagicDNS name without the trailing dot, exactly as
 // the client matches it against its own name.
-func (nv NodeView) CertDomain(cfg *Config) (string, bool) {
-	if !nv.Valid() || !cfg.DNSConfig.Certificates.Enabled {
+func (nv NodeView) CertDomain(dns DNSView) (string, bool) {
+	if !nv.Valid() || !dns.CertificatesEnabled() {
 		return "", false
 	}
 
-	fqdn, err := nv.GetFQDN(cfg.DNSConfig.BaseDomain)
+	fqdn, err := nv.GetFQDN(dns.BaseDomain())
 	if err != nil {
 		return "", false
 	}
@@ -937,14 +961,14 @@ func (nv NodeView) CertDomain(cfg *Config) (string, bool) {
 	// certificate for a name the operator gave to a service. A wildcard
 	// order shares its challenge record with the bare name, so names
 	// below the node's are covered too.
-	if cfg.extraRecordAt(domain, true) {
+	if dns.extraRecordAtOrBelow(domain) {
 		return "", false
 	}
 
 	// A node may publish only its own name's challenge, which keeps it from
 	// other names' certificates only where the provider answers each name's
 	// challenge apart.
-	if iso, ok := cfg.DNSProvider().(hsdns.Isolator); ok && !iso.Isolates(domain) {
+	if isolates := dns.settings.isolates; isolates != nil && !isolates(domain) {
 		return "", false
 	}
 
@@ -1268,6 +1292,37 @@ func (nv NodeView) IPsAsString() []string {
 	return nv.ж.IPsAsString()
 }
 
+// HasNetworkChanges checks if the node has network-related changes.
+// Returns true if IPs, announced routes, or approved routes changed.
+// This is primarily used for policy cache invalidation. Route slices
+// are compared order-insensitively since clients may re-advertise the
+// same routes in a different order.
+func (nv NodeView) HasNetworkChanges(other NodeView) bool {
+	if !slices.Equal(nv.IPs(), other.IPs()) {
+		return true
+	}
+
+	if !equalPrefixesUnordered(nv.AnnouncedRoutes(), other.AnnouncedRoutes()) {
+		return true
+	}
+
+	// An endpoint update leaves the route facts alone; skipping the
+	// derived routes keeps it linear in a router's route count.
+	if nv.Valid() && other.Valid() && nv.ж.SameRouteFacts(other.ж) {
+		return false
+	}
+
+	if !equalPrefixesUnordered(nv.SubnetRoutes(), other.SubnetRoutes()) {
+		return true
+	}
+
+	if !equalPrefixesUnordered(nv.ExitRoutes(), other.ExitRoutes()) {
+		return true
+	}
+
+	return false
+}
+
 // equalPrefixesUnordered reports whether a and b contain the same
 // prefixes, order-independent. Inputs are cloned before sorting so
 // callers' slices are not mutated.
@@ -1329,6 +1384,14 @@ func (nv NodeView) HasPolicyChange(other NodeView) bool {
 		return false
 	}
 
+	// Wildcard sources include manual approvals even after withdrawal.
+	a := slices.DeleteFunc(slices.Clone(nv.ж.ApprovedRoutes), tsaddr.IsExitRoute)
+
+	b := slices.DeleteFunc(slices.Clone(other.ж.ApprovedRoutes), tsaddr.IsExitRoute)
+	if !equalPrefixesUnordered(a, b) {
+		return true
+	}
+
 	if !equalPrefixesUnordered(nv.SubnetRoutes(), other.SubnetRoutes()) {
 		return true
 	}
@@ -1346,13 +1409,14 @@ func TailNodes(
 	capVer tailcfg.CapabilityVersion,
 	primaryRouteFunc RouteFunc,
 	cfg *Config,
+	dns DNSView,
 ) ([]*tailcfg.Node, error) {
 	tNodes := make([]*tailcfg.Node, 0, nodes.Len())
 
 	for _, node := range nodes.All() {
 		// nil selfPolicyCaps: this batch builds peer views; the caller
 		// sets each peer's CapMap from [policyv2.PeerCapMap].
-		tNode, err := node.TailNode(capVer, primaryRouteFunc, cfg, nil)
+		tNode, err := node.TailNode(capVer, primaryRouteFunc, cfg, dns, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -1374,13 +1438,14 @@ func (nv NodeView) TailNode(
 	capVer tailcfg.CapabilityVersion,
 	primaryRouteFunc RouteFunc,
 	cfg *Config,
+	dns DNSView,
 	selfPolicyCaps tailcfg.NodeCapMap,
 ) (*tailcfg.Node, error) {
 	if !nv.Valid() {
 		return nil, ErrInvalidNodeView
 	}
 
-	hostname, err := nv.GetFQDN(cfg.DNSConfig.BaseDomain)
+	hostname, err := nv.GetFQDN(dns.BaseDomain())
 	if err != nil {
 		return nil, err
 	}
@@ -1434,7 +1499,7 @@ func (nv NodeView) TailNode(
 	// Baseline caps every node receives, regardless of policy. Mirrors
 	// what Tailscale SaaS emits for a default tailnet.
 	// cfg.Taildrop.Enabled gates CapabilityFileSharing.
-	// cfg.DNSConfig.Certificates.Enabled gates HTTPS, without which
+	// The snapshot's certificate settings gate HTTPS, without which
 	// `tailscale serve` refuses to serve HTTPS.
 	capMap := tailcfg.NodeCapMap{
 		nodecap.SSH:                     []tailcfg.RawMessage{},
@@ -1451,7 +1516,7 @@ func (nv NodeView) TailNode(
 		capMap[nodecap.FileSharing] = []tailcfg.RawMessage{}
 	}
 
-	if _, ok := nv.CertDomain(cfg); ok {
+	if _, ok := nv.CertDomain(dns); ok {
 		capMap[nodecap.HTTPS] = []tailcfg.RawMessage{}
 	}
 
@@ -1554,4 +1619,83 @@ func PeerHostinfo(hi tailcfg.HostinfoView) tailcfg.HostinfoView {
 	}
 
 	return out.View()
+}
+
+// renderedHostinfoEqual compares the union of SelfHostinfo, PeerHostinfo,
+// TailNode's HomeDERP and NextDNS metadata (OS), without copying reports.
+func renderedHostinfoEqual(a, b *tailcfg.Hostinfo) bool {
+	if a == b {
+		return true
+	}
+
+	if a == nil || b == nil {
+		return false
+	}
+
+	derp := func(hi *tailcfg.Hostinfo) tailcfg.DERPRegionID {
+		if hi.NetInfo == nil {
+			return 0
+		}
+
+		return hi.NetInfo.PreferredDERP
+	}
+
+	return a.Hostname == b.Hostname && a.OS == b.OS &&
+		slices.Equal(a.RequestTags, b.RequestTags) &&
+		slices.Equal(a.RoutableIPs, b.RoutableIPs) &&
+		slices.EqualFunc(a.Services, b.Services, func(x, y tailcfg.Service) bool {
+			return x.Proto == y.Proto && x.Port == y.Port && x.Description == y.Description
+		}) &&
+		slices.Equal(a.SSH_HostKeys, b.SSH_HostKeys) &&
+		a.AppConnector.EqualBool(true) == b.AppConnector.EqualBool(true) &&
+		derp(a) == derp(b)
+}
+
+// SameRender reports whether nv and o differ only in fields no map
+// renders (Unhealthy, read by the election; ActiveSessions, SessionEpoch,
+// ReportGen, SessionStart and UpdatedAt, kept for sessions and the database,
+// and control-address, lifetime and approval-provenance metadata),
+// and in LastSeen while online in both, so no map, the node's own or a
+// peer's, can differ between them: [NodeView.TailNode] renders LastSeen
+// only for an offline node. A map request stamping LastSeen then wakes
+// nobody.
+//
+// An expired node is never the same: its render reads the clock, so the
+// expiry tick rewriting it unchanged is what tells its viewers. Every
+// other write to it, a reconnect included, wakes them too.
+func (nv NodeView) SameRender(o NodeView) bool {
+	if !nv.Valid() || !o.Valid() {
+		return nv.Valid() == o.Valid()
+	}
+
+	if nv.IsExpired() || o.IsExpired() {
+		return false
+	}
+
+	owner, otherOwner := nv.Owner(), o.Owner()
+	if owner.Valid() != otherOwner.Valid() || owner.Valid() &&
+		!reflect.DeepEqual(owner.TailscaleUserProfile(), otherOwner.TailscaleUserProfile()) {
+		return false
+	}
+
+	a, b := *nv.ж, *o.ж
+	if !renderedHostinfoEqual(a.Hostinfo, b.Hostinfo) {
+		return false
+	}
+
+	online := a.IsOnline != nil && *a.IsOnline && b.IsOnline != nil && *b.IsOnline
+
+	for _, n := range []*Node{&a, &b} {
+		// Maps read the owner's profile above, never credential/admin metadata.
+		n.User, n.AuthKey, n.AuthKeyID = nil, nil, nil
+		n.Hostinfo = nil
+		n.Unhealthy, n.ActiveSessions, n.SessionEpoch, n.ReportGen, n.UpdatedAt = false, 0, 0, 0, time.Time{}
+
+		n.SessionStart, n.LastControlAddress, n.Ephemeral, n.AutoApprovedRoutes = time.Time{}, nil, false, nil
+		if online {
+			n.LastSeen = nil
+		}
+	}
+
+	return reflect.DeepEqual(a, b)
 }

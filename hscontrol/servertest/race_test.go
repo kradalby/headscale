@@ -19,7 +19,7 @@ import (
 // TestRace contains tests designed to trigger race conditions in
 // the control plane. Run with -race to detect data races.
 // These tests stress concurrent access patterns in poll.go,
-// the [mapper.Batcher], the [state.NodeStore], and the [mapper] subsystem.
+// the [mapper.Hub], the world behind [state.State], and the [mapper] subsystem.
 
 // TestRacePollSessionReplacement tests the race between an old
 // poll session's deferred cleanup and a new session starting.
@@ -28,8 +28,8 @@ func TestRacePollSessionReplacement(t *testing.T) {
 
 	// Rapidly replace the poll session by doing immediate
 	// disconnect+reconnect. This races the old session's
-	// deferred cleanup ([state.NodeStore.RemoveNode], [state.State.Disconnect], grace period
-	// goroutine) with the new session's setup ([state.NodeStore.AddNode], [state.State.Connect],
+	// deferred cleanup ([mapper.Hub.Leave], [state.State.Disconnect], grace period
+	// goroutine) with the new session's setup ([mapper.Hub.Join], [state.State.Connect],
 	// initial map send).
 	t.Run("immediate_session_replace_10x", func(t *testing.T) {
 		t.Parallel()
@@ -135,9 +135,8 @@ func TestRaceConcurrentServerMutations(t *testing.T) {
 			for i := range 5 {
 				route := netip.MustParsePrefix(
 					fmt.Sprintf("10.%d.0.0/24", i))
-				_, c, _ := srv.State().SetApprovedRoutes(
+				_, _ = srv.State().SetApprovedRoutes(
 					nodeID1, []netip.Prefix{route})
-				srv.App.Change(c)
 			}
 		})
 
@@ -151,10 +150,7 @@ func TestRaceConcurrentServerMutations(t *testing.T) {
 					]
 				}`))
 				if err == nil && changed {
-					changes, err := srv.State().ReloadPolicy()
-					if err == nil {
-						srv.App.Change(changes...)
-					}
+					_ = srv.State().ReloadPolicy()
 				}
 			}
 		})
@@ -195,10 +191,7 @@ func TestRaceConcurrentServerMutations(t *testing.T) {
 		// Delete node2 and change policy simultaneously.
 
 		wg.Go(func() {
-			delChange, err := srv.State().DeleteNode(nv2)
-			if err == nil {
-				srv.App.Change(delChange...)
-			}
+			_ = srv.State().DeleteNode(nv2)
 		})
 
 		wg.Go(func() {
@@ -208,10 +201,7 @@ func TestRaceConcurrentServerMutations(t *testing.T) {
 				]
 			}`))
 			if err == nil && changed {
-				changes, err := srv.State().ReloadPolicy()
-				if err == nil {
-					srv.App.Change(changes...)
-				}
+				_ = srv.State().ReloadPolicy()
 			}
 		})
 
@@ -385,21 +375,18 @@ func TestRaceConnectDuringGracePeriod(t *testing.T) {
 		surviving := originals[n/2:]
 		allActive := append(surviving, replacements...)
 
-		for _, c := range allActive {
-			c.WaitForPeers(t, len(allActive)-1, 30*time.Second)
-		}
-
+		waitForMutualVisibility(t, allActive, 30*time.Second)
 		servertest.AssertConsistentState(t, allActive)
 	})
 }
 
-// TestRaceBatcherContention tests race conditions in the [mapper.Batcher]
+// TestRaceMapHubContention tests race conditions in the [mapper.Hub]
 // when many changes arrive simultaneously.
-func TestRaceBatcherContention(t *testing.T) {
+func TestRaceMapHubContention(t *testing.T) {
 	t.Parallel()
 
 	// Many nodes connecting at the same time generates many
-	// concurrent [hscontrol.Headscale.Change] calls. The [mapper.Batcher] must handle this
+	// concurrent commits. The [mapper.Hub] must handle this
 	// without dropping updates or panicking.
 	t.Run("many_simultaneous_connects", func(t *testing.T) {
 		t.Parallel()
@@ -427,8 +414,7 @@ func TestRaceBatcherContention(t *testing.T) {
 	})
 
 	// Rapid connect + disconnect + connect of different nodes
-	// generates interleaved [state.NodeStore.AddNode]/[state.NodeStore.RemoveNode]/[state.NodeStore.AddNode] in the
-	// [mapper.Batcher].
+	// interleaves joins and sessions ending in the [mapper.Hub].
 	t.Run("interleaved_add_remove_add", func(t *testing.T) {
 		t.Parallel()
 
@@ -469,6 +455,10 @@ func TestRaceBatcherContention(t *testing.T) {
 
 				return found
 			})
+
+		// No join was lost to the interleaving: both hold every node.
+		observer.WaitForPeers(t, 6, 15*time.Second)
+		servertest.AssertConsistentState(t, []*servertest.TestClient{observer, final})
 	})
 
 	// Route changes and node connect happening at the same time.
@@ -489,9 +479,8 @@ func TestRaceBatcherContention(t *testing.T) {
 
 		wg.Go(func() {
 			route := netip.MustParsePrefix("10.88.0.0/24")
-			_, c, _ := srv.State().SetApprovedRoutes(
+			_, _ = srv.State().SetApprovedRoutes(
 				nodeID1, []netip.Prefix{route})
-			srv.App.Change(c)
 		})
 
 		var c2 *servertest.TestClient
@@ -583,12 +572,12 @@ func TestRaceMapResponseDuringDisconnect(t *testing.T) {
 	})
 }
 
-// TestRaceNodeStoreContention tests concurrent access to the [state.NodeStore].
-func TestRaceNodeStoreContention(t *testing.T) {
+// TestRaceNodeWriteContention tests concurrent node writes to the state.
+func TestRaceNodeWriteContention(t *testing.T) {
 	t.Parallel()
 
 	// Many [state.State.GetNodeByID] calls while nodes are connecting and
-	// disconnecting. This tests the [state.NodeStore]'s read/write locking.
+	// disconnecting. This tests reads of snapshots while writes commit.
 	t.Run("concurrent_reads_during_mutations", func(t *testing.T) {
 		t.Parallel()
 
@@ -647,8 +636,14 @@ func TestRaceNodeStoreContention(t *testing.T) {
 		for i := 2; i < n; i++ {
 			_, ok := srv.State().GetNodeByID(nodeIDs[i])
 			assert.True(t, ok,
-				"node %d should still be in NodeStore", i)
+				"node %d should still exist", i)
 		}
+
+		for _, c := range clients {
+			c.WaitForPeers(t, n-1, 15*time.Second)
+		}
+
+		servertest.AssertConsistentState(t, clients)
 	})
 
 	// [state.State.ListNodes] while nodes are being added and removed.

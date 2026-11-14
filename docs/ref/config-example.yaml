@@ -442,12 +442,6 @@ tuning:
   # How often queued changes are sent to clients as one update; must be
   # positive.
   batch_change_delay: 800ms
-  # How many map updates are queued per connected client.
-  node_mapsession_buffered_chan_size: 30
-  # The number of workers building map updates for connected clients. Zero picks
-  # the number from the CPU count.
-  # Default: three quarters of the CPU cores, at least one.
-  batcher_workers: 0
   # How long a pending registration waits to be completed. Zero uses the
   # default.
   register_cache_expiration: 15m
@@ -456,12 +450,12 @@ tuning:
   # Zero uses the default. See [Pending authentication
   # limits](https://headscale.net/stable/ref/registration/#pending-authentication-limits).
   register_cache_max_entries: 1024
-  # How many node changes are batched before the in-memory node state, peer
-  # relationships included, is rebuilt; must be positive. Higher values save CPU
-  # on bulk changes but delay each change until its batch is full or
-  # `tuning.node_store_batch_timeout` passes.
+  # The maximum number of writes a graph commit waits to collect during an HA
+  # route outage; must be positive. Outside an outage, commits do not wait for a
+  # batch. Writes arriving during a commit can share the next one, with affected
+  # graph inputs and derived values updated together.
   node_store_batch_size: 100
-  # The longest a partial batch of node changes waits before the rebuild; must
-  # be positive. Lower values answer single changes faster at the cost of more
-  # rebuilds.
+  # The longest a graph commit waits to collect writes during an HA route
+  # outage; must be positive. Outside an outage, commits do not wait for this
+  # timeout.
   node_store_batch_timeout: 500ms

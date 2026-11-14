@@ -16,6 +16,7 @@ import (
 	"unicode"
 
 	apiv1 "github.com/juanfont/headscale/hscontrol/api/v1"
+	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -30,10 +31,10 @@ type apiV1Harness struct {
 	huma http.Handler
 }
 
-func newAPIV1Harness(t *testing.T) *apiV1Harness {
+func newAPIV1Harness(t *testing.T, options ...func(*types.Config)) *apiV1Harness {
 	t.Helper()
 
-	app := createTestApp(t)
+	app := createTestApp(t, options...)
 
 	return &apiV1Harness{
 		app:  app,
@@ -47,9 +48,8 @@ func newAPIV1Harness(t *testing.T) *apiV1Harness {
 // router in TestAPIV1AuthMiddleware.
 func newHumaTestHandler(app *Headscale) http.Handler {
 	mux, _ := apiv1.Handler(apiv1.Backend{
-		State:  app.state,
-		Change: app.Change,
-		Cfg:    app.cfg,
+		State: app.state,
+		Cfg:   app.cfg,
 	})
 
 	return apiv1.WithLocalTrust(mux)

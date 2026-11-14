@@ -426,10 +426,10 @@ func useLoaded(t *testing.T, path string) {
 	l, err := loadConfig(path)
 	require.NoError(t, err)
 
-	old := loaded
-	loaded = l
+	old, oldFile := loaded, cfgFile
+	loaded, cfgFile = l, path
 
-	t.Cleanup(func() { loaded = old })
+	t.Cleanup(func() { loaded, cfgFile = old, oldFile })
 }
 
 func TestInitConfigSkippedLogLevel(t *testing.T) {

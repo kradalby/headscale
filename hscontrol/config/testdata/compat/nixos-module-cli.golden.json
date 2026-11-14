@@ -143,8 +143,6 @@
     },
     "Tuning": {
       "BatchChangeDelay": 0,
-      "NodeMapSessionBufferedChanSize": 0,
-      "BatcherWorkers": 0,
       "RegisterCacheExpiration": 0,
       "RegisterCacheMaxEntries": 0,
       "NodeStoreBatchSize": 0,

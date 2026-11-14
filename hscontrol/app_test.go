@@ -19,6 +19,8 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/dnstype"
 )
 
 func TestSecurityHeaders(t *testing.T) {
@@ -96,11 +98,12 @@ func TestDebugHostGuard(t *testing.T) {
 // config.Marshal writes it, without credentials; the running values keep
 // theirs.
 func TestDebugConfigRedacts(t *testing.T) {
-	app := createTestApp(t)
+	app := createTestApp(t, func(cfg *types.Config) {
+		cfg.DNSConfig.Nameservers.Global = []string{"1.1.1.1", "https://marker-dns-user:marker-dns-pass@dns.example.com/q"}
+		cfg.DNSConfig.Nameservers.Split = map[string][]string{"corp.example.com": {"https://marker-split@dns.example.com/q"}}
+	})
 	app.cfg.ServerURL = "https://marker-user:marker-pass@localhost:8080"
 	app.cfg.CLI.Address = "https://marker-cli@cli.example.com"
-	app.cfg.DNSConfig.Nameservers.Global = []string{"1.1.1.1", "https://marker-dns-user:marker-dns-pass@dns.example.com/q"}
-	app.cfg.DNSConfig.Nameservers.Split = map[string][]string{"corp.example.com": {"https://marker-split@dns.example.com/q"}}
 	app.cfg.Database.Postgres.Pass = "marker-pg-pass"
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/debug/config", nil)
@@ -280,8 +283,8 @@ func TestNewHeadscaleSecrets(t *testing.T) {
 }
 
 // validConfig is config.Default with a local server URL, its files under a
-// fresh temp dir, the policy in the database, DNS off, and the batcher
-// quick and single-threaded for tests.
+// fresh temp dir, the policy in the database, DNS off, and a short map-update
+// coalescing delay for tests.
 func validConfig(t *testing.T) types.Config {
 	t.Helper()
 
@@ -301,7 +304,6 @@ func validConfig(t *testing.T) types.Config {
 	cfg.DNSConfig.OverrideLocalDNS = false
 	cfg.DNSConfig.BaseDomain = ""
 	cfg.Tuning.BatchChangeDelay = 100 * time.Millisecond
-	cfg.Tuning.BatcherWorkers = 1
 
 	return cfg
 }
@@ -482,7 +484,9 @@ func TestDERPRefreshDoesNotBlockScheduledTasks(t *testing.T) {
 
 	require.NoError(t, os.WriteFile(records, []byte(`[{"name":"a.example.com","type":"A","value":"100.64.0.1"}]`), 0o600))
 
-	assert.Eventually(t, func() bool { return app.cfg.HasExtraRecord("a.example.com") }, 10*time.Second, 50*time.Millisecond,
+	assert.Eventually(t, func() bool {
+		return app.state.Snapshot().DNS().ExtraRecords().Len() == 1 && app.state.Snapshot().DNS().ExtraRecords().At(0).Name == "a.example.com"
+	}, 10*time.Second, 50*time.Millisecond,
 		"extra records not reloaded while the DERP refresh is stuck")
 }
 
@@ -570,4 +574,64 @@ func TestServeStopsOnContextCancel(t *testing.T) {
 	}
 
 	assert.NoFileExists(t, cfg.UnixSocket)
+}
+
+func TestNewHeadscaleFreezesDNS(t *testing.T) {
+	for _, mode := range []string{"magic", "disabled", "empty"} {
+		t.Run(mode, func(t *testing.T) {
+			split := map[string][]string{"split.test": {"1.1.1.1"}}
+			if mode == "empty" {
+				split = nil
+			}
+
+			app := createTestApp(t, func(cfg *types.Config) {
+				cfg.Prefixes.V4 = new(netip.MustParsePrefix("172.16.0.0/16"))
+				cfg.Prefixes.V6 = new(netip.MustParsePrefix("fd00:115c:a1e0::/48"))
+				cfg.DNSConfig.MagicDNS = mode == "magic"
+				cfg.DNSConfig.BaseDomain = "frozen.example.com"
+				cfg.DNSConfig.Nameservers.Split = split
+				cfg.DNSConfig.ExtraRecordsPath = "original.json"
+			})
+			app.cfg.DNSConfig.ExtraRecordsPath = "changed.json"
+			view := app.state.Snapshot().DNS()
+			assert.Equal(t, "original.json", view.ExtraRecordsPath())
+			out := view.AsStruct()
+			require.NotNil(t, out)
+
+			if mode == "empty" {
+				assert.Empty(t, out.Routes)
+				return
+			}
+
+			require.Len(t, split, 1, "startup must not mutate the builder")
+			assert.Equal(t, []*dnstype.Resolver{{Addr: "1.1.1.1"}}, out.Routes["split.test"])
+
+			for _, zone := range []string{"16.172.in-addr.arpa", "0.e.1.a.c.5.1.1.0.0.d.f.ip6.arpa"} {
+				resolvers, ok := out.Routes[zone]
+				assert.Equal(t, mode == "magic", ok, zone)
+
+				if ok {
+					assert.NotNil(t, resolvers)
+					assert.Empty(t, resolvers)
+				}
+			}
+		})
+	}
+}
+
+// TestDebugConfigUsesSnapshot pins the actual endpoint to the live graph DNS revision.
+func TestDebugConfigUsesSnapshot(t *testing.T) {
+	app := createTestApp(t)
+	before := app.state.Snapshot()
+	app.state.SetExtraRecords([]tailcfg.DNSRecord{{Name: "Live.Example.com", Type: "A", Value: "100.64.0.99"}})
+	require.Empty(t, before.DNS().ExtraRecords().AsSlice(), "publishing records must leave the old snapshot unchanged")
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/debug/config", nil)
+	req.Host = "localhost"
+	req.RemoteAddr = "127.0.0.1:1234"
+	rec := httptest.NewRecorder()
+	app.debugHTTPServer().Handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "live.example.com")
+	assert.Contains(t, rec.Body.String(), "100.64.0.99")
+	assert.Empty(t, app.cfg.DNSConfig.ExtraRecords, "the startup builder is not the running revision")
 }

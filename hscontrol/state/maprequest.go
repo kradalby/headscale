@@ -1,6 +1,5 @@
-// Package state provides pure functions for processing [tailcfg.MapRequest] data.
-// These functions are extracted from [State.UpdateNodeFromMapRequest] to improve
-// testability and maintainability.
+// Pure functions for processing [tailcfg.MapRequest] data, extracted from
+// [State.UpdateNodeFromMapRequest] so they can be tested alone.
 
 package state
 
@@ -10,19 +9,15 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/views"
 )
 
-// mapRequestDelta carries the classified facts extracted from one MapRequest
-// against the currently-stored node. It separates the raw wire-level peer
-// change (what the client actually sent) from the broadcast/persist/policy
-// decisions made from it, so that each downstream decision (broadcast, persist,
-// policy refresh, relation rebuild) sees only its own input.
+// mapRequestDelta carries the facts compared from one MapRequest against the
+// currently-stored node. It separates the raw wire-level peer change (what
+// the client actually sent) from the store, persist and route-approval
+// decisions made from it.
 //
-// Construction happens once per MapRequest inside the NodeStore write callback
-// (so comparisons run against serialized current state); classification happens
-// after the write succeeds. Splitting these avoids redoing comparisons and
-// avoids having the broadcast classifier depend on incidental branch order.
+// It is built inside the writer closure, so comparisons run against the node
+// the write replaces.
 type mapRequestDelta struct {
 	// peerChange is the wire-level delta produced by
 	// [types.Node.PeerChangeFromMapRequest] - LastSeen is always stamped.
@@ -33,35 +28,16 @@ type mapRequestDelta struct {
 	// It gates storing and persisting the new Hostinfo.
 	hostinfoChanged bool
 
-	// peerHostinfoChanged reports whether a Hostinfo field that peers read
-	// changed (see [peerHostinfoEqual]). Only that forces a whole-node resend.
-	peerHostinfoChanged bool
-
-	// dnsMetadataChanged reports whether a Hostinfo field feeding the
-	// node's NextDNS device metadata (Hostname, OS) changed.
-	dnsMetadataChanged bool
-
 	// routesChanged reports whether announced routes (RoutableIPs)
 	// changed. Routes are policy and election inputs, so they are tracked
 	// on their own.
 	routesChanged bool
 
 	// derpChanged reports whether PreferredDERP changed. oldDERP/newDERP
-	// carry the values; DERP zero means "unchanged" on the wire, so
-	// clearing DERP to zero cannot be sent as a patch and forces a
-	// whole-peer update.
+	// carry the values; DERP zero means "unchanged" on the wire, so a
+	// clear-to-zero is invisible to the peer change.
 	derpChanged      bool
 	oldDERP, newDERP tailcfg.DERPRegionID
-
-	// endpointBroadcast reports whether the endpoint delta is worth fanning
-	// out (i.e., a newly-added useful non-STUN endpoint). Storage still
-	// happens regardless; this gates only broadcast.
-	endpointBroadcast bool
-
-	// discoKeyChanged reports whether the node's discovery key changed.
-	// Key patches already carry the resulting endpoints/expiry,
-	// so a key change subsumes endpoint/DERP patches.
-	discoKeyChanged bool
 
 	// persistWorthy reports whether the request carries data that should
 	// hit the database. LastSeen-only updates are not persist-worthy.
@@ -71,13 +47,10 @@ type mapRequestDelta struct {
 // MarshalZerologObject implements [zerolog.LogObjectMarshaler].
 func (d mapRequestDelta) MarshalZerologObject(e *zerolog.Event) {
 	e.Bool("hostinfo.changed", d.hostinfoChanged).
-		Bool("hostinfo.peer_changed", d.peerHostinfoChanged).
 		Bool("routes.changed", d.routesChanged).
 		Bool("derp.changed", d.derpChanged).
 		Int("derp.old", int(d.oldDERP)).
 		Int("derp.new", int(d.newDERP)).
-		Bool("endpoint.broadcast", d.endpointBroadcast).
-		Bool("disco_key.changed", d.discoKeyChanged).
 		Bool("persist", d.persistWorthy)
 }
 
@@ -151,18 +124,6 @@ func hostinfoEqual(oldHI, newHI *tailcfg.Hostinfo) bool {
 	newCopy.NetInfo = nil
 
 	return oldCopy.Equal(&newCopy)
-}
-
-// peerHostinfoEqual reports whether a and b agree on what peers are sent of
-// them ([types.PeerHostinfo]) and on the routes this server feeds into policy.
-// Everything else is stored but never fanned out.
-func peerHostinfoEqual(a, b tailcfg.HostinfoView) bool {
-	if !a.Valid() || !b.Valid() {
-		return a.Valid() == b.Valid()
-	}
-
-	return types.PeerHostinfo(a).Equal(types.PeerHostinfo(b)) &&
-		views.SliceEqual(a.RoutableIPs(), b.RoutableIPs())
 }
 
 // netInfoEqualIgnoringDERP compares two NetInfo values via

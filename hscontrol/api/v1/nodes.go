@@ -264,9 +264,7 @@ func registerNodeWriteOps(api huma.API, b Backend) {
 			return nil, huma.Error404NotFound("node not found")
 		}
 
-		changes, err := b.State.DeleteNode(node)
-		b.Change(changes...)
-
+		err = b.State.DeleteNode(node)
 		if err != nil {
 			return nil, huma.Error500InternalServerError("deleting node", err)
 		}
@@ -307,9 +305,7 @@ func registerNodeWriteOps(api huma.API, b Backend) {
 
 		switch {
 		case disableExpiry:
-			node, nodeChange, expErr := b.State.SetNodeExpiry(nodeID, nil)
-			b.Change(nodeChange)
-
+			node, expErr := b.State.SetNodeExpiry(nodeID, nil)
 			if expErr != nil {
 				return nil, mapError("expiring node", expErr)
 			}
@@ -322,9 +318,7 @@ func registerNodeWriteOps(api huma.API, b Backend) {
 			expiry = *customExpiry
 		}
 
-		node, nodeChange, err := b.State.SetNodeExpiry(nodeID, &expiry)
-		b.Change(nodeChange)
-
+		node, err := b.State.SetNodeExpiry(nodeID, &expiry)
 		if err != nil {
 			return nil, mapError("expiring node", err)
 		}
@@ -348,9 +342,7 @@ func registerNodeWriteOps(api huma.API, b Backend) {
 			return nil, err
 		}
 
-		node, nodeChange, err := b.State.RenameNode(nodeID, in.NewName)
-		b.Change(nodeChange)
-
+		node, err := b.State.RenameNode(nodeID, in.NewName)
 		if err != nil {
 			return nil, mapError("renaming node", err)
 		}
@@ -394,9 +386,7 @@ func registerNodeWriteOps(api huma.API, b Backend) {
 			return nil, huma.Error404NotFound("node not found")
 		}
 
-		node, nodeChange, err := b.State.SetNodeTags(nodeID, in.Body.Tags)
-		b.Change(nodeChange)
-
+		node, err := b.State.SetNodeTags(nodeID, in.Body.Tags)
 		if err != nil {
 			return nil, huma.Error400BadRequest("setting tags", err)
 		}
@@ -447,9 +437,7 @@ func registerNodeAdminOps(api huma.API, b Backend) {
 		slices.SortFunc(newApproved, netip.Prefix.Compare)
 		newApproved = slices.Compact(newApproved)
 
-		node, nodeChange, err := b.State.SetApprovedRoutes(nodeID, newApproved)
-		b.Change(nodeChange)
-
+		node, err := b.State.SetApprovedRoutes(nodeID, newApproved)
 		if err != nil {
 			return nil, mapError("setting approved routes", err)
 		}
@@ -482,15 +470,12 @@ func registerNodeAdminOps(api huma.API, b Backend) {
 			return nil, mapError("looking up user", err)
 		}
 
-		node, nodeChange, err := b.State.HandleNodeFromAuthPath(
+		node, err := b.State.HandleNodeFromAuthPath(
 			registrationID,
 			types.UserID(user.ID),
 			nil,
 			util.RegisterMethodCLI,
 		)
-		// Empty changes are ignored by the change sink.
-		b.Change(nodeChange)
-
 		if err != nil {
 			return nil, mapError("registering node", err)
 		}
@@ -513,9 +498,7 @@ func registerNodeAdminOps(api huma.API, b Backend) {
 			return nil, huma.Error400BadRequest("backfilling node IPs", errBackfillNotConfirmed)
 		}
 
-		changes, cs, err := b.State.BackfillNodeIPs()
-		b.Change(cs...)
-
+		changes, err := b.State.BackfillNodeIPs()
 		if err != nil {
 			return nil, huma.Error500InternalServerError("backfilling node IPs", err)
 		}

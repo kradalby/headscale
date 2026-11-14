@@ -136,9 +136,7 @@ func registerACL(api huma.API, b Backend) {
 			}
 		}
 
-		updated, cs, err := b.State.UpdatePolicy(in.RawBody)
-		b.Change(cs...)
-
+		updated, err := b.State.UpdatePolicy(ctx, in.RawBody)
 		if err != nil {
 			return nil, mapError("setting policy", err)
 		}

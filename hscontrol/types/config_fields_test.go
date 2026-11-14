@@ -138,8 +138,6 @@ func TestConfigFields(t *testing.T) {
 		"cli.timeout",
 		"cli.insecure",
 		"tuning.batch_change_delay",
-		"tuning.node_mapsession_buffered_chan_size",
-		"tuning.batcher_workers",
 		"tuning.register_cache_expiration",
 		"tuning.register_cache_max_entries",
 		"tuning.node_store_batch_size",

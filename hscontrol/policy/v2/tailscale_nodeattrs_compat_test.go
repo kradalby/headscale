@@ -246,7 +246,7 @@ func testNodeAttrsSuccess(
 	selfCapMap := func(t *testing.T, node *types.Node) tailcfg.NodeCapMap {
 		t.Helper()
 
-		tn, err := node.View().TailNode(0, noRoutes, cfg, got[node.ID])
+		tn, err := node.View().TailNode(0, noRoutes, cfg, cfg.DNSView(), got[node.ID])
 		require.NoErrorf(t, err, "%s/%s: TailNode", tf.TestID, node.GivenName)
 
 		return tn.CapMap

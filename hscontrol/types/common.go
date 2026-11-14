@@ -7,11 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	"tailscale.com/util/rands"
 )
 
@@ -200,6 +200,14 @@ func (rn *AuthRequest) PrepareForCache() error {
 	}
 
 	if len(data) > MaxRegistrationPayloadBytes {
+		// The rejection reaches the client as an error only; without this
+		// it looks like a server bug to operators, and the size says
+		// whether a real client is hitting the limit.
+		log.Warn().
+			Int("payload_bytes", len(data)).
+			Int("payload_limit", MaxRegistrationPayloadBytes).
+			Msg("registration payload too large, rejecting")
+
 		return fmt.Errorf("%w: limit %d bytes", ErrRegistrationPayloadTooLarge, MaxRegistrationPayloadBytes)
 	}
 
@@ -335,23 +343,4 @@ type AuthVerdict struct {
 
 func (v AuthVerdict) Accept() bool {
 	return v.Err == nil
-}
-
-// DefaultBatcherWorkers returns the default number of batcher workers.
-// Default to 3/4 of CPU cores, minimum 1, no maximum.
-func DefaultBatcherWorkers() int {
-	return DefaultBatcherWorkersFor(runtime.NumCPU())
-}
-
-// DefaultBatcherWorkersFor returns the default number of batcher workers for a given CPU count.
-// Default to 3/4 of CPU cores, minimum 1, no maximum.
-func DefaultBatcherWorkersFor(cpuCount int) int {
-	const (
-		workerNumerator   = 3
-		workerDenominator = 4
-	)
-
-	defaultWorkers := max((cpuCount*workerNumerator)/workerDenominator, 1)
-
-	return defaultWorkers
 }

@@ -92,6 +92,56 @@ the Tailscale admin console. `GET /api/v2/device/{id}/update-status` reports the
 update. Both answer as Tailscale does: a node that does not allow remote updates,
 is not connected, or refuses is "not found". See [the client docs](https://headscale.net/stable/about/clients/#update-clients). [#3632](https://github.com/juanfont/headscale/pull/3632)
 
+### Control plane scales with what changes, not tailnet size
+
+A change now reaches only the nodes that see it, and costs about what those
+nodes are sent: an endpoint update, a join or a policy edit no longer
+reworks every node's map, and a change no node sees costs almost nothing.
+Policy recompiles reuse what a node change cannot reach, connected nodes
+that see the same peers share one copy of them, and a peer is encoded once
+for every map that carries it. Node writes no longer wait to be batched
+except during an HA subnet route outage, which is what
+`tuning.node_store_batch_timeout` and `tuning.node_store_batch_size` now
+bound. Large tailnets use less CPU and memory, and joins and failovers
+reach clients sooner.
+`HEADSCALE_DEBUG_POLICY_AUDIT=1` checks every policy recompile against a
+compile from scratch and logs any difference. A changed policy document's tests run
+against the users and nodes it is published with; if those change while the
+tests run, the write is tested again, up to three times, the last time
+holding other writes until the tests finish.
+Reloading the byte-identical live document skips compilation and its
+`tests`/`sshTests`. API writes still validate and store the document, including
+when its bytes are unchanged, while an unchanged write sends clients nothing
+and keeps SSH check approvals. Use `headscale check policy` to validate a
+candidate without publishing a change.
+`headscale policy set --bypass-server-and-access-database-directly` now evaluates
+the document's `tests`/`sshTests` and one node's SSH rules against the persisted
+users and nodes before storing it, as the running server's set does, and refuses
+unless the configured unix socket shows no headscale runs; `--force` does not
+override that refusal. `policy get` keeps its read-only bypass behaviour against a running server.
+
+[#37](https://github.com/kradalby/headscale/pull/37)
+
+### Via-scoped subnet failover elects live routers
+
+Subnet failover for a grant with `via` now elects from the routers that are
+actually serving: an online, healthy router carrying one of the grant's tags
+and advertising an approved route overlapping the grant's destination. The available
+router with the oldest control session serves the route. A reconnecting router
+joins as a standby, while one that kept its session can take its routes back
+when available again. With no available router, a `via` grant keeps its route
+on the lowest-ID approving router, independently of its previous winner. Grants with different `via`
+tags elect separately before their route contributions are combined, so one
+group's failure no longer cancels another group's authorization, and exit-node
+grants steer per node instead of entering the subnet election. A grant source
+can match through an advertised-and-approved source subnet as well as its
+Tailscale addresses; the selection does not widen the grant's destination or
+port access. An election is identified by its `via` tags and route, so a policy
+edit that keeps both preserves the election's session ordering and previous assignment.
+See [the routes reference](docs/ref/routes.md) for the failover rules.
+
+[#44](https://github.com/kradalby/headscale/pull/44)
+
 ### BREAKING
 
 #### Database
@@ -172,6 +222,14 @@ is not connected, or refuses is "not found". See [the client docs](https://heads
 - `tls_cert_path`, `tls_key_path`, `tls_letsencrypt_*`, `acme_url` and `acme_email` are deprecated in favour of `tls.cert_path`, `tls.key_path` and `tls.acme.*` [#3554](https://github.com/juanfont/headscale/pull/3554)
   - The old keys continue to work, with a warning, but will be removed in a future release
 - Headscale's own ACME certificate is managed by CertMagic instead of autocert; the first start registers a new ACME account and obtains a new certificate in `tls.acme.cache_dir`, which now defaults to `/var/lib/headscale/cache` [#3554](https://github.com/juanfont/headscale/pull/3554)
+- `tuning.batcher_workers` and `tuning.node_mapsession_buffered_chan_size` are removed, alongside the already removed `tuning.notifier_send_timeout`: graph map streams do not use them. Remove these keys from configuration files, where they now stop loading. Their `HEADSCALE_*` environment variables are ignored with a removal warning, following the existing environment-variable contract. Generated configuration and NixOS options no longer expose the two settings [#37](https://github.com/kradalby/headscale/pull/37)
+
+#### Observability
+
+- The `headscale_nodestore_*` metrics are removed. `headscale_world_nodes` replaces `headscale_nodestore_nodes`, `headscale_world_commits_total` counts published graph transactions after the initial snapshot (including DNS/DERP changes; transactions that stage no edit, refusals and panicking batches are excluded, and a panicking batch's surviving write-by-write retries each count separately), and `headscale_world_write_batch_size` records completed node batch sizes (including batches that stage no edit). A changed node batch counts as one graph transaction; neither metric proves database persistence or client delivery [#37](https://github.com/kradalby/headscale/pull/37)
+- `headscale_mapper_changes_dropped_total` is removed: each map session renders from the latest state, so no change is dropped [#37](https://github.com/kradalby/headscale/pull/37)
+- `headscale_mapresponse_generated_total` counts the responses rendered for each session, by response type, instead of each change once [#37](https://github.com/kradalby/headscale/pull/37)
+- New: `headscale_policy_compiles_total` by result (the graph's compiles at boot and on each change to the document, the users, or a node field the policy reads, published or refused; a document refused before it reaches the graph, a write's test candidate and the audit's compile are not counted), `headscale_world_commit_panics_total` and `headscale_graph_map_log_misses_total` [#37](https://github.com/kradalby/headscale/pull/37)
 
 - Invalid booleans stop startup or CLI commands. Use `true` or `false`. Remove ignored `database.gorm.prepare_stmt`; Headscale logs a warning. [#3619](https://github.com/juanfont/headscale/pull/3619)
 - Debug hosts must be localhost, an IP, or the configured `server_url`/`metrics_listen_addr` host. `/metrics` accepts other hosts. [#3619](https://github.com/juanfont/headscale/pull/3619)
@@ -229,6 +287,8 @@ is not connected, or refuses is "not found". See [the client docs](https://heads
 - A registration request from a client below the minimum supported version is now rejected before it can log a node out, use a pre-auth key or start a login [#3519](https://github.com/juanfont/headscale/pull/3519)
 
 - A node re-registering with a spent, expired or revoked pre-auth key is now rejected if it expired or changed node key while the re-registration was in flight [#3525](https://github.com/juanfont/headscale/pull/3525)
+- An expired node — including a tagged node expired by an admin — now requires fresh, valid authorization before it can re-register: restarting with the node's own spent, expired or revoked key no longer resumes the old authorization, and a new node key requires a valid credential that can authorize that node [#43](https://github.com/kradalby/headscale/pull/43)
+- A logout or non-streaming map request that still resolves to its node after a reauthentication replaced the node key is rejected instead of modifying the newer registration; the logout reaches the client as an error. A logout whose key no longer resolves asks the client to rotate its node key and creates no registration [#43](https://github.com/kradalby/headscale/pull/43)
 - DERP client verification (the embedded DERP server and the `/verify` endpoint) looks up the node key directly instead of scanning every node on each connection [#3520](https://github.com/juanfont/headscale/pull/3520)
 - Keep a node's `via` exit nodes when it also matches an `app` grant to `*`, as on Tailscale SaaS [#3566](https://github.com/juanfont/headscale/pull/3566)
 - Packet filters are written as on Tailscale SaaS: node addresses one by one, the internet as address ranges, and `via` rules never merged with other rules. Rules naming many nodes send longer filters, and every node gets one full filter update after upgrading [#3566](https://github.com/juanfont/headscale/pull/3566)
@@ -262,6 +322,14 @@ is not connected, or refuses is "not found". See [the client docs](https://heads
 - The v1 API stores an API key or pre-auth key created without `expiration` as one that never expires, and reports its expiration as `null`. It was stored as already expired and rejected on first use. The CLI always sends an expiration and was not affected. Keys created this way before stay expired; create new ones [#3254](https://github.com/juanfont/headscale/pull/3254)
 - The v2 API accepts an auth key create that leaves out `tags`, as Tailscale does [#3254](https://github.com/juanfont/headscale/pull/3254)
 - The v2 API refuses an auth key `expirySeconds` below 0 or above 90 days, as Tailscale does; a negative value used to mean 90 days [#3254](https://github.com/juanfont/headscale/pull/3254)
+
+- Ephemeral cleanup rechecks the node's current lifetime and active sessions, so an old timer cannot delete a reconnected node or a tagged node claimed by a user [#3545](https://github.com/juanfont/headscale/pull/3545)
+- Streaming map requests no longer update the node's Hostinfo, endpoints or disco key, as Tailscale capability version 68 specifies; Tailscale clients report these in a separate update, which is applied. A stream delivered after a newer update no longer rolls the node back to its older state [#37](https://github.com/kradalby/headscale/pull/37)
+- Every endpoint change a node reports reaches its peers, STUN-only ones included. Peers are rendered from the stored node, so the stored endpoints are what they get; withholding STUN-only additions, as 0.29 did, would need endpoint types stored alongside them [#37](https://github.com/kradalby/headscale/pull/37)
+- A user created or renamed so that a policy's `user@` name matches several users no longer fails the user write or the boot: that name grants nothing, every other entry (other members of its groups included) still applies, and a warning names it. Setting a policy that names such a user is still refused, now in grants too [#37](https://github.com/kradalby/headscale/pull/37)
+- Peers are rendered for at most the server's current capability version, so a client newer than the server sees each peer's `Cap` as the server's current version, not its own [#37](https://github.com/kradalby/headscale/pull/37)
+- MagicDNS reverse zones for IPv4 prefixes whose configured address has host bits set, and for IPv6 prefixes whose mask is not nibble-aligned, are enumerated from the masked prefix, so tailnets with such custom prefixes advertise the correct set of reverse zones [#40](https://github.com/kradalby/headscale/pull/40)
+- Split-DNS zones with an empty resolver list are now sent as an empty route — handled by the client's built-in resolver — instead of `null` [#40](https://github.com/kradalby/headscale/pull/40)
 
 ## 0.29.7 (2026-10-30)
 
@@ -454,7 +522,7 @@ named sources and destinations and cover the whole policy — both `acls` and `g
 contribute. They run on user-initiated writes via `headscale policy set`, on SIGHUP reload
 (`systemctl reload headscale` / `kill -HUP $(pidof headscale)`), and on `headscale policy check`.
 A failing test rejects the write before it is applied, with the same error message Tailscale SaaS
-would return for the same policy.
+would return for the same policy. Tests run against the users and nodes the policy is published with.
 
 At boot a stored policy whose tests no longer pass — for example because a referenced user was
 deleted while the server was offline — logs a warning and the server keeps running. Fix the
@@ -473,7 +541,7 @@ reach any destination, and `check` requires reachability specifically through a 
 rule. Tests run on `headscale policy set`, on SIGHUP reload (`systemctl reload headscale` /
 `kill -HUP $(pidof headscale)`), and on `headscale policy check`. A failing test rejects the
 write before it is applied, with the same error message Tailscale SaaS would return for the same
-policy.
+policy. Tests run against the users and nodes the policy is published with.
 
 At boot a stored policy whose sshTests no longer pass — for example because a referenced user was
 deleted while the server was offline — logs a warning and the server keeps running. Fix the

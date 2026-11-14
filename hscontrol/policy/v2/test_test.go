@@ -466,13 +466,10 @@ func TestSetPolicyEvaluatesTestsUnlocked(t *testing.T) {
 		}]
 	}`
 
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := pm.SetPolicy([]byte(bad))
+		_, err := replacePolicy(&pm, []byte(bad))
 		done <- err
 	}()
 
@@ -522,7 +519,7 @@ func TestSetPolicyRejectsFailingTests(t *testing.T) {
 
 	beforeFilter, _ := pm.Filter()
 
-	changed, err := pm.SetPolicy([]byte(bad))
+	changed, err := replacePolicy(&pm, []byte(bad))
 	require.Error(t, err, "SetPolicy must reject a policy whose tests fail")
 	require.False(t, changed, "SetPolicy must report no change when rejected")
 	require.ErrorIs(t, err, errPolicyTestsFailed)
@@ -559,7 +556,7 @@ func TestNewPolicyManagerSkipsTests(t *testing.T) {
 
 	// And a subsequent SetPolicy of the same body must reject — that's
 	// the user-write path.
-	_, err = pm.SetPolicy([]byte(stale))
+	_, err = replacePolicy(&pm, []byte(stale))
 	require.Error(t, err)
 	require.ErrorIs(t, err, errPolicyTestsFailed)
 }
@@ -702,7 +699,7 @@ func TestFailureBreakdownIsBounded(t *testing.T) {
 			pm, err := NewPolicyManager([]byte(`{}`), users, nodes.ViewSlice())
 			require.NoError(t, err)
 
-			_, err = pm.SetPolicy([]byte(`{"acls": [], ` + hosts + tt.block + `}`))
+			_, err = replacePolicy(&pm, []byte(`{"acls": [], `+hosts+tt.block+`}`))
 			require.ErrorIs(t, err, tt.sentinel)
 			require.Less(t, len(err.Error()), 100<<10)
 			require.True(t, strings.HasSuffix(err.Error(), fmt.Sprintf(

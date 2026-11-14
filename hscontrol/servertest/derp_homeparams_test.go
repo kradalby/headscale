@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/netmap"
 )
@@ -43,7 +42,6 @@ func TestDERPHomeParamsReachClient(t *testing.T) {
 				},
 			},
 		})
-		srv.App.Change(change.DERPMap())
 	}
 
 	waitScores := func(name string, want map[tailcfg.DERPRegionID]float64) {

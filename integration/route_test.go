@@ -28,6 +28,7 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/ipproto"
+	"tailscale.com/types/key"
 	"tailscale.com/types/views"
 	"tailscale.com/util/must"
 	"tailscale.com/util/slicesx"
@@ -105,8 +106,10 @@ func TestEnablingRoutes(t *testing.T) {
 	// they are not yet enabled.
 	for _, client := range allClients {
 		assert.EventuallyWithT(t, func(c *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(c, err)
+			status := assertClientStatus(c, client)
+			if status == nil {
+				return
+			}
 
 			for _, peerKey := range status.Peers() {
 				peerStatus := status.Peer[peerKey]
@@ -142,8 +145,10 @@ func TestEnablingRoutes(t *testing.T) {
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		// Verify that the clients can see the new routes
 		for _, client := range allClients {
-			status, err := client.Status()
-			assert.NoError(c, err)
+			status := assertClientStatus(c, client)
+			if status == nil {
+				return
+			}
 
 			for _, peerKey := range status.Peers() {
 				peerStatus := status.Peer[peerKey]
@@ -200,8 +205,10 @@ func TestEnablingRoutes(t *testing.T) {
 	// Verify that the clients can see the new routes
 	for _, client := range allClients {
 		assert.EventuallyWithT(t, func(c *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(c, err)
+			status := assertClientStatus(c, client)
+			if status == nil {
+				return
+			}
 
 			for _, peerKey := range status.Peers() {
 				peerStatus := status.Peer[peerKey]
@@ -351,8 +358,10 @@ func TestHASubnetRouterFailover(t *testing.T) {
 	// they are not yet enabled.
 	for _, client := range allClients {
 		assert.EventuallyWithT(t, func(c *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(c, err)
+			status := assertClientStatus(c, client)
+			if status == nil {
+				return
+			}
 
 			for _, peerKey := range status.Peers() {
 				peerStatus := status.Peer[peerKey]
@@ -1404,8 +1413,11 @@ func TestSubnetRouteACL(t *testing.T) {
 		var status *ipnstate.Status
 
 		require.EventuallyWithT(t, func(c *assert.CollectT) {
-			s, err := client.Status()
-			assert.NoError(c, err)
+			s := assertClientStatus(c, client)
+			if s == nil {
+				return
+			}
+
 			assert.NotNil(c, s)
 
 			if s != nil {
@@ -1468,8 +1480,10 @@ func TestSubnetRouteACL(t *testing.T) {
 	// they are not yet enabled.
 	for _, client := range allClients {
 		assert.EventuallyWithT(t, func(c *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(c, err)
+			status := assertClientStatus(c, client)
+			if status == nil {
+				return
+			}
 
 			for _, peerKey := range status.Peers() {
 				peerStatus := status.Peer[peerKey]
@@ -1498,11 +1512,15 @@ func TestSubnetRouteACL(t *testing.T) {
 
 	// Verify that the client has routes from the primary machine
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		srs1, err := subRouter1.Status()
-		assert.NoError(c, err)
+		srs1 := assertClientStatus(c, subRouter1)
+		if srs1 == nil {
+			return
+		}
 
-		clientStatus, err := client.Status()
-		assert.NoError(c, err)
+		clientStatus := assertClientStatus(c, client)
+		if clientStatus == nil {
+			return
+		}
 
 		srs1PeerStatus := clientStatus.Peer[srs1.Self.PublicKey]
 
@@ -1644,8 +1662,10 @@ func TestEnablingExitRoutes(t *testing.T) {
 	// they are not yet enabled.
 	for _, client := range allClients {
 		assert.EventuallyWithT(t, func(c *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(c, err)
+			status := assertClientStatus(c, client)
+			if status == nil {
+				return
+			}
 
 			for _, peerKey := range status.Peers() {
 				peerStatus := status.Peer[peerKey]
@@ -1682,8 +1702,10 @@ func TestEnablingExitRoutes(t *testing.T) {
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		// Verify that the clients can see the new routes
 		for _, client := range allClients {
-			status, err := client.Status()
-			assert.NoError(c, err)
+			status := assertClientStatus(c, client)
+			if status == nil {
+				return
+			}
 
 			for _, peerKey := range status.Peers() {
 				peerStatus := status.Peer[peerKey]
@@ -1806,8 +1828,10 @@ func TestExitRoutesWithAutogroupInternetACL(t *testing.T) {
 	// reads (see tailscale.com/ipn/ipnlocal/local.go).
 	for _, client := range allClients {
 		assert.EventuallyWithT(t, func(c *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(c, err)
+			status := assertClientStatus(c, client)
+			if status == nil {
+				return
+			}
 
 			peerCount := 0
 
@@ -1925,8 +1949,10 @@ func TestSubnetRouterMultiNetwork(t *testing.T) {
 	// Verify that no routes has been sent to the client,
 	// they are not yet enabled.
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		status, err := user1c.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, user1c)
+		if status == nil {
+			return
+		}
 
 		for _, peerKey := range status.Peers() {
 			peerStatus := status.Peer[peerKey]
@@ -1955,8 +1981,10 @@ func TestSubnetRouterMultiNetwork(t *testing.T) {
 
 	// Verify that the routes have been sent to the client
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		status, err := user2c.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, user2c)
+		if status == nil {
+			return
+		}
 
 		for _, peerKey := range status.Peers() {
 			peerStatus := status.Peer[peerKey]
@@ -2081,8 +2109,10 @@ func TestSubnetRouterMultiNetworkExitNode(t *testing.T) {
 	// Verify that no routes has been sent to the client,
 	// they are not yet enabled.
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		status, err := user1c.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, user1c)
+		if status == nil {
+			return
+		}
 
 		for _, peerKey := range status.Peers() {
 			peerStatus := status.Peer[peerKey]
@@ -2106,8 +2136,10 @@ func TestSubnetRouterMultiNetworkExitNode(t *testing.T) {
 
 	// Wait for exit routes to be visible to the client.
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		status, err := user2c.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, user2c)
+		if status == nil {
+			return
+		}
 
 		for _, peerKey := range status.Peers() {
 			peerStatus := status.Peer[peerKey]
@@ -2127,8 +2159,11 @@ func TestSubnetRouterMultiNetworkExitNode(t *testing.T) {
 
 	// Wait for exit node to become active.
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		status, err := user2c.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, user2c)
+		if status == nil {
+			return
+		}
+
 		assert.NotNil(c, status.ExitNodeStatus, "exit node should be active")
 	}, 30*time.Second, 500*time.Millisecond, "exit node activation")
 
@@ -2697,8 +2732,10 @@ func TestAutoApproveMultiNetwork(t *testing.T) {
 
 					// Verify that the routes have been sent to the client.
 					assert.EventuallyWithT(t, func(c *assert.CollectT) {
-						status, err := client.Status()
-						assert.NoError(c, err)
+						status := assertClientStatus(c, client)
+						if status == nil {
+							return
+						}
 
 						// Debug output to understand peer visibility
 						t.Logf("Client %s sees %d peers", client.Hostname(), len(status.Peers()))
@@ -2791,8 +2828,10 @@ func TestAutoApproveMultiNetwork(t *testing.T) {
 
 					// Verify that the routes have been sent to the client.
 					assert.EventuallyWithT(t, func(c *assert.CollectT) {
-						status, err := client.Status()
-						assert.NoError(c, err)
+						status := assertClientStatus(c, client)
+						if status == nil {
+							return
+						}
 
 						for _, peerKey := range status.Peers() {
 							peerStatus := status.Peer[peerKey]
@@ -2848,8 +2887,10 @@ func TestAutoApproveMultiNetwork(t *testing.T) {
 
 					// Verify that the routes have been sent to the client.
 					assert.EventuallyWithT(t, func(c *assert.CollectT) {
-						status, err := client.Status()
-						assert.NoError(c, err)
+						status := assertClientStatus(c, client)
+						if status == nil {
+							return
+						}
 
 						for _, peerKey := range status.Peers() {
 							peerStatus := status.Peer[peerKey]
@@ -2906,8 +2947,10 @@ func TestAutoApproveMultiNetwork(t *testing.T) {
 
 					// Verify that the routes have been sent to the client.
 					assert.EventuallyWithT(t, func(c *assert.CollectT) {
-						status, err := client.Status()
-						assert.NoError(c, err)
+						status := assertClientStatus(c, client)
+						if status == nil {
+							return
+						}
 
 						for _, peerKey := range status.Peers() {
 							peerStatus := status.Peer[peerKey]
@@ -2967,8 +3010,10 @@ func TestAutoApproveMultiNetwork(t *testing.T) {
 
 					// Verify that the routes have been sent to the client.
 					assert.EventuallyWithT(t, func(c *assert.CollectT) {
-						status, err := client.Status()
-						assert.NoError(c, err)
+						status := assertClientStatus(c, client)
+						if status == nil {
+							return
+						}
 
 						for _, peerKey := range status.Peers() {
 							peerStatus := status.Peer[peerKey]
@@ -3015,8 +3060,10 @@ func TestAutoApproveMultiNetwork(t *testing.T) {
 
 					// Verify that the routes have been sent to the client.
 					assert.EventuallyWithT(t, func(c *assert.CollectT) {
-						status, err := client.Status()
-						assert.NoError(c, err)
+						status := assertClientStatus(c, client)
+						if status == nil {
+							return
+						}
 
 						for _, peerKey := range status.Peers() {
 							peerStatus := status.Peer[peerKey]
@@ -3055,8 +3102,10 @@ func TestAutoApproveMultiNetwork(t *testing.T) {
 
 					// Verify that the routes have been sent to the client.
 					assert.EventuallyWithT(t, func(c *assert.CollectT) {
-						status, err := client.Status()
-						assert.NoError(c, err)
+						status := assertClientStatus(c, client)
+						if status == nil {
+							return
+						}
 
 						for _, peerKey := range status.Peers() {
 							peerStatus := status.Peer[peerKey]
@@ -3326,11 +3375,15 @@ func TestSubnetRouteACLFiltering(t *testing.T) {
 
 	// Now check the client node status
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		nodeStatus, err := nodeClient.Status()
-		assert.NoError(c, err)
+		nodeStatus := assertClientStatus(c, nodeClient)
+		if nodeStatus == nil {
+			return
+		}
 
-		routerStatus, err := routerClient.Status()
-		assert.NoError(c, err)
+		routerStatus := assertClientStatus(c, routerClient)
+		if routerStatus == nil {
+			return
+		}
 
 		// Check that the node can see the subnet routes from the router
 		routerPeerStatus := nodeStatus.Peer[routerStatus.Self.PublicKey]
@@ -3589,8 +3642,10 @@ func TestGrantViaSubnetSteering(t *testing.T) {
 
 	// Verify Client A sees only Router A's subnet route (via steering).
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		status, err := clientA.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, clientA)
+		if status == nil {
+			return
+		}
 
 		routerAID := routerA.MustID()
 		routerBID := routerB.MustID()
@@ -3615,8 +3670,10 @@ func TestGrantViaSubnetSteering(t *testing.T) {
 
 	// Verify Client B sees only Router B's subnet route (via steering).
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		status, err := clientB.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, clientB)
+		if status == nil {
+			return
+		}
 
 		routerAID := routerA.MustID()
 		routerBID := routerB.MustID()
@@ -4091,8 +4148,10 @@ func TestHASubnetRouterFailoverBothOffline(t *testing.T) {
 
 	// R2 — client view.
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		clientStatus, err := client.Status()
-		assert.NoError(c, err)
+		clientStatus := assertClientStatus(c, client)
+		if clientStatus == nil {
+			return
+		}
 
 		srs2 := subRouter2.MustStatus()
 
@@ -4321,8 +4380,10 @@ func TestHASubnetRouterFailoverBothOfflineCablePull(t *testing.T) {
 
 	// R2 — client should observe r2 online with the route.
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		clientStatus, err := client.Status()
-		assert.NoError(c, err)
+		clientStatus := assertClientStatus(c, client)
+		if clientStatus == nil {
+			return
+		}
 
 		srs2 := subRouter2.MustStatus()
 
@@ -4598,9 +4659,37 @@ func TestHASubnetRouterFailoverDockerDisconnect(t *testing.T) {
 	// ============================================================
 	t.Log("=== Phase 4a: cable-pull r1, expect failover to r2. ===")
 
+	var r1Key key.NodePublic
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		st, err := subRouter1.Status()
+		if !assert.NoError(c, err) {
+			return
+		}
+
+		r1Key = st.Self.PublicKey
+	}, propagationTime, 200*time.Millisecond, "phase 4a: read r1's node key")
+
 	require.NoError(t, subRouter1.DisconnectFromNetwork(usernet1),
 		"phase 4a: docker disconnect r1")
 	requirePrimary(nodeID2, "phase 4a: r2 promoted after r1 down")
+
+	// The server can elect r2 before its map arrives. Wait for r2 to stop
+	// routing through r1 before pulling its cable, or table52 can strand the
+	// route and prevent Docker from restoring r2's gateway on reconnect.
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		st, err := subRouter2.Status()
+		if !assert.NoError(c, err) {
+			return
+		}
+
+		peer, ok := st.Peer[r1Key]
+		assert.True(c, ok, "r2 should list r1 as a peer")
+
+		if ok && peer.PrimaryRoutes != nil {
+			assert.NotContains(c, peer.PrimaryRoutes.AsSlice(), pref)
+		}
+	}, propagationTime, 200*time.Millisecond, "phase 4a: r2 no longer routes pref via r1")
 
 	t.Log("=== Phase 4b: cable-pull r2, primary must NOT flap to offline r1. ===")
 	require.NoError(t, subRouter2.DisconnectFromNetwork(usernet1),

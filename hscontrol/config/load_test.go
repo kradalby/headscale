@@ -253,8 +253,8 @@ func TestConfigSource(t *testing.T) {
 		},
 		{
 			name: "mapping under a plain setting",
-			file: "tuning:\n  batcher_workers:\n    bogus: 1\nserver_url:\n  bogus: x\n",
-			errs: []string{"unknown configuration key tuning.batcher_workers.bogus", "unknown configuration key server_url.bogus"},
+			file: "tuning:\n  node_store_batch_size:\n    bogus: 1\nserver_url:\n  bogus: x\n",
+			errs: []string{"unknown configuration key tuning.node_store_batch_size.bogus", "unknown configuration key server_url.bogus"},
 		},
 		{
 			name: "non-string yaml keys are normalised",
@@ -3696,13 +3696,11 @@ type compatPolicyConfig struct {
 }
 
 type compatTuning struct {
-	BatchChangeDelay               time.Duration
-	NodeMapSessionBufferedChanSize int
-	BatcherWorkers                 int
-	RegisterCacheExpiration        time.Duration
-	RegisterCacheMaxEntries        int
-	NodeStoreBatchSize             int
-	NodeStoreBatchTimeout          time.Duration
+	BatchChangeDelay        time.Duration
+	RegisterCacheExpiration time.Duration
+	RegisterCacheMaxEntries int
+	NodeStoreBatchSize      int
+	NodeStoreBatchTimeout   time.Duration
 }
 
 // compatView renders cfg in the golden shape, deriving the values the
@@ -3728,7 +3726,6 @@ func compatView(cfg *types.Config) compatConfig {
 	}
 
 	tuning := compatTuning(cfg.Tuning)
-	tuning.BatcherWorkers = cfg.Tuning.BatcherWorkerCount()
 
 	// Today's loader read an empty list as nil and an unset map as empty.
 	trusted := cfg.TrustedProxies
@@ -3912,10 +3909,6 @@ func loadCompat(t *testing.T, file, envFile string, cli bool) compatRecord {
 				UnixSocket:         view.UnixSocket,
 				CLI:                view.CLI,
 			}
-		}
-
-		if view.Tuning.BatcherWorkers == types.DefaultBatcherWorkers() {
-			view.Tuning.BatcherWorkers = 0 // depends on runtime.NumCPU
 		}
 
 		raw, err := json.Marshal(view)
@@ -4462,6 +4455,7 @@ func TestEnvNames(t *testing.T) {
 
 			l, err := Load(path, true, []string{configEnvName(k.Path) + "=" + val})
 			require.NoError(t, err)
+
 			assert.Empty(t, l.Warnings)
 
 			for j, f := range types.ConfigFields(l.Config) {
@@ -4614,6 +4608,55 @@ func TestMapKeyCollision(t *testing.T) {
 			_, err := Load(dir, false, tt.env)
 			require.ErrorContains(t, err, tt.want)
 			requireHidden(t, err, "marker")
+		})
+	}
+}
+
+// TestRemovedTuningKeys rejects obsolete file settings and preserves the
+// shared-prefix environment contract: warn about removed variables and ignore them.
+func TestRemovedTuningKeys(t *testing.T) {
+	base := writeConfig(t, "server_url: https://example.com\n")
+	loaded, err := Load(base, true, nil)
+	require.NoError(t, err)
+	require.NoError(t, Validate(loaded.Config))
+	assert.Empty(t, loaded.Warnings)
+
+	for _, key := range []string{"tuning.batcher_workers", "tuning.node_mapsession_buffered_chan_size", "tuning.notifier_send_timeout"} {
+		t.Run(key, func(t *testing.T) {
+			for _, value := range []string{"4", "{bogus: marker-unused-value}"} {
+				path := writeConfig(t, "server_url: https://example.com\n"+key+": "+value+"\n")
+				loaded, err := Load(path, true, nil)
+				require.ErrorContains(t, err, key+" was removed in 0.30")
+				require.ErrorContains(t, err, "remove it")
+				require.ErrorContains(t, err, path)
+				requireHidden(t, err, "marker-unused-value")
+				assert.Nil(t, loaded.Config)
+			}
+
+			// Null means unset before strict key checks, as for all removed keys.
+			unset := writeConfig(t, "server_url: https://example.com\n"+key+": null\n")
+			loaded, err := Load(unset, true, nil)
+			require.NoError(t, err)
+			assert.Empty(t, loaded.Warnings)
+			assert.Equal(t, Default().Tuning, loaded.Config.Tuning)
+
+			envName := configEnvName(key)
+			env := []string{envName + "=marker-unused-value"}
+			loaded, err = Load(base, true, env)
+			require.NoError(t, err)
+			require.NoError(t, Validate(loaded.Config))
+			assert.Equal(t, Default().Tuning, loaded.Config.Tuning, "a removed variable must not affect supported tuning")
+			require.Len(t, loaded.Warnings, 1)
+			assert.Contains(t, loaded.Warnings[0], envName+" was removed in 0.30")
+			assert.Contains(t, loaded.Warnings[0], "remove it")
+			assert.NotContains(t, loaded.Warnings[0], "marker-unused-value")
+
+			path := writeConfig(t, "server_url: https://example.com\n"+key+": 4\n")
+			loaded, err = Load(path, true, env)
+			require.ErrorContains(t, err, key+" was removed")
+			assert.Nil(t, loaded.Config, "an environment variable cannot rescue a removed file key")
+			require.Len(t, loaded.Warnings, 1, "removed-variable guidance survives the file error")
+			assert.Contains(t, loaded.Warnings[0], envName)
 		})
 	}
 }

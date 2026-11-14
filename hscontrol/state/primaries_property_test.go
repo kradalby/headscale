@@ -213,7 +213,7 @@ func samePrefixSet(a, b []netip.Prefix) bool {
 // that may stay unhealthy while no router is available.
 func checkPrimariesProperties(
 	rt *rapid.T,
-	ns *NodeStore,
+	ns *world,
 	m *primariesModel,
 	nodeIDs []types.NodeID,
 	prevSnapshotPrimaries map[netip.Prefix]types.NodeID,
@@ -226,7 +226,7 @@ func checkPrimariesProperties(
 	}
 
 	for _, id := range nodeIDs {
-		got := ns.PrimaryRoutesForNode(id)
+		got := ns.snapshot().PrimaryRoutesForNode(id)
 		want := expectedByNode[id]
 
 		if !samePrefixSet(got, want) {
@@ -236,10 +236,10 @@ func checkPrimariesProperties(
 			)
 		}
 
-		if want := !m.unhealthy[id]; ns.IsNodeHealthy(id) != want {
+		if want := !m.unhealthy[id]; ns.snapshot().IsNodeHealthy(id) != want {
 			rt.Fatalf(
 				"IsNodeHealthy(%d) = %v, want %v",
-				id, ns.IsNodeHealthy(id), want,
+				id, ns.snapshot().IsNodeHealthy(id), want,
 			)
 		}
 	}
@@ -253,7 +253,7 @@ func checkPrimariesProperties(
 			continue
 		}
 
-		got, ok := ns.PrimaryRouteFor(p)
+		got, ok := ns.snapshot().PrimaryRouteFor(p)
 		if !ok {
 			rt.Fatalf(
 				"prefix %s has a primary in the model but none in NodeStore",
@@ -272,7 +272,7 @@ func checkPrimariesProperties(
 	// Structural invariants on the live snapshot, independent of the
 	// model. These catch shapes the model alone cannot — e.g. an owner
 	// that no longer approves the prefix attributed to it.
-	snapshotPrimaries := ns.PrimaryRoutes()
+	snapshotPrimaries := ns.snapshot().PrimaryRoutes()
 
 	// A primary that owns ≥1 prefix in `routes` must also light up
 	// `isPrimaryRoute` (PrimaryRoutesForNode returns nil unless the
@@ -285,7 +285,7 @@ func checkPrimariesProperties(
 	}
 
 	for owner := range ownersInRoutes {
-		if got := ns.PrimaryRoutesForNode(owner); len(got) == 0 {
+		if got := ns.snapshot().PrimaryRoutesForNode(owner); len(got) == 0 {
 			rt.Fatalf(
 				"node %d owns a prefix in routes but PrimaryRoutesForNode is empty",
 				owner,
@@ -300,7 +300,7 @@ func checkPrimariesProperties(
 	approversByPrefix := m.approversByPrefix()
 
 	for prefix, owner := range snapshotPrimaries {
-		nv, ok := ns.GetNode(owner)
+		nv, ok := ns.snapshot().GetNode(owner)
 		if !ok || !nv.Valid() {
 			rt.Fatalf(
 				"prefix %s primary %d not present in NodeStore",
@@ -351,7 +351,7 @@ func checkPrimariesProperties(
 		// session before the primary's. A router that reconnects joins
 		// as a standby; one that keeps its session wins again.
 		for _, c := range approversByPrefix[prefix] {
-			cv, _ := ns.GetNode(c)
+			cv, _ := ns.snapshot().GetNode(c)
 			if m.available(c) && cv.SessionStart().Before(nv.SessionStart()) {
 				rt.Fatalf(
 					"prefix %s primary %d holds it over %d, whose session is older",
@@ -384,8 +384,8 @@ func nodeForRapid(id types.NodeID) types.Node {
 // snapshotPrimariesCopy returns a defensive copy of the snapshot's
 // prefix→primary map so the caller can compare against a later
 // snapshot without aliasing the live map.
-func snapshotPrimariesCopy(ns *NodeStore) map[netip.Prefix]types.NodeID {
-	live := ns.PrimaryRoutes()
+func snapshotPrimariesCopy(ns *world) map[netip.Prefix]types.NodeID {
+	live := ns.snapshot().PrimaryRoutes()
 
 	out := make(map[netip.Prefix]types.NodeID, len(live))
 	maps.Copy(out, live)
@@ -430,10 +430,7 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 			netip.MustParsePrefix("10.0.1.0/24"),
 		}
 
-		ns := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
-
-		ns.Start()
-		defer ns.Stop()
+		ns := newTestWorld(t)
 
 		for _, id := range nodeIDs {
 			ns.PutNode(nodeForRapid(id))

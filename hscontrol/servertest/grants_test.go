@@ -9,7 +9,6 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/net/tsaddr"
@@ -39,6 +38,13 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 		c1.WaitForPeers(t, 1, 10*time.Second)
 		c2.WaitForPeers(t, 1, 10*time.Second)
 
+		_, err := srv.State().SetPolicy([]byte(`{"acls":[]}`))
+		require.NoError(t, err)
+
+		for _, client := range []*servertest.TestClient{c1, c2} {
+			client.WaitForCondition(t, "deny baseline delivered", 10*time.Second, func(nm *netmap.NetworkMap) bool { return len(nm.PacketFilter) == 0 })
+		}
+
 		// Record update counts before policy change.
 		countC1 := c1.UpdateCount()
 		countC2 := c2.UpdateCount()
@@ -54,9 +60,8 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 		require.NoError(t, err)
 
 		if changed {
-			changes, err := srv.State().ReloadPolicy()
+			err := srv.State().ReloadPolicy()
 			require.NoError(t, err)
-			srv.App.Change(changes...)
 		}
 
 		// Wait for both clients to receive an update after the policy change.
@@ -132,9 +137,8 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 		require.NoError(t, err)
 
 		if changed {
-			changes, err := srv.State().ReloadPolicy()
+			err := srv.State().ReloadPolicy()
 			require.NoError(t, err)
-			srv.App.Change(changes...)
 		}
 
 		// Wait for [netmap.NetworkMap.PacketFilter] with cap match rules to arrive.
@@ -218,9 +222,8 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 		require.NoError(t, err)
 
 		if changed {
-			changes, err := srv.State().ReloadPolicy()
+			err := srv.State().ReloadPolicy()
 			require.NoError(t, err)
-			srv.App.Change(changes...)
 		}
 
 		// Wait for the filter itself: any other frame, such as a peer's
@@ -260,9 +263,8 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 		require.NoError(t, err)
 
 		if changed {
-			changes, err := srv.State().ReloadPolicy()
+			err := srv.State().ReloadPolicy()
 			require.NoError(t, err)
-			srv.App.Change(changes...)
 		}
 
 		// Wait for the second policy update to arrive.
@@ -330,9 +332,8 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 		require.NoError(t, err)
 
 		if changed {
-			changes, err := srv.State().ReloadPolicy()
+			err := srv.State().ReloadPolicy()
 			require.NoError(t, err)
-			srv.App.Change(changes...)
 		}
 
 		// Wait for policy to take effect. Each node should only
@@ -416,9 +417,8 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 		require.NoError(t, err)
 
 		if changed {
-			changes, err := srv.State().ReloadPolicy()
+			err := srv.State().ReloadPolicy()
 			require.NoError(t, err)
-			srv.App.Change(changes...)
 		}
 
 		c1 := servertest.NewClient(t, srv, "mixed-node1",
@@ -525,9 +525,8 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 		require.NoError(t, err)
 
 		if changed {
-			changes, err := srv.State().ReloadPolicy()
+			err := srv.State().ReloadPolicy()
 			require.NoError(t, err)
-			srv.App.Change(changes...)
 		}
 
 		// Create routers and clients with tags.
@@ -575,16 +574,14 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 
 		// Approve routes on both routers.
 		routerAID := findNodeID(t, srv, "router-a")
-		_, routeChangeA, err := srv.State().SetApprovedRoutes(
+		_, err = srv.State().SetApprovedRoutes(
 			routerAID, []netip.Prefix{route})
 		require.NoError(t, err)
-		srv.App.Change(routeChangeA)
 
 		routerBID := findNodeID(t, srv, "router-b")
-		_, routeChangeB, err := srv.State().SetApprovedRoutes(
+		_, err = srv.State().SetApprovedRoutes(
 			routerBID, []netip.Prefix{route})
 		require.NoError(t, err)
-		srv.App.Change(routeChangeB)
 
 		// clientA should see routerA with the route in AllowedIPs.
 		clientA.WaitForCondition(t, "clientA sees route via router-a",
@@ -693,9 +690,8 @@ func TestGrantViaSubnetFilterRules(t *testing.T) {
 	require.NoError(t, err)
 
 	if changed {
-		changes, err := srv.State().ReloadPolicy()
+		err := srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 	}
 
 	routerA := servertest.NewClient(t, srv, "router-a",
@@ -721,10 +717,9 @@ func TestGrantViaSubnetFilterRules(t *testing.T) {
 	_ = routerA.Direct().SendUpdate(ctx)
 
 	routerAID := findNodeID(t, srv, "router-a")
-	_, routeChange, err := srv.State().SetApprovedRoutes(
+	_, err = srv.State().SetApprovedRoutes(
 		routerAID, []netip.Prefix{route})
 	require.NoError(t, err)
-	srv.App.Change(routeChange)
 
 	// Wait for clientA to see the route in AllowedIPs.
 	clientA.WaitForCondition(t, "clientA sees route via router-a",
@@ -747,25 +742,21 @@ func TestGrantViaSubnetFilterRules(t *testing.T) {
 	// Critical: the router's [netmap.NetworkMap.PacketFilter] MUST contain rules with
 	// the via-steered subnet (10.0.0.0/24) as a destination.
 	// Without this, the router drops traffic forwarded through it.
-	routerNM := routerA.Netmap()
-	require.NotNil(t, routerNM)
-	require.NotNil(t, routerNM.PacketFilter,
-		"router PacketFilter should not be nil")
-
-	var foundSubnetDst bool
-
-	for _, m := range routerNM.PacketFilter {
-		for _, dst := range m.Dsts {
-			dstPrefix := netip.PrefixFrom(dst.Net.Addr(), dst.Net.Bits())
-			if route.Contains(dstPrefix.Addr()) && dstPrefix.Bits() >= route.Bits() {
-				foundSubnetDst = true
+	// The router's map is sent independently of clientA's, so wait for it.
+	routerA.WaitForCondition(t, "router PacketFilter has via-steered subnet 10.0.0.0/24 as dst",
+		15*time.Second,
+		func(nm *netmap.NetworkMap) bool {
+			for _, m := range nm.PacketFilter {
+				for _, dst := range m.Dsts {
+					dstPrefix := netip.PrefixFrom(dst.Net.Addr(), dst.Net.Bits())
+					if route.Contains(dstPrefix.Addr()) && dstPrefix.Bits() >= route.Bits() {
+						return true
+					}
+				}
 			}
-		}
-	}
 
-	assert.True(t, foundSubnetDst,
-		"router PacketFilter should contain destination rules for via-steered subnet 10.0.0.0/24; "+
-			"without per-node filter compilation for via grants, these rules are missing")
+			return false
+		})
 }
 
 // TestGrantViaSubnetBroaderDstFilterRules verifies that a via grant
@@ -812,9 +803,8 @@ func TestGrantViaSubnetBroaderDstFilterRules(t *testing.T) {
 	require.NoError(t, err)
 
 	if changed {
-		changes, err := srv.State().ReloadPolicy()
+		err := srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 	}
 
 	routerA := servertest.NewClient(t, srv, "router-a",
@@ -839,10 +829,9 @@ func TestGrantViaSubnetBroaderDstFilterRules(t *testing.T) {
 	_ = routerA.Direct().SendUpdate(ctx)
 
 	routerAID := findNodeID(t, srv, "router-a")
-	_, routeChange, err := srv.State().SetApprovedRoutes(
+	_, err = srv.State().SetApprovedRoutes(
 		routerAID, []netip.Prefix{advertised})
 	require.NoError(t, err)
-	srv.App.Change(routeChange)
 
 	// Client should see the advertised route in router's AllowedIPs.
 	clientA.WaitForCondition(t, "clientA sees advertised route via router-a",
@@ -864,25 +853,22 @@ func TestGrantViaSubnetBroaderDstFilterRules(t *testing.T) {
 
 	// Router's PacketFilter must contain the broader grant dst as a
 	// destination — that is what Tailscale SaaS emits for via grants.
-	routerNM := routerA.Netmap()
-	require.NotNil(t, routerNM)
-	require.NotNil(t, routerNM.PacketFilter,
-		"router PacketFilter should not be nil")
-
-	var foundBroaderDst bool
-
-	for _, m := range routerNM.PacketFilter {
-		for _, dst := range m.Dsts {
-			dstPrefix := netip.PrefixFrom(dst.Net.Addr(), dst.Net.Bits())
-			if dstPrefix == broaderDst {
-				foundBroaderDst = true
+	// The via gate requires advertised-route overlap, and the emitted
+	// prefix is the dst. The router's map is sent independently of
+	// clientA's, so wait for it.
+	routerA.WaitForCondition(t, "router PacketFilter has broader grant dst 10.0.0.0/8",
+		15*time.Second,
+		func(nm *netmap.NetworkMap) bool {
+			for _, m := range nm.PacketFilter {
+				for _, dst := range m.Dsts {
+					if netip.PrefixFrom(dst.Net.Addr(), dst.Net.Bits()) == broaderDst {
+						return true
+					}
+				}
 			}
-		}
-	}
 
-	assert.True(t, foundBroaderDst,
-		"router PacketFilter should contain destination rules for the broader grant dst 10.0.0.0/8; "+
-			"the via gate requires advertised-route overlap, and the emitted prefix is the dst")
+			return false
+		})
 }
 
 // TestGrantViaExitNodeNoFilterRules verifies wire-format SaaS compat:
@@ -926,9 +912,8 @@ func TestGrantViaExitNodeNoFilterRules(t *testing.T) {
 	require.NoError(t, err)
 
 	if changed {
-		changes, err := srv.State().ReloadPolicy()
+		err := srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 	}
 
 	exitA := servertest.NewClient(t, srv, "exit-a",
@@ -954,10 +939,9 @@ func TestGrantViaExitNodeNoFilterRules(t *testing.T) {
 	_ = exitA.Direct().SendUpdate(ctx)
 
 	exitAID := findNodeID(t, srv, "exit-a")
-	_, routeChange, err := srv.State().SetApprovedRoutes(
+	_, err = srv.State().SetApprovedRoutes(
 		exitAID, []netip.Prefix{exitRouteV4, exitRouteV6})
 	require.NoError(t, err)
-	srv.App.Change(routeChange)
 
 	// Wait for routes to propagate.
 	exitA.WaitForCondition(t, "exit-a routes approved",
@@ -1024,9 +1008,8 @@ func TestGrantViaExitNodeInternetVisibility(t *testing.T) {
 	require.NoError(t, err)
 
 	if changed {
-		changes, err := srv.State().ReloadPolicy()
+		err := srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 	}
 
 	exitA := servertest.NewClient(t, srv, "exit-a",
@@ -1051,10 +1034,9 @@ func TestGrantViaExitNodeInternetVisibility(t *testing.T) {
 	_ = exitA.Direct().SendUpdate(ctx)
 
 	exitAID := findNodeID(t, srv, "exit-a")
-	_, routeChange, err := srv.State().SetApprovedRoutes(
+	_, err = srv.State().SetApprovedRoutes(
 		exitAID, []netip.Prefix{exitRouteV4, exitRouteV6})
 	require.NoError(t, err)
-	srv.App.Change(routeChange)
 
 	clientA.WaitForCondition(t, "client-a sees exit-a with exit AllowedIPs",
 		15*time.Second,
@@ -1121,9 +1103,8 @@ func TestGrantViaTwoExitGrantsWithACL(t *testing.T) {
 	require.NoError(t, err)
 
 	if changed {
-		changes, err := srv.State().ReloadPolicy()
+		err := srv.State().ReloadPolicy()
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 	}
 
 	laptop := servertest.NewClient(t, srv, "alice-laptop",
@@ -1136,10 +1117,9 @@ func TestGrantViaTwoExitGrantsWithACL(t *testing.T) {
 			servertest.WithTags("tag:"+name))
 		advertiseRoutes(t, exit, tsaddr.ExitRoutes())
 
-		_, routeChange, err := srv.State().SetApprovedRoutes(
+		_, err := srv.State().SetApprovedRoutes(
 			findNodeID(t, srv, name), tsaddr.ExitRoutes())
 		require.NoError(t, err)
-		srv.App.Change(routeChange)
 	}
 
 	laptop.WaitForCondition(t, "alice-laptop sees exit-a and exit-b as exit nodes, not exit-c",
@@ -1222,9 +1202,8 @@ func TestGrantViaSubnetFailover(t *testing.T) {
 		require.NoError(t, err)
 
 		if changed {
-			changes, err := srv.State().ReloadPolicy()
+			err := srv.State().ReloadPolicy()
 			require.NoError(t, err)
-			srv.App.Change(changes...)
 		}
 
 		clients := map[string]*servertest.TestClient{}
@@ -1273,9 +1252,8 @@ func TestGrantViaSubnetFailover(t *testing.T) {
 	setExpiry := func(t *testing.T, srv *servertest.TestServer, id types.NodeID, expiry *time.Time) {
 		t.Helper()
 
-		_, c, err := srv.State().SetNodeExpiry(id, expiry)
+		_, err := srv.State().SetNodeExpiry(id, expiry)
 		require.NoError(t, err)
-		srv.App.Change(c)
 	}
 
 	for _, mode := range []string{"offline", "unhealthy", "expired"} {
@@ -1295,7 +1273,7 @@ func TestGrantViaSubnetFailover(t *testing.T) {
 			case "unhealthy":
 				changed := srv.State().SetNodeHealth(router1ID, false)
 				require.True(t, changed, "a via health change must trigger a recompute")
-				srv.App.Change(change.PolicyChange())
+
 			case "expired":
 				setExpiry(t, srv, router1ID, new(time.Now().Add(-time.Minute)))
 			}
@@ -1310,7 +1288,7 @@ func TestGrantViaSubnetFailover(t *testing.T) {
 			case "unhealthy":
 				changed := srv.State().SetNodeHealth(router1ID, true)
 				require.True(t, changed, "a via recovery must trigger a recompute")
-				srv.App.Change(change.PolicyChange())
+
 			case "expired":
 				setExpiry(t, srv, router1ID, nil)
 			}

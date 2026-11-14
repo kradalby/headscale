@@ -6745,6 +6745,68 @@ func TestUnmarshalPolicyMaxDstPorts(t *testing.T) {
 	}
 }
 
+func TestResolveUserDomainUsesCurrentUsers(t *testing.T) {
+	const allowed = "alice@allowed.example"
+
+	tests := []struct {
+		name      string
+		email     string
+		nodeUser  *types.User
+		tags      []string
+		omitUsers bool
+		omitKey   bool
+		twoUsers  bool
+		want      bool
+	}{
+		{name: "current user revoked", email: "alice@removed.example", nodeUser: &types.User{ID: 1, Email: allowed}},
+		{name: "current user joined", email: allowed, nodeUser: &types.User{ID: 1, Email: "alice@removed.example"}, want: true},
+		{name: "current user unchanged", email: allowed, nodeUser: &types.User{ID: 1, Email: allowed}, want: true},
+		{name: "second matching user", email: allowed, nodeUser: &types.User{ID: 2}, twoUsers: true, want: true},
+		{name: "association without foreign key", email: allowed, nodeUser: &types.User{ID: 1}, omitKey: true, want: true},
+		{name: "cleared email", nodeUser: &types.User{ID: 1, Email: allowed}},
+		{name: "malformed email", email: "alice.allowed.example", nodeUser: &types.User{ID: 1, Email: allowed}},
+		{name: "case folded domain", email: "alice@ALLOWED.EXAMPLE", nodeUser: &types.User{ID: 1}, want: true},
+		{name: "domain suffix", email: "alice@allowed.example.evil", nodeUser: &types.User{ID: 1, Email: allowed}},
+		{name: "domain prefix", email: "alice@notallowed.example", nodeUser: &types.User{ID: 1, Email: allowed}},
+		{name: "user missing from current list", omitUsers: true, nodeUser: &types.User{ID: 1, Email: allowed}},
+		{name: "different user ID", email: allowed, nodeUser: &types.User{ID: 2, Email: allowed}},
+		{name: "unhydrated owner", email: allowed},
+		{name: "tagged node", email: allowed, nodeUser: &types.User{ID: 1, Email: allowed}, tags: []string{"tag:server"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			users := types.Users{{ID: 1, Name: allowed, Email: tt.email}}
+			if tt.twoUsers {
+				users = append(users, types.User{ID: 2, Email: allowed})
+			}
+
+			if tt.omitUsers {
+				users = nil
+			}
+
+			userID := new(uint(1))
+			if tt.omitKey {
+				userID = nil
+			}
+
+			nodes := types.Nodes{{
+				ID: 1, IPv4: ap("100.64.0.1"), UserID: userID, User: tt.nodeUser, Tags: tt.tags,
+			}}
+			token := Username("user:*@allowed.example")
+			addresses, err := token.Resolve(nil, users, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			var want []netip.Prefix
+			if tt.want {
+				want = []netip.Prefix{mp("100.64.0.1/32")}
+			}
+
+			require.ElementsMatch(t, want, addresses.Prefixes())
+		})
+	}
+}
+
 func TestResolveUserPrecedence(t *testing.T) {
 	const (
 		address    = "alice@example.com"
@@ -6892,7 +6954,7 @@ func TestSetPolicyBareAtToken(t *testing.T) {
 				require.NoError(t, err)
 
 				candidate := fmt.Sprintf(`{%s, "tests":[{"src":%q, "accept":[%q]}]}`, allowAll, tt.src, tt.dst)
-				_, err = pm.SetPolicy([]byte(candidate))
+				_, err = replacePolicy(&pm, []byte(candidate))
 				require.ErrorIs(t, err, errPolicyTestsFailed)
 
 				for _, user := range users {
@@ -6914,4 +6976,171 @@ func TestParsePolicy(t *testing.T) {
 	pol, err = ParsePolicy([]byte(""))
 	require.NoError(t, err)
 	require.Nil(t, pol)
+}
+
+func TestFlattenTagOwners(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   TagOwners
+		wantErr string
+	}{
+		{
+			name: "tag-owns-tag",
+			input: TagOwners{
+				Tag("tag:bigbrother"):   Owners{new(Group("group:user1"))},
+				Tag("tag:smallbrother"): Owners{new(Tag("tag:bigbrother"))},
+			},
+			wantErr: "",
+		},
+		{
+			// SaaS tolerates tag:a <-> tag:b cycles by dropping the
+			// cycle edge; both tags resolve to an empty owner set
+			// because neither chain reaches a non-tag owner.
+			name: "circular-reference-resolves-to-empty",
+			input: TagOwners{
+				Tag("tag:a"): Owners{new(Tag("tag:b"))},
+				Tag("tag:b"): Owners{new(Tag("tag:a"))},
+			},
+			wantErr: "",
+		},
+		{
+			// tag:a -> tag:a self-reference: the only owner is the
+			// cycle edge itself; result is empty.
+			name: "self-reference-resolves-to-empty",
+			input: TagOwners{
+				Tag("tag:a"): Owners{new(Tag("tag:a"))},
+			},
+			wantErr: "",
+		},
+		{
+			// Cycle plus a sibling non-tag owner: the cycle edge
+			// drops out, the sibling owner survives.
+			name: "cycle-plus-sibling-keeps-sibling",
+			input: TagOwners{
+				Tag("tag:a"): Owners{new(Tag("tag:b")), new(Username("alice@example.com"))},
+				Tag("tag:b"): Owners{new(Tag("tag:a"))},
+			},
+			wantErr: "",
+		},
+		{
+			name: "mixed-owners",
+			input: TagOwners{
+				Tag("tag:x"): Owners{new(Username("user1@")), new(Tag("tag:y"))},
+				Tag("tag:y"): Owners{new(Username("user2@"))},
+			},
+			wantErr: "",
+		},
+		{
+			name: "mixed-dupe-owners",
+			input: TagOwners{
+				Tag("tag:x"): Owners{new(Username("user1@")), new(Tag("tag:y"))},
+				Tag("tag:y"): Owners{new(Username("user1@"))},
+			},
+			wantErr: "",
+		},
+		{
+			name: "no-tag-owners",
+			input: TagOwners{
+				Tag("tag:solo"): Owners{new(Username("user1@"))},
+			},
+			wantErr: "",
+		},
+		{
+			name: "tag-long-owner-chain",
+			input: TagOwners{
+				Tag("tag:a"): Owners{new(Group("group:user1"))},
+				Tag("tag:b"): Owners{new(Tag("tag:a"))},
+				Tag("tag:c"): Owners{new(Tag("tag:b"))},
+				Tag("tag:d"): Owners{new(Tag("tag:c"))},
+				Tag("tag:e"): Owners{new(Tag("tag:d"))},
+				Tag("tag:f"): Owners{new(Tag("tag:e"))},
+				Tag("tag:g"): Owners{new(Tag("tag:f"))},
+			},
+			wantErr: "",
+		},
+		{
+			// Long cycle: every tag eventually points back to itself.
+			// Each tag resolves to the empty owner set.
+			name: "tag-long-circular-chain-resolves-to-empty",
+			input: TagOwners{
+				Tag("tag:a"): Owners{new(Tag("tag:g"))},
+				Tag("tag:b"): Owners{new(Tag("tag:a"))},
+				Tag("tag:c"): Owners{new(Tag("tag:b"))},
+				Tag("tag:d"): Owners{new(Tag("tag:c"))},
+				Tag("tag:e"): Owners{new(Tag("tag:d"))},
+				Tag("tag:f"): Owners{new(Tag("tag:e"))},
+				Tag("tag:g"): Owners{new(Tag("tag:f"))},
+			},
+			wantErr: "",
+		},
+		{
+			name: "undefined-tag-reference",
+			input: TagOwners{
+				Tag("tag:a"): Owners{new(Tag("tag:nonexistent"))},
+			},
+			wantErr: `tag "tag:a" references undefined tag "tag:nonexistent"`,
+		},
+		{
+			name: "tag-with-empty-owners-is-valid",
+			input: TagOwners{
+				Tag("tag:a"): Owners{new(Tag("tag:b"))},
+				Tag("tag:b"): Owners{}, // empty owners but exists
+			},
+			wantErr: "",
+		},
+	}
+
+	users := types.Users{{ID: 1, Name: "user1"}, {ID: 2, Name: "user2"}, {ID: 3, Name: "alice", Email: "alice@example.com"}}
+	nodes := types.Nodes{node("u1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]), node("u2", "100.64.0.2", "fd7a:115c:a1e0::2", users[1]), node("alice", "100.64.0.3", "fd7a:115c:a1e0::3", users[2])}
+	wants := map[string]map[Tag][]uint{
+		"tag-owns-tag":                     {"tag:bigbrother": {1}},
+		"cycle-plus-sibling-keeps-sibling": {"tag:a": {3}},
+		"mixed-owners":                     {"tag:x": {1}, "tag:y": {2}},
+		"mixed-dupe-owners":                {"tag:x": {1}, "tag:y": {1}},
+		"no-tag-owners":                    {"tag:solo": {1}},
+		"tag-long-owner-chain":             {"tag:a": {1}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pol := &Policy{TagOwners: tt.input, Groups: Groups{"group:user1": Usernames{"user1@"}}}
+
+			owners, err := resolveTagOwners(pol, users, nodes.ViewSlice())
+			if tt.wantErr != "" {
+				require.ErrorIs(t, err, ErrUndefinedTagReference)
+				return
+			}
+
+			require.NoError(t, err)
+
+			for tag := range tt.input {
+				for _, n := range nodes {
+					want := slices.Contains(wants[tt.name][tag], n.User.ID)
+					require.Equal(t, want, owners[tag].Contains(*n.IPv4), "%s user %s", tag, n.User.Name)
+				}
+			}
+		})
+	}
+}
+
+func TestSSHSourceRejectsHostsAndPrefixes(t *testing.T) {
+	for name, src := range map[string]string{
+		"host":   `"h"`,
+		"prefix": `"100.64.0.5/32"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			pol := `{"hosts":{"h":"100.64.0.5/32"},
+				"ssh":[{"action":"accept","src":[` + src + `],"dst":["autogroup:self"],"users":["root"]}]}`
+
+			_, err := unmarshalPolicy([]byte(pol))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "[ssh]")
+
+			if name == "host" {
+				require.ErrorIs(t, err, ErrSSHSrcHost)
+			} else {
+				require.ErrorIs(t, err, ErrSSHSrcIP)
+			}
+		})
+	}
 }

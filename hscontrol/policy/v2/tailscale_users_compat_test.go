@@ -293,11 +293,11 @@ func runUserTokenCompat(t *testing.T, c *testcapture.Capture, o userTokenOverlay
 	// already running the policy.
 	runtime, runtimeErr := NewPolicyManager(policyJSON, saasUsers, saasNodes.ViewSlice())
 	if runtimeErr == nil {
-		_, _, runtimeErr = runtime.SetUsers(users)
+		_, _, runtimeErr = replaceUsers(&runtime, users)
 	}
 
 	if runtimeErr == nil {
-		_, runtimeErr = runtime.SetNodes(nodes.ViewSlice())
+		_, runtimeErr = replaceNodes(&runtime, nodes.ViewSlice())
 	}
 
 	managers := []struct {
@@ -438,7 +438,7 @@ func userTokenCaptureMismatch(
 
 		return cmp.Diff(capture.PacketFilterRules, got, append(cmpOptions(), cmpopts.EquateEmpty())...)
 	case "capmap":
-		tn, err := node.View().TailNode(0, noRoutes, nodeAttrsCompatConfig(c), pm.NodeCapMap(node.ID))
+		tn, err := node.View().TailNode(0, noRoutes, nodeAttrsCompatConfig(c), nodeAttrsCompatConfig(c).DNSView(), pm.NodeCapMap(node.ID))
 		if err != nil {
 			return err.Error()
 		}

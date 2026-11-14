@@ -6,16 +6,129 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
-// TestRouteApprovalWaitsForAnnouncement: approvers run when the announced
-// set changes, over every announced route, and neither on a policy reload
-// nor on a report that keeps the routes.
+// TestAutoApproveBatchApprovesRoutes preserves route approval and durability
+// coverage at the announcement boundary; a policy reload approves nothing.
+func TestAutoApproveBatchApprovesRoutes(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	route := netip.MustParsePrefix("10.0.0.0/24")
+
+	_, ok := s.world.UpdateNode(nodeID, func(n *types.Node) {
+		n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+	})
+	require.True(t, ok)
+
+	pol := `{
+		"autoApprovers": {"routes": {"10.0.0.0/24": ["persist-user@"]}},
+		"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]
+	}`
+	_, err := s.SetPolicy([]byte(pol))
+	require.NoError(t, err)
+
+	err = s.ReloadPolicy()
+	require.NoError(t, err)
+
+	nv, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+	require.Empty(t, nv.ApprovedRoutes().AsSlice(), "a reload approves nothing")
+
+	for _, routes := range [][]netip.Prefix{nil, {route}} {
+		err = s.UpdateNodeFromMapRequest(nodeID, tailcfg.MapRequest{
+			NodeKey: nv.NodeKey(), Hostinfo: &tailcfg.Hostinfo{RoutableIPs: routes},
+		})
+		require.NoError(t, err)
+	}
+
+	nv, ok = s.GetNodeByID(nodeID)
+	require.True(t, ok)
+	assert.Equal(t, []netip.Prefix{route}, nv.ApprovedRoutes().AsSlice())
+	assert.Equal(t, []netip.Prefix{route}, nv.AutoApprovedRoutes().AsSlice())
+
+	durable, err := s.db.GetNodeByID(nodeID)
+	require.NoError(t, err)
+	assert.Equal(t, []netip.Prefix{route}, []netip.Prefix(durable.ApprovedRoutes))
+	assert.Equal(t, []netip.Prefix{route}, []netip.Prefix(durable.AutoApprovedRoutes))
+}
+
+// TestAutoApproveSurvivesVanishedRow verifies that a deleting node cannot block
+// policy reload or the targeted, durable approval of a surviving node.
+func TestAutoApproveSurvivesVanishedRow(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	routeA := netip.MustParsePrefix("10.0.0.0/24")
+	routeB := netip.MustParsePrefix("10.1.0.0/24")
+
+	_, ok := s.world.UpdateNode(nodeID, func(n *types.Node) {
+		n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{routeA}}
+	})
+	require.True(t, ok)
+
+	survivor := registerPersistedNode(t, s, "autoapprove-survivor")
+
+	_, ok = s.world.UpdateNode(survivor.ID(), func(n *types.Node) {
+		n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{routeB}}
+	})
+	require.True(t, ok)
+
+	pol := `{
+		"autoApprovers": {"routes": {
+			"10.0.0.0/24": ["persist-user@"],
+			"10.1.0.0/24": ["persist-user@"]
+		}},
+		"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]
+	}`
+	_, err := s.SetPolicy([]byte(pol))
+	require.NoError(t, err)
+
+	// A lifetime delete's window: the victim's row is gone while the world
+	// still knows it. Neither reload nor another node's approval may write it.
+	victim, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+	require.NoError(t, s.db.DeleteNode(victim.AsStruct()))
+
+	err = s.ReloadPolicy()
+	require.NoError(t, err, "a vanished node must not fail the reload")
+
+	live, ok := s.GetNodeByID(survivor.ID())
+	require.True(t, ok)
+	require.Empty(t, live.ApprovedRoutes().AsSlice(), "a reload approves nothing")
+
+	for _, routes := range [][]netip.Prefix{nil, {routeB}} {
+		err = s.UpdateNodeFromMapRequest(survivor.ID(), tailcfg.MapRequest{
+			NodeKey: live.NodeKey(), Hostinfo: &tailcfg.Hostinfo{RoutableIPs: routes},
+		})
+		require.NoError(t, err)
+	}
+
+	live, ok = s.GetNodeByID(survivor.ID())
+	require.True(t, ok)
+	assert.Equal(t, []netip.Prefix{routeB}, live.ApprovedRoutes().AsSlice(),
+		"the surviving node's approval must publish")
+	assert.Equal(t, []netip.Prefix{routeB}, live.AutoApprovedRoutes().AsSlice())
+
+	durable, err := s.db.GetNodeByID(survivor.ID())
+	require.NoError(t, err)
+	assert.Equal(t, []netip.Prefix{routeB}, []netip.Prefix(durable.ApprovedRoutes),
+		"the surviving node's approval must reach its row")
+	assert.Equal(t, []netip.Prefix{routeB}, []netip.Prefix(durable.AutoApprovedRoutes))
+
+	_, err = s.db.GetNodeByID(nodeID)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound, "the deleted row must stay deleted")
+
+	victim, ok = s.GetNodeByID(nodeID)
+	require.True(t, ok)
+	assert.Empty(t, victim.ApprovedRoutes().AsSlice(), "approval must leave the deleting node untouched")
+}
+
 func TestRouteApprovalWaitsForAnnouncement(t *testing.T) {
 	_, s, nodeID := persistTestSetup(t)
 	t.Cleanup(func() { _ = s.Close() })
@@ -29,7 +142,7 @@ func TestRouteApprovalWaitsForAnnouncement(t *testing.T) {
 	report := func(hostname string, routes ...netip.Prefix) {
 		t.Helper()
 
-		_, err := s.UpdateNodeFromMapRequest(nodeID, tailcfg.MapRequest{
+		err := s.UpdateNodeFromMapRequest(nodeID, tailcfg.MapRequest{
 			NodeKey:  nv.NodeKey(),
 			DiscoKey: nv.DiscoKey(),
 			Hostinfo: &tailcfg.Hostinfo{Hostname: hostname, RoutableIPs: routes},
@@ -54,7 +167,7 @@ func TestRouteApprovalWaitsForAnnouncement(t *testing.T) {
 	}`)
 	require.NoError(t, err)
 
-	_, err = s.ReloadPolicy()
+	err = s.ReloadPolicy()
 	require.NoError(t, err)
 	assert.Empty(t, approved(), "a reload approves nothing")
 
@@ -66,9 +179,6 @@ func TestRouteApprovalWaitsForAnnouncement(t *testing.T) {
 		"a new announcement runs approvers over every announced route")
 }
 
-// TestAutoApproveKeepsCurrentManualRoutes: registration approval runs on
-// the node the writer replaces, so an admin write that lands after the
-// caller read its view survives.
 func TestAutoApproveKeepsCurrentManualRoutes(t *testing.T) {
 	manual := netip.MustParsePrefix("10.0.0.0/24")
 	automatic := netip.MustParsePrefix("10.1.0.0/24")
@@ -92,18 +202,18 @@ func TestAutoApproveKeepsCurrentManualRoutes(t *testing.T) {
 			}`))
 			require.NoError(t, err)
 
-			_, ok := s.nodeStore.UpdateNode(nodeID, func(n *types.Node) {
+			_, ok := s.world.UpdateNode(nodeID, func(n *types.Node) {
 				n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{manual, automatic}}
 			})
 			require.True(t, ok)
 
-			stale, _, err := s.SetApprovedRoutes(nodeID, []netip.Prefix{manual})
+			stale, err := s.SetApprovedRoutes(nodeID, []netip.Prefix{manual})
 			require.NoError(t, err)
 
-			_, _, err = s.SetApprovedRoutes(nodeID, tt.replacement)
+			_, err = s.SetApprovedRoutes(nodeID, tt.replacement)
 			require.NoError(t, err)
 
-			_, err = s.AutoApproveRoutes(stale)
+			err = s.AutoApproveRoutes(stale)
 			require.NoError(t, err)
 
 			current, ok := s.GetNodeByID(nodeID)
@@ -117,9 +227,6 @@ func TestAutoApproveKeepsCurrentManualRoutes(t *testing.T) {
 	}
 }
 
-// TestRegistrationApprovesOnlyWithNewNodeKey: a registration runs route
-// auto-approval when it brings a new node key or a change to the announced
-// routes, not on a login that keeps both.
 func TestRegistrationApprovesOnlyWithNewNodeKey(t *testing.T) {
 	s := newRetagTestState(t)
 	user := s.CreateUserForTest("approve-user")
@@ -141,36 +248,32 @@ func TestRegistrationApprovesOnlyWithNewNodeKey(t *testing.T) {
 		Hostinfo: &tailcfg.Hostinfo{Hostname: "router", RoutableIPs: []netip.Prefix{route}},
 	}
 
-	node, _, err := s.HandleNodeFromPreAuthKey(req, machineKey)
+	node, err := s.HandleNodeFromPreAuthKey(req, machineKey)
 	require.NoError(t, err)
 	require.Equal(t, []netip.Prefix{route}, approvedRoutes(t, s, node.ID()), "a new node")
 
-	_, _, err = s.SetApprovedRoutes(node.ID(), nil)
+	_, err = s.SetApprovedRoutes(node.ID(), nil)
 	require.NoError(t, err)
 
-	_, _, err = s.HandleNodeFromPreAuthKey(req, machineKey)
+	_, err = s.HandleNodeFromPreAuthKey(req, machineKey)
 	require.NoError(t, err)
 	assert.Empty(t, approvedRoutes(t, s, node.ID()), "the same node key")
 
 	added := netip.MustParsePrefix("10.0.2.0/24")
 	req.Hostinfo = &tailcfg.Hostinfo{Hostname: "router", RoutableIPs: []netip.Prefix{route, added}}
-	_, _, err = s.HandleNodeFromPreAuthKey(req, machineKey)
+	_, err = s.HandleNodeFromPreAuthKey(req, machineKey)
 	require.NoError(t, err)
 	assert.Equal(t, []netip.Prefix{route, added}, approvedRoutes(t, s, node.ID()), "a new announced route")
 
-	_, _, err = s.SetApprovedRoutes(node.ID(), nil)
+	_, err = s.SetApprovedRoutes(node.ID(), nil)
 	require.NoError(t, err)
 
 	req.NodeKey = key.NewNode().Public()
-	_, _, err = s.HandleNodeFromPreAuthKey(req, machineKey)
+	_, err = s.HandleNodeFromPreAuthKey(req, machineKey)
 	require.NoError(t, err)
 	assert.Equal(t, []netip.Prefix{route, added}, approvedRoutes(t, s, node.ID()), "a new node key")
 }
 
-// TestRegistrationApprovalComparesReplacedNode: registration approval compares
-// with the node the writer replaced, so an announcement and an admin revoke
-// that land after the lookup leave an unchanged re-registration approving
-// nothing.
 func TestRegistrationApprovalComparesReplacedNode(t *testing.T) {
 	s := newRetagTestState(t)
 	user := s.CreateUserForTest("approve-user")
@@ -190,11 +293,11 @@ func TestRegistrationApprovalComparesReplacedNode(t *testing.T) {
 	route := netip.MustParsePrefix("10.0.1.0/24")
 	hi := &tailcfg.Hostinfo{Hostname: "h0", RoutableIPs: []netip.Prefix{route}}
 
-	_, err = s.UpdateNodeFromMapRequest(c.node.ID(), tailcfg.MapRequest{NodeKey: c.regReq.NodeKey, Hostinfo: hi})
+	err = s.UpdateNodeFromMapRequest(c.node.ID(), tailcfg.MapRequest{NodeKey: c.regReq.NodeKey, Hostinfo: hi})
 	require.NoError(t, err)
 	require.Equal(t, []netip.Prefix{route}, approvedRoutes(t, s, c.node.ID()), "the announcement approves")
 
-	_, _, err = s.SetApprovedRoutes(c.node.ID(), nil)
+	_, err = s.SetApprovedRoutes(c.node.ID(), nil)
 	require.NoError(t, err)
 
 	req := c.regReq
@@ -202,7 +305,7 @@ func TestRegistrationApprovalComparesReplacedNode(t *testing.T) {
 	node, replaced, err := s.reregisterNodeWithPAK(stale, stalePAK, nil, req, c.machineKey, hi.Hostname, req.Hostinfo)
 	require.NoError(t, err)
 
-	_, _, err = s.approveRoutesAfterRegistration(replaced, node, change.Change{})
+	err = s.approveRoutesAfterRegistration(replaced, node)
 	require.NoError(t, err)
 	assert.Empty(t, approvedRoutes(t, s, c.node.ID()), "the admin revoke stands")
 }
@@ -216,10 +319,6 @@ func approvedRoutes(t *testing.T, s *State, id types.NodeID) []netip.Prefix {
 	return nv.ApprovedRoutes().AsSlice()
 }
 
-// TestWithdrawnRouteKeepsOnlyAdminApprovals: a route only auto-approval
-// granted is dropped once the router stops announcing it and approved again
-// when it comes back; a route an admin approved stays, also when
-// autoApprovers cover it, and so does every approval made before the upgrade.
 func TestWithdrawnRouteKeepsOnlyAdminApprovals(t *testing.T) {
 	auto := netip.MustParsePrefix("10.0.1.0/24")
 	admin := netip.MustParsePrefix("10.0.2.0/24")
@@ -235,7 +334,7 @@ func TestWithdrawnRouteKeepsOnlyAdminApprovals(t *testing.T) {
 			setup: func(t *testing.T, s *State, id types.NodeID) {
 				t.Helper()
 
-				_, _, err := s.SetApprovedRoutes(id, []netip.Prefix{auto, admin})
+				_, err := s.SetApprovedRoutes(id, []netip.Prefix{auto, admin})
 				require.NoError(t, err)
 			},
 			want: []netip.Prefix{auto, admin},
@@ -250,7 +349,7 @@ func TestWithdrawnRouteKeepsOnlyAdminApprovals(t *testing.T) {
 				"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]
 			}`)
 			require.NoError(t, err)
-			_, err = s.ReloadPolicy()
+			err = s.ReloadPolicy()
 			require.NoError(t, err)
 
 			announce(t, s, id, auto, admin)
@@ -301,14 +400,13 @@ func TestWithdrawnRouteKeepsOnlyAdminApprovals(t *testing.T) {
 	})
 }
 
-// announce sends a map request in which node id announces routes.
 func announce(t *testing.T, s *State, id types.NodeID, routes ...netip.Prefix) {
 	t.Helper()
 
 	nv, ok := s.GetNodeByID(id)
 	require.True(t, ok)
 
-	_, err := s.UpdateNodeFromMapRequest(id, tailcfg.MapRequest{
+	err := s.UpdateNodeFromMapRequest(id, tailcfg.MapRequest{
 		NodeKey:  nv.NodeKey(),
 		DiscoKey: nv.DiscoKey(),
 		Hostinfo: &tailcfg.Hostinfo{Hostname: nv.Hostname(), RoutableIPs: routes},
@@ -316,8 +414,6 @@ func announce(t *testing.T, s *State, id types.NodeID, routes ...netip.Prefix) {
 	require.NoError(t, err)
 }
 
-// TestRegistrationDropsWithdrawnAutoApprovals: a registration that stops
-// announcing an auto-approved route drops its approval too.
 func TestRegistrationDropsWithdrawnAutoApprovals(t *testing.T) {
 	s := newRetagTestState(t)
 	user := s.CreateUserForTest("withdraw-user")
@@ -340,18 +436,16 @@ func TestRegistrationDropsWithdrawnAutoApprovals(t *testing.T) {
 		Hostinfo: &tailcfg.Hostinfo{Hostname: "router", RoutableIPs: []netip.Prefix{kept, withdrawn}},
 	}
 
-	node, _, err := s.HandleNodeFromPreAuthKey(req, machineKey)
+	node, err := s.HandleNodeFromPreAuthKey(req, machineKey)
 	require.NoError(t, err)
 	require.Equal(t, []netip.Prefix{kept, withdrawn}, approvedRoutes(t, s, node.ID()))
 
 	req.Hostinfo = &tailcfg.Hostinfo{Hostname: "router", RoutableIPs: []netip.Prefix{kept}}
-	_, _, err = s.HandleNodeFromPreAuthKey(req, machineKey)
+	_, err = s.HandleNodeFromPreAuthKey(req, machineKey)
 	require.NoError(t, err)
 	assert.Equal(t, []netip.Prefix{kept}, approvedRoutes(t, s, node.ID()))
 }
 
-// TestAdminTagChangeApprovesRoutes: an admin tag change runs route
-// auto-approval for the routes the new tags may approve.
 func TestAdminTagChangeApprovesRoutes(t *testing.T) {
 	_, s, id := persistTestSetup(t)
 	t.Cleanup(func() { _ = s.Close() })
@@ -368,7 +462,7 @@ func TestAdminTagChangeApprovesRoutes(t *testing.T) {
 	announce(t, s, id, route)
 	require.Empty(t, approvedRoutes(t, s, id), "the user may not approve it")
 
-	node, _, err := s.SetNodeTags(id, []string{"tag:router"})
+	node, err := s.SetNodeTags(id, []string{"tag:router"})
 	require.NoError(t, err)
 	assert.Equal(t, []netip.Prefix{route}, node.ApprovedRoutes().AsSlice())
 	assert.Equal(t, []netip.Prefix{route}, approvedRoutes(t, s, id))

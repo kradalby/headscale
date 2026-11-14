@@ -278,6 +278,7 @@ jobs:
           - TestNodeUpdateClientCommand
           - TestOAuthClientCommand
           - TestOAuthClientCommandValidation
+          - TestPolicyCheckCommand
           - TestSSHTestsRejectFailingPolicy
           - TestPolicyCommand
           - TestPolicyBrokenConfigCommand
@@ -308,11 +309,15 @@ jobs:
           - TestSetNodeExpiryInFuture
           - TestDisableNodeExpiry
           - TestNodeOnlineStatus
+          - TestNodeOfflineReachesViewers
           - TestPingAllByIPManyUpDown
           - TestNodeDeletionEndsLongPoll
           - Test2118DeletingOnlineNodePanics
           - TestGrantCapRelay
           - TestGrantCapDrive
+          - TestOnlineOracleIgnoresFailedStaleInitial
+          - TestClientOnlineMapUnavailable
+          - TestClientStatusAssertions
           - TestK8sOperator
           - TestEnablingRoutes
           - TestHASubnetRouterFailover

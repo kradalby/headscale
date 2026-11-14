@@ -305,7 +305,12 @@ func (v NodeView) SessionEpoch() uint64 { return v.ж.SessionEpoch }
 // overlapping reconnect keeps it. Primary election prefers the
 // oldest. Runtime-only.
 func (v NodeView) SessionStart() time.Time { return v.ж.SessionStart }
-func (v NodeView) String() string          { return v.ж.String() }
+
+// ReportGen orders the map reports applied to the node: each report
+// worth persisting takes a new, increasing value, published with it, so
+// a row write can say which reports it made durable. Memory only.
+func (v NodeView) ReportGen() uint64 { return v.ж.ReportGen }
+func (v NodeView) String() string    { return v.ж.String() }
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _NodeViewNeedsRegeneration = Node(struct {
@@ -339,6 +344,7 @@ var _NodeViewNeedsRegeneration = Node(struct {
 	ActiveSessions     int
 	SessionEpoch       uint64
 	SessionStart       time.Time
+	ReportGen          uint64
 }{})
 
 // View returns a read-only view of PreAuthKey.

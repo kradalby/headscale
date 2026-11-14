@@ -89,10 +89,8 @@ func runNodeExpiryCompat(t *testing.T, id, observer string) {
 			case <-t.Context().Done():
 				return
 			case <-tick.C:
-				next, changes, _ := r.srv.State().ExpireExpiredNodes(last)
+				next, _ := r.srv.State().ExpireExpiredNodes(last)
 				last = next
-
-				r.srv.App.Change(changes...)
 			}
 		}
 	}()

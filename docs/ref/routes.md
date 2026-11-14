@@ -352,7 +352,21 @@ This feature is enabled by default when at least two nodes advertise the same pr
 
 Of the routers that are online, healthy and not expired, the one connected to Headscale the longest serves a route. A
 router that reconnects becomes a standby, while a router that stays connected takes its routes back once it is approved,
-healthy or unexpired again. When none is available, the route stays with the router that served it last.
+healthy or unexpired again. When none is available, the route stays with the router that served it last while that router
+still approves it; otherwise a healthy approving router with the lowest node ID holds it until one becomes available.
+
+For a grant with `via`, subnet failover uses the same session ordering among routers carrying one of that grant's tags and
+advertising an approved route overlapping the grant's destination. When none is available, a `via` grant uses its lowest-ID
+approving router, independently of the previous winner. Grants with the same `via` tags share one election per
+route; grants with different tags elect separately before their route contributions are combined. An overlapping grant
+without `via` uses the ordinary tailnet-wide election instead.
+
+An election is identified by its `via` tags and route, not by the grant's position, so adding, removing or reordering other
+grants preserves its session ordering and previous assignment. A source can match through its Tailscale addresses or an
+advertised-and-approved source subnet. This route selection does not widen the grant's destination or port access.
+
+Exit-node grants use per-node steering, not subnet-primary elections. An approved exit node carrying a matching `via` tag
+remains an exit candidate independently of subnet failover; the client selects its exit node.
 
 ## Troubleshooting
 

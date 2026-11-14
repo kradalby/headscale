@@ -910,14 +910,6 @@ type Tuning struct {
 	// as one update; must be positive.
 	BatchChangeDelay time.Duration `example:"\"500ms\"" koanf:"batch_change_delay"`
 
-	// NodeMapSessionBufferedChanSize is how many map updates are queued
-	// per connected client.
-	NodeMapSessionBufferedChanSize int `example:"60" koanf:"node_mapsession_buffered_chan_size"`
-
-	// BatcherWorkers is the number of workers building map updates for
-	// connected clients. Zero picks the number from the CPU count.
-	BatcherWorkers int `defaulttext:"three quarters of the CPU cores, at least one" example:"8" koanf:"batcher_workers"`
-
 	// RegisterCacheExpiration is how long a pending registration waits
 	// to be completed. Zero uses the default.
 	RegisterCacheExpiration time.Duration `example:"\"30m\"" koanf:"register_cache_expiration"`
@@ -928,26 +920,17 @@ type Tuning struct {
 	// [Pending authentication limits](https://headscale.net/stable/ref/registration/#pending-authentication-limits).
 	RegisterCacheMaxEntries int `example:"4096" koanf:"register_cache_max_entries"`
 
-	// NodeStoreBatchSize is how many node changes are batched before the
-	// in-memory node state, peer relationships included, is rebuilt; must
-	// be positive. Higher values save CPU on bulk changes but delay each
-	// change until its batch is full or `tuning.node_store_batch_timeout`
-	// passes.
+	// NodeStoreBatchSize is the maximum number of writes a graph commit
+	// waits to collect during an HA route outage; must be positive.
+	// Outside an outage, commits do not wait for a batch. Writes arriving
+	// during a commit can share the next one, with affected graph inputs
+	// and derived values updated together.
 	NodeStoreBatchSize int `example:"200" koanf:"node_store_batch_size"`
 
-	// NodeStoreBatchTimeout is the longest a partial batch of node changes
-	// waits before the rebuild; must be positive. Lower values answer
-	// single changes faster at the cost of more rebuilds.
+	// NodeStoreBatchTimeout is the longest a graph commit waits to collect
+	// writes during an HA route outage; must be positive. Outside an
+	// outage, commits do not wait for this timeout.
 	NodeStoreBatchTimeout time.Duration `example:"\"1s\"" koanf:"node_store_batch_timeout"`
-}
-
-// BatcherWorkerCount is BatcherWorkers, or [DefaultBatcherWorkers] when unset.
-func (t Tuning) BatcherWorkerCount() int {
-	if t.BatcherWorkers > 0 {
-		return t.BatcherWorkers
-	}
-
-	return DefaultBatcherWorkers()
 }
 
 // DERPShuffleSeed seeds the DERP node order: dns.base_domain, or the

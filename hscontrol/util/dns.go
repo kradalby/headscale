@@ -24,7 +24,7 @@ const (
 )
 
 // DNS validation errors. Hostname-side validation lives on
-// `tailscale.com/util/dnsname` and [state.NodeStore] collision handling; only
+// `tailscale.com/util/dnsname` and the state's given-name collision handling; only
 // the username-side errors stay in this package.
 var (
 	ErrUsernameTooShort        = errors.New("username must be at least 2 characters long")
@@ -132,7 +132,7 @@ func GenerateIPv6DNSRootDomain(ipPrefix netip.Prefix) []dnsname.FQDN {
 	const nibbleLen = 4
 
 	maskBits, _ := netipx.PrefixIPNet(ipPrefix).Mask.Size()
-	expanded := ipPrefix.Addr().StringExpanded()
+	expanded := ipPrefix.Masked().Addr().StringExpanded()
 	nibbleStr := strings.ReplaceAll(expanded, ":", "")
 
 	// TODO?: that does not look the most efficient implementation,
@@ -158,11 +158,12 @@ func GenerateIPv6DNSRootDomain(ipPrefix netip.Prefix) []dnsname.FQDN {
 		dom, _ := makeDomain()
 		fqdns = append(fqdns, dom)
 	} else {
-		domCount := 1 << (maskBits % nibbleLen)
+		domCount := 1 << (nibbleLen - maskBits%nibbleLen)
+		minVal, _ := strconv.ParseInt(string(nibbleStr[maskBits/nibbleLen]), 16, 8)
 
 		fqdns = make([]dnsname.FQDN, 0, domCount)
 		for i := range domCount {
-			varNibble := fmt.Sprintf("%x", i)
+			varNibble := fmt.Sprintf("%x", minVal+int64(i))
 
 			dom, err := makeDomain(varNibble)
 			if err != nil {
