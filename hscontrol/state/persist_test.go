@@ -3590,6 +3590,7 @@ func TestCommittedRegistrationSurvivesUserRefreshFailure(t *testing.T) {
 		require.NoError(t, gdb.Callback().Query().Before("gorm:query").Register("test:fail-users", func(tx *gorm.DB) {
 			if saved.Load() && tx.Statement.Table == "users" {
 				failed.Add(1)
+
 				_ = tx.AddError(errInjectedUserList)
 			}
 		}))
