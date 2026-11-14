@@ -1106,6 +1106,113 @@ func BenchmarkPeerClassesDiversity(b *testing.B) {
 	}
 }
 
+// TestMatcherKeyEquivalence compares the identity relation with the prefix-based
+// key, including canonical rewrites and destinations split across ports/caps.
+func TestMatcherKeyEquivalence(t *testing.T) {
+	t.Parallel()
+
+	prefixKey := func(m *matcher.Match) string {
+		var b strings.Builder
+		fmt.Fprintf(&b, "%t,%t|", m.DestsIsTheInternet(), m.CapDestsIsTheInternet())
+
+		for _, p := range m.Srcs().Prefixes() {
+			b.WriteString(p.String())
+			b.WriteByte(',')
+		}
+
+		b.WriteByte('>')
+
+		for _, p := range m.Dests().Prefixes() {
+			b.WriteString(p.String())
+			b.WriteByte(',')
+		}
+
+		return b.String()
+	}
+
+	addresses := []string{
+		"invalid", "10.0.0.0/25", "10.0.0.128/25", "10.0.0.0/24",
+		"2001:db8::/65", "2001:db8:0:0:8000::/65", "2001:db8::/64", "::ffff:10.0.0.1",
+		"10.0.0.1-10.0.0.3", "10.0.0.1", "0.0.0.0/0", "::/0", "*",
+	}
+	oldToNew, newToOld := map[string]string{}, map[string]string{}
+
+	for i := range 512 {
+		rule := tailcfg.FilterRule{}
+		for j := range i % 5 {
+			rule.SrcIPs = append(rule.SrcIPs, addresses[(i+j*7)%len(addresses)])
+			rule.DstPorts = append(rule.DstPorts, tailcfg.NetPortRange{IP: addresses[(i*3+j)%len(addresses)]})
+		}
+
+		if i%3 == 0 {
+			rule.CapGrant = []tailcfg.CapGrant{{Dsts: []netip.Prefix{
+				netip.MustParsePrefix("8.8.8.0/24"), netip.MustParsePrefix("2001:db8::/64"),
+			}}}
+		}
+
+		for range 2 {
+			m := matcher.MatchFromFilterRule(rule)
+
+			old, key := prefixKey(&m), matcherKey(&m)
+			if previous, ok := oldToNew[old]; ok {
+				require.Equal(t, previous, key, "canonical equality lost: rule %d", i)
+			}
+
+			if previous, ok := newToOld[key]; ok {
+				require.Equal(t, previous, old, "key collision: rule %d", i)
+			}
+
+			oldToNew[old], newToOld[key] = key, old
+
+			rule.SrcIPs = append(rule.SrcIPs, rule.SrcIPs...)
+			slices.Reverse(rule.SrcIPs)
+			rule.DstPorts = append(rule.DstPorts, rule.DstPorts...)
+			slices.Reverse(rule.DstPorts)
+		}
+	}
+}
+
+func BenchmarkMatcherKey(b *testing.B) {
+	for _, shape := range []string{"prefixes", "ranges"} {
+		for _, n := range []int{0, 1, 10, 100, 1000} {
+			b.Run(fmt.Sprintf("%s/ranges=%d", shape, n), func(b *testing.B) {
+				rule := tailcfg.FilterRule{}
+
+				for i := range n {
+					var first, last netip.Addr
+					if i%2 == 0 {
+						first = netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 1})
+						last = netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 254})
+					} else {
+						first = netip.AddrFrom16([16]byte{0x20, 1, 0xd, 0xb8, byte(i >> 8), byte(i), 15: 1})
+						last = netip.AddrFrom16([16]byte{0x20, 1, 0xd, 0xb8, byte(i >> 8), byte(i), 15: 254})
+					}
+
+					address := first.String()
+					if shape == "ranges" {
+						address += "-" + last.String()
+					}
+
+					rule.SrcIPs = append(rule.SrcIPs, address)
+					rule.DstPorts = append(rule.DstPorts, tailcfg.NetPortRange{IP: address})
+				}
+
+				m := matcher.MatchFromFilterRule(rule)
+				require.Len(b, m.Srcs().Ranges(), n)
+				require.Len(b, m.Dests().Ranges(), n)
+				b.ReportAllocs()
+
+				var key string
+				for b.Loop() {
+					key = matcherKey(&m)
+				}
+
+				require.NotEmpty(b, key)
+			})
+		}
+	}
+}
+
 func BenchmarkCachedMatcherSidesChanges(b *testing.B) {
 	for _, shape := range []string{"pairs", "tag-pairs", "dense", "self", "allow-all"} {
 		for _, n := range []int{100, 500, 1000, 2000} {
@@ -1177,6 +1284,14 @@ func TestCachedMatcherSides(t *testing.T) {
 	ms := matcher.MatchesFromFilterRules(rules)
 	_, _, prev := cachedMatcherSides(ms, nodes.ViewSlice(), nil)
 
+	rewritten := slices.Clone(rules)
+	for i, rule := range rules {
+		rewritten[i].SrcIPs = append(slices.Clone(rule.SrcIPs), rule.SrcIPs...)
+		rewritten[i].DstPorts = append(slices.Clone(rule.DstPorts), rule.DstPorts...)
+		slices.Reverse(rewritten[i].SrcIPs)
+		slices.Reverse(rewritten[i].DstPorts)
+	}
+
 	frozen := &sideCache{keys: slices.Clone(prev.keys), nodes: make(map[types.NodeID]cachedSides)}
 	for id, old := range prev.nodes {
 		frozen.nodes[id] = cachedSides{node: old.node, src: slices.Clone(old.src), dst: slices.Clone(old.dst)}
@@ -1204,6 +1319,7 @@ func TestCachedMatcherSides(t *testing.T) {
 	}{
 		{"unchanged", ms, nodes, true},
 		{"equivalent matchers", matcher.MatchesFromFilterRules(rules), nodes, true},
+		{"rewritten rules", matcher.MatchesFromFilterRules(rewritten), nodes, true},
 		{"reordered", reordered, nodes, false},
 		{"inserted", slices.Insert(slices.Clone(ms), 1, added), nodes, false},
 		{"deleted", ms[2:], nodes, false},

@@ -1,6 +1,7 @@
 package matcher
 
 import (
+	"encoding/binary"
 	"net/netip"
 	"slices"
 	"strings"
@@ -132,6 +133,44 @@ func (m *Match) Srcs() *netipx.IPSet { return m.srcs }
 // Dests returns the destination addresses. It is shared and must not be
 // modified.
 func (m *Match) Dests() *netipx.IPSet { return m.dests }
+
+// Key returns a canonical, opaque identity for what m matches, including both
+// internet flags. It ignores ports, protocols and capability contents.
+func (m *Match) Key() string {
+	// Ranges are already canonical. Fixed-size records and a source count keep
+	// the two sides distinct without expanding ranges into prefixes.
+	var header [1 + 8]byte
+	if m.internet {
+		header[0] |= 1
+	}
+
+	if m.capInternet {
+		header[0] |= 2
+	}
+
+	binary.BigEndian.PutUint64(header[1:], uint64(len(m.srcRanges)))
+
+	var b strings.Builder
+	b.Grow(len(header) + (1+16+16)*(len(m.srcRanges)+len(m.destRanges)))
+	b.Write(header[:])
+
+	for _, ranges := range [][]netipx.IPRange{m.srcRanges, m.destRanges} {
+		for _, r := range ranges {
+			// As16 maps IPv4 into IPv6, so retain the original family too.
+			if r.From().Is4() {
+				b.WriteByte(4)
+			} else {
+				b.WriteByte(6)
+			}
+
+			from, to := r.From().As16(), r.To().As16()
+			b.Write(from[:])
+			b.Write(to[:])
+		}
+	}
+
+	return b.String()
+}
 
 func (m *Match) SrcsContainsIPs(ips ...netip.Addr) bool {
 	return slices.ContainsFunc(ips, m.srcs.Contains)
