@@ -6872,3 +6872,246 @@ func TestClassMapsBuildAllocationWork(t *testing.T) {
 	})
 	require.Less(t, allocs, float64(10*n), "bulk construction must not copy HAMT paths for every peer")
 }
+
+func TestStreamSelfCacheTracksInputs(t *testing.T) {
+	const rules = `"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}],"tagOwners":{"tag:test":["u1@"]}`
+
+	policy := func(attrs string) string { return `{` + rules + `,"nodeAttrs":` + attrs + `}` }
+	cfg, s, ids := streamTestState(t, policy(`[]`), func(cfg *types.Config) {
+		cfg.DNSConfig.Certificates.Enabled = true
+	})
+	self, backup := ids[0], ids[1]
+	route := netip.MustParsePrefix("10.0.0.0/24")
+
+	for _, id := range []types.NodeID{self, backup} {
+		n := mustNode(t, s, id).AsStruct()
+		n.Hostinfo = &tailcfg.Hostinfo{Hostname: n.Hostname, OS: "linux", RoutableIPs: []netip.Prefix{route}}
+		n.ApprovedRoutes = []netip.Prefix{route}
+		s.PutNodeInStoreForTest(*n)
+	}
+
+	gen := s.Connect(backup)
+	s.Connect(self)
+	st := NewStream(cfg, NewHub(), self, capVer)
+	initial, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	client := newModelClient(initial[0])
+
+	st.Delivered()
+
+	var (
+		snapshots []*state.Snapshot
+		retained  []*tailcfg.Node
+		encoded   [][]byte
+	)
+
+	check := func(reuse bool) {
+		t.Helper()
+
+		before := st.sent.self
+		snap := s.Snapshot()
+		out, err := st.Update(snap)
+		require.NoError(t, err)
+
+		if reuse {
+			assert.Same(t, before, st.sent.self)
+
+			for _, response := range out {
+				assert.Nil(t, response.Node, "unchanged self must send no update")
+			}
+		} else {
+			assert.NotSame(t, before, st.sent.self)
+		}
+
+		for _, response := range out {
+			client.apply(response)
+		}
+
+		st.Delivered()
+
+		fresh, err := NewStream(cfg, NewHub(), self, capVer).Initial(snap)
+		require.NoError(t, err)
+		require.Empty(t, client.sameAs(newModelClient(fresh[0])))
+		assert.Empty(t, st.sent.self.Hostinfo.OS(), "self Hostinfo stays sanitized")
+
+		for i, old := range retained {
+			got, err := json.Marshal(old)
+			require.NoError(t, err)
+			assert.Equal(t, encoded[i], got, "retained render %d was mutated", i)
+			oldMap, err := NewStream(cfg, NewHub(), self, capVer).Initial(snapshots[i])
+			require.NoError(t, err)
+			assert.Equal(t, old, oldMap[0].Node, "retained snapshot %d was mutated", i)
+		}
+
+		data, err := json.Marshal(st.sent.self)
+		require.NoError(t, err)
+
+		snapshots = append(snapshots, snap)
+		retained = append(retained, st.sent.self)
+		encoded = append(encoded, data)
+	}
+	setPolicy := func(attrs string) {
+		t.Helper()
+
+		_, err := s.SetPolicy([]byte(policy(attrs)))
+		require.NoError(t, err)
+	}
+
+	check(true)
+
+	before := s.Snapshot()
+	other := s.CreateRegisteredNodeForTest(mustNode(t, s, ids[2]).User().AsStruct(), "other")
+	s.PutNodeInStoreForTest(*other)
+	require.NotEqual(t, before.PolicyRev(), s.Snapshot().PolicyRev())
+	check(true)
+	require.NoError(t, s.DeleteNode(mustNode(t, s, other.ID)))
+	check(true)
+	setPolicy(`[{"target":["u2@"],"attr":["custom:other"]}]`)
+	check(true)
+	setPolicy(`[{"target":["*"],"attr":["custom:self"]}]`)
+	check(false)
+	assert.Contains(t, st.sent.self.CapMap, nodecap.Cap("custom:self"))
+
+	before = s.Snapshot()
+
+	setPolicy(`[{"target":["*"],"attr":["custom:self"]},{"target":["u2@"],"attr":["custom:other"]}]`)
+	require.NotEqual(t, before.PolicyRev(), s.Snapshot().PolicyRev())
+	check(true)
+	setPolicy(`[{"target":["*"],"attr":["nextdns:first"]}]`)
+	check(false)
+
+	caps := st.sent.self.CapMap
+
+	setPolicy(`[{"target":["*"],"attr":["nextdns:second"]}]`)
+	check(false)
+	assert.False(t, caps.Equal(st.sent.self.CapMap), "parameterized capability changes invalidate self")
+	setPolicy(`[{"target":["*"],"attr":["disable-ipv4"]}]`)
+	check(false)
+	assert.NotContains(t, st.sent.self.Addresses, mustNode(t, s, self).Prefixes()[0])
+	setPolicy(`[]`)
+	check(false)
+	assert.Contains(t, st.sent.self.Addresses, mustNode(t, s, self).Prefixes()[0])
+
+	n := mustNode(t, s, self).AsStruct()
+	n.Hostinfo.Services = []tailcfg.Service{{Proto: "tcp", Port: 8080}}
+	s.PutNodeInStoreForTest(*n)
+	check(false)
+
+	_, err = s.RenameNode(self, "renamed")
+	require.NoError(t, err)
+	check(false)
+
+	_, err = s.RenameUser(mustNode(t, s, self).TypedUserID(), "renamed-user")
+	require.NoError(t, err)
+	check(false)
+
+	_, err = s.SetNodeTags(self, []string{"tag:test"})
+	require.NoError(t, err)
+	check(false)
+	assert.Equal(t, taggedSelfUserID(self), st.sent.self.User)
+	setPolicy(`[{"target":["u2@"],"attr":["custom:other"]}]`)
+	check(true)
+	assert.Equal(t, taggedSelfUserID(self), st.sent.self.User)
+
+	require.NotContains(t, st.sent.self.PrimaryRoutes, route)
+	selfBefore := mustNode(t, s, self)
+	require.NoError(t, s.Disconnect(backup, gen))
+	require.Equal(t, selfBefore, mustNode(t, s, self), "HA move must not change the self view")
+	check(false)
+	assert.Contains(t, st.sent.self.PrimaryRoutes, route)
+	s.SetExtraRecords([]tailcfg.DNSRecord{{Name: strings.TrimSuffix(st.sent.self.Name, "."), Value: "100.64.0.99"}})
+	check(false)
+	assert.NotContains(t, st.sent.self.CapMap, nodecap.HTTPS)
+	s.SetExtraRecords(nil)
+	check(false)
+	assert.Contains(t, st.sent.self.CapMap, nodecap.HTTPS)
+}
+
+func TestStreamSelfCacheRetriesFailedRender(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	st := NewStream(cfg, NewHub(), ids[0], capVer)
+	_, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	before := st.sent.self
+	n := mustNode(t, s, ids[0]).AsStruct()
+	n.Expiry = new(time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC))
+	s.PutNodeInStoreForTest(*n)
+
+	for range 2 {
+		_, err := st.Update(s.Snapshot())
+		require.ErrorIs(t, err, types.ErrExpiryOutOfRange)
+		assert.Same(t, before, st.r.self)
+		assert.Same(t, before, st.sent.self)
+	}
+
+	n.GivenName = "recovered"
+	n.Expiry = nil
+	s.PutNodeInStoreForTest(*n)
+	out, err := st.Update(s.Snapshot())
+	require.NoError(t, err)
+	require.NotEmpty(t, out)
+	require.NotNil(t, out[0].Node)
+	assert.Equal(t, "recovered.headscale.test.", out[0].Node.Name)
+
+	fresh, err := NewStream(cfg, NewHub(), ids[0], capVer).Initial(s.Snapshot())
+	require.NoError(t, err)
+	assert.Equal(t, fresh[0].Node, out[0].Node)
+}
+
+// BenchmarkSelfCache measures sparse sessions after a policy recompile and one
+// session after its own Hostinfo write; fixture construction is outside the loop.
+func BenchmarkSelfCache(b *testing.B) {
+	for _, n := range []int{100, 1000, 5000} {
+		for _, kind := range []string{"policy", "own-hostinfo"} {
+			b.Run(fmt.Sprintf("nodes=%d/%s", n, kind), func(b *testing.B) {
+				s, streams := scalingTailnet(b, n, "users")
+				st := streams[0]
+				policy := strings.TrimSuffix(scalingPolicies["users"], "}") + `,"nodeAttrs":[{"target":["*"],"attr":["custom:self"]}]}`
+				_, err := s.SetPolicy([]byte(policy))
+				require.NoError(b, err)
+
+				for _, stream := range streams {
+					_, err := stream.Update(s.Snapshot())
+					require.NoError(b, err)
+					stream.Delivered()
+				}
+
+				i, renders := 0, 0
+
+				for b.Loop() {
+					if kind == "policy" {
+						p := strings.ReplaceAll(policy, ":*", fmt.Sprintf(":%d", 443+i%2))
+						_, err := s.SetPolicy([]byte(p))
+						require.NoError(b, err)
+					} else {
+						node := mustNode(b, s, st.nodeID).AsStruct()
+						node.Hostinfo = &tailcfg.Hostinfo{Hostname: fmt.Sprintf("self-%d", i)}
+						s.PutNodeInStoreForTest(*node)
+					}
+
+					updated := streams[:1]
+					if kind == "policy" {
+						updated = streams
+					}
+
+					for _, stream := range updated {
+						before := stream.sent.self
+						_, err := stream.Update(s.Snapshot())
+						require.NoError(b, err)
+						stream.Delivered()
+
+						if before != stream.sent.self {
+							renders++
+						}
+					}
+
+					i++
+				}
+
+				b.ReportMetric(float64(renders)/float64(i), "self-renders/op")
+			})
+		}
+	}
+}
