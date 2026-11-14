@@ -6341,6 +6341,175 @@ func TestIncrementalSelfRulesKeepOldSnapshot(t *testing.T) {
 	require.Equal(t, want, got)
 }
 
+func TestIncrementalSelfRulesReuse(t *testing.T) {
+	users := types.Users{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
+
+	nodes := types.Nodes{
+		node("alice", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
+		node("bob", "100.64.0.2", "fd7a:115c:a1e0::2", users[1]),
+	}
+	for i, n := range nodes {
+		n.ID = types.NodeID(i + 1) //nolint:gosec // bounded fixture
+	}
+
+	pol := []byte(`{"grants":[{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["tcp:443"]}]}`)
+	old, err := NewPolicyManager(pol, users, nodes.ViewSlice())
+	require.NoError(t, err)
+	old.BuildPeerClasses(nodes.ViewSlice(), nil)
+	bob := old.selfFor(0, 2)
+	want, err := json.Marshal(old.selfFor(0, 1).rules)
+	require.NoError(t, err)
+
+	joined := node("joined", "100.64.0.3", "fd7a:115c:a1e0::3", users[0])
+	joined.ID = 3
+	after := append(slices.Clone(nodes), joined)
+	next, err := NewPolicyManagerFrom(old, pol, users, after.ViewSlice())
+	require.NoError(t, err)
+	require.Equal(t, 1, next.selfRules.Size(), "only Alice's rules need rebuilding")
+	got, ok := next.selfRules.Load(selfRulesKey{grant: 0, user: 2})
+	require.True(t, ok)
+	require.Same(t, &bob.rules[0], &got.rules[0], "Bob's immutable rules are shared")
+	require.NoError(t, next.Audit(pol, users, after.ViewSlice()))
+
+	gotOld, err := json.Marshal(old.selfFor(0, 1).rules)
+	require.NoError(t, err)
+	require.Equal(t, want, gotOld, "a retained snapshot keeps its original destinations")
+
+	// Deleting the user's last device must also discard their cached rules.
+	remaining := types.Nodes{nodes[1]}.ViewSlice()
+	last, err := NewPolicyManagerFrom(next, pol, users, remaining)
+	require.NoError(t, err)
+	require.Equal(t, 1, last.selfRules.Size())
+	_, ok = last.selfRules.Load(selfRulesKey{grant: 0, user: 1})
+	require.False(t, ok)
+	require.NoError(t, last.Audit(pol, users, remaining))
+}
+
+func TestIncrementalSelfRulesInputs(t *testing.T) {
+	const (
+		mainGrant      = `{"src":["autogroup:member","alice@","group:both"],"dst":["autogroup:self","tag:service"],"ip":["tcp:443"],"app":{"example.com/cap":[{"read":true}]}}`
+		transientGrant = `{"src":["tag:transient"],"dst":["tag:service"],"ip":["tcp:22"]}`
+		viaGrant       = `{"src":["*"],"dst":["10.1.0.0/24"],"ip":["*"],"via":["tag:service"]}`
+	)
+
+	policy := func(grants string) []byte {
+		return []byte(`{"groups":{"group:both":["alice@","bob@"]},"tagOwners":{"tag:service":[],"tag:transient":[]},"grants":[` + grants + `],"ssh":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self"],"users":["root"]}]}`)
+	}
+
+	for _, change := range []string{
+		"unchanged", "join", "delete", "IPv4", "IPv6", "owner", "tagged", "unhydrated", "order",
+		"user deleted", "user recreated", "user ID replaced", "grant deleted", "grant reordered", "ports", "capabilities",
+		"source membership", "compiled slot added", "compiled slot removed",
+	} {
+		t.Run(change, func(t *testing.T) {
+			users := types.Users{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
+
+			nodes := types.Nodes{
+				node("alice1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
+				node("alice2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
+				node("bob1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
+				node("bob2", "100.64.0.4", "fd7a:115c:a1e0::4", users[1]),
+				node("service", "100.64.0.5", "fd7a:115c:a1e0::5", users[0]),
+			}
+			for i, n := range nodes {
+				n.ID = types.NodeID(i + 1) //nolint:gosec // bounded fixture
+			}
+
+			nodes[4].Tags = []string{"tag:service"}
+			nodes[4].ApprovedRoutes = []netip.Prefix{mp("0.0.0.0/0"), mp("::/0"), mp("10.1.0.0/24")}
+
+			nodes[4].Hostinfo = &tailcfg.Hostinfo{RoutableIPs: nodes[4].ApprovedRoutes}
+			if change == "compiled slot removed" {
+				nodes[4].Tags = append(nodes[4].Tags, "tag:transient")
+			}
+
+			pol := policy(transientGrant + "," + mainGrant + "," + viaGrant)
+			old, err := NewPolicyManager(pol, users, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			classes := old.BuildPeerClasses(nodes.ViewSlice(), nil)
+
+			filters := make([][]tailcfg.FilterRule, 0, len(nodes))
+			for _, n := range nodes {
+				filters = append(filters, old.unreducedRules(n.View()))
+				_, err = old.SSHPolicy(scanServerURL, n.View())
+				require.NoError(t, err)
+			}
+
+			want, err := json.Marshal(filters)
+			require.NoError(t, err)
+
+			users = slices.Clone(users)
+
+			after := make(types.Nodes, len(nodes))
+			for i, n := range nodes {
+				after[i] = n.Clone()
+			}
+
+			switch change {
+			case "join":
+				n := node("joined", "100.64.0.6", "fd7a:115c:a1e0::6", users[0])
+				n.ID = 6
+				after = append(after, n)
+			case "delete":
+				after = after[1:]
+			case "IPv4":
+				after[0].IPv4 = ap("100.64.0.99")
+			case "IPv6":
+				after[0].IPv6 = ap("fd7a:115c:a1e0::99")
+			case "owner":
+				after[0].User, after[0].UserID = new(users[1]), new(users[1].ID)
+			case "tagged":
+				after[0].Tags = []string{"tag:service"}
+			case "unhydrated":
+				after[0].User = nil
+			case "order":
+				after[0], after[1] = after[1], after[0]
+			case "user deleted":
+				users = users[1:]
+				after = after[2:]
+			case "user recreated", "user ID replaced":
+				users[0] = types.User{ID: 1, Name: "replacement"}
+				if change == "user ID replaced" {
+					users[0] = types.User{ID: 3, Name: "alice"}
+				}
+
+				for _, n := range after[:2] {
+					n.User, n.UserID = new(users[0]), new(users[0].ID)
+				}
+			case "grant deleted":
+				pol = policy(transientGrant + "," + viaGrant)
+			case "grant reordered":
+				pol = policy(mainGrant + "," + transientGrant + "," + viaGrant)
+			case "ports":
+				pol = bytes.ReplaceAll(pol, []byte("tcp:443"), []byte("udp:53"))
+			case "capabilities":
+				pol = bytes.ReplaceAll(pol, []byte(`"read":true`), []byte(`"write":true`))
+			case "source membership":
+				pol = bytes.ReplaceAll(pol, []byte(`"group:both":["alice@","bob@"]`), []byte(`"group:both":["bob@"]`))
+			case "compiled slot added":
+				after[4].Tags = append(after[4].Tags, "tag:transient")
+			case "compiled slot removed":
+				after[4].Tags = []string{"tag:service"}
+			}
+
+			next, err := NewPolicyManagerFrom(old, pol, users, after.ViewSlice())
+			require.NoError(t, err)
+			require.NoError(t, next.Audit(pol, users, after.ViewSlice()))
+			require.NoError(t, next.AuditPeers(next.BuildPeerClasses(after.ViewSlice(), classes), after.ViewSlice()))
+
+			filters = filters[:0]
+			for _, n := range nodes {
+				filters = append(filters, old.unreducedRules(n.View()))
+			}
+
+			got, err := json.Marshal(filters)
+			require.NoError(t, err)
+			require.Equal(t, want, got, "retained snapshots are immutable")
+		})
+	}
+}
+
 func TestViaPrepInternetReachabilityMatchesGrantSemantics(t *testing.T) {
 	users := types.Users{{ID: 1, Name: "viewer"}}
 	exits := []netip.Prefix{mp("0.0.0.0/0"), mp("::/0")}
