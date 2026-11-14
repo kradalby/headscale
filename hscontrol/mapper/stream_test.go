@@ -3087,6 +3087,140 @@ func TestPingDropsWhenQueueFull(t *testing.T) {
 	assert.True(t, hub.Ping(1, pr), "a drained queue refused a ping")
 }
 
+func TestFrameClassification(t *testing.T) {
+	at := time.Now()
+	for _, tc := range []struct {
+		name     string
+		classify func(*tailcfg.MapResponse) bool
+		response tailcfg.MapResponse
+		payload  string
+	}{
+		{"patch", patchOnly, tailcfg.MapResponse{ControlTime: &at, PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 1}}}, "PeersChangedPatch"},
+		{"derp", derpOnly, tailcfg.MapResponse{ControlTime: &at, DERPMap: &tailcfg.DERPMap{}}, "DERPMap"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.True(t, tc.classify(&tc.response))
+
+			missingTime := tc.response
+			missingTime.ControlTime = nil
+			require.False(t, tc.classify(&missingTime))
+
+			zeroTime := time.Time{}
+			withZeroTime := tc.response
+			withZeroTime.ControlTime = &zeroTime
+			require.True(t, tc.classify(&withZeroTime), "a present zero time is still a control time")
+
+			// Discover every field so dependency additions cannot silently bypass classification.
+			typ := reflect.TypeFor[tailcfg.MapResponse]()
+			for i := range typ.NumField() {
+				field := typ.Field(i)
+				if field.Name == tc.payload || field.Name == "ControlTime" {
+					continue
+				}
+
+				t.Run(field.Name, func(t *testing.T) {
+					response := tc.response
+
+					value := reflect.ValueOf(&response).Elem().Field(i)
+					switch value.Kind() { //nolint:exhaustive // Fail new field kinds until a nonzero test value is added.
+					case reflect.Slice:
+						value.Set(reflect.MakeSlice(value.Type(), 0, 0))
+						require.False(t, tc.classify(&response), "nonnil empty slice is an extra field")
+						value.Set(reflect.MakeSlice(value.Type(), 1, 1))
+					case reflect.Map:
+						value.Set(reflect.MakeMap(value.Type()))
+						require.False(t, tc.classify(&response), "nonnil empty map is an extra field")
+						value.SetMapIndex(reflect.Zero(value.Type().Key()), reflect.Zero(value.Type().Elem()))
+					case reflect.Pointer:
+						value.Set(reflect.New(value.Type().Elem()))
+					case reflect.String:
+						value.SetString("set")
+					case reflect.Bool:
+						value.SetBool(true)
+					case reflect.Int64:
+						value.SetInt(1)
+					default:
+						t.Fatalf("add a nonzero test value for %s (%s)", field.Name, field.Type)
+					}
+
+					before := response
+					require.False(t, tc.classify(&response), "extra field must prevent sharing")
+					require.Equal(t, before, response, "classification must not mutate the response")
+				})
+			}
+		})
+	}
+
+	for _, patches := range [][]*tailcfg.PeerChange{nil, {}, {{}, {}}} {
+		require.False(t, patchOnly(&tailcfg.MapResponse{ControlTime: &at, PeersChangedPatch: patches}))
+	}
+
+	require.True(t, patchOnly(&tailcfg.MapResponse{ControlTime: &at, PeersChangedPatch: []*tailcfg.PeerChange{nil}}))
+	require.False(t, derpOnly(&tailcfg.MapResponse{ControlTime: &at}))
+}
+
+func TestFrameClassificationAllocs(t *testing.T) {
+	at := time.Now()
+	patch := &tailcfg.MapResponse{ControlTime: &at, PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 1}}}
+	derp := &tailcfg.MapResponse{ControlTime: &at, DERPMap: &tailcfg.DERPMap{}}
+	allocs := testing.AllocsPerRun(100, func() {
+		if !patchOnly(patch) || !derpOnly(derp) {
+			t.Fatal("single patch and DERP frames must be shareable")
+		}
+	})
+	require.Zero(t, allocs, "classification must not allocate per viewer")
+}
+
+func TestFrameSharingKeepsCommitTimes(t *testing.T) {
+	at := time.Now()
+	for name, response := range map[string]tailcfg.MapResponse{
+		"patch": {ControlTime: &at, PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 1}}},
+		"derp":  {ControlTime: &at, DERPMap: &tailcfg.DERPMap{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var cache frameCache
+
+			first := response
+			require.Same(t, &first, cache.share(&first))
+
+			equalTime := at
+			same := response
+			same.ControlTime = &equalTime
+			require.Same(t, &first, cache.share(&same))
+
+			later := at.Add(time.Second)
+			newer := response
+			newer.ControlTime = &later
+			require.Same(t, &newer, cache.share(&newer))
+			require.Same(t, &same, cache.share(&same), "older commits cannot reuse a newer frame")
+			require.Len(t, cache.frames, 1)
+			require.Len(t, cache.byResp, 1)
+		})
+	}
+}
+
+func BenchmarkFrameClassification(b *testing.B) {
+	at := time.Now()
+	for name, response := range map[string]*tailcfg.MapResponse{
+		"patch":        {ControlTime: &at, PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 1}}},
+		"derp":         {ControlTime: &at, DERPMap: &tailcfg.DERPMap{}},
+		"mixed":        {ControlTime: &at, PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 1}}, DERPMap: &tailcfg.DERPMap{}},
+		"empty-filter": {ControlTime: &at, PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 1}}, PacketFilters: map[string][]tailcfg.FilterRule{}},
+		"no-time":      {PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 1}}},
+		"two-patches":  {ControlTime: &at, PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 1}, {NodeID: 2}}},
+	} {
+		for classifier, classify := range map[string]func(*tailcfg.MapResponse) bool{"patchOnly": patchOnly, "derpOnly": derpOnly} {
+			b.Run(classifier+"/"+name, func(b *testing.B) {
+				b.ReportAllocs()
+
+				for b.Loop() {
+					classify(response)
+				}
+			})
+		}
+	}
+}
+
 // TestDERPFramesShared changes the DERP map and checks every session is
 // sent the same response, so it is encoded once.
 func TestDERPFramesShared(t *testing.T) {
