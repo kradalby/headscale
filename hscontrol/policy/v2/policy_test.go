@@ -6985,3 +6985,153 @@ func viaRoutesForPeerReference(pm *PolicyManager, viewer, peer types.NodeView, p
 
 	return result
 }
+
+// legacySideIndex freezes address insertion and sorting before capacity sizing.
+func legacySideIndex(nodes views.Slice[types.NodeView]) *sideIndex {
+	idx := &sideIndex{}
+
+	for _, n := range nodes.All() {
+		if !n.Valid() {
+			continue
+		}
+
+		for _, ip := range n.IPs() {
+			idx.byIP = append(idx.byIP, ipNode{ip: ip, id: n.ID()})
+		}
+
+		if len(n.SubnetRoutes()) > 0 {
+			idx.routers = append(idx.routers, n)
+		}
+
+		if n.IsExitNode() {
+			idx.exits = append(idx.exits, n.ID())
+		}
+	}
+
+	slices.SortFunc(idx.byIP, func(a, b ipNode) int { return a.ip.Compare(b.ip) })
+
+	return idx
+}
+
+func sideIndexNodes(count int, family string, routerEvery int) views.Slice[types.NodeView] {
+	nodes := make([]types.NodeView, count)
+	for i := range nodes {
+		n := &types.Node{ID: types.NodeID(count - i)} //nolint:gosec // Test sizes are nonnegative and bounded by 10,000.
+		v4 := netip.AddrFrom4([4]byte{100, 64, byte(i >> 8), byte(i)})
+		v6 := netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 14: byte(i >> 8), 15: byte(i)})
+
+		switch family {
+		case "v4":
+			n.IPv4 = new(v4)
+		case "v6":
+			n.IPv6 = new(v6)
+		case "dual":
+			n.IPv4, n.IPv6 = new(v4), new(v6)
+		case "mixed":
+			switch i % 5 {
+			case 0:
+				continue // Invalid view.
+			case 1: // Valid node without addresses.
+			case 2:
+				n.IPv4 = new(v4)
+			case 3:
+				n.IPv6 = new(v6)
+			case 4:
+				n.IPv4, n.IPv6 = new(v4), new(v6)
+			}
+		case "invalid":
+			n.IPv4, n.IPv6 = new(netip.Addr{}), new(netip.Addr{})
+		case "duplicate":
+			n.IPv4, n.IPv6 = new(netip.MustParseAddr("100.64.0.1")), new(netip.MustParseAddr("100.64.0.1"))
+		}
+
+		if routerEvery > 0 && i%routerEvery == 0 {
+			n.ApprovedRoutes = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")}
+			n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: slices.Clone(n.ApprovedRoutes)}
+		}
+
+		nodes[i] = n.View()
+	}
+
+	return views.SliceOf(nodes)
+}
+
+func TestSideIndexMatchesLegacy(t *testing.T) {
+	t.Parallel()
+
+	var builder netipx.IPSetBuilder
+	for _, prefix := range []string{"100.64.0.0/24", "fd7a:115c:a1e0::/120", "192.0.2.0/24"} {
+		builder.AddPrefix(netip.MustParsePrefix(prefix))
+	}
+
+	set, err := builder.IPSet()
+	require.NoError(t, err)
+
+	for _, family := range []string{"v4", "v6", "dual", "mixed", "invalid", "duplicate"} {
+		for _, count := range []int{0, 1, 10, 1000, 10000} {
+			t.Run(fmt.Sprintf("%s/%d", family, count), func(t *testing.T) {
+				t.Parallel()
+
+				nodes := sideIndexNodes(count, family, 10)
+				before, err := json.Marshal(nodes)
+				require.NoError(t, err)
+
+				want, got := legacySideIndex(nodes), newSideIndex(nodes)
+				assert.Equal(t, want.byIP, got.byIP)
+				assert.Equal(t, want.routers, got.routers)
+				assert.Equal(t, want.exits, got.exits)
+				assert.Equal(t, want.inSet(nil), got.inSet(nil))
+				assert.Equal(t, want.inSet(set), got.inSet(set))
+
+				for _, prefix := range []string{"0.0.0.0/0", "::/0", "100.64.0.0/24", "192.0.2.0/24"} {
+					r := netipx.RangeOfPrefix(netip.MustParsePrefix(prefix))
+					assert.Equal(t, want.inRange(r), got.inRange(r))
+				}
+
+				after, err := json.Marshal(nodes)
+				require.NoError(t, err)
+				assert.Equal(t, before, after, "index construction must not mutate caller nodes")
+			})
+		}
+	}
+
+	assert.Nil(t, newSideIndex(views.Slice[types.NodeView]{}).byIP)
+}
+
+func BenchmarkSideIndexFamilies(b *testing.B) {
+	for _, family := range []string{"v4", "v6", "dual", "mixed", "invalid", "duplicate"} {
+		for _, count := range []int{0, 1, 10, 1000, 10000} {
+			for _, routerEvery := range []int{0, 10} {
+				b.Run(fmt.Sprintf("%s/n=%d/routerEvery=%d", family, count, routerEvery), func(b *testing.B) {
+					nodes := sideIndexNodes(count, family, routerEvery)
+
+					b.ReportAllocs()
+
+					for b.Loop() {
+						idx := newSideIndex(nodes)
+						runtime.KeepAlive(idx)
+					}
+
+					b.StopTimer()
+
+					idx := newSideIndex(nodes)
+					b.ReportMetric(float64(cap(idx.byIP)), "retained-slots")
+					b.ReportMetric(float64(len(idx.byIP)), "addresses")
+				})
+			}
+		}
+	}
+}
+
+func TestSideIndexCapacity(t *testing.T) {
+	t.Parallel()
+
+	for _, family := range []string{"v4", "v6", "dual", "mixed", "invalid", "duplicate"} {
+		t.Run(family, func(t *testing.T) {
+			t.Parallel()
+
+			idx := newSideIndex(sideIndexNodes(1000, family, 0))
+			assert.Equal(t, len(idx.byIP), cap(idx.byIP), "immutable address index must not retain growth slack")
+		})
+	}
+}

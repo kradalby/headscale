@@ -1620,7 +1620,26 @@ type ipNode struct {
 }
 
 func newSideIndex(nodes views.Slice[types.NodeView]) *sideIndex {
+	addresses := 0
+
+	for _, n := range nodes.All() {
+		if !n.Valid() {
+			continue
+		}
+
+		if n.IPv4().Valid() {
+			addresses++
+		}
+
+		if n.IPv6().Valid() {
+			addresses++
+		}
+	}
+
 	idx := &sideIndex{}
+	if addresses > 0 {
+		idx.byIP = make([]ipNode, 0, addresses)
+	}
 
 	for _, n := range nodes.All() {
 		if !n.Valid() {
