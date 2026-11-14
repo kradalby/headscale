@@ -1224,9 +1224,11 @@ func derpOnly(resp *tailcfg.MapResponse) bool {
 		return false
 	}
 
-	only := tailcfg.MapResponse{DERPMap: resp.DERPMap, ControlTime: resp.ControlTime}
+	rest := *resp
+	rest.DERPMap, rest.ControlTime = nil, nil
 
-	return reflect.DeepEqual(*resp, only)
+	// Check every remaining field, including future MapResponse additions.
+	return reflect.ValueOf(rest).IsZero()
 }
 
 // patchOnly reports whether resp holds a single patch and its time and
@@ -1236,9 +1238,10 @@ func patchOnly(resp *tailcfg.MapResponse) bool {
 		return false
 	}
 
-	only := tailcfg.MapResponse{PeersChangedPatch: resp.PeersChangedPatch, ControlTime: resp.ControlTime}
+	rest := *resp
+	rest.PeersChangedPatch, rest.ControlTime = nil, nil
 
-	return reflect.DeepEqual(*resp, only)
+	return reflect.ValueOf(rest).IsZero()
 }
 
 // Encode returns resp encoded by encode: once for a response sessions
