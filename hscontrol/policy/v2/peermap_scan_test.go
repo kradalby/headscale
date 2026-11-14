@@ -952,6 +952,129 @@ func nilIfEmpty[T any](s []T) []T {
 	return s
 }
 
+func TestBuildPeerClassesSharedMatchers(t *testing.T) {
+	nodes := types.Nodes{
+		ownRulesNode(1, &scanUsers[0], nil),
+		ownRulesNode(2, &scanUsers[0], nil),
+		ownRulesNode(3, &scanUsers[1], nil),
+		ownRulesNode(4, nil, []string{"tag:router"}, "10.1.0.0/24", "fd00:1::/64"),
+		ownRulesNode(5, nil, []string{"tag:exit"}, "0.0.0.0/0", "::/0"),
+		ownRulesNode(6, nil, []string{"tag:srv"}, "10.2.0.0/16"),
+	}
+	nodes[2].IPv4 = nil
+	nodes[3].IPv6 = nil
+
+	different := slices.Clone(nodes)
+	different[2] = nodes[2].Clone()
+	different[2].IPv6 = new(netip.MustParseAddr("fd7a:115c:a1e0::99"))
+	different = append(different, ownRulesNode(7, &scanUsers[1], nil))
+
+	const (
+		owners = `"tagOwners":{"tag:router":[],"tag:exit":[],"tag:srv":[]}`
+		shared = `{"src":["10.2.0.0/16"],"dst":["fd7a:115c:a1e0::3"],"ip":["tcp:443"]}`
+		self   = `{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["tcp:22"]}`
+		via    = `{"src":["u2@"],"dst":["10.1.0.0/24","fd00:1::/64"],"ip":["tcp:443"],"via":["tag:router"]}`
+		app    = `{"src":["u2@"],"dst":["tag:srv"],"app":{"example.com/cap/read":[{}]}}`
+	)
+
+	for name, policy := range map[string]string{
+		"nil":          "",
+		"default":      `{}`,
+		"empty ACLs":   `{"acls":[]}`,
+		"empty grants": `{"grants":[]}`,
+		"self only":    `{"grants":[` + self + `]}`,
+		"via only":     `{` + owners + `,"grants":[` + via + `]}`,
+		"app only":     `{` + owners + `,"grants":[` + app + `]}`,
+		"shared":       `{` + owners + `,"grants":[` + shared + `,` + app + `]}`,
+		"mixed": `{` + owners + `,"acls":[{"action":"accept","src":["u1@"],"dst":["autogroup:internet:*"]}],
+			"grants":[` + shared + `,` + self + `,` + via + `,` + app + `]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			original, err := NewPolicyManager([]byte(policy), scanUsers, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			previous := original.BuildPeerClasses(nodes.ViewSlice(), nil)
+			oldPeers := buildPeerMapPairScan(original, nodes.ViewSlice())
+			next, err := NewPolicyManagerFrom(original, []byte(policy), scanUsers, different.ViewSlice())
+			require.NoError(t, err)
+
+			for _, pm := range []*PolicyManager{original, next} {
+				for _, in := range []views.Slice[types.NodeView]{nodes.ViewSlice(), nodes[:4].ViewSlice(), different.ViewSlice(), {}} {
+					want := buildPeerMapPairScan(pm, in)
+					for _, prev := range []*PeerClasses{nil, previous} {
+						got := pm.BuildPeerClasses(in, prev)
+						for _, node := range in.All() {
+							require.Equal(t, nilIfEmpty(want[node.ID()]), nilIfEmpty(got.Peers(node.ID())), "node %d", node.ID())
+						}
+					}
+				}
+			}
+
+			for _, node := range nodes {
+				require.Equal(t, nilIfEmpty(oldPeers[node.ID]), nilIfEmpty(previous.Peers(node.ID)), "retained node %d", node.ID)
+			}
+		})
+	}
+}
+
+func BenchmarkPeerClassesSharedMatchers(b *testing.B) {
+	for _, ruleCount := range []int{0, 100, 500, 2000} {
+		for _, shape := range []string{"shared", "self", "via"} {
+			b.Run(fmt.Sprintf("rules=%d/%s", ruleCount, shape), func(b *testing.B) {
+				nodes, users, _ := diversePeerPolicy(20, "self")
+
+				grants := make([]map[string]any, 0, ruleCount+1)
+				for i := range ruleCount {
+					user := users[i%len(users)].Name + "@"
+					grants = append(grants, map[string]any{
+						"src": []string{user, fmt.Sprintf("10.255.%d.%d", i/256, i%256)},
+						"dst": []string{user}, "ip": []string{"tcp:443"},
+					})
+				}
+
+				switch shape {
+				case "self":
+					grants = append(grants, map[string]any{"src": []string{"autogroup:member"}, "dst": []string{"autogroup:self"}, "ip": []string{"tcp:22"}})
+				case "via":
+					nodes = append(nodes, ownRulesNode(21, nil, []string{"tag:router"}, "10.1.0.0/24"))
+					grants = append(grants, map[string]any{"src": []string{"autogroup:member"}, "dst": []string{"10.1.0.0/24"}, "ip": []string{"tcp:443"}, "via": []string{"tag:router"}})
+				}
+
+				policy, err := json.Marshal(map[string]any{"tagOwners": map[string][]string{"tag:router": {}}, "grants": grants})
+				require.NoError(b, err)
+
+				in := nodes.ViewSlice()
+				pm, err := NewPolicyManager(policy, users, in)
+				require.NoError(b, err)
+				require.Len(b, pm.matchers, ruleCount, "distinct source sets must keep every shared rule")
+				previous := pm.BuildPeerClasses(in, nil)
+
+				want := buildPeerMapPairScan(pm, in)
+				for _, node := range nodes {
+					require.Equal(b, nilIfEmpty(want[node.ID]), nilIfEmpty(previous.Peers(node.ID)))
+				}
+
+				for _, phase := range []string{"fresh", "reuse"} {
+					b.Run(phase, func(b *testing.B) {
+						var prev *PeerClasses
+						if phase == "reuse" {
+							prev = previous
+						}
+
+						b.ReportAllocs()
+
+						for b.Loop() {
+							pm.BuildPeerClasses(in, prev)
+						}
+
+						b.ReportMetric(float64(len(pm.matchers)), "shared-rules/op")
+					})
+				}
+			})
+		}
+	}
+}
+
 func TestAuditCatchesStaleMatchersAndVia(t *testing.T) {
 	u1, u2 := &scanUsers[0], &scanUsers[1]
 
