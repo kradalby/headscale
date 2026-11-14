@@ -760,7 +760,9 @@ func mergeKeyedRules(rules []tailcfg.FilterRule, keys []string) []tailcfg.Filter
 	}
 
 	keyToIdx := make(map[string]int)
-	owned := make(map[int]bool)
+	// A negative count keeps an unmerged destination slice shared.
+	var dstCounts []int
+
 	result := make([]tailcfg.FilterRule, 0, len(rules))
 
 	for i, rule := range rules {
@@ -771,22 +773,54 @@ func mergeKeyedRules(rules []tailcfg.FilterRule, keys []string) []tailcfg.Filter
 		}
 
 		if idx, ok := keyToIdx[keys[i]]; ok {
-			if !owned[idx] {
-				result[idx].DstPorts = slices.Clone(result[idx].DstPorts)
-				owned[idx] = true
+			if dstCounts == nil {
+				dstCounts = make([]int, len(rules))
+				for j := range result {
+					dstCounts[j] = -1
+				}
 			}
 
-			result[idx].DstPorts = append(result[idx].DstPorts, rule.DstPorts...)
+			if dstCounts[idx] < 0 {
+				dstCounts[idx] = len(result[idx].DstPorts)
+			}
+
+			dstCounts[idx] += len(rule.DstPorts)
 
 			continue
 		}
 
 		keyToIdx[keys[i]] = len(result)
+		if dstCounts != nil {
+			dstCounts[len(result)] = -1
+		}
+
 		result = append(result, tailcfg.FilterRule{
 			SrcIPs:   rule.SrcIPs,
 			DstPorts: slices.Clip(rule.DstPorts),
 			IPProto:  rule.IPProto,
 		})
+	}
+
+	if dstCounts == nil {
+		return result
+	}
+
+	for i, rule := range rules {
+		if len(rule.CapGrant) > 0 {
+			continue
+		}
+
+		idx := keyToIdx[keys[i]]
+		if dstCounts[idx] < 0 {
+			continue
+		}
+
+		if dstCounts[idx] > 0 {
+			result[idx].DstPorts = make([]tailcfg.NetPortRange, 0, dstCounts[idx])
+			dstCounts[idx] = 0
+		}
+
+		result[idx].DstPorts = append(result[idx].DstPorts, rule.DstPorts...)
 	}
 
 	return result
