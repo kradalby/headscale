@@ -362,12 +362,30 @@ func GroupBy[K cmp.Ordered, V any, G comparable](
 	groupsOf func(K, V) []G,
 	sameGroups func(was, is V) bool,
 ) Grouped[K, V, G] {
+	if prev.In == nil && prev.Groups == nil {
+		members := make(map[G][]K)
+
+		for k, v := range in.All() {
+			for _, g := range groupsOf(k, v) {
+				members[g] = append(members[g], k)
+			}
+		}
+
+		for g, keys := range members {
+			slices.Sort(keys)
+			members[g] = slices.Compact(keys)
+		}
+
+		return Grouped[K, V, G]{In: in, Groups: NewMap(slices.Equal[[]K], members)}
+	}
+
 	groups := prev.Groups
 	if groups == nil {
 		groups = NewMap[G, []K](slices.Equal[[]K], nil)
 	}
 
-	e := groups.Edit()
+	// Changed groups own their slices until the result is published.
+	changed := make(map[G][]K)
 
 	for _, k := range Changes(prev.In, in) {
 		old, hadOld := prev.In.Get(k)
@@ -412,22 +430,43 @@ func GroupBy[K cmp.Ordered, V any, G comparable](
 				continue
 			}
 
-			keys, _ := e.Get(g)
+			keys, owned := changed[g]
+			if !owned {
+				keys, _ = groups.Get(g)
+			}
+
 			if i, found := slices.BinarySearch(keys, k); found {
-				keys = slices.Delete(slices.Clone(keys), i, i+1)
-				if len(keys) == 0 {
-					e.Delete(g)
-				} else {
-					e.Set(g, keys)
+				if !owned {
+					keys = slices.Clone(keys)
 				}
+
+				changed[g] = slices.Delete(keys, i, i+1)
 			}
 		}
 
 		for _, g := range is {
-			keys, _ := e.Get(g)
-			if i, found := slices.BinarySearch(keys, k); !found {
-				e.Set(g, slices.Insert(slices.Clone(keys), i, k))
+			keys, owned := changed[g]
+			if !owned {
+				keys, _ = groups.Get(g)
 			}
+
+			if i, found := slices.BinarySearch(keys, k); !found {
+				if !owned {
+					keys = slices.Clone(keys)
+				}
+
+				changed[g] = slices.Insert(keys, i, k)
+			}
+		}
+	}
+
+	e := groups.Edit()
+
+	for g, keys := range changed {
+		if len(keys) == 0 {
+			e.Delete(g)
+		} else {
+			e.Set(g, keys)
 		}
 	}
 
