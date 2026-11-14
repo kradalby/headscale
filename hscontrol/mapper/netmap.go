@@ -851,8 +851,13 @@ func (cm *classMaps) get(
 	}
 
 	for _, id := range changed {
+		// The view is immutable, so an ID outside it was never in this map.
+		if !inView(view, id) {
+			continue
+		}
+
 		peer, ok := snap.GetNode(id)
-		if !ok || !inView(view, id) {
+		if !ok {
 			if e != nil {
 				e.Delete(id.NodeID())
 				owners.drop(id.NodeID())

@@ -3664,6 +3664,181 @@ func BenchmarkClassMapsBuild(b *testing.B) {
 	}
 }
 
+// BenchmarkClassMapsUpdate replays a fixed delta against cached class maps.
+// Peer renders are warm; snapshot writes and cursor resets are untimed.
+func BenchmarkClassMapsUpdate(b *testing.B) {
+	for _, shape := range []string{"small-classes", "dense"} {
+		for _, delta := range []string{"unchanged", "endpoint", "repeated-endpoint", "global-caps"} {
+			b.Run(shape+"/"+delta, func(b *testing.B) {
+				cfg, s := benchState(b, 1000, 100)
+				if shape == "small-classes" {
+					_, err := s.SetPolicy([]byte(`{"grants":[{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["*"]}]}`))
+					require.NoError(b, err)
+				}
+
+				before := s.Snapshot()
+
+				var (
+					cm      classMaps
+					renders peerRenders
+				)
+				for _, view := range before.PeerViews() {
+					cm.get(cfg, &renders, before, view, capVer, before.PeerPolicyRev(), before.Policy().NodeCapMaps())
+				}
+
+				previous := make(map[*classEntry]*classPeers, len(cm.m))
+				for _, entry := range cm.m {
+					previous[entry] = entry.cur
+				}
+
+				if delta != "unchanged" {
+					nodes := s.ListNodes()
+
+					limit := 1
+					if delta == "repeated-endpoint" {
+						limit = 128
+					}
+
+					if delta == "global-caps" {
+						limit = 100
+					}
+
+					for i := range limit {
+						index := i
+						if delta == "repeated-endpoint" {
+							index = 0
+						}
+
+						n := nodes.At(index).AsStruct()
+						n.Endpoints = []netip.AddrPort{netip.MustParseAddrPort(fmt.Sprintf("192.0.2.1:%d", i+1))}
+						s.PutNodeInStoreForTest(*n)
+					}
+
+					if delta == "global-caps" {
+						policy := `{"nodeAttrs":[{"target":["*"],"attr":["custom:probe"]}]}`
+						if shape == "small-classes" {
+							policy = `{"grants":[{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["*"]}],"nodeAttrs":[{"target":["*"],"attr":["custom:probe"]}]}`
+						}
+
+						_, err := s.SetPolicy([]byte(policy))
+						require.NoError(b, err)
+					}
+				}
+
+				after := s.Snapshot()
+				touched, ok := after.NodesTouchedSince(before.NodesVersion())
+				require.True(b, ok, "the delta stays within the node edit log")
+
+				if delta == "global-caps" {
+					require.Len(b, after.CapsChangedSince(before.CapsVersion()), 1000)
+					require.Len(b, touched, 100)
+				}
+
+				views := slices.DeleteFunc(slices.Clone(after.PeerViews()), func(v []types.NodeID) bool { return len(v) == 0 })
+				require.Len(b, views, len(previous), "the delta keeps the classes")
+
+				for _, view := range views {
+					require.NotNil(b, cm.m[classKey{view: &view[0], n: len(view)}], "the delta keeps view identity")
+					cm.get(cfg, &renders, after, view, capVer, after.PeerPolicyRev(), after.Policy().NodeCapMaps())
+				}
+
+				b.ReportAllocs()
+
+				for b.Loop() {
+					b.StopTimer()
+
+					for entry, cur := range previous {
+						entry.cur = cur
+					}
+
+					b.StartTimer()
+
+					for _, view := range views {
+						cm.get(cfg, &renders, after, view, capVer, after.PeerPolicyRev(), after.Policy().NodeCapMaps())
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestClassMapsChangedCandidates catches lost in-view updates or deletions
+// when global deltas also contain repeated IDs outside an immutable view.
+func TestClassMapsChangedCandidates(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	sparse := mustNode(t, s, ids[1]).AsStruct()
+	s.DeleteNodeFromStoreForTest(ids[1])
+
+	sparse.ID = types.NodeID(1 << 40)
+	ids[1] = sparse.ID
+	s.PutNodeInStoreForTest(*sparse)
+
+	view := slices.Clone(ids[:2])
+
+	var (
+		cm      classMaps
+		renders peerRenders
+	)
+
+	before := s.Snapshot()
+	old, oldProfiles := cm.get(cfg, &renders, before, view, capVer, before.PeerPolicyRev(), before.Policy().NodeCapMaps())
+
+	oldNodes := maps.Collect(old.All())
+	for id, node := range oldNodes {
+		oldNodes[id] = node.Clone()
+	}
+
+	oldOwners := maps.Collect(oldProfiles.All())
+
+	for range 2 {
+		for _, id := range ids {
+			n := mustNode(t, s, id).AsStruct()
+			n.Hostname += "-changed"
+			s.PutNodeInStoreForTest(*n)
+		}
+	}
+
+	_, err := s.SetPolicy([]byte(`{"nodeAttrs":[{"target":["*"],"attr":["custom:probe"]}]}`))
+	require.NoError(t, err)
+	n := mustNode(t, s, ids[1]).AsStruct()
+	owner := mustNode(t, s, ids[2]).User().AsStruct()
+	n.UserID, n.User = &owner.ID, owner
+	s.PutNodeInStoreForTest(*n)
+
+	check := func() {
+		t.Helper()
+
+		snap := s.Snapshot()
+		cm.pruned = snap.PeersRev() // Keep testing the supplied view after a deletion changes live classes.
+		got, profiles := cm.get(cfg, &renders, snap, view, capVer, snap.PeerPolicyRev(), snap.Policy().NodeCapMaps())
+
+		var fresh classMaps
+
+		want, wantProfiles := fresh.get(cfg, &renders, snap, view, capVer, snap.PeerPolicyRev(), snap.Policy().NodeCapMaps())
+		require.Equal(t, maps.Collect(want.All()), maps.Collect(got.All()))
+		require.Equal(t, maps.Collect(wantProfiles.All()), maps.Collect(profiles.All()))
+
+		_, outside := got.Get(ids[2].NodeID())
+		require.False(t, outside)
+		require.Equal(t, oldNodes, maps.Collect(old.All()), "old peer maps stay immutable")
+		require.Equal(t, oldOwners, maps.Collect(oldProfiles.All()), "old profiles stay immutable")
+	}
+	check()
+	s.DeleteNodeFromStoreForTest(ids[1])
+	check()
+
+	stale, staleProfiles := cm.get(cfg, &renders, before, view, capVer, before.PeerPolicyRev(), before.Policy().NodeCapMaps())
+	require.Equal(t, oldNodes, maps.Collect(stale.All()))
+	require.Equal(t, oldOwners, maps.Collect(staleProfiles.All()))
+	check()
+
+	for _, empty := range [][]types.NodeID{nil, {}} {
+		peers, profiles := cm.get(cfg, &renders, s.Snapshot(), empty, capVer, 0, nil)
+		require.Zero(t, peers.Len())
+		require.Zero(t, profiles.Len())
+	}
+}
+
 func BenchmarkClassOwnersSet(b *testing.B) {
 	owners := make([]types.UserView, 10)
 	for i := range owners {
