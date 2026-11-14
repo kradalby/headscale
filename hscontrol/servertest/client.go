@@ -59,6 +59,9 @@ type TestClient struct {
 	// c2nHandler answers c2n requests; see [WithC2NHandler].
 	c2nHandler http.Handler
 
+	// cleanupOnce releases the test cleanup's client capture after early teardown.
+	cleanupOnce func()
+
 	// Connection lifecycle.
 	pollCtx    context.Context //nolint:containedctx // test-only; context stored for cancel control
 	pollCancel context.CancelFunc
@@ -316,9 +319,8 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 
 	tc.direct = direct
 
-	tb.Cleanup(func() {
-		tc.cleanup()
-	})
+	tc.cleanupOnce = sync.OnceFunc(tc.cleanup)
+	tb.Cleanup(tc.cleanupOnce)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
