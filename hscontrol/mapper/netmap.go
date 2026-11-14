@@ -142,10 +142,12 @@ type renderer struct {
 	dns    *tailcfg.DNSConfig
 	dnsKey dnsKey
 
-	// self is reused while the node, the policy and the primary routes,
+	// self is reused while the node, its policy caps and the primary routes,
 	// which its own routes come from, are unchanged.
 	self    *tailcfg.Node
 	selfKey selfKey
+	// selfCaps is the policy's immutable map, never the rendered CapMap.
+	selfCaps tailcfg.NodeCapMap
 
 	// rendered counts peer renders, for tests that bound per-write work.
 	rendered int
@@ -165,8 +167,8 @@ type dnsKey struct {
 // selfKey holds what the node's own entry renders from. dns is there for
 // the HTTPS capability: an extra record at the node's name takes it away.
 type selfKey struct {
-	self                   types.NodeView
-	policy, primaries, dns uint64
+	self           types.NodeView
+	primaries, dns uint64
 }
 
 func newRenderer(cfg *types.Config, hub *Hub, nodeID types.NodeID, capVer tailcfg.CapabilityVersion) *renderer {
@@ -372,11 +374,12 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 	capMaps := pm.NodeCapMaps()
 
 	dns := snap.DNS()
+	selfCaps := capMaps[self.ID()]
 
-	if k := (selfKey{self: self, policy: snap.PolicyRev(), primaries: snap.PrimariesRev(), dns: snap.DNSRev()}); r.self == nil || k != r.selfKey {
+	if k := (selfKey{self: self, primaries: snap.PrimariesRev(), dns: snap.DNSRev()}); r.self == nil || k != r.selfKey || !r.selfCaps.Equal(selfCaps) {
 		tn, err := self.TailNode(r.capVer, func(types.NodeID) []netip.Prefix {
 			return self.AllApprovedRoutes()
-		}, r.cfg, dns, capMaps[self.ID()])
+		}, r.cfg, dns, selfCaps)
 		if err != nil {
 			return nil, err
 		}
@@ -392,7 +395,7 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 		tn.Cap, tn.Online, tn.LastSeen = 0, nil, nil
 		tn.Hostinfo = types.SelfHostinfo(tn.Hostinfo)
 
-		r.self, r.selfKey = tn, k
+		r.self, r.selfKey, r.selfCaps = tn, k, selfCaps
 	}
 
 	tn := r.self
