@@ -222,7 +222,7 @@ See [the routes reference](docs/ref/routes.md) for the failover rules.
 - `tls_cert_path`, `tls_key_path`, `tls_letsencrypt_*`, `acme_url` and `acme_email` are deprecated in favour of `tls.cert_path`, `tls.key_path` and `tls.acme.*` [#3554](https://github.com/juanfont/headscale/pull/3554)
   - The old keys continue to work, with a warning, but will be removed in a future release
 - Headscale's own ACME certificate is managed by CertMagic instead of autocert; the first start registers a new ACME account and obtains a new certificate in `tls.acme.cache_dir`, which now defaults to `/var/lib/headscale/cache` [#3554](https://github.com/juanfont/headscale/pull/3554)
-- `tuning.batcher_workers`, `tuning.notifier_send_timeout` and `tuning.node_mapsession_buffered_chan_size` have no effect and log a deprecation warning when set [#37](https://github.com/kradalby/headscale/pull/37)
+- `tuning.batcher_workers` and `tuning.node_mapsession_buffered_chan_size` are removed, alongside the already removed `tuning.notifier_send_timeout`: graph map streams do not use them. Remove these keys from configuration files, where they now stop loading. Their `HEADSCALE_*` environment variables are ignored with a removal warning, following the existing environment-variable contract. Generated configuration and NixOS options no longer expose the two settings [#37](https://github.com/kradalby/headscale/pull/37)
 
 #### Observability
 

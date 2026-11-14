@@ -219,18 +219,13 @@ func loadLeaves(t *testing.T, leaves map[string]any) *types.Config {
 	return loadFile(t, writeFile(t, t.TempDir(), "config.json", string(b)))
 }
 
-// loadFile reads a full generated config. Only its two inert tuning keys warn.
+// loadFile is path as config.Load reads it, which must be without warnings.
 func loadFile(t *testing.T, path string) *types.Config {
 	t.Helper()
 
 	l, err := config.Load(path, true, nil)
 	require.NoError(t, err)
-	require.Len(t, l.Warnings, 2)
-	for i, key := range []string{"tuning.batcher_workers", "tuning.node_mapsession_buffered_chan_size"} {
-		require.Contains(t, l.Warnings[i], key)
-		require.Contains(t, l.Warnings[i], path)
-		require.Contains(t, l.Warnings[i], "has no effect with graph map streams")
-	}
+	require.Empty(t, l.Warnings)
 
 	return l.Config
 }

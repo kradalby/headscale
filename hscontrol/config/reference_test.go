@@ -192,7 +192,7 @@ func TestReferenceKeys(t *testing.T) {
 			"| `postgres` | PostgreSQL, at [`database.postgres.host`](#database.postgres.host). ",
 		}},
 		{path: "dns.base_domain", want: []string{"- **Default:** `tailnet.internal`\n"}, hide: []string{"required"}},
-		{path: "tuning.batcher_workers", want: []string{"- **Default:** `0` (three quarters of the CPU cores, at least one)\n"}},
+		{path: "tuning.node_store_batch_size", want: []string{"- **Default:** `100`\n"}},
 		{path: "unix_socket_permission", want: []string{"- **Type:** [file mode](#type-file-mode)\n", "- **Default:** `\"0770\"`\n"}},
 		{path: "dns.nameservers.split", want: []string{
 			"- **Type:** [map of `<domain>` → list of strings](#type-map)\n",
@@ -252,6 +252,15 @@ func TestReferenceKeys(t *testing.T) {
 		require.NoError(t, r.facts(k))
 		require.Contains(t, r.String(), "- **Default:** `tailnet.internal`; required when [`dns.magic_dns`](#dns.magic_dns) is true\n")
 	})
+}
+
+func TestReferenceDefaultText(t *testing.T) {
+	k := schemaByPath(t)["tuning.node_store_batch_size"]
+	k.DefaultText = "chosen at start"
+
+	var page reference
+	require.NoError(t, page.facts(k))
+	assert.Contains(t, page.String(), "- **Default:** `100` (chosen at start)\n")
 }
 
 // TestOpenMapDocs: the page prints an open map's key case only through its

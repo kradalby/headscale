@@ -148,7 +148,7 @@ func TestGenerateExample(t *testing.T) {
 			assert.Contains(t, commentAbove(text, `  level: info`), "One of: `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `panic`, `disabled`.")
 			require.Contains(t, text, "\n  base_domain: tailnet.internal\n")
 			assert.NotContains(t, commentAbove(text, `  base_domain: tailnet.internal`), "Required when")
-			assert.Contains(t, commentAbove(text, `  batcher_workers: 0`), "Default: three quarters of the CPU cores, at least one.")
+			assert.Contains(t, text, "\n  node_store_batch_size: 100\n")
 			assert.Equal(t, len(wantTop), strings.Count(text, "\n\n"), "one blank line before each top-level key")
 		})
 	}
@@ -348,8 +348,8 @@ func TestGenerateExampleSubtree(t *testing.T) {
 }
 
 // TestGenerateExampleMinimal: the minimal example holds only the keys every
-// server must set, under their sections; it and the full example validate
-// with server_url set. The full example warns only for its inert tuning keys.
+// server must set, under their sections; it and the full example, with
+// server_url set, load without warnings and validate.
 func TestGenerateExampleMinimal(t *testing.T) {
 	d := Default()
 
@@ -400,16 +400,7 @@ func TestGenerateExampleMinimal(t *testing.T) {
 
 			l, err := Load(path, true, nil)
 			require.NoError(t, err, set)
-			if tt.name == "full docs" {
-				require.Len(t, l.Warnings, 2)
-				for i, key := range []string{"tuning.batcher_workers", "tuning.node_mapsession_buffered_chan_size"} {
-					assert.Contains(t, l.Warnings[i], key)
-					assert.Contains(t, l.Warnings[i], path)
-					assert.Contains(t, l.Warnings[i], "has no effect with graph map streams")
-				}
-			} else {
-				assert.Empty(t, l.Warnings)
-			}
+			assert.Empty(t, l.Warnings)
 			assert.NoError(t, Validate(l.Config))
 		})
 	}

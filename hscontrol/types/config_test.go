@@ -506,8 +506,6 @@ func TestDerivedValues(t *testing.T) {
 		{"sqlite", DatabaseConfig{Type: "sqlite"}.IsSQLite(), true},
 		{"sqlite3", DatabaseConfig{Type: "sqlite3"}.IsSQLite(), true},
 		{"postgres", DatabaseConfig{Type: "postgres"}.IsSQLite(), false},
-		{"workers unset", Tuning{}.BatcherWorkerCount(), DefaultBatcherWorkers()},
-		{"workers set", Tuning{BatcherWorkers: 7}.BatcherWorkerCount(), 7},
 		{"zone unset", DNSConfig{BaseDomain: "ts.example.com"}.CertificateZone(), "ts.example.com"},
 		{"zone set", DNSConfig{BaseDomain: "ts.example.com", Certificates: CertificatesConfig{Zone: "example.com"}}.CertificateZone(), "example.com"},
 		{"resolvers unset", resolvers().ResolverAddrs(), []string{"9.9.9.9:53", "149.112.112.112:53"}},

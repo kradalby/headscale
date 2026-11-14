@@ -79,12 +79,11 @@ func Default() types.Config {
 		Taildrop: types.TaildropConfig{Enabled: true},
 		CLI:      types.CLIConfig{Timeout: 5 * time.Second},
 		Tuning: types.Tuning{
-			BatchChangeDelay:               800 * time.Millisecond,
-			NodeMapSessionBufferedChanSize: 30,
-			NodeStoreBatchSize:             100,
-			NodeStoreBatchTimeout:          500 * time.Millisecond,
-			RegisterCacheExpiration:        15 * time.Minute,
-			RegisterCacheMaxEntries:        1024,
+			BatchChangeDelay:        800 * time.Millisecond,
+			NodeStoreBatchSize:      100,
+			NodeStoreBatchTimeout:   500 * time.Millisecond,
+			RegisterCacheExpiration: 15 * time.Minute,
+			RegisterCacheMaxEntries: 1024,
 		},
 	}
 }

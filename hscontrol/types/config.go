@@ -910,14 +910,6 @@ type Tuning struct {
 	// as one update; must be positive.
 	BatchChangeDelay time.Duration `example:"\"500ms\"" koanf:"batch_change_delay"`
 
-	// NodeMapSessionBufferedChanSize is accepted for compatibility but has
-	// no effect. Graph map streams do not use this queue size.
-	NodeMapSessionBufferedChanSize int `example:"60" koanf:"node_mapsession_buffered_chan_size"`
-
-	// BatcherWorkers is accepted for compatibility but has no effect.
-	// Each graph map stream renders its own updates.
-	BatcherWorkers int `defaulttext:"three quarters of the CPU cores, at least one" example:"8" koanf:"batcher_workers"`
-
 	// RegisterCacheExpiration is how long a pending registration waits
 	// to be completed. Zero uses the default.
 	RegisterCacheExpiration time.Duration `example:"\"30m\"" koanf:"register_cache_expiration"`
@@ -939,15 +931,6 @@ type Tuning struct {
 	// writes during an HA route outage; must be positive. Outside an
 	// outage, commits do not wait for this timeout.
 	NodeStoreBatchTimeout time.Duration `example:"\"1s\"" koanf:"node_store_batch_timeout"`
-}
-
-// BatcherWorkerCount is BatcherWorkers, or [DefaultBatcherWorkers] when unset.
-func (t Tuning) BatcherWorkerCount() int {
-	if t.BatcherWorkers > 0 {
-		return t.BatcherWorkers
-	}
-
-	return DefaultBatcherWorkers()
 }
 
 // DERPShuffleSeed seeds the DERP node order: dns.base_domain, or the

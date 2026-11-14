@@ -233,8 +233,6 @@
     },
     "Tuning": {
       "BatchChangeDelay": 500000000,
-      "NodeMapSessionBufferedChanSize": 50,
-      "BatcherWorkers": 4096,
       "RegisterCacheExpiration": 1200000000000,
       "RegisterCacheMaxEntries": 2000,
       "NodeStoreBatchSize": 50,
@@ -246,8 +244,6 @@
     "oidc.client_secret": "marker-oidc-secret-from-file"
   },
   "warnings": [
-    "tuning.batcher_workers ($DIR/config.yaml:138:3) has no effect with graph map streams; remove it from the configuration",
-    "tuning.node_mapsession_buffered_chan_size ($DIR/config.yaml:137:3) has no effect with graph map streams; remove it from the configuration",
     "Warning: when using tls.acme.hostname with TLS-ALPN-01 as challenge type, headscale must be reachable on port 443, i.e. listen_addr should probably end in :443"
   ]
 }

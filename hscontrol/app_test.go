@@ -283,8 +283,8 @@ func TestNewHeadscaleSecrets(t *testing.T) {
 }
 
 // validConfig is config.Default with a local server URL, its files under a
-// fresh temp dir, the policy in the database, DNS off, and the batcher
-// quick and single-threaded for tests.
+// fresh temp dir, the policy in the database, DNS off, and a short map-update
+// coalescing delay for tests.
 func validConfig(t *testing.T) types.Config {
 	t.Helper()
 
@@ -304,7 +304,6 @@ func validConfig(t *testing.T) types.Config {
 	cfg.DNSConfig.OverrideLocalDNS = false
 	cfg.DNSConfig.BaseDomain = ""
 	cfg.Tuning.BatchChangeDelay = 100 * time.Millisecond
-	cfg.Tuning.BatcherWorkers = 1
 
 	return cfg
 }

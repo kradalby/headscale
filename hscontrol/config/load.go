@@ -475,13 +475,6 @@ func newConfigSource(path string, isFile bool, environ []string) (*configSource,
 	// with the file's error.
 	envErr := s.loadEnv(environ)
 
-	for _, key := range []string{"tuning.batcher_workers", "tuning.node_mapsession_buffered_chan_size"} {
-		_, _, inFile := dottedPosition(s.keys, "", strings.Split(key, "."))
-		if inFile || s.envVars[key] != "" {
-			s.warnings = append(s.warnings, key+s.origin(key)+" has no effect with graph map streams; remove it from the configuration")
-		}
-	}
-
 	return s, cmp.Or(fileErr, envErr)
 }
 

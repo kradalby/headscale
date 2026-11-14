@@ -2605,7 +2605,6 @@ func TestGitHubIssue3129_BlockedWriteSessionLifecycle(t *testing.T) {
 			require.NoError(t, app.state.UpdatePolicyManagerUsersForTest())
 
 			app.cfg.Tuning.BatchChangeDelay = 20 * time.Millisecond
-			app.cfg.Tuning.NodeMapSessionBufferedChanSize = 1
 
 			app.mapHub.Close()
 			require.NoError(t, app.state.Close())
@@ -2668,7 +2667,7 @@ func TestGitHubIssue3129_BlockedWriteSessionLifecycle(t *testing.T) {
 			}()
 
 			// Distinct pings cannot collapse into a state refresh on retry. Both must
-			// reach a recovering client, including the one that encountered a full channel.
+			// reach a recovering client after the blocked write completes.
 			const (
 				firstPing  = "https://example.com/queued-first"
 				secondPing = "https://example.com/queued-second"
