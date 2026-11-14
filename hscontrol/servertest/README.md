@@ -9,13 +9,13 @@ The ordinary test suite runs all five policies with 12 nodes. Larger runs
 require `HEADSCALE_STRESS_NODES`; setting it replaces the small node count.
 Nothing large is enabled by `go test ./...` or by omitting `-short`.
 
-| Case               | Expected visibility                                          | Main pressure                                      |
-| ------------------ | ------------------------------------------------------------ | -------------------------------------------------- |
-| `allow_all`        | Everyone sees everyone                                       | Dense graph, map size, broadcast fan-out           |
-| `isolated`         | No peers                                                     | Registration and state updates without peer output |
-| `personal_devices` | Up to ten devices belonging to the same user                 | Per-node policy compilation and isolation          |
-| `shared_service`   | One tagged service sees everyone; everyone else sees only it | Uneven fan-out and tag identity                    |
-| `personal_ssh`     | Personal devices, with SSH to the same user's devices        | Per-node SSH policy generation                     |
+| Case               | Expected visibility                                                   | Main pressure                                           |
+| ------------------ | --------------------------------------------------------------------- | ------------------------------------------------------- |
+| `allow_all`        | Everyone sees everyone                                                | Dense graph, map size, broadcast fan-out                |
+| `isolated`         | Same-user devices remain peers; all traffic is denied                 | Registration and state updates with bounded peer output |
+| `personal_devices` | Up to ten devices belonging to the same user                          | Per-node policy compilation and isolation               |
+| `shared_service`   | One tagged service sees everyone; others see it and same-user devices | Uneven fan-out and tag identity                         |
+| `personal_ssh`     | Personal devices, with SSH to the same user's devices                 | Per-node SSH policy generation                          |
 
 Each case enrolls its clients, sends three Hostinfo bursts, revokes access,
 restores access, and reconnects one client per user. Bursts change one node
@@ -70,6 +70,78 @@ Choose large dense runs deliberately: 10,000 all-to-all clients hold
 other state. A sparse output graph still requires policy/peer calculations;
 it does not guarantee linear CPU use. `GOMEMLIMIT` is a soft Go heap target,
 not an RSS cap. Go's resource settings constrain server and clients together.
+
+## Sustained registration and deletion churn
+
+`TestScaleChurn` shares the five policies above and adds `growing_diversity`:
+one explicit user-to-same-user TCP 443 grant per ten-device user, so both
+identity count and rule count grow as ceil(nodes/10). Its peer sets match
+`personal_devices`, allowing comparisons between equal output sizes with
+different policy work. This is growing user/rule diversity, not distinct tags
+or via-router churn.
+
+Every case performs ten rounds. Round r deletes slots r, r+10, and so on
+through `State.DeleteNode` while their real control sessions are open, waits
+for removal delivery, then enrolls fresh clients with new machine/node keys
+and durable node IDs in those slots. The cohort is about 10% of the live
+nodes; all original clients are replaced once, while population stays
+bounded. Authentication and deletion batches have at most 32 workers.
+Policy revocation runs concurrently with replacement in round 4; restoration
+runs concurrently in round 5. Then separate storms restart every client on a fresh Direct/Noise transport
+and log every client out and back in with its reusable auth key. Authenticated
+restarts preserve node IDs and keys; logout/relogin preserves the machine's registered
+ID but rotates its node key, which must also reach every affected peer.
+These storms do not count as
+join/leave churn. Unlike the mapper's store-only `rejoin` benchmark, cohort
+replacement includes real authentication, SQLite registration and deletion.
+
+Each removal/replacement phase checks every surviving client's exact peer
+IDs and keys, including absence of retired IDs and cross-user isolation,
+IPv4/IPv6 filter probes and SSH principals. Policy generation attributes
+check delivery after policy changes and storms. Live client polls, hub
+sessions and durable SQLite IDs/keys must agree after every phase. Removal
+and replacement report operation counts, mutation wall time and subsequent
+delivery convergence separately; those timings include harness work and
+are not per-operation latency percentiles.
+
+The final phase forces GC and checks weak references to retired clients and
+old compiled policies while the server and current clients remain live.
+Old policies own old node sets; a weak reference to a temporary `Snapshot`
+wrapper alone would not prove their release. Client cleanup callbacks release
+their capture after early teardown, and `WithoutNetmapHistory` disables
+historical client maps. Collection checks cover those objects and session
+counts, not all server caches or a server-only heap plateau.
+
+```sh
+# Ordinary CI runs this small six-policy smoke test too.
+go test ./hscontrol/servertest -run '^TestScaleChurn$' -count=1 -v
+
+# Profile a selected workload in a fresh process; keep runtime settings fixed.
+mkdir -p control_logs/server-churn
+HEADSCALE_STRESS_NODES=500 GOMAXPROCS=2 GOMEMLIMIT=2GiB \
+  go test -p=2 ./hscontrol/servertest \
+  -run '^TestScaleChurn/500_nodes/growing_diversity$' -count=1 -v -timeout=30m \
+  -cpuprofile=control_logs/server-churn/cpu.prof \
+  -memprofile=control_logs/server-churn/alloc.prof \
+  >control_logs/server-churn/run.log 2>&1
+go tool pprof -sample_index=alloc_space control_logs/server-churn/alloc.prof
+```
+
+Ramp from 12 to 100, 500, 1000 and 2000 nodes before considering 5000 sparse
+clients. Attempt 10000 sparse clients only with measured memory and latency
+headroom. Dense visibility retains O(N²) current client peers, so a successful
+sparse run does not justify an equally large dense run. Use an external hard
+memory/swap cap (for example a systemd scope with `MemoryMax=4G` and
+`MemorySwapMax=0`) as well as Go's soft limit; serialize heavy comparisons.
+Record resource failures without silently raising caps. Go 1.27's
+`testing.TempDir` prefers `GOTMPDIR` over `TMPDIR`: to put SQLite fixtures on
+tmpfs while keeping compiler scratch on disk, set the outer `GOTMPDIR` to a
+disk directory and add `-exec 'env GOTMPDIR=/dev/shm/server-churn'` to
+`go test` after creating that runtime directory. Standalone test binaries
+instead need `GOTMPDIR` set to the runtime directory directly. Tmpfs pages
+also count against the cgroup limit; the phase log includes the actual DB path.
+CPU/alloc profiles include enrollment and assertions; use a separate trace run when diagnosing
+scheduler or GC delays. The limitations below also apply to churn profiles.
 
 ## Read results and find congestion
 
