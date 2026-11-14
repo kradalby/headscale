@@ -1955,6 +1955,64 @@ func BenchmarkScalingWrites(b *testing.B) {
 	}
 }
 
+// BenchmarkViaOnlineWrites keeps writer selection fixed across sizes. A failover
+// disconnects and reconnects the elected router before delivery: the standby
+// wins and keeps its election when the former winner returns. Every operation
+// transfers the route, rather than amortizing one failover over ordinary writes.
+func BenchmarkViaOnlineWrites(b *testing.B) {
+	for _, kind := range []string{"router-failover", "member-online", "unrelated-user"} {
+		for _, n := range []int{100, 400, 1000} {
+			b.Run(fmt.Sprintf("%s/nodes=%d", kind, n), func(b *testing.B) {
+				shape := "via"
+				if kind == "unrelated-user" {
+					shape = "users"
+				}
+
+				s, streams := scalingTailnet(b, n, shape)
+				sc := newScalingRun(s, streams)
+				write := func(tb testing.TB, s *state.State, _ types.NodeID, i int) {
+					tb.Helper()
+
+					id := streams[1].nodeID
+					if kind == "router-failover" {
+						id = streams[(i%2)*10].nodeID
+					}
+
+					scalingWrites["online"](tb, s, id, i)
+
+					if kind == "router-failover" {
+						scalingWrites["online"](tb, s, id, i)
+					}
+				}
+
+				b.ReportAllocs()
+
+				i := 0
+				for b.Loop() {
+					sc.step(b, write, i)
+					i++
+				}
+
+				sc.requireSettled(b, "online")
+
+				if kind == "router-failover" {
+					snap := s.Snapshot()
+					viewer := mustNode(b, s, streams[1].nodeID)
+					matchers, err := snap.Policy().MatchersForNode(viewer)
+					require.NoError(b, err)
+					winner := mustNode(b, s, streams[(i%2)*10].nodeID)
+					require.Contains(b, snap.RoutesForPeer(viewer, winner, matchers), netip.MustParsePrefix("10.0.0.0/24"))
+					require.Positive(b, sc.updates, "each failover must send route changes")
+				}
+
+				b.ReportMetric(float64(sc.woken)/float64(i), "woken/op")
+				b.ReportMetric(float64(sc.updates)/float64(i), "updates/op")
+				b.ReportMetric(float64(sc.rendered)/float64(i), "peer-renders/op")
+			})
+		}
+	}
+}
+
 // scalingEndpoint moves node id to endpoint port i in the store: the
 // benchmarks measure the control plane's work for the write, not SQLite.
 func scalingEndpoint(tb testing.TB, s *state.State, id types.NodeID, i int) {
