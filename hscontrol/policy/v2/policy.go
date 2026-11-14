@@ -300,6 +300,8 @@ func NewPolicyManagerFrom(prev *PolicyManager, b []byte, users []types.User, nod
 
 	if prev != nil && bytes.Equal(prev.src, b) && types.SamePolicyUsers(prev.users, users) {
 		prevGrants, change = prev.grantResults, diffNodes(prev.nodesByID, nodes)
+		change.indexUsers(pol, users)
+
 		if indexed != nil {
 			indexed.aliases = prev.aliases.carry(change)
 		}

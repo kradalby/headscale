@@ -1168,6 +1168,43 @@ type nodeChange struct {
 	users    map[uint]struct{}
 	routes   bool // a node's approved routes changed
 	untagged bool // an untagged node, an autogroup:member, changed
+
+	// Current identities of changed owners, populated by indexUsers.
+	userNames map[string]struct{}
+	domains   []string
+	groups    Groups
+}
+
+// indexUsers projects changed owner IDs onto current users, not the possibly
+// stale user records embedded in nodes. Collisions conservatively invalidate
+// every matching token; resolution still decides precedence and ambiguity.
+func (c *nodeChange) indexUsers(pol *Policy, users types.Users) {
+	if pol == nil || len(c.users) == 0 {
+		return
+	}
+
+	c.groups = pol.Groups
+	c.userNames = make(map[string]struct{}, 3*len(c.users))
+
+	for _, user := range users {
+		if _, changed := c.users[user.ID]; !changed {
+			continue
+		}
+
+		for _, name := range []string{user.Name, user.Email} {
+			if name != "" {
+				c.userNames[name] = struct{}{}
+			}
+		}
+
+		if user.ProviderIdentifier.Valid && user.ProviderIdentifier.String != "" {
+			c.userNames[user.ProviderIdentifier.String] = struct{}{}
+		}
+
+		if _, domain, ok := strings.CutLast(user.Email, "@"); ok {
+			c.domains = append(c.domains, domain)
+		}
+	}
 }
 
 // movesSSH reports whether the change can alter how rule prepares. SSH
@@ -1193,6 +1230,11 @@ func diffNodes(prev map[types.NodeID]types.NodeView, nodes views.Slice[types.Nod
 
 			if uid := n.UserID(); uid.Valid() {
 				c.users[uid.Get()] = struct{}{}
+			}
+
+			// User aliases resolve the loaded association, even without a foreign key.
+			if n.User().Valid() {
+				c.users[n.User().ID()] = struct{}{}
 			}
 		}
 	}
@@ -1249,7 +1291,7 @@ func (c *nodeChange) reaches(grant Grant) bool {
 // moves reports whether the change can alter what a resolves to: a tag or
 // user it names gained or lost a node or address, its autogroup's members
 // moved, or, for a wildcard, which carries every approved subnet, routes
-// changed. Groups and users are checked against any user-owned change;
+// changed. Groups and users are checked against the changed owners' identities;
 // addresses and hosts never change with nodes.
 func (c *nodeChange) moves(a Alias) bool {
 	switch a := a.(type) {
@@ -1257,8 +1299,24 @@ func (c *nodeChange) moves(a Alias) bool {
 		_, ok := c.tags[*a]
 
 		return ok
-	case *Username, *Group:
-		return len(c.users) > 0
+	case *Username:
+		if domain, ok := strings.CutPrefix(a.String(), "user:*@"); ok {
+			return slices.ContainsFunc(c.domains, func(changed string) bool {
+				return strings.EqualFold(changed, domain)
+			})
+		}
+
+		_, ok := c.userNames[strings.TrimSuffix(a.String(), "@")]
+
+		return ok
+	case *Group:
+		for _, user := range c.groups[*a] {
+			if c.moves(&user) {
+				return true
+			}
+		}
+
+		return false
 	case *AutoGroup:
 		// member and self are untagged nodes, recorded by owner; tagged
 		// ones by tag; internet and danger-all are fixed.
