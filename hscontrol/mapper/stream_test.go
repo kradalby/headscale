@@ -3268,6 +3268,141 @@ func TestFirstMapDeliveryAfterFoldedAttempts(t *testing.T) {
 	require.Empty(t, newModelClient(resps[0]).sameAs(newModelClient(fresh[0])))
 }
 
+// BenchmarkClassMapsBuild isolates rebuilding a class after its view identity
+// changes, with the individual peer renders already cached.
+func BenchmarkClassMapsBuild(b *testing.B) {
+	for _, n := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) {
+			cfg, s := benchState(b, n, 10)
+			snap := s.Snapshot()
+			view := snap.PeerViews()[0]
+			require.Len(b, view, n)
+
+			var (
+				renders peerRenders
+				warm    classMaps
+			)
+			warm.get(cfg, &renders, snap, view, capVer, 0, nil)
+			b.ReportAllocs()
+
+			var (
+				peers    *peerMap
+				profiles *profileMap
+			)
+
+			for b.Loop() {
+				var cm classMaps
+
+				peers, profiles = cm.get(cfg, &renders, snap, view, capVer, 0, nil)
+			}
+
+			require.Equal(b, n, peers.Len())
+			require.Equal(b, 10, profiles.Len())
+			b.ReportMetric(float64(n), "peers/op")
+		})
+	}
+}
+
+func BenchmarkClassOwnersSet(b *testing.B) {
+	owners := make([]types.UserView, 10)
+	for i := range owners {
+		u := &types.User{Name: fmt.Sprintf("owner-%d", i)}
+		u.ID = uint(i + 1)
+		owners[i] = u.View()
+	}
+
+	for _, n := range []int{100, 1000, 10000} {
+		for _, kind := range []string{"build", "unchanged"} {
+			b.Run(fmt.Sprintf("%s/nodes=%d", kind, n), func(b *testing.B) {
+				base := newClassOwners()
+				if kind == "unchanged" {
+					e := base.edit()
+					for i := range n {
+						e.set(tailcfg.NodeID(i+1), owners[i%len(owners)])
+					}
+
+					base = e.done()
+				}
+
+				b.ReportAllocs()
+
+				var next classOwners
+
+				for b.Loop() {
+					e := base.edit()
+					for i := range n {
+						e.set(tailcfg.NodeID(i+1), owners[i%len(owners)])
+					}
+
+					next = e.done()
+				}
+
+				require.Equal(b, n, next.of.Len())
+				require.Equal(b, 10, next.profiles.Len())
+				b.ReportMetric(float64(n), "sets/op")
+			})
+		}
+	}
+}
+
+func TestClassOwnersUnchangedDoesNotAllocate(t *testing.T) {
+	alice := &types.User{Name: "alice"}
+	alice.ID = 1
+	e := newClassOwners().edit()
+	e.set(1, alice.View())
+	base := e.done()
+	e = base.edit()
+
+	allocs := testing.AllocsPerRun(100, func() { e.set(1, alice.View()) })
+	require.Zero(t, allocs, "an unchanged owner must not rebuild its profile")
+
+	next := e.done()
+	require.Same(t, base.profiles, next.profiles)
+	require.Same(t, base.of, next.of)
+	require.Same(t, base.nodes, next.nodes)
+}
+
+func TestClassOwnersProfileAndOwnershipChanges(t *testing.T) {
+	alice := &types.User{Name: "alice"}
+	alice.ID = 1
+	bob := &types.User{Name: "bob"}
+	bob.ID = 2
+
+	e := newClassOwners().edit()
+	e.set(1, alice.View())
+	e.set(2, alice.View())
+	base := e.done()
+
+	renamed := *alice
+	renamed.DisplayName = "Alice Updated"
+	e = base.edit()
+	e.set(1, renamed.View())
+	e.set(2, renamed.View())
+	updated := e.done()
+	p, ok := updated.profiles.Get(1)
+	require.True(t, ok)
+	require.Equal(t, renamed.TailscaleUserProfile(), p)
+	p, _ = base.profiles.Get(1)
+	require.Equal(t, alice.TailscaleUserProfile(), p, "old snapshots keep their profiles")
+
+	e = updated.edit()
+	e.set(1, bob.View())
+	e.set(2, types.UserView{})
+	next := e.done()
+	require.Equal(t, 1, next.of.Len())
+	uid, ok := next.of.Get(1)
+	require.True(t, ok)
+	require.Equal(t, tailcfg.UserID(2), uid)
+
+	count, ok := next.nodes.Get(2)
+	require.True(t, ok)
+	require.Equal(t, 1, count)
+	require.Equal(t, 1, next.profiles.Len())
+	p, _ = next.profiles.Get(2)
+	require.Equal(t, bob.TailscaleUserProfile(), p)
+	require.Equal(t, 2, updated.of.Len())
+}
+
 // BenchmarkFirstMap separates a reconnect on a warm hub from the first
 // render on a cold hub and from reopening state (including Close). The last
 // includes DB load, policy compile and peer construction, but not process
