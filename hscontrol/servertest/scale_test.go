@@ -4,13 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"weak"
 
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,12 +22,16 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/ipproto"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/wgengine/filter"
 )
 
-const scaleDevicesPerUser = 10
+const (
+	scaleDevicesPerUser     = 10
+	scaleConvergenceTimeout = 2 * time.Minute
+)
 
 type scaleCase struct {
 	name          string
@@ -35,7 +43,15 @@ type scaleCase struct {
 
 // TestScale runs the same workloads at smoke-test and explicitly selected sizes.
 // See README.md for large runs, resource constraints, and profiling commands.
-func TestScale(t *testing.T) {
+func TestScale(t *testing.T) { testScale(t, false) }
+
+// TestScaleChurn replaces every client over ten bounded rounds, then exercises
+// transport reconnects and authenticated relogins separately from node churn.
+func TestScaleChurn(t *testing.T) { testScale(t, true) }
+
+func testScale(t *testing.T, churn bool) {
+	t.Helper()
+
 	nodes := 12
 
 	if value, ok := os.LookupEnv("HEADSCALE_STRESS_NODES"); ok {
@@ -102,10 +118,23 @@ func TestScale(t *testing.T) {
 		},
 	}
 
+	if churn {
+		grants := make([]string, 0, (nodes+scaleDevicesPerUser-1)/scaleDevicesPerUser)
+		for i := range (nodes + scaleDevicesPerUser - 1) / scaleDevicesPerUser {
+			grants = append(grants, fmt.Sprintf(`{"src":["scale-user-%d@"],"dst":["scale-user-%d@"],"ip":["tcp:443"]}`, i, i))
+		}
+
+		cases = append(cases, scaleCase{
+			name:    "growing_diversity",
+			policy:  `{"grants":[` + strings.Join(grants, ",") + `]}`,
+			canSend: personalVisibility,
+		})
+	}
+
 	t.Run(fmt.Sprintf("%d_nodes", nodes), func(t *testing.T) {
 		// Run serially: each server and all its clients share this process.
 		for _, tc := range cases {
-			t.Run(tc.name, func(t *testing.T) { runScale(t, nodes, tc) })
+			t.Run(tc.name, func(t *testing.T) { runScale(t, nodes, tc, churn) })
 		}
 	})
 }
@@ -115,7 +144,7 @@ type quietScaleTB struct{ testing.TB }
 
 func (quietScaleTB) Logf(string, ...any) {}
 
-func runScale(t *testing.T, nodes int, tc scaleCase) {
+func runScale(t *testing.T, nodes int, tc scaleCase, churn bool) {
 	t.Helper()
 
 	var opts []ServerOption
@@ -127,16 +156,18 @@ func runScale(t *testing.T, nodes int, tc scaleCase) {
 	clients := make([]*TestClient, nodes)
 	selfNodes := make([]tailcfg.NodeView, nodes)
 	indices := make(map[tailcfg.NodeID]int, nodes)
-
-	const convergenceTimeout = 2 * time.Minute
+	users := make([]*types.User, (nodes+scaleDevicesPerUser-1)/scaleDevicesPerUser)
+	seenIDs := make(map[tailcfg.NodeID]bool)
+	seenKeys := make(map[key.NodePublic]bool)
 
 	t.Logf(
-		"target_nodes=%d devices_per_user=%d gomaxprocs=%d gomemlimit=%q go=%s",
+		"target_nodes=%d devices_per_user=%d gomaxprocs=%d gomemlimit=%q go=%s database_path=%q",
 		nodes,
 		scaleDevicesPerUser,
 		runtime.GOMAXPROCS(0),
 		os.Getenv("GOMEMLIMIT"),
 		runtime.Version(),
+		srv.cfg.Database.Sqlite.Path,
 	)
 
 	phase := func(name string, work func()) {
@@ -179,6 +210,19 @@ func runScale(t *testing.T, nodes int, tc scaleCase) {
 
 		work()
 		checkScaleStreams(t, srv, clients, indices)
+
+		if churn {
+			durable, err := srv.State().DB().ListNodes()
+			require.NoError(t, err)
+			require.Len(t, durable, len(indices))
+			require.Equal(t, len(indices), srv.State().ListNodes().Len())
+
+			for _, node := range durable {
+				i, ok := indices[node.ID.NodeID()]
+				require.True(t, ok, "unexpected durable node %d", node.ID)
+				require.Equal(t, selfNodes[i].Key(), node.NodeKey)
+			}
+		}
 	}
 
 	// A generation attribute distinguishes fresh policy delivery from old maps.
@@ -196,66 +240,22 @@ func runScale(t *testing.T, nodes int, tc scaleCase) {
 	}
 
 	waitForState := func(generation string, revoked bool, osMarker string) {
-		deadline := time.Now().Add(convergenceTimeout)
-
-		for i, c := range clients {
-			wantPeers := tc.peerCount(i, nodes, revoked)
-
-			c.WaitForCondition(
-				t,
-				fmt.Sprintf("%s: %d peers, OS=%q", generation, wantPeers, osMarker),
-				time.Until(deadline),
-				func(nm *netmap.NetworkMap) bool {
-					if !nm.SelfNode.CapMap().Contains(nodecap.Cap(generation)) ||
-						len(nm.Peers) != wantPeers {
-						return false
-					}
-
-					hasSSH := nm.SSHPolicy != nil && len(nm.SSHPolicy.Rules) > 0
-					if hasSSH != (tc.ssh && !revoked) {
-						return false
-					}
-
-					if revoked && nm.PacketFilterRules.Len() != 0 {
-						return false
-					}
-
-					// The policy's attribute can reach the node a frame ahead of
-					// its filter, and peers alone may not tell the two apart.
-					return tc.peersMatch(nm, i, indices, osMarker) &&
-						scalePacketFilterMismatch(tc, nm, selfNodes, i, revoked) == ""
-				},
-			)
-			require.Empty(t, scalePacketFilterMismatch(tc, c.Netmap(), selfNodes, i, revoked))
-
-			if tc.ssh && !revoked {
-				checkScaleSSH(t, c.Netmap().SSHPolicy, selfNodes, i)
-			}
-		}
+		waitForScaleState(t, tc, clients, selfNodes, indices, generation, revoked, osMarker)
 	}
 
-	phase("enroll", func() {
-		users := make([]*types.User, (nodes+scaleDevicesPerUser-1)/scaleDevicesPerUser)
-		for i := range users {
-			users[i] = srv.CreateUser(t, fmt.Sprintf("scale-user-%d", i))
-		}
-
-		setPolicy(tc.policy, "example.com/scale-initial")
-
-		// Bound concurrent logins, and join every batch before checking results.
-		for first := 0; first < nodes; first += 32 {
+	registerSlots := func(slots []int, round int) {
+		// Bound concurrent authentication and durable writes to 32 clients.
+		for first := 0; first < len(slots); first += 32 {
 			var registrations sync.WaitGroup
-			for i := first; i < min(first+32, nodes); i++ {
+			for _, i := range slots[first:min(first+32, len(slots))] {
 				registrations.Go(func() {
-					opts := []ClientOption{
-						WithUser(users[i/scaleDevicesPerUser]), WithoutNetmapHistory(),
-					}
+					opts := []ClientOption{WithUser(users[i/scaleDevicesPerUser]), WithoutNetmapHistory()}
 					if tc.taggedService && i == 0 {
 						opts = append(opts, WithTags("tag:service"))
 					}
 
 					clients[i] = NewClient(quietScaleTB{t}, srv,
-						fmt.Sprintf("scale-node-%05d", i), opts...)
+						fmt.Sprintf("scale-node-%05d-%02d", i, round), opts...)
 				})
 			}
 
@@ -266,20 +266,41 @@ func runScale(t *testing.T, nodes int, tc scaleCase) {
 			}
 		}
 
-		deadline := time.Now().Add(convergenceTimeout)
-		for i, c := range clients {
-			c.WaitForCondition(t, "initial map", time.Until(deadline),
+		deadline := time.Now().Add(scaleConvergenceTimeout)
+		for _, i := range slots {
+			clients[i].WaitForCondition(t, "initial map", time.Until(deadline),
 				func(nm *netmap.NetworkMap) bool { return nm.SelfNode.Valid() })
-			id := c.Netmap().SelfNode.ID()
-			selfNodes[i] = c.Netmap().SelfNode
-			_, duplicate := indices[id]
-			require.False(t, duplicate, "duplicate client node ID %d", id)
-			indices[id] = i
+			nm := clients[i].Netmap()
+			require.NotNil(t, nm)
+			require.True(t, nm.SelfNode.Valid())
+			id := nm.SelfNode.ID()
+			require.False(t, seenIDs[id], "reused node ID %d", id)
+			require.False(t, seenKeys[nm.NodeKey], "reused node key %s", nm.NodeKey)
+			seenIDs[id], seenKeys[nm.NodeKey] = true, true
+			selfNodes[i], indices[id] = nm.SelfNode, i
+		}
+	}
+
+	slots := make([]int, nodes)
+	for i := range slots {
+		slots[i] = i
+	}
+
+	phase("enroll", func() {
+		for i := range users {
+			users[i] = srv.CreateUser(t, fmt.Sprintf("scale-user-%d", i))
 		}
 
+		setPolicy(tc.policy, "example.com/scale-initial")
+		registerSlots(slots, 0)
 		require.Equal(t, nodes, srv.State().ListNodes().Len())
 		waitForState("example.com/scale-initial", false, "")
 	})
+
+	if churn {
+		runScaleChurn(t, srv, tc, clients, selfNodes, indices, phase, setPolicy, waitForState, registerSlots)
+		return
+	}
 
 	// One sender per user, including the shared service, changes in each burst.
 	for round := range 3 {
@@ -316,13 +337,250 @@ func runScale(t *testing.T, nodes int, tc scaleCase) {
 	})
 }
 
+func waitForScaleState(
+	t *testing.T,
+	tc scaleCase,
+	clients []*TestClient,
+	selfNodes []tailcfg.NodeView,
+	indices map[tailcfg.NodeID]int,
+	generation string,
+	revoked bool,
+	osMarker string,
+) {
+	t.Helper()
+
+	deadline := time.Now().Add(scaleConvergenceTimeout)
+
+	for i, c := range clients {
+		if c == nil {
+			continue
+		}
+
+		wantPeers := tc.peerCount(i, selfNodes, revoked)
+
+		c.WaitForCondition(
+			t,
+			fmt.Sprintf("%s: %d peers, OS=%q", generation, wantPeers, osMarker),
+			time.Until(deadline),
+			func(nm *netmap.NetworkMap) bool {
+				if !nm.SelfNode.CapMap().Contains(nodecap.Cap(generation)) ||
+					len(nm.Peers) != wantPeers {
+					return false
+				}
+
+				hasSSH := nm.SSHPolicy != nil && len(nm.SSHPolicy.Rules) > 0
+				if hasSSH != (tc.ssh && !revoked) {
+					return false
+				}
+
+				if tc.ssh && !revoked && scaleSSHPolicyMismatch(nm.SSHPolicy, selfNodes, i) != "" {
+					return false
+				}
+
+				if revoked && nm.PacketFilterRules.Len() != 0 {
+					return false
+				}
+
+				// The policy's attribute can reach the node a frame ahead of
+				// its filter, and peers alone may not tell the two apart.
+				return tc.peersMatch(nm, i, indices, selfNodes, revoked, osMarker) &&
+					scalePacketFilterMismatch(tc, nm, selfNodes, i, revoked) == ""
+			},
+		)
+		require.Empty(t, scalePacketFilterMismatch(tc, c.Netmap(), selfNodes, i, revoked))
+
+		if tc.ssh && !revoked {
+			require.Empty(t, scaleSSHPolicyMismatch(c.Netmap().SSHPolicy, selfNodes, i))
+		}
+	}
+}
+
+func runScaleChurn(
+	t *testing.T,
+	srv *TestServer,
+	tc scaleCase,
+	clients []*TestClient,
+	selfNodes []tailcfg.NodeView,
+	indices map[tailcfg.NodeID]int,
+	phase func(string, func()),
+	setPolicy func(string, string),
+	waitForState func(string, bool, string),
+	registerSlots func([]int, int),
+) {
+	t.Helper()
+
+	nodes := len(clients)
+
+	retiredClients := make([]weak.Pointer[TestClient], 0, nodes)
+	oldPolicies := make([]weak.Pointer[policyv2.PolicyManager], 0, scaleDevicesPerUser)
+
+	generation := "example.com/scale-initial"
+	revoked := false
+
+	for round := range scaleDevicesPerUser {
+		var cohort []int
+		for i := round; i < nodes; i += scaleDevicesPerUser {
+			cohort = append(cohort, i)
+		}
+
+		pm, ok := srv.State().Snapshot().Policy().(*policyv2.PolicyManager)
+		require.True(t, ok)
+
+		oldPolicies = append(oldPolicies, weak.Make(pm))
+
+		phase(fmt.Sprintf("churn_%02d_remove", round), func() {
+			started := time.Now()
+
+			for first := 0; first < len(cohort); first += 32 {
+				var removals sync.WaitGroup
+				for _, i := range cohort[first:min(first+32, len(cohort))] {
+					removals.Go(func() {
+						node, ok := srv.State().GetNodeByNodeKey(selfNodes[i].Key())
+						if assert.True(t, ok) {
+							assert.NoError(t, srv.State().DeleteNode(node))
+						}
+
+						clients[i].cleanupOnce()
+					})
+				}
+
+				removals.Wait()
+
+				if t.Failed() {
+					t.FailNow()
+				}
+			}
+
+			for _, i := range cohort {
+				retiredClients = append(retiredClients, weak.Make(clients[i]))
+				delete(indices, selfNodes[i].ID())
+				clients[i], selfNodes[i] = nil, tailcfg.NodeView{}
+			}
+
+			mutated := time.Since(started)
+
+			waitForState(generation, revoked, "")
+			t.Logf("operations=%d mutation_elapsed=%s convergence_elapsed=%s", len(cohort), mutated, time.Since(started)-mutated)
+		})
+		phase(fmt.Sprintf("churn_%02d_replace", round), func() {
+			started := time.Now()
+
+			var policyChange sync.WaitGroup
+			// Change policy while fresh clients authenticate and establish streams.
+			if round == 4 || round == 5 {
+				revoked = round == 4
+				generation = fmt.Sprintf("example.com/scale-churn-%d", round)
+
+				policyChange.Go(func() {
+					policy := tc.policy
+					if revoked {
+						policy = `{"acls":[]}`
+					}
+
+					setPolicy(policy, generation)
+				})
+			}
+
+			registerSlots(cohort, round+1)
+			policyChange.Wait()
+
+			if t.Failed() {
+				t.FailNow()
+			}
+
+			mutated := time.Since(started)
+
+			waitForState(generation, revoked, "")
+			t.Logf("operations=%d mutation_elapsed=%s convergence_elapsed=%s", len(cohort), mutated, time.Since(started)-mutated)
+		})
+	}
+
+	for _, relogin := range []bool{false, true} {
+		stormName := "reconnect_storm"
+		if relogin {
+			stormName = "relogin_storm"
+		}
+
+		phase(stormName, func() {
+			for first := 0; first < nodes; first += 32 {
+				var storm sync.WaitGroup
+
+				for offset, c := range clients[first:min(first+32, nodes)] {
+					i := first + offset
+
+					storm.Go(func() {
+						ctx, cancel := context.WithTimeout(t.Context(), scaleConvergenceTimeout)
+						defer cancel()
+
+						id, nodeKey := c.Netmap().SelfNode.ID(), c.Netmap().NodeKey
+						if relogin {
+							require.NoError(t, c.LogoutAndDisconnect(ctx))
+
+							require.NoError(t, c.ReloginAndPoll(ctx))
+						} else {
+							hi := &tailcfg.Hostinfo{Hostname: c.Name, BackendLogID: "servertest-" + c.Name}
+							require.NoError(t, c.RestartWithKey(ctx, c.authKey, hi))
+						}
+
+						c.WaitForCondition(t, "new stream map", scaleConvergenceTimeout, func(nm *netmap.NetworkMap) bool {
+							_, maps := c.Stream()
+
+							keyMatches := nm.NodeKey == nodeKey
+							if relogin {
+								keyMatches = nm.NodeKey != nodeKey
+							}
+
+							return maps > 0 && nm.SelfNode.ID() == id && keyMatches
+						})
+						selfNodes[i] = c.Netmap().SelfNode
+					})
+				}
+
+				storm.Wait()
+
+				if t.Failed() {
+					t.FailNow()
+				}
+			}
+
+			generation = fmt.Sprintf("example.com/scale-storm-%v", relogin)
+			setPolicy(tc.policy, generation)
+			waitForState(generation, false, "")
+			t.Logf("operations=%d", nodes)
+		})
+	}
+
+	phase("release_retired", func() {
+		// Old policy objects own the snapshot's node set. A fresh Snapshot wrapper
+		// alone is not a retention probe: the world constructs one on every read.
+		require.Eventually(t, func() bool {
+			runtime.GC()
+
+			for _, old := range retiredClients {
+				if old.Value() != nil {
+					return false
+				}
+			}
+
+			for _, old := range oldPolicies {
+				if old.Value() != nil {
+					return false
+				}
+			}
+
+			return true
+		}, 10*time.Second, 100*time.Millisecond, "retired clients and old compiled policies must be collectible")
+		t.Logf("released_clients=%d released_policies=%d", len(retiredClients), len(oldPolicies))
+	})
+}
+
 // peerCount is how many peers viewer has: the nodes it can reach or be reached
 // from, and its user's other devices, which are peers under any policy.
-func (tc scaleCase) peerCount(viewer, total int, revoked bool) int {
+func (tc scaleCase) peerCount(viewer int, active []tailcfg.NodeView, revoked bool) int {
 	count := 0
 
-	for j := range total {
-		if j == viewer {
+	for j, node := range active {
+		if j == viewer || !node.Valid() {
 			continue
 		}
 
@@ -354,17 +612,19 @@ func (tc scaleCase) peersMatch(
 	nm *netmap.NetworkMap,
 	viewer int,
 	indices map[tailcfg.NodeID]int,
+	active []tailcfg.NodeView,
+	revoked bool,
 	osMarker string,
 ) bool {
 	var previous tailcfg.NodeID
 
 	for _, peer := range nm.Peers {
 		j, ok := indices[peer.ID()]
-		if !ok || j == viewer || peer.ID() <= previous {
+		if !ok || j == viewer || peer.ID() <= previous || peer.Key() != active[j].Key() {
 			return false
 		}
 
-		if !tc.linked(viewer, j) && !tc.sameUser(viewer, j) {
+		if (revoked || !tc.linked(viewer, j)) && !tc.sameUser(viewer, j) {
 			return false
 		}
 
@@ -448,6 +708,10 @@ func scalePacketFilterMismatch(
 
 	sibling := first + (viewer-first+1)%groupSize
 	for _, source := range []int{sibling, (first + scaleDevicesPerUser) % len(selfNodes), 0} {
+		if !selfNodes[source].Valid() {
+			continue
+		}
+
 		for family, dst := range nm.SelfNode.Addresses().All() {
 			src := selfNodes[source].Addresses().At(family).Addr()
 
@@ -482,48 +746,46 @@ func scalePacketFilterMismatch(
 	return ""
 }
 
-func checkScaleSSH(
-	t *testing.T,
-	policy *tailcfg.SSHPolicy,
-	selfNodes []tailcfg.NodeView,
-	viewer int,
-) {
-	t.Helper()
+func scaleSSHPolicyMismatch(policy *tailcfg.SSHPolicy, selfNodes []tailcfg.NodeView, viewer int) string {
+	if policy == nil || len(policy.Rules) != 1 {
+		return "expected one SSH rule"
+	}
 
-	require.NotNil(t, policy)
-	require.Len(t, policy.Rules, 1)
 	rule := policy.Rules[0]
-	require.NotNil(t, rule.Action)
-	require.True(t, rule.Action.Accept)
-	require.False(t, rule.Action.Reject)
-	require.Empty(t, rule.Action.HoldAndDelegate)
-	require.Equal(t, map[string]string{"0": "", "root": "root"}, rule.SSHUsers)
+	if rule.Action == nil || !rule.Action.Accept || rule.Action.Reject || rule.Action.HoldAndDelegate != "" {
+		return "expected SSH accept action"
+	}
+
+	if !maps.Equal(rule.SSHUsers, map[string]string{"0": "", "root": "root"}) {
+		return "unexpected SSH user mapping"
+	}
 
 	wantIPs := make(map[string]bool)
 
 	first := viewer / scaleDevicesPerUser * scaleDevicesPerUser
 	for _, node := range selfNodes[first:min(first+scaleDevicesPerUser, len(selfNodes))] {
+		if !node.Valid() {
+			continue
+		}
+
 		for _, prefix := range node.Addresses().All() {
 			wantIPs[prefix.Addr().String()] = true
 		}
 	}
 
-	require.Len(t, rule.Principals, len(wantIPs))
+	if len(rule.Principals) != len(wantIPs) {
+		return fmt.Sprintf("got %d SSH principals, want %d", len(rule.Principals), len(wantIPs))
+	}
 
 	for _, principal := range rule.Principals {
-		require.False(t, principal.Any)
-		require.Empty(t, principal.Node)
-		require.Empty(t, principal.UserLogin)
-		require.True(
-			t,
-			wantIPs[principal.NodeIP],
-			"unexpected SSH source %s",
-			principal.NodeIP,
-		)
+		if principal.Any || principal.Node != "" || principal.UserLogin != "" || !wantIPs[principal.NodeIP] {
+			return fmt.Sprintf("unexpected SSH principal %+v", principal)
+		}
+
 		delete(wantIPs, principal.NodeIP)
 	}
 
-	require.Empty(t, wantIPs)
+	return ""
 }
 
 func checkScaleStreams(
@@ -537,7 +799,7 @@ func checkScaleStreams(
 	// A reconnected client's old session leaves the hub on its own time.
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
 		connections := srv.App.MapHub().Connected()
-		assert.Len(ct, connections, len(clients))
+		assert.Len(ct, connections, len(indices))
 
 		for id, sessions := range connections {
 			_, known := indices[id.NodeID()]
@@ -547,7 +809,9 @@ func checkScaleStreams(
 	}, 10*time.Second, 20*time.Millisecond, "one session per client")
 
 	for _, c := range clients {
-		require.NotNil(t, c, "client registration failed")
+		if c == nil {
+			continue
+		}
 
 		select {
 		case <-c.pollDone:
