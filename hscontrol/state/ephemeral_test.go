@@ -133,18 +133,82 @@ func stackContains(want ...string) bool {
 	return false
 }
 
+// TestLifetimeDeletesShareBatchWithoutBlockingUnrelatedAdmission catches a
+// global admission lock held across graph publication: independent deletes
+// and admission must reach the next batch while an earlier commit is held.
+func TestLifetimeDeletesShareBatchWithoutBlockingUnrelatedAdmission(t *testing.T) {
+	for _, mode := range []string{"logout", "gc"} {
+		t.Run(mode, func(t *testing.T) {
+			_, s, id := persistTestSetup(t)
+			t.Cleanup(func() { _ = s.Close() })
+
+			a := registerEphemeralNode(t, s, "admission-a")
+			b := registerEphemeralNode(t, s, "admission-b")
+			before := s.Snapshot().s.Rev()
+
+			entered, release := make(chan struct{}), make(chan struct{})
+			unblock := sync.OnceFunc(func() { close(release) })
+
+			var wg sync.WaitGroup
+
+			t.Cleanup(func() { unblock(); wg.Wait() })
+			wg.Go(func() {
+				s.world.update(func(*nodeEdit) { close(entered); <-release })
+			})
+			<-entered
+
+			deleteNode := func(node types.NodeView) error {
+				if mode == "logout" {
+					_, err := s.LogoutNode(node, new(time.Now().Add(-time.Hour)))
+
+					return err
+				}
+
+				_, err := s.DeleteEphemeralNode(node.ID())
+
+				return err
+			}
+			queued := func() int {
+				s.world.writeMu.Lock()
+				defer s.world.writeMu.Unlock()
+
+				return len(s.world.writes)
+			}
+
+			deletedA, deletedB := make(chan error, 1), make(chan error, 1)
+			connected := make(chan uint64, 1)
+
+			wg.Go(func() { deletedA <- deleteNode(a) })
+			require.Eventually(t, func() bool { return queued() == 1 }, 5*time.Second, time.Millisecond,
+				"first delete must reach graph publication")
+
+			wg.Go(func() { connected <- s.Connect(id) })
+			wg.Go(func() { deletedB <- deleteNode(b) })
+			require.Eventually(t, func() bool { return queued() == 3 }, 5*time.Second, time.Millisecond,
+				"unrelated admission and deletion must join the pending graph batch")
+
+			unblock()
+			wg.Wait()
+			require.NoError(t, <-deletedA)
+			require.NoError(t, <-deletedB)
+			require.NotZero(t, <-connected)
+			requireNodeGone(t, s, a.ID())
+			requireNodeGone(t, s, b.ID())
+			assert.Equal(t, before+1, s.Snapshot().s.Rev(), "both deletes and admission must share one commit")
+		})
+	}
+}
+
 // TestGCWaitingOnSessionsKeepsTheControlPlaneRunning pins the lock order of
 // DeleteEphemeralNode: a Connect whose world write queues behind a held batch
-// keeps connectMu's read lock, and the GC delete waiting on session admission
+// keeps that node's admission lock, and the GC delete waiting on session admission
 // must not be holding a row lock while it waits — or every persist, expiry and
 // registration in the tailnet stalls behind one inactivity timer.
 func TestGCWaitingOnSessionsKeepsTheControlPlaneRunning(t *testing.T) {
-	dbPath, s, id := persistTestSetup(t)
+	dbPath, s, _ := persistTestSetup(t)
 	_ = dbPath
 
 	t.Cleanup(func() { _ = s.Close() })
-
-	probe := registerPersistedNode(t, s, "gc-stall-probe")
 
 	eph := registerEphemeralNode(t, s, "gc-stall-target")
 	require.Zero(t, eph.ActiveSessions(), "precondition: the ephemeral node has no session")
@@ -162,10 +226,10 @@ func TestGCWaitingOnSessionsKeepsTheControlPlaneRunning(t *testing.T) {
 	<-entered
 
 	// A session queues its world write behind the held batch, holding
-	// connectMu's read lock while it waits.
+	// that node's admission lock while it waits.
 	epoch := make(chan uint64, 1)
 
-	wg.Go(func() { epoch <- s.Connect(id) })
+	wg.Go(func() { epoch <- s.Connect(eph.ID()) })
 
 	require.Eventually(t, func() bool {
 		s.world.writeMu.Lock()
@@ -182,15 +246,15 @@ func TestGCWaitingOnSessionsKeepsTheControlPlaneRunning(t *testing.T) {
 	})
 
 	require.Eventually(t, func() bool {
-		return stackContains("(*State).DeleteEphemeralNode(", "[sync.RWMutex.Lock")
+		return stackContains("(*State).DeleteEphemeralNode(", "[sync.Mutex.Lock")
 	}, 5*time.Second, time.Millisecond, "the GC must park on session admission")
 
-	// While the GC waits, an unrelated persist must complete: a row lock may
+	// While the GC waits, a same-node persist must complete: a row lock may
 	// not be held across the wait.
 	persistDone := make(chan error, 1)
 
 	go func() {
-		_, err := s.persistNode(probe)
+		_, err := s.persistNode(eph)
 		persistDone <- err
 	}()
 
@@ -206,8 +270,9 @@ func TestGCWaitingOnSessionsKeepsTheControlPlaneRunning(t *testing.T) {
 	require.NoError(t, <-gcDone)
 	require.NotZero(t, <-epoch, "the blocked session itself must still be admitted")
 
-	_, ok := s.GetNodeByID(eph.ID())
-	require.False(t, ok, "the ephemeral node is deleted once sessions release")
+	live, ok := s.GetNodeByID(eph.ID())
+	require.True(t, ok, "the GC must recheck and preserve the newly admitted session")
+	assert.Equal(t, 1, live.ActiveSessions())
 }
 
 // TestEphemeralDeletePanicReleasesTheNodeRowLock pins that a panicking
@@ -253,15 +318,15 @@ func TestEphemeralDeletePanicReleasesTheNodeRowLock(t *testing.T) {
 		t.Fatal("the panicking delete leaked its row lock; every write is wedged")
 	}
 
-	require.NotZero(t, s.Connect(id), "session admission must be released too")
+	require.NotZero(t, s.Connect(eph.ID()), "same-node session admission must be released too")
 }
 
 // TestLogoutDeletePanicReleasesSessionAdmission pins the same panic safety on
-// the logout-driven delete: the ephemeral branch takes connectMu around
+// the logout-driven delete: the ephemeral branch takes admission around
 // DeleteNode, and a panicking row write must not leak it — leaked, every
-// Connect in the tailnet blocks for the life of the process.
+// Connect for this node blocks for the life of the process.
 func TestLogoutDeletePanicReleasesSessionAdmission(t *testing.T) {
-	dbPath, s, id := persistTestSetup(t)
+	dbPath, s, _ := persistTestSetup(t)
 	_ = dbPath
 
 	t.Cleanup(func() { _ = s.Close() })
@@ -284,13 +349,13 @@ func TestLogoutDeletePanicReleasesSessionAdmission(t *testing.T) {
 	// Session admission must not be wedged by the leaked lock.
 	connected := make(chan uint64, 1)
 
-	go func() { connected <- s.Connect(id) }()
+	go func() { connected <- s.Connect(eph.ID()) }()
 
 	select {
 	case epoch := <-connected:
 		require.NotZero(t, epoch)
 	case <-time.After(2 * time.Second):
-		t.Fatal("the panicking logout leaked connectMu; session admission is wedged")
+		t.Fatal("the panicking logout leaked admission; same-node session admission is wedged")
 	}
 }
 
@@ -335,7 +400,7 @@ func TestLogoutEphemeralDeletionExcludesSessions(t *testing.T) {
 	// While the delete is in flight, Connect must park on session
 	// admission instead of acquiring the vanishing node.
 	require.Eventually(t, func() bool {
-		return stackContains("(*State).Connect(", "[sync.RWMutex.RLock")
+		return stackContains("(*State).Connect(", "[sync.Mutex.Lock")
 	}, 5*time.Second, time.Millisecond, "Connect must wait out the delete")
 
 	unblock()
@@ -693,9 +758,7 @@ func TestEphemeralGCFreesTheAddressesItsRecheckSaw(t *testing.T) {
 	// The release is a deferred once, so a failure at any later step still
 	// unblocks the parked goroutine, which drains into its buffered channels
 	// and exits instead of leaking with the lock held.
-	s.connectMu.RLock()
-
-	release := sync.OnceFunc(s.connectMu.RUnlock)
+	release := sync.OnceFunc(s.admission.lock(eph.ID()))
 	defer release()
 
 	gcGone := make(chan bool, 1)
@@ -710,7 +773,7 @@ func TestEphemeralGCFreesTheAddressesItsRecheckSaw(t *testing.T) {
 	}()
 
 	require.Eventually(t, func() bool {
-		return stackContains("(*State).DeleteEphemeralNode(", "[sync.RWMutex.Lock")
+		return stackContains("(*State).DeleteEphemeralNode(", "[sync.Mutex.Lock")
 	}, 5*time.Second, time.Millisecond, "the GC must park on session admission")
 
 	_, err := s.BackfillNodeIPs()

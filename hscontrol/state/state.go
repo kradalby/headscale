@@ -241,15 +241,15 @@ type State struct {
 	// always converges on the in-memory node rather than being clobbered by a
 	// stale caller snapshot or resurrected by an update racing with deletion.
 	rows rowLocks
-	// connectMu excludes session admission (State.Connect, its only reader)
-	// from a lifetime delete in flight: a Connect arriving while the row is
-	// being removed must wait or find the node gone, never acquire a live
-	// epoch for it. It is never acquired under a row lock — a session parked
-	// on its batched world write must not stall a persist behind a delete
-	// waiting that session out — and a delete waiting behind registration
+	// admission serialises session admission and lifetime deletes per node:
+	// a Connect arriving while its row is being removed must wait or find
+	// the node gone, never acquire a live epoch for it. Independent nodes
+	// can still reach the same graph batch. It is never acquired under a row
+	// lock — a session parked on its batched world write must not stall a
+	// persist behind a delete waiting that session out — and a delete waiting behind registration
 	// SQL must not block admission, so the GC decides the node's lifetime
 	// first and only then takes it.
-	connectMu sync.RWMutex
+	admission rowLocks
 
 	// reportSeq numbers the map reports worth persisting
 	// ([types.Node.ReportGen]); durable holds, per node, the highest number
@@ -1036,18 +1036,17 @@ func (s *State) DeleteEphemeralNode(id types.NodeID) (bool, error) {
 	// GC queued behind may publish the node's new lifetime (permanent, or
 	// reconnected) before the lock arrives, so the check must see what that
 	// registration published; and this wait must not block session
-	// admission, so connectMu is not held here.
+	// admission, so the admission lock is not held here.
 	node, err := s.ephemeralDeleteCandidate(id)
 	if err != nil || !node.Valid() {
 		return false, err
 	}
 
 	// Phase 2 — delete under session admission, excluding Connect until the
-	// node is gone from memory too. connectMu is never taken under
+	// node is gone from memory too. Admission is never taken under
 	// a row lock: a session parked on its batched world write must not have
 	// every persist stall behind this delete while it is waited out.
-	s.connectMu.Lock()
-	defer s.connectMu.Unlock()
+	defer s.admission.lock(id)()
 
 	outcome, fresh, err := s.deleteEphemeralRow(node)
 	if err != nil {
@@ -1145,8 +1144,7 @@ func (s *State) ConnectForMapRequest(id types.NodeID, nodeKey key.NodePublic) ui
 }
 
 func (s *State) connect(id types.NodeID, expectedKey key.NodePublic) uint64 {
-	s.connectMu.RLock()
-	defer s.connectMu.RUnlock()
+	defer s.admission.lock(id)()
 
 	var epoch uint64
 
@@ -1426,12 +1424,11 @@ func (s *State) LogoutNode(node types.NodeView, expiry *time.Time) (types.NodeVi
 
 	if current.IsEphemeral() {
 		// The delete spans row and memory; keep session admission excluded
-		// across all of it, as the ephemeral GC does. connectMu is taken
+		// across all of it, as the ephemeral GC does. Admission is taken
 		// here, not the row lock: DeleteNode takes the row lock itself. Both are
 		// released by defers, so a panicking delete cannot wedge admission
 		// or the rest of the control plane.
-		s.connectMu.Lock()
-		defer s.connectMu.Unlock()
+		defer s.admission.lock(current.ID())()
 
 		return types.NodeView{}, s.DeleteNode(current)
 	}
