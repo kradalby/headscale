@@ -294,17 +294,16 @@ func (node *Node) IsEphemeral() bool {
 // deterministic: IPv4 (if allocated) first, IPv6 second. At most one
 // of each family.
 func (node *Node) IPs() []netip.Addr {
-	var ret []netip.Addr
-
-	if node.IPv4 != nil {
-		ret = append(ret, *node.IPv4)
+	switch {
+	case node.IPv4 != nil && node.IPv6 != nil:
+		return []netip.Addr{*node.IPv4, *node.IPv6}
+	case node.IPv4 != nil:
+		return []netip.Addr{*node.IPv4}
+	case node.IPv6 != nil:
+		return []netip.Addr{*node.IPv6}
+	default:
+		return nil
 	}
-
-	if node.IPv6 != nil {
-		ret = append(ret, *node.IPv6)
-	}
-
-	return ret
 }
 
 // HasIP reports if a node has a given IP address.
