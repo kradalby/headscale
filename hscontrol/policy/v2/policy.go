@@ -1293,13 +1293,10 @@ func (pm *PolicyManager) BuildPeerClasses(nodes views.Slice[types.NodeView], pre
 		return c
 	}
 
+	// Every node reads the grants' shared rules and its own
+	// (autogroup:self, via); a node's peers are those the shared rules
+	// give its class, plus those its own rules link it to.
 	matchers := pm.matchers
-	if pm.needsPerNodeFilter {
-		// Every node reads the grants' shared rules and its own
-		// (autogroup:self, via); a node's peers are those the shared rules
-		// give its class, plus those its own rules link it to.
-		matchers = matcher.MatchesFromFilterRules(sharedRules(pm.compiledGrants))
-	}
 
 	var cache *sideCache
 	if prev != nil {
