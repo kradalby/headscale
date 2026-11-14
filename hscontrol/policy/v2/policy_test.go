@@ -5752,6 +5752,134 @@ func TestSidesKeyIsInjective(t *testing.T) {
 	assert.Equal(t, sidesKey(src, dst), sidesKey(slices.Clone(src), slices.Clone(dst)))
 }
 
+// legacySidesKey preserves the byte serialization used before the builder.
+func legacySidesKey(src, dst []uint64) string {
+	b := make([]byte, 0, 2*binary.MaxVarintLen64+8*(len(src)+len(dst)))
+	for _, side := range [][]uint64{src, dst} {
+		if side == nil {
+			b = append(b, 0)
+
+			continue
+		}
+
+		b = append(b, 1)
+
+		b = binary.AppendUvarint(b, uint64(len(side)))
+		for _, word := range side {
+			b = binary.LittleEndian.AppendUint64(b, word)
+		}
+	}
+
+	return string(b)
+}
+
+func TestSidesKeySerialization(t *testing.T) {
+	r := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // reproducible keys
+	sides := make([][]uint64, 2, 26)
+	sides[1] = []uint64{}
+
+	for _, n := range []int{1, 2, 16, 127, 128, 1024} {
+		zero, sparse, dense, random := make([]uint64, n), make([]uint64, n), make([]uint64, n), make([]uint64, n)
+		for i := range n {
+			sparse[i] = uint64(1) << (i % 64)
+			dense[i] = ^uint64(0)
+			random[i] = r.Uint64()
+		}
+
+		sides = append(sides, zero, sparse, dense, random)
+	}
+
+	seen := map[string][2]int{}
+
+	for i, src := range sides {
+		for j, dst := range sides {
+			key := sidesKey(src, dst)
+			require.Equal(t, legacySidesKey(src, dst), key, "sides %d/%d", i, j)
+
+			if previous, ok := seen[key]; ok {
+				require.Equal(t, sides[previous[0]], src, "source collision")
+				require.Equal(t, sides[previous[1]], dst, "destination collision")
+			}
+
+			seen[key] = [2]int{i, j}
+		}
+	}
+}
+
+func TestSidesKeyOwnsStorage(t *testing.T) {
+	src, dst := []uint64{0x0807060504030201}, []uint64{0}
+	key := sidesKey(src, dst)
+	want := "\x01\x01\x01\x02\x03\x04\x05\x06\x07\x08\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00"
+
+	require.Equal(t, want, key)
+
+	src[0], dst[0] = 0, ^uint64(0)
+	_ = sidesKey(src, dst)
+
+	require.Equal(t, want, key)
+}
+
+var sidesKeyResult string
+
+func TestSidesKeyAllocation(t *testing.T) {
+	side := make([]uint64, 1024)
+	for _, tc := range []struct {
+		name     string
+		src, dst []uint64
+		want     float64
+	}{
+		{"nil", nil, nil, 0},
+		{"empty-src", []uint64{}, nil, 0},
+		{"empty-dst", nil, []uint64{}, 0},
+		{"empty-both", []uint64{}, []uint64{}, 0},
+		{"words", side, side, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(100, func() {
+				sidesKeyResult = sidesKey(tc.src, tc.dst)
+			})
+			require.LessOrEqual(t, allocs, tc.want)
+		})
+	}
+}
+
+func BenchmarkSidesKey(b *testing.B) {
+	for _, n := range []int{0, 1, 2, 16, 128, 1024} {
+		for _, dense := range []bool{false, true} {
+			side := make([]uint64, n)
+			for i := range side {
+				if dense {
+					side[i] = ^uint64(0)
+				} else {
+					side[i] = uint64(1) << (i % 64)
+				}
+			}
+
+			for _, tc := range []struct {
+				name     string
+				src, dst []uint64
+			}{
+				{"nil", nil, nil},
+				{"src", side, nil},
+				{"dst", nil, side},
+				{"both", side, side},
+			} {
+				if tc.name == "nil" && (n != 0 || dense) {
+					continue
+				}
+
+				b.Run(fmt.Sprintf("words=%d/dense=%t/%s", n, dense, tc.name), func(b *testing.B) {
+					b.ReportAllocs()
+
+					for b.Loop() {
+						sidesKeyResult = sidesKey(tc.src, tc.dst)
+					}
+				})
+			}
+		}
+	}
+}
+
 func BenchmarkNewPolicyManagerAfterTagJoin(b *testing.B) {
 	const (
 		tags  = 1000
