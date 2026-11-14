@@ -1893,24 +1893,50 @@ func matcherSides(matchers []matcher.Match, nodes views.Slice[types.NodeView]) (
 // joining raw words with a separator byte would let one pair's words
 // spell another's separator.
 func sidesKey(src, dst []uint64) string {
-	b := make([]byte, 0, 2*binary.MaxVarintLen64+8*(len(src)+len(dst)))
+	if len(src) == 0 && len(dst) == 0 {
+		switch {
+		case src == nil && dst == nil:
+			return "\x00\x00"
+		case src == nil:
+			return "\x00\x01\x00"
+		case dst == nil:
+			return "\x01\x00\x00"
+		default:
+			return "\x01\x00\x01\x00"
+		}
+	}
+
+	var scratch [binary.MaxVarintLen64]byte
+
+	size := 2 + 8*(len(src)+len(dst))
+	for _, side := range [][]uint64{src, dst} {
+		if side != nil {
+			size += binary.PutUvarint(scratch[:], uint64(len(side)))
+		}
+	}
+
+	var b strings.Builder
+	b.Grow(size)
 
 	for _, side := range [][]uint64{src, dst} {
 		if side == nil {
-			b = append(b, 0)
+			b.WriteByte(0)
 
 			continue
 		}
 
-		b = append(b, 1)
-		b = binary.AppendUvarint(b, uint64(len(side)))
+		b.WriteByte(1)
+
+		n := binary.PutUvarint(scratch[:], uint64(len(side)))
+		b.Write(scratch[:n])
 
 		for _, w := range side {
-			b = binary.LittleEndian.AppendUint64(b, w)
+			binary.LittleEndian.PutUint64(scratch[:], w)
+			b.Write(scratch[:8])
 		}
 	}
 
-	return string(b)
+	return b.String()
 }
 
 // canAccessSides reports whether a source side reaches a destination
