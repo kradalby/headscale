@@ -1730,15 +1730,25 @@ func cachedMatcherSides(
 		}
 	}
 
-	// Which new matchers prev knew, and where.
-	from := make([]int, len(matchers))
+	// Link each old slot to its new slots; duplicate keys use the first old slot.
+	var to, links []int
+	if prev != nil && !sameOrder {
+		to = make([]int, len(prev.keys))
+		for k := range to {
+			to[k] = -1
+		}
+
+		links = make([]int, len(matchers))
+	}
+
 	fresh := make([]int, 0, len(matchers))
 
 	for k, key := range next.keys {
 		if old, ok := oldIdx[key]; ok {
-			from[k] = old
+			if !sameOrder {
+				links[k], to[old] = to[old], k
+			}
 		} else {
-			from[k] = -1
 			fresh = append(fresh, k)
 		}
 	}
@@ -1770,19 +1780,8 @@ func cachedMatcherSides(
 
 			evaluate = fresh
 
-			for k, o := range from {
-				if o < 0 {
-					continue
-				}
-
-				if bitSet(old.src, o) {
-					srcOf[i] = setBit(srcOf[i], words, k)
-				}
-
-				if bitSet(old.dst, o) {
-					dstOf[i] = setBit(dstOf[i], words, k)
-				}
-			}
+			srcOf[i] = remapMatcherSide(old.src, to, links, words)
+			dstOf[i] = remapMatcherSide(old.dst, to, links, words)
 		}
 
 		ips, subnet, isExit := n.IPs(), n.SubnetRoutes(), n.IsExitNode()
@@ -1823,8 +1822,22 @@ func matcherKey(m *matcher.Match) string {
 	return m.Key()
 }
 
-func bitSet(side []uint64, k int) bool {
-	return side != nil && side[k/64]&(1<<(k%64)) != 0 //nolint:mnd
+// remapMatcherSide visits only set bits, leaving unmatched sides nil.
+func remapMatcherSide(side []uint64, to, links []int, words int) []uint64 {
+	var out []uint64
+
+	for w, word := range side {
+		for word != 0 {
+			o := 64*w + bits.TrailingZeros64(word) //nolint:mnd
+			for k := to[o]; k >= 0; k = links[k] {
+				out = setBit(out, words, k)
+			}
+
+			word &= word - 1
+		}
+	}
+
+	return out
 }
 
 func setBit(side []uint64, words, k int) []uint64 {

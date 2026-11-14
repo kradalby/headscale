@@ -2562,3 +2562,191 @@ func TestPeerClassesMixedSelfVia(t *testing.T) {
 		}
 	}
 }
+
+// TestCachedMatcherSidesRemapMasks compares arbitrary cached masks with the
+// original linear remap, including duplicate keys with different old bits.
+func TestCachedMatcherSidesRemapMasks(t *testing.T) {
+	t.Parallel()
+
+	nodes := scanManyRulesNodes(16).ViewSlice()
+
+	ms := make([]matcher.Match, 140)
+	for k := range ms {
+		ms[k] = matcher.MatchFromFilterRule(tailcfg.FilterRule{
+			SrcIPs:   []string{fmt.Sprintf("192.0.2.%d", k+1)},
+			DstPorts: []tailcfg.NetPortRange{{IP: "*", Ports: tailcfg.PortRangeAny}},
+		})
+	}
+
+	ms[70] = ms[0]
+	_, _, prev := cachedMatcherSides(ms, nodes, nil)
+	rng := rand.New(rand.NewPCG(7, 19)) //nolint:gosec // reproducible test input
+
+	for i, n := range nodes.All() {
+		old := prev.nodes[n.ID()]
+		if i%4 != 0 {
+			old.src, old.dst = make([]uint64, 3), make([]uint64, 3)
+
+			for k := range ms {
+				if i%4 == 3 || (i%4 == 2 && rng.IntN(20) == 0) {
+					old.src = setBit(old.src, 3, k)
+				}
+
+				if i%4 == 3 || (i%4 == 2 && rng.IntN(20) == 0) {
+					old.dst = setBit(old.dst, 3, k)
+				}
+			}
+		}
+
+		if i == 2 {
+			// Duplicate old slots disagree deliberately: only slot zero may be reused.
+			old.src, old.dst = []uint64{1, 0, 0}, []uint64{0, 1 << 6, 0}
+		}
+
+		prev.nodes[n.ID()] = old
+	}
+
+	frozen := &sideCache{keys: slices.Clone(prev.keys), nodes: make(map[types.NodeID]cachedSides)}
+	for id, old := range prev.nodes {
+		frozen.nodes[id] = cachedSides{node: old.node, src: slices.Clone(old.src), dst: slices.Clone(old.dst)}
+	}
+
+	reordered := slices.Clone(ms)
+	slices.Reverse(reordered)
+
+	fresh := matcher.MatchFromFilterRule(tailcfg.FilterRule{
+		SrcIPs:   []string{nodes.At(0).IPv4().String()},
+		DstPorts: []tailcfg.NetPortRange{{IP: nodes.At(1).IPv6().String(), Ports: tailcfg.PortRangeAny}},
+	})
+	for name, next := range map[string][]matcher.Match{
+		"same":       ms,
+		"reverse":    reordered,
+		"remove":     ms[65:],
+		"insert":     slices.Insert(slices.Clone(ms), 64, fresh),
+		"duplicates": {ms[70], ms[0], ms[0], ms[139], fresh},
+		"empty":      nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			// Include an invalid view and an unchanged node set in a different order.
+			in := []types.NodeView{{}}
+			for i := nodes.Len() - 1; i >= 0; i-- {
+				in = append(in, nodes.At(i))
+			}
+
+			input := views.SliceOf(in)
+			wantSrc, wantDst := matcherSides(next, input)
+
+			keys := make([]string, len(next))
+			for k := range next {
+				keys[k] = matcherKey(&next[k])
+			}
+
+			for i, node := range input.All() {
+				if !node.Valid() {
+					continue
+				}
+
+				old, ok := prev.lookup(node)
+				if !ok {
+					continue
+				}
+
+				if slices.Equal(keys, prev.keys) {
+					wantSrc[i], wantDst[i] = old.src, old.dst
+					continue
+				}
+
+				src, dst := wantSrc[i], wantDst[i]
+				wantSrc[i], wantDst[i] = nil, nil
+
+				for k, key := range keys {
+					o := slices.Index(prev.keys, key)
+
+					source, dest := bitSet(src, k), bitSet(dst, k)
+					if o >= 0 {
+						source, dest = bitSet(old.src, o), bitSet(old.dst, o)
+					}
+
+					if source {
+						wantSrc[i] = setBit(wantSrc[i], (len(next)+63)/64, k)
+					}
+
+					if dest {
+						wantDst[i] = setBit(wantDst[i], (len(next)+63)/64, k)
+					}
+				}
+			}
+
+			src, dst, _ := cachedMatcherSides(next, input, prev)
+			require.Equal(t, wantSrc, src)
+			require.Equal(t, wantDst, dst)
+			require.Equal(t, frozen, prev, "previous cache changed")
+		})
+	}
+}
+
+// BenchmarkMatcherSideRemap keeps old and new inputs fixed across iterations;
+// fresh keys match the same nodes but require evaluation rather than reuse.
+func BenchmarkMatcherSideRemap(b *testing.B) {
+	for _, size := range [][2]int{{100, 10}, {1000, 100}, {10000, 1000}, {10000, 100}, {1000, 1000}} {
+		for _, shape := range []string{"sparse", "dense"} {
+			b.Run(fmt.Sprintf("%s/nodes=%d/rules=%d", shape, size[0], size[1]), func(b *testing.B) {
+				nodes := scanManyRulesNodes(size[0]).ViewSlice()
+
+				rules := make([]tailcfg.FilterRule, size[1])
+				for k := range rules {
+					src := []string{nodes.At(k % nodes.Len()).IPv4().String(), fmt.Sprintf("2001:db8::%x", k+1)}
+
+					dst := nodes.At((k + 1) % nodes.Len()).IPv4().String()
+					if shape == "dense" {
+						src[0], dst = "100.64.0.0/10", "100.64.0.0/10"
+					}
+
+					rules[k] = tailcfg.FilterRule{SrcIPs: src, DstPorts: []tailcfg.NetPortRange{{IP: dst, Ports: tailcfg.PortRangeAny}}}
+				}
+
+				ms := matcher.MatchesFromFilterRules(rules)
+				_, _, prev := cachedMatcherSides(ms, nodes, nil)
+
+				for _, change := range []string{"same", "one", "few", "all", "reverse"} {
+					b.Run(change, func(b *testing.B) {
+						next := slices.Clone(ms)
+						count := 0
+
+						switch change {
+						case "one":
+							count = 1
+						case "few":
+							count = 3
+						case "all":
+							count = len(next)
+						case "reverse":
+							slices.Reverse(next)
+						}
+
+						for k := range count {
+							rule := rules[k]
+							rule.SrcIPs = append(slices.Clone(rule.SrcIPs), fmt.Sprintf("2001:db8:1::%x", k+1))
+							next[k] = matcher.MatchFromFilterRule(rule)
+						}
+
+						wantSrc, wantDst := matcherSides(next, nodes)
+						src, dst, _ := cachedMatcherSides(next, nodes, prev)
+						require.Equal(b, wantSrc, src)
+						require.Equal(b, wantDst, dst)
+						b.ReportAllocs()
+
+						for b.Loop() {
+							cachedMatcherSides(next, nodes, prev)
+						}
+					})
+				}
+			})
+		}
+	}
+}
+
+func bitSet(side []uint64, k int) bool {
+	return side != nil && side[k/64]&(1<<(k%64)) != 0 //nolint:mnd
+}
