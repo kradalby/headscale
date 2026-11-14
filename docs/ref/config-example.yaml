@@ -442,13 +442,6 @@ tuning:
   # How often queued changes are sent to clients as one update; must be
   # positive.
   batch_change_delay: 800ms
-  # Accepted for compatibility but has no effect. Graph map streams do not use
-  # this queue size.
-  node_mapsession_buffered_chan_size: 30
-  # Accepted for compatibility but has no effect. Each graph map stream renders
-  # its own updates.
-  # Default: three quarters of the CPU cores, at least one.
-  batcher_workers: 0
   # How long a pending registration waits to be completed. Zero uses the
   # default.
   register_cache_expiration: 15m

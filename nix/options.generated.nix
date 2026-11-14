@@ -987,23 +987,6 @@ in
       '';
       example = "500ms";
     };
-    node_mapsession_buffered_chan_size = lib.mkOption {
-      type = lib.types.int;
-      default = 30;
-      description = ''
-        Accepted for compatibility but has no effect. Graph map streams do not use this queue size.
-      '';
-      example = 60;
-    };
-    batcher_workers = lib.mkOption {
-      type = lib.types.int;
-      default = 0;
-      defaultText = lib.literalMD "three quarters of the CPU cores, at least one";
-      description = ''
-        Accepted for compatibility but has no effect. Each graph map stream renders its own updates.
-      '';
-      example = 8;
-    };
     register_cache_expiration = lib.mkOption {
       type = t.duration;
       default = "15m";

@@ -124,8 +124,6 @@ var configFieldDocs = map[string]string{
 	"TLSConfig.KeyPath":                                   "The PEM private key file of `tls.cert_path`, relative to the configuration file.",
 	"TaildropConfig.Enabled":                              "Gives every node the file-sharing capability. False omits it from the baseline; a policy `nodeAttrs` grant can still give it.",
 	"Tuning.BatchChangeDelay":                             "How often queued changes are sent to clients as one update; must be positive.",
-	"Tuning.BatcherWorkers":                               "Accepted for compatibility but has no effect. Each graph map stream renders its own updates.",
-	"Tuning.NodeMapSessionBufferedChanSize":               "Accepted for compatibility but has no effect. Graph map streams do not use this queue size.",
 	"Tuning.NodeStoreBatchSize":                           "The maximum number of writes a graph commit waits to collect during an HA route outage; must be positive. Outside an outage, commits do not wait for a batch. Writes arriving during a commit can share the next one, with affected graph inputs and derived values updated together.",
 	"Tuning.NodeStoreBatchTimeout":                        "The longest a graph commit waits to collect writes during an HA route outage; must be positive. Outside an outage, commits do not wait for this timeout.",
 	"Tuning.RegisterCacheExpiration":                      "How long a pending registration waits to be completed. Zero uses the default.",
