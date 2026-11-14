@@ -143,6 +143,69 @@ also count against the cgroup limit; the phase log includes the actual DB path.
 CPU/alloc profiles include enrollment and assertions; use a separate trace run when diagnosing
 scheduler or GC delays. The limitations below also apply to churn profiles.
 
+## Registered nodes with a connected subset
+
+`TestScalePartialTailnet` separates registered population from connected control
+clients. Its ordinary smoke test uses 20 registered nodes and 10 connected
+clients, with `self` and `per_user` policies. Both allow same-user TCP 443;
+`per_user` has one explicit grant per user, including offline users. Set
+`HEADSCALE_STRESS_REGISTERED` and `HEADSCALE_STRESS_CONNECTED` independently to
+select larger populations. Both counts must be multiples of ten, with at least
+ten connected clients and one additional offline user group.
+
+Every node authenticates over Noise and receives an initial map. Offline user
+groups enroll first in batches of at most 32 clients; those clients close after
+the batch's initial maps, leaving durable registrations. Only node views, IDs,
+keys and weak collection probes remain. Setup convergence waits for the server's
+15-second reconnect grace before requiring offline state. Active user groups then enroll and keep
+their streams open. The test never holds a client for every registered node.
+Whole user groups form the connected subset, so active clients' same-user peers
+are all online. Offline nodes still contribute to graph and policy size, and
+cross-user packet probes include offline addresses.
+
+Ten cohorts delete and replace every active member once with fresh authenticated
+keys and durable IDs. Policy revocation and restoration precede replacement in
+rounds four and five. Each phase checks exact active peer IDs/keys, forbidden
+cross-user visibility, IPv4/IPv6 packet verdicts, policy generation delivery,
+one session per active client, and every surviving registration's durable
+identity and user ownership. Offline registrations must retain their original
+IDs/keys and stay offline. GC checks retired-client collection after offline
+enrollment and retired-client/old-policy collection after churn while the server
+and active clients remain live. Phase logs separate mutations from convergence;
+offline and active enrollment are separate setup phases.
+
+```sh
+# Ordinary small coverage; also runs without stress environment variables.
+HEADSCALE_DEBUG_POLICY_AUDIT=1 go test ./hscontrol/servertest \
+  -run '^TestScalePartialTailnet$' -count=1 -v
+
+# 1000 registered nodes, only 100 connected control clients.
+HEADSCALE_STRESS_REGISTERED=1000 HEADSCALE_STRESS_CONNECTED=100 \
+  GOMAXPROCS=2 GOMEMLIMIT=2GiB go test -p=2 ./hscontrol/servertest \
+  -run '^TestScalePartialTailnet/1000_registered/100_connected/self$' \
+  -count=1 -v -timeout=30m
+
+# Raise the connected fraction only after checking measured memory headroom.
+HEADSCALE_STRESS_REGISTERED=10000 HEADSCALE_STRESS_CONNECTED=5000 \
+  GOMAXPROCS=2 GOMEMLIMIT=2GiB go test -p=2 ./hscontrol/servertest \
+  -run '^TestScalePartialTailnet/10000_registered/5000_connected/self$' \
+  -count=1 -v -timeout=30m
+```
+
+Serialize heavy comparisons and use the hard memory/swap limits described above.
+Hold connected count and policy shape fixed
+when comparing registered-population growth; report both counts. Ramp from
+1000 registered/100 connected to 5000 registered/100 connected, and inspect
+measured peak memory before larger populations. A 10000 registered/100 connected
+run is not a 10000-connected-client result. These profiles still include test
+clients, setup and assertions; they do not establish a server-only capacity.
+To measure active-client cost, hold registered count fixed and increase the
+connected subset, for example 10000 registered/1000 connected, then 10000/5000
+only if the measured peak projects within the hard memory limit. Select
+`per_user` instead of `self` to exercise explicit grants with the same peer
+output. Keep the existing ten-second login and first-map deadlines; a failure
+is a workload limit to report, not a reason to extend them.
+
 ## Read results and find congestion
 
 Each phase logs wall time, allocated bytes during the phase, ending heap
