@@ -3198,6 +3198,373 @@ func releaseLingeringWrites(t *testing.T, s *State, done <-chan error) error {
 
 var errInjectedUserList = errors.New("injected user listing failure")
 
+func TestRegistrationUserQueries(t *testing.T) {
+	for _, method := range []string{"auth", "pre-auth key", "tagged key", "system tagged key"} {
+		t.Run(method, func(t *testing.T) {
+			_, s, nodeID := persistTestSetup(t)
+			t.Cleanup(func() { _ = s.Close() })
+
+			node, ok := s.GetNodeByID(nodeID)
+			require.True(t, ok)
+
+			userID := node.TypedUserID()
+
+			users := make([]types.User, 100)
+			for i := range users {
+				users[i].Name = "bystander-" + strconv.Itoa(i)
+			}
+
+			require.NoError(t, s.db.DB.Create(&users).Error)
+			require.NoError(t, s.refreshUsers())
+
+			var tags []string
+			if strings.Contains(method, "tagged") {
+				tags = []string{"tag:server"}
+			}
+
+			creator := &userID
+			if method == "system tagged key" {
+				creator = nil
+			}
+
+			pak, err := s.CreatePreAuthKey(creator, true, false, nil, tags)
+			require.NoError(t, err)
+
+			var rows []int64
+
+			require.NoError(t, s.db.DB.Callback().Query().After("gorm:query").Register("test:user-query-rows", func(tx *gorm.DB) {
+				if tx.Statement.Table == "users" {
+					rows = append(rows, tx.RowsAffected)
+					t.Logf("users query: %s; rows=%d", tx.Statement.SQL.String(), tx.RowsAffected)
+				}
+			}))
+
+			machineKey := key.NewMachine().Public()
+			nodeKey := key.NewNode().Public()
+
+			var registeredID types.NodeID
+
+			for range 2 {
+				var registered types.NodeView
+
+				if method == "auth" {
+					authID := types.MustAuthID()
+					require.NoError(t, s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+						MachineKey: machineKey, NodeKey: nodeKey, Hostname: "query-node",
+					})))
+					registered, err = s.HandleNodeFromAuthPath(authID, userID, nil, util.RegisterMethodOIDC)
+				} else {
+					registered, err = s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+						Auth: &tailcfg.RegisterResponseAuth{AuthKey: pak.Key}, NodeKey: nodeKey,
+						Hostinfo: &tailcfg.Hostinfo{Hostname: "query-node"},
+					}, machineKey)
+				}
+
+				require.NoError(t, err)
+				require.True(t, registered.Valid())
+
+				if registeredID != 0 {
+					assert.Equal(t, registeredID, registered.ID(), "reauth must keep the registered node")
+				}
+
+				registeredID = registered.ID()
+				assert.Equal(t, len(tags) != 0, registered.IsTagged())
+			}
+
+			for _, count := range rows {
+				assert.LessOrEqual(t, count, int64(1), "registration must not materialize unrelated users")
+			}
+
+			assert.Len(t, s.Snapshot().Users(), 101, "registration must preserve every policy user")
+		})
+	}
+}
+
+func TestRegistrationPublishesFreshUser(t *testing.T) {
+	for _, method := range []string{"auth", "pre-auth key", "tagged key"} {
+		for _, existing := range []bool{false, true} {
+			t.Run(method+"/existing="+strconv.FormatBool(existing), func(t *testing.T) {
+				_, s, _ := persistTestSetup(t)
+				t.Cleanup(func() { _ = s.Close() })
+
+				user := types.User{
+					Name: "login-user", Provider: util.RegisterMethodOIDC,
+					ProviderIdentifier: sql.NullString{String: "https://issuer.example/old", Valid: true},
+				}
+
+				var (
+					created *types.User
+					err     error
+				)
+				if existing {
+					created, err = s.CreateUser(user)
+				} else {
+					created, err = s.db.CreateUser(user)
+				}
+
+				require.NoError(t, err)
+
+				before := s.Snapshot()
+
+				_, err = s.SetPolicy([]byte(`{"nodeAttrs":[{"target":["current@example.com"],"attr":["randomize-client-port"]}]}`))
+				require.NoError(t, err)
+
+				var tags []string
+				if method == "tagged key" {
+					tags = []string{"tag:server"}
+				}
+
+				pak, err := s.CreatePreAuthKey(created.TypedID(), true, false, nil, tags)
+				require.NoError(t, err)
+
+				// Change the row after registration loaded its identity, before its node commits.
+				require.NoError(t, s.db.DB.Callback().Create().Before("gorm:create").Register("test:fresh-login-user", func(tx *gorm.DB) {
+					if tx.Statement.Table == "nodes" {
+						err := tx.Session(&gorm.Session{NewDB: true}).Model(&types.User{}).Where("id = ?", created.ID).Updates(map[string]any{
+							"name": "current-user", "email": "current@example.com", "display_name": "Current User",
+							"profile_pic_url": "https://example.com/current", "provider_identifier": "https://issuer.example/current",
+						}).Error
+						_ = tx.AddError(err)
+					}
+				}))
+
+				machineKey := key.NewMachine().Public()
+				nodeKey := key.NewNode().Public()
+
+				var node types.NodeView
+
+				if method == "auth" {
+					authID := types.MustAuthID()
+					require.NoError(t, s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+						MachineKey: machineKey, NodeKey: nodeKey, Hostname: "fresh-user-node",
+					})))
+					node, err = s.HandleNodeFromAuthPath(authID, types.UserID(created.ID), nil, util.RegisterMethodOIDC)
+				} else {
+					node, err = s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+						Auth: &tailcfg.RegisterResponseAuth{AuthKey: pak.Key}, NodeKey: nodeKey,
+						Hostinfo: &tailcfg.Hostinfo{Hostname: "fresh-user-node"},
+					}, machineKey)
+				}
+
+				require.NoError(t, err)
+
+				stored, err := s.GetUserByID(types.UserID(created.ID))
+				require.NoError(t, err)
+				require.Equal(t, "current-user", stored.Name)
+
+				users := s.Snapshot().Users()
+				require.Len(t, users, 2)
+				idx := slices.IndexFunc(users, func(u types.User) bool { return u.ID == created.ID })
+				require.NotEqual(t, -1, idx)
+				assert.Equal(t, *stored, users[idx], "policy users must carry the fresh identity and profile")
+
+				current, ok := s.GetNodeByID(node.ID())
+				require.True(t, ok)
+
+				if method == "tagged key" {
+					assert.True(t, current.IsTagged())
+					assert.False(t, current.UserID().Valid())
+				} else {
+					assert.Equal(t, stored.TailscaleUserProfile(), current.User().TailscaleUserProfile())
+					assert.NotEmpty(t, s.Snapshot().Policy().NodeCapMap(node.ID()), "the current email must resolve in policy")
+				}
+
+				if method != "auth" {
+					assert.Equal(t, stored.TailscaleUserProfile(), current.AuthKey().User().TailscaleUserProfile())
+				}
+
+				for _, old := range before.Users() {
+					assert.NotEqual(t, "current-user", old.Name, "old snapshots must retain their user values")
+				}
+			})
+		}
+	}
+}
+
+func TestRegistrationUserAmbiguity(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	_, err := s.SetPolicy([]byte(`{"nodeAttrs":[{"target":["persist-user@"],"attr":["randomize-client-port"]}]}`))
+	require.NoError(t, err)
+	require.NotEmpty(t, s.Snapshot().Policy().NodeCapMap(nodeID))
+
+	user, err := s.db.CreateUser(types.User{
+		Name: "persist-user", Provider: util.RegisterMethodOIDC,
+		ProviderIdentifier: sql.NullString{String: "https://issuer.example/other", Valid: true},
+	})
+	require.NoError(t, err)
+
+	validations := 0
+	s.beforeAmbiguityCheck = func() { validations++ }
+	machineKey := key.NewMachine().Public()
+	nodeKey := key.NewNode().Public()
+
+	for range 2 {
+		authID := types.MustAuthID()
+		require.NoError(t, s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+			MachineKey: machineKey, NodeKey: nodeKey, Hostname: "ambiguous-user-node",
+		})))
+		_, err := s.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, util.RegisterMethodOIDC)
+		require.NoError(t, err)
+		assert.Empty(t, s.Snapshot().Policy().NodeCapMap(nodeID), "a newly ambiguous name must grant nothing")
+		assert.Equal(t, 1, validations, "only the first registration changes the identity set")
+	}
+}
+
+func TestRegistrationUserPublicationOrder(t *testing.T) {
+	for _, mutation := range []string{"rename", "create", "delete"} {
+		t.Run(mutation, func(t *testing.T) {
+			_, s, nodeID := persistTestSetup(t)
+			t.Cleanup(func() { _ = s.Close() })
+
+			node, ok := s.GetNodeByID(nodeID)
+			require.True(t, ok)
+
+			userID := node.TypedUserID()
+			pak, err := s.CreatePreAuthKey(&userID, true, false, nil, nil)
+			require.NoError(t, err)
+
+			resume := make(chan struct{})
+
+			release := sync.OnceFunc(func() { close(resume) })
+			defer release()
+
+			reached := make(chan struct{})
+
+			var paused atomic.Bool
+
+			s.beforeUsersPublish = func() {
+				if !paused.Swap(true) {
+					close(reached)
+					<-resume
+				}
+			}
+			before := s.Snapshot()
+			registered := make(chan error, 1)
+
+			go func() {
+				_, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+					Auth: &tailcfg.RegisterResponseAuth{AuthKey: pak.Key}, NodeKey: node.NodeKey(),
+					Hostinfo: &tailcfg.Hostinfo{Hostname: node.Hostname()},
+				}, node.MachineKey())
+				registered <- err
+			}()
+
+			<-reached
+
+			if mutation == "delete" {
+				err := s.DeleteNode(node)
+				require.NoError(t, err)
+			}
+
+			changed := make(chan error, 1)
+
+			go func() {
+				var err error
+
+				switch mutation {
+				case "rename":
+					_, err = s.RenameUser(userID, "current-user")
+				case "create":
+					_, err = s.CreateUser(types.User{Name: "created-user"})
+				case "delete":
+					err = s.DeleteUser(userID)
+				}
+
+				changed <- err
+			}()
+
+			require.Eventually(t, func() bool {
+				if mutation == "create" {
+					_, err := s.GetUserByName("created-user")
+					return err == nil
+				}
+
+				u, err := s.GetUserByID(userID)
+				if mutation == "delete" {
+					return errors.Is(err, db.ErrUserNotFound)
+				}
+
+				return err == nil && u.Name == "current-user"
+			}, 5*time.Second, time.Millisecond, "user mutation must commit while registration holds publication")
+
+			release()
+			require.NoError(t, <-registered)
+			require.NoError(t, <-changed)
+
+			users, err := s.ListAllUsers()
+			require.NoError(t, err)
+			assert.Equal(t, users, s.Snapshot().Users(), "registration must not overwrite a newer full refresh")
+			assert.Equal(t, "persist-user", before.Users()[0].Name)
+
+			if mutation == "delete" {
+				recreated, err := s.CreateUser(types.User{Name: "persist-user"})
+				require.NoError(t, err)
+				assert.NotEqual(t, uint(userID), recreated.ID)
+				require.Len(t, s.Snapshot().Users(), 1)
+				assert.Equal(t, recreated.ID, s.Snapshot().Users()[0].ID)
+			}
+		})
+	}
+}
+
+// BenchmarkRegistrationUsers holds the node population fixed while user count grows.
+func BenchmarkRegistrationUsers(b *testing.B) {
+	for _, count := range []int{10, 100, 500, 1000} {
+		b.Run("users="+strconv.Itoa(count), func(b *testing.B) {
+			cfg := persistTestConfig(b.TempDir() + "/headscale.db")
+			database, err := db.NewHeadscaleDatabase(cfg)
+			require.NoError(b, err)
+
+			users := make([]types.User, count)
+			for i := range users {
+				users[i].Name = "bench-user-" + strconv.Itoa(i)
+			}
+
+			require.NoError(b, database.DB.CreateInBatches(&users, 100).Error)
+			require.NoError(b, database.Close())
+
+			s, err := NewState(cfg)
+			require.NoError(b, err)
+			b.Cleanup(func() { _ = s.Close() })
+
+			userID := types.UserID(users[count-1].ID)
+			pak, err := s.CreatePreAuthKey(&userID, true, false, nil, nil)
+			require.NoError(b, err)
+
+			request := tailcfg.RegisterRequest{
+				Auth: &tailcfg.RegisterResponseAuth{AuthKey: pak.Key}, NodeKey: key.NewNode().Public(),
+				Hostinfo: &tailcfg.Hostinfo{Hostname: "bench-node"},
+			}
+			machineKey := key.NewMachine().Public()
+			_, err = s.HandleNodeFromPreAuthKey(request, machineKey)
+			require.NoError(b, err)
+
+			var rows, queries int64
+
+			require.NoError(b, s.db.DB.Callback().Query().After("gorm:query").Register("bench:user-query-rows", func(tx *gorm.DB) {
+				if tx.Statement.Table == "users" {
+					rows += tx.RowsAffected
+					queries++
+				}
+			}))
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				_, err := s.HandleNodeFromPreAuthKey(request, machineKey)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			b.ReportMetric(float64(rows)/float64(b.N), "user-rows/op")
+			b.ReportMetric(float64(queries)/float64(b.N), "user-queries/op")
+		})
+	}
+}
+
 // TestCommittedRegistrationSurvivesUserRefreshFailure pins D29: once a
 // registration has committed its node, a failure to refresh the policy's
 // users must not fail the request. The client would see an error for a
@@ -3206,10 +3573,13 @@ func TestCommittedRegistrationSurvivesUserRefreshFailure(t *testing.T) {
 	// failUserListsAfterSave fails every users query once a node row is
 	// created, which reaches the refresh but not the registration's own
 	// lookups.
-	failUserListsAfterSave := func(t *testing.T, s *State) {
+	failUserListsAfterSave := func(t *testing.T, s *State) *atomic.Int32 {
 		t.Helper()
 
-		var saved atomic.Bool
+		var (
+			saved  atomic.Bool
+			failed atomic.Int32
+		)
 
 		gdb := s.DB().DB
 		require.NoError(t, gdb.Callback().Create().After("gorm:create").Register("test:node-saved", func(tx *gorm.DB) {
@@ -3219,9 +3589,13 @@ func TestCommittedRegistrationSurvivesUserRefreshFailure(t *testing.T) {
 		}))
 		require.NoError(t, gdb.Callback().Query().Before("gorm:query").Register("test:fail-users", func(tx *gorm.DB) {
 			if saved.Load() && tx.Statement.Table == "users" {
+				failed.Add(1)
+
 				_ = tx.AddError(errInjectedUserList)
 			}
 		}))
+
+		return &failed
 	}
 
 	t.Run("pre-auth key", func(t *testing.T) {
@@ -3232,7 +3606,7 @@ func TestCommittedRegistrationSurvivesUserRefreshFailure(t *testing.T) {
 		pak, err := s.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
 		require.NoError(t, err)
 
-		failUserListsAfterSave(t, s)
+		failed := failUserListsAfterSave(t, s)
 
 		nodeKey := key.NewNode().Public()
 		node, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
@@ -3242,6 +3616,7 @@ func TestCommittedRegistrationSurvivesUserRefreshFailure(t *testing.T) {
 		}, key.NewMachine().Public())
 		require.NoError(t, err, "a committed registration must not fail on the refresh")
 		require.True(t, node.Valid())
+		assert.EqualValues(t, 1, failed.Load(), "the postcommit refresh must exercise its error path")
 
 		stored, ok := s.GetNodeByNodeKey(nodeKey)
 		require.True(t, ok)
@@ -3254,7 +3629,7 @@ func TestCommittedRegistrationSurvivesUserRefreshFailure(t *testing.T) {
 
 		user := s.CreateUserForTest("refresh-auth")
 
-		failUserListsAfterSave(t, s)
+		failed := failUserListsAfterSave(t, s)
 
 		nodeKey := key.NewNode().Public()
 		authID := types.MustAuthID()
@@ -3268,6 +3643,7 @@ func TestCommittedRegistrationSurvivesUserRefreshFailure(t *testing.T) {
 		node, err := s.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, util.RegisterMethodOIDC)
 		require.NoError(t, err, "a committed registration must not fail on the refresh")
 		require.True(t, node.Valid())
+		assert.EqualValues(t, 1, failed.Load(), "the postcommit refresh must exercise its error path")
 
 		stored, ok := s.GetNodeByNodeKey(nodeKey)
 		require.True(t, ok)
