@@ -122,6 +122,40 @@ paths, including statsviz. `/metrics` accepts any Host.
 
     Access the debug interface on your device by opening `http://<IP_OF_HEADSCALE>:9090/debug/` in your web browser.
 
+### Graph explorer
+
+Debug builds serve a graph explorer at `/debug/graph/` on the metrics and debug listener. It draws the control plane's
+cells, devices, users, tags, routes, DERP regions and extra DNS records as one snapshot shows them, and can follow
+changes live. Only the flake's `headscale-debug` package includes it:
+
+```console
+nix build .#headscale-debug
+./result/bin/headscale serve
+```
+
+Release binaries, container images, `go build` and the default `nix build` omit it: `/debug/graph/` answers 404, the
+`/debug/` index does not link it and the rest of the debug interface is unchanged.
+
+The explorer shows the policy source, every device's packet filter and SSH policy, so it has the gate of `/debug/policy`,
+`/debug/filter` and `/debug/ssh`: loopback, Tailscale addresses, `TS_ALLOW_DEBUG_IP` or the debug key. Unlike
+`/debug/statsviz/` it does not admit other private-network addresses. The page carries the `debugkey` parameter to its
+own assets and requests and sends no `Referer`. Data requests a browser marks as cross-site are refused, as are those
+from browsers that mark no site but name another host as their origin.
+
+Bounds and cost:
+
+- A scene holds at most 200 objects and 1000 relationships; search or focus to see others. Search and focus are
+  limited to 512 bytes each and responses to 2 MiB; a larger scene or detail returns an error.
+- Every scene scans all devices. A live viewer repeats that up to four times a second while anything changes, even
+  outside its scene, so the cost grows with tailnet size times live viewers. Prefer paused snapshots on large
+  tailnets.
+- At most four live viewers are connected at once; another live connection is refused with 503 until one closes. A
+  hidden browser tab closes its live connection and reloads the scene when shown again. A live connection ends after
+  a minute and the browser reconnects for a new baseline, so a viewer that vanished without closing its connection
+  holds its place for at most that long.
+- Details are answered for the last eight scenes sent to any viewer. Older revisions answer 409 and the page asks for
+  a refresh. The retained snapshots share unchanged state with the current one.
+
 ### Checking control-plane progress
 
 These signals describe different stages of an update:

@@ -19,6 +19,15 @@ permissions:
   contents: read
 
 jobs:
+  debug-graph:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: NixOS/nix-installer-action@v1.0.0
+      - uses: Mic92/hestia@v3.1.0
+      - name: debug-graph
+        run: nix build -L .#checks.x86_64-linux.debug-graph .#checks.x86_64-linux.debug-build .#checks.x86_64-linux.debug-gotest
+
   build:
     runs-on: ubuntu-latest
     steps:
