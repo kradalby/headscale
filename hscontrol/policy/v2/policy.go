@@ -2464,6 +2464,7 @@ type viaPrep struct {
 	grants   []Grant
 	srcs     []*netipx.IPSet
 	dsts     [][]netip.Prefix
+	dstSets  []*netipx.IPSet
 	internet []bool
 	// reachesInternet is the regular grant's immutable destination test;
 	// rebuilding its IPSet for every viewer/router pair costs tailnet size.
@@ -2538,6 +2539,7 @@ func (pm *PolicyManager) viaPrep() *viaPrep {
 			grants:          grants,
 			srcs:            make([]*netipx.IPSet, len(grants)),
 			dsts:            make([][]netip.Prefix, len(grants)),
+			dstSets:         make([]*netipx.IPSet, len(grants)),
 			internet:        make([]bool, len(grants)),
 			reachesInternet: make([]bool, len(grants)),
 			primary:         make([]map[netip.Prefix]types.NodeID, len(grants)),
@@ -2571,6 +2573,12 @@ func (pm *PolicyManager) viaPrep() *viaPrep {
 			prep.dsts[i], prep.internet[i] = resolveViaDestinations(pm.pol, pm.users, pm.nodes, grant.Destinations)
 
 			if !grant.HasVia() {
+				var dst netipx.IPSetBuilder
+				for _, prefix := range prep.dsts[i] {
+					dst.AddPrefix(prefix)
+				}
+
+				prep.dstSets[i], _ = dst.IPSet()
 				prep.reachesInternet[i] = grantReachesInternet(grant, prep.dsts[i])
 
 				candidates = append(candidates, nil)
@@ -3097,6 +3105,17 @@ func (pm *PolicyManager) viaRoutesForPeer(viewer, peer types.NodeView, primary f
 			}
 
 			if !matchViewer(i) {
+				continue
+			}
+
+			// Most node-only grants cannot reach these routes. Keep the
+			// ordered prefix scan only for grants that can affect steering.
+			overlaps := func(p netip.Prefix) bool {
+				return !tsaddr.IsExitRoute(p) && prep.dstSets[i].OverlapsPrefix(p)
+			}
+			if !prep.reachesInternet[i] &&
+				!slices.ContainsFunc(result.Include, overlaps) &&
+				!slices.ContainsFunc(result.Exclude, overlaps) {
 				continue
 			}
 
