@@ -987,27 +987,31 @@ func (pm *PolicyManager) filterChangedNodes(prev *PolicyManager, perNode bool) (
 
 // changedRules returns the rules in only one of a and b.
 func changedRules(a, b []tailcfg.FilterRule) []tailcfg.FilterRule {
-	count := func(rules []tailcfg.FilterRule) map[string]int {
+	count := func(rules []tailcfg.FilterRule) (map[string]int, []string) {
 		m := make(map[string]int, len(rules))
-		for _, r := range rules {
-			m[ruleKey(r)]++
+		keys := make([]string, len(rules))
+
+		for i, r := range rules {
+			keys[i] = ruleKey(r)
+			m[keys[i]]++
 		}
 
-		return m
+		return m, keys
 	}
 
-	inA, inB := count(a), count(b)
+	inA, keysA := count(a)
+	inB, keysB := count(b)
 
 	var out []tailcfg.FilterRule
 
-	for _, r := range a {
-		if inB[ruleKey(r)] == 0 {
+	for i, r := range a {
+		if inB[keysA[i]] == 0 {
 			out = append(out, r)
 		}
 	}
 
-	for _, r := range b {
-		if inA[ruleKey(r)] == 0 {
+	for i, r := range b {
+		if inA[keysB[i]] == 0 {
 			out = append(out, r)
 		}
 	}

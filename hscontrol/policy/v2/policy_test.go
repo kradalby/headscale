@@ -35,6 +35,178 @@ import (
 	"tailscale.com/util/multierr"
 )
 
+func TestChangedRules(t *testing.T) {
+	t.Parallel()
+
+	tcp := tailcfg.FilterRule{
+		SrcIPs:  []string{"100.64.0.1", "fd7a:115c:a1e0::1"},
+		IPProto: []int{ProtocolTCP},
+		DstPorts: []tailcfg.NetPortRange{
+			{IP: "100.64.0.2", Ports: tailcfg.PortRange{First: 443, Last: 443}},
+			{IP: "fd7a:115c:a1e0::2", Ports: tailcfg.PortRange{First: 8000, Last: 9000}},
+		},
+	}
+	udp := tcp
+	udp.IPProto = []int{ProtocolUDP}
+	icmp := tcp
+	icmp.IPProto = []int{1, 58}
+	otherSource := tcp
+	otherSource.SrcIPs = []string{"100.64.0.3", "fd7a:115c:a1e0::3"}
+	otherDestination := tcp
+	otherDestination.DstPorts = slices.Clone(tcp.DstPorts)
+	otherDestination.DstPorts[1].IP = "fd7a:115c:a1e0::3"
+	otherFirst := tcp
+	otherFirst.DstPorts = slices.Clone(tcp.DstPorts)
+	otherFirst.DstPorts[1].Ports.First++
+	otherLast := tcp
+	otherLast.DstPorts = slices.Clone(tcp.DstPorts)
+	otherLast.DstPorts[1].Ports.Last++
+	both := tcp
+	both.IPProto = []int{ProtocolTCP, ProtocolUDP}
+	reversed := tcp
+	reversed.IPProto = []int{ProtocolUDP, ProtocolTCP}
+	capRule := tailcfg.FilterRule{
+		SrcIPs: slices.Clone(tcp.SrcIPs),
+		CapGrant: []tailcfg.CapGrant{{
+			Dsts: []netip.Prefix{netip.MustParsePrefix("100.64.0.2/32"), netip.MustParsePrefix("fd7a:115c:a1e0::2/128")},
+			CapMap: tailcfg.PeerCapMap{
+				"example.com/a": {`{"role":"reader"}`, `{"role":"writer"}`},
+				"example.com/b": {`true`},
+			},
+		}},
+	}
+	reorderedMap := capRule
+	reorderedMap.CapGrant = slices.Clone(capRule.CapGrant)
+	reorderedMap.CapGrant[0].CapMap = make(tailcfg.PeerCapMap)
+	reorderedMap.CapGrant[0].CapMap["example.com/b"] = capRule.CapGrant[0].CapMap["example.com/b"]
+	reorderedMap.CapGrant[0].CapMap["example.com/a"] = capRule.CapGrant[0].CapMap["example.com/a"]
+	otherValues := capRule
+	otherValues.CapGrant = slices.Clone(capRule.CapGrant)
+	otherValues.CapGrant[0].CapMap = maps.Clone(capRule.CapGrant[0].CapMap)
+	otherValues.CapGrant[0].CapMap["example.com/a"] = []tailcfg.RawMessage{`{"role":"writer"}`, `{"role":"reader"}`}
+	otherCapDestination := capRule
+	otherCapDestination.CapGrant = slices.Clone(capRule.CapGrant)
+	otherCapDestination.CapGrant[0].Dsts = []netip.Prefix{netip.MustParsePrefix("fd7a:115c:a1e0::3/128")}
+
+	tests := []struct {
+		name string
+		a, b []tailcfg.FilterRule
+		want []tailcfg.FilterRule
+	}{
+		{name: "nil"},
+		{name: "empty", a: []tailcfg.FilterRule{}, b: []tailcfg.FilterRule{}},
+		{name: "nil and empty", b: []tailcfg.FilterRule{}},
+		{name: "empty fields", a: []tailcfg.FilterRule{{}}, b: []tailcfg.FilterRule{{SrcIPs: []string{}, IPProto: []int{}, DstPorts: []tailcfg.NetPortRange{}, CapGrant: []tailcfg.CapGrant{}}}},
+		{name: "added", b: []tailcfg.FilterRule{tcp, capRule}, want: []tailcfg.FilterRule{tcp, capRule}},
+		{name: "removed", a: []tailcfg.FilterRule{capRule, udp}, want: []tailcfg.FilterRule{capRule, udp}},
+		{name: "unchanged", a: []tailcfg.FilterRule{tcp, capRule}, b: []tailcfg.FilterRule{tcp, capRule}},
+		{name: "reordered", a: []tailcfg.FilterRule{tcp, udp, capRule}, b: []tailcfg.FilterRule{capRule, udp, tcp}},
+		{name: "fewer shared duplicates", a: []tailcfg.FilterRule{tcp, tcp}, b: []tailcfg.FilterRule{tcp}},
+		{name: "more shared duplicates", a: []tailcfg.FilterRule{tcp}, b: []tailcfg.FilterRule{tcp, tcp}},
+		{name: "ordered unique duplicates", a: []tailcfg.FilterRule{udp, capRule, tcp, udp}, b: []tailcfg.FilterRule{icmp, tcp, icmp}, want: []tailcfg.FilterRule{udp, capRule, udp, icmp, icmp}},
+		{name: "tcp to udp", a: []tailcfg.FilterRule{tcp}, b: []tailcfg.FilterRule{udp}, want: []tailcfg.FilterRule{tcp, udp}},
+		{name: "other protocols", a: []tailcfg.FilterRule{udp}, b: []tailcfg.FilterRule{icmp}, want: []tailcfg.FilterRule{udp, icmp}},
+		{name: "protocol order", a: []tailcfg.FilterRule{both}, b: []tailcfg.FilterRule{reversed}, want: []tailcfg.FilterRule{both, reversed}},
+		{name: "source", a: []tailcfg.FilterRule{tcp}, b: []tailcfg.FilterRule{otherSource}, want: []tailcfg.FilterRule{tcp, otherSource}},
+		{name: "destination", a: []tailcfg.FilterRule{tcp}, b: []tailcfg.FilterRule{otherDestination}, want: []tailcfg.FilterRule{tcp, otherDestination}},
+		{name: "first port", a: []tailcfg.FilterRule{tcp}, b: []tailcfg.FilterRule{otherFirst}, want: []tailcfg.FilterRule{tcp, otherFirst}},
+		{name: "last port", a: []tailcfg.FilterRule{tcp}, b: []tailcfg.FilterRule{otherLast}, want: []tailcfg.FilterRule{tcp, otherLast}},
+		{name: "capability map order", a: []tailcfg.FilterRule{capRule}, b: []tailcfg.FilterRule{reorderedMap}},
+		{name: "capability value order", a: []tailcfg.FilterRule{capRule}, b: []tailcfg.FilterRule{otherValues}, want: []tailcfg.FilterRule{capRule, otherValues}},
+		{name: "capability destination", a: []tailcfg.FilterRule{capRule}, b: []tailcfg.FilterRule{otherCapDestination}, want: []tailcfg.FilterRule{capRule, otherCapDestination}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, tt.want, changedRules(tt.a, tt.b))
+		})
+	}
+}
+
+func TestChangedRulesKeyAllocations(t *testing.T) {
+	// Wide keys make redundant serialization dominate the temporary maps.
+	sources := make([]string, 256)
+	for i := range sources {
+		sources[i] = fmt.Sprintf("fd7a:115c:a1e0::%x", i+1)
+	}
+
+	rules := make([]tailcfg.FilterRule, 16)
+	for i := range rules {
+		rules[i] = tailcfg.FilterRule{
+			SrcIPs:  sources,
+			IPProto: []int{ProtocolTCP},
+			DstPorts: []tailcfg.NetPortRange{
+				{IP: fmt.Sprintf("100.64.0.%d", i+1), Ports: tailcfg.PortRange{First: 443, Last: 443}},
+			},
+		}
+	}
+
+	keyAllocs := testing.AllocsPerRun(5, func() { runtime.KeepAlive(ruleKey(rules[0])) })
+	got := testing.AllocsPerRun(5, func() { runtime.KeepAlive(changedRules(rules, rules)) })
+	assert.Less(t, got, 3*float64(len(rules))*keyAllocs,
+		"keys for both inputs should be built once, with room for maps and slices")
+}
+
+func BenchmarkChangedRules(b *testing.B) {
+	for _, count := range []int{1, 10, 100, 500} {
+		for _, width := range []int{2, 20, 200} {
+			b.Run(fmt.Sprintf("rules=%d/sources=%d", count, width), func(b *testing.B) {
+				old := make([]tailcfg.FilterRule, count)
+				for i := range old {
+					sources := make([]string, width)
+					for j := range sources {
+						if j%2 == 0 {
+							sources[j] = fmt.Sprintf("100.%d.%d.%d", 64+i/256, i%256, j/2+1)
+						} else {
+							sources[j] = fmt.Sprintf("fd7a:115c:a1e0:%x::%x", i, j/2+1)
+						}
+					}
+
+					old[i] = tailcfg.FilterRule{
+						SrcIPs:  sources,
+						IPProto: []int{ProtocolTCP},
+						DstPorts: []tailcfg.NetPortRange{
+							{IP: sources[0], Ports: tailcfg.PortRange{First: 443, Last: 443}},
+						},
+					}
+				}
+
+				oneChanged := slices.Clone(old)
+				oneChanged[0].IPProto = []int{ProtocolUDP}
+
+				disjoint := slices.Clone(old)
+				for i := range disjoint {
+					disjoint[i].IPProto = []int{ProtocolUDP}
+				}
+
+				reordered := slices.Clone(old)
+				slices.Reverse(reordered)
+
+				for _, tc := range []struct {
+					name string
+					a, b []tailcfg.FilterRule
+				}{
+					{"unchanged", old, slices.Clone(old)},
+					{"one_changed", old, oneChanged},
+					{"disjoint", old, disjoint},
+					{"duplicates", append(slices.Clone(old), old...), old},
+					{"reordered", old, reordered},
+				} {
+					b.Run(tc.name, func(b *testing.B) {
+						b.ReportAllocs()
+
+						for b.Loop() {
+							runtime.KeepAlive(changedRules(tc.a, tc.b))
+						}
+					})
+				}
+			})
+		}
+	}
+}
+
 // TestApprovedSubnetRoutesIgnoreNodeOrder: the routes land in every wildcard
 // rule, and the filter hash decides whether a policy write changed anything.
 func TestApprovedSubnetRoutesIgnoreNodeOrder(t *testing.T) {
