@@ -844,7 +844,7 @@ func TestEphemeralGCExcludesConnectDuringDeletion(t *testing.T) {
 			}
 
 			for g := range strings.SplitSeq(string(buf[:n]), "\n\n") {
-				if strings.Contains(g, "(*State).Connect(") && strings.Contains(g, "[sync.RWMutex.RLock") {
+				if strings.Contains(g, "(*State).Connect(") && strings.Contains(g, "[sync.Mutex.Lock") {
 					return true
 				}
 			}
