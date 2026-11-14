@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1658,6 +1659,156 @@ func TestBuildPeerClassesReuseMatchesFresh(t *testing.T) {
 			default:
 				polB = scanRandomPolicy(r)
 			}
+		}
+	}
+}
+
+func TestBuildPeerClassesExplicitNodes(t *testing.T) {
+	pol := []byte(`{"tagOwners":{"tag:router":[],"tag:exit":[]},"grants":[
+		{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["tcp:443"]},
+		{"src":["u2@"],"dst":["10.1.0.0/24","fd00:1::/64"],"ip":["*"],"via":["tag:router"]},
+		{"src":["u1@"],"dst":["autogroup:internet"],"ip":["*"]}]}`)
+	nodes := types.Nodes{
+		ownRulesNode(1, &scanUsers[0], nil),
+		ownRulesNode(2, &scanUsers[0], nil),
+		ownRulesNode(3, &scanUsers[1], nil),
+		ownRulesNode(4, nil, []string{"tag:router"}, "10.1.0.0/24"),
+		ownRulesNode(5, nil, []string{"tag:router"}, "fd00:1::/64"),
+		ownRulesNode(6, nil, []string{"tag:exit"}, "0.0.0.0/0", "::/0"),
+	}
+	in := nodes.ViewSlice()
+	pm, err := NewPolicyManager(pol, scanUsers, in)
+	require.NoError(t, err)
+
+	retained := pm.BuildPeerClasses(in, nil)
+	index := pm.sideIndex()
+	wantIndex := sideIndex{byIP: slices.Clone(index.byIP), routers: slices.Clone(index.routers), exits: slices.Clone(index.exits)}
+
+	for _, change := range []string{"same", "copy", "clone", "order", "IPv4", "IPv6", "remove", "add", "router", "exit", "empty"} {
+		t.Run(change, func(t *testing.T) {
+			explicit := slices.Clone(nodes)
+
+			switch change {
+			case "clone":
+				for i, n := range explicit {
+					explicit[i] = n.Clone()
+				}
+			case "order":
+				slices.Reverse(explicit)
+			case "IPv4", "IPv6":
+				explicit[2] = explicit[2].Clone()
+				if change == "IPv4" {
+					explicit[2].IPv4 = ap("100.64.0.99")
+				} else {
+					explicit[2].IPv6 = ap("fd7a:115c:a1e0::99")
+				}
+			case "remove":
+				explicit = explicit[:3]
+			case "add":
+				explicit = append(explicit, ownRulesNode(7, nil, []string{"tag:router"}, "100.64.0.0/24", "fd7a:115c:a1e0::/64"))
+			case "router", "exit":
+				i := 3
+				if change == "exit" {
+					i = 5
+				}
+
+				explicit[i] = explicit[i].Clone()
+				explicit[i].ApprovedRoutes = nil
+			case "empty":
+				explicit = nil
+			}
+
+			input := explicit.ViewSlice()
+
+			switch change {
+			case "same":
+				input = in
+			case "copy":
+				input = views.SliceOf(in.AsSlice())
+			}
+
+			want := buildPeerMapPairScan(pm, input)
+			for _, classes := range []*PeerClasses{pm.BuildPeerClasses(input, nil), pm.BuildPeerClasses(input, retained)} {
+				for _, n := range input.All() {
+					require.Equal(t, nilIfEmpty(slices.Sorted(slices.Values(want[n.ID()]))), nilIfEmpty(classes.Peers(n.ID())), "node %d", n.ID())
+				}
+			}
+
+			next, err := NewPolicyManagerFrom(pm, pol, scanUsers, input)
+			require.NoError(t, err)
+			require.NoError(t, next.Audit(pol, scanUsers, input))
+			require.NoError(t, pm.AuditPeers(retained, in), "old snapshot must retain its original peers")
+			require.Equal(t, wantIndex, *index)
+		})
+	}
+}
+
+func TestSideIndexConcurrentReaders(t *testing.T) {
+	t.Parallel()
+
+	nodes, users, pol := diversePeerPolicy(20, "self")
+	in := nodes.ViewSlice()
+	pm, err := NewPolicyManager(pol, users, in)
+	require.NoError(t, err)
+
+	for reader := range 8 {
+		t.Run(strconv.Itoa(reader), func(t *testing.T) {
+			t.Parallel()
+
+			for range 10 {
+				classes := pm.BuildPeerClasses(in, nil)
+				idx := pm.sideIndex()
+				require.Len(t, idx.byIP, 2*len(nodes))
+
+				for i, n := range nodes {
+					require.Equal(t, []types.NodeID{nodes[i^1].ID}, classes.Peers(n.ID))
+				}
+			}
+		})
+	}
+}
+
+func TestSideIndexMissingAddresses(t *testing.T) {
+	n := ownRulesNode(1, nil, []string{"tag:exit"}, "0.0.0.0/0", "::/0")
+	n.IPv4, n.IPv6 = nil, nil
+	pm := &PolicyManager{nodes: views.SliceOf([]types.NodeView{{}, n.View()})}
+	idx := pm.sideIndex()
+	require.Empty(t, idx.byIP)
+	require.Empty(t, idx.routers)
+	require.Equal(t, []types.NodeID{1}, idx.exits)
+}
+
+func BenchmarkSideIndex(b *testing.B) {
+	for _, n := range []int{100, 1000, 5000, 10000} {
+		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) {
+			in := scanManyRulesNodes(n).ViewSlice()
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				newSideIndex(in)
+			}
+		})
+	}
+}
+
+func BenchmarkPeerClassesSideIndex(b *testing.B) {
+	for _, shape := range []string{"pairs", "self", "allow-all"} {
+		for _, n := range []int{100, 1000, 5000, 10000} {
+			b.Run(fmt.Sprintf("%s/nodes=%d", shape, n), func(b *testing.B) {
+				nodes, users, pol := diversePeerPolicy(n, shape)
+				in := nodes.ViewSlice()
+				pm, err := NewPolicyManager(pol, users, in)
+				require.NoError(b, err)
+				pm.sideIndex()
+				prev := pm.BuildPeerClasses(in, nil)
+
+				b.ReportAllocs()
+
+				for b.Loop() {
+					pm.BuildPeerClasses(in, prev)
+				}
+			})
 		}
 	}
 }
