@@ -805,7 +805,12 @@ func (cm *classMaps) get(
 		return cur.peers, cur.owners.profiles
 	}
 
-	e, owners, changed := newPeerMap().Edit(), newClassOwners().edit(), view
+	var (
+		e      *graph.MapEdit[tailcfg.NodeID, *tailcfg.Node]
+		owners classOwnersEdit
+	)
+
+	changed := view
 
 	dns := snap.DNS()
 
@@ -816,11 +821,26 @@ func (cm *classMaps) get(
 		}
 	}
 
+	var (
+		peers    map[tailcfg.NodeID]*tailcfg.Node
+		profiles map[tailcfg.UserID]tailcfg.UserProfile
+		of       map[tailcfg.NodeID]tailcfg.UserID
+		nodes    map[tailcfg.UserID]int
+	)
+	if e == nil {
+		peers = make(map[tailcfg.NodeID]*tailcfg.Node, len(view))
+		profiles = make(map[tailcfg.UserID]tailcfg.UserProfile)
+		of = make(map[tailcfg.NodeID]tailcfg.UserID, len(view))
+		nodes = make(map[tailcfg.UserID]int)
+	}
+
 	for _, id := range changed {
 		peer, ok := snap.GetNode(id)
 		if !ok || !inView(view, id) {
-			e.Delete(id.NodeID())
-			owners.drop(id.NodeID())
+			if e != nil {
+				e.Delete(id.NodeID())
+				owners.drop(id.NodeID())
+			}
 
 			continue
 		}
@@ -833,19 +853,42 @@ func (cm *classMaps) get(
 				Uint64(zf.NodeID, peer.ID().Uint64()).
 				Str(zf.NodeHostname, peer.Hostname()).
 				Msgf("dropping peer %d from map responses: invalid node data; fix with `%s`", peer.ID(), types.StoredDataFixHint(peer.ID(), err))
-			e.Delete(id.NodeID())
-			owners.drop(id.NodeID())
+
+			if e != nil {
+				e.Delete(id.NodeID())
+				owners.drop(id.NodeID())
+			}
 
 			continue
 		}
 
-		e.Set(id.NodeID(), tn)
-		owners.set(id.NodeID(), peer.Owner())
+		if e != nil {
+			e.Set(id.NodeID(), tn)
+			owners.set(id.NodeID(), peer.Owner())
+		} else {
+			peers[id.NodeID()] = tn
+
+			if owner := peer.Owner(); owner.Valid() {
+				p := owner.TailscaleUserProfile()
+				profiles[p.ID] = p
+				of[id.NodeID()] = p.ID
+				nodes[p.ID]++
+			}
+		}
 	}
 
 	next := &classPeers{
 		rev: snap.Rev(), nodes: snap.NodesVersion(), caps: snap.CapsVersion(),
-		peers: e.Done(), owners: owners.done(),
+	}
+	if e != nil {
+		next.peers, next.owners = e.Done(), owners.done()
+	} else {
+		next.peers = graph.NewMap(graph.Same[*tailcfg.Node], peers)
+		next.owners = classOwners{
+			profiles: graph.NewMap(sameProfile, profiles),
+			of:       graph.NewMap(graph.Same[tailcfg.UserID], of),
+			nodes:    graph.NewMap(graph.Same[int], nodes),
+		}
 	}
 
 	// A session rendering an older snapshot than the class's latest keeps
