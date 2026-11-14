@@ -6457,3 +6457,190 @@ func TestViaPrepInternetReachabilityFollowsChangedAliases(t *testing.T) {
 	require.ElementsMatch(t, exits, removed.ViaRoutesForPeer(changed[0].View(), changed[2].View()).Exclude)
 	require.True(t, public.viaPrep().reachesInternet[1], "tag-membership invalidation creates a new immutable preparation")
 }
+
+// TestViaDestinationOverlapReference compares steering with the original prefix
+// scan, including result order, per-grant elections and regular-grant overrides.
+func TestViaDestinationOverlapReference(t *testing.T) {
+	t.Parallel()
+
+	users := types.Users{{ID: 1, Name: "viewer"}, {ID: 2, Name: "outside"}}
+	routes := []netip.Prefix{mp("10.2.0.0/24"), mp("10.1.0.0/24"), mp("fd00:1::/64"), mp("0.0.0.0/0"), mp("::/0")}
+	nodes := types.Nodes{
+		{ID: 1, IPv4: ap("100.64.0.1"), UserID: new(users[0].ID), User: new(users[0]), Hostinfo: &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{mp("172.16.0.0/24")}}, ApprovedRoutes: []netip.Prefix{mp("172.16.0.0/24")}},
+		{ID: 2, IPv4: ap("100.64.0.2"), Tags: []string{"tag:a"}, UserID: new(users[0].ID), Hostinfo: &tailcfg.Hostinfo{RoutableIPs: routes}, ApprovedRoutes: routes},
+		{ID: 3, IPv4: ap("100.64.0.3"), Tags: []string{"tag:a", "tag:b"}, Hostinfo: &tailcfg.Hostinfo{RoutableIPs: routes}, ApprovedRoutes: routes},
+		{ID: 4, IPv4: ap("100.64.0.4"), Tags: []string{"tag:other"}, Hostinfo: &tailcfg.Hostinfo{RoutableIPs: routes}, ApprovedRoutes: routes},
+		{ID: 5, IPv4: ap("10.1.0.7"), Tags: []string{"tag:destination"}},
+		{ID: 6, IPv4: ap("100.64.0.6"), UserID: new(users[1].ID), User: new(users[1])},
+	}
+
+	for _, dst := range []string{
+		`"autogroup:member","autogroup:tagged"`,
+		`"10.0.0.0/8"`, `"10.1.0.128/25"`, `"10.1.0.7/32"`,
+		`"fd00::/8"`, `"fd00:1::/65"`, `"fd00:2::/64"`,
+		`"10.2.0.0/25","10.1.0.0/25","fd00:1::/65"`,
+		`"10.1.0.0/24","10.1.0.0/24"`,
+		`"tag:destination"`, `"autogroup:internet"`, `"*"`,
+	} {
+		t.Run(dst, func(t *testing.T) {
+			t.Parallel()
+
+			pol := []byte(`{"tagOwners":{"tag:a":["viewer@"],"tag:b":["viewer@"],"tag:other":["viewer@"],"tag:destination":["viewer@"]},"grants":[
+				{"src":["172.16.0.128/25"],"dst":["10.2.0.128/25","10.1.0.0/16","fd00:1::/65","autogroup:internet"],"ip":["*"],"via":["tag:a"]},
+				{"src":["viewer@"],"dst":["10.1.0.7/32","fd00:1::/64"],"ip":["*"],"via":["tag:b"]},
+				{"src":["*"],"dst":[` + dst + `],"ip":["*"]}]}`)
+			original, err := NewPolicyManager(pol, users, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			changed := slices.Clone(nodes)
+			changed[4] = nodes[4].Clone()
+			changed[4].IPv4 = ap("10.3.0.7")
+			recompiled, err := NewPolicyManagerFrom(original, pol, users, changed.ViewSlice())
+			require.NoError(t, err)
+
+			for _, pm := range []*PolicyManager{recompiled, original} {
+				for _, winner := range []types.NodeID{0, 2, 3} {
+					elected, _ := pm.ElectViaRoutes(nil, nil, func(candidates views.Slice[types.NodeID], _ types.NodeID) (types.NodeID, bool) {
+						if winner == 0 {
+							return 0, false
+						}
+
+						if slices.Contains(candidates.AsSlice(), winner) {
+							return winner, true
+						}
+
+						return candidates.At(0), true
+					})
+
+					for _, viewer := range nodes {
+						for _, peer := range nodes {
+							primary := func(i int, prefix netip.Prefix) types.NodeID {
+								id, _ := elected.winners.Get(viaKey{pm.viaPrep().via[i], prefix})
+								return id
+							}
+							want := viaRoutesForPeerReference(pm, viewer.View(), peer.View(), primary)
+							require.Equal(t, want, elected.ForPeer(viewer.View(), peer.View()), "winner=%d viewer=%d peer=%d", winner, viewer.ID, peer.ID)
+
+							static := func(i int, prefix netip.Prefix) types.NodeID { return pm.viaPrep().primary[i][prefix] }
+							require.Equal(t, viaRoutesForPeerReference(pm, viewer.View(), peer.View(), static), pm.ViaRoutesForPeer(viewer.View(), peer.View()))
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+// viaRoutesForPeerReference retains the linear destination scan as a behavior
+// reference; it must not use destination indexes added to the renderer.
+//
+//nolint:gocyclo // preserve the original branch structure for differential testing
+func viaRoutesForPeerReference(pm *PolicyManager, viewer, peer types.NodeView, primary func(int, netip.Prefix) types.NodeID) types.ViaRouteResult {
+	var result types.ViaRouteResult
+
+	prep := pm.viaPrep()
+	if prep == nil {
+		return result
+	}
+
+	if viewer.ID() == peer.ID() {
+		return result
+	}
+
+	grants := prep.grants
+	viewerIPs := viewer.IPs()
+	viewerSubnets := viewer.SubnetRoutes()
+
+	matchViewer := func(i int) bool {
+		return prep.srcs[i] != nil && (slices.ContainsFunc(viewerIPs, prep.srcs[i].Contains) ||
+			slices.ContainsFunc(viewerSubnets, prep.srcs[i].OverlapsPrefix))
+	}
+	resolvedDstPrefixes, grantHasAutoGroupInternet := prep.dsts, prep.internet
+
+	for i, grant := range grants {
+		if !grant.HasVia() {
+			continue
+		}
+
+		if !matchViewer(i) {
+			continue
+		}
+
+		peerSubnetRoutes := peer.SubnetRoutes()
+
+		var matchedPrefixes []netip.Prefix
+
+		for _, dstPrefix := range resolvedDstPrefixes[i] {
+			for _, route := range peerSubnetRoutes {
+				if dstPrefix.Overlaps(route) && !slices.Contains(matchedPrefixes, route) {
+					matchedPrefixes = append(matchedPrefixes, route)
+				}
+			}
+		}
+
+		if grantHasAutoGroupInternet[i] && peer.IsExitNode() {
+			matchedPrefixes = append(matchedPrefixes, peer.ExitRoutes()...)
+		}
+
+		if len(matchedPrefixes) == 0 {
+			continue
+		}
+
+		peerHasVia := false
+
+		for _, viaTag := range grant.Via {
+			if peer.HasTag(string(viaTag)) {
+				peerHasVia = true
+
+				break
+			}
+		}
+
+		for _, prefix := range matchedPrefixes {
+			include := peerHasVia
+			if include && !tsaddr.IsExitRoute(prefix) {
+				include = peer.ID() == primary(i, prefix)
+			}
+
+			if include {
+				result.Include = append(result.Include, prefix)
+			} else {
+				result.Exclude = append(result.Exclude, prefix)
+			}
+		}
+	}
+
+	if len(result.Include) > 0 || len(result.Exclude) > 0 {
+		for i, grant := range grants {
+			if grant.HasVia() {
+				continue
+			}
+
+			if !matchViewer(i) {
+				continue
+			}
+
+			for _, dstPrefix := range resolvedDstPrefixes[i] {
+				for _, p := range result.Include {
+					if !tsaddr.IsExitRoute(p) && dstPrefix.Overlaps(p) &&
+						!slices.Contains(result.UsePrimary, p) {
+						result.UsePrimary = append(result.UsePrimary, p)
+					}
+				}
+
+				result.Exclude = slices.DeleteFunc(result.Exclude, func(p netip.Prefix) bool {
+					return !tsaddr.IsExitRoute(p) && dstPrefix.Overlaps(p)
+				})
+			}
+
+			if prep.reachesInternet[i] {
+				result.Exclude = slices.DeleteFunc(result.Exclude, tsaddr.IsExitRoute)
+			}
+		}
+	}
+
+	result.Include = uniquePrefixes(result.Include)
+	result.Exclude = uniquePrefixes(result.Exclude)
+
+	return result
+}
