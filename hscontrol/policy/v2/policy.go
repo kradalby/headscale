@@ -1820,22 +1820,7 @@ func (c *sideCache) lookup(n types.NodeView) (cachedSides, bool) {
 
 // matcherKey identifies a matcher by what it matches.
 func matcherKey(m *matcher.Match) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "%t,%t|", m.DestsIsTheInternet(), m.CapDestsIsTheInternet())
-
-	for _, p := range m.Srcs().Prefixes() {
-		b.WriteString(p.String())
-		b.WriteByte(',')
-	}
-
-	b.WriteByte('>')
-
-	for _, p := range m.Dests().Prefixes() {
-		b.WriteString(p.String())
-		b.WriteByte(',')
-	}
-
-	return b.String()
+	return m.Key()
 }
 
 func bitSet(side []uint64, k int) bool {
