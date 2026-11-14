@@ -253,11 +253,14 @@ func runScale(t *testing.T, nodes int, tc scaleCase, churn bool) {
 					if tc.taggedService && i == 0 {
 						opts = append(opts, WithTags("tag:service"))
 					}
+
 					clients[i] = NewClient(quietScaleTB{t}, srv,
 						fmt.Sprintf("scale-node-%05d-%02d", i, round), opts...)
 				})
 			}
+
 			registrations.Wait()
+
 			if t.Failed() {
 				t.FailNow()
 			}
@@ -708,6 +711,7 @@ func scalePacketFilterMismatch(
 		if !selfNodes[source].Valid() {
 			continue
 		}
+
 		for family, dst := range nm.SelfNode.Addresses().All() {
 			src := selfNodes[source].Addresses().At(family).Addr()
 
@@ -746,6 +750,7 @@ func scaleSSHPolicyMismatch(policy *tailcfg.SSHPolicy, selfNodes []tailcfg.NodeV
 	if policy == nil || len(policy.Rules) != 1 {
 		return "expected one SSH rule"
 	}
+
 	rule := policy.Rules[0]
 	if rule.Action == nil || !rule.Action.Accept || rule.Action.Reject || rule.Action.HoldAndDelegate != "" {
 		return "expected SSH accept action"
@@ -754,12 +759,15 @@ func scaleSSHPolicyMismatch(policy *tailcfg.SSHPolicy, selfNodes []tailcfg.NodeV
 	if !maps.Equal(rule.SSHUsers, map[string]string{"0": "", "root": "root"}) {
 		return "unexpected SSH user mapping"
 	}
+
 	wantIPs := make(map[string]bool)
+
 	first := viewer / scaleDevicesPerUser * scaleDevicesPerUser
 	for _, node := range selfNodes[first:min(first+scaleDevicesPerUser, len(selfNodes))] {
 		if !node.Valid() {
 			continue
 		}
+
 		for _, prefix := range node.Addresses().All() {
 			wantIPs[prefix.Addr().String()] = true
 		}
@@ -768,10 +776,12 @@ func scaleSSHPolicyMismatch(policy *tailcfg.SSHPolicy, selfNodes []tailcfg.NodeV
 	if len(rule.Principals) != len(wantIPs) {
 		return fmt.Sprintf("got %d SSH principals, want %d", len(rule.Principals), len(wantIPs))
 	}
+
 	for _, principal := range rule.Principals {
 		if principal.Any || principal.Node != "" || principal.UserLogin != "" || !wantIPs[principal.NodeIP] {
 			return fmt.Sprintf("unexpected SSH principal %+v", principal)
 		}
+
 		delete(wantIPs, principal.NodeIP)
 	}
 
