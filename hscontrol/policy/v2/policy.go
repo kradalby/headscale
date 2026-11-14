@@ -1434,7 +1434,13 @@ func (pm *PolicyManager) BuildPeerClasses(nodes views.Slice[types.NodeView], pre
 // a node is linked to every node on the other side of one of its own
 // rules. Nodes are found by address range, not by trying every node.
 func (pm *PolicyManager) addNodeOnlyPeers(c *PeerClasses, nodes views.Slice[types.NodeView]) {
-	idx := newSideIndex(nodes)
+	// Explicit node lists can differ from the compiled policy's nodes.
+	var idx *sideIndex
+	if views.SliceEqual(nodes, pm.nodes) {
+		idx = pm.sideIndex()
+	} else {
+		idx = newSideIndex(nodes)
+	}
 
 	// A grant gives each node in to the nodes in set as peers. Rules a
 	// user's untagged nodes share make one grant for all of them, so a
