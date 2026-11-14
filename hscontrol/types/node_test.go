@@ -23,6 +23,59 @@ import (
 	"tailscale.com/types/key"
 )
 
+func TestNodeIPs(t *testing.T) {
+	v4 := netip.MustParseAddr("100.64.0.1")
+	v6 := netip.MustParseAddr("fd7a:115c:a1e0::1")
+	invalid := netip.Addr{}
+
+	for _, tt := range []struct {
+		name string
+		node Node
+		want []netip.Addr
+	}{
+		{name: "none"},
+		{name: "ipv4", node: Node{IPv4: &v4}, want: []netip.Addr{v4}},
+		{name: "ipv6", node: Node{IPv6: &v6}, want: []netip.Addr{v6}},
+		{name: "both", node: Node{IPv4: &v4, IPv6: &v6}, want: []netip.Addr{v4, v6}},
+		{name: "invalid ipv4", node: Node{IPv4: &invalid}, want: []netip.Addr{invalid}},
+		{name: "invalid ipv6", node: Node{IPv6: &invalid}, want: []netip.Addr{invalid}},
+		{name: "invalid both", node: Node{IPv4: &invalid, IPv6: &invalid}, want: []netip.Addr{invalid, invalid}},
+		{name: "stored families", node: Node{IPv4: &v6, IPv6: &v4}, want: []netip.Addr{v6, v4}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			view := tt.node.View()
+			for _, read := range []struct {
+				name string
+				ips  func() []netip.Addr
+			}{
+				{name: "node", ips: tt.node.IPs},
+				{name: "view", ips: view.IPs},
+			} {
+				t.Run(read.name, func(t *testing.T) {
+					got := read.ips()
+					require.Equal(t, tt.want, got)
+
+					retained := read.ips()
+
+					for i := range got {
+						got[i] = netip.MustParseAddr("192.0.2.1")
+					}
+
+					require.Equal(t, tt.want, retained, "results must not share storage")
+					require.Equal(t, tt.want, read.ips(), "mutation must not reach the node")
+					clone := tt.node.Clone()
+					clone.IPv4 = new(netip.MustParseAddr("100.64.0.2"))
+					require.Equal(t, netip.MustParseAddr("100.64.0.2"), clone.View().IPs()[0])
+					require.Equal(t, tt.want, retained, "a new snapshot must not change retained results")
+					require.Equal(t, tt.want, view.IPs())
+				})
+			}
+		})
+	}
+
+	require.Nil(t, (NodeView{}).IPs())
+}
+
 func Test_NodeCanAccess(t *testing.T) {
 	iap := func(ipStr string) *netip.Addr {
 		ip := netip.MustParseAddr(ipStr)

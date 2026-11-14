@@ -10,6 +10,55 @@ import (
 	"tailscale.com/tailcfg"
 )
 
+var benchmarkNodeIPs []netip.Addr
+
+func BenchmarkNodeIPs(b *testing.B) {
+	for _, family := range []string{"none", "ipv4", "ipv6", "both"} {
+		b.Run(family, func(b *testing.B) {
+			nodes := make([]Node, 1024)
+			for i := range nodes {
+				if family == "ipv4" || family == "both" {
+					nodes[i].IPv4 = new(netip.AddrFrom4([4]byte{100, 64, byte(i >> 8), byte(i)}))
+				}
+
+				if family == "ipv6" || family == "both" {
+					nodes[i].IPv6 = new(netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 15: byte(i)}))
+				}
+			}
+
+			b.Run("owned", func(b *testing.B) {
+				b.ReportAllocs()
+
+				for i := range b.N {
+					benchmarkNodeIPs = nodes[i%len(nodes)].IPs()
+				}
+			})
+			b.Run("iterate", func(b *testing.B) {
+				b.ReportAllocs()
+
+				for i := range b.N {
+					for _, ip := range nodes[i%len(nodes)].IPs() {
+						if !ip.IsValid() {
+							b.Fatal("invalid benchmark address")
+						}
+					}
+				}
+			})
+			b.Run("view-iterate", func(b *testing.B) {
+				b.ReportAllocs()
+
+				for i := range b.N {
+					for _, ip := range nodes[i%len(nodes)].View().IPs() {
+						if !ip.IsValid() {
+							b.Fatal("invalid benchmark address")
+						}
+					}
+				}
+			})
+		})
+	}
+}
+
 func BenchmarkNodeViewCanAccess(b *testing.B) {
 	addr := func(ip string) *netip.Addr {
 		parsed := netip.MustParseAddr(ip)
