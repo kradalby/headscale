@@ -1709,6 +1709,8 @@ func cachedMatcherSides(
 		next.keys[k] = matcherKey(&matchers[k])
 	}
 
+	sameOrder := prev != nil && slices.Equal(next.keys, prev.keys)
+
 	if prev != nil {
 		for k, key := range prev.keys {
 			if _, dup := oldIdx[key]; !dup {
@@ -1747,6 +1749,14 @@ func cachedMatcherSides(
 		evaluate := all
 
 		if old, ok := prev.lookup(n); ok {
+			if sameOrder {
+				// No evaluation or remapping will write these immutable masks.
+				srcOf[i], dstOf[i] = old.src, old.dst
+				next.nodes[n.ID()] = old
+
+				continue
+			}
+
 			evaluate = fresh
 
 			for k, o := range from {
