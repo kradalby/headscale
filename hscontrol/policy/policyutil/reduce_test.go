@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
+	"reflect"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -15,6 +17,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/require"
+	"go4.org/netipx"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/must"
@@ -1564,5 +1567,325 @@ func BenchmarkReducerTagFanout(b *testing.B) {
 
 	for b.Loop() {
 		red.Reduce(node)
+	}
+}
+
+// linearRouteReduction deliberately checks every approved prefix for every
+// destination, independently of the reducer's route representation.
+func linearRouteReduction(node types.NodeView, rules []tailcfg.FilterRule) []tailcfg.FilterRule {
+	ret := []tailcfg.FilterRule{}
+	ips, subnets, exits := node.IPs(), node.SubnetRoutes(), node.ExitRoutes()
+
+	for _, rule := range rules {
+		var dests []tailcfg.NetPortRange
+
+		for _, dest := range rule.DstPorts {
+			if dest.IP == "*" {
+				if len(ips)+len(subnets)+len(exits) > 0 {
+					dests = append(dests, dest)
+				}
+
+				continue
+			}
+
+			r, err := util.ParseIPRange(dest.IP)
+			if err != nil {
+				continue
+			}
+
+			overlaps := func(prefix netip.Prefix) bool { return r.Overlaps(netipx.RangeOfPrefix(prefix)) }
+			if slices.ContainsFunc(ips, r.Contains) ||
+				slices.ContainsFunc(subnets, overlaps) ||
+				slices.ContainsFunc(exits, overlaps) {
+				dests = append(dests, dest)
+			}
+		}
+
+		if len(dests) > 0 {
+			out := rule
+			out.DstPorts = dests
+			ret = append(ret, out)
+		}
+	}
+
+	return ret
+}
+
+func TestRouterReduction(t *testing.T) {
+	type routeCase struct {
+		name       string
+		advertised []netip.Prefix
+		approved   []netip.Prefix
+	}
+
+	tests := make([]routeCase, 0, 14)
+	tests = append(tests, []routeCase{
+		{name: "no-routes"},
+		{name: "unapproved", advertised: []netip.Prefix{p("10.0.0.0/24"), p("::/0")}},
+		{name: "unadvertised", approved: []netip.Prefix{p("10.0.0.0/24"), p("0.0.0.0/0")}},
+		{
+			name:       "partial-approval",
+			advertised: []netip.Prefix{p("10.0.0.0/24"), p("10.0.1.0/24"), p("2001:db8::/64"), p("0.0.0.0/0")},
+			approved:   []netip.Prefix{p("10.0.0.0/24"), p("2001:db8::/64"), p("10.0.2.0/24")},
+		},
+		{
+			name: "overlapping-adjacent-unsorted",
+			advertised: []netip.Prefix{
+				p("10.0.1.0/24"), p("2001:db8::/64"), p("10.0.0.0/24"), p("10.0.0.0/25"), p("10.0.0.0/24"),
+			},
+			approved: []netip.Prefix{p("10.0.0.0/25"), p("10.0.0.0/24"), p("10.0.1.0/24"), p("2001:db8::/64")},
+		},
+		{
+			name:       "containing-after-contained",
+			advertised: []netip.Prefix{p("10.0.0.0/25"), p("10.0.0.0/24")},
+			approved:   []netip.Prefix{p("10.0.0.0/25"), p("10.0.0.0/24")},
+		},
+		{name: "v4-exit", advertised: []netip.Prefix{p("0.0.0.0/0")}, approved: []netip.Prefix{p("0.0.0.0/0")}},
+		{name: "v6-exit", advertised: []netip.Prefix{p("::/0")}, approved: []netip.Prefix{p("::/0")}},
+		{name: "dual-exit", advertised: tsaddr.ExitRoutes(), approved: tsaddr.ExitRoutes()},
+	}...)
+
+	for _, count := range []int{1, 10, 100, 1000, 10000} {
+		routes := routerReductionRoutes(count, true)
+		tests = append(tests, routeCase{fmt.Sprintf("disjoint-%d", count), routes, routes})
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := (&types.Node{
+				IPv4: ap("100.64.0.1"), IPv6: ap("fd7a:115c:a1e0::1"),
+				Hostinfo: &tailcfg.Hostinfo{RoutableIPs: tt.advertised}, ApprovedRoutes: tt.approved,
+			}).View()
+
+			rule := tailcfg.FilterRule{SrcIPs: []string{"100.64.0.2"}, IPProto: []int{6, 17}}
+			for _, ip := range []string{
+				"10.0.0.0", "10.0.0.255", "10.0.1.1", "10.0.2.1", "10.0.3.1", "10.0.255.250-10.1.0.1",
+				"10.0.0.0/8", "2001:db8::", "2001:db8::ffff", "2001:db8:0:1::", "2001:db8::/32",
+				"100.64.0.1", "fd7a:115c:a1e0::1", "172.16.0.1", "2001:db9::1", "*",
+				"", "invalid", "10.0.0.1/24", "10.0.0.2-10.0.0.1", "10.0.0.1-2001:db8::1", "10.0.0.0",
+			} {
+				rule.DstPorts = append(rule.DstPorts, tailcfg.NetPortRange{
+					IP: ip, Ports: tailcfg.PortRange{First: 22, Last: 443},
+				})
+			}
+
+			if len(tt.advertised) > 0 {
+				rule.DstPorts = append(rule.DstPorts, tailcfg.NetPortRange{
+					IP: tt.advertised[len(tt.advertised)-1].Addr().String(), Ports: tailcfg.PortRangeAny,
+				})
+			}
+
+			rule.DstPorts = append(rule.DstPorts, rule.DstPorts[0], rule.DstPorts[0])
+			rules := []tailcfg.FilterRule{rule, {}, rule, {}}
+			want := linearRouteReduction(node, rules)
+			// Capability destinations only match node addresses, never its routes.
+			capRule := tailcfg.FilterRule{SrcIPs: []string{"*"}, CapGrant: []tailcfg.CapGrant{{
+				Dsts:   []netip.Prefix{p("10.0.0.0/8"), p("2001:db8::/32"), p("100.64.0.0/10"), p("fd7a:115c:a1e0::/48")},
+				CapMap: tailcfg.PeerCapMap{"test-cap": {"true"}},
+			}}}
+			rules[3] = capRule
+			capRule.CapGrant = slices.Clone(capRule.CapGrant)
+			capRule.CapGrant[0].Dsts = []netip.Prefix{p("100.64.0.1/32"), p("fd7a:115c:a1e0::1/128")}
+			want = append(want, capRule)
+
+			withoutRoutes := (&types.Node{IPv4: ap("100.64.0.1"), IPv6: ap("fd7a:115c:a1e0::1")}).View()
+			wantWithoutRoutes := append(linearRouteReduction(withoutRoutes, rules[:3]), capRule)
+			before := must.Get(json.Marshal(rules))
+			nodeBefore := must.Get(json.Marshal(node))
+			red := policyutil.NewReducer(rules)
+
+			var cold, primed policyutil.DstCache
+			primed.Prime(rules)
+
+			for range 2 {
+				require.Equal(t, want, policyutil.ReduceFilterRules(node, rules))
+				require.Equal(t, want, policyutil.NewReducer(rules).Reduce(node))
+				require.Equal(t, want, red.Reduce(node))
+				require.Equal(t, want, cold.Reduce(node, rules))
+				require.Equal(t, want, primed.Reduce(node, rules))
+			}
+
+			retained := red.Reduce(node)
+			require.Equal(t, wantWithoutRoutes, red.Reduce(withoutRoutes))
+
+			// Concurrent callers share only immutable rules and parsed destinations.
+			var wg sync.WaitGroup
+			for range 4 {
+				wg.Go(func() {
+					for range 3 {
+						if !reflect.DeepEqual(want, red.Reduce(node)) || !reflect.DeepEqual(wantWithoutRoutes, red.Reduce(withoutRoutes)) ||
+							!reflect.DeepEqual(want, primed.Reduce(node, rules)) || !reflect.DeepEqual(want, cold.Reduce(node, rules)) {
+							t.Error("concurrent reduction differs from linear oracle")
+							return
+						}
+					}
+				})
+			}
+
+			wg.Wait()
+			require.Equal(t, want, retained, "later reductions changed retained output")
+			require.Equal(t, before, must.Get(json.Marshal(rules)), "retained rules changed")
+			require.Equal(t, nodeBefore, must.Get(json.Marshal(node)), "retained node changed")
+		})
+	}
+}
+
+func routerReductionRoutes(count int, mixed bool) []netip.Prefix {
+	routes := make([]netip.Prefix, count)
+	for i := range routes {
+		if mixed && i%2 == 1 {
+			routes[i] = netip.MustParsePrefix(fmt.Sprintf("2001:db8:%x::/64", i*2))
+		} else {
+			routes[i] = netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(i * 2 / 256), byte(i * 2 % 256), 0}), 24)
+		}
+	}
+
+	return routes
+}
+
+func BenchmarkRouterReduction(b *testing.B) {
+	for _, count := range []int{0, 1, 10, 100, 1000, 10000} {
+		for _, destCount := range []int{1, 100, 1000} {
+			for _, shape := range []string{"miss", "first-hit", "last-hit", "mixed"} {
+				b.Run(fmt.Sprintf("routes=%d/dests=%d/%s", count, destCount, shape), func(b *testing.B) {
+					routes := routerReductionRoutes(count, shape == "mixed")
+					node := (&types.Node{
+						IPv4: ap("100.64.0.1"), IPv6: ap("fd7a:115c:a1e0::1"),
+						Hostinfo: &tailcfg.Hostinfo{RoutableIPs: routes}, ApprovedRoutes: routes,
+					}).View()
+					rules := []tailcfg.FilterRule{{SrcIPs: []string{"*"}}}
+
+					for i := range destCount {
+						ip := "172.16.0.1"
+
+						if count > 0 {
+							switch shape {
+							case "first-hit":
+								ip = routes[0].Addr().String()
+							case "last-hit":
+								ip = routes[count-1].Addr().String()
+							case "mixed":
+								if i%2 == 0 {
+									ip = routes[(i/2)%count].Addr().String()
+								}
+							}
+						}
+
+						rules[0].DstPorts = append(rules[0].DstPorts, tailcfg.NetPortRange{IP: ip, Ports: tailcfg.PortRangeAny})
+					}
+
+					red := policyutil.NewReducer(rules)
+
+					want := 0
+					if count > 0 && shape != "miss" {
+						want = destCount
+						if shape == "mixed" {
+							want = (destCount + 1) / 2
+						}
+					}
+
+					b.ReportAllocs()
+					b.ResetTimer()
+
+					for b.Loop() {
+						got := red.Reduce(node)
+						if want == 0 {
+							if len(got) != 0 {
+								b.Fatal("unrelated destination reached router")
+							}
+						} else if len(got) != 1 || len(got[0].DstPorts) != want {
+							b.Fatal("reduced destination count differs")
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestRouterReductionEmptyAddresses(t *testing.T) {
+	for _, routes := range [][]netip.Prefix{
+		nil, {p("10.0.0.0/24")}, {p("::/0")}, {{}, p("10.0.0.0/24")}, {{}},
+	} {
+		node := (&types.Node{Hostinfo: &tailcfg.Hostinfo{RoutableIPs: routes}, ApprovedRoutes: routes}).View()
+		rules := []tailcfg.FilterRule{{SrcIPs: []string{"*"}, DstPorts: []tailcfg.NetPortRange{
+			{IP: "*"}, {IP: "10.0.0.1"}, {IP: "2001:db8::1"}, {IP: "invalid"},
+		}}}
+		want := linearRouteReduction(node, rules)
+		require.Equal(t, want, policyutil.ReduceFilterRules(node, rules), "routes %v", routes)
+		require.Equal(t, want, policyutil.NewReducer(rules).Reduce(node), "routes %v", routes)
+
+		var cache policyutil.DstCache
+		require.Equal(t, want, cache.Reduce(node, rules), "routes %v", routes)
+	}
+}
+
+func TestRouterReductionAllocsIndependentOfDests(t *testing.T) {
+	routes := routerReductionRoutes(10, true)
+	node := (&types.Node{IPv4: ap("100.64.0.1"), Hostinfo: &tailcfg.Hostinfo{RoutableIPs: routes}, ApprovedRoutes: routes}).View()
+	allocs := func(count int) int {
+		rules := []tailcfg.FilterRule{{SrcIPs: []string{"*"}}}
+		for range count {
+			rules[0].DstPorts = append(rules[0].DstPorts, tailcfg.NetPortRange{IP: "172.16.0.1"})
+		}
+
+		return int(testing.AllocsPerRun(10, func() { policyutil.ReduceFilterRules(node, rules) }))
+	}
+	require.Equal(t, allocs(10), allocs(1000), "router reduction must not allocate per destination")
+}
+
+func BenchmarkRouterReductionRouteShapes(b *testing.B) {
+	for _, shape := range []string{"adjacent", "overlapping", "partial", "v4-exit", "v6-exit", "dual-exit"} {
+		for _, destCount := range []int{1, 1000} {
+			b.Run(fmt.Sprintf("%s/dests=%d", shape, destCount), func(b *testing.B) {
+				routes := routerReductionRoutes(1000, true)
+				if shape == "adjacent" {
+					for i := range routes {
+						routes[i] = netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(i / 256), byte(i % 256), 0}), 24)
+					}
+				}
+
+				if shape == "overlapping" {
+					routes = append(routes, p("10.0.0.0/8"), p("2001:db8::/32"))
+				}
+
+				switch shape {
+				case "v4-exit":
+					routes = append(routes, p("0.0.0.0/0"))
+				case "v6-exit":
+					routes = append(routes, p("::/0"))
+				case "dual-exit":
+					routes = append(routes, tsaddr.ExitRoutes()...)
+				}
+
+				approved := routes
+				if shape == "partial" {
+					approved = routes[:len(routes)/2]
+				}
+
+				node := (&types.Node{
+					IPv4: ap("100.64.0.1"), Hostinfo: &tailcfg.Hostinfo{RoutableIPs: routes}, ApprovedRoutes: approved,
+				}).View()
+				rules := []tailcfg.FilterRule{{SrcIPs: []string{"*"}}}
+
+				dests := []string{"10.0.0.1", "10.7.204.1", "172.16.0.1", "2001:db8:7ce::1", "2001:db9::1"}
+				for i := range destCount {
+					rules[0].DstPorts = append(rules[0].DstPorts, tailcfg.NetPortRange{IP: dests[i%len(dests)], Ports: tailcfg.PortRangeAny})
+				}
+
+				red := policyutil.NewReducer(rules)
+				want := linearRouteReduction(node, rules)
+				require.Equal(b, want, red.Reduce(node))
+				b.ReportAllocs()
+				b.ResetTimer()
+
+				for b.Loop() {
+					got := red.Reduce(node)
+					if len(got) != len(want) || (len(want) > 0 && len(got[0].DstPorts) != len(want[0].DstPorts)) {
+						b.Fatal("reduced destination count differs")
+					}
+				}
+			})
+		}
 	}
 }
