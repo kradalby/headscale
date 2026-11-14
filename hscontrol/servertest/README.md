@@ -206,6 +206,70 @@ only if the measured peak projects within the hard memory limit. Select
 output. Keep the existing ten-second login and first-map deadlines; a failure
 is a workload limit to report, not a reason to extend them.
 
+## Connected via/self HA churn
+
+`TestScaleViaChurn` runs serial `via_only` and `via_self` cases with 20
+user-owned viewers and three tagged routers by default: **23 registered,
+connected nodes**, not 20 total nodes. `HEADSCALE_STRESS_VIA_VIEWERS` replaces
+only the viewer count (minimum 20); it is independent of
+`HEADSCALE_STRESS_NODES`. Users own up to ten devices each. One prefix,
+`10.33.0.0/24`, has two via routers and one non-via router. The non-via
+router connects first and must retain global primary throughout the test.
+Both policies grant member viewers TCP access to that prefix through
+`tag:router`; `via_self` also grants TCP access to the user's own devices.
+No all-to-all grant is present.
+
+Ten rounds alternate immediate health failover and recovery of the oldest
+via session, then delete and replace one viewer per user through the real
+registration and durable deletion paths. Every original viewer is replaced.
+Each replacement changes the policy generation and alternates TCP 443 and 8443. A final router deletion, replacement and health failover checks that
+the replacement can win while the non-via global primary remains unchanged.
+Registration and deletion batches contain at most 32 clients. The existing
+ten-second login and first-map timeouts remain unchanged.
+
+Every phase checks exact peer IDs, keys and online state, current self
+identity and policy generation, and exact peer AllowedIPs, including the
+single via route holder seen by every viewer. Losing via routers remain
+peers; same-user devices remain peers even in `via_only`, where their traffic
+is denied. Filter probes cover IPv4/IPv6 node addresses, same-user access,
+cross-user denial, router-address denial, the permitted subnet/port, denied
+ports/protocols and unrelated subnet addresses. Router filters accept viewer
+traffic to the subnet even on the standby; steering selects the route holder.
+The non-via router must deny it. Durable IDs, keys, ownership, non-ephemeral
+registration and one hub session per client must agree. Weak references to
+retired clients and compiled policies must clear while current clients live.
+
+```sh
+# Small ordinary-suite smoke: both policies, 20 viewers + 3 routers.
+HEADSCALE_DEBUG_POLICY_AUDIT=1 go test ./hscontrol/servertest \
+  -run '^TestScaleViaChurn$' -count=1 -v
+
+# Selected policy: 100 viewers + 3 routers = 103 connected nodes.
+# Apply the shared lock and hard memory cap described below before running.
+mkdir -p control_logs
+HEADSCALE_STRESS_VIA_VIEWERS=100 GOMAXPROCS=2 GOMEMLIMIT=2GiB \
+  go test -p=2 ./hscontrol/servertest \
+  -run '^TestScaleViaChurn/100_viewers/via_self$' -count=1 -v -timeout=30m \
+  -cpuprofile=control_logs/via-100-cpu.prof \
+  -memprofile=control_logs/via-100-alloc.prof
+```
+
+Use a common `flock` for shared-host profiling, then require at least
+8 GiB of `MemAvailable`; release the lock while waiting for memory.
+Use `MemoryMax=4G`, `MemorySwapMax=0`, `GOMAXPROCS=2`, `GOMEMLIMIT=2GiB`
+and `GOFLAGS=-p=2`. Keep compiler scratch on disk and runtime fixtures in
+`/dev/shm`, using the `GOTMPDIR` split described above. Freeze source and
+test-binary hashes before large runs and save CPU/alloc profiles for each run. Ramp 100,
+500, then 1000 viewers in fresh processes; attempt 5000 only if measured
+cgroup peak memory projects below 4 GiB with margin. Preserve failed
+attempts without raising caps or relaxing login timeouts. Report viewers +
+routers = total registered/connected, policy shape, prefix/router counts,
+peer entries, mutation time, convergence time and cgroup peak separately.
+Profiles include clients, SQLite, enrollment, assertions and teardown;
+they do not establish server-only or data-plane capacity. A separate
+trace at 1000 viewers or fewer is optional when profiles leave a question
+unresolved.
+
 ## Read results and find congestion
 
 Each phase logs wall time, allocated bytes during the phase, ending heap

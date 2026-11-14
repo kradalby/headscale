@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"net/netip"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +17,7 @@ import (
 	"weak"
 
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
+	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1119,4 +1122,451 @@ func TestClientNetmapHistory(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestScaleViaChurn catches stale via elections, cross-user self grants and
+// retired identities surviving durable churn on authenticated map streams.
+func TestScaleViaChurn(t *testing.T) {
+	failures, runs := state.PolicyAuditFailures(), state.PolicyAuditRuns()
+
+	t.Cleanup(func() {
+		assert.Equal(t, failures, state.PolicyAuditFailures(), "incremental policy and election must agree with fresh builds")
+
+		if os.Getenv("HEADSCALE_DEBUG_POLICY_AUDIT") == "1" {
+			assert.Greater(t, state.PolicyAuditRuns(), runs, "policy audit must run when enabled")
+		}
+	})
+
+	viewers := 20
+
+	if value, ok := os.LookupEnv("HEADSCALE_STRESS_VIA_VIEWERS"); ok {
+		var err error
+
+		viewers, err = strconv.Atoi(value)
+		require.NoError(t, err, "HEADSCALE_STRESS_VIA_VIEWERS must be an integer")
+		require.GreaterOrEqual(t, viewers, 20, "need two ten-device user groups")
+	}
+
+	for _, self := range []bool{false, true} {
+		name := "via_only"
+		if self {
+			name = "via_self"
+		}
+
+		t.Run(fmt.Sprintf("%d_viewers/%s", viewers, name), func(t *testing.T) {
+			runScaleViaChurn(t, viewers, self)
+		})
+	}
+}
+
+//nolint:gocyclo // bounded fixture driver with independent churn phases
+func runScaleViaChurn(t *testing.T, viewers int, self bool) {
+	t.Helper()
+
+	route := netip.MustParsePrefix("10.33.0.0/24")
+
+	var opts []ServerOption
+	if _, large := os.LookupEnv("HEADSCALE_STRESS_VIA_VIEWERS"); !large {
+		opts = append(opts, WithNodeStoreBatchTimeout(10*time.Millisecond))
+	}
+
+	srv := NewServer(t, opts...)
+	// Slots 0, 1, 2 are the non-via global primary and the via HA pair.
+	clients := make([]*TestClient, viewers+3)
+	nodes := make([]tailcfg.NodeView, len(clients))
+	indices := make(map[tailcfg.NodeID]int, len(clients))
+
+	users := make([]*types.User, (viewers+scaleDevicesPerUser-1)/scaleDevicesPerUser)
+	for i := range users {
+		users[i] = srv.CreateUser(t, fmt.Sprintf("via-user-%d", i))
+	}
+
+	seenIDs := make(map[tailcfg.NodeID]bool)
+	seenKeys := make(map[key.NodePublic]bool)
+	seenMachines := make(map[key.MachinePublic]bool)
+
+	retired := make([]weak.Pointer[TestClient], 0, viewers+1)
+	oldPolicies := make([]weak.Pointer[policyv2.PolicyManager], 0, scaleDevicesPerUser)
+	generation := "example.com/via-initial"
+	port := uint16(443)
+	winner := 1
+
+	setPolicy := func() {
+		personal := ""
+		if self {
+			personal = fmt.Sprintf(`,{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["tcp:%d"]}`, port)
+		}
+
+		policy := fmt.Sprintf(`{
+			"tagOwners":{"tag:other":["via-user-0@"],"tag:router":["via-user-0@"]},
+			"autoApprovers":{"routes":{"10.33.0.0/24":["tag:other","tag:router"]}},
+			"grants":[{"src":["autogroup:member"],"dst":["10.33.0.0/24"],"ip":["tcp:%d"],"via":["tag:router"]}%s],
+			"nodeAttrs":[{"target":["*"],"attr":[%q]}]
+		}`, port, personal, generation)
+		_, err := srv.State().SetPolicyInDB(policy)
+		require.NoError(t, err)
+		require.NoError(t, srv.State().ReloadPolicy())
+	}
+	register := func(slots []int, round int) {
+		for first := 0; first < len(slots); first += 32 {
+			var batch sync.WaitGroup
+			for _, i := range slots[first:min(first+32, len(slots))] {
+				batch.Go(func() {
+					name := fmt.Sprintf("via-node-%05d-%02d", i, round)
+					user := users[0]
+					options := []ClientOption{WithoutNetmapHistory()}
+
+					if i < 3 {
+						tag := "tag:router"
+						if i == 0 {
+							tag = "tag:other"
+						}
+
+						options = append(options, WithTags(tag), WithHostinfo(&tailcfg.Hostinfo{
+							Hostname: name, BackendLogID: "servertest-" + name, RoutableIPs: []netip.Prefix{route},
+						}))
+					} else {
+						user = users[(i-3)/scaleDevicesPerUser]
+					}
+
+					options = append(options, WithUser(user))
+					clients[i] = NewClient(quietScaleTB{t}, srv, name, options...)
+				})
+			}
+
+			batch.Wait()
+
+			if t.Failed() {
+				t.FailNow()
+			}
+		}
+
+		for _, i := range slots {
+			node := clients[i].Netmap().SelfNode
+			require.True(t, node.Valid())
+			require.False(t, seenIDs[node.ID()], "reused durable ID")
+			require.False(t, seenKeys[node.Key()], "reused node key")
+			require.False(t, seenMachines[clients[i].MachineKey()], "reused machine key")
+			seenIDs[node.ID()], seenKeys[node.Key()], seenMachines[clients[i].MachineKey()] = true, true, true
+			nodes[i], indices[node.ID()] = node, i
+		}
+	}
+	remove := func(slots []int) {
+		for first := 0; first < len(slots); first += 32 {
+			var batch sync.WaitGroup
+			for _, i := range slots[first:min(first+32, len(slots))] {
+				batch.Go(func() {
+					node, ok := srv.State().GetNodeByNodeKey(nodes[i].Key())
+					if assert.True(t, ok) {
+						assert.NoError(t, srv.State().DeleteNode(node))
+					}
+
+					clients[i].cleanupOnce()
+				})
+			}
+
+			batch.Wait()
+
+			if t.Failed() {
+				t.FailNow()
+			}
+		}
+
+		for _, i := range slots {
+			retired = append(retired, weak.Make(clients[i]))
+			delete(indices, nodes[i].ID())
+			clients[i], nodes[i] = nil, tailcfg.NodeView{}
+		}
+	}
+	wait := func() {
+		deadline := time.Now().Add(scaleConvergenceTimeout)
+
+		for i, c := range clients {
+			if c == nil {
+				continue
+			}
+
+			require.EventuallyWithT(t, func(ct *assert.CollectT) {
+				nm := c.Netmap()
+				if assert.NotNil(ct, nm) {
+					assert.Empty(ct, scaleViaMismatch(nm, nodes, indices, i, winner, self, generation, port, route))
+				}
+			}, time.Until(deadline), 20*time.Millisecond, "%s slot=%d winner=%d port=%d", generation, i, winner, port)
+		}
+
+		checkScaleStreams(t, srv, clients, indices)
+		require.Contains(t, srv.State().GetNodePrimaryRoutes(types.NodeID(nodes[0].ID())), route) //nolint:gosec // test node IDs are small
+		durable, err := srv.State().DB().ListNodes()
+		require.NoError(t, err)
+		require.Len(t, durable, len(indices))
+		require.Equal(t, len(indices), srv.State().ListNodes().Len())
+
+		for _, node := range durable {
+			i, ok := indices[node.ID.NodeID()]
+			require.True(t, ok, "unexpected durable ID %d", node.ID)
+			require.Equal(t, nodes[i].Key(), node.NodeKey)
+			require.Equal(t, clients[i].MachineKey(), node.MachineKey)
+			require.False(t, node.IsEphemeral(), "churn must delete durable nodes")
+			require.Equal(t, i < 3, node.IsTagged())
+
+			if i < 3 {
+				tag := "tag:router"
+				if i == 0 {
+					tag = "tag:other"
+				}
+
+				require.Equal(t, types.Strings{tag}, node.Tags)
+			} else {
+				require.NotNil(t, node.UserID)
+				require.Equal(t, users[(i-3)/scaleDevicesPerUser].ID, *node.UserID)
+			}
+		}
+	}
+	phase := func(name string, mutate func()) {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+
+		started := time.Now()
+
+		mutate()
+
+		mutated := time.Since(started)
+
+		wait()
+		runtime.ReadMemStats(&after)
+
+		peers := 0
+
+		for _, c := range clients {
+			if c != nil {
+				peers += len(c.Peers())
+			}
+		}
+
+		t.Logf("phase=%s mutation_elapsed=%s convergence_elapsed=%s allocated_bytes=%d heap_bytes=%d gc_cycles=%d goroutines=%d registered_nodes=%d connected_clients=%d peer_entries=%d",
+			name, mutated, time.Since(started)-mutated, after.TotalAlloc-before.TotalAlloc, after.HeapAlloc,
+			after.NumGC-before.NumGC, runtime.NumGoroutine(), len(indices), len(indices), peers)
+	}
+
+	t.Logf("viewers=%d routers=3 total=%d prefixes=1 self=%v devices_per_user=10 gomaxprocs=%d gomemlimit=%q go=%s database_path=%q",
+		viewers, len(clients), self, runtime.GOMAXPROCS(0), os.Getenv("GOMEMLIMIT"), runtime.Version(), srv.cfg.Database.Sqlite.Path)
+	phase("enroll", func() {
+		setPolicy()
+		// Session age must be deterministic: non-via router holds global primary.
+		for i := range 3 {
+			register([]int{i}, 0)
+		}
+
+		slots := make([]int, viewers)
+		for i := range slots {
+			slots[i] = i + 3
+		}
+
+		register(slots, 0)
+	})
+
+	for round := range scaleDevicesPerUser {
+		pm, ok := srv.State().Snapshot().Policy().(*policyv2.PolicyManager)
+		require.True(t, ok)
+
+		oldPolicies = append(oldPolicies, weak.Make(pm))
+
+		phase(fmt.Sprintf("health_%02d", round), func() {
+			healthy := round%2 != 0
+			require.True(t, srv.State().SetNodeHealth(types.NodeID(nodes[1].ID()), healthy)) //nolint:gosec // test node IDs are small
+
+			winner = 2
+			if healthy {
+				winner = 1
+			}
+		})
+
+		var cohort []int
+		for i := round + 3; i < len(clients); i += scaleDevicesPerUser {
+			cohort = append(cohort, i)
+		}
+
+		phase(fmt.Sprintf("remove_%02d", round), func() { remove(cohort) })
+		phase(fmt.Sprintf("replace_%02d", round), func() {
+			port = 443
+			if round%2 == 0 {
+				port = 8443
+			}
+
+			generation = fmt.Sprintf("example.com/via-round-%d", round)
+
+			setPolicy()
+			register(cohort, round+1)
+		})
+	}
+
+	phase("router_delete", func() {
+		remove([]int{1})
+
+		winner = 2
+	})
+	phase("router_replace", func() { register([]int{1}, 11) })
+	phase("replacement_failover", func() {
+		require.True(t, srv.State().SetNodeHealth(types.NodeID(nodes[2].ID()), false)) //nolint:gosec // test node IDs are small
+
+		winner = 1
+	})
+	phase("release_retired", func() {
+		require.Eventually(t, func() bool {
+			runtime.GC()
+
+			for _, old := range retired {
+				if old.Value() != nil {
+					return false
+				}
+			}
+
+			for _, old := range oldPolicies {
+				if old.Value() != nil {
+					return false
+				}
+			}
+
+			return true
+		}, 10*time.Second, 100*time.Millisecond, "retired clients and policies must collect while current streams live")
+		t.Logf("released_clients=%d released_policies=%d", len(retired), len(oldPolicies))
+	})
+}
+
+//nolint:gocyclo // independent identity, peer, route and packet-filter invariants
+func scaleViaMismatch(nm *netmap.NetworkMap, nodes []tailcfg.NodeView, indices map[tailcfg.NodeID]int,
+	viewer, winner int, self bool, generation string, port uint16, route netip.Prefix,
+) string {
+	if nm.SelfNode.ID() != nodes[viewer].ID() || nm.NodeKey != nodes[viewer].Key() ||
+		!nm.SelfNode.CapMap().Contains(nodecap.Cap(generation)) {
+		return "stale self identity or policy generation"
+	}
+
+	for capability := range nm.SelfNode.CapMap().All() {
+		if strings.HasPrefix(string(capability), "example.com/via-") && string(capability) != generation {
+			return "retired policy generation"
+		}
+	}
+	// Both via routers remain visible, including the losing/unhealthy router.
+	// Same-user devices remain peers even without a self traffic grant.
+	wantPeer := func(j int) bool {
+		return j != viewer && nodes[j].Valid() && ((viewer >= 3 && j >= 3 &&
+			(viewer-3)/scaleDevicesPerUser == (j-3)/scaleDevicesPerUser) ||
+			(viewer >= 3 && (j == 1 || j == 2)) || (j >= 3 && (viewer == 1 || viewer == 2)))
+	}
+	count := 0
+
+	for j := range nodes {
+		if wantPeer(j) {
+			count++
+		}
+	}
+
+	if len(nm.Peers) != count {
+		return fmt.Sprintf("peer count %d, want %d", len(nm.Peers), count)
+	}
+
+	var previous tailcfg.NodeID
+
+	for _, peer := range nm.Peers {
+		j, ok := indices[peer.ID()]
+		if !ok || !wantPeer(j) || peer.ID() <= previous || peer.Key() != nodes[j].Key() || !peer.Online().Get() {
+			return fmt.Sprintf("unexpected/stale peer %d", peer.ID())
+		}
+
+		previous = peer.ID()
+
+		wantIPs := slices.Clone(nodes[j].Addresses().AsSlice())
+		if viewer >= 3 && j == winner {
+			wantIPs = append(wantIPs, route)
+		}
+
+		if len(peer.AllowedIPs().AsSlice()) != len(wantIPs) ||
+			slices.ContainsFunc(wantIPs, func(p netip.Prefix) bool { return !slices.Contains(peer.AllowedIPs().AsSlice(), p) }) {
+			return fmt.Sprintf("peer %d allowed IPs %v, want %v", peer.ID(), peer.AllowedIPs().AsSlice(), wantIPs)
+		}
+	}
+
+	var localIPs netipx.IPSetBuilder
+	for _, prefix := range nm.SelfNode.Addresses().All() {
+		localIPs.AddPrefix(prefix)
+	}
+
+	if viewer < 3 {
+		localIPs.AddPrefix(route)
+	}
+
+	local, err := localIPs.IPSet()
+	if err != nil {
+		return err.Error()
+	}
+
+	packetFilter := filter.New(nm.PacketFilter, nil, local, nil, nil, logger.Discard)
+
+	otherPort := uint16(8443)
+	if port == otherPort {
+		otherPort = 443
+	}
+
+	sources := []int{0, 1, 2}
+
+	for _, first := range []int{3, 13} {
+		for j := first; j < min(first+scaleDevicesPerUser, len(nodes)); j++ {
+			if nodes[j].Valid() {
+				sources = append(sources, j)
+				break
+			}
+		}
+	}
+
+	if viewer >= 3 {
+		first := 3 + (viewer-3)/scaleDevicesPerUser*scaleDevicesPerUser
+		for j := first; j < min(first+scaleDevicesPerUser, len(nodes)); j++ {
+			if j != viewer && nodes[j].Valid() {
+				sources = append(sources, j)
+				break
+			}
+		}
+	}
+
+	for _, source := range sources {
+		if !nodes[source].Valid() {
+			continue
+		}
+
+		for family, dst := range nm.SelfNode.Addresses().All() {
+			src := nodes[source].Addresses().At(family).Addr()
+
+			want := filter.Drop
+			if self && viewer >= 3 && source >= 3 && (viewer-3)/scaleDevicesPerUser == (source-3)/scaleDevicesPerUser {
+				want = filter.Accept
+			}
+
+			if packetFilter.CheckTCP(src, dst.Addr(), port) != want ||
+				packetFilter.CheckTCP(src, dst.Addr(), 80) != filter.Drop ||
+				packetFilter.CheckTCP(src, dst.Addr(), otherPort) != filter.Drop ||
+				packetFilter.Check(src, dst.Addr(), port, ipproto.UDP) != filter.Drop {
+				return fmt.Sprintf("wrong node filter %d -> %d", source, viewer)
+			}
+		}
+
+		if viewer < 3 {
+			src := nodes[source].Addresses().At(0).Addr()
+
+			want := filter.Drop
+			if viewer != 0 && source >= 3 {
+				want = filter.Accept
+			}
+
+			if packetFilter.CheckTCP(src, route.Addr().Next(), port) != want ||
+				packetFilter.CheckTCP(src, route.Addr().Next(), 80) != filter.Drop ||
+				packetFilter.CheckTCP(src, route.Addr().Next(), otherPort) != filter.Drop ||
+				packetFilter.Check(src, route.Addr().Next(), port, ipproto.UDP) != filter.Drop ||
+				packetFilter.CheckTCP(src, netip.MustParseAddr("10.34.0.1"), port) != filter.Drop {
+				return fmt.Sprintf("wrong subnet filter %d -> router %d", source, viewer)
+			}
+		}
+	}
+
+	return ""
 }
