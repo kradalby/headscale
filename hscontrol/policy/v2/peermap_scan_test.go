@@ -2,6 +2,7 @@ package v2
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"math/bits"
@@ -1576,3 +1577,276 @@ func TestNewPolicyManagerFromTransitions(t *testing.T) {
 }
 
 const scanServerURL = "https://headscale.example.com"
+
+// userAliasFixture varies nodes, identities and rules independently. Groups overlap
+// so a change to one user reaches both groups containing that user.
+func userAliasFixture(tb testing.TB, nodeCount, userCount, ruleCount int, groups bool) ([]byte, types.Users, types.Nodes) {
+	tb.Helper()
+
+	users := make(types.Users, userCount)
+	for i := range users {
+		users[i] = types.User{ID: uint(i + 1), Name: fmt.Sprintf("alias-user-%d", i)} //nolint:gosec
+	}
+
+	nodes := make(types.Nodes, nodeCount)
+	ip := netip.MustParseAddr("100.64.0.1")
+
+	for i := range nodes {
+		u := &users[i%userCount]
+		nodes[i] = &types.Node{ID: types.NodeID(i + 1), Hostname: fmt.Sprintf("alias-node-%d", i), UserID: &u.ID, User: u, IPv4: new(ip)} //nolint:gosec
+		ip = ip.Next()
+	}
+
+	var policy strings.Builder
+	policy.WriteString(`{"groups":{`)
+
+	if groups {
+		for i := range users {
+			if i > 0 {
+				policy.WriteByte(',')
+			}
+
+			fmt.Fprintf(&policy, `"group:alias-%d":[%q,%q]`, i, users[i].Name+"@", users[(i+1)%userCount].Name+"@")
+		}
+	}
+
+	policy.WriteString(`},"grants":[`)
+
+	for i := range ruleCount {
+		if i > 0 {
+			policy.WriteByte(',')
+		}
+
+		alias := users[i%userCount].Name + "@"
+		if groups {
+			alias = fmt.Sprintf("group:alias-%d", i%userCount)
+		}
+
+		fmt.Fprintf(&policy, `{"src":[%q],"dst":[%q],"ip":["tcp:%d"]}`, alias, alias, 443+i)
+	}
+
+	policy.WriteString(`]}`)
+
+	return []byte(policy.String()), users, nodes
+}
+
+func TestUserAliasChangeReusesUnrelatedGrants(t *testing.T) {
+	for _, groups := range []bool{false, true} {
+		t.Run(fmt.Sprintf("groups=%t", groups), func(t *testing.T) {
+			policy, users, before := userAliasFixture(t, 100, 10, 10, groups)
+			prev, err := NewPolicyManager(policy, users, before.ViewSlice())
+			require.NoError(t, err)
+
+			oldFilter := slices.Clone(prev.filter)
+
+			after := slices.Clone(before)
+			after[0] = before[0].Clone()
+			after[0].IPv4 = ap("100.65.0.1")
+			inc, err := NewPolicyManagerFrom(prev, policy, users, after.ViewSlice())
+			require.NoError(t, err)
+			require.NoError(t, inc.Audit(policy, users, after.ViewSlice()))
+			require.Equal(t, oldFilter, prev.filter, "old snapshot is immutable")
+
+			recompiled := 0
+
+			for i, r := range inc.grantResults {
+				if r.cg != prev.grantResults[i].cg {
+					recompiled++
+				}
+			}
+
+			want := 1
+			if groups {
+				want = 2
+			}
+
+			require.Equal(t, want, recompiled, "only grants naming the changed user should recompile")
+		})
+	}
+}
+
+// BenchmarkUserAliasChurn separates fixed changed work from node/rule diversity.
+// It measures compilation only; it excludes peer construction and map delivery.
+func BenchmarkUserAliasChurn(b *testing.B) {
+	for _, groups := range []bool{false, true} {
+		shape := "users"
+		if groups {
+			shape = "groups"
+		}
+
+		for _, size := range []struct {
+			name                string
+			nodes, users, rules int
+		}{
+			{"growing/nodes=100", 100, 10, 10},
+			{"growing/nodes=500", 500, 50, 50},
+			{"growing/nodes=1000", 1000, 100, 100},
+			{"growing/nodes=2000", 2000, 200, 200},
+			{"fixed-rules/nodes=100", 100, 10, 10},
+			{"fixed-rules/nodes=500", 500, 10, 10},
+			{"fixed-rules/nodes=1000", 1000, 10, 10},
+			{"fixed-rules/nodes=2000", 2000, 10, 10},
+			{"fixed-nodes/rules=10", 1000, 100, 10},
+			{"fixed-nodes/rules=50", 1000, 100, 50},
+			{"fixed-nodes/rules=100", 1000, 100, 100},
+			{"fixed-nodes/rules=200", 1000, 100, 200},
+		} {
+			b.Run(shape+"/"+size.name, func(b *testing.B) {
+				policy, users, before := userAliasFixture(b, size.nodes, size.users, size.rules, groups)
+				prev, err := NewPolicyManager(policy, users, before.ViewSlice())
+				require.NoError(b, err)
+
+				joined := append(slices.Clone(before), before[0].Clone())
+				joined[len(before)].ID = types.NodeID(size.nodes + 1) //nolint:gosec
+				joined[len(before)].IPv4 = ap("100.65.0.1")
+				changed := slices.Clone(before)
+				changed[0] = before[0].Clone()
+				changed[0].IPv4 = ap("100.65.0.2")
+
+				for _, op := range []struct {
+					name  string
+					prev  *PolicyManager
+					nodes types.Nodes
+				}{
+					{"fresh", nil, before},
+					{"unchanged", prev, before},
+					{"join", prev, joined},
+					{"leave", prev, before[1:]},
+					{"address", prev, changed},
+				} {
+					b.Run(op.name, func(b *testing.B) {
+						nodes := op.nodes.ViewSlice()
+
+						b.ReportAllocs()
+
+						var next *PolicyManager
+						for b.Loop() {
+							next, err = NewPolicyManagerFrom(op.prev, policy, users, nodes)
+							if err != nil {
+								b.Fatal(err)
+							}
+						}
+
+						recompiled := 0
+
+						for i, r := range next.grantResults {
+							if op.prev == nil || r.cg != op.prev.grantResults[i].cg {
+								recompiled++
+							}
+						}
+
+						b.ReportMetric(float64(recompiled), "compiled-grants/op")
+					})
+				}
+			})
+		}
+	}
+}
+
+// TestUserAliasIncrementalIdentities keeps stale embedded user records on nodes:
+// token and domain membership must follow the current users, including collisions.
+func TestUserAliasIncrementalIdentities(t *testing.T) {
+	users := types.Users{
+		{ID: 1, Name: "alice", Email: "alice@allowed.example"},
+		{ID: 2, Name: "bob", Email: "bob@other.example", ProviderIdentifier: sql.NullString{String: "https://idp.example/bob", Valid: true}},
+		{ID: 3, Name: "alice@allowed.example"},
+		{ID: 4, Name: "duplicate"},
+		{ID: 5, Name: "duplicate"},
+		{ID: 6, Name: "https://idp.example/bob", Email: "duplicate-email@example.com"},
+		{ID: 7, Name: "seventh", Email: "duplicate-email@example.com"},
+		{ID: 8, Name: "folded", Email: "folded@ALLOWED.EXAMPLE"},
+	}
+
+	aliases := []string{"alice@", "alice@allowed.example", "bob@", "https://idp.example/bob@", "duplicate@", "duplicate-email@example.com", "missing@", "@", "user:*@allowed.example", "user:*@ALLOWED.EXAMPLE", "user:*@other.example", "group:a", "group:b", "group:overlap"}
+	policy := func(reverse bool) []byte {
+		grants := make([]string, 0, len(aliases))
+		for i, alias := range aliases {
+			grants = append(grants, fmt.Sprintf(`{"src":[%q],"dst":[%q],"ip":["tcp:%d"]}`, alias, alias, 443+i))
+		}
+
+		if reverse {
+			slices.Reverse(grants)
+		}
+
+		return []byte(`{"groups":{"group:a":["alice@","missing@"],"group:b":["bob@"],"group:overlap":["alice@","bob@","user:*@allowed.example"]},"grants":[` + strings.Join(grants, ",") + `],"ssh":[{"action":"accept","src":["group:a"],"dst":["autogroup:self"],"users":["root"]},{"action":"accept","src":["bob@"],"dst":["autogroup:self"],"users":["root"]}]}`)
+	}
+
+	for _, transition := range []string{"join", "leave", "address", "owner", "tag", "untag", "association-only", "association-lost", "rename", "delete-user", "recreate-user", "email-domain", "reorder-grants", "fresh-policy"} {
+		t.Run(transition, func(t *testing.T) {
+			before := make(types.Nodes, len(users))
+			for i, user := range users {
+				stale := user
+				stale.Name, stale.Email = "stale-name", "stale@invalid.example"
+				before[i] = ownRulesNode(i+1, &stale, nil)
+			}
+
+			if transition == "association-only" {
+				before[0].UserID = nil
+			}
+
+			if transition == "untag" {
+				before[0].Tags = []string{"tag:retained-creator"}
+			}
+
+			pol := policy(false)
+			prev, err := NewPolicyManagerFrom(nil, pol, users, before.ViewSlice())
+			require.NoError(t, err)
+
+			prevClasses := prev.BuildPeerClasses(before.ViewSlice(), nil)
+			for _, n := range before {
+				_, err := prev.FilterForNode(n.View())
+				require.NoError(t, err)
+				_, err = prev.SSHPolicy(scanServerURL, n.View())
+				require.NoError(t, err)
+			}
+
+			oldFilter, err := json.Marshal(prev.filter)
+			require.NoError(t, err)
+
+			after, nextUsers := slices.Clone(before), slices.Clone(users)
+			after[0] = before[0].Clone()
+
+			switch transition {
+			case "join":
+				joined := before[0].Clone()
+				joined.ID, joined.IPv4 = 99, ap("100.64.0.99")
+				after = append(after, joined)
+			case "leave":
+				after = after[1:]
+			case "address", "association-only":
+				after[0].IPv4 = ap("100.64.0.99")
+			case "owner":
+				after[0].User, after[0].UserID = &nextUsers[1], &nextUsers[1].ID
+			case "tag":
+				after[0].Tags = []string{"tag:retained-creator"}
+			case "untag":
+				after[0].Tags = nil
+			case "association-lost":
+				after[0].User = nil
+			case "rename":
+				nextUsers[0].Name = "renamed"
+			case "delete-user":
+				nextUsers = nextUsers[1:]
+			case "recreate-user":
+				nextUsers[0].ID = 99
+				after[0].User, after[0].UserID = &nextUsers[0], &nextUsers[0].ID
+			case "email-domain":
+				nextUsers[0].Email = "alice@removed.example"
+			case "reorder-grants":
+				pol = policy(true)
+			case "fresh-policy":
+				pol = bytes.ReplaceAll(pol, []byte("tcp:443"), []byte("tcp:8443"))
+			}
+
+			inc, err := NewPolicyManagerFrom(prev, pol, nextUsers, after.ViewSlice())
+			require.NoError(t, err)
+			require.NoError(t, inc.Audit(pol, nextUsers, after.ViewSlice()))
+			require.NoError(t, inc.AuditPeers(inc.BuildPeerClasses(after.ViewSlice(), prevClasses), after.ViewSlice()))
+
+			stillOld, err := json.Marshal(prev.filter)
+			require.NoError(t, err)
+			require.Equal(t, oldFilter, stillOld, "old snapshot filter is unchanged")
+			require.NoError(t, prev.Audit(policy(false), users, before.ViewSlice()))
+		})
+	}
+}
