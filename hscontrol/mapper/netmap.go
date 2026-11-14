@@ -752,7 +752,9 @@ func (e classOwnersEdit) set(id tailcfg.NodeID, owner types.UserView) {
 		e.nodes.Set(p.ID, n+1)
 	}
 
-	e.profiles.Set(p.ID, p)
+	if was, ok := e.profiles.Get(p.ID); !ok || !sameProfile(was, p) {
+		e.profiles.Set(p.ID, p)
+	}
 }
 
 // get returns the peer map of view at snap: every node of view rendered
