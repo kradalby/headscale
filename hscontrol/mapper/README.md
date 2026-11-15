@@ -46,8 +46,13 @@ history. These remain enabled rather than being copied into another driver.
   documents must refuse without publication. Valid requests always publish
   LastSeen; its timestamp must fall within the request's measured interval
   before the reference adopts it. The substantive-report sequence is predicted
-  independently. Requests omit Hostinfo and carry one endpoint; richer incoming
-  request normalization stays in the existing State tests.
+  independently. Endpoint/DiscoKey requests retain their original domain, including
+  zero DiscoKey diagnostics. Hostinfo operations hold keys/endpoints and routes
+  stable while varying reported names, OS, TCP services, requested tags and
+  omitted/explicit NetInfo. `inputRequest` predicts normalized values from owned
+  inputs before calling State; it never adopts a returned node as its oracle.
+  Missing node IDs also refuse before publication. These refusal guarantees do
+  not claim that persistence errors after publication are atomic.
 - **Database fixture:** users have explicit IDs and timestamps. Nodes have real
   SQLite rows before request operations and graph publication. The DB clock is
   fixed per fixture. Direct graph edits are deliberately not advertised as
@@ -305,4 +310,58 @@ outside this helper; existing causal and fresh-render checks still apply.
 ```sh
 go test -p 1 ./hscontrol/mapper -run '^TestStreamNodeInputContracts$' -count=1
 go test -p 1 ./hscontrol/mapper -run '^(TestStreamPacketIntentHistory|TestStreamPolicyFileHistory)$' -count=1 -rapid.seed=2026111562 -rapid.checks=30 -rapid.nofailfile
+```
+
+## Public MapRequest histories
+
+`TestStreamMapRequestHistory` composes the existing operation adapter, World and
+route references, Route-selected delivery, Hub JSON/zstd encoding, cumulative
+client and full session checks in both DB and real policy-file fixtures.
+Mandatory phases establish reports, repeat them, omit Hostinfo, omit NetInfo,
+replace DERP 1 with 2, explicitly clear DERP to 0, report an empty hostname and
+withdraw, re-advertise and withdraw routes again. Report, DERP-clear and route
+phases complete every consumer before the next transition. Other phases and
+generated coalesced suffixes retain partial delivery and reconnects. Deny/allow policy replacements
+interleave with the generated request batches; file mode performs real reloads.
+Unwoken sessions are still checked, so this does not force wakes to conceal
+Route failures.
+
+The input reference preserves stored Hostinfo on omission and stored NetInfo
+when only NetInfo is omitted. Explicit NetInfo replaces it, including DERP 0.
+Supported nonempty hostnames are short DNS-safe per-node labels: automatic
+GivenName follows them, custom names stay unchanged, and empty reported names
+preserve Node.Hostname/GivenName. Generated reports use the current Node.Hostname
+unless explicitly changing it; older direct-graph Hostinfo operations can leave
+the two hostname fields inconsistent and do not define collision-free requests. Reported RequestTags never grant effective tags
+or change ownership. Identical reports change only measured LastSeen, without
+advancing the independently predicted substantive-report sequence.
+
+The route domain uses canonical, distinct IPv4 subnet prefixes. The focused
+fixture seeds manual and automatic approval provenance, then exercises public
+advertisement/withdrawal under policies without auto-approvers. Manual approvals
+survive withdrawal; withdrawn automatic approvals disappear; no announced and
+approved route means stale Unhealthy clears. Re-advertisement does not restore
+removed automatic approval. Broad Hostinfo operations preserve advertisements
+because richer policies contain auto-approvers outside this reference domain.
+An unsupported route-changing policy fails an explicit precondition rather than
+silently skipping a case or adopting production approvals.
+
+Every accepted request is checked for caller nonmutation. After acceptance the
+adapter overwrites its submitted Hostinfo, NetInfo, service/tag/route slices and
+endpoint buffers, then checks current and retained snapshots against separately
+owned World values. Golden phase assertions anchor automatic/custom names, tag
+ownership, approval provenance and health. The focused operation subset
+`TestRapidStreamOperationContracts/request-hostinfo` reuses the same generator
+and adapter under the existing policy fixtures.
+
+This domain excludes DERP latency jitter, arbitrary hostname sanitation and
+collisions, route duplicates, general auto-approver policy evaluation, tag claim
+authorization, persistence failure/retry and concurrent request ordering. The
+existing State tests cover additional normalization cases. It does not change
+the enabled broad-domain wire or policy diagnostics.
+
+```sh
+go test -p 1 ./hscontrol/mapper -run '^TestStreamMapRequestHistory$' -count=1 -rapid.seed=2026111571 -rapid.checks=30 -rapid.nofailfile
+go test -p 1 ./hscontrol/mapper -run '^TestRapidStreamOperationContracts$/^request-hostinfo$' -count=1 -rapid.seed=2026111572 -rapid.checks=100 -rapid.nofailfile
+CGO_ENABLED=1 go test -race -p 1 ./hscontrol/mapper -run '^TestStreamMapRequestHistory$' -count=1 -rapid.seed=2026111573 -rapid.checks=10 -rapid.nofailfile
 ```

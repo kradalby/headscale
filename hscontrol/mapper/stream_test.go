@@ -9108,7 +9108,7 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 
 	operations := kinds
 	if len(operations) == 0 {
-		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "packet-policy", "packet-deny", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "stale-request", "invalid-policy"}
+		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "packet-policy", "packet-deny", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request", "invalid-policy"}
 		if len(ids) > 3 {
 			operations = append(operations, "delete")
 		}
@@ -9254,6 +9254,44 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 		if op == "stale-request" {
 			result.request.NodeKey = key.NodePublic{}
 		}
+	case "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "request-routes", "missing-request":
+		result.request = tailcfg.MapRequest{
+			NodeKey: n.NodeKey, DiscoKey: n.DiscoKey,
+			Endpoints: slices.Clone(n.Endpoints), Hostinfo: n.Hostinfo.Clone(),
+		}
+		hi := result.request.Hostinfo
+		// Direct graph inputs can leave Hostinfo.Hostname unlike Node.Hostname.
+		// Public reports use the node label, avoiding unmodeled graph-name collisions.
+		hi.Hostname = n.Hostname
+
+		switch op {
+		case "request-hostinfo":
+			// Per-ID labels cannot collide with another generated node's names.
+			hi.Hostname = fmt.Sprintf("request-%d-%d", id, rapid.IntRange(0, 3).Draw(t, "request-name"))
+			hi.OS = rapid.SampledFrom([]string{"linux", "windows", "android", ""}).Draw(t, "request-os")
+
+			hi.Services = nil
+			if rapid.Bool().Draw(t, "request-service") {
+				hi.Services = []tailcfg.Service{{Proto: "tcp", Port: rapid.Uint16().Draw(t, "request-port")}}
+			}
+
+			hi.RequestTags = slices.Clone(rapid.SampledFrom([][]string{nil, {"tag:srv"}, {"tag:router", "tag:srv"}}).Draw(t, "requested-tags"))
+		case "request-netinfo":
+			hi.NetInfo = &tailcfg.NetInfo{PreferredDERP: tailcfg.DERPRegionID(rapid.IntRange(0, 2).Draw(t, "request-derp"))}
+		case "request-omit-netinfo":
+			hi.NetInfo = nil
+		case "request-nil":
+			result.request.Hostinfo = nil
+		case "request-routes":
+			// This operation is selected only by histories without auto-approvers.
+			hi.RoutableIPs = slices.Clone(rapid.SampledFrom([][]netip.Prefix{
+				nil,
+				{netip.MustParsePrefix("10.0.0.0/24")},
+				{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("10.1.0.0/24")},
+			}).Draw(t, "request-routes"))
+		case "missing-request":
+			result.node.ID = maxStreamPropertyNodeID + 1
+		}
 	case "file-stage":
 		result.intent = propcheck.DrawPacketIntent(t, p.world)
 		result.policy, result.doc = -1, result.intent.Document(t)
@@ -9336,35 +9374,11 @@ func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 	case "stale-request":
 		require.ErrorIs(t, p.state.UpdateNodeFromMapRequest(op.node.ID, op.request), state.ErrNodeKeyChanged)
 		require.Equal(t, before.Rev(), p.state.Snapshot().Rev(), "refused key published")
-	case "request":
-		start := time.Now()
-
-		require.NoError(t, p.state.UpdateNodeFromMapRequest(op.node.ID, op.request))
-
-		end := time.Now()
-		got, ok := p.state.Snapshot().GetNode(op.node.ID)
-		require.True(t, ok)
-
-		seen := got.LastSeen().Clone()
-		require.NotNil(t, seen)
-		require.False(t, seen.Before(start), "LastSeen precedes request")
-		require.False(t, seen.After(end), "LastSeen follows request completion")
-
-		n := op.before.Clone()
-		// Requests in this component have one endpoint and omit Hostinfo. A
-		// substantive endpoint/disco change receives the next report sequence.
-		if !slices.Equal(n.Endpoints, op.request.Endpoints) || n.DiscoKey != op.request.DiscoKey {
-			p.reportSeq++
-			n.ReportGen = p.reportSeq
-		}
-
-		n.Endpoints, n.DiscoKey, n.LastSeen = slices.Clone(op.request.Endpoints), op.request.DiscoKey, new(*seen)
-		if n.Unhealthy && len(propertyApproved(n)) == 0 {
-			n.Unhealthy = false
-		}
-
-		p.world.Put(n)
-		require.Equal(t, before.Rev()+1, p.state.Snapshot().Rev(), "MapRequest always publishes LastSeen")
+	case "missing-request":
+		require.ErrorIs(t, p.state.UpdateNodeFromMapRequest(op.node.ID, op.request), state.ErrNodeNotInNodeStore)
+		require.Equal(t, before.Rev(), p.state.Snapshot().Rev(), "missing node published")
+	case "request", "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "request-routes":
+		p.inputRequest(t, op)
 	default:
 		p.put(t, op.node)
 
@@ -9396,6 +9410,121 @@ func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 	p.checkCausal(t, before, after, op)
 }
 
+// inputRequest predicts the supported report domain before calling State.
+// Latency jitter, colliding/unsanitized names and policy auto-approval are outside it.
+func (p *streamPropertySystem) inputRequest(t *rapid.T, op streamOperation) {
+	before, oldWorld := p.state.Snapshot(), p.world.Clone()
+	n := op.before.Clone()
+	req := op.request
+	req.Hostinfo, req.Endpoints = req.Hostinfo.Clone(), slices.Clone(req.Endpoints)
+
+	oldEndpoints := slices.SortedFunc(slices.Values(n.Endpoints), netip.AddrPort.Compare)
+	newEndpoints := slices.SortedFunc(slices.Values(req.Endpoints), netip.AddrPort.Compare)
+
+	changed := n.DiscoKey != req.DiscoKey
+	if req.Endpoints != nil && !slices.Equal(oldEndpoints, newEndpoints) {
+		n.Endpoints = slices.Clone(req.Endpoints)
+		changed = true
+	}
+
+	n.DiscoKey = req.DiscoKey
+
+	if req.Hostinfo != nil {
+		hi := req.Hostinfo.Clone()
+		if hi.NetInfo == nil {
+			hi.NetInfo = n.Hostinfo.NetInfo.Clone()
+		}
+
+		changed = changed || !reflect.DeepEqual(n.Hostinfo, hi)
+		if hi.Hostname != "" {
+			if n.GivenName == n.Hostname {
+				n.GivenName = hi.Hostname
+			}
+
+			n.Hostname = hi.Hostname
+		}
+
+		if !slices.Equal(n.Hostinfo.RoutableIPs, hi.RoutableIPs) {
+			var policy map[string]json.RawMessage
+
+			doc, err := hujson.Standardize(p.policyDoc)
+			require.NoError(t, err)
+			require.NoError(t, json.Unmarshal(doc, &policy))
+			require.NotContains(t, policy, "autoApprovers", "route request requires independently modeled approvals")
+
+			// Manual approval survives withdrawal; automatic approval requires advertisement.
+			n.ApprovedRoutes = n.ApprovedRoutes[:0]
+
+			n.AutoApprovedRoutes = n.AutoApprovedRoutes[:0]
+			for _, route := range op.before.ApprovedRoutes {
+				auto := slices.Contains(op.before.AutoApprovedRoutes, route)
+				if !auto || slices.Contains(hi.RoutableIPs, route) {
+					n.ApprovedRoutes = append(n.ApprovedRoutes, route)
+					if auto {
+						n.AutoApprovedRoutes = append(n.AutoApprovedRoutes, route)
+					}
+				}
+			}
+		}
+
+		n.Hostinfo = hi
+	}
+
+	if changed {
+		p.reportSeq++
+		n.ReportGen = p.reportSeq
+	}
+
+	if n.Unhealthy && len(propertyApproved(n)) == 0 {
+		n.Unhealthy = false
+	}
+
+	start := time.Now()
+
+	require.NoError(t, p.state.UpdateNodeFromMapRequest(n.ID, req))
+
+	end := time.Now()
+
+	require.Equal(t, op.request, req, "State mutated the submitted request")
+
+	got, ok := p.state.Snapshot().GetNode(n.ID)
+	require.True(t, ok)
+
+	seen := got.LastSeen().Clone()
+	require.NotNil(t, seen)
+	require.False(t, seen.Before(start), "LastSeen precedes request")
+	require.False(t, seen.After(end), "LastSeen follows request completion")
+	n.LastSeen = new(*seen)
+	p.world.Put(n)
+	require.Equal(t, before.Rev()+1, p.state.Snapshot().Rev(), "MapRequest always publishes LastSeen")
+
+	// Reusing caller-owned buffers must not change current or retained snapshots.
+	if req.Hostinfo != nil {
+		req.Hostinfo.Hostname = "mutated-after-request"
+		if req.Hostinfo.NetInfo != nil {
+			req.Hostinfo.NetInfo.PreferredDERP = 99
+		}
+
+		if len(req.Hostinfo.Services) > 0 {
+			req.Hostinfo.Services[0].Port++
+		}
+
+		if len(req.Hostinfo.RequestTags) > 0 {
+			req.Hostinfo.RequestTags[0] = "tag:mutated"
+		}
+
+		if len(req.Hostinfo.RoutableIPs) > 0 {
+			req.Hostinfo.RoutableIPs[0] = netip.MustParsePrefix("192.0.2.0/24")
+		}
+	}
+
+	if len(req.Endpoints) > 0 {
+		req.Endpoints[0] = netip.MustParseAddrPort("192.0.2.99:1")
+	}
+
+	propcheck.CheckWorld(t, oldWorld, before, p.probes)
+}
+
 func propertyApproved(n *types.Node) []netip.Prefix {
 	var routes []netip.Prefix
 
@@ -9419,7 +9548,7 @@ func (p *streamPropertySystem) checkCausal(t require.TestingT, before, after *st
 	}
 
 	switch op.kind {
-	case "endpoints", "hostinfo", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "stale-request", "invalid-policy", "delete":
+	case "endpoints", "hostinfo", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "stale-request", "missing-request", "invalid-policy", "delete":
 	default:
 		if !strings.HasPrefix(op.kind, "file-") || before.Rev() != after.Rev() && op.kind != "file-comment" {
 			return
@@ -9811,6 +9940,7 @@ func TestRapidStreamOperationContracts(t *testing.T) {
 		{"endpoints", "hostinfo", "dns", "derp", "noop", "revert"},
 		{"derp", "derp-policy", "derp-noop", "derp-restore", "policy-restore"},
 		{"request", "stale-request", "invalid-policy"},
+		{"request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request"},
 		{"generated-policy", "policy-order", "policy-duplicate", "policy-restore"},
 	} {
 		t.Run(kinds[0], func(t *testing.T) {
@@ -10405,4 +10535,118 @@ func runStreamPacketIntentHistory(t *testing.T, mode types.PolicyMode) {
 
 		p.check(t, p.state.Snapshot())
 	})
+}
+
+// A mandatory report history reaches omission, explicit clears and withdrawal
+// before generated operations can encounter unrelated broad-domain diagnostics.
+func TestStreamMapRequestHistory(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+			rapid.Check(t, func(t *rapid.T) {
+				p := newStreamPropertySystem(t, mode)
+				last := p.state.Snapshot()
+				flush := func(complete bool) {
+					snap := p.state.Snapshot()
+					all, wake := Route(last, snap, snap.Since(last))
+					p.hub.advance(snap)
+
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if p.sessions[id].down {
+							if complete || rapid.Bool().Draw(t, "request-reconnect") {
+								p.open(t, id, snap, false)
+							}
+						} else if _, named := wake[id]; all || named {
+							delivery := 0
+							if !complete {
+								delivery = rapid.IntRange(0, 2).Draw(t, "request-delivery")
+							}
+
+							p.update(t, id, snap, delivery)
+						}
+
+						if complete {
+							require.False(t, p.sessions[id].down, "clear phase must complete for viewer %d", id)
+						}
+					}
+
+					p.check(t, snap)
+					last = snap
+				}
+
+				p.setPolicy(t, 0)
+				// Seed existing approval provenance; the public reports below must
+				// preserve manual approval and revoke withdrawn automatic approval.
+				router := p.world.Nodes[3].Clone()
+				router.GivenName = "custom-router"
+				router.Hostinfo.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("10.1.0.0/24")}
+				router.ApprovedRoutes = slices.Clone(router.Hostinfo.RoutableIPs)
+				router.AutoApprovedRoutes = slices.Clone(router.Hostinfo.RoutableIPs[1:])
+				router.Unhealthy = true
+				p.put(t, router)
+				flush(true)
+
+				for _, id := range []types.NodeID{1, 3} {
+					for _, phase := range []string{"report", "same", "nil", "omit-netinfo", "derp-two", "derp-clear", "empty-name", "withdraw", "reannounce", "withdraw-again"} {
+						n := p.world.Nodes[id].Clone()
+						hi := n.Hostinfo.Clone()
+
+						switch phase {
+						case "report":
+							hi.Hostname = fmt.Sprintf("request-%d-0", id)
+							hi.OS = "windows"
+							hi.Services = []tailcfg.Service{{Proto: "tcp", Port: 443}}
+							hi.RequestTags = []string{"tag:srv", "tag:router"}
+							hi.NetInfo = &tailcfg.NetInfo{PreferredDERP: 1}
+						case "nil":
+							hi = nil
+						case "omit-netinfo":
+							hi.NetInfo = nil
+						case "derp-two":
+							hi.NetInfo.PreferredDERP = 2
+						case "derp-clear":
+							hi.NetInfo.PreferredDERP = 0
+						case "empty-name":
+							hi.Hostname = ""
+						case "withdraw", "withdraw-again":
+							hi.RoutableIPs = nil
+						case "reannounce":
+							hi.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("10.1.0.0/24")}
+						}
+
+						t.Logf("request node %d phase %s", id, phase)
+						p.apply(t, streamOperation{kind: "request-hostinfo", node: n, before: n.Clone(), request: tailcfg.MapRequest{
+							NodeKey: n.NodeKey, DiscoKey: n.DiscoKey, Endpoints: slices.Clone(n.Endpoints), Hostinfo: hi,
+						}})
+						flush(phase == "report" || phase == "derp-clear" || phase == "withdraw" || phase == "reannounce" || phase == "withdraw-again")
+					}
+				}
+
+				require.Equal(t, "request-1-0", p.world.Nodes[1].GivenName)
+				require.Empty(t, p.world.Nodes[1].Tags, "requested tags do not grant ownership")
+				require.Equal(t, "custom-router", p.world.Nodes[3].GivenName)
+				require.Equal(t, types.Strings{"tag:a", "tag:srv", "tag:router"}, p.world.Nodes[3].Tags)
+				require.Equal(t, types.Prefixes{netip.MustParsePrefix("10.0.0.0/24")}, p.world.Nodes[3].ApprovedRoutes)
+				require.Empty(t, p.world.Nodes[3].AutoApprovedRoutes)
+				require.False(t, p.world.Nodes[3].Unhealthy)
+
+				for _, policy := range []int{1, 0} {
+					p.setPolicy(t, policy)
+					flush(true)
+				}
+
+				for range rapid.IntRange(1, 8).Draw(t, "request batches") {
+					p.setPolicy(t, rapid.IntRange(0, 1).Draw(t, "request policy"))
+
+					for range rapid.IntRange(1, 3).Draw(t, "request coalesced writes") {
+						p.apply(t, p.drawOperation(t, "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-nil", "request-same", "request-routes", "stale-request", "missing-request"))
+					}
+
+					flush(false)
+				}
+
+				flush(true)
+			})
+		})
+	}
 }
