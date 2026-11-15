@@ -657,8 +657,9 @@ func (pm *PolicyManager) inheritFilters(prev *PolicyManager) {
 		}
 
 		n, ok := pm.nodesByID[id]
+		old := prev.nodesByID[id]
 
-		return ok && !n.HasPolicyChange(prev.nodesByID[id])
+		return ok && (n == old || !n.HasPolicyChange(old))
 	}
 
 	prev.filterRulesMap.Range(func(id types.NodeID, rules []tailcfg.FilterRule) bool {
