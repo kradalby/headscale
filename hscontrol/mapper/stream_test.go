@@ -17,10 +17,12 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 	"weak"
 
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/graph"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -135,6 +137,183 @@ func mentions(resps []*tailcfg.MapResponse, id types.NodeID) bool {
 	}
 
 	return false
+}
+
+func TestStreamMembershipDeltaCandidates(t *testing.T) {
+	for _, kind := range []string{"join", "leave", "replace", "coalesced", "coalesced-outside", "caps", "visibility", "invalid", "repair"} {
+		t.Run(kind, func(t *testing.T) {
+			policy := ""
+			if kind == "coalesced-outside" {
+				policy = ownUserOnly
+			}
+
+			cfg, s, ids := streamTestState(t, policy)
+			hub := NewHub()
+			t.Cleanup(hub.Close)
+			st := NewStream(cfg, hub, ids[0], capVer)
+
+			if kind == "repair" {
+				n := mustNode(t, s, ids[1]).AsStruct()
+				n.Expiry = new(time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC))
+				s.PutNodeInStoreForTest(*n)
+			}
+
+			before := s.Snapshot()
+			initial, err := st.Initial(before)
+			require.NoError(t, err)
+			st.Delivered()
+
+			client := newModelClient(initial[0])
+			oldPeerMap := st.r.lastClass
+			oldClass := maps.Collect(oldPeerMap.All())
+
+			joined := mustNode(t, s, ids[2]).AsStruct()
+			joined.ID = types.NodeID(1 << 40)
+			joined.Hostname, joined.GivenName = "joined", "joined"
+			joined.IPv4, joined.IPv6 = new(netip.MustParseAddr("100.100.100.100")), nil
+
+			limit := 1
+
+			switch kind {
+			case "leave":
+				s.DeleteNodeFromStoreForTest(ids[2])
+			case "replace":
+				s.DeleteNodeFromStoreForTest(ids[2])
+				s.PutNodeInStoreForTest(*joined)
+
+				limit = 2
+			case "coalesced":
+				for i := range 32 {
+					scalingEndpoint(t, s, ids[1], i+1)
+				}
+
+				s.PutNodeInStoreForTest(*joined)
+				s.DeleteNodeFromStoreForTest(joined.ID)
+				joined.ID++
+				s.PutNodeInStoreForTest(*joined)
+
+				limit = 2
+			case "coalesced-outside":
+				for i := range 32 {
+					scalingEndpoint(t, s, ids[2], i+1)
+				}
+
+				owner := mustNode(t, s, ids[1]).AsStruct()
+				joined.UserID, joined.User = owner.UserID, owner.User
+				s.PutNodeInStoreForTest(*joined)
+			case "caps":
+				s.PutNodeInStoreForTest(*joined)
+				_, err = s.SetPolicy([]byte(fmt.Sprintf(`{"nodeAttrs":[{"target":[%q],"attr":["custom:probe"]}]}`, mustNode(t, s, ids[1]).IPs()[0].String())))
+				require.NoError(t, err)
+
+				limit = 2
+			case "visibility":
+				_, err = s.SetPolicy([]byte(ownUserOnly))
+				require.NoError(t, err)
+			case "invalid", "repair":
+				n := mustNode(t, s, ids[1]).AsStruct()
+
+				n.Expiry = nil
+				if kind == "invalid" {
+					n.Expiry = new(time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC))
+				}
+
+				s.PutNodeInStoreForTest(*n)
+				s.PutNodeInStoreForTest(*joined)
+
+				limit = 2
+			default:
+				s.PutNodeInStoreForTest(*joined)
+			}
+
+			after := s.Snapshot()
+			view := after.PeerView(ids[0])
+			require.False(t, len(view) == len(st.r.lastPeerIDs) && len(view) > 0 && &view[0] == &st.r.lastPeerIDs[0], "fixture must replace view identity")
+			class, _, _ := st.r.classes.get(cfg, st.r.renders, after, view, capVer, after.PeerPolicyRev(), after.Policy().NodeCapMaps())
+			misses := graph.MapLogMisses()
+			candidates := st.r.peerCandidates(after, class, view)
+
+			if kind == "coalesced" || kind == "coalesced-outside" {
+				misses++ // The coalesced edit log is larger than these tiny views.
+			}
+
+			require.Equal(t, misses, graph.MapLogMisses(), "use the smaller candidate source")
+			slices.Sort(candidates)
+			candidates = slices.Compact(candidates)
+			require.Subset(t, candidates, graph.Changes(st.r.lastClass, class), "candidates must cover every changed render")
+			require.LessOrEqual(t, len(candidates), limit, "membership edits must not name every peer")
+
+			check := func(snap *state.Snapshot) {
+				t.Helper()
+
+				updates, err := st.Update(snap)
+				require.NoError(t, err)
+
+				for _, response := range updates {
+					client.apply(response)
+				}
+
+				st.Delivered()
+
+				freshHub := NewHub()
+				t.Cleanup(freshHub.Close)
+				fresh, err := NewStream(cfg, freshHub, ids[0], capVer).Initial(snap)
+				require.NoError(t, err)
+				require.Empty(t, client.sameAs(newModelClient(fresh[0])))
+			}
+			check(after)
+			check(before) // An older snapshot cannot use the forward node edit log.
+			check(after)
+			require.Equal(t, oldClass, maps.Collect(oldPeerMap.All()), "old class must stay immutable")
+		})
+	}
+}
+
+func TestStreamSharesClassNodeCursor(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	hub := NewHub()
+	t.Cleanup(hub.Close)
+	streams := []*Stream{NewStream(cfg, hub, ids[0], capVer), NewStream(cfg, hub, ids[1], capVer)}
+
+	check := func(snap *state.Snapshot) {
+		t.Helper()
+
+		for _, st := range streams {
+			var err error
+			if st.sent == nil {
+				_, err = st.Initial(snap)
+			} else {
+				_, err = st.Update(snap)
+			}
+
+			require.NoError(t, err)
+			st.Delivered()
+		}
+
+		_, _, cursor := streams[0].r.classes.get(cfg, streams[0].r.renders, snap, snap.PeerView(ids[0]), capVer, snap.PeerPolicyRev(), snap.Policy().NodeCapMaps())
+		for _, st := range streams {
+			if cursor != st.r.lastNodes {
+				t.Fatal("sessions must share their class's existing cursor")
+			}
+		}
+	}
+
+	before := s.Snapshot()
+	check(before)
+	scalingEndpoint(t, s, ids[2], 1)
+	after := s.Snapshot()
+	check(after)
+
+	for _, st := range streams {
+		_, err := st.Update(before)
+		require.NoError(t, err)
+		st.Delivered()
+		touched, ok := after.NodesTouchedSince(st.r.lastNodes)
+		require.True(t, ok)
+		require.Equal(t, []types.NodeID{ids[2]}, touched, "stale renders must use their own snapshot's cursor")
+	}
+
+	check(after)
 }
 
 func TestStreamInitialIsFullAndThenQuiet(t *testing.T) {
@@ -3631,6 +3810,148 @@ func TestFirstMapDeliveryAfterFoldedAttempts(t *testing.T) {
 	require.Empty(t, newModelClient(resps[0]).sameAs(newModelClient(fresh[0])))
 }
 
+// BenchmarkPeerRenderCIChurn replays fixed snapshots with warm class maps,
+// isolating each session's render after CI replacements or endpoint writes.
+// The 802 tags and 402 grants include shared services, per-app CI access,
+// developer access and an administrator. Class construction is untimed.
+func BenchmarkPeerRenderCIChurn(b *testing.B) {
+	tags := make([]string, 0, 802)
+	tags = append(tags, "tag:admin", "tag:ci-common")
+	common, ci := make([]string, 0, 100), make([]string, 0, 301)
+
+	ci = append(ci, "tag:ci-common")
+	for i := range 100 {
+		common = append(common, fmt.Sprintf("tag:common%d", i))
+		tags = append(tags, fmt.Sprintf("tag:dev%d", i), common[i])
+	}
+
+	grants := make([]map[string]any, 0, 402)
+	grants = append(grants, map[string]any{"src": []string{"tag:admin"}, "dst": []string{"*"}, "ip": []string{"tcp:22", "tcp:80", "tcp:443"}})
+
+	for i := range 300 {
+		app, worker := fmt.Sprintf("tag:app%d", i), fmt.Sprintf("tag:ci-app%d", i)
+		tags = append(tags, app, worker)
+		ci = append(ci, worker)
+		grants = append(grants, map[string]any{"src": []string{worker}, "dst": []string{app}, "ip": []string{"tcp:80"}})
+	}
+
+	grants = append(grants, map[string]any{"src": ci, "dst": common, "ip": []string{"tcp:80"}})
+	for i := range 100 {
+		grants = append(grants, map[string]any{
+			"src": []string{fmt.Sprintf("tag:dev%d", i)},
+			"dst": []string{fmt.Sprintf("tag:app%d", i), fmt.Sprintf("tag:app%d", i+100), fmt.Sprintf("tag:app%d", i+200)},
+			"ip":  []string{"tcp:80"},
+		})
+	}
+
+	owners := make(map[string][]string, len(tags))
+	for _, tag := range tags {
+		owners[tag] = []string{"u-0@"}
+	}
+
+	policy, err := json.Marshal(map[string]any{"tagOwners": owners, "grants": grants})
+	require.NoError(b, err)
+	require.Len(b, tags, 802)
+	require.Len(b, grants, 402)
+
+	for _, n := range []int{1000, 6600} {
+		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) {
+			cfg, s := benchState(b, n, 10)
+			roles := make(map[string]types.NodeID)
+
+			var workers []*types.Node
+
+			for i, nv := range s.ListNodes().All() {
+				node := nv.AsStruct()
+				tag := tags[i%len(tags)]
+				node.Tags = []string{tag}
+				s.PutNodeInStoreForTest(*node)
+
+				roles[tag] = node.ID
+				if strings.HasPrefix(tag, "tag:ci-app") {
+					workers = append(workers, node)
+				}
+			}
+
+			_, err := s.SetPolicy(policy)
+			require.NoError(b, err)
+			require.GreaterOrEqual(b, len(workers), 16)
+
+			for _, kind := range []string{"endpoint", "replace", "replace-x16"} {
+				before := s.Snapshot()
+
+				count := 1
+				if kind == "replace-x16" {
+					count = 16
+				}
+
+				var replacements []types.NodeID
+
+				for i, original := range workers[:count] {
+					node := original.Clone()
+					if kind == "endpoint" {
+						node.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1234")}
+					} else {
+						s.DeleteNodeFromStoreForTest(node.ID)
+						node.ID = types.NodeID(1<<40 + i) //nolint:gosec // bounded fixture
+						node.Hostname, node.GivenName = fmt.Sprintf("replacement-%d", i), fmt.Sprintf("replacement-%d", i)
+						replacements = append(replacements, node.ID)
+					}
+
+					s.PutNodeInStoreForTest(*node)
+				}
+
+				after := s.Snapshot()
+
+				for _, role := range []string{"tag:admin", "tag:common0", "tag:app0"} {
+					b.Run(kind+"/"+role, func(b *testing.B) {
+						hub := NewHub()
+						b.Cleanup(hub.Close)
+						r := newRenderer(cfg, hub, roles[role], capVer)
+						_, err := r.render(before)
+						require.NoError(b, err)
+
+						previous := *r
+						warm, err := r.render(after)
+						require.NoError(b, err)
+
+						freshHub := NewHub()
+						b.Cleanup(freshHub.Close)
+						fresh, err := newRenderer(cfg, freshHub, roles[role], capVer).render(after)
+						require.NoError(b, err)
+						require.Equal(b, maps.Collect(fresh.allPeers()), maps.Collect(warm.allPeers()))
+						require.Equal(b, maps.Collect(fresh.profiles.All()), maps.Collect(warm.profiles.All()))
+
+						misses := graph.MapLogMisses()
+
+						b.ReportAllocs()
+
+						for b.Loop() {
+							*r = previous
+
+							_, err := r.render(after)
+							if err != nil {
+								b.Fatal(err)
+							}
+						}
+
+						b.ReportMetric(float64(graph.MapLogMisses()-misses)/float64(b.N), "map-log-misses/op")
+						b.ReportMetric(float64(warm.peers.Len()), "class-peers")
+					})
+				}
+
+				for _, id := range replacements {
+					s.DeleteNodeFromStoreForTest(id)
+				}
+
+				for _, original := range workers[:count] {
+					s.PutNodeInStoreForTest(*original)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkClassMapsBuild isolates rebuilding a class after its view identity
 // changes, with the individual peer renders already cached.
 func BenchmarkClassMapsBuild(b *testing.B) {
@@ -3656,7 +3977,7 @@ func BenchmarkClassMapsBuild(b *testing.B) {
 			for b.Loop() {
 				var cm classMaps
 
-				peers, profiles = cm.get(cfg, &renders, snap, view, capVer, 0, nil)
+				peers, profiles, _ = cm.get(cfg, &renders, snap, view, capVer, 0, nil)
 			}
 
 			require.Equal(b, n, peers.Len())
@@ -3783,7 +4104,7 @@ func TestClassMapsChangedCandidates(t *testing.T) {
 	)
 
 	before := s.Snapshot()
-	old, oldProfiles := cm.get(cfg, &renders, before, view, capVer, before.PeerPolicyRev(), before.Policy().NodeCapMaps())
+	old, oldProfiles, _ := cm.get(cfg, &renders, before, view, capVer, before.PeerPolicyRev(), before.Policy().NodeCapMaps())
 
 	oldNodes := maps.Collect(old.All())
 	for id, node := range oldNodes {
@@ -3812,11 +4133,11 @@ func TestClassMapsChangedCandidates(t *testing.T) {
 
 		snap := s.Snapshot()
 		cm.pruned = snap.PeersRev() // Keep testing the supplied view after a deletion changes live classes.
-		got, profiles := cm.get(cfg, &renders, snap, view, capVer, snap.PeerPolicyRev(), snap.Policy().NodeCapMaps())
+		got, profiles, _ := cm.get(cfg, &renders, snap, view, capVer, snap.PeerPolicyRev(), snap.Policy().NodeCapMaps())
 
 		var fresh classMaps
 
-		want, wantProfiles := fresh.get(cfg, &renders, snap, view, capVer, snap.PeerPolicyRev(), snap.Policy().NodeCapMaps())
+		want, wantProfiles, _ := fresh.get(cfg, &renders, snap, view, capVer, snap.PeerPolicyRev(), snap.Policy().NodeCapMaps())
 		require.Equal(t, maps.Collect(want.All()), maps.Collect(got.All()))
 		require.Equal(t, maps.Collect(wantProfiles.All()), maps.Collect(profiles.All()))
 
@@ -3829,15 +4150,16 @@ func TestClassMapsChangedCandidates(t *testing.T) {
 	s.DeleteNodeFromStoreForTest(ids[1])
 	check()
 
-	stale, staleProfiles := cm.get(cfg, &renders, before, view, capVer, before.PeerPolicyRev(), before.Policy().NodeCapMaps())
+	stale, staleProfiles, _ := cm.get(cfg, &renders, before, view, capVer, before.PeerPolicyRev(), before.Policy().NodeCapMaps())
 	require.Equal(t, oldNodes, maps.Collect(stale.All()))
 	require.Equal(t, oldOwners, maps.Collect(staleProfiles.All()))
 	check()
 
 	for _, empty := range [][]types.NodeID{nil, {}} {
-		peers, profiles := cm.get(cfg, &renders, s.Snapshot(), empty, capVer, 0, nil)
+		peers, profiles, cursor := cm.get(cfg, &renders, s.Snapshot(), empty, capVer, 0, nil)
 		require.Zero(t, peers.Len())
 		require.Zero(t, profiles.Len())
+		require.Equal(t, state.NodesVersion{}, cursor, "an empty view needs no node cursor")
 	}
 }
 
@@ -6977,7 +7299,7 @@ func TestClassMapsBuildAndEdit(t *testing.T) {
 
 			before := s.Snapshot()
 			view := before.PeerView(ids[0])
-			peers, profiles := cm.get(cfg, &renders, before, view, capVer, before.PeerPolicyRev(), nil)
+			peers, profiles, _ := cm.get(cfg, &renders, before, view, capVer, before.PeerPolicyRev(), nil)
 			entry := cm.m[classKey{view: &view[0], n: len(view)}]
 			require.NotNil(t, entry)
 			owners := entry.cur.owners
@@ -7004,11 +7326,11 @@ func TestClassMapsBuildAndEdit(t *testing.T) {
 			s.PutNodeInStoreForTest(*orphan)
 			after = s.Snapshot()
 			require.Same(t, &view[0], &after.PeerView(ids[0])[0], "orphaning preserves the allow-all class")
-			updated, updatedProfiles := cm.get(cfg, &renders, after, view, capVer, after.PeerPolicyRev(), nil)
+			updated, updatedProfiles, _ := cm.get(cfg, &renders, after, view, capVer, after.PeerPolicyRev(), nil)
 
 			var fresh classMaps
 
-			expected, expectedProfiles := fresh.get(cfg, &renders, after, view, capVer, after.PeerPolicyRev(), nil)
+			expected, expectedProfiles, _ := fresh.get(cfg, &renders, after, view, capVer, after.PeerPolicyRev(), nil)
 			require.Equal(t, maps.Collect(expected.All()), maps.Collect(updated.All()))
 			require.Equal(t, maps.Collect(expectedProfiles.All()), maps.Collect(updatedProfiles.All()))
 
@@ -7043,7 +7365,7 @@ func TestClassMapsBuildAllocationWork(t *testing.T) {
 	allocs := testing.AllocsPerRun(5, func() {
 		var cm classMaps
 
-		peers, profiles := cm.get(cfg, &renders, snap, view, capVer, 0, nil)
+		peers, profiles, _ := cm.get(cfg, &renders, snap, view, capVer, 0, nil)
 		require.Equal(t, n, peers.Len())
 		require.Equal(t, 10, profiles.Len())
 	})
@@ -7290,6 +7612,62 @@ func BenchmarkSelfCache(b *testing.B) {
 				b.ReportMetric(float64(renders)/float64(i), "self-renders/op")
 			})
 		}
+	}
+}
+
+func TestStreamCapabilityVersionLifetime(t *testing.T) {
+	for _, mode := range []string{"advance", "release"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg, s, ids := streamTestState(t, ownUserOnly)
+			hub := NewHub()
+			t.Cleanup(hub.Close)
+			st := NewStream(cfg, hub, ids[0], capVer)
+			old := func() weak.Pointer[byte] {
+				capability := "custom:retained-" + strings.Repeat("x", 64<<10)
+				policy := strings.TrimSuffix(ownUserOnly, "}") + fmt.Sprintf(`,"nodeAttrs":[{"target":[%q],"attr":[%q]}]}`, mustNode(t, s, ids[2]).IPs()[0].String(), capability)
+				_, err := s.SetPolicy([]byte(policy))
+				require.NoError(t, err)
+				_, err = st.Initial(s.Snapshot())
+				require.NoError(t, err)
+				st.Delivered()
+
+				caps := s.Snapshot().Policy().NodeCapMaps()[ids[2]]
+				require.Len(t, caps, 1)
+
+				for name := range caps {
+					// Track the allocated string behind an invisible node's cap key.
+					return weak.Make(unsafe.StringData(string(name)))
+				}
+
+				return weak.Pointer[byte]{}
+			}()
+
+			_, err := s.SetPolicy([]byte(ownUserOnly))
+			require.NoError(t, err)
+			hub.advance(s.Snapshot())
+			active := NewStream(cfg, hub, ids[1], capVer)
+			_, err = active.Initial(s.Snapshot())
+			require.NoError(t, err)
+			active.Delivered()
+			runtime.GC()
+			require.NotNil(t, old.Value(), "an idle stream retains its capability version")
+
+			if mode == "advance" {
+				_, err = st.Update(s.Snapshot())
+				require.NoError(t, err)
+				st.Delivered()
+			} else {
+				st = nil
+			}
+
+			require.Eventually(t, func() bool {
+				runtime.GC()
+				return old.Value() == nil
+			}, time.Second, 10*time.Millisecond, "advancing or releasing the stream must release old capability data")
+			runtime.KeepAlive(st)
+			runtime.KeepAlive(active)
+			runtime.KeepAlive(s)
+		})
 	}
 }
 
