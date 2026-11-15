@@ -370,6 +370,69 @@ go test -p 1 ./hscontrol/mapper -run '^TestRapidStreamOperationContracts$/^reque
 CGO_ENABLED=1 go test -race -p 1 ./hscontrol/mapper -run '^TestStreamMapRequestHistory$' -count=1 -rapid.seed=2026111573 -rapid.checks=10 -rapid.nofailfile
 ```
 
+## Ordered application capability intent
+
+`propcheck.AppIntent` owns an ordered list of custom `AppGrant` inputs. It shares
+`PacketSelector` matching and tag-versus-user ownership with `PacketIntent`.
+`AppIntent.Document` composes both inputs; app-only documents carry an explicit
+empty packet intent, so the packet checker also proves they grant no TCP/UDP
+ports. Mixed documents use the existing packet oracle without redefining it.
+These peer capabilities are distinct from `Node.CapMap` and network permissions.
+
+`DrawAppIntent` includes a live literal-IP witness, then zero to three grants
+using wildcard, user, tag or literal-IP selectors. The bounded custom keys are
+under `example.com/cap/`; payloads are canonical JSON objects with ordered and
+possibly repeated values. Nil and empty value lists both retain capability-key
+presence. `Capabilities` scans only owned World identities and grant inputs.
+`CheckAppIntent` evaluates delivered FilterRules using the pinned Tailscale
+`Filter.CapsWithValues`, compares every returned key and each ordered value,
+and requires matching sources to be visible to their destination. It does not
+require reciprocal visibility for app-only grants. Empty intent still checks
+all current node pairs, catching retained revoked capabilities.
+
+App metadata follows the same active/staged policy records, file reloads,
+comments, historical restores, DERP-only changes and old snapshots as packet
+intent. Unrelated richer documents clear both metadata fields. Reorder and
+duplicate operations create a new ordered app intent and serialize its grants;
+they never reuse stale expected order or derive expectation from compiled rules.
+Unrelated document fields, including DERP overlays, survive these transformations.
+
+The shared incremental policy history checks retained, warm and fresh managers
+independently against both input models. `TestIncrementalPolicyRapidAppIntent`
+keeps order/duplicate diagnostics enabled; `TestIncrementalPolicyRapidAppReplacements`
+keeps value replacements, denial, restores and generated identity/family changes
+reachable without those earlier diagnostics. `TestAppIntentOwnershipAndValues`
+anchors the model with literal ownership, family, key-presence and ordered-value
+expectations. Corruption controls reject dropped capabilities, retained revoked
+capabilities, reversed or duplicated payloads, and substituted empty-valued keys,
+even without a warm/fresh comparison.
+
+`TestRapidStreamAppIntent` reuses the whole-system scheduler and both DB and
+real file backends. Every completed delivery and retained snapshot runs the same
+app check alongside packet, projection and fresh-map checks. The fixed
+`TestStreamAppIntentHistory` reaches value replacement, clear/restore, mixed
+packet/app policies, staging/reload/refusal, ownership revocation and DERP edits.
+It checks unwoken live clients before reconnecting a partially delivered
+destination, and completes destination 2 before restoring a revoked state.
+
+`TestIncrementalAppIntentConsumerInvalidation` strengthens the existing production
+bug evidence: a warmed destination receives `[read, write]` after input changes
+to `[write, read]`, and `[read]` after input changes to `[read, read]`. Fresh
+managers satisfy intent. These are observable order/multiplicity defects, not
+new bug classes or claims of opened network ports. Existing audits and enabled
+failing properties remain intact; aggregate results are deliberately diagnostic.
+
+```sh
+go test -p 1 ./hscontrol/policy/v2 -run '^(TestAppIntentOwnershipAndValues|TestAppIntentRejectsCorruptedConsumerRules|TestIncrementalPolicyRapidAppReplacements)$' -count=1 -rapid.seed=2026111571 -rapid.checks=300 -rapid.nofailfile
+go test -p 1 ./hscontrol/mapper -run '^TestStreamAppIntentHistory$' -count=1 -rapid.seed=2026111571 -rapid.checks=20 -rapid.nofailfile
+go test -p 1 ./hscontrol/policy/v2 -run '^TestIncrementalAppIntentConsumerInvalidation$' -count=1
+```
+
+The domain excludes companion capabilities, via and public/subnet destinations,
+nodeAttrs capabilities, general aliases and self traffic. Current-pair probes do
+not independently test deleted nodes or removed addresses. Full clients, network
+transport and application-specific interpretation of JSON remain outside scope.
+
 ## Generated subscription bridge
 
 `TestRapidStreamSubscription` bridges owned input histories through the real

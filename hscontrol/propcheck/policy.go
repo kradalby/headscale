@@ -12,6 +12,7 @@ import (
 	"go4.org/netipx"
 	"pgregory.net/rapid"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/logger"
 	"tailscale.com/wgengine/filter"
@@ -204,6 +205,10 @@ type PacketIntent struct {
 }
 
 func (p *PacketIntent) Document(t require.TestingT) []byte {
+	return p.document(t, nil)
+}
+
+func (p *PacketIntent) document(t require.TestingT, app *AppIntent) []byte {
 	grants := make([]any, 0, len(p.Grants))
 	tags := map[string][]string{}
 
@@ -223,6 +228,20 @@ func (p *PacketIntent) Document(t require.TestingT) []byte {
 			"src": []string{g.Src.alias()}, "dst": []string{g.Dst.alias()},
 			"ip": []string{fmt.Sprintf("%s:%d-%d", proto, g.First, g.Last)},
 		})
+	}
+
+	if app != nil {
+		for _, g := range app.Grants {
+			for _, s := range []PacketSelector{g.Src, g.Dst} {
+				if s.Tag != "" {
+					tags[s.Tag] = []string{}
+				}
+			}
+
+			grants = append(grants, map[string]any{
+				"src": []string{g.Src.alias()}, "dst": []string{g.Dst.alias()}, "app": g.Caps,
+			})
+		}
 	}
 
 	return policyJSON(t, map[string]any{"grants": grants, "tagOwners": tags})
@@ -388,6 +407,173 @@ func CheckPacketIntent(t require.TestingT, m World, intent *PacketIntent, destin
 		}
 
 		if allowed {
+			peers = append(peers, id)
+		}
+	}
+
+	return peers
+}
+
+// AppGrant carries custom peer capabilities, never Node.CapMap or network ports.
+// Caps and its ordered values are owned inputs, immutable after construction.
+type AppGrant struct {
+	Src, Dst PacketSelector
+	Caps     tailcfg.PeerCapMap
+}
+
+// AppIntent specifies ordered node-to-node custom capability grants only.
+// It excludes companion grants, via, public/subnet destinations and nodeAttrs.
+type AppIntent struct {
+	Grants []AppGrant
+}
+
+// Document composes independent packet and app inputs in one policy document.
+// An explicit empty packet intent proves app-only grants open no TCP/UDP ports.
+func (a *AppIntent) Document(t require.TestingT, packet *PacketIntent) []byte {
+	return packet.document(t, a)
+}
+
+// Reordered preserves old history while changing the actual ordered input.
+// Payload maps can be shared because neither model nor serializer mutates them.
+func (a *AppIntent) Reordered(duplicate bool) *AppIntent {
+	next := &AppIntent{Grants: slices.Clone(a.Grants)}
+	slices.Reverse(next.Grants)
+
+	if duplicate && len(next.Grants) > 0 {
+		next.Grants = append(next.Grants, next.Grants[0])
+	}
+
+	return next
+}
+
+// DrawAppIntent includes a live literal witness and broader identity selectors.
+func DrawAppIntent(t *rapid.T, m World) *AppIntent {
+	ids := slices.Sorted(maps.Keys(m.Nodes))
+
+	selectors := []PacketSelector{{}, {Tag: "tag:srv"}, {Tag: "tag:router"}}
+	for _, u := range m.Users {
+		selectors = append(selectors, PacketSelector{User: u.Name})
+	}
+
+	var witnesses []AppGrant
+
+	for _, id := range ids {
+		n := m.Nodes[id]
+		for _, tag := range n.Tags {
+			selectors = append(selectors, PacketSelector{Tag: tag})
+		}
+
+		for family, ip := range []*netip.Addr{n.IPv4, n.IPv6} {
+			if ip == nil {
+				continue
+			}
+
+			selectors = append(selectors, PacketSelector{IP: *ip})
+
+			for _, other := range ids {
+				dst := []*netip.Addr{m.Nodes[other].IPv4, m.Nodes[other].IPv6}[family]
+				if id != other && dst != nil {
+					witnesses = append(witnesses, AppGrant{Src: PacketSelector{IP: *ip}, Dst: PacketSelector{IP: *dst}})
+				}
+			}
+		}
+	}
+
+	require.NotEmpty(t, witnesses, "app intent needs two nodes sharing an address family")
+
+	a := &AppIntent{Grants: []AppGrant{rapid.SampledFrom(witnesses).Draw(t, "app witness")}}
+	for range rapid.IntRange(0, 3).Draw(t, "extra app grants") {
+		a.Grants = append(a.Grants, AppGrant{
+			Src: rapid.SampledFrom(selectors).Draw(t, "app source"),
+			Dst: rapid.SampledFrom(selectors).Draw(t, "app destination"),
+		})
+	}
+
+	for i := range a.Grants {
+		caps := tailcfg.PeerCapMap{}
+
+		for _, key := range rapid.SliceOfNDistinct(rapid.SampledFrom([]peercap.Cap{
+			"example.com/cap/read", "example.com/cap/write", "example.com/cap/audit",
+		}), 1, 3, func(key peercap.Cap) peercap.Cap { return key }).Draw(t, "app keys") {
+			var values []tailcfg.RawMessage
+
+			if rapid.Bool().Draw(t, "app nonnil values") {
+				values = make([]tailcfg.RawMessage, 0, 3)
+				for range rapid.IntRange(0, 3).Draw(t, "app values") {
+					values = append(values, tailcfg.RawMessage(policyJSON(t, map[string]any{
+						"role":  rapid.SampledFrom([]string{"read", "write", "audit"}).Draw(t, "app role"),
+						"level": rapid.IntRange(0, 2).Draw(t, "app level"),
+					})))
+				}
+			}
+
+			caps[key] = values
+		}
+
+		a.Grants[i].Caps = caps
+	}
+
+	return a
+}
+
+// Capabilities scans only owned input grants and World identities. Missing keys
+// differ from present keys with no values; repeated values remain repeated.
+func (a *AppIntent) Capabilities(m World, src, dst types.NodeID, srcIP, dstIP netip.Addr) tailcfg.PeerCapMap {
+	want := tailcfg.PeerCapMap{}
+
+	for _, g := range a.Grants {
+		if g.Src.matches(m, m.Nodes[src], srcIP) && g.Dst.matches(m, m.Nodes[dst], dstIP) {
+			for key, values := range g.Caps {
+				want[key] = append(want[key], values...)
+			}
+		}
+	}
+
+	return want
+}
+
+// CheckAppIntent observes the pinned consumer, including unexpected keys after
+// revocation. Only destinations require matching sources as peers; app-only
+// grants do not imply symmetric visibility or permission to open network ports.
+func CheckAppIntent(t require.TestingT, m World, intent *AppIntent, destination types.NodeID, rules []tailcfg.FilterRule) []types.NodeID {
+	dst := m.Nodes[destination]
+	require.NotNil(t, dst)
+
+	matches, err := filter.MatchesFromFilterRules(rules)
+	require.NoError(t, err)
+
+	actual := filter.New(matches, nil, nil, nil, nil, logger.Discard)
+
+	var peers []types.NodeID
+
+	for _, id := range slices.Sorted(maps.Keys(m.Nodes)) {
+		if id == destination {
+			continue
+		}
+
+		src := m.Nodes[id]
+		visible := false
+
+		for family, srcIP := range []*netip.Addr{src.IPv4, src.IPv6} {
+			dstIP := []*netip.Addr{dst.IPv4, dst.IPv6}[family]
+			if srcIP == nil || dstIP == nil {
+				continue
+			}
+
+			want := intent.Capabilities(m, id, destination, *srcIP, *dstIP)
+			got := actual.CapsWithValues(*srcIP, *dstIP)
+			require.Len(t, got, len(want), "app keys %d (%s) to %d (%s): want=%v got=%v", id, srcIP, destination, dstIP, want, got)
+
+			for _, key := range slices.Sorted(maps.Keys(want)) {
+				values, present := got[key]
+				require.True(t, present, "missing app key %q from %d to %d", key, id, destination)
+				require.True(t, slices.Equal(want[key], values), "app values %q from %d (%s) to %d (%s): want=%v got=%v", key, id, srcIP, destination, dstIP, want[key], values)
+			}
+
+			visible = visible || len(want) > 0
+		}
+
+		if visible {
 			peers = append(peers, id)
 		}
 	}

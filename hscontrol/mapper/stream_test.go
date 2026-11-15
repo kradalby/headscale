@@ -8499,9 +8499,10 @@ type streamPropertySession struct {
 }
 
 type streamPropertyPolicy struct {
-	doc    []byte
-	kind   int
-	intent *propcheck.PacketIntent
+	doc       []byte
+	kind      int
+	intent    *propcheck.PacketIntent
+	appIntent *propcheck.AppIntent
 }
 
 const maxStreamPropertyNodeID types.NodeID = 255
@@ -8519,6 +8520,7 @@ type streamPropertySystem struct {
 	policy       int
 	policyDoc    []byte
 	packetIntent *propcheck.PacketIntent
+	appIntent    *propcheck.AppIntent
 	policies     []streamPropertyPolicy
 	stagedPolicy streamOperation
 	world        propcheck.World
@@ -8672,7 +8674,7 @@ func (p *streamPropertySystem) stagePolicy(t *rapid.T, op streamOperation) {
 		require.NoError(t, os.Rename(p.cfg.Policy.Path+".next", p.cfg.Policy.Path))
 	}
 
-	p.stagedPolicy = streamOperation{doc: slices.Clone(op.doc), policy: op.policy, intent: op.intent, reject: op.reject}
+	p.stagedPolicy = streamOperation{doc: slices.Clone(op.doc), policy: op.policy, intent: op.intent, appIntent: op.appIntent, reject: op.reject}
 }
 
 // Active expectations advance only after acceptance. Refused files remain on
@@ -8722,8 +8724,8 @@ func (p *streamPropertySystem) inputPolicy(t *rapid.T, op streamOperation) {
 	}
 
 	require.Equal(t, wantRev, p.state.Snapshot().Rev(), "policy publication")
-	p.policy, p.policyDoc, p.packetIntent = op.policy, slices.Clone(op.doc), op.intent
-	p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(op.doc), kind: op.policy, intent: op.intent})
+	p.policy, p.policyDoc, p.packetIntent, p.appIntent = op.policy, slices.Clone(op.doc), op.intent, op.appIntent
+	p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(op.doc), kind: op.policy, intent: op.intent, appIntent: op.appIntent})
 }
 
 // applyStreamPropertyWire crosses the real encoder boundary. Removal frames
@@ -8875,6 +8877,7 @@ func (p *streamPropertySystem) check(t *rapid.T, snap *state.Snapshot) {
 func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *state.Snapshot, session *streamPropertySession) {
 	t.Helper()
 	checkStreamPacketIntent(t, p.world, p.packetIntent, id, session.client)
+	checkStreamAppIntent(t, p.world, p.appIntent, id, session.client)
 	checkStreamNodeInputs(t, p.world, id, session.client, p.cfg.DNSConfig.BaseDomain, p.packetIntent != nil || (p.policy >= 0 && p.policy <= 2))
 
 	freshHub := NewHub()
@@ -9094,6 +9097,7 @@ type streamOperation struct {
 	policy       int
 	doc          []byte
 	intent       *propcheck.PacketIntent
+	appIntent    *propcheck.AppIntent
 	reject       bool
 	user         types.User
 	records      []tailcfg.DNSRecord
@@ -9109,7 +9113,7 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 
 	operations := kinds
 	if len(operations) == 0 {
-		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "packet-policy", "packet-deny", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request", "invalid-policy"}
+		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request", "invalid-policy"}
 		if len(ids) > 3 {
 			operations = append(operations, "delete")
 		}
@@ -9199,15 +9203,42 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 	case "packet-deny":
 		result.intent = &propcheck.PacketIntent{}
 		result.policy, result.doc = -1, result.intent.Document(t)
+	case "app-policy", "mixed-policy", "app-deny":
+		result.intent = &propcheck.PacketIntent{}
+
+		result.appIntent = &propcheck.AppIntent{}
+		if op != "app-deny" {
+			result.appIntent = propcheck.DrawAppIntent(t, p.world)
+		}
+
+		if op == "mixed-policy" {
+			result.intent = propcheck.DrawPacketIntent(t, p.world)
+		}
+
+		result.policy, result.doc = -1, result.appIntent.Document(t, result.intent)
 	case "policy-order", "policy-duplicate":
 		doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
 		require.NoError(t, err)
 
 		result.intent = p.packetIntent
-		result.policy, result.doc = p.policy, propcheck.ReorderPolicy(t, doc, op == "policy-duplicate")
+
+		result.policy = p.policy
+		if p.appIntent == nil {
+			result.doc = propcheck.ReorderPolicy(t, doc, op == "policy-duplicate")
+		} else {
+			result.appIntent = p.appIntent.Reordered(op == "policy-duplicate")
+			// Serialize the transformed input; retain unrelated document fields,
+			// including any DERP overlay added since this intent was generated.
+			var previous, composed map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(doc, &previous))
+			require.NoError(t, json.Unmarshal(result.appIntent.Document(t, result.intent), &composed))
+			previous["grants"], previous["tagOwners"] = composed["grants"], composed["tagOwners"]
+			result.doc, err = json.Marshal(previous)
+			require.NoError(t, err)
+		}
 	case "policy-restore":
 		saved := p.policies[rapid.IntRange(0, len(p.policies)-1).Draw(t, "policy-ancestor")]
-		result.policy, result.doc, result.intent = saved.kind, slices.Clone(saved.doc), saved.intent
+		result.policy, result.doc, result.intent, result.appIntent = saved.kind, slices.Clone(saved.doc), saved.intent, saved.appIntent
 	case "user":
 		u := p.world.Users[rapid.IntRange(0, 2).Draw(t, "user")]
 
@@ -9240,7 +9271,7 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 		result.doc, err = json.Marshal(policy)
 		require.NoError(t, err)
 
-		result.policy, result.intent = p.policy, p.packetIntent
+		result.policy, result.intent, result.appIntent = p.policy, p.packetIntent, p.appIntent
 	case "add":
 		result.node = p.drawNode(t, p.lastNodeID+1)
 	case "request", "stale-request":
@@ -9295,11 +9326,16 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 		}
 	case "file-stage":
 		result.intent = propcheck.DrawPacketIntent(t, p.world)
+
 		result.policy, result.doc = -1, result.intent.Document(t)
+		if p.appIntent != nil {
+			result.appIntent = propcheck.DrawAppIntent(t, p.world)
+			result.doc = result.appIntent.Document(t, result.intent)
+		}
 	case "file-reload":
-		result.policy, result.doc, result.intent, result.reject = p.stagedPolicy.policy, slices.Clone(p.stagedPolicy.doc), p.stagedPolicy.intent, p.stagedPolicy.reject
+		result.policy, result.doc, result.intent, result.appIntent, result.reject = p.stagedPolicy.policy, slices.Clone(p.stagedPolicy.doc), p.stagedPolicy.intent, p.stagedPolicy.appIntent, p.stagedPolicy.reject
 	case "file-same", "file-comment":
-		result.policy, result.doc, result.intent = p.policy, slices.Clone(p.policyDoc), p.packetIntent
+		result.policy, result.doc, result.intent, result.appIntent = p.policy, slices.Clone(p.policyDoc), p.packetIntent, p.appIntent
 		if op == "file-comment" {
 			doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
 			require.NoError(t, err)
@@ -9326,7 +9362,7 @@ func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 	beforeDERP := p.effectiveDERP(t)
 
 	switch op.kind {
-	case "policy", "generated-policy", "packet-policy", "packet-deny", "policy-order", "policy-duplicate", "policy-restore", "derp-policy", "file-stage", "file-reload", "file-same", "file-comment", "file-empty", "file-missing", "file-test-failure":
+	case "policy", "generated-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "policy-order", "policy-duplicate", "policy-restore", "derp-policy", "file-stage", "file-reload", "file-same", "file-comment", "file-empty", "file-missing", "file-test-failure":
 		p.inputPolicy(t, op)
 	case "invalid-policy":
 		op.doc, op.reject = []byte(`{"grants":`), true
@@ -9687,11 +9723,17 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 		audits := state.PolicyAuditFailures()
 
 		p := newStreamPropertySystem(t, mode)
+
 		if len(kinds) > 0 {
-			p.apply(t, p.drawOperation(t, "packet-policy"))
+			initial := "packet-policy"
+			if slices.Contains(kinds, "app-policy") {
+				initial = "app-policy"
+			}
+
+			p.apply(t, p.drawOperation(t, initial))
 
 			if mode != types.PolicyModeFile {
-				p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: p.policy, intent: p.packetIntent}}
+				p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: p.policy, intent: p.packetIntent, appIntent: p.appIntent}}
 			}
 
 			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
@@ -9707,6 +9749,7 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			old := p.state.Snapshot()
 			oldWorld := p.world.Clone()
 			oldIntent := p.packetIntent
+			oldAppIntent := p.appIntent
 			oldIdentityAddresses := oldIntent != nil || (p.policy >= 0 && p.policy <= 2)
 			oldDERP := p.effectiveDERP(t)
 			oldNode := old.ListNodes().At(0).ID()
@@ -9717,6 +9760,7 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			oldClient := newPropertyClient(&tailcfg.MapResponse{})
 			applyStreamPropertyWire(t, oldHub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, oldMap)})
 			checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, oldClient)
+			checkStreamAppIntent(t, oldWorld, oldAppIntent, oldNode, oldClient)
 			checkStreamNodeInputs(t, oldWorld, oldNode, oldClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses)
 			oldHub.Close()
 
@@ -9761,6 +9805,7 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			lateClient.check(t, oldClient)
 
 			checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, lateClient)
+			checkStreamAppIntent(t, oldWorld, oldAppIntent, oldNode, lateClient)
 			checkStreamNodeInputs(t, oldWorld, oldNode, lateClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses)
 
 			last = snap
@@ -9775,7 +9820,12 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 				}
 			}
 
-			for _, operation := range []string{"policy-order", "policy-duplicate", "packet-deny", "policy-restore", "packet-policy", "identity"} {
+			mandatory := []string{"policy-order", "policy-duplicate", "packet-deny", "policy-restore", "packet-policy", "identity"}
+			if slices.Contains(kinds, "app-policy") {
+				mandatory = []string{"app-deny", "policy-restore", "mixed-policy", "app-policy", "identity", "policy-order", "policy-duplicate"}
+			}
+
+			for _, operation := range mandatory {
 				operations = []string{operation}
 
 				commit(t)
@@ -10666,6 +10716,138 @@ func TestStreamMapRequestHistory(t *testing.T) {
 				}
 
 				flush(true)
+			})
+		})
+	}
+}
+
+func checkStreamAppIntent(t require.TestingT, world propcheck.World, intent *propcheck.AppIntent, id types.NodeID, client *propertyClient) {
+	if intent == nil {
+		return
+	}
+
+	for _, peer := range propcheck.CheckAppIntent(t, world, intent, id, client.filter) {
+		require.Contains(t, client.peers, peer.NodeID(), "required app source")
+	}
+}
+
+func TestRapidStreamAppIntent(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			runRapidStreamSystem(t, mode, "app-policy", "mixed-policy", "app-deny", "policy-order", "policy-duplicate", "policy-restore", "identity", "user", "request-hostinfo", "derp-policy", "noop")
+		})
+	}
+}
+
+// Fixed value changes, revocations and restores reach the consumer independently
+// of the enabled order/duplicate diagnostics in generated histories.
+func TestStreamAppIntentHistory(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+			rapid.Check(t, func(t *rapid.T) {
+				p := newStreamPropertySystem(t, mode)
+				packet := &propcheck.PacketIntent{}
+				mixed := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{{
+					Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"},
+					Protocol: ipproto.TCP, First: 22, Last: 23,
+				}}}
+				first := &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+					Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"},
+					Caps: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`, `{"role":"read"}`}, "example.com/cap/empty": nil},
+				}}}
+				second := &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+					Src: first.Grants[0].Src, Dst: first.Grants[0].Dst,
+					Caps: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"audit"}`}, "example.com/cap/empty": {}},
+				}}}
+				last := p.state.Snapshot()
+				flush := func() {
+					snap := p.state.Snapshot()
+					all, wake := Route(last, snap, snap.Since(last))
+					p.hub.advance(snap)
+
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if p.sessions[id].down {
+							p.open(t, id, snap, false)
+						} else if _, named := wake[id]; all || named {
+							p.update(t, id, snap, rapid.IntRange(0, 2).Draw(t, "app delivery"))
+						}
+					}
+					// Check unwoken live clients before any reconnect can hide a
+					// missing Route wake.
+					p.check(t, snap)
+					// Complete the destination while this state still exists; a
+					// partial prefix cannot erase a revocation before restoration.
+					if p.sessions[2].down {
+						p.open(t, 2, snap, false)
+					}
+
+					require.False(t, p.sessions[2].down)
+
+					last = snap
+				}
+				set := func(app *propcheck.AppIntent, ports *propcheck.PacketIntent) {
+					p.apply(t, streamOperation{kind: "app-policy", policy: -1, doc: app.Document(t, ports), intent: ports, appIntent: app})
+					flush()
+				}
+				set(first, packet)
+
+				old, oldWorld := p.state.Snapshot(), p.world.Clone()
+
+				for _, app := range []*propcheck.AppIntent{second, {}, first} {
+					set(app, packet)
+				}
+
+				set(first, mixed)
+				set(first, packet)
+
+				if mode == types.PolicyModeFile {
+					p.apply(t, streamOperation{kind: "file-stage", policy: -1, doc: second.Document(t, packet), intent: packet, appIntent: second})
+					flush()
+					require.Same(t, first, p.appIntent)
+					p.apply(t, p.drawOperation(t, "file-reload"))
+					flush()
+					require.Same(t, second, p.appIntent)
+
+					for _, kind := range []string{"file-same", "file-comment", "invalid-policy", "file-reload", "file-empty", "file-reload", "file-missing", "file-reload", "file-test-failure", "file-reload"} {
+						p.apply(t, p.drawOperation(t, kind))
+						flush()
+						require.Same(t, second, p.appIntent)
+					}
+
+					set(first, packet)
+				}
+
+				saved := p.policies[len(p.policies)-1]
+
+				set(second, packet)
+
+				p.policies = []streamPropertyPolicy{saved}
+				p.apply(t, p.drawOperation(t, "policy-restore"))
+				flush()
+				require.Same(t, first, p.appIntent)
+
+				for _, id := range []types.NodeID{1, 2} {
+					before := p.world.Nodes[id].Clone()
+					tagged := before.Clone()
+					tagged.Tags = []string{"tag:srv"}
+					p.apply(t, streamOperation{kind: "identity", before: before, node: tagged})
+					flush()
+					p.apply(t, streamOperation{kind: "identity", before: tagged, node: before})
+					flush()
+				}
+
+				p.apply(t, p.drawOperation(t, "derp-policy"))
+				flush()
+				require.Same(t, first, p.appIntent)
+
+				late, err := NewStream(p.cfg, p.hub, 2, capVer).r.render(old)
+				require.NoError(t, err)
+
+				client := newPropertyClient(&tailcfg.MapResponse{})
+				applyStreamPropertyWire(t, p.hub, client, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
+				checkStreamAppIntent(t, oldWorld, first, 2, client)
+				checkStreamPacketIntent(t, oldWorld, packet, 2, client)
 			})
 		})
 	}

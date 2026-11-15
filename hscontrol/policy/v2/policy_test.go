@@ -7960,6 +7960,19 @@ func TestIncrementalAppGrantOrderInvalidatesFilter(t *testing.T) {
 // Lost grants, broadened ports and creator-as-owner mistakes must disagree with
 // this input model even when incremental and full compiles agree with each other.
 func TestIncrementalPolicyRapidPacketIntent(t *testing.T) {
+	runIncrementalPolicyIntent(t, false, true)
+}
+
+func TestIncrementalPolicyRapidAppIntent(t *testing.T) {
+	runIncrementalPolicyIntent(t, true, true)
+}
+
+func TestIncrementalPolicyRapidAppReplacements(t *testing.T) {
+	runIncrementalPolicyIntent(t, true, false)
+}
+
+func runIncrementalPolicyIntent(t *testing.T, apps, reorder bool) {
+	t.Helper()
 	rapid.Check(t, func(t *rapid.T) {
 		in := incrementalInput{users: []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}, {ID: 3, Name: "u3"}}}
 		for i := range rapid.IntRange(4, 6).Draw(t, "nodes") {
@@ -7977,21 +7990,37 @@ func TestIncrementalPolicyRapidPacketIntent(t *testing.T) {
 		intent := propcheck.DrawPacketIntent(t, world(in))
 		in.doc = intent.Document(t)
 
+		var appIntent *propcheck.AppIntent
+		if apps {
+			appIntent = propcheck.DrawAppIntent(t, world(in))
+			in.doc = appIntent.Document(t, intent)
+		}
+
 		type savedPolicy struct {
-			doc    []byte
-			intent *propcheck.PacketIntent
+			doc       []byte
+			intent    *propcheck.PacketIntent
+			appIntent *propcheck.AppIntent
 		}
 
 		// Every history replaces and restores a document; generated steps add
 		// identity/family changes and further historical transformations.
-		ops := append([]string{"order", "duplicate", "deny", "restore", "policy"}, rapid.SliceOfN(rapid.SampledFrom([]string{"policy", "identity", "family", "order", "duplicate", "restore"}), 1, 8).Draw(t, "intent operations")...)
+		ops := []string{"deny", "restore", "policy"}
+		choices := []string{"policy", "identity", "family", "restore"}
+
+		if reorder {
+			ops = append([]string{"order", "duplicate"}, ops...)
+			choices = append(choices, "order", "duplicate")
+		}
+
+		ops = append(ops, rapid.SliceOfN(rapid.SampledFrom(choices), 1, 8).Draw(t, "intent operations")...)
 		history := make([]savedPolicy, 1, 1+len(ops))
-		history[0] = savedPolicy{in.doc, intent}
+		history[0] = savedPolicy{in.doc, intent, appIntent}
 
 		type retained struct {
-			world   propcheck.World
-			intent  *propcheck.PacketIntent
-			manager *PolicyManager
+			world     propcheck.World
+			intent    *propcheck.PacketIntent
+			appIntent *propcheck.AppIntent
+			manager   *PolicyManager
 		}
 
 		var (
@@ -8006,10 +8035,10 @@ func TestIncrementalPolicyRapidPacketIntent(t *testing.T) {
 			require.NoError(t, err)
 
 			m := world(in)
-			snapshots = append(snapshots, retained{m, intent, next})
+			snapshots = append(snapshots, retained{m, intent, appIntent, next})
 			// Packet order is not authorization. Existing equivalence properties
 			// retain their stronger representation diagnostics separately.
-			for _, saved := range append(slices.Clone(snapshots), retained{m, intent, fresh}) {
+			for _, saved := range append(slices.Clone(snapshots), retained{m, intent, appIntent, fresh}) {
 				classes := saved.manager.BuildPeerClasses(saved.manager.nodes, nil)
 				for _, id := range slices.Sorted(maps.Keys(saved.world.Nodes)) {
 					n := saved.world.Nodes[id]
@@ -8018,6 +8047,12 @@ func TestIncrementalPolicyRapidPacketIntent(t *testing.T) {
 
 					for _, peer := range propcheck.CheckPacketIntent(t, saved.world, saved.intent, id, rules) {
 						require.Contains(t, classes.Peers(id), peer, "required incoming/outgoing packet peer")
+					}
+
+					if saved.appIntent != nil {
+						for _, peer := range propcheck.CheckAppIntent(t, saved.world, saved.appIntent, id, rules) {
+							require.Contains(t, classes.Peers(id), peer, "required app source")
+						}
 					}
 				}
 			}
@@ -8036,14 +8071,30 @@ func TestIncrementalPolicyRapidPacketIntent(t *testing.T) {
 				in.doc = intent.Document(t)
 			case "restore":
 				saved := history[rapid.IntRange(0, len(history)-1).Draw(t, "intent ancestor")]
-				in.doc, intent = slices.Clone(saved.doc), saved.intent
+				in.doc, intent, appIntent = slices.Clone(saved.doc), saved.intent, saved.appIntent
+			case "order", "duplicate":
+				if appIntent != nil {
+					appIntent = appIntent.Reordered(op == "duplicate")
+					in.doc = appIntent.Document(t, intent)
+				} else {
+					in = in.edit(t, op)
+				}
 			default:
 				in = in.edit(t, op)
 			}
 
+			if apps && (op == "policy" || op == "deny") {
+				appIntent = &propcheck.AppIntent{}
+				if op == "policy" {
+					appIntent = propcheck.DrawAppIntent(t, world(in))
+				}
+
+				in.doc = appIntent.Document(t, intent)
+			}
+
 			check()
 
-			history = append(history, savedPolicy{slices.Clone(in.doc), intent})
+			history = append(history, savedPolicy{slices.Clone(in.doc), intent, appIntent})
 		}
 	})
 }
@@ -8188,6 +8239,182 @@ func TestPacketIntentRevocation(t *testing.T) {
 					}
 				})
 			}
+		})
+	}
+}
+
+// Literal expectations pin ownership, nil/empty key presence, order and repeats
+// independently of the policy compiler and the generated reference model.
+func TestAppIntentOwnershipAndValues(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: users}
+
+	nodes := make(types.Nodes, 0, 4)
+
+	for i := range 4 {
+		n := node(fmt.Sprintf("n%d", i+1), fmt.Sprintf("100.64.0.%d", i+1), fmt.Sprintf("fd7a:115c:a1e0::%d", i+1), users[i%2])
+
+		n.ID = types.NodeID(i + 1)
+		if i >= 2 {
+			n.Tags = []string{"tag:srv"}
+		}
+
+		m.Put(n)
+		nodes = append(nodes, n)
+	}
+
+	intent := &propcheck.AppIntent{Grants: []propcheck.AppGrant{
+		{Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"}, Caps: tailcfg.PeerCapMap{
+			"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`, `{"role":"read"}`},
+			"example.com/cap/nil":   nil, "example.com/cap/empty": {},
+		}},
+		{Src: propcheck.PacketSelector{Tag: "tag:srv"}, Dst: propcheck.PacketSelector{User: "u2"}, Caps: tailcfg.PeerCapMap{"example.com/cap/tag": nil}},
+		{Src: propcheck.PacketSelector{IP: *nodes[0].IPv6}, Dst: propcheck.PacketSelector{IP: *nodes[3].IPv6}, Caps: tailcfg.PeerCapMap{"example.com/cap/v6": {`{"family":6}`}}},
+	}}
+	packet := &propcheck.PacketIntent{}
+	pm, err := NewPolicyManager(intent.Document(t, packet), users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	classes := pm.BuildPeerClasses(pm.nodes, nil)
+
+	for _, tc := range []struct {
+		src, dst types.NodeID
+		v6       bool
+		want     tailcfg.PeerCapMap
+	}{
+		{1, 2, false, tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`, `{"role":"read"}`}, "example.com/cap/nil": nil, "example.com/cap/empty": nil}},
+		{1, 2, true, tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`, `{"role":"read"}`}, "example.com/cap/nil": nil, "example.com/cap/empty": nil}},
+		{2, 1, false, tailcfg.PeerCapMap{}},
+		{3, 2, true, tailcfg.PeerCapMap{"example.com/cap/tag": nil}},
+		{1, 4, false, tailcfg.PeerCapMap{}},
+		{1, 4, true, tailcfg.PeerCapMap{"example.com/cap/v6": {`{"family":6}`}}},
+	} {
+		src, dst := m.Nodes[tc.src].IPv4, m.Nodes[tc.dst].IPv4
+		if tc.v6 {
+			src, dst = m.Nodes[tc.src].IPv6, m.Nodes[tc.dst].IPv6
+		}
+
+		require.Equal(t, tc.want, intent.Capabilities(m, tc.src, tc.dst, *src, *dst), "%+v", tc)
+	}
+
+	for _, n := range nodes {
+		rules, err := pm.FilterForNode(n.View())
+		require.NoError(t, err)
+		propcheck.CheckPacketIntent(t, m, packet, n.ID, rules)
+
+		for _, peer := range propcheck.CheckAppIntent(t, m, intent, n.ID, rules) {
+			require.Contains(t, classes.Peers(n.ID), peer)
+		}
+	}
+}
+
+// These enabled regressions expose the known cache invalidation defects through
+// consumer values, without the older representation/audit check stopping first.
+func TestIncrementalAppIntentConsumerInvalidation(t *testing.T) {
+	for _, duplicate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("duplicate=%t", duplicate), func(t *testing.T) {
+			nodes := scanManyRulesNodes(2)
+
+			m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}}
+			for _, n := range nodes {
+				m.Put(n)
+			}
+
+			before := &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+				Src: propcheck.PacketSelector{IP: *nodes[0].IPv4}, Dst: propcheck.PacketSelector{IP: *nodes[1].IPv4},
+				Caps: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`}},
+			}}}
+			if !duplicate {
+				before.Grants = append(before.Grants, propcheck.AppGrant{
+					Src: before.Grants[0].Src, Dst: before.Grants[0].Dst,
+					Caps: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"write"}`}},
+				})
+			}
+
+			packet := &propcheck.PacketIntent{}
+			old, err := NewPolicyManager(before.Document(t, packet), nil, nodes.ViewSlice())
+			require.NoError(t, err)
+			rules, err := old.FilterForNode(nodes[1].View())
+			require.NoError(t, err)
+			propcheck.CheckAppIntent(t, m, before, nodes[1].ID, rules)
+
+			after := before.Reordered(duplicate)
+			next, err := NewPolicyManagerFrom(old, after.Document(t, packet), nil, nodes.ViewSlice())
+			require.NoError(t, err)
+			fresh, err := NewPolicyManager(after.Document(t, packet), nil, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			for _, manager := range []*PolicyManager{fresh, next} {
+				rules, err := manager.FilterForNode(nodes[1].View())
+				require.NoError(t, err)
+				propcheck.CheckAppIntent(t, m, after, nodes[1].ID, rules)
+			}
+		})
+	}
+}
+
+// Capture only assertion failures so negative oracle controls remain ordinary
+// passing tests. A different panic cannot masquerade as rejecting corrupt rules.
+type appIntentFailure struct {
+	message string
+}
+
+func (f *appIntentFailure) Errorf(format string, args ...any) {
+	f.message = fmt.Sprintf(format, args...)
+}
+
+func (f *appIntentFailure) FailNow() { panic(f) }
+
+func TestAppIntentRejectsCorruptedConsumerRules(t *testing.T) {
+	nodes := scanManyRulesNodes(2)
+
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}}
+	for _, n := range nodes {
+		m.Put(n)
+	}
+
+	intent := &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+		Src: propcheck.PacketSelector{IP: *nodes[0].IPv4}, Dst: propcheck.PacketSelector{IP: *nodes[1].IPv4},
+		Caps: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`}, "example.com/cap/empty": nil},
+	}}}
+	actual := []tailcfg.FilterRule{{SrcIPs: []string{nodes[0].IPv4.String()}, CapGrant: []tailcfg.CapGrant{{
+		Dsts:   []netip.Prefix{netip.PrefixFrom(*nodes[1].IPv4, 32)},
+		CapMap: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`}, "example.com/cap/empty": {}},
+	}}}}
+	propcheck.CheckAppIntent(t, m, intent, nodes[1].ID, actual)
+
+	for _, mutation := range []string{"drop", "retain-revoked", "reverse", "duplicate", "replace-empty-key"} {
+		t.Run(mutation, func(t *testing.T) {
+			rules := slices.Clone(actual)
+			rules[0].CapGrant = slices.Clone(actual[0].CapGrant)
+			caps := maps.Clone(actual[0].CapGrant[0].CapMap)
+			caps["example.com/cap/roles"] = slices.Clone(caps["example.com/cap/roles"])
+			rules[0].CapGrant[0].CapMap = caps
+			want := intent
+			message := "app values"
+
+			switch mutation {
+			case "drop":
+				rules, message = nil, "app keys"
+			case "retain-revoked":
+				want, message = &propcheck.AppIntent{}, "app keys"
+			case "reverse":
+				slices.Reverse(caps["example.com/cap/roles"])
+			case "duplicate":
+				caps["example.com/cap/roles"] = append(caps["example.com/cap/roles"], caps["example.com/cap/roles"][0])
+			case "replace-empty-key":
+				delete(caps, "example.com/cap/empty")
+				caps["example.com/cap/unexpected"] = nil
+				message = "missing app key"
+			}
+
+			failure := &appIntentFailure{}
+			// No warm/fresh agreement participates: identical corruption in
+			// both compiler paths must still fail this input-derived check.
+			require.PanicsWithValue(t, failure, func() {
+				propcheck.CheckAppIntent(failure, m, want, nodes[1].ID, rules)
+			})
+			require.Contains(t, failure.message, message)
 		})
 	}
 }
