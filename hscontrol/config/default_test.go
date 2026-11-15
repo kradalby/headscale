@@ -38,7 +38,6 @@ func TestDefaultHoldsDefaults(t *testing.T) {
 	assert.Equal(t, 1024, d.Tuning.RegisterCacheMaxEntries)
 	assert.Equal(t, 100, d.Tuning.NodeStoreBatchSize)
 	assert.Equal(t, 500*time.Millisecond, d.Tuning.NodeStoreBatchTimeout)
-	assert.Zero(t, d.Tuning.BatcherWorkers, "auto: its count depends on the host")
 	require.Equal(t, []string{"9.9.9.9:53", "149.112.112.112:53"}, d.DNSConfig.Challenge.Resolvers)
 
 	assert.Equal(t, types.ListenAddr("0.0.0.0:8080"), d.Addr)

@@ -1,8 +1,6 @@
 package state
 
 import (
-	"fmt"
-
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/rs/zerolog/log"
@@ -16,7 +14,7 @@ import (
 // run the whole set.
 type nodeHealthCheck struct {
 	name  string
-	check func(nv types.NodeView, cfg *types.Config) (problem, fixHint string, ok bool)
+	check func(nv types.NodeView, dns types.DNSView) (problem, fixHint string, ok bool)
 }
 
 // nodeHealthChecks is the registry of node-data health checks; append to it
@@ -29,10 +27,10 @@ var nodeHealthChecks = []nodeHealthCheck{givenNameMapsToValidFQDN, expiryIsEncod
 // any peer's — so it must be renamed to recover.
 var givenNameMapsToValidFQDN = nodeHealthCheck{
 	name: "given-name-maps-to-valid-fqdn",
-	check: func(nv types.NodeView, cfg *types.Config) (string, string, bool) {
-		err := types.ValidateGivenName(nv.GivenName(), cfg.DNSConfig.BaseDomain)
+	check: func(nv types.NodeView, dns types.DNSView) (string, string, bool) {
+		err := types.ValidateGivenName(nv.GivenName(), dns.BaseDomain())
 		if err != nil {
-			return err.Error(), fmt.Sprintf("headscale nodes rename %d <name>", nv.ID()), false
+			return err.Error(), types.StoredDataFixHint(nv.ID(), err), false
 		}
 
 		return "", "", true
@@ -44,16 +42,13 @@ var givenNameMapsToValidFQDN = nodeHealthCheck{
 // any peer's — so its expiry must be reset to recover.
 var expiryIsEncodable = nodeHealthCheck{
 	name: "expiry-is-encodable",
-	check: func(nv types.NodeView, _ *types.Config) (string, string, bool) {
+	check: func(nv types.NodeView, _ types.DNSView) (string, string, bool) {
 		// No expiry is sent as the zero time, which is in range.
 		expiry, _ := nv.Expiry().GetOk()
 
 		_, err := types.ValidateExpiry(expiry)
 		if err != nil {
-			return err.Error(), fmt.Sprintf(
-				"headscale nodes expire --identifier %d",
-				nv.ID(),
-			), false
+			return err.Error(), types.StoredDataFixHint(nv.ID(), err), false
 		}
 
 		return "", "", true
@@ -76,9 +71,12 @@ type nodeHealthFinding struct {
 func (s *State) scanNodeHealth() []nodeHealthFinding {
 	var findings []nodeHealthFinding
 
-	for _, nv := range s.nodeStore.ListNodes().All() {
+	snap := s.Snapshot()
+
+	dns := snap.DNS()
+	for _, nv := range snap.ListNodes().All() {
 		for _, c := range nodeHealthChecks {
-			problem, fixHint, ok := c.check(nv, s.cfg)
+			problem, fixHint, ok := c.check(nv, dns)
 			if ok {
 				continue
 			}

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/netmap"
@@ -32,9 +31,8 @@ func TestPolicyDERPMapReachesClient(t *testing.T) {
 	setPolicy := func(pol string) {
 		t.Helper()
 
-		_, changes, err := srv.State().UpdatePolicy([]byte(pol))
+		_, err := srv.State().UpdatePolicy(t.Context(), []byte(pol))
 		require.NoError(t, err)
-		srv.App.Change(changes...)
 	}
 
 	const region901 = `"901": {"RegionID": 901, "RegionCode": "custom", "Nodes": [
@@ -52,7 +50,6 @@ func TestPolicyDERPMapReachesClient(t *testing.T) {
 	srv.State().SetDERPMap(&tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
 		902: {RegionID: 902, Nodes: []*tailcfg.DERPNode{{Name: "902a", RegionID: 902, DERPPort: -1}}},
 	}})
-	srv.App.Change(change.DERPMap())
 
 	setPolicy(`{"derpMap": {"Regions": {` + region901 + `}}}`)
 	waitRegions("refreshed map with policy region", 901, 902)

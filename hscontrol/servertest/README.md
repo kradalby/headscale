@@ -1,7 +1,7 @@
 # Server stress tests
 
 `TestScale` exercises a real Headscale server, SQLite, policy compilation,
-the NodeStore, mapper workers, Noise, and Tailscale control clients over the
+the world and its map sessions, Noise, and Tailscale control clients over the
 existing in-memory network. Every registered node has a live control client.
 The test cases and their policies are together in `scale_test.go`.
 
@@ -9,21 +9,20 @@ The ordinary test suite runs all five policies with 12 nodes. Larger runs
 require `HEADSCALE_STRESS_NODES`; setting it replaces the small node count.
 Nothing large is enabled by `go test ./...` or by omitting `-short`.
 
-| Case               | Expected visibility                                          | Main pressure                                      |
-| ------------------ | ------------------------------------------------------------ | -------------------------------------------------- |
-| `allow_all`        | Everyone sees everyone                                       | Dense graph, map size, broadcast fan-out           |
-| `isolated`         | No peers                                                     | Registration and state updates without peer output |
-| `personal_devices` | Up to ten devices belonging to the same user                 | Per-node policy compilation and isolation          |
-| `shared_service`   | One tagged service sees everyone; everyone else sees only it | Uneven fan-out and tag identity                    |
-| `personal_ssh`     | Personal devices, with SSH to the same user's devices        | Per-node SSH policy generation                     |
+| Case               | Expected visibility                                                   | Main pressure                                           |
+| ------------------ | --------------------------------------------------------------------- | ------------------------------------------------------- |
+| `allow_all`        | Everyone sees everyone                                                | Dense graph, map size, broadcast fan-out                |
+| `isolated`         | Same-user devices remain peers; all traffic is denied                 | Registration and state updates with bounded peer output |
+| `personal_devices` | Up to ten devices belonging to the same user                          | Per-node policy compilation and isolation               |
+| `shared_service`   | One tagged service sees everyone; others see it and same-user devices | Uneven fan-out and tag identity                         |
+| `personal_ssh`     | Personal devices, with SSH to the same user's devices                 | Per-node SSH policy generation                          |
 
 Each case enrolls its clients, sends three Hostinfo bursts, revokes access,
 restores access, and reconnects one client per user. Bursts change one node
 per ten-node user; the final user can have fewer nodes. Registration uses
-batches of at most 32 concurrent logins. Mapper workers are
-`min(4, GOMAXPROCS)`, with the harness's 50 ms mapper delay, 30-frame session
-buffer. Explicit scale runs use the server's default NodeStore batching;
-the routine 12-node smoke run shortens its batch wait to 10 ms.
+batches of at most 32 concurrent logins. Map sessions coalesce changes for
+the harness's 50 ms batch delay. Explicit scale runs do not hold writes
+during an HA outage; the routine 12-node smoke run holds them for 10 ms.
 
 Completion means the intended state reached every affected client, with the
 exact permitted peer IDs, fresh OS markers, and online peers. Bounded
@@ -33,9 +32,9 @@ same-user principal addresses. After reconnecting, a new policy generation
 broadcast checks delivery on every recovered stream, including isolated nodes.
 Policy changes carry a new node attribute so an old map cannot satisfy a
 policy wait. Revocation also checks that packet filter rules are empty.
-Each phase checks both client streams and server connections and rejects
-mapper work errors. Convergence has a shared two-minute deadline per wait,
-and existing login helpers retain their ten-second registration timeout.
+Each phase checks both client streams and server connections. Convergence
+has a shared two-minute deadline per wait, and existing login helpers retain
+their ten-second registration timeout.
 There are no sleep-based completion checks or automatic reconnect retries.
 
 ## Run
@@ -59,7 +58,7 @@ HEADSCALE_STRESS_NODES=10000 GOMAXPROCS=4 \
   go test ./hscontrol/servertest -run '^TestScale/10000_nodes/personal_devices$' \
   -count=1 -v -timeout=60m
 
-# A compute-constrained run: one Go execution thread and one mapper worker.
+# A compute-constrained run: one Go execution thread.
 HEADSCALE_STRESS_NODES=500 GOMAXPROCS=1 GOMEMLIMIT=512MiB \
   go test ./hscontrol/servertest -run '^TestScale/500_nodes/personal_devices$' \
   -count=1 -v -timeout=30m
@@ -71,6 +70,205 @@ Choose large dense runs deliberately: 10,000 all-to-all clients hold
 other state. A sparse output graph still requires policy/peer calculations;
 it does not guarantee linear CPU use. `GOMEMLIMIT` is a soft Go heap target,
 not an RSS cap. Go's resource settings constrain server and clients together.
+
+## Sustained registration and deletion churn
+
+`TestScaleChurn` shares the five policies above and adds `growing_diversity`:
+one explicit user-to-same-user TCP 443 grant per ten-device user, so both
+identity count and rule count grow as ceil(nodes/10). Its peer sets match
+`personal_devices`, allowing comparisons between equal output sizes with
+different policy work. This is growing user/rule diversity, not distinct tags
+or via-router churn.
+
+Every case performs ten rounds. Round r deletes slots r, r+10, and so on
+through `State.DeleteNode` while their real control sessions are open, waits
+for removal delivery, then enrolls fresh clients with new machine/node keys
+and durable node IDs in those slots. The cohort is about 10% of the live
+nodes; all original clients are replaced once, while population stays
+bounded. Authentication and deletion batches have at most 32 workers.
+Policy revocation runs concurrently with replacement in round 4; restoration
+runs concurrently in round 5. Then separate storms restart every client on a fresh Direct/Noise transport
+and log every client out and back in with its reusable auth key. Authenticated
+restarts preserve node IDs and keys; logout/relogin preserves the machine's registered
+ID but rotates its node key, which must also reach every affected peer.
+These storms do not count as
+join/leave churn. Unlike the mapper's store-only `rejoin` benchmark, cohort
+replacement includes real authentication, SQLite registration and deletion.
+
+Each removal/replacement phase checks every surviving client's exact peer
+IDs and keys, including absence of retired IDs and cross-user isolation,
+IPv4/IPv6 filter probes and SSH principals. Policy generation attributes
+check delivery after policy changes and storms. Live client polls, hub
+sessions and durable SQLite IDs/keys must agree after every phase. Removal
+and replacement report operation counts, mutation wall time and subsequent
+delivery convergence separately; those timings include harness work and
+are not per-operation latency percentiles.
+
+The final phase forces GC and checks weak references to retired clients and
+old compiled policies while the server and current clients remain live.
+Old policies own old node sets; a weak reference to a temporary `Snapshot`
+wrapper alone would not prove their release. Client cleanup callbacks release
+their capture after early teardown, and `WithoutNetmapHistory` disables
+historical client maps. Collection checks cover those objects and session
+counts, not all server caches or a server-only heap plateau.
+
+```sh
+# Ordinary CI runs this small six-policy smoke test too.
+go test ./hscontrol/servertest -run '^TestScaleChurn$' -count=1 -v
+
+# Profile a selected workload in a fresh process; keep runtime settings fixed.
+mkdir -p control_logs/server-churn
+HEADSCALE_STRESS_NODES=500 GOMAXPROCS=2 GOMEMLIMIT=2GiB \
+  go test -p=2 ./hscontrol/servertest \
+  -run '^TestScaleChurn/500_nodes/growing_diversity$' -count=1 -v -timeout=30m \
+  -cpuprofile=control_logs/server-churn/cpu.prof \
+  -memprofile=control_logs/server-churn/alloc.prof \
+  >control_logs/server-churn/run.log 2>&1
+go tool pprof -sample_index=alloc_space control_logs/server-churn/alloc.prof
+```
+
+Ramp from 12 to 100, 500, 1000 and 2000 nodes before considering 5000 sparse
+clients. Attempt 10000 sparse clients only with measured memory and latency
+headroom. Dense visibility retains O(N²) current client peers, so a successful
+sparse run does not justify an equally large dense run. Use an external hard
+memory/swap cap (for example a systemd scope with `MemoryMax=4G` and
+`MemorySwapMax=0`) as well as Go's soft limit; serialize heavy comparisons.
+Record resource failures without silently raising caps. Go 1.27's
+`testing.TempDir` prefers `GOTMPDIR` over `TMPDIR`: to put SQLite fixtures on
+tmpfs while keeping compiler scratch on disk, set the outer `GOTMPDIR` to a
+disk directory and add `-exec 'env GOTMPDIR=/dev/shm/server-churn'` to
+`go test` after creating that runtime directory. Standalone test binaries
+instead need `GOTMPDIR` set to the runtime directory directly. Tmpfs pages
+also count against the cgroup limit; the phase log includes the actual DB path.
+CPU/alloc profiles include enrollment and assertions; use a separate trace run when diagnosing
+scheduler or GC delays. The limitations below also apply to churn profiles.
+
+## Registered nodes with a connected subset
+
+`TestScalePartialTailnet` separates registered population from connected control
+clients. Its ordinary smoke test uses 20 registered nodes and 10 connected
+clients, with `self` and `per_user` policies. Both allow same-user TCP 443;
+`per_user` has one explicit grant per user, including offline users. Set
+`HEADSCALE_STRESS_REGISTERED` and `HEADSCALE_STRESS_CONNECTED` independently to
+select larger populations. Both counts must be multiples of ten, with at least
+ten connected clients and one additional offline user group.
+
+Every node authenticates over Noise and receives an initial map. Offline user
+groups enroll first in batches of at most 32 clients; those clients close after
+the batch's initial maps, leaving durable registrations. Only node views, IDs,
+keys and weak collection probes remain. Setup convergence waits for the server's
+15-second reconnect grace before requiring offline state. Active user groups then enroll and keep
+their streams open. The test never holds a client for every registered node.
+Whole user groups form the connected subset, so active clients' same-user peers
+are all online. Offline nodes still contribute to graph and policy size, and
+cross-user packet probes include offline addresses.
+
+Ten cohorts delete and replace every active member once with fresh authenticated
+keys and durable IDs. Policy revocation and restoration precede replacement in
+rounds four and five. Each phase checks exact active peer IDs/keys, forbidden
+cross-user visibility, IPv4/IPv6 packet verdicts, policy generation delivery,
+one session per active client, and every surviving registration's durable
+identity and user ownership. Offline registrations must retain their original
+IDs/keys and stay offline. GC checks retired-client collection after offline
+enrollment and retired-client/old-policy collection after churn while the server
+and active clients remain live. Phase logs separate mutations from convergence;
+offline and active enrollment are separate setup phases.
+
+```sh
+# Ordinary small coverage; also runs without stress environment variables.
+HEADSCALE_DEBUG_POLICY_AUDIT=1 go test ./hscontrol/servertest \
+  -run '^TestScalePartialTailnet$' -count=1 -v
+
+# 1000 registered nodes, only 100 connected control clients.
+HEADSCALE_STRESS_REGISTERED=1000 HEADSCALE_STRESS_CONNECTED=100 \
+  GOMAXPROCS=2 GOMEMLIMIT=2GiB go test -p=2 ./hscontrol/servertest \
+  -run '^TestScalePartialTailnet/1000_registered/100_connected/self$' \
+  -count=1 -v -timeout=30m
+
+# Raise the connected fraction only after checking measured memory headroom.
+HEADSCALE_STRESS_REGISTERED=10000 HEADSCALE_STRESS_CONNECTED=5000 \
+  GOMAXPROCS=2 GOMEMLIMIT=2GiB go test -p=2 ./hscontrol/servertest \
+  -run '^TestScalePartialTailnet/10000_registered/5000_connected/self$' \
+  -count=1 -v -timeout=30m
+```
+
+Serialize heavy comparisons and use the hard memory/swap limits described above.
+Hold connected count and policy shape fixed
+when comparing registered-population growth; report both counts. Ramp from
+1000 registered/100 connected to 5000 registered/100 connected, and inspect
+measured peak memory before larger populations. A 10000 registered/100 connected
+run is not a 10000-connected-client result. These profiles still include test
+clients, setup and assertions; they do not establish a server-only capacity.
+To measure active-client cost, hold registered count fixed and increase the
+connected subset, for example 10000 registered/1000 connected, then 10000/5000
+only if the measured peak projects within the hard memory limit. Select
+`per_user` instead of `self` to exercise explicit grants with the same peer
+output. Keep the existing ten-second login and first-map deadlines; a failure
+is a workload limit to report, not a reason to extend them.
+
+## Connected via/self HA churn
+
+`TestScaleViaChurn` runs serial `via_only` and `via_self` cases with 20
+user-owned viewers and three tagged routers by default: **23 registered,
+connected nodes**, not 20 total nodes. `HEADSCALE_STRESS_VIA_VIEWERS` replaces
+only the viewer count (minimum 20); it is independent of
+`HEADSCALE_STRESS_NODES`. Users own up to ten devices each. One prefix,
+`10.33.0.0/24`, has two via routers and one non-via router. The non-via
+router connects first and must retain global primary throughout the test.
+Both policies grant member viewers TCP access to that prefix through
+`tag:router`; `via_self` also grants TCP access to the user's own devices.
+No all-to-all grant is present.
+
+Ten rounds alternate immediate health failover and recovery of the oldest
+via session, then delete and replace one viewer per user through the real
+registration and durable deletion paths. Every original viewer is replaced.
+Each replacement changes the policy generation and alternates TCP 443 and 8443. A final router deletion, replacement and health failover checks that
+the replacement can win while the non-via global primary remains unchanged.
+Registration and deletion batches contain at most 32 clients. The existing
+ten-second login and first-map timeouts remain unchanged.
+
+Every phase checks exact peer IDs, keys and online state, current self
+identity and policy generation, and exact peer AllowedIPs, including the
+single via route holder seen by every viewer. Losing via routers remain
+peers; same-user devices remain peers even in `via_only`, where their traffic
+is denied. Filter probes cover IPv4/IPv6 node addresses, same-user access,
+cross-user denial, router-address denial, the permitted subnet/port, denied
+ports/protocols and unrelated subnet addresses. Router filters accept viewer
+traffic to the subnet even on the standby; steering selects the route holder.
+The non-via router must deny it. Durable IDs, keys, ownership, non-ephemeral
+registration and one hub session per client must agree. Weak references to
+retired clients and compiled policies must clear while current clients live.
+
+```sh
+# Small ordinary-suite smoke: both policies, 20 viewers + 3 routers.
+HEADSCALE_DEBUG_POLICY_AUDIT=1 go test ./hscontrol/servertest \
+  -run '^TestScaleViaChurn$' -count=1 -v
+
+# Selected policy: 100 viewers + 3 routers = 103 connected nodes.
+# Apply the shared lock and hard memory cap described below before running.
+mkdir -p control_logs
+HEADSCALE_STRESS_VIA_VIEWERS=100 GOMAXPROCS=2 GOMEMLIMIT=2GiB \
+  go test -p=2 ./hscontrol/servertest \
+  -run '^TestScaleViaChurn/100_viewers/via_self$' -count=1 -v -timeout=30m \
+  -cpuprofile=control_logs/via-100-cpu.prof \
+  -memprofile=control_logs/via-100-alloc.prof
+```
+
+Use a common `flock` for shared-host profiling, then require at least
+8 GiB of `MemAvailable`; release the lock while waiting for memory.
+Use `MemoryMax=4G`, `MemorySwapMax=0`, `GOMAXPROCS=2`, `GOMEMLIMIT=2GiB`
+and `GOFLAGS=-p=2`. Keep compiler scratch on disk and runtime fixtures in
+`/dev/shm`, using the `GOTMPDIR` split described above. Freeze source and
+test-binary hashes before large runs and save CPU/alloc profiles for each run. Ramp 100,
+500, then 1000 viewers in fresh processes; attempt 5000 only if measured
+cgroup peak memory projects below 4 GiB with margin. Preserve failed
+attempts without raising caps or relaxing login timeouts. Report viewers +
+routers = total registered/connected, policy shape, prefix/router counts,
+peer entries, mutation time, convergence time and cgroup peak separately.
+Profiles include clients, SQLite, enrollment, assertions and teardown;
+they do not establish server-only or data-plane capacity. A separate
+trace at 1000 viewers or fewer is optional when profiles leave a question
+unresolved.
 
 ## Read results and find congestion
 
@@ -107,3 +305,106 @@ performs extra runtime stack inspection in test binaries; confirm CPU
 findings against a standalone server before optimizing them. Docker/real
 tailscaled tests remain necessary for network behavior, data-plane traffic,
 and a server-only resource ceiling.
+
+## Policy and map microbenchmarks
+
+The mapper's `BenchmarkScalingWrites` uses ten users or twenty tags regardless
+of node count. That measures growth within a fixed policy, not growth in
+policy diversity. It selects a node from the existing streams before each
+write. Endpoint writes go to the store directly, without SQLite: the rows
+measure the control plane's work, which a map request's database write would
+dominate in narrow shapes. `endpoints-x16` makes sixteen such writes, picked
+through `ListNodes`, which the hub routes as one change, as it does commits
+that coalesce under load. Rejoin still measures test-helper deletion and
+insertion, including name validation, not authentication or durable
+registration. The encoder uses the same cached node JSON and zstd
+compression as the poll loop.
+
+`ignored-health` measures alternating unchanged and rejected health requests
+on offline nodes without approved routes. It does not measure accepted
+hidden-state mutations, so it is no evidence about actual health transitions.
+
+The scaling benchmarks and `TestScalingWriteWork` run each write kind under
+five policy shapes: `allow-all`, `users`, `tags`, `self` and `via`. The first four
+vary how visibility is partitioned. `via` adds a grant steered through a router
+tag on top of full visibility and makes a subset of nodes online routers, in
+pairs sharing a subnet so each subnet has a primary and a standby. It is the
+shape where a write can change which router a peer reaches a subnet through, so
+it measures the election and per-peer route steering that the other shapes
+never touch. The shape verifies in setup that a member sees a subnet through the
+router the grant elected, so a benchmark cannot silently fall back to ordinary
+routes. `TestScalingWriteWork` pins per-shape work ceilings, not times; read
+the `via` rows against the other shapes at the same write kind.
+
+`policy/<shape>` names the starting policy. Setup replaces that policy with
+`*` to `*:2` and delivers the expansion, so the timed loop only alternates ports
+1 and 2 under full visibility: a steady recompile and diff, not the one-time
+visibility expansion the replacement causes — every iteration is a change. The
+expansion belongs to setup: it grows every client's peers from its starting
+visibility to the whole tailnet, which would dominate whichever timed write
+it landed in.
+
+The `peer-renders/op` metric sums `len(netMap.changed)` across sessions:
+added or pointer-changed peer references, excluding removals. It does not
+count shared `peerRenders.render` calls or `TailNode` cache misses, and
+pointer changes need not produce wire changes. Successful setup maps,
+updates and reconnects call `Delivered` after encoding (or after setup's
+simulated delivery); untimed checks reject retained failed-write attempts.
+
+`BenchmarkPeerClassesDiversity` in `hscontrol/policy/v2` grows identities and
+rules with the tailnet:
+
+- `pairs`: N nodes, N/2 independent IP grants, N classes, one peer per node.
+- `tag-pairs`: the same visibility with N distinct tags and N/2 tag grants.
+- `dense`: N/2 distinct sources can reach everyone, producing N/2+1 classes
+  and dense output.
+- `self`: N/2 users with two devices each and an `autogroup:self` grant.
+- `allow-all`: one shared class, the fixed-diversity comparison.
+
+Each shape separates policy compilation, class construction without previous
+sides (`fresh`), and construction reusing unchanged nodes and rules
+(`reuse`). These are individual stages, not registration latency. In
+particular, `reuse` does not include a policy edit or a joining node.
+`BenchmarkCachedMatcherSidesChanges` isolates side construction with unchanged
+inputs, one changed node address, or reversed matcher order; its compiled
+matchers stay fixed, so it does not measure policy compilation.
+Construction phases report `classes/op`: the class views the phase's own
+build produced, including a shared base view that per-node rules may
+supersede. Compilation does not build or report class views.
+
+Run from the Nix shell:
+
+```sh
+go test ./hscontrol/policy/v2 -run '^$' -bench '^BenchmarkPeerClassesDiversity$' -benchtime=200ms -count=5 -cpu=1
+go test ./hscontrol/mapper -run '^$' -bench '^BenchmarkFirstMap/nodes=1000$/' -benchtime=200ms -count=5 -cpu=1
+go test ./hscontrol/mapper -run '^$' -bench '^BenchmarkFirstMap/nodes=10000$/' -benchtime=200ms -count=5 -cpu=1
+```
+
+Class construction used to compare every class pair, intersecting up to
+ceil(M/64) matcher words for M rules. Sparse sides now join the classes on
+opposite sides of each matcher, deduplicating symmetric neighbors; the
+build records which path ran, and the diversity suite asserts the sparse
+shapes join while the dense shape keeps the scan. Dense sides or excessive
+repeated joins retain the short-circuit pair scan. The join changes only
+the shared-rule calculation; per-node self/via grants still add their peers
+afterwards. An unchanged visibility relation includes self edges inside a
+class; `Peers` removes the requesting node.
+
+This does not make the entire build linear. Fresh side evaluation still
+checks N nodes against M matchers. Reuse shares immutable masks for unchanged
+nodes when matcher contents and order agree; changed matcher sequences still
+remap bits per node, O(NM). Stored side bitsets cost O(N ceil(M/64)); views can
+cost O(NC) for C classes, reaching O(N²). Policy diversity and dense output remain
+architectural limits: measurements of this join live in the pull request
+that introduced it, and new hardware deserves new measurements, not these.
+
+`BenchmarkFirstMap` distinguishes `warm-hub`, `cold-hub`, and `new-state`
+for both JSON and zstd. A cold hub starts new render/class/encoding caches
+but uses an already compiled world. `new-state` also reopens the existing
+SQLite database, loads nodes, compiles policy and constructs peers; state
+closure is included in its time. Neither case restarts the OS process,
+performs HTTP/Noise handshakes, or measures a concurrent reconnect storm.
+zstd in test binaries has the extra stack inspection described above. A
+warm, uncompressed map is therefore not evidence of cold server restart
+behavior, and none of these microbenchmarks establish restart convergence
+or a production latency guarantee.

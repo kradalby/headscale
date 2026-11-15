@@ -11,6 +11,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/util/multierr"
 )
 
 // sshTestUsers/sshTestNodes are reused across the table below to keep
@@ -930,7 +931,7 @@ func TestSetPolicyRejectsFailingSSHTests(t *testing.T) {
 	beforeJSON, err := json.Marshal(beforePol)
 	require.NoError(t, err)
 
-	changed, err := pm.SetPolicy([]byte(bad))
+	changed, err := replacePolicy(&pm, []byte(bad))
 	require.Error(t, err, "SetPolicy must reject a policy whose sshTests fail")
 	require.False(t, changed, "SetPolicy must report no change when rejected")
 	require.ErrorIs(t, err, errSSHPolicyTestsFailed)
@@ -1006,7 +1007,7 @@ func TestSetPolicyAggregatesACLAndSSHTestFailures(t *testing.T) {
 	pm, err := NewPolicyManager([]byte(good), users, nodes.ViewSlice())
 	require.NoError(t, err)
 
-	_, err = pm.SetPolicy([]byte(bad))
+	_, err = replacePolicy(&pm, []byte(bad))
 	require.Error(t, err)
 	require.ErrorIs(t, err, errPolicyTestsFailed,
 		"aggregated error must wrap the ACL test sentinel")
@@ -1050,7 +1051,7 @@ func TestNewPolicyManagerWarnsOnSSHTestsFailure(t *testing.T) {
 
 	// A subsequent SetPolicy of the same body must reject — that's
 	// the user-write path.
-	_, err = pm.SetPolicy([]byte(stale))
+	_, err = replacePolicy(&pm, []byte(stale))
 	require.Error(t, err)
 	require.ErrorIs(t, err, errSSHPolicyTestsFailed)
 }
@@ -1132,7 +1133,7 @@ func TestSSHTestsReportNamesAliasNotNode(t *testing.T) {
 		]
 	}`
 
-	_, err = pm.SetPolicy([]byte(policy))
+	_, err = replacePolicy(&pm, []byte(policy))
 	require.ErrorIs(t, err, errSSHPolicyTestsFailed)
 
 	for line, want := range map[string]int{
@@ -1202,4 +1203,57 @@ func TestRunSSHTestsManyNamesAndPrincipals(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("sshTests did not finish in time")
 	}
+}
+
+func TestTestFailuresAggregate(t *testing.T) {
+	users := sshTestUsers()
+	nodes := sshTestNodes(users)
+
+	// Both blocks fail: acls only allow alice but tests assert bob;
+	// ssh only allows alice but sshTests assert bob.
+	bad := `{
+		"tagOwners": { "tag:server": ["alice@headscale.net"] },
+		"acls": [{
+			"action": "accept",
+			"src":    ["alice@headscale.net"],
+			"dst":    ["tag:server:22"]
+		}],
+		"ssh": [{
+			"action": "accept",
+			"src":    ["alice@headscale.net"],
+			"dst":    ["tag:server"],
+			"users":  ["root"]
+		}],
+		"tests": [{
+			"src":    "bob@headscale.net",
+			"accept": ["tag:server:22"]
+		}],
+		"sshTests": [{
+			"src":    "bob@headscale.net",
+			"dst":    ["tag:server"],
+			"accept": ["root"]
+		}]
+	}`
+
+	pm, err := NewPolicyManager([]byte(bad), users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	err = multierr.New(pm.RunTests(), pm.RunSSHTests())
+	require.Error(t, err)
+	require.ErrorIs(t, err, errPolicyTestsFailed,
+		"aggregated error must wrap the ACL test sentinel")
+	require.ErrorIs(t, err, errSSHPolicyTestsFailed,
+		"aggregated error must wrap the SSH test sentinel")
+
+	body := err.Error()
+	assert.Contains(t, body, "tag:server:22",
+		"aggregated error must include the ACL failure message")
+	assert.Contains(t, body, "bob@headscale.net",
+		"aggregated error must include the bob src")
+	// The SSH renderer emits "src/user -> dst" form; the ACL renderer
+	// emits "src -> dst". Substring "/root -> " is unique to the SSH
+	// body, so finding it inside the aggregated error proves the SSH
+	// failure rendering was concatenated alongside the ACL body.
+	assert.Contains(t, body, "/root -> ",
+		"aggregated error must include the SSH-shape src/user -> dst rendering")
 }

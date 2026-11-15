@@ -233,8 +233,6 @@
     },
     "Tuning": {
       "BatchChangeDelay": 500000000,
-      "NodeMapSessionBufferedChanSize": 50,
-      "BatcherWorkers": 4096,
       "RegisterCacheExpiration": 1200000000000,
       "RegisterCacheMaxEntries": 2000,
       "NodeStoreBatchSize": 50,

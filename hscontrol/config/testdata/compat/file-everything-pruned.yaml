@@ -134,8 +134,6 @@ cli:
 
 tuning:
   batch_change_delay: 500ms
-  node_mapsession_buffered_chan_size: 50
-  batcher_workers: 4096
   register_cache_expiration: 20m
   register_cache_max_entries: 2000
   node_store_batch_size: 50

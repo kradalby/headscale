@@ -4516,3 +4516,216 @@ func mergeFilterRules(rules []tailcfg.FilterRule) []tailcfg.FilterRule {
 
 	return mergeKeyedRules(rules, ruleKeys(rules))
 }
+
+func TestSrcIPsWithRoutes(t *testing.T) {
+	t.Parallel()
+
+	// Build a resolved address set for a single IP.
+	var b netipx.IPSetBuilder
+	b.AddPrefix(netip.MustParsePrefix("100.64.0.1/32"))
+
+	resolved, err := newResolvedAddresses(b.IPSet())
+	require.NoError(t, err)
+
+	// Node with approved subnet route.
+	nodeWithRoutes := types.Nodes{
+		&types.Node{
+			IPv4: ap("100.64.0.5"),
+			Hostinfo: &tailcfg.Hostinfo{
+				RoutableIPs: []netip.Prefix{
+					mp("10.0.0.0/24"),
+				},
+			},
+			ApprovedRoutes: []netip.Prefix{
+				mp("10.0.0.0/24"),
+			},
+		},
+	}.ViewSlice()
+
+	emptyNodes := types.Nodes{}.ViewSlice()
+
+	tests := []struct {
+		name         string
+		resolved     ResolvedAddresses
+		hasWildcard  bool
+		hasDangerAll bool
+		nodes        func() []string
+		want         []string
+	}{
+		{
+			name:         "danger-all returns star regardless",
+			resolved:     resolved,
+			hasWildcard:  false,
+			hasDangerAll: true,
+			want:         []string{"*"},
+		},
+		{
+			name:         "danger-all takes precedence over wildcard",
+			resolved:     resolved,
+			hasWildcard:  true,
+			hasDangerAll: true,
+			want:         []string{"*"},
+		},
+		{
+			name:         "wildcard appends approved subnet routes",
+			resolved:     resolved,
+			hasWildcard:  true,
+			hasDangerAll: false,
+		},
+		{
+			name:         "neither returns resolved addrs only",
+			resolved:     resolved,
+			hasWildcard:  false,
+			hasDangerAll: false,
+			want:         []string{"100.64.0.1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			nodes := emptyNodes
+			if tt.hasWildcard && !tt.hasDangerAll {
+				nodes = nodeWithRoutes
+			}
+
+			got := srcIPsWithRoutes(tt.resolved, tt.hasWildcard, tt.hasDangerAll, nodes)
+
+			if tt.hasDangerAll {
+				assert.Equal(t, []string{"*"}, got)
+			} else if tt.hasWildcard {
+				assert.Contains(t, got, "100.64.0.1", "should contain the resolved IP")
+				assert.Contains(t, got, "10.0.0.0/24", "should contain approved subnet route")
+			} else {
+				assert.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
+
+func TestMergeFilterRulesSharesUnmergedDstPorts(t *testing.T) {
+	ports := func(ips ...string) []tailcfg.NetPortRange {
+		out := make([]tailcfg.NetPortRange, 0, len(ips)+1) // spare capacity
+		for _, ip := range ips {
+			out = append(out, tailcfg.NetPortRange{IP: ip, Ports: tailcfg.PortRangeAny})
+		}
+
+		return out
+	}
+
+	a := tailcfg.FilterRule{SrcIPs: []string{"100.64.0.1"}, DstPorts: ports("100.64.0.2")}
+	b := tailcfg.FilterRule{SrcIPs: []string{"100.64.0.3"}, DstPorts: ports("100.64.0.4")}
+	c := tailcfg.FilterRule{SrcIPs: []string{"100.64.0.1"}, DstPorts: ports("100.64.0.5")}
+
+	got := mergeFilterRules([]tailcfg.FilterRule{a, b, c})
+	require.Len(t, got, 2)
+
+	assert.Same(t, &b.DstPorts[0], &got[1].DstPorts[0], "unmerged rule copied its DstPorts")
+	assert.Len(t, got[0].DstPorts, 2)
+	assert.NotSame(t, &a.DstPorts[0], &got[0].DstPorts[0], "merge reused the first rule's DstPorts")
+	assert.Empty(t, a.DstPorts[:cap(a.DstPorts)][1].IP, "merge wrote into the first rule's array")
+}
+
+func TestMergeKeyedRulesOrderAndOwnership(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, mergeKeyedRules(nil, nil))
+	require.Equal(t, []tailcfg.FilterRule{}, mergeKeyedRules([]tailcfg.FilterRule{}, nil))
+
+	for _, first := range [][]tailcfg.NetPortRange{nil, {}, {{IP: "100.64.0.2"}}} {
+		for _, next := range [][]tailcfg.NetPortRange{nil, {}, {{IP: "100.64.0.2"}, {IP: "fd7a:115c:a1e0::2"}}} {
+			// Spare capacity must stay untouched, even when the first slice is empty.
+			backing := make([]tailcfg.NetPortRange, len(first)+4)
+			copy(backing, first)
+
+			if first != nil {
+				first = backing[:len(first)]
+			}
+
+			capRule := tailcfg.FilterRule{
+				SrcIPs:   []string{"100.64.0.3"},
+				SrcBits:  []int{32},
+				CapGrant: []tailcfg.CapGrant{{Dsts: []netip.Prefix{mp("100.64.0.4/32")}, Caps: []peercap.Cap{"test"}}},
+			}
+			unique := tailcfg.FilterRule{SrcIPs: []string{"100.64.0.5"}, DstPorts: []tailcfg.NetPortRange{{IP: "100.64.0.6"}}}
+			rules := []tailcfg.FilterRule{
+				{SrcIPs: []string{"100.64.0.1"}, SrcBits: []int{32}, DstPorts: first, IPProto: []int{ProtocolTCP}, CapGrant: []tailcfg.CapGrant{}},
+				capRule,
+				unique,
+				{SrcIPs: []string{"100.64.0.1"}, DstPorts: next, IPProto: []int{ProtocolTCP}},
+				capRule,
+			}
+			keys := ruleKeys(rules)
+
+			wantPorts := append(slices.Clone(first), next...)
+			want := []tailcfg.FilterRule{
+				{SrcIPs: rules[0].SrcIPs, DstPorts: wantPorts, IPProto: rules[0].IPProto},
+				capRule, unique, capRule,
+			}
+			input, err := json.Marshal(rules)
+			require.NoError(t, err)
+
+			got := mergeKeyedRules(rules, keys)
+			require.Equal(t, want, got)
+			assert.Same(t, &unique.DstPorts[0], &got[2].DstPorts[0])
+			assert.Equal(t, len(unique.DstPorts), cap(got[2].DstPorts))
+			assert.Same(t, &capRule.CapGrant[0], &got[1].CapGrant[0])
+
+			again := mergeKeyedRules(rules, keys)
+
+			if len(got[0].DstPorts) > 0 {
+				got[0].DstPorts[0].IP = "changed"
+			}
+
+			got[0].DstPorts = append(got[0].DstPorts, tailcfg.NetPortRange{IP: "appended"})
+
+			assert.Equal(t, want, again, "separate merges must own separate destination buffers")
+
+			after, err := json.Marshal(rules)
+			require.NoError(t, err)
+			assert.Equal(t, input, after, "merge or output mutation changed inputs")
+			assert.Equal(t, make([]tailcfg.NetPortRange, 4), backing[len(first):])
+		}
+	}
+}
+
+func BenchmarkMergeKeyedRules(b *testing.B) {
+	for _, n := range []int{1, 10, 100, 500, 5000} {
+		for _, groups := range slices.Compact([]int{1, min(10, n), n}) {
+			for _, dsts := range []int{0, 1, 40} {
+				for _, caps := range []bool{false, true} {
+					b.Run(fmt.Sprintf("rules=%d/groups=%d/dsts=%d/caps=%t", n, groups, dsts, caps), func(b *testing.B) {
+						rules := make([]tailcfg.FilterRule, 0, n+n/7)
+						for i := range n {
+							rule := tailcfg.FilterRule{
+								SrcIPs:  []string{fmt.Sprintf("100.64.%d.%d", (i%groups)/256, (i%groups)%256)},
+								IPProto: []int{ProtocolTCP},
+							}
+							if dsts > 0 || i%2 == 0 {
+								rule.DstPorts = make([]tailcfg.NetPortRange, dsts, dsts+1)
+							}
+
+							for j := range dsts {
+								rule.DstPorts[j] = tailcfg.NetPortRange{IP: "100.100.0.1", Ports: tailcfg.PortRange{First: uint16(j), Last: uint16(j)}} //nolint:gosec
+							}
+
+							rules = append(rules, rule)
+							if caps && i%7 == 0 {
+								rules = append(rules, tailcfg.FilterRule{CapGrant: []tailcfg.CapGrant{{Caps: []peercap.Cap{"test"}}}})
+							}
+						}
+
+						keys := ruleKeys(rules)
+
+						b.ReportAllocs()
+
+						for b.Loop() {
+							mergeKeyedRules(rules, keys)
+						}
+					})
+				}
+			}
+		}
+	}
+}

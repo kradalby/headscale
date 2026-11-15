@@ -94,7 +94,7 @@ func TestPolicyManagerConcurrentReads(t *testing.T) {
 	// caches the readers are populating.
 	wg.Go(func() {
 		for range mutatorReloads {
-			_, err := pm.SetNodes(nodes.ViewSlice())
+			_, err := replaceNodes(&pm, nodes.ViewSlice())
 			assert.NoError(t, err) //nolint:testifylint // assert (not require) is correct off the test goroutine
 		}
 	})

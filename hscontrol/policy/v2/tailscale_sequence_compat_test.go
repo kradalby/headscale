@@ -102,12 +102,12 @@ func runPolicySequenceCompat(t *testing.T, id string) {
 			pm, err = NewPolicyManager(policy, users, nodes.ViewSlice())
 			require.NoError(t, err, "%s: policy", step.Name)
 		} else {
-			_, err = pm.SetNodes(nodes.ViewSlice())
+			_, err = replaceNodes(&pm, nodes.ViewSlice())
 			require.NoError(t, err, "%s: nodes", step.Name)
 
 			if pushed != nil {
 				policy = pushed
-				_, err = pm.SetPolicy(policy)
+				_, err = replacePolicy(&pm, policy)
 				require.NoError(t, err, "%s: policy", step.Name)
 			}
 		}

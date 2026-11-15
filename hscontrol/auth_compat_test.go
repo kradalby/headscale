@@ -230,9 +230,8 @@ func (r *pendingReplay) apply(t *testing.T, step testcapture.Step) {
 			r.stopWaiting(a.Node)
 
 			for _, nv := range r.nodes(a.Node) {
-				changes, err := r.app.state.DeleteNode(nv)
+				err := r.app.state.DeleteNode(nv)
 				require.NoError(t, err, "%s: retire %s", step.Name, a.Node)
-				r.app.Change(changes...)
 			}
 
 		case "wait":
@@ -305,9 +304,8 @@ func (r *pendingReplay) setExpiry(t *testing.T, step testcapture.Step, a testcap
 	nodes := r.nodes(alias)
 	require.Len(t, nodes, 1, "%s: %s", step.Name, a.Path)
 
-	_, changes, err := r.app.state.SetNodeExpiry(nodes[0].ID(), expiry)
+	_, err := r.app.state.SetNodeExpiry(nodes[0].ID(), expiry)
 	require.NoError(t, err, "%s: %s", step.Name, a.Path)
-	r.app.Change(changes)
 }
 
 // request builds the register request a client sent: its node keys, the

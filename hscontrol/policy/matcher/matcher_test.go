@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -648,4 +649,80 @@ func TestMatchFromStrings_MalformedFailsOpen(t *testing.T) {
 		"valid dst entry must still match")
 	assert.False(t, m.DestsContainsIP(netip.MustParseAddr("8.8.8.8")),
 		"malformed dst entry must not widen the set")
+}
+
+// TestKey catches identity collisions and loss of canonical reuse across rule rewrites.
+func TestKey(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		a, b  []string
+		equal bool
+	}{
+		{"empty invalid", nil, []string{"invalid", "10.0.0.1/99"}, true},
+		{"duplicate reordered", []string{"10.0.0.1", "2001:db8::1"}, []string{"2001:db8::1", "10.0.0.1", "10.0.0.1"}, true},
+		{"adjacent", []string{"10.0.0.0/25", "10.0.0.128/25"}, []string{"10.0.0.0/24"}, true},
+		{"overlap", []string{"2001:db8::/64", "2001:db8::/65"}, []string{"2001:db8::/64"}, true},
+		{"range", []string{"10.0.0.1-10.0.0.3"}, []string{"10.0.0.1", "10.0.0.2/31"}, true},
+		{"ipv6 range", []string{"2001:db8::1-2001:db8::3"}, []string{"2001:db8::1", "2001:db8::2/127"}, true},
+		{"similar text", []string{"10.0.0.1", "10.0.0.23"}, []string{"10.0.0.12", "10.0.0.3"}, false},
+		{"endpoints", []string{"10.0.0.1-10.0.0.3"}, []string{"10.0.0.1-10.0.0.4"}, false},
+		{"families", []string{"0.0.0.1"}, []string{"::1"}, false},
+		{"mapped ipv4", []string{"10.0.0.1"}, []string{"::ffff:10.0.0.1"}, false},
+		{"empty nonempty", nil, []string{"0.0.0.0"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			a, b := MatchFromStrings(tc.a, tc.a), MatchFromStrings(tc.b, tc.b)
+			require.Equal(t, tc.equal, a.Key() == b.Key())
+			a, b = MatchFromStrings(tc.a, nil), MatchFromStrings(tc.b, nil)
+			require.Equal(t, tc.equal, a.Key() == b.Key(), "source identity with equal internet flags")
+		})
+	}
+
+	src := MatchFromStrings([]string{"10.0.0.1"}, nil)
+	dst := MatchFromStrings(nil, []string{"10.0.0.1"})
+	require.NotEqual(t, src.Key(), dst.Key(), "source/destination boundary lost")
+
+	port := MatchFromFilterRule(tailcfg.FilterRule{DstPorts: []tailcfg.NetPortRange{{IP: "*"}}})
+	capability := MatchFromFilterRule(tailcfg.FilterRule{CapGrant: []tailcfg.CapGrant{{Dsts: []netip.Prefix{
+		netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+	}}}})
+	both := MatchFromFilterRule(tailcfg.FilterRule{
+		DstPorts: []tailcfg.NetPortRange{{IP: "*"}},
+		CapGrant: []tailcfg.CapGrant{{Dsts: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}}},
+	})
+
+	require.True(t, port.Dests().Equal(capability.Dests()))
+	require.True(t, port.Dests().Equal(both.Dests()))
+	require.NotEqual(t, port.Key(), capability.Key())
+	require.NotEqual(t, port.Key(), both.Key())
+	require.NotEqual(t, capability.Key(), both.Key())
+
+	a := MatchFromFilterRule(tailcfg.FilterRule{
+		SrcIPs:   []string{"10.0.0.1"},
+		DstPorts: []tailcfg.NetPortRange{{IP: "10.0.0.2", Ports: tailcfg.PortRange{First: 80, Last: 80}}},
+	})
+	b := MatchFromFilterRule(tailcfg.FilterRule{
+		SrcIPs:   []string{"10.0.0.1"},
+		CapGrant: []tailcfg.CapGrant{{Dsts: []netip.Prefix{netip.MustParsePrefix("10.0.0.2/32")}}},
+	})
+	require.Equal(t, a.Key(), b.Key(), "non-internet port/capability placement is ignored")
+
+	key := a.Key()
+
+	var workers sync.WaitGroup
+	for range 8 {
+		workers.Go(func() {
+			cloned := a
+			for range 100 {
+				assert.Equal(t, key, cloned.Key())
+			}
+		})
+	}
+
+	workers.Wait()
+	require.Equal(t, key, a.Key(), "concurrent copies changed the retained match")
 }

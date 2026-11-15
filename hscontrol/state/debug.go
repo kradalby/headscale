@@ -2,6 +2,7 @@ package state
 
 import (
 	"fmt"
+	"maps"
 	"net/netip"
 	"slices"
 	"strings"
@@ -114,14 +115,70 @@ func (s *State) DebugOverview() string {
 	return sb.String()
 }
 
-// DebugNodeStore returns debug information about the [NodeStore].
+// DebugNodeStore returns debug information about the in-memory nodes, their
+// peers and primary routes, all from one snapshot.
 func (s *State) DebugNodeStore() string {
-	return s.nodeStore.DebugString()
+	snap := s.Snapshot()
+	nodes := snap.ListNodes()
+
+	var sb strings.Builder
+
+	sb.WriteString("=== Node State Debug Information ===\n\n")
+
+	fmt.Fprintf(&sb, "Snapshot Revision: %d\n", snap.Rev())
+	fmt.Fprintf(&sb, "Total Nodes: %d\n\n", nodes.Len())
+
+	// Internal UserID tracking, not display owner: tagged nodes are listed
+	// under no user.
+	byUser := make(map[types.UserID][]types.NodeView)
+
+	for _, nv := range nodes.All() {
+		if !nv.IsTagged() {
+			byUser[nv.TypedUserID()] = append(byUser[nv.TypedUserID()], nv)
+		}
+	}
+
+	fmt.Fprintf(&sb, "Users with Nodes: %d\n", len(byUser))
+	sb.WriteString("Nodes by Internal User ID:\n")
+
+	for _, uid := range slices.Sorted(maps.Keys(byUser)) {
+		userName := "unknown"
+		if u := byUser[uid][0].User(); u.Valid() {
+			userName = u.Name()
+		}
+
+		fmt.Fprintf(&sb, "  - User %d (%s): %d nodes\n", uid, userName, len(byUser[uid]))
+	}
+
+	sb.WriteString("\n")
+
+	sb.WriteString("Peer Relationships:\n")
+
+	totalPeers := 0
+
+	for _, nv := range nodes.All() {
+		peerCount := len(snap.ListPeerIDs(nv.ID()))
+		totalPeers += peerCount
+
+		fmt.Fprintf(&sb, "  - Node %d (%s): %d peers\n", nv.ID(), nv.Hostname(), peerCount)
+	}
+
+	if nodes.Len() > 0 {
+		fmt.Fprintf(&sb, "  - Average peers per node: %.1f\n", float64(totalPeers)/float64(nodes.Len()))
+	}
+
+	sb.WriteString("\n")
+
+	sb.WriteString("Primary Routes:\n")
+	sb.WriteString(snap.PrimaryRoutesString())
+	sb.WriteString("\n")
+
+	return sb.String()
 }
 
 // DebugDERPMap returns debug information about the DERP map configuration.
 func (s *State) DebugDERPMap() string {
-	derpMap := s.derpMap.Load()
+	derpMap := s.Snapshot().DERPMap()
 	if derpMap == nil {
 		return "DERP Map: not configured\n"
 	}
@@ -153,7 +210,8 @@ func (s *State) DebugDERPMap() string {
 
 // DebugSSHPolicies returns debug information about SSH policies for all nodes.
 func (s *State) DebugSSHPolicies() map[string]*tailcfg.SSHPolicy {
-	nodes := s.nodeStore.ListNodes()
+	snap := s.Snapshot()
+	nodes := snap.ListNodes()
 
 	sshPolicies := make(map[string]*tailcfg.SSHPolicy)
 
@@ -162,7 +220,7 @@ func (s *State) DebugSSHPolicies() map[string]*tailcfg.SSHPolicy {
 			continue
 		}
 
-		pol, err := s.SSHPolicy(node)
+		pol, err := snap.Policy().SSHPolicy(s.cfg.ServerURL, node)
 		if err != nil {
 			// Store the error information
 			continue
@@ -178,14 +236,28 @@ func (s *State) DebugSSHPolicies() map[string]*tailcfg.SSHPolicy {
 
 // DebugRegistrationCache returns debug information about the registration cache.
 func (s *State) DebugRegistrationCache() map[string]any {
+	expiration := s.authCacheExpiration
+	if expiration == 0 {
+		expiration = registerCacheExpiration
+	}
+
 	return map[string]any{
 		"type":        "expirable-lru",
-		"expiration":  s.authCacheExpiration.String(),
+		"expiration":  expiration.String(),
 		"max_entries": s.authCacheMaxEntries,
 		"ssh_reserve": authCacheSSHReserve,
 		"current_len": s.authCache.Len(),
 		"status":      "active",
 	}
+}
+
+// DebugConfig returns debug information about the current configuration.
+func (s *State) DebugConfig() *types.Config {
+	dns := s.Snapshot().DNS()
+	cfg := *s.cfg
+	cfg.DNSConfig = dns.DebugConfig()
+
+	return &cfg
 }
 
 // DebugPolicy returns the current policy data as a string.
@@ -217,14 +289,16 @@ func (s *State) DebugFilter() ([]tailcfg.FilterRule, error) {
 }
 
 // DebugRoutes returns the current primary routes information as a
-// structured object built from the [NodeStore] snapshot.
+// structured object built from one [Snapshot].
 func (s *State) DebugRoutes() types.DebugRoutes {
+	snap := s.Snapshot()
+
 	debug := types.DebugRoutes{
 		AvailableRoutes: make(map[types.NodeID][]netip.Prefix),
 		PrimaryRoutes:   make(map[string]types.NodeID),
 	}
 
-	for _, nv := range s.nodeStore.ListNodes().All() {
+	for _, nv := range snap.ListNodes().All() {
 		if !nv.Valid() {
 			continue
 		}
@@ -243,18 +317,18 @@ func (s *State) DebugRoutes() types.DebugRoutes {
 		debug.AvailableRoutes[nv.ID()] = approved
 	}
 
-	for prefix, id := range s.nodeStore.PrimaryRoutes() {
+	for prefix, id := range snap.PrimaryRoutes() {
 		debug.PrimaryRoutes[prefix.String()] = id
 	}
 
 	var unhealthy []types.NodeID
 
-	for _, nv := range s.nodeStore.ListNodes().All() {
+	for _, nv := range snap.ListNodes().All() {
 		if !nv.Valid() {
 			continue
 		}
 
-		if !s.nodeStore.IsNodeHealthy(nv.ID()) {
+		if !snap.IsNodeHealthy(nv.ID()) {
 			unhealthy = append(unhealthy, nv.ID())
 		}
 	}
@@ -279,12 +353,13 @@ func (s *State) DebugPolicyManager() string {
 
 // PolicyDebugString returns a debug representation of the current policy.
 func (s *State) PolicyDebugString() string {
-	return s.polMan.DebugString()
+	return s.Snapshot().Policy().DebugString()
 }
 
 // DebugOverviewJSON returns a structured overview of the current state for debugging.
 func (s *State) DebugOverviewJSON() DebugOverviewInfo {
-	allNodes := s.nodeStore.ListNodes()
+	snap := s.Snapshot()
+	allNodes := snap.ListNodes()
 	users, _ := s.ListAllUsers()
 
 	info := DebugOverviewInfo{
@@ -309,7 +384,7 @@ func (s *State) DebugOverviewJSON() DebugOverviewInfo {
 				info.Nodes.Expired++
 			}
 
-			if node.IsEphemeral() {
+			if node.AuthKey().Valid() && node.AuthKey().Ephemeral() {
 				info.Nodes.Ephemeral++
 			}
 		}
@@ -321,7 +396,7 @@ func (s *State) DebugOverviewJSON() DebugOverviewInfo {
 		info.Policy.Path = s.cfg.Policy.Path
 	}
 
-	derpMap := s.derpMap.Load()
+	derpMap := snap.DERPMap()
 	if derpMap != nil {
 		info.DERP.Configured = true
 		info.DERP.Regions = len(derpMap.Regions)
@@ -331,14 +406,14 @@ func (s *State) DebugOverviewJSON() DebugOverviewInfo {
 	}
 
 	// Route information
-	info.PrimaryRoutes = len(s.nodeStore.PrimaryRoutes())
+	info.PrimaryRoutes = len(snap.PrimaryRoutes())
 
 	return info
 }
 
 // DebugDERPJSON returns structured debug information about the DERP map configuration.
 func (s *State) DebugDERPJSON() DebugDERPInfo {
-	derpMap := s.derpMap.Load()
+	derpMap := s.Snapshot().DERPMap()
 
 	info := DebugDERPInfo{
 		Configured: derpMap != nil,
@@ -374,15 +449,21 @@ func (s *State) DebugDERPJSON() DebugDERPInfo {
 	return info
 }
 
-// DebugNodeStoreJSON returns the actual nodes map from the current [NodeStore] snapshot.
+// DebugNodeStoreJSON returns a copy of every node in the current snapshot.
 func (s *State) DebugNodeStoreJSON() map[types.NodeID]types.Node {
-	snapshot := s.nodeStore.data.Load()
-	return snapshot.nodesByID
+	nodes := s.Snapshot().ListNodes()
+
+	out := make(map[types.NodeID]types.Node, nodes.Len())
+	for _, nv := range nodes.All() {
+		out[nv.ID()] = *nv.AsStruct()
+	}
+
+	return out
 }
 
 // DebugPolicyManagerJSON returns structured debug information about the policy manager.
 func (s *State) DebugPolicyManagerJSON() DebugStringInfo {
 	return DebugStringInfo{
-		Content: s.polMan.DebugString(),
+		Content: s.Snapshot().Policy().DebugString(),
 	}
 }

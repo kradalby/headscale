@@ -3,6 +3,7 @@ package v2
 import (
 	"bytes"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -334,7 +335,9 @@ func TestNodesWithChangedCapMap(t *testing.T) {
 	pm, err := NewPolicyManager([]byte(policyA), users, nodes.ViewSlice())
 	require.NoError(t, err)
 
-	initial := pm.NodesWithChangedCapMap()
+	initial := capMapChanges(nil, pm)
+	previous := pm
+
 	slices.Sort(initial)
 	assert.Equal(t, []types.NodeID{3}, initial,
 		"first build reports every node with a non-empty CapMap")
@@ -348,24 +351,26 @@ func TestNodesWithChangedCapMap(t *testing.T) {
 		}]
 	}`
 
-	changed, err := pm.SetPolicy([]byte(policyB))
+	changed, err := replacePolicy(&pm, []byte(policyB))
 	require.NoError(t, err)
 	require.True(t, changed)
 
-	delta := pm.NodesWithChangedCapMap()
+	delta := capMapChanges(previous, pm)
+	previous = pm
+
 	slices.Sort(delta)
 	assert.Equal(t, []types.NodeID{3, 4, 5}, delta,
 		"server lost the cap, client and prod gained it -- diff is the symmetric difference")
 
-	assert.Empty(t, pm.NodesWithChangedCapMap(),
+	assert.Empty(t, capMapChanges(previous, pm),
 		"NodesWithChangedCapMap drains its buffer on read")
 
 	// Reload the same bytes. updateLocked still runs, but no node's
 	// CapMap hash should change.
-	_, err = pm.SetPolicy([]byte(policyB))
+	_, err = replacePolicy(&pm, []byte(policyB))
 	require.NoError(t, err)
 
-	assert.Empty(t, pm.NodesWithChangedCapMap(),
+	assert.Empty(t, capMapChanges(previous, pm),
 		"reloading the same policy must not produce CapMap diffs")
 }
 
@@ -399,10 +404,31 @@ func TestMalformedNextDNSAttrWarnsOnceAtLoad(t *testing.T) {
 	require.NoError(t, err)
 
 	// The write path reloads the bytes it just set.
-	_, err = pm.SetPolicy(pol)
+	_, err = replacePolicy(&pm, pol)
 	require.NoError(t, err)
 
 	assert.Contains(t, pm.NodeCapMap(1), nodecap.Cap("nextdns:a/b?c"))
 	assert.Equal(t, 1, strings.Count(buf.String(), "nextdns:a/b?c"), buf.String())
 	assert.NotContains(t, buf.String(), "nextdns:abc123")
+}
+
+func capMapChanges(before, after *PolicyManager) []types.NodeID {
+	ids := map[types.NodeID]bool{}
+	for id := range before.NodeCapMaps() {
+		ids[id] = true
+	}
+
+	for id := range after.NodeCapMaps() {
+		ids[id] = true
+	}
+
+	var changed []types.NodeID
+
+	for id := range ids {
+		if !reflect.DeepEqual(before.NodeCapMap(id), after.NodeCapMap(id)) {
+			changed = append(changed, id)
+		}
+	}
+
+	return changed
 }

@@ -681,8 +681,11 @@ func TestPreAuthKeyCorrectUserLoggedInCommand(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := client.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, client)
+		if status == nil {
+			return
+		}
+
 		assert.NotContains(ct, []string{"Starting", "Running"}, status.BackendState,
 			"Expected node to be logged out, backend state: %s", status.BackendState)
 	}, integrationutil.StatusReadyTimeout, 2*time.Second)
@@ -691,8 +694,11 @@ func TestPreAuthKeyCorrectUserLoggedInCommand(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := client.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, client)
+		if status == nil {
+			return
+		}
+
 		assert.Equal(ct, "Running", status.BackendState, "Expected node to be logged in, backend state: %s", status.BackendState)
 		// The PreAuthKey was created with tags, so the node is tagged, and a
 		// tagged node sees itself as a user of its own, named after it, as on SaaS.
@@ -797,8 +803,11 @@ func TestTaggedNodesCLIOutput(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := client.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, client)
+		if status == nil {
+			return
+		}
+
 		assert.NotContains(ct, []string{"Starting", "Running"}, status.BackendState,
 			"Expected node to be logged out, backend state: %s", status.BackendState)
 	}, integrationutil.StatusReadyTimeout, 2*time.Second)
@@ -808,8 +817,11 @@ func TestTaggedNodesCLIOutput(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := client.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, client)
+		if status == nil {
+			return
+		}
+
 		assert.Equal(ct, "Running", status.BackendState, "Expected node to be logged in, backend state: %s", status.BackendState)
 		// A tagged node sees itself as a user of its own, named after it, as on SaaS.
 		assert.Equal(ct, strings.TrimSuffix(status.Self.DNSName, "."), status.User[status.Self.UserID].LoginName,

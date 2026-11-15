@@ -2,6 +2,8 @@ package state
 
 import (
 	"fmt"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -9,6 +11,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -22,7 +25,7 @@ func newTestStateForSSHCheck(t *testing.T) *State {
 	for i := range 10 {
 		node := s.CreateRegisteredNodeForTest(user, fmt.Sprintf("ssh-node-%d", i))
 		node.User = user
-		s.nodeStore.PutNode(*node)
+		s.world.PutNode(*node)
 	}
 
 	return s
@@ -86,7 +89,7 @@ func TestSSHCheckAuthConcurrent(t *testing.T) {
 
 	for i := range 100 {
 		wg.Go(func() {
-			src := types.NodeID(uint64(i%10 + 1)) //nolint:gosec
+			src := types.NodeID(uint64(i % 10))   //nolint:gosec
 			dst := types.NodeID(uint64(i%5 + 10)) //nolint:gosec
 
 			s.SetLastSSHAuth(src, dst)
@@ -129,7 +132,7 @@ func TestSSHCheckAuthFollowsSourceOwner(t *testing.T) {
 
 			src, dst := types.NodeID(1), types.NodeID(2)
 			if tt.tagged {
-				_, _, err = s.SetNodeTags(src, []string{"tag:ci", "tag:ops"})
+				_, err = s.SetNodeTags(src, []string{"tag:ci", "tag:ops"})
 				require.NoError(t, err)
 			}
 
@@ -144,14 +147,14 @@ func TestSSHCheckAuthFollowsSourceOwner(t *testing.T) {
 					id = dst
 				}
 
-				_, _, err = s.SetNodeTags(id, []string{"tag:ci"})
+				_, err = s.SetNodeTags(id, []string{"tag:ci"})
 				require.NoError(t, err)
 			case "retag":
-				_, _, err = s.SetNodeTags(src, []string{"tag:ops"})
+				_, err = s.SetNodeTags(src, []string{"tag:ops"})
 				require.NoError(t, err)
 			case "user_change":
 				other := s.CreateUserForTest("other-user")
-				_, ok = s.nodeStore.UpdateNode(src, func(n *types.Node) {
+				_, ok = s.world.UpdateNode(src, func(n *types.Node) {
 					n.UserID = &other.ID
 					n.User = other
 				})
@@ -160,13 +163,13 @@ func TestSSHCheckAuthFollowsSourceOwner(t *testing.T) {
 				node, ok := s.GetNodeByID(src)
 				require.True(t, ok)
 
-				_, err = s.DeleteNode(node)
+				err = s.DeleteNode(node)
 				require.NoError(t, err)
 			case "rekey":
-				_, ok = s.nodeStore.UpdateNode(src, func(n *types.Node) { n.NodeKey = key.NewNode().Public() })
+				_, ok = s.world.UpdateNode(src, func(n *types.Node) { n.NodeKey = key.NewNode().Public() })
 				require.True(t, ok)
 			case "same_tags":
-				_, ok = s.nodeStore.UpdateNode(src, func(n *types.Node) {
+				_, ok = s.world.UpdateNode(src, func(n *types.Node) {
 					n.Tags = []string{"tag:ops", "tag:ci"}
 				})
 				require.True(t, ok)
@@ -195,7 +198,7 @@ func TestSSHCheckAuthExpiresWithSource(t *testing.T) {
 	require.True(t, ok)
 
 	expiry := time.Now()
-	_, _, err := s.SetNodeExpiry(src, &expiry)
+	_, err := s.SetNodeExpiry(src, &expiry)
 	require.NoError(t, err)
 
 	for _, destination := range []types.NodeID{dst, other} {
@@ -211,7 +214,7 @@ func TestSSHCheckAuthExpiresWithSource(t *testing.T) {
 	userID := types.UserID(node.UserID().Get())
 	pak, err := s.CreatePreAuthKey(&userID, true, false, nil, nil)
 	require.NoError(t, err)
-	reauthenticated, _, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+	reauthenticated, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
 		Auth:     &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
 		NodeKey:  key.NewNode().Public(),
 		Hostinfo: &tailcfg.Hostinfo{Hostname: node.Hostname()},
@@ -241,7 +244,7 @@ func TestSSHCheckAuthKeepsApprovalOnExpiryExtension(t *testing.T) {
 			before, ok := s.GetLastSSHAuth(src, dst)
 			require.True(t, ok)
 
-			_, _, err := s.SetNodeExpiry(src, expiry)
+			_, err := s.SetNodeExpiry(src, expiry)
 			require.NoError(t, err)
 
 			after, ok := s.GetLastSSHAuth(src, dst)
@@ -251,13 +254,13 @@ func TestSSHCheckAuthKeepsApprovalOnExpiryExtension(t *testing.T) {
 	}
 }
 
-// TestSSHCheckAuthExpiresWithinBatch: a relogin that shares the expiry's
-// NodeStore batch renews the node before SetNodeExpiry sees it, so the expiry
-// must forget approvals from what its own write saw.
 func TestSSHCheckAuthExpiresWithinBatch(t *testing.T) {
 	s := newTestStateForSSHCheck(t)
 	src, dst := types.NodeID(1), types.NodeID(2)
 	s.SetLastSSHAuth(src, dst)
+	_, approved := s.GetLastSSHAuth(src, dst)
+	require.True(t, approved)
+
 	node, ok := s.GetNodeByID(src)
 	require.True(t, ok)
 
@@ -265,14 +268,14 @@ func TestSSHCheckAuthExpiresWithinBatch(t *testing.T) {
 	pak, err := s.CreatePreAuthKey(&userID, true, false, nil, nil)
 	require.NoError(t, err)
 
-	// Hold the writer so the expiry and the relogin land in one batch, in
-	// this order.
+	// Hold graph publication while expiry takes the row lock. Reauth must
+	// wait for expiry's memory+SQL write, rather than publish a provisional identity.
 	entered, release := make(chan struct{}), make(chan struct{})
 
 	releaseOnce := sync.OnceFunc(func() { close(release) })
 	defer releaseOnce()
 
-	go s.nodeStore.UpdateNode(dst, func(*types.Node) {
+	go s.world.UpdateNode(dst, func(*types.Node) {
 		close(entered)
 		<-release
 	})
@@ -283,7 +286,7 @@ func TestSSHCheckAuthExpiresWithinBatch(t *testing.T) {
 	expiryDone := make(chan error, 1)
 
 	go func() {
-		_, _, err := s.SetNodeExpiry(src, &expiry)
+		_, err := s.SetNodeExpiry(src, &expiry)
 		expiryDone <- err
 	}()
 
@@ -291,21 +294,62 @@ func TestSSHCheckAuthExpiresWithinBatch(t *testing.T) {
 
 	regDone := make(chan error, 1)
 
+	var approvalAtReauth, expiredAtReauth bool
+
+	renewalKey := key.NewNode().Public()
+
+	require.NoError(t, s.db.DB.Callback().Update().Before("gorm:update").Register("observe_ssh_renewal", func(tx *gorm.DB) {
+		candidate, ok := tx.Statement.Dest.(*types.Node)
+		if tx.Statement.Table != "nodes" || !ok || candidate.ID != src || candidate.NodeKey != renewalKey {
+			return
+		}
+
+		current, ok := s.GetNodeByID(src)
+		expiredAtReauth = ok && current.IsExpired()
+		_, approvalAtReauth = s.GetLastSSHAuth(src, dst)
+	}))
+	t.Cleanup(func() { _ = s.db.DB.Callback().Update().Remove("observe_ssh_renewal") })
+
 	go func() {
-		_, _, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+		_, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
 			Auth:     &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
-			NodeKey:  key.NewNode().Public(),
+			NodeKey:  renewalKey,
 			Hostinfo: &tailcfg.Hostinfo{Hostname: node.Hostname()},
 			Expiry:   time.Now().Add(24 * time.Hour),
 		}, node.MachineKey())
 		regDone <- err
 	}()
 
-	waitParkedOnWriteQueue(t, "reregisterNodeWithPAK")
+	buf := make([]byte, 1<<20)
+
+	require.Eventually(t, func() bool {
+		n := runtime.Stack(buf, true)
+		for n == len(buf) {
+			buf = make([]byte, len(buf)*2)
+			n = runtime.Stack(buf, true)
+		}
+
+		for g := range strings.SplitSeq(string(buf[:n]), "\n\n") {
+			if strings.Contains(g, ".reregisterNodeWithPAK(") && strings.Contains(g, "(*rowLocks).lock(") {
+				return true
+			}
+		}
+
+		return false
+	}, 5*time.Second, time.Millisecond)
+
+	select {
+	case err := <-regDone:
+		require.NoError(t, err)
+		t.Fatal("reauth completed before the pending expiry released its row")
+	default:
+	}
 
 	releaseOnce()
 	require.NoError(t, <-expiryDone)
 	require.NoError(t, <-regDone)
+	assert.True(t, expiredAtReauth, "reauth sees the committed expiry before renewing it")
+	assert.False(t, approvalAtReauth, "expiry already revoked the human approval before renewal")
 
 	renewed, ok := s.GetNodeByID(src)
 	require.True(t, ok)

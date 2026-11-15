@@ -148,7 +148,7 @@ func TestGenerateExample(t *testing.T) {
 			assert.Contains(t, commentAbove(text, `  level: info`), "One of: `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `panic`, `disabled`.")
 			require.Contains(t, text, "\n  base_domain: tailnet.internal\n")
 			assert.NotContains(t, commentAbove(text, `  base_domain: tailnet.internal`), "Required when")
-			assert.Contains(t, commentAbove(text, `  batcher_workers: 0`), "Default: three quarters of the CPU cores, at least one.")
+			assert.Contains(t, text, "\n  node_store_batch_size: 100\n")
 			assert.Equal(t, len(wantTop), strings.Count(text, "\n\n"), "one blank line before each top-level key")
 		})
 	}

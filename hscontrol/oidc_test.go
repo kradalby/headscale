@@ -19,6 +19,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/hashicorp/golang-lru/v2/expirable"
+	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/oauth2-proxy/mockoidc"
 	"github.com/stretchr/testify/assert"
@@ -926,7 +927,7 @@ func TestOIDCPendingCallbackPreservesSSHVerdict(t *testing.T) {
 	require.True(t, ok)
 
 	principal := mockoidc.DefaultUser()
-	user, _, err := a.createOrUpdateUserFromClaim(&types.OIDCClaims{
+	user, err := a.createOrUpdateUserFromClaim(&types.OIDCClaims{
 		Iss:           b.idp.Issuer(),
 		Sub:           principal.Subject,
 		Username:      principal.PreferredUsername,
@@ -1497,12 +1498,12 @@ func TestOIDCLoginClearsUnverifiedEmail(t *testing.T) {
 		Iss: "https://idp.example.com", Sub: "alice", Username: "alice",
 		Email: "alice@example.com", EmailVerified: true,
 	}
-	first, _, err := provider.createOrUpdateUserFromClaim(claims)
+	first, err := provider.createOrUpdateUserFromClaim(claims)
 	require.NoError(t, err)
 	require.Equal(t, "alice@example.com", first.Email)
 
 	claims.EmailVerified = false
-	second, _, err := provider.createOrUpdateUserFromClaim(claims)
+	second, err := provider.createOrUpdateUserFromClaim(claims)
 	require.NoError(t, err)
 	assert.Equal(t, first.ID, second.ID)
 	assert.Empty(t, second.Email)
@@ -1536,7 +1537,7 @@ func TestOIDCConcurrentFirstLoginCreatesOneUser(t *testing.T) {
 
 			c := claims
 
-			user, _, err := provider.createOrUpdateUserFromClaim(&c)
+			user, err := provider.createOrUpdateUserFromClaim(&c)
 			if user != nil {
 				ids[i] = user.ID
 			}
@@ -1564,7 +1565,7 @@ func TestOIDCCallbackDispatchesUserIdentityChange(t *testing.T) {
 	require.True(t, ok)
 
 	provider.cfg.EmailVerifiedRequired = true
-	user, _, err := provider.createOrUpdateUserFromClaim(&types.OIDCClaims{
+	user, err := provider.createOrUpdateUserFromClaim(&types.OIDCClaims{
 		Iss: b.idp.Issuer(), Sub: "identity-change", Username: "alice",
 		Email: "alice@old.example", EmailVerified: true,
 	})
@@ -1579,11 +1580,18 @@ func TestOIDCCallbackDispatchesUserIdentityChange(t *testing.T) {
 	}`))
 	require.NoError(t, err)
 
-	responses := make(chan *tailcfg.MapResponse, 8)
-	require.NoError(t, b.app.mapBatcher.AddNode(node.ID, responses, tailcfg.CurrentCapabilityVersion, nil))
-	t.Cleanup(func() { b.app.mapBatcher.RemoveNode(node.ID, responses) })
+	session := b.app.mapHub.Join(node.ID, nil)
+	require.NotNil(t, session)
+	t.Cleanup(func() { b.app.mapHub.Leave(session) })
 
-	initial := <-responses
+	stream := mapper.NewStream(b.app.cfg, b.app.mapHub, node.ID, tailcfg.CurrentCapabilityVersion)
+	stream.Attach(session)
+	frames, err := stream.Initial(b.app.state.Snapshot())
+	require.NoError(t, err)
+	require.NotEmpty(t, frames)
+	stream.Delivered()
+
+	initial := frames[0]
 	require.NotEmpty(t, initial.PacketFilters["base"])
 
 	b.idp.QueueUser(&mockoidc.MockUser{
@@ -1600,9 +1608,19 @@ func TestOIDCCallbackDispatchesUserIdentityChange(t *testing.T) {
 
 	assert.Eventually(t, func() bool {
 		select {
-		case response := <-responses:
-			filters, present := response.PacketFilters["base"]
-			return present && len(filters) == 0
+		case <-session.Wakes():
+			frames, err := stream.Update(b.app.state.Snapshot())
+			require.NoError(t, err)
+			stream.Delivered()
+
+			for _, response := range frames {
+				filters, present := response.PacketFilters["base"]
+				if present && len(filters) == 0 {
+					return true
+				}
+			}
+
+			return false
 		default:
 			return false
 		}
@@ -1615,7 +1633,7 @@ func (b *oidcBrowser) pendingSSHCheck(t *testing.T) (types.AuthID, types.Nodes) 
 	provider, ok := b.app.authProvider.(*AuthProviderOIDC)
 	require.True(t, ok)
 
-	owner, _, err := provider.createOrUpdateUserFromClaim(&types.OIDCClaims{
+	owner, err := provider.createOrUpdateUserFromClaim(&types.OIDCClaims{
 		Iss: b.idp.Issuer(), Sub: "ssh-owner", Username: "ssh-owner",
 	})
 	require.NoError(t, err)
@@ -1779,7 +1797,7 @@ func TestRegisterConfirmShowsExistingNode(t *testing.T) {
 	taggedMachine := key.NewMachine().Public()
 	tagKey, err := b.app.state.CreatePreAuthKey(nil, true, false, nil, []string{"tag:server"})
 	require.NoError(t, err)
-	_, _, err = b.app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+	_, err = b.app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
 		Auth:     &tailcfg.RegisterResponseAuth{AuthKey: tagKey.Key},
 		NodeKey:  key.NewNode().Public(),
 		Hostinfo: &tailcfg.Hostinfo{Hostname: "server"},

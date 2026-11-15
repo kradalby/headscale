@@ -196,7 +196,7 @@ func TestGenerateNixOptions(t *testing.T) {
 				"\n    - `postgres`: ",
 			},
 		},
-		{path: "tuning.batcher_workers", want: []string{"\n  default = 0;\n  defaultText = lib.literalMD \"three quarters of the CPU cores, at least one\";\n"}},
+		{path: "tuning.node_store_batch_size", want: []string{"\n  default = 100;\n"}},
 		{
 			path: "oidc.client_secret",
 			want: []string{
@@ -259,6 +259,16 @@ func TestGenerateNixOptions(t *testing.T) {
 	}
 
 	// Built by hand, so the rendering is pinned whatever Default requires.
+	t.Run("default text", func(t *testing.T) {
+		k := schemaByPath(t)["tuning.node_store_batch_size"]
+		k.DefaultText = "chosen at start"
+
+		opt, err := nixOption(k, 0)
+		require.NoError(t, err)
+		assert.Contains(t, opt, "\n  default = 100;\n")
+		assert.Contains(t, opt, "\n  defaultText = lib.literalMD \"chosen at start\";\n")
+	})
+
 	t.Run("required when", func(t *testing.T) {
 		k := schemaByPath(t)["dns.base_domain"]
 		k.Required, k.RequiredWhen = true, "`dns.magic_dns` is true"
