@@ -8505,6 +8505,8 @@ const maxStreamPropertyNodeID types.NodeID = 255
 type streamPropertySystem struct {
 	lastNodeID types.NodeID
 	dnsRecords []tailcfg.DNSRecord
+	derpMap    *tailcfg.DERPMap
+	derpMaps   []*tailcfg.DERPMap
 	viaOnly    bool
 	cfg        *types.Config
 	state      *state.State
@@ -8561,7 +8563,11 @@ func newStreamPropertySystem(t *rapid.T) *streamPropertySystem {
 		p.world.Users = append(p.world.Users, u)
 	}
 
-	s.SetDERPMap(&tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: {RegionID: 1}}})
+	p.derpMap = &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: {
+		RegionID: 1, Nodes: []*tailcfg.DERPNode{{Name: "1a", RegionID: 1, HostName: "derp.example.com"}},
+	}}}
+	p.derpMaps = []*tailcfg.DERPMap{p.derpMap.Clone()}
+	s.SetDERPMap(p.derpMap.Clone())
 
 	count := rapid.IntRange(3, 8).Draw(t, "nodes")
 	for i := range count {
@@ -8641,7 +8647,7 @@ func (p *streamPropertySystem) setPolicy(t *rapid.T, index int) {
 
 // applyStreamPropertyWire crosses the real encoder boundary. Removal frames
 // must stand alone, so even old delta-only consumers receive revocations.
-func applyStreamPropertyWire(t *rapid.T, hub *Hub, client *propertyClient, responses []*tailcfg.MapResponse) {
+func applyStreamPropertyWire(t require.TestingT, hub *Hub, client *propertyClient, responses []*tailcfg.MapResponse) {
 	for _, response := range responses {
 		// Exercise both Hub.Encode slots without changing generated operation draws.
 		wireRoundTrip(t, hub, response, false)
@@ -8667,6 +8673,7 @@ func applyStreamPropertyWire(t *rapid.T, hub *Hub, client *propertyClient, respo
 		}
 
 		client.apply(&wire)
+		client.derp = streamDERPSemantic(client.derp)
 
 		if client.self != nil {
 			require.NotContains(t, client.peers, client.self.ID, "self leaked into the initial peer list")
@@ -8781,6 +8788,7 @@ func (p *streamPropertySystem) check(t *rapid.T, snap *state.Snapshot) {
 		applyStreamPropertyWire(t, freshHub, fresh, responses)
 		freshHub.Close()
 		session.client.check(t, fresh)
+		require.Equal(t, wireJSON(t, streamDERPSemantic(p.effectiveDERP(t))), wireJSON(t, session.client.derp), "DERP input to client")
 		require.Len(t, session.client.deltaPeers, len(fresh.peers), "delta-only observer retained a removed peer")
 
 		for peer := range fresh.peers {
@@ -8843,6 +8851,33 @@ func (p *streamPropertySystem) check(t *rapid.T, snap *state.Snapshot) {
 	}
 }
 
+// Missing scores and explicit 1.0 both select the default latency weight.
+// Preserve every non-default score, including stale scores after a clear.
+func streamDERPSemantic(dm *tailcfg.DERPMap) *tailcfg.DERPMap {
+	dm = dm.Clone()
+	if dm != nil && dm.HomeParams != nil {
+		maps.DeleteFunc(dm.HomeParams.RegionScore, func(_ tailcfg.DERPRegionID, score float64) bool { return score == 1 })
+
+		if len(dm.HomeParams.RegionScore) == 0 {
+			dm.HomeParams = nil
+		}
+	}
+
+	return dm
+}
+
+// Decode only DERP from generated input; this is not a policy interpreter.
+func (p *streamPropertySystem) effectiveDERP(t require.TestingT) *tailcfg.DERPMap {
+	var policy struct {
+		DERPMap *tailcfg.DERPMap `json:"derpMap"`
+	}
+	if len(p.policyDoc) > 0 {
+		require.NoError(t, json.Unmarshal(p.policyDoc, &policy))
+	}
+
+	return propcheck.EffectiveDERP(p.derpMap, policy.DERPMap)
+}
+
 // checkWorld reuses the exact scan assertions used by the focused state property.
 // Probes retain old keys as well as current ones to catch stale index entries.
 func (p *streamPropertySystem) checkWorld(t *rapid.T) {
@@ -8859,6 +8894,7 @@ func (p *streamPropertySystem) checkWorld(t *rapid.T) {
 
 	snap := p.state.Snapshot()
 	propcheck.CheckWorld(t, p.world, snap, p.probes)
+	require.Equal(t, p.effectiveDERP(t), snap.DERPMap(), "DERP reference")
 	require.True(t, slices.Equal(p.dnsRecords, snap.DNS().ExtraRecords().AsSlice()), "DNS reference")
 	require.Equal(t, string(p.policyDoc), string(snap.PolicySource()), "published policy input")
 
@@ -8983,7 +9019,7 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 
 	operations := kinds
 	if len(operations) == 0 {
-		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "noop", "revert", "request", "stale-request", "invalid-policy"}
+		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "stale-request", "invalid-policy"}
 		if len(ids) > 3 {
 			operations = append(operations, "delete")
 		}
@@ -9086,14 +9122,22 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 	case "dns":
 		result.records = propcheck.DrawDNSRecords(t)
 	case "derp":
-		regions := make(map[tailcfg.DERPRegionID]*tailcfg.DERPRegion)
+		result.derp = propcheck.DrawDERPMap(t, false)
+	case "derp-noop":
+		result.derp = p.derpMap.Clone()
+	case "derp-restore":
+		result.derp = p.derpMaps[rapid.IntRange(0, len(p.derpMaps)-1).Draw(t, "DERP ancestor")].Clone()
+	case "derp-policy":
+		var policy map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(p.policyDoc, &policy))
+		dm, err := json.Marshal(propcheck.DrawDERPMap(t, true))
+		require.NoError(t, err)
 
-		for i := range rapid.IntRange(0, 3).Draw(t, "derp-count") {
-			id := tailcfg.DERPRegionID(i + 1)
-			regions[id] = &tailcfg.DERPRegion{RegionID: id, RegionName: fmt.Sprintf("region-%d", rapid.IntRange(0, 3).Draw(t, "derp-name"))}
-		}
+		policy["derpMap"] = dm
+		result.doc, err = json.Marshal(policy)
+		require.NoError(t, err)
 
-		result.derp = &tailcfg.DERPMap{Regions: regions}
+		result.policy = p.policy
 	case "add":
 		result.node = p.drawNode(t, p.lastNodeID+1)
 	case "request", "stale-request":
@@ -9119,9 +9163,10 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 	audits := state.PolicyAuditFailures()
 	before := p.state.Snapshot()
+	beforeDERP := p.effectiveDERP(t)
 
 	switch op.kind {
-	case "policy", "generated-policy", "policy-order", "policy-duplicate", "policy-restore":
+	case "policy", "generated-policy", "policy-order", "policy-duplicate", "policy-restore", "derp-policy":
 		changed, err := p.state.SetPolicy(op.doc)
 		require.NoError(t, err, "generated policy: %s", op.doc)
 		expectedChange := !bytes.Equal(p.policyDoc, op.doc)
@@ -9155,8 +9200,16 @@ func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 		}
 
 		require.Equal(t, wantRev, p.state.Snapshot().Rev(), "DNS publication equivalence")
-	case "derp":
+	case "derp", "derp-noop", "derp-restore":
+		wantRev := before.Rev()
+		if !reflect.DeepEqual(p.derpMap, op.derp) {
+			wantRev++
+		}
+
 		p.state.SetDERPMap(op.derp)
+		p.derpMap = op.derp.Clone()
+		p.derpMaps = append(p.derpMaps, op.derp.Clone())
+		require.Equal(t, wantRev, p.state.Snapshot().Rev(), "configured DERP publication")
 	case "delete":
 		p.world.Delete(op.node.ID)
 		p.state.DeleteNodeFromStoreForTest(op.node.ID)
@@ -9222,7 +9275,14 @@ func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 	p.checkWorld(t)
 	p.checkHistory(t)
 	require.Equal(t, audits, state.PolicyAuditFailures(), "policy audit after %s", op.kind)
-	p.checkCausal(t, before, p.state.Snapshot(), op)
+
+	after := p.state.Snapshot()
+	if strings.HasPrefix(op.kind, "derp") {
+		changed := !reflect.DeepEqual(beforeDERP, p.effectiveDERP(t))
+		require.Equal(t, changed, after.Since(before).Global, "effective DERP global wake")
+	}
+
+	p.checkCausal(t, before, after, op)
 }
 
 func propertyApproved(n *types.Node) []netip.Prefix {
@@ -9240,7 +9300,7 @@ func propertyApproved(n *types.Node) []netip.Prefix {
 // checkCausal checks one input's effect through render, diff, JSON and the
 // pinned client. It runs in focused histories and after each composed write,
 // independently of the aggregate's coalesced/partial delivery schedule.
-func (p *streamPropertySystem) checkCausal(t *rapid.T, before, after *state.Snapshot, op streamOperation) {
+func (p *streamPropertySystem) checkCausal(t require.TestingT, before, after *state.Snapshot, op streamOperation) {
 	// Router removal can move another router's overlay; wider policies can
 	// change other peers' visibility. Those use the composed intent checks.
 	if op.kind == "delete" && (p.policy != 0 || len(propertyApproved(op.node)) != 0) {
@@ -9248,7 +9308,7 @@ func (p *streamPropertySystem) checkCausal(t *rapid.T, before, after *state.Snap
 	}
 
 	switch op.kind {
-	case "endpoints", "hostinfo", "dns", "derp", "noop", "revert", "stale-request", "invalid-policy", "delete":
+	case "endpoints", "hostinfo", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "stale-request", "invalid-policy", "delete":
 	default:
 		return
 	}
@@ -9284,6 +9344,9 @@ func (p *streamPropertySystem) checkCausal(t *rapid.T, before, after *state.Snap
 		case "endpoints":
 			if peer := expected.peers[op.node.ID.NodeID()]; peer != nil {
 				peer.Endpoints = slices.Clone(op.node.Endpoints)
+				if propertyExpired(op.node) {
+					peer.Endpoints = nil
+				}
 			}
 
 			if expected.self.ID == op.node.ID.NodeID() {
@@ -9305,7 +9368,12 @@ func (p *streamPropertySystem) checkCausal(t *rapid.T, before, after *state.Snap
 					require.Equal(t, op.node.Hostinfo.OS, subject.Hostinfo.OS(), "reported peer OS")
 				}
 
-				require.Equal(t, op.node.Hostinfo.NetInfo.PreferredDERP, subject.HomeDERP, "reported home DERP")
+				home := op.node.Hostinfo.NetInfo.PreferredDERP
+				if !self && propertyExpired(op.node) {
+					home = 0
+				}
+
+				require.Equal(t, home, subject.HomeDERP, "reported home DERP")
 			}
 			// Hostinfo can change platform-dependent capabilities on self; peers
 			// and globals unrelated to this node must still remain unchanged.
@@ -9320,9 +9388,15 @@ func (p *streamPropertySystem) checkCausal(t *rapid.T, before, after *state.Snap
 			require.True(t, slices.Equal(propcheck.CanonicalDNSRecords(op.records), actual.dns.ExtraRecords), "DNS input to canonical wire records")
 			expected.dns = expected.dns.Clone()
 			expected.dns.ExtraRecords = propcheck.CanonicalDNSRecords(op.records)
-		case "derp":
-			require.Equal(t, wireJSON(t, op.derp), wireJSON(t, actual.derp))
-			expected.derp = actual.derp
+		case "derp", "derp-policy", "derp-noop", "derp-restore":
+			expected.derp = streamDERPSemantic(p.effectiveDERP(t))
+			require.Equal(t, wireJSON(t, expected.derp), wireJSON(t, actual.derp), "effective DERP on wire")
+
+			if reflect.DeepEqual(before.DERPMap(), after.DERPMap()) {
+				for _, response := range responses {
+					require.Nil(t, response.DERPMap, "equal effective DERP emitted a delta")
+				}
+			}
 		case "delete":
 			delete(expected.peers, op.node.ID.NodeID())
 			delete(expected.deltaPeers, op.node.ID.NodeID())
@@ -9356,6 +9430,7 @@ func TestRapidStreamSystem(t *testing.T) {
 			// cache advancement; a late renderer must still read it correctly.
 			old := p.state.Snapshot()
 			oldWorld := p.world.Clone()
+			oldDERP := p.effectiveDERP(t)
 			oldNode := old.ListNodes().At(0).ID()
 			oldHub := NewHub()
 			oldMap, err := NewStream(p.cfg, oldHub, oldNode, capVer).r.render(old)
@@ -9397,6 +9472,7 @@ func TestRapidStreamSystem(t *testing.T) {
 
 			p.check(t, snap)
 			propcheck.CheckWorld(t, oldWorld, old, p.probes)
+			require.Equal(t, oldDERP, old.DERPMap(), "retained DERP snapshot")
 			lateMap, err := NewStream(p.cfg, p.hub, oldNode, capVer).r.render(old)
 			require.NoError(t, err)
 
@@ -9556,6 +9632,7 @@ func TestRapidStreamOperationContracts(t *testing.T) {
 
 	for _, kinds := range [][]string{
 		{"endpoints", "hostinfo", "dns", "derp", "noop", "revert"},
+		{"derp", "derp-policy", "derp-noop", "derp-restore", "policy-restore"},
 		{"request", "stale-request", "invalid-policy"},
 		{"generated-policy", "policy-order", "policy-duplicate", "policy-restore"},
 	} {
@@ -9713,4 +9790,128 @@ func TestStreamRouteOverlaySurvivesStaleCacheAndMembership(t *testing.T) {
 	}
 
 	checkRoute()
+}
+
+// Complete configured maps can clear scores on reload. JSON omitempty must not
+// turn that clear into the pinned client's "keep the previous scores" update.
+func TestStreamDERPScoreClearConverges(t *testing.T) {
+	for _, reset := range []struct {
+		name string
+		home *tailcfg.DERPHomeParams
+	}{
+		{"home-parameters", nil},
+		{"empty-scores", &tailcfg.DERPHomeParams{RegionScore: map[tailcfg.DERPRegionID]float64{}}},
+	} {
+		t.Run(reset.name, func(t *testing.T) {
+			cfg, s, ids := streamTestState(t, "")
+			base := &tailcfg.DERPMap{
+				Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: {
+					RegionID: 1, Nodes: []*tailcfg.DERPNode{{Name: "1a", RegionID: 1, HostName: "derp.example.com"}},
+				}},
+				HomeParams: &tailcfg.DERPHomeParams{RegionScore: map[tailcfg.DERPRegionID]float64{1: 2}},
+			}
+			s.SetDERPMap(base)
+
+			hub := NewHub()
+			defer hub.Close()
+
+			stream := NewStream(cfg, hub, ids[0], capVer)
+			initial, err := stream.Initial(s.Snapshot())
+			require.NoError(t, err)
+
+			client := newPropertyClient(&tailcfg.MapResponse{})
+			for _, response := range initial {
+				client.apply(wireRoundTrip(t, hub, response, false))
+			}
+
+			stream.Delivered()
+
+			before := s.Snapshot()
+			next := base.Clone()
+			next.HomeParams = reset.home
+			s.SetDERPMap(next)
+			after := s.Snapshot()
+			require.Equal(t, propcheck.EffectiveDERP(next, nil), after.DERPMap())
+			all, _ := Route(before, after, after.Since(before))
+			require.True(t, all, "configured score clear must wake clients")
+
+			responses, err := stream.Update(after)
+			require.NoError(t, err)
+			require.NotEmpty(t, responses)
+
+			for _, response := range responses {
+				wireRoundTrip(t, hub, response, false)
+				client.apply(wireRoundTrip(t, hub, response, true))
+			}
+
+			require.Equal(t, wireJSON(t, streamDERPSemantic(propcheck.EffectiveDERP(next, nil))), wireJSON(t, streamDERPSemantic(client.derp)), "client retained cleared DERP scores")
+		})
+	}
+}
+
+func TestRapidStreamDERPMaskedPublication(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t)
+		p.setPolicy(t, 0)
+		base := p.derpMap.Clone()
+		custom := base.Regions[1].Clone()
+		custom.RegionID, custom.Nodes[0].RegionID = 900, 900
+		policy := &tailcfg.DERPMap{
+			OmitDefaultRegions: true,
+			Regions:            map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{900: custom},
+			HomeParams:         &tailcfg.DERPHomeParams{RegionScore: map[tailcfg.DERPRegionID]float64{900: 2}},
+		}
+		doc, err := json.Marshal(map[string]any{"derpMap": policy})
+		require.NoError(t, err)
+		p.apply(t, streamOperation{kind: "derp-policy", doc: doc, policy: 0})
+		old, want := p.state.Snapshot(), p.effectiveDERP(t)
+		base.Regions[1].RegionName = "masked configured change"
+		p.apply(t, streamOperation{kind: "derp", derp: base})
+		require.Greater(t, p.state.Snapshot().Rev(), old.Rev())
+		require.False(t, p.state.Snapshot().Since(old).Global)
+		p.apply(t, streamOperation{kind: "derp-noop", derp: base.Clone()})
+		p.apply(t, streamOperation{kind: "derp-policy", doc: []byte(`{"derpMap":{"Regions":{"1":null}}}`), policy: 0})
+		p.apply(t, streamOperation{kind: "derp-policy", doc: []byte(`{}`), policy: 0})
+		p.apply(t, streamOperation{kind: "derp-restore", derp: p.derpMaps[0].Clone()})
+		require.Equal(t, want, old.DERPMap(), "old effective snapshot survives base and policy changes")
+	})
+}
+
+// Expiry suppresses a peer's connectivity fields, but not the node's own view.
+func TestStreamCausalExpiredConnectivity(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		t.Run(fmt.Sprintf("expired=%t", expired), func(t *testing.T) {
+			cfg, s, ids := streamTestState(t, "")
+			p := &streamPropertySystem{cfg: cfg}
+			view, ok := s.Snapshot().GetNode(ids[0])
+			require.True(t, ok)
+
+			node := view.AsStruct()
+			node.Hostinfo = &tailcfg.Hostinfo{Hostname: "connectivity", OS: "linux", NetInfo: &tailcfg.NetInfo{PreferredDERP: 1}}
+
+			node.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")}
+			if expired {
+				node.Expiry = new(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
+			}
+
+			s.PutNodeInStoreForTest(*node.Clone())
+
+			for _, kind := range []string{"endpoints", "hostinfo"} {
+				before := s.Snapshot()
+
+				op := streamOperation{kind: kind, before: node.Clone()}
+				if kind == "endpoints" {
+					node.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.2:41642")}
+				} else {
+					node.Hostinfo.NetInfo.PreferredDERP = 2
+					node.Hostinfo.Hostname = "changed-connectivity"
+				}
+
+				op.node = node.Clone()
+				s.PutNodeInStoreForTest(*node.Clone())
+				// checkCausal visits every viewer, including this node itself.
+				p.checkCausal(t, before, s.Snapshot(), op)
+			}
+		})
+	}
 }

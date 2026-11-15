@@ -11,10 +11,45 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/juanfont/headscale/hscontrol/propcheck"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/require"
+	"pgregory.net/rapid"
 	"tailscale.com/tailcfg"
 )
+
+func TestApplyPolicyRapidReference(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		base, policy := propcheck.DrawDERPMap(t, false), propcheck.DrawDERPMap(t, true)
+		for id, region := range base.Regions {
+			require.Empty(t, ValidateRegion(id, region))
+		}
+
+		if rapid.Bool().Draw(t, "nil base boundary") {
+			base = nil
+		}
+
+		baseBefore, policyBefore := base.Clone(), policy.Clone()
+		want := propcheck.EffectiveDERP(base, policy)
+		got := ApplyPolicy(base, policy)
+		require.Equal(t, want, got, "independent DERP precedence")
+		require.Equal(t, baseBefore, base, "base input mutated")
+		require.Equal(t, policyBefore, policy, "policy input mutated")
+		// Later composition must not mutate earlier results or inputs.
+		_ = ApplyPolicy(base, propcheck.DrawDERPMap(t, true))
+		require.Equal(t, want, got, "retained result changed")
+
+		if base != nil && policy != nil {
+			for _, region := range policy.Regions {
+				if region != nil {
+					region.Nodes[0].HostName = "mutated.example.com"
+				}
+			}
+
+			require.Equal(t, want, got, "policy regions must be cloned")
+		}
+	})
+}
 
 func TestShuffleDERPMapDeterministic(t *testing.T) {
 	tests := []struct {

@@ -114,3 +114,36 @@ OnlineChange, legacy DERP strings, unsigned peers and client Debug actions are
 outside the generated wire domain. Pinned replay covers the modern fields
 Headscale emits. Generated failures can stop a broad history early, so focused
 component campaigns remain necessary.
+
+## Shared DERP composition
+
+`propcheck.DrawDERPMap` feeds structured policy `derpMap` fields and configured
+DERP operations. `propcheck.EffectiveDERP` selects each region by explicit key
+precedence and owns expected storage. `derp.TestApplyPolicyRapidReference` checks
+that reference, input nonmutation, retained results and cloned policy regions.
+It does not demand ownership of base regions or HomeParams from `ApplyPolicy`.
+
+The stream driver derives effective DERP from configured inputs and the policy
+JSON, checks snapshots after every write and compares delivered clients against
+that independent expectation as well as fresh streams. Configured writes,
+policy overlays, identical copies and historical restoration share the same
+operations in `TestRapidStreamOperationContracts/derp` and the broad driver.
+Configured publication follows complete input equality; global wakes and DERP
+deltas follow effective equality. Retained snapshots keep their old DERP value.
+`TestRapidStreamDERPMaskedPublication` checks masked configured writes, ignored
+policy scores, null removal and restoration without relying on random discovery.
+
+Configured maps have explicit non-nil Regions with valid non-null regions;
+empty Regions removes all relays. Policy overlays cover nil/empty, default-region
+null deletion, custom regions 900 and 999, replacement, omit-defaults and ignored
+HomeParams. Positive scores, empty scores and removed HomeParams remain in the
+input domain. Nil configured maps are only focused ApplyPolicy boundary checks,
+not an advertised post-start reload. Fetching, source merge and HTTP are covered
+elsewhere. This component does not assert a general policy compiler oracle.
+
+`TestStreamDERPScoreClearConverges` is an enabled diagnostic for configured
+HomeParams/score clears. The pinned client retains omitted HomeParams or
+RegionScore; JSON omitempty can therefore preserve stale scores after a clear.
+Do not exclude these supported reload inputs to make a campaign pass. Stream
+comparisons normalize absent/empty HomeParams and explicit score 1.0 to default
+latency weights; every non-default score remains observable.
