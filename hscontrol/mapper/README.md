@@ -51,8 +51,9 @@ history. These remain enabled rather than being copied into another driver.
 - **Database fixture:** users have explicit IDs and timestamps. Nodes have real
   SQLite rows before request operations and graph publication. The DB clock is
   fixed per fixture. Direct graph edits are deliberately not advertised as
-  durable DB writes. Policy changes use in-memory `State.SetPolicy`, not the
-  durable policy API.
+  durable DB writes. Default policy changes use in-memory `State.SetPolicy`,
+  not the durable policy API. The explicit file fixture uses `State.ReloadPolicy`
+  as described below.
 - **Independent intent:** allow-all, deny-all and self/member policies predict
   peer membership and tag-versus-user ownership from World. Peer keys and tags
   are checked against input. Allow-all maps independently predict addresses,
@@ -194,6 +195,10 @@ with six mandatory history phases and one to eight additional commits per case;
 The fixed history keeps ownership revocation/restoration, document replacement,
 deny/restore, membership and reconnect checks reachable independently of earlier
 failures in broader generated histories.
+After each fixed ownership revocation, destination 2 must complete that snapshot
+before identity restoration: it reopens if disconnected or receives a complete
+update otherwise. Both paths run `checkSession`; other deliveries retain random
+partial prefixes. The memory and file fixtures share this guarantee.
 
 The focused policy history evaluates both incremental and fresh managers against
 intent and retains old managers/worlds. It deliberately does not use the older
@@ -214,3 +219,57 @@ This domain excludes self traffic, return traffic, external/subnet destinations,
 CIDRs, groups, hosts, autogroups, ACL syntax, SSH, app capabilities and OIDC/email
 alias resolution. It samples selected ports rather than every possible packet.
 Full Tailscale processes and network transport remain outside this fixture.
+
+## Successive policy files
+
+`TestRapidStreamPolicyFiles` uses the same composed driver with file mode
+selected before `State.NewState`. A valid deny document, its independent
+`PacketIntent`, and accepted history agree before any session opens. Production
+has one configured `Policy.Path`: this property replaces successive complete
+files at that path, rather than merging simultaneous files.
+
+`streamPropertySystem.inputPolicy` is the shared input adapter for `setPolicy`
+and policy operations. File writes stage a small sibling file and rename it to
+the configured path, then call `State.ReloadPolicy`. Staged bytes and intent are
+owned separately from active expectations. Only acceptance advances the active
+document and intent; the reference never derives them from graph or compiler
+output. Per-attempt cleanup removes staged files together with the fixture DB.
+
+The file domain composes packet replacements, explicit deny, reorder,
+duplicates, prior accepted documents, identical bytes and equivalent HuJSON
+comments. Staging without reload leaves graph and consumers unchanged. Malformed
+syntax, empty and missing files, and a valid document with a failing embedded
+TCP test must refuse without publication. The embedded test uses live literal
+addresses, so user renames cannot make it vacuous. Repeated reloads of refused
+files remain refused; replacing them with accepted bytes restores normal
+operation. World checks preserve input-owned route approvals through every
+reload, including accepted policy changes.
+
+The existing Route, Stream, Hub JSON/zstd replay, cumulative client, peer ledger,
+retained snapshots and per-delivery `checkSession` checks remain in use.
+Staging, same-byte reloads, equivalent comments and refusals additionally preserve
+the prior consumer state and require no delta, including a repeated quiet
+update. Comment edits still publish changed raw source bytes and a new revision.
+Batch-end checks include unwoken clients; partial prefixes are checked
+after reconnect. All policy audit diagnostics remain enabled.
+
+`TestStreamPolicyFileHistory` reuses the fixed packet history with one-grant
+documents and explicit staging, successful reload, refusal and restoration
+phases. It keeps those contracts reachable even when generated multi-grant
+histories stop at known compiler diagnostics. The generated file history adds
+eleven file-boundary phases to the existing six packet phases, then one to eight
+additional commits; each commit coalesces one to three operations.
+Seed 20261115 completes the file-boundary phases, then reaches the existing
+reordered-packet filter audit diagnostic. That failure remains enabled; it does
+not by itself establish an authorization mismatch.
+
+```sh
+go test -p 1 ./hscontrol/mapper -run '^TestStreamPolicyFileHistory$' -count=1 -rapid.seed=20261115 -rapid.checks=20 -rapid.nofailfile
+go test -p 1 ./hscontrol/mapper -run '^TestRapidStreamPolicyFiles$' -count=1 -rapid.seed=20261115 -rapid.checks=10 -rapid.nofailfile
+CGO_ENABLED=1 go test -race -p 1 ./hscontrol/mapper -run '^TestStreamPolicyFileHistory$' -count=1 -rapid.seed=20261116 -rapid.checks=10 -rapid.nofailfile
+```
+
+This tests explicit reload of complete replacements. It does not cover a file
+watcher, signal delivery, concurrent OS partial writes, crash durability,
+server restart, or a multi-file merge API. Default DB fixtures and their existing
+in-memory policy behavior remain unchanged.

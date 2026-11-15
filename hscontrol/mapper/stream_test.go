@@ -30,6 +30,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tailscale/hujson"
 	"go4.org/mem"
 	"gorm.io/gorm"
 	"pgregory.net/rapid"
@@ -8518,6 +8519,7 @@ type streamPropertySystem struct {
 	policyDoc    []byte
 	packetIntent *propcheck.PacketIntent
 	policies     []streamPropertyPolicy
+	stagedPolicy streamOperation
 	world        propcheck.World
 	probes       propcheck.WorldProbes
 	routes       propcheck.RouteResult
@@ -8528,7 +8530,7 @@ type streamPropertySystem struct {
 
 // newStreamPropertySystem owns resources per Rapid case, including shrink
 // attempts. No assertion or Cleanup escapes to the outer testing.T.
-func newStreamPropertySystem(t *rapid.T) *streamPropertySystem {
+func newStreamPropertySystem(t *rapid.T, mode ...types.PolicyMode) *streamPropertySystem {
 	dir, err := os.MkdirTemp("", "mapper-property-")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
@@ -8542,6 +8544,13 @@ func newStreamPropertySystem(t *rapid.T) *streamPropertySystem {
 		Prefixes:  types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential},
 		DNSConfig: types.DNSConfig{BaseDomain: "headscale.test", MagicDNS: true},
 	}
+	startup := &propcheck.PacketIntent{}
+
+	if len(mode) > 0 && mode[0] == types.PolicyModeFile {
+		cfg.Policy = types.PolicyConfig{Mode: types.PolicyModeFile, Path: dir + "/policy.hujson"}
+		require.NoError(t, os.WriteFile(cfg.Policy.Path, startup.Document(t), 0o600))
+	}
+
 	s, err := state.NewState(cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
@@ -8556,6 +8565,11 @@ func newStreamPropertySystem(t *rapid.T) *streamPropertySystem {
 		world:   propcheck.World{Nodes: map[types.NodeID]*types.Node{}},
 		history: newPeerHistoryModel(maxConcurrentMapSessionsPerNode, peerHistoryTTL),
 		probes:  propcheck.WorldProbes{UserIDs: []types.UserID{0, 1, 2, 3}},
+	}
+	if cfg.Policy.Mode == types.PolicyModeFile {
+		p.policy, p.policyDoc, p.packetIntent = -1, startup.Document(t), startup
+		p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: -1, intent: startup}}
+		p.stagedPolicy = streamOperation{doc: slices.Clone(p.policyDoc), policy: -1, intent: startup}
 	}
 
 	for i := range 3 {
@@ -8577,7 +8591,9 @@ func newStreamPropertySystem(t *rapid.T) *streamPropertySystem {
 		p.insert(t, types.NodeID(i+1))
 	}
 
-	p.setPolicy(t, rapid.IntRange(0, len(streamPropertyPolicies)-1).Draw(t, "initial-policy"))
+	if cfg.Policy.Mode != types.PolicyModeFile {
+		p.setPolicy(t, rapid.IntRange(0, len(streamPropertyPolicies)-1).Draw(t, "initial-policy"))
+	}
 
 	for _, node := range s.ListNodes().All() {
 		p.open(t, node.ID(), s.Snapshot(), false)
@@ -8639,14 +8655,74 @@ func (p *streamPropertySystem) put(t *rapid.T, n *types.Node) {
 }
 
 func (p *streamPropertySystem) setPolicy(t *rapid.T, index int) {
-	_, err := p.state.SetPolicy([]byte(streamPropertyPolicies[index]))
-	require.NoError(t, err)
+	p.apply(t, streamOperation{kind: "policy", policy: index, doc: []byte(streamPropertyPolicies[index])})
+}
 
-	p.policy = index
-	p.packetIntent = nil
-	p.policyDoc = []byte(streamPropertyPolicies[index])
-	p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(p.policyDoc), kind: index})
-	p.checkWorld(t)
+// Staging owns its input independently of the active policy and graph. Rename
+// models successive complete files at the one configured production path.
+func (p *streamPropertySystem) stagePolicy(t *rapid.T, op streamOperation) {
+	require.Equal(t, types.PolicyModeFile, p.cfg.Policy.Mode)
+
+	if op.kind == "file-missing" {
+		err := os.Remove(p.cfg.Policy.Path)
+		require.True(t, err == nil || errors.Is(err, os.ErrNotExist), "remove policy: %v", err)
+	} else {
+		require.NoError(t, os.WriteFile(p.cfg.Policy.Path+".next", op.doc, 0o600))
+		require.NoError(t, os.Rename(p.cfg.Policy.Path+".next", p.cfg.Policy.Path))
+	}
+
+	p.stagedPolicy = streamOperation{doc: slices.Clone(op.doc), policy: op.policy, intent: op.intent, reject: op.reject}
+}
+
+// Active expectations advance only after acceptance. Refused files remain on
+// disk, so a later reload must refuse again until another file replaces them.
+func (p *streamPropertySystem) inputPolicy(t *rapid.T, op streamOperation) {
+	before := p.state.Snapshot().Rev()
+
+	var err error
+
+	if p.cfg.Policy.Mode == types.PolicyModeFile {
+		if op.kind != "file-reload" {
+			p.stagePolicy(t, op)
+		}
+
+		if op.kind == "file-stage" {
+			require.Equal(t, before, p.state.Snapshot().Rev(), "staging published")
+			return
+		}
+
+		err = p.state.ReloadPolicy()
+	} else {
+		var changed bool
+
+		changed, err = p.state.SetPolicy(op.doc)
+		if err == nil {
+			require.Equal(t, !bytes.Equal(p.policyDoc, op.doc), changed, "SetPolicy change result")
+		}
+	}
+
+	if op.reject {
+		require.Error(t, err, "refused policy: %s", op.doc)
+
+		if op.kind == "file-test-failure" {
+			require.ErrorContains(t, err, "test(s) failed", "embedded test must fail evaluation")
+		}
+
+		require.Equal(t, before, p.state.Snapshot().Rev(), "refused policy published")
+
+		return
+	}
+
+	require.NoError(t, err, "accepted policy: %s", op.doc)
+
+	wantRev := before
+	if !bytes.Equal(p.policyDoc, op.doc) {
+		wantRev++
+	}
+
+	require.Equal(t, wantRev, p.state.Snapshot().Rev(), "policy publication")
+	p.policy, p.policyDoc, p.packetIntent = op.policy, slices.Clone(op.doc), op.intent
+	p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(op.doc), kind: op.policy, intent: op.intent})
 }
 
 // applyStreamPropertyWire crosses the real encoder boundary. Removal frames
@@ -8889,8 +8965,11 @@ func (p *streamPropertySystem) effectiveDERP(t require.TestingT) *tailcfg.DERPMa
 	var policy struct {
 		DERPMap *tailcfg.DERPMap `json:"derpMap"`
 	}
+
 	if len(p.policyDoc) > 0 {
-		require.NoError(t, json.Unmarshal(p.policyDoc, &policy))
+		doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(doc, &policy))
 	}
 
 	return propcheck.EffectiveDERP(p.derpMap, policy.DERPMap)
@@ -9024,6 +9103,7 @@ type streamOperation struct {
 	policy       int
 	doc          []byte
 	intent       *propcheck.PacketIntent
+	reject       bool
 	user         types.User
 	records      []tailcfg.DNSRecord
 	derp         *tailcfg.DERPMap
@@ -9129,8 +9209,11 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 		result.intent = &propcheck.PacketIntent{}
 		result.policy, result.doc = -1, result.intent.Document(t)
 	case "policy-order", "policy-duplicate":
+		doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
+		require.NoError(t, err)
+
 		result.intent = p.packetIntent
-		result.policy, result.doc = p.policy, propcheck.ReorderPolicy(t, p.policyDoc, op == "policy-duplicate")
+		result.policy, result.doc = p.policy, propcheck.ReorderPolicy(t, doc, op == "policy-duplicate")
 	case "policy-restore":
 		saved := p.policies[rapid.IntRange(0, len(p.policies)-1).Draw(t, "policy-ancestor")]
 		result.policy, result.doc, result.intent = saved.kind, slices.Clone(saved.doc), saved.intent
@@ -9155,7 +9238,10 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 		result.derp = p.derpMaps[rapid.IntRange(0, len(p.derpMaps)-1).Draw(t, "DERP ancestor")].Clone()
 	case "derp-policy":
 		var policy map[string]json.RawMessage
-		require.NoError(t, json.Unmarshal(p.policyDoc, &policy))
+
+		doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(doc, &policy))
 		dm, err := json.Marshal(propcheck.DrawDERPMap(t, true))
 		require.NoError(t, err)
 
@@ -9178,6 +9264,25 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 		if op == "stale-request" {
 			result.request.NodeKey = key.NodePublic{}
 		}
+	case "file-stage":
+		result.intent = propcheck.DrawPacketIntent(t, p.world)
+		result.policy, result.doc = -1, result.intent.Document(t)
+	case "file-reload":
+		result.policy, result.doc, result.intent, result.reject = p.stagedPolicy.policy, slices.Clone(p.stagedPolicy.doc), p.stagedPolicy.intent, p.stagedPolicy.reject
+	case "file-same", "file-comment":
+		result.policy, result.doc, result.intent = p.policy, slices.Clone(p.policyDoc), p.packetIntent
+		if op == "file-comment" {
+			doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
+			require.NoError(t, err)
+
+			result.doc = append([]byte("// equivalent policy document\n"), bytes.TrimSpace(doc)...)
+		}
+	case "file-empty", "file-missing":
+		result.reject = true
+	case "file-test-failure":
+		// A literal live witness cannot become vacuous after user renames.
+		result.doc = []byte(fmt.Sprintf(`{"grants":[],"tests":[{"src":%q,"proto":"tcp","accept":[%q]}]}`, p.world.Nodes[ids[0]].IPv4.String(), p.world.Nodes[ids[1]].IPv4.String()+":22"))
+		result.reject = true
 	case "delete", "noop", "invalid-policy":
 	}
 
@@ -9192,24 +9297,11 @@ func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 	beforeDERP := p.effectiveDERP(t)
 
 	switch op.kind {
-	case "policy", "generated-policy", "packet-policy", "packet-deny", "policy-order", "policy-duplicate", "policy-restore", "derp-policy":
-		changed, err := p.state.SetPolicy(op.doc)
-		require.NoError(t, err, "generated policy: %s", op.doc)
-		expectedChange := !bytes.Equal(p.policyDoc, op.doc)
-		require.Equal(t, expectedChange, changed)
-
-		wantRev := before.Rev()
-		if expectedChange {
-			wantRev++
-		}
-
-		require.Equal(t, wantRev, p.state.Snapshot().Rev(), "policy publication")
-		p.policy, p.policyDoc, p.packetIntent = op.policy, slices.Clone(op.doc), op.intent
-		p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(op.doc), kind: op.policy, intent: op.intent})
+	case "policy", "generated-policy", "packet-policy", "packet-deny", "policy-order", "policy-duplicate", "policy-restore", "derp-policy", "file-stage", "file-reload", "file-same", "file-comment", "file-empty", "file-missing", "file-test-failure":
+		p.inputPolicy(t, op)
 	case "invalid-policy":
-		_, err := p.state.SetPolicy([]byte(`{"grants":`))
-		require.Error(t, err)
-		require.Equal(t, before.Rev(), p.state.Snapshot().Rev(), "refused policy published")
+		op.doc, op.reject = []byte(`{"grants":`), true
+		p.inputPolicy(t, op)
 	case "user":
 		users := slices.Clone(p.world.Users)
 		users[op.user.ID-1] = op.user
@@ -9339,7 +9431,9 @@ func (p *streamPropertySystem) checkCausal(t require.TestingT, before, after *st
 	switch op.kind {
 	case "endpoints", "hostinfo", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "stale-request", "invalid-policy", "delete":
 	default:
-		return
+		if !strings.HasPrefix(op.kind, "file-") || before.Rev() != after.Rev() && op.kind != "file-comment" {
+			return
+		}
 	}
 
 	for _, viewer := range before.ListNodes().All() {
@@ -9358,6 +9452,11 @@ func (p *streamPropertySystem) checkCausal(t require.TestingT, before, after *st
 		stream.Delivered()
 		responses, err := stream.Update(after)
 		require.NoError(t, err)
+
+		if strings.HasPrefix(op.kind, "file-") || op.kind == "invalid-policy" {
+			require.Empty(t, responses, "staged, unchanged or refused file emitted a delta")
+		}
+
 		applyStreamPropertyWire(t, hub, actual, responses)
 
 		freshHub := NewHub()
@@ -9448,14 +9547,18 @@ func (p *streamPropertySystem) checkCausal(t require.TestingT, before, after *st
 // already equal an independent fresh stream. Rapid's default case and step
 // budgets bound CI work; -rapid.checks, -rapid.steps and -rapid.seed drive campaigns.
 func TestRapidStreamSystem(t *testing.T) {
-	runRapidStreamSystem(t)
+	runRapidStreamSystem(t, types.PolicyModeDB)
 }
 
 func TestRapidStreamPacketIntent(t *testing.T) {
-	runRapidStreamSystem(t, "packet-policy", "packet-deny", "policy-order", "policy-duplicate", "policy-restore", "identity", "user", "noop")
+	runRapidStreamSystem(t, types.PolicyModeDB, "packet-policy", "packet-deny", "policy-order", "policy-duplicate", "policy-restore", "identity", "user", "noop")
 }
 
-func runRapidStreamSystem(t *testing.T, kinds ...string) {
+func TestRapidStreamPolicyFiles(t *testing.T) {
+	runRapidStreamSystem(t, types.PolicyModeFile, "packet-policy", "packet-deny", "policy-order", "policy-duplicate", "policy-restore", "file-stage", "file-reload", "file-same", "file-comment", "invalid-policy", "file-empty", "file-missing", "file-test-failure", "identity", "user", "endpoints", "noop")
+}
+
+func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) {
 	t.Helper()
 
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
@@ -9463,11 +9566,14 @@ func runRapidStreamSystem(t *testing.T, kinds ...string) {
 		operations := kinds
 		audits := state.PolicyAuditFailures()
 
-		p := newStreamPropertySystem(t)
+		p := newStreamPropertySystem(t, mode)
 		if len(kinds) > 0 {
 			p.apply(t, p.drawOperation(t, "packet-policy"))
 
-			p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: p.policy, intent: p.packetIntent}}
+			if mode != types.PolicyModeFile {
+				p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: p.policy, intent: p.packetIntent}}
+			}
+
 			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
 				p.update(t, id, p.state.Snapshot(), 0)
 			}
@@ -9538,6 +9644,14 @@ func runRapidStreamSystem(t *testing.T, kinds ...string) {
 		}
 
 		if len(kinds) > 0 {
+			if mode == types.PolicyModeFile {
+				for _, operation := range []string{"file-stage", "file-reload", "file-same", "file-comment", "invalid-policy", "file-empty", "file-missing", "file-reload", "policy-restore", "file-test-failure", "policy-restore"} {
+					operations = []string{operation}
+
+					commit(t)
+				}
+			}
+
 			for _, operation := range []string{"policy-order", "policy-duplicate", "packet-deny", "policy-restore", "packet-policy", "identity"} {
 				operations = []string{operation}
 
@@ -10052,9 +10166,19 @@ func checkStreamPacketIntent(t require.TestingT, world propcheck.World, intent *
 // A fixed history keeps downstream revocation and identity checks reachable
 // even when broader generated documents stop at enabled compiler diagnostics.
 func TestStreamPacketIntentHistory(t *testing.T) {
+	runStreamPacketIntentHistory(t, types.PolicyModeDB)
+}
+
+func TestStreamPolicyFileHistory(t *testing.T) {
+	runStreamPacketIntentHistory(t, types.PolicyModeFile)
+}
+
+func runStreamPacketIntentHistory(t *testing.T, mode types.PolicyMode) {
+	t.Helper()
+
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
 	rapid.Check(t, func(t *rapid.T) {
-		p := newStreamPropertySystem(t)
+		p := newStreamPropertySystem(t, mode)
 		first := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{{
 			Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"},
 			Protocol: ipproto.TCP, First: 22, Last: 23,
@@ -10093,6 +10217,23 @@ func TestStreamPacketIntentHistory(t *testing.T) {
 				flush()
 			}
 		}
+
+		if mode == types.PolicyModeFile {
+			// Staging a distinct complete document must not change any client;
+			// only its later reload changes the active input and intent.
+			p.apply(t, streamOperation{kind: "file-stage", policy: -1, doc: second.Document(t), intent: second})
+			flush()
+			p.apply(t, p.drawOperation(t, "file-reload"))
+			flush()
+
+			for _, kind := range []string{"file-same", "file-comment", "invalid-policy", "file-reload", "file-empty", "file-reload", "file-missing", "file-reload", "file-test-failure", "file-reload", "policy-restore"} {
+				p.apply(t, p.drawOperation(t, kind))
+				flush()
+			}
+
+			p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: first.Document(t), intent: first})
+			flush()
+		}
 		// Preserve the creator while removing source and then destination user
 		// rights; both must be revoked through the consumer's cumulative filter.
 		for _, id := range []types.NodeID{1, 2} {
@@ -10101,6 +10242,17 @@ func TestStreamPacketIntentHistory(t *testing.T) {
 			n.Tags = []string{"tag:srv"}
 			p.apply(t, streamOperation{kind: "identity", node: n, before: before})
 			flush()
+
+			// Check revocation at its destination before restoration can hide
+			// a partial write; other sessions keep their generated schedule.
+			revoked := p.state.Snapshot()
+			if p.sessions[2].down {
+				p.open(t, 2, revoked, false)
+			} else {
+				p.update(t, 2, revoked, 0)
+			}
+
+			require.False(t, p.sessions[2].down, "destination 2 must complete the revoked snapshot before restoring node %d", id)
 			p.apply(t, streamOperation{kind: "identity", node: before, before: n})
 			flush()
 		}
