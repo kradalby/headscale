@@ -8874,6 +8874,7 @@ func (p *streamPropertySystem) check(t *rapid.T, snap *state.Snapshot) {
 func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *state.Snapshot, session *streamPropertySession) {
 	t.Helper()
 	checkStreamPacketIntent(t, p.world, p.packetIntent, id, session.client)
+	checkStreamNodeInputs(t, p.world, id, session.client, p.cfg.DNSConfig.BaseDomain, p.packetIntent != nil || (p.policy >= 0 && p.policy <= 2))
 
 	freshHub := NewHub()
 	responses, err := NewStream(p.cfg, freshHub, id, session.capVer).Initial(snap)
@@ -8908,17 +8909,6 @@ func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *s
 		}
 
 		if visible {
-			require.Equal(t, peer.NodeKey, wire.Key, "peer identity")
-			require.Equal(t, peer.DiscoKey, wire.DiscoKey, "peer discovery key")
-			require.True(t, slices.Equal([]string(peer.Tags), wire.Tags), "peer tags")
-
-			owner := tailcfg.UserID(types.TaggedDevicesUserID)
-			if len(peer.Tags) == 0 && peer.UserID != nil {
-				owner = tailcfg.UserID(*peer.UserID) //nolint:gosec // Fixture user IDs are 1..3.
-			}
-
-			require.Equal(t, owner, wire.User, "peer ownership")
-
 			if p.policy == 0 {
 				var primaries []netip.Prefix
 
@@ -9587,6 +9577,7 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			old := p.state.Snapshot()
 			oldWorld := p.world.Clone()
 			oldIntent := p.packetIntent
+			oldIdentityAddresses := oldIntent != nil || (p.policy >= 0 && p.policy <= 2)
 			oldDERP := p.effectiveDERP(t)
 			oldNode := old.ListNodes().At(0).ID()
 			oldHub := NewHub()
@@ -9596,6 +9587,7 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			oldClient := newPropertyClient(&tailcfg.MapResponse{})
 			applyStreamPropertyWire(t, oldHub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, oldMap)})
 			checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, oldClient)
+			checkStreamNodeInputs(t, oldWorld, oldNode, oldClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses)
 			oldHub.Close()
 
 			for range rapid.IntRange(1, 3).Draw(t, "coalesced-writes") {
@@ -9639,6 +9631,7 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			lateClient.check(t, oldClient)
 
 			checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, lateClient)
+			checkStreamNodeInputs(t, oldWorld, oldNode, lateClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses)
 
 			last = snap
 		}
@@ -10149,6 +10142,132 @@ func TestRouteWakesExitForCapabilitySource(t *testing.T) {
 	}
 
 	require.Equal(t, endpoints, client.peers[source.NodeID()].Endpoints, "exit retained stale source endpoints")
+}
+
+// Check input contracts even when fresh and incremental renders agree on the
+// same wrong output. The fixture's base domain is fixed at construction.
+// identityAddresses is true only for documents known to omit disable-ipv4.
+func checkStreamNodeInputs(t require.TestingT, world propcheck.World, viewer types.NodeID, client *propertyClient, baseDomain string, identityAddresses bool) {
+	require.NotNil(t, client.self, "viewer %d self", viewer)
+	require.Equal(t, viewer.NodeID(), client.self.ID, "self identity")
+
+	nodes := make([]*tailcfg.Node, 1, 1+len(client.peers))
+	nodes[0] = client.self
+
+	for _, id := range slices.Sorted(maps.Keys(client.peers)) {
+		peer := client.peers[id]
+		require.NotNil(t, peer, "peer %d", id)
+		require.Equal(t, id, peer.ID, "peer map identity")
+		require.NotEqual(t, viewer.NodeID(), id, "self must not appear as a peer")
+
+		nodes = append(nodes, peer)
+	}
+
+	for _, wire := range nodes {
+		input := world.Nodes[types.NodeID(wire.ID)] //nolint:gosec // Fixture node IDs are 1..255.
+		require.NotNil(t, input, "viewer %d: unexpected node %d", viewer, wire.ID)
+		require.Equal(t, input.ID.NodeID(), wire.ID, "node ID")
+		require.Equal(t, tailcfg.StableNodeID(strconv.FormatUint(uint64(input.ID), 10)), wire.StableID, "node %d stable ID", input.ID)
+
+		name := input.GivenName
+		if baseDomain != "" {
+			name += "." + baseDomain + "."
+		}
+
+		require.Equal(t, name, wire.Name, "node %d name from owned input", input.ID)
+		require.Equal(t, input.NodeKey, wire.Key, "node %d key", input.ID)
+		require.Equal(t, input.DiscoKey, wire.DiscoKey, "node %d discovery key", input.ID)
+		require.True(t, slices.Equal([]string(input.Tags), wire.Tags), "node %d tags", input.ID)
+		require.True(t, input.CreatedAt.Equal(wire.Created), "node %d Created: want %s, got %s", input.ID, input.CreatedAt, wire.Created)
+
+		var owner tailcfg.UserID
+		if len(input.Tags) > 0 {
+			owner = tailcfg.UserID(types.TaggedDevicesUserID)
+			if input.ID == viewer {
+				owner += 1 + tailcfg.UserID(input.ID) //nolint:gosec // Fixture node IDs are 1..255.
+			}
+		} else if input.UserID != nil {
+			owner = tailcfg.UserID(*input.UserID) //nolint:gosec // Fixture user IDs fit int64.
+		}
+
+		require.Equal(t, owner, wire.User, "node %d ownership", input.ID)
+
+		if input.ID == viewer {
+			require.True(t, wire.MachineAuthorized, "self authorized")
+			require.False(t, wire.Expired, "self expiry override")
+			require.Zero(t, wire.Cap, "self capability version override")
+			require.Nil(t, wire.Online, "self online override")
+			require.Nil(t, wire.LastSeen, "self last-seen override")
+		}
+
+		if identityAddresses {
+			var addresses []netip.Prefix
+
+			for _, ip := range []*netip.Addr{input.IPv4, input.IPv6} {
+				if ip != nil {
+					addresses = append(addresses, netip.PrefixFrom(*ip, ip.BitLen()))
+				}
+			}
+
+			require.ElementsMatch(t, addresses, wire.Addresses, "node %d own addresses", input.ID)
+
+			for _, prefix := range addresses {
+				require.Contains(t, wire.AllowedIPs, prefix, "node %d own identity in AllowedIPs", input.ID)
+			}
+		}
+	}
+}
+
+// Literal wire examples keep the shared checker independent of TailNode,
+// GetFQDN, ownership helpers and the fresh-render comparison.
+func TestStreamNodeInputContracts(t *testing.T) {
+	userKey := key.NodePublicFromRaw32(mem.B([]byte("01234567890123456789012345678901")))
+	tagKey := key.NodePublicFromRaw32(mem.B([]byte("12345678901234567890123456789012")))
+	userDisco := key.DiscoPublicFromRaw32(mem.B([]byte("23456789012345678901234567890123")))
+	tagDisco := key.DiscoPublicFromRaw32(mem.B([]byte("34567890123456789012345678901234")))
+	created := time.Date(2026, time.November, 15, 12, 30, 0, 0, time.FixedZone("fixture", 3600))
+	world := propcheck.World{Nodes: map[types.NodeID]*types.Node{
+		7: {
+			ID: 7, GivenName: "laptop", Hostname: "not-the-given-name", UserID: new(uint(41)),
+			NodeKey: userKey, DiscoKey: userDisco, CreatedAt: created,
+			IPv4:     new(netip.MustParseAddr("100.64.0.7")),
+			IsOnline: new(true), LastSeen: new(created), Expiry: new(time.Unix(1, 0)),
+		},
+		9: {
+			ID: 9, GivenName: "router", Hostname: "also-not-the-given-name", UserID: new(uint(41)),
+			Tags: []string{"tag:srv"}, NodeKey: tagKey, DiscoKey: tagDisco, CreatedAt: created,
+			IPv6:     new(netip.MustParseAddr("fd7a:115c:a1e0::9")),
+			IsOnline: new(false), LastSeen: new(created), Expiry: new(time.Unix(1, 0)),
+		},
+	}}
+
+	for _, tt := range []struct {
+		name, domain, userName, tagName string
+	}{
+		{"fqdn", "example.test", "laptop.example.test.", "router.example.test."},
+		{"without-base-domain", "", "laptop", "router"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			user := &tailcfg.Node{
+				ID: 7, StableID: "7", Name: tt.userName, User: 41,
+				Key: userKey, DiscoKey: userDisco, Created: time.Date(2026, time.November, 15, 11, 30, 0, 0, time.UTC),
+				Addresses:  []netip.Prefix{netip.MustParsePrefix("100.64.0.7/32")},
+				AllowedIPs: []netip.Prefix{netip.MustParsePrefix("100.64.0.7/32")},
+			}
+			tagged := &tailcfg.Node{
+				ID: 9, StableID: "9", Name: tt.tagName, User: 2147455555, Tags: []string{"tag:srv"},
+				Key: tagKey, DiscoKey: tagDisco, Created: time.Date(2026, time.November, 15, 11, 30, 0, 0, time.UTC),
+				Addresses:  []netip.Prefix{netip.MustParsePrefix("fd7a:115c:a1e0::9/128")},
+				AllowedIPs: []netip.Prefix{netip.MustParsePrefix("fd7a:115c:a1e0::9/128"), netip.MustParsePrefix("10.0.0.0/24")},
+			}
+			userSelf, taggedSelf := user.Clone(), tagged.Clone()
+			userSelf.MachineAuthorized, taggedSelf.MachineAuthorized = true, true
+			taggedSelf.User = 2147455565
+
+			checkStreamNodeInputs(t, world, 7, newPropertyClient(&tailcfg.MapResponse{Node: userSelf, Peers: []*tailcfg.Node{tagged}}), tt.domain, true)
+			checkStreamNodeInputs(t, world, 9, newPropertyClient(&tailcfg.MapResponse{Node: taggedSelf, Peers: []*tailcfg.Node{user}}), tt.domain, true)
+		})
+	}
 }
 
 // Only fully delivered sessions must reflect current intent; partial prefixes

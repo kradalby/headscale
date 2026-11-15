@@ -55,9 +55,10 @@ history. These remain enabled rather than being copied into another driver.
   not the durable policy API. The explicit file fixture uses `State.ReloadPolicy`
   as described below.
 - **Independent intent:** allow-all, deny-all and self/member policies predict
-  peer membership and tag-versus-user ownership from World. Peer keys and tags
-  are checked against input. Allow-all maps independently predict addresses,
-  subnet winners and approved exit routes. Rich policies use the shared
+  peer membership from World. `checkStreamNodeInputs` checks self and peer
+  identity, names, keys, tags, creation time and ownership against owned inputs.
+  Packet-intent and simple-policy maps independently check own addresses;
+  allow-all maps also predict subnet winners and approved exit routes. Rich policies use the shared
   structured generator, full-compile policy audits, focused incremental
   equivalence tests and fresh-render comparison; they do not have an independent
   general policy interpreter.
@@ -273,3 +274,35 @@ This tests explicit reload of complete replacements. It does not cover a file
 watcher, signal delivery, concurrent OS partial writes, crash durability,
 server restart, or a multi-file merge API. Default DB fixtures and their existing
 in-memory policy behavior remain unchanged.
+
+## Independent node projection
+
+`checkStreamNodeInputs` checks every delivered self and peer against owned
+`propcheck.World` inputs. It runs in `checkSession` after every completed
+delivery, including intermediate maps, and on retained full and late maps using
+their old World and policy-domain flag. The base domain is fixed by the fixture
+at construction. Expected names use GivenName plus that domain and a trailing
+dot; without a base domain, the name is the bare GivenName. Neither fresh
+renders nor `TailNode`, `GetFQDN` or ownership projection helpers supply the
+expected values.
+
+The contract includes numeric ID, decimal StableID, name, NodeKey, DiscoKey,
+tags, Created as an instant, and user-versus-tag ownership. Tagged peer ownership
+ignores the creator; tagged self ownership uses its isolated user ID. Self must
+remain authorized and unexpired, with zero Cap and absent Online/LastSeen.
+`TestStreamNodeInputContracts` supplies literal examples for both viewer roles,
+non-UTC creation input, expired/online input, empty/nonempty domains, separate
+IPv4-only and IPv6-only nodes, and a router with an additional subnet route.
+
+For PacketIntent documents and simple policy kinds 0–2, which have no
+disable-ipv4 attribute, exact Addresses come from owned IPv4/IPv6 and every own
+identity prefix must appear in AllowedIPs. AllowedIPs may also contain routes;
+the existing route oracle checks those separately. Rich node-attribute policies
+retain fresh-render address checks until independent attribute intent exists.
+Peer capability versions, connectivity, expiry and Hostinfo projection remain
+outside this helper; existing causal and fresh-render checks still apply.
+
+```sh
+go test -p 1 ./hscontrol/mapper -run '^TestStreamNodeInputContracts$' -count=1
+go test -p 1 ./hscontrol/mapper -run '^(TestStreamPacketIntentHistory|TestStreamPolicyFileHistory)$' -count=1 -rapid.seed=2026111562 -rapid.checks=30 -rapid.nofailfile
+```
