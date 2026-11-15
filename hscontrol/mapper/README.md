@@ -538,7 +538,11 @@ accept regardless of input rule order. `Decision` reads only those inputs and
 packet/app document. Explicit empty packet intent checks that SSH-only documents
 deny the bounded TCP/UDP probes between distinct nodes. Empty app intent also checks capability denial. Mixed
 histories carry all three intents; unrelated policy replacements clear the SSH
-metadata. Active, staged, restored, commented, reordered, duplicated and DERP-only
+metadata. `streamSSHIntent` derives empty authorization from owned documents whose
+SSH rules are absent, null or empty, so replacement still checks denial. Nonempty
+unmodeled SSH rules retain the existing audit/fresh-render checks. The fallback
+is captured before writes for retained maps and never changes policy metadata or
+input bytes. Active, staged, restored, commented, reordered, duplicated and DERP-only
 documents retain the corresponding immutable intent. Historical checks retain
 both the old World and old intent; late rendering uses `r.render(old)` plus
 `fullResponse`, because `Initial(old)` may intentionally advance to Hub's latest

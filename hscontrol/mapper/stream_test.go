@@ -8884,8 +8884,8 @@ func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *s
 	checkStreamPacketIntent(t, p.world, streamPacketIntent(p.world, p.policy, p.packetIntent), id, session.client)
 	checkStreamAppIntent(t, p.world, p.appIntent, id, session.client)
 
-	if p.sshIntent != nil {
-		propcheck.CheckSSHIntent(t, p.world, p.sshIntent, id, session.client.ssh, p.cfg.ServerURL)
+	if intent := streamSSHIntent(t, p.policyDoc, p.sshIntent); intent != nil {
+		propcheck.CheckSSHIntent(t, p.world, intent, id, session.client.ssh, p.cfg.ServerURL)
 	}
 
 	checkStreamNodeInputs(t, p.world, id, session.client, p.cfg.DNSConfig.BaseDomain, p.packetIntent != nil || (p.policy >= 0 && p.policy <= 2))
@@ -9797,7 +9797,7 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			oldWorld := p.world.Clone()
 			oldIntent := streamPacketIntent(oldWorld, p.policy, p.packetIntent)
 			oldAppIntent := p.appIntent
-			oldSSHIntent := p.sshIntent
+			oldSSHIntent := streamSSHIntent(t, p.policyDoc, p.sshIntent)
 			oldIdentityAddresses := oldIntent != nil || (p.policy >= 0 && p.policy <= 2)
 			oldDERP := p.effectiveDERP(t)
 			oldNode := old.ListNodes().At(0).ID()
@@ -10748,6 +10748,48 @@ func streamPacketIntent(world propcheck.World, kind int, explicit *propcheck.Pac
 	}
 
 	return intent
+}
+
+// A known SSH-free document means denial even when no generated intent exists.
+// Keep this derived expectation out of metadata so edits preserve original bytes.
+func streamSSHIntent(t require.TestingT, doc []byte, explicit *propcheck.SSHIntent) *propcheck.SSHIntent {
+	if explicit != nil {
+		return explicit
+	}
+
+	if len(doc) > 0 {
+		standard, err := hujson.Standardize(slices.Clone(doc))
+		require.NoError(t, err)
+
+		var fields struct {
+			SSH []json.RawMessage `json:"ssh"`
+		}
+
+		require.NoError(t, json.Unmarshal(standard, &fields))
+
+		if len(fields.SSH) > 0 {
+			return nil
+		}
+	}
+
+	return &propcheck.SSHIntent{}
+}
+
+func TestStreamSSHIntentInputs(t *testing.T) {
+	for _, doc := range []string{"", `{}`, `{"ssh":null}`, `{"ssh":[]}`, "{ // retained comment\n \"ssh\": [], }"} {
+		input := []byte(doc)
+		before := slices.Clone(input)
+		intent := streamSSHIntent(t, input, nil)
+		require.NotNil(t, intent, "known empty SSH authorization")
+		require.Empty(t, intent.Grants)
+		require.Equal(t, before, input, "owned policy bytes survive standardization")
+	}
+
+	rich := []byte(streamPropertyPolicies[3])
+	require.Nil(t, streamSSHIntent(t, rich, nil), "unmodeled SSH rules remain unmodeled")
+
+	explicit := &propcheck.SSHIntent{Grants: []propcheck.SSHGrant{{Src: propcheck.PacketSelector{User: "u1"}, Self: true, Users: []string{"root"}}}}
+	require.Same(t, explicit, streamSSHIntent(t, rich, explicit))
 }
 
 // Only fully delivered sessions must reflect current intent; partial prefixes
