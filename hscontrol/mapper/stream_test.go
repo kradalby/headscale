@@ -9925,3 +9925,47 @@ func TestStreamCausalExpiredConnectivity(t *testing.T) {
 		})
 	}
 }
+
+// An app grant to a public prefix makes an exit see its source without
+// granting the source exit traffic, so routing cannot assume symmetric peers.
+func TestRouteWakesExitForCapabilitySource(t *testing.T) {
+	cfg, s, ids := streamTestState(t, `{"grants":[{"src":["u1@"],"dst":["8.8.8.0/24"],"app":{"example.com/cap":[]}}]}`)
+	source, exit := ids[0], ids[2]
+	s.DeleteNodeFromStoreForTest(ids[1])
+
+	router := mustNode(t, s, exit).AsStruct()
+	router.ApprovedRoutes = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")}
+	router.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: slices.Clone(router.ApprovedRoutes)}
+	s.PutNodeInStoreForTest(*router)
+
+	before := s.Snapshot()
+	require.Equal(t, []types.NodeID{source}, before.ListPeerIDs(exit))
+	require.NotContains(t, before.ListPeerIDs(source), exit, "capabilities alone do not grant exit traffic")
+
+	hub := NewHub()
+	t.Cleanup(hub.Close)
+	stream := NewStream(cfg, hub, exit, capVer)
+	initial, err := stream.Initial(before)
+	require.NoError(t, err)
+
+	client := newPropertyClient(&tailcfg.MapResponse{})
+	applyStreamPropertyWire(t, hub, client, initial)
+	stream.Delivered()
+
+	endpoints := []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")}
+	require.NoError(t, s.UpdateNodeFromMapRequest(source, tailcfg.MapRequest{
+		NodeKey: mustNode(t, s, source).NodeKey(), Endpoints: endpoints,
+	}))
+	after := s.Snapshot()
+	all, wake := Route(before, after, after.Since(before))
+	_, named := wake[exit]
+	assert.True(t, all || named, "the exit must learn its capability source changed")
+
+	if all || named {
+		responses, err := stream.Update(after)
+		require.NoError(t, err)
+		applyStreamPropertyWire(t, hub, client, responses)
+	}
+
+	require.Equal(t, endpoints, client.peers[source.NodeID()].Endpoints, "exit retained stale source endpoints")
+}
