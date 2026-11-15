@@ -1,6 +1,7 @@
 package hscontrol
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -546,13 +547,33 @@ func writeMapResponse(w http.ResponseWriter, compress string, flush bool, msg *t
 	return writeMapFrame(w, flush, msg, compress == util.ZstdCompression, encodeMapResponse, nil)
 }
 
+var mapJSONBuffers = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
 // encodeMapResponse marshals msg and, when compress, zstd compresses it.
 func encodeMapResponse(msg *tailcfg.MapResponse, compress bool) ([]byte, error) {
 	if msg == &keepAlive {
 		return keepAliveFrame(compress)
 	}
 
-	jsonBody, err := mapper.Marshal(msg)
+	var (
+		jsonBody []byte
+		err      error
+	)
+
+	if compress {
+		// JSON is temporary; only the independently owned compressed bytes escape.
+		buf := mapJSONBuffers.Get().(*bytes.Buffer) //nolint:forcetypeassert // only buffers stored
+		defer func() {
+			buf.Reset()
+			mapJSONBuffers.Put(buf)
+		}()
+
+		err = mapper.MarshalTo(buf, msg)
+		jsonBody = buf.Bytes()
+	} else {
+		jsonBody, err = mapper.Marshal(msg)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("marshalling map response: %w", err)
 	}

@@ -5,6 +5,7 @@ import (
 	jsonv1 "encoding/json"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
+	"io"
 	"reflect"
 	"runtime"
 	"slices"
@@ -1275,6 +1276,12 @@ func (h *Hub) Encode(
 // made once for all the maps that carry it.
 func Marshal(resp *tailcfg.MapResponse) ([]byte, error) {
 	return jsonv2.Marshal(resp, jsonv1.DefaultOptionsV1(), nodeMarshalers)
+}
+
+// MarshalTo writes the same JSON as [Marshal] to w, which may receive partial
+// output on error. A caller with a reusable buffer avoids Marshal's output copy.
+func MarshalTo(w io.Writer, resp *tailcfg.MapResponse) error {
+	return jsonv2.MarshalWrite(w, resp, jsonv1.DefaultOptionsV1(), nodeMarshalers)
 }
 
 var (
