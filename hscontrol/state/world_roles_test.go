@@ -501,6 +501,11 @@ type churnRun struct {
 	users []types.User
 	next  types.NodeID
 	uid   uint
+
+	// aligned gives new nodes addresses of one width, so a list of them
+	// sorts alike as text and as addresses and rules from different paths
+	// share merge keys.
+	aligned bool
 }
 
 // setUsers stores the user list. While a refused document stands every
@@ -551,6 +556,11 @@ func (c *churnRun) randomNode() *types.Node {
 		IPv6:      new(netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 14: byte(id >> 8), 15: byte(id)})), //nolint:gosec // a few hundred nodes
 		IsOnline:  new(true),
 		Hostinfo:  &tailcfg.Hostinfo{},
+	}
+
+	if c.aligned {
+		n.IPv4 = new(netip.AddrFrom4([4]byte{100, 64, 1, byte(100 + id)}))                                   //nolint:gosec // fewer than 156 nodes
+		n.IPv6 = new(netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 14: 0x10, 15: byte(id)})) //nolint:gosec // fewer than 156 nodes
 	}
 
 	c.reown(n)

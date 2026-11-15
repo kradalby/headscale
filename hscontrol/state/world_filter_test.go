@@ -1,0 +1,884 @@
+package state
+
+import (
+	"cmp"
+	"fmt"
+	"math/rand/v2"
+	"net/netip"
+	"slices"
+	"sync"
+	"testing"
+
+	"github.com/juanfont/headscale/hscontrol/graph"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
+	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"tailscale.com/envknob"
+	"tailscale.com/tailcfg"
+)
+
+func (s *Snapshot) templates() *policyv2.Templates      { return s.s.Get(s.w.templates) }
+func (s *Snapshot) approvals() policyv2.SubnetApprovals { return s.s.Get(s.w.approvals) }
+
+// filterAuditOf returns s's templates, membership and compile as the
+// filter audit reads them.
+func filterAuditOf(s *Snapshot) policyv2.FilterAudit {
+	cp := s.s.Get(s.w.policy)
+	pm, _ := cp.pm.(*policyv2.PolicyManager)
+
+	return policyv2.FilterAudit{
+		Templates: s.templates(),
+		Postings:  s.postings(),
+		Approvals: s.approvals(),
+		Nodes:     s.s.Get(s.w.policyNodes).list,
+		Users:     s.s.Get(s.w.policyUsers),
+		Policy:    pm,
+		Current:   cp.err == nil,
+	}
+}
+
+// requireFilters requires every node's filter expanded from s's templates
+// and postings to equal the compile's, which the audit also checks at
+// every commit; calling it here names the mismatch.
+func requireFilters(t *testing.T, s *Snapshot, msgAndArgs ...any) policyv2.FilterReport {
+	t.Helper()
+
+	rep, err := policyv2.AuditFilters(filterAuditOf(s))
+	require.NoError(t, err, msgAndArgs...)
+
+	return rep
+}
+
+// filterRevs are the revisions at which the cells the filter audit reads
+// last changed.
+type filterRevs struct{ templates, approvals, postings, policy uint64 }
+
+func (s *Snapshot) filterRevs() filterRevs {
+	return filterRevs{
+		templates: graph.ChangedAt(s.s, s.w.templates),
+		approvals: graph.ChangedAt(s.s, s.w.approvals),
+		postings:  graph.ChangedAt(s.s, s.w.postings),
+		policy:    graph.ChangedAt(s.s, s.w.policy),
+	}
+}
+
+const filterCostPolicy = `{
+	"groups": {"group:eng": ["alice@", "carol@"]},
+	"tagOwners": {"tag:web": ["alice@"], "tag:db": ["alice@"], "tag:r": ["alice@"]},
+	"acls": [
+		{"action": "accept", "src": ["group:eng"], "dst": ["tag:web:443"]},
+		{"action": "accept", "src": ["*"], "dst": ["tag:db:5432"]},
+		{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]}
+	]}`
+
+// TestWorldFilterCostFollowsChange pins what each kind of write reaches
+// among the template and route cells, and when the filter audit runs: an
+// endpoint, Hostinfo or health write reaches neither and expands nothing;
+// a join reaches the postings, not the templates; an approval reaches the
+// approved routes; a port edit keeps the templates of the grants it does
+// not touch.
+func TestWorldFilterCostFollowsChange(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+
+	failures := PolicyAuditFailures()
+
+	users := []types.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}, {ID: 3, Name: "carol"}}
+	alice, carol := &users[0], &users[2]
+
+	web := worldNode(4, alice, "100.64.0.4")
+	web.Tags, web.UserID, web.User = []string{"tag:web"}, nil, nil
+
+	router := worldNode(5, alice, "100.64.0.5")
+	router.Tags, router.UserID, router.User = []string{"tag:r"}, nil, nil
+
+	w, err := newWorld(types.Nodes{
+		worldNode(1, alice, "100.64.0.1"),
+		worldNode(2, alice, "100.64.0.2"),
+		worldNode(3, carol, "100.64.0.3"),
+		web, router,
+	}, users, []byte(filterCostPolicy), types.DNSView{})
+	require.NoError(t, err)
+
+	start := w.snapshot()
+	requireFilters(t, start)
+	require.True(t, start.FilterAudited())
+
+	route := netip.MustParsePrefix("10.0.0.0/24")
+
+	type moves struct{ templates, approvals, postings, audited bool }
+
+	steps := []struct {
+		name  string
+		write func()
+		want  moves
+	}{
+		{"endpoint", func() {
+			w.UpdateNode(1, func(n *types.Node) { n.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")} })
+		}, moves{}},
+		{"health", func() { w.UpdateNode(5, func(n *types.Node) { n.Unhealthy = true }) }, moves{}},
+		{"announce without approval", func() {
+			w.UpdateNode(5, func(n *types.Node) { n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}} })
+		}, moves{}},
+		{"approve", func() { w.UpdateNode(5, func(n *types.Node) { n.ApprovedRoutes = []netip.Prefix{route} }) }, moves{approvals: true, audited: true}},
+		{"withdraw, still approved", func() {
+			w.UpdateNode(5, func(n *types.Node) { n.Hostinfo = &tailcfg.Hostinfo{} })
+		}, moves{audited: true}},
+		// An exit route counts only announced as well.
+		{"approve exit routes", func() {
+			w.UpdateNode(5, func(n *types.Node) {
+				n.ApprovedRoutes = append(n.ApprovedRoutes, netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"))
+			})
+		}, moves{}},
+		{"announce exit routes", func() {
+			w.UpdateNode(5, func(n *types.Node) {
+				n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")}}
+			})
+		}, moves{audited: true}},
+		{"join", func() { w.PutNode(*worldNode(6, carol, "100.64.0.6")) }, moves{postings: true, audited: true}},
+		{"leave", func() { w.DeleteNode(6) }, moves{postings: true, audited: true}},
+		{"address", func() { w.UpdateNode(2, func(n *types.Node) { n.IPv4 = new(netip.MustParseAddr("100.64.0.92")) }) }, moves{audited: true}},
+		{"tag", func() {
+			w.UpdateNode(3, func(n *types.Node) { n.Tags, n.UserID, n.User = []string{"tag:db"}, nil, nil })
+		}, moves{postings: true, audited: true}},
+		{"display name", func() {
+			users[0].DisplayName = "Alice"
+			require.NoError(t, w.SetUsers(users))
+		}, moves{}},
+		{"port edit", func() {
+			_, err := w.SetPolicy([]byte(replaceOnce(filterCostPolicy, "tag:web:443", "tag:web:8443")), noCheck)
+			require.NoError(t, err)
+		}, moves{templates: true, audited: true}},
+	}
+
+	for _, step := range steps {
+		before := w.snapshot()
+		runs := FilterAuditRuns()
+
+		step.write()
+
+		after := w.snapshot()
+
+		t.Run(step.name, func(t *testing.T) {
+			require.Equal(t, before.Rev()+1, after.Rev(), "the write is one commit")
+
+			b, a := before.filterRevs(), after.filterRevs()
+			assert.Equal(t, step.want.templates, a.templates != b.templates, "templates moved")
+			assert.Equal(t, step.want.approvals, a.approvals != b.approvals, "approved routes moved")
+			assert.Equal(t, step.want.postings, a.postings != b.postings, "postings moved")
+
+			audits := uint64(0)
+			if step.want.audited {
+				audits = 1
+			}
+
+			assert.Equal(t, audits, FilterAuditRuns()-runs, "filter audits")
+			require.True(t, after.FilterAudited(), "the verdict covers the commit")
+			requireFilters(t, after)
+		})
+	}
+
+	// The port edit kept the templates of the grants it did not touch.
+	last := w.snapshot()
+	prev := start.templates()
+	cur := last.templates()
+	require.Len(t, cur.Grants(), len(prev.Grants()))
+	assert.NotSame(t, prev.Grants()[0], cur.Grants()[0], "the edited grant")
+
+	for i := 1; i < len(cur.Grants()); i++ {
+		assert.Same(t, prev.Grants()[i], cur.Grants()[i], "grant %d kept", i)
+	}
+
+	assert.Zero(t, PolicyAuditFailures()-failures, "audit failures")
+}
+
+// filterChurnOwnRules place merged rules at a receiver's own rules, which
+// takes one of a few owners holding a self rule that reaches nothing on a
+// node: the focused churn runs them alone, with users fixed.
+var filterChurnOwnRules = []string{
+	// A receiver's own self rule that reaches nothing there (an exit node
+	// routing one family, an owner node without addresses that routes)
+	// still places the merged rule of its key.
+	`{"tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
+	  "grants": [
+		{"src": ["bob@"], "dst": ["autogroup:self"], "ip": ["tcp:22"]},
+		{"src": ["alice@"], "dst": ["autogroup:self"], "ip": ["tcp:22"]},
+		{"src": ["*"], "dst": ["*"], "ip": ["*"]},
+		{"src": ["bob@"], "dst": ["tag:a", "tag:b"], "ip": ["tcp:22"]},
+		{"src": ["alice@"], "dst": ["10.0.0.0/8", "tag:b"], "ip": ["tcp:22"]}]}`,
+	// Self rules merged at a shared rule; a rule whose destinations have
+	// no address places nothing; self over several ports.
+	`{"tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
+	  "acls": [
+		{"action": "accept", "src": ["alice@"], "dst": ["tag:a:22"]},
+		{"action": "accept", "src": ["*"], "dst": ["*:*"]},
+		{"action": "accept", "src": ["alice@"], "dst": ["autogroup:self:22"]},
+		{"action": "accept", "src": ["bob@"], "dst": ["tag:b:22"]},
+		{"action": "accept", "src": ["bob@"], "dst": ["bob@:22"]},
+		{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:22,80"]}]}`,
+}
+
+// filterChurnPolicies are the documents the filter churn switches between:
+// every way today's compile places, merges or drops a rule. Variants of
+// one document name the same selectors, so templates carry across them.
+var filterChurnPolicies = slices.Concat(filterChurnOwnRules, []string{
+	``,
+	`{"acls": []}`,
+	// Equal sources at several positions, a duplicate rule, a rule that
+	// reaches no node.
+	`{"groups": {"group:a": ["alice@", "carol@example.com"]},
+	  "tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
+	  "acls": [
+		{"action": "accept", "src": ["group:a"], "dst": ["tag:a:22"]},
+		{"action": "accept", "src": ["tag:b"], "dst": ["autogroup:member:80"]},
+		{"action": "accept", "src": ["alice@", "carol@example.com"], "dst": ["tag:b:443", "autogroup:member:443"]},
+		{"action": "accept", "src": ["group:a"], "dst": ["tag:b:22", "group:a:22"]},
+		{"action": "accept", "src": ["group:a"], "dst": ["tag:b:22"]}]}`,
+	`{"groups": {"group:a": ["alice@", "carol@example.com"]},
+	  "tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
+	  "acls": [
+		{"action": "accept", "src": ["alice@", "carol@example.com"], "dst": ["tag:b:443", "autogroup:member:443"]},
+		{"action": "accept", "src": ["group:a"], "dst": ["tag:a:2222"]},
+		{"action": "accept", "src": ["tag:b"], "dst": ["autogroup:member:80"]},
+		{"action": "accept", "src": ["group:a"], "dst": ["tag:b:22", "group:a:22"]},
+		{"action": "accept", "src": ["group:a"], "dst": ["tag:b:22"]}]}`,
+	// autogroup:self from identities and from *, mixed with other
+	// destinations.
+	`{"groups": {"group:a": ["alice@", "bob@"]},
+	  "tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
+	  "hosts": {"lan": "100.64.0.0/24"},
+	  "acls": [
+		{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]},
+		{"action": "accept", "src": ["*"], "dst": ["autogroup:self:22", "lan:22"]},
+		{"action": "accept", "src": ["bob@", "group:a"], "dst": ["autogroup:self:443", "tag:a:443"]},
+		{"action": "accept", "src": ["alice@"], "dst": ["alice@:443"]}]}`,
+	// autogroup:self from single users, which a node sharing a member's
+	// address meets.
+	`{"acls": [
+		{"action": "accept", "src": ["bob@"], "dst": ["autogroup:self:22"]},
+		{"action": "accept", "src": ["alice@", "carol@example.com"], "dst": ["autogroup:self:80", "bob@:80"]}]}`,
+	// Via, with and without the internet, and a regular rule from the
+	// same sources.
+	`{"tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
+	  "grants": [
+		{"src": ["alice@", "tag:a"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via": ["tag:b"]},
+		{"src": ["alice@", "tag:a"], "dst": ["10.0.0.0/24", "autogroup:internet"], "ip": ["tcp:22"], "via": ["tag:b"]},
+		{"src": ["alice@", "tag:a"], "dst": ["autogroup:internet"], "ip": ["*"], "via": ["tag:a", "tag:b"]},
+		{"src": ["alice@", "tag:a"], "dst": ["10.0.0.0/24"], "ip": ["*"]},
+		{"src": ["autogroup:member"], "dst": ["tag:b"], "ip": ["*"], "via": ["tag:b"], "app": {"example.com/cap/x": [{}]}}]}`,
+	// App capabilities: companions both ways, a source naming nobody,
+	// with and without ip.
+	`{"groups": {"group:a": ["alice@", "carol@example.com"]},
+	  "tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
+	  "grants": [
+		{"src": ["group:a"], "dst": ["tag:a", "tag:b"], "app": {"tailscale.com/cap/drive": [{"shares": ["*"], "access": "rw"}]}},
+		{"src": ["*"], "dst": ["*"], "app": {"tailscale.com/cap/relay": [{}]}},
+		{"src": ["autogroup:member"], "dst": ["autogroup:self"], "ip": ["tcp:22"], "app": {"tailscale.com/cap/drive": [{"shares": ["*"]}]}},
+		{"src": ["nobody@"], "dst": ["tag:a"], "app": {"example.com/cap/x": [{}]}},
+		{"src": ["group:a"], "dst": ["tag:a"], "ip": ["tcp:443", "udp:53"], "app": {"example.com/cap/y": [{"v": 1}]}}]}`,
+	// Address sources and destinations, protocols.
+	`{"groups": {"group:a": ["alice@"]},
+	  "tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
+	  "acls": [
+		{"action": "accept", "src": ["autogroup:danger-all"], "dst": ["tag:a:*"]},
+		{"action": "accept", "src": ["*"], "dst": ["autogroup:internet:*", "10.0.0.0/8:*"]},
+		{"action": "accept", "src": ["group:a", "autogroup:tagged"], "dst": ["*:22"]},
+		{"action": "accept", "proto": "udp", "src": ["group:a"], "dst": ["tag:b:53"]},
+		{"action": "accept", "src": ["*", "group:a"], "dst": ["tag:b:80"]}]}`,
+	`{"groups": {"group:a": ["alice@", "bob@"]},
+	  "tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
+	  "grants": [
+		{"src": ["group:a"], "dst": ["tag:a"], "ip": ["tcp:22", "udp:53", "icmp:*", "gre:*"]},
+		{"src": ["autogroup:member"], "dst": ["tag:a", "autogroup:self"], "ip": ["tcp:22"]},
+		{"src": ["group:a"], "dst": ["tag:b"], "ip": ["tcp:22"]}]}`,
+	// Companions of * to a tag and of identities to *.
+	`{"tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
+	  "grants": [
+		{"src": ["*"], "dst": ["tag:a"], "app": {"tailscale.com/cap/drive": [{}]}},
+		{"src": ["alice@", "tag:b"], "dst": ["*"], "app": {"tailscale.com/cap/relay": [{}]}}]}`,
+	// The internet and a public prefix through a via router, which only
+	// an exit node serves the internet for.
+	`{"tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
+	  "grants": [
+		{"src": ["alice@", "tag:a"], "dst": ["autogroup:internet", "8.8.8.0/24"], "ip": ["*"], "via": ["tag:b"]},
+		{"src": ["alice@", "tag:a"], "dst": ["8.8.8.0/24", "10.0.0.0/8"], "ip": ["tcp:443"]}]}`,
+	// One table, two prefixes for a host: kept templates, new literals.
+	`{"hosts": {"lan": "10.0.0.0/24"}, "tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
+	  "acls": [
+		{"action": "accept", "src": ["lan", "alice@"], "dst": ["tag:a:22", "lan:80"]},
+		{"action": "accept", "src": ["*"], "dst": ["lan:443"]}]}`,
+	`{"hosts": {"lan": "100.64.0.0/16"}, "tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
+	  "acls": [
+		{"action": "accept", "src": ["lan", "alice@"], "dst": ["tag:a:22", "lan:80"]},
+		{"action": "accept", "src": ["*"], "dst": ["lan:443"]}]}`,
+})
+
+// TestWorldFiltersUnderRandomChurn drives random writes of every kind the
+// filter reads, many in one commit, and requires every node's filter
+// expanded from the incrementally maintained templates and postings to
+// equal the compile's after each, the templates to equal a build from
+// scratch, and the audit to run at every commit that can change either
+// side and at no other.
+func TestWorldFiltersUnderRandomChurn(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+
+	failures := PolicyAuditFailures()
+
+	var shapes policyv2.FilterShapes
+
+	for seed := range uint64(4) {
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+			shapes.Add(filterChurn(t, rand.New(rand.NewPCG(seed, 23)), filterChurnPolicies, true)) //nolint:gosec // deterministic test input
+		})
+	}
+
+	for seed := range uint64(2) {
+		t.Run(fmt.Sprintf("own-rules/seed=%d", seed), func(t *testing.T) {
+			shapes.Add(filterChurn(t, rand.New(rand.NewPCG(seed, 29)), filterChurnOwnRules, false)) //nolint:gosec // deterministic test input
+		})
+	}
+
+	assert.Zero(t, PolicyAuditFailures()-failures, "audit failures")
+
+	t.Logf("shapes cut: %+v", shapes)
+
+	// A shape no seed reaches tests nothing.
+	for name, n := range map[string]int{
+		"exit receivers": shapes.Exit, "routed receivers": shapes.Routed, "self rules": shapes.Self,
+		"via rules": shapes.Via, "capability rules": shapes.CapGrant, "companion rules": shapes.Companion,
+		"rules with cap sources": shapes.Capped, "rules merged at a rule that does not reach the receiver": shapes.Anchored,
+		"owner nodes a self source names by address alone":           shapes.SelfByAddress,
+		"rules merged at a receiver's own rule that reaches nothing": shapes.OwnAnchored,
+	} {
+		assert.Positive(t, n, name)
+	}
+}
+
+// shareOp gives an untagged node another owner's untagged node's
+// addresses, the one case where a self source's addresses name a node its
+// membership does not.
+func (c *churnRun) shareOp(e *nodeEdit) {
+	var owned []*types.Node
+
+	for _, n := range e.All() {
+		if !n.IsTagged() && n.User != nil {
+			owned = append(owned, n)
+		}
+	}
+
+	slices.SortFunc(owned, func(a, b *types.Node) int { return cmp.Compare(a.ID, b.ID) })
+
+	for range 4 {
+		if len(owned) < 2 {
+			return
+		}
+
+		a, b := owned[c.r.IntN(len(owned))], owned[c.r.IntN(len(owned))]
+		if a.User.ID != b.User.ID {
+			n := a.Clone()
+			n.IPv4, n.IPv6 = b.IPv4, b.IPv6
+			e.Set(n.ID, n)
+
+			return
+		}
+	}
+}
+
+// familyOp gives a node one family only, or an address outside the
+// tailnet's ranges, which * does not name.
+func (c *churnRun) familyOp(e *nodeEdit) {
+	ids := make([]types.NodeID, 0, e.Len())
+	for id := range e.All() {
+		ids = append(ids, id)
+	}
+
+	if len(ids) == 0 {
+		return
+	}
+
+	slices.Sort(ids)
+
+	n := mustGet(c.t, e, ids[c.r.IntN(len(ids))]).Clone()
+	b := byte(n.ID) //nolint:gosec // a few hundred nodes
+
+	switch c.r.IntN(3) {
+	case 0:
+		n.IPv4 = nil
+		n.IPv6 = new(netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 14: 0x40, 15: b}))
+	case 1:
+		n.IPv4 = new(netip.AddrFrom4([4]byte{100, 66, 0, b}))
+		n.IPv6 = nil
+	default:
+		// Outside both of *'s ranges.
+		n.IPv4 = new(netip.AddrFrom4([4]byte{192, 168, 0, b}))
+		n.IPv6 = new(netip.AddrFrom16([16]byte{0xfd, 0x00, 15: b}))
+	}
+
+	e.Set(n.ID, n)
+}
+
+// routerOwnerOp makes a user's node a router without addresses: its own
+// self rules, to the user's other nodes, reach nothing on it, and still
+// place the merged rules of their keys.
+func (c *churnRun) routerOwnerOp(e *nodeEdit) {
+	var owned []*types.Node
+
+	for _, n := range e.All() {
+		if !n.IsTagged() && n.User != nil {
+			owned = append(owned, n)
+		}
+	}
+
+	if len(owned) == 0 {
+		return
+	}
+
+	slices.SortFunc(owned, func(a, b *types.Node) int { return cmp.Compare(a.ID, b.ID) })
+
+	n := owned[c.r.IntN(len(owned))].Clone()
+	route := netip.MustParsePrefix("10.0.0.0/24")
+	n.IPv4, n.IPv6 = nil, nil
+	n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+	n.ApprovedRoutes = []netip.Prefix{route}
+	e.Set(n.ID, n)
+}
+
+// routeOp is one random change to a node's routes, staged on e: approved
+// and announced, approved only, announced only, an exit node, or none.
+// The routes overlap each other and the tailnet's own addresses.
+func (c *churnRun) routeOp(e *nodeEdit) {
+	ids := make([]types.NodeID, 0, e.Len())
+	for id := range e.All() {
+		ids = append(ids, id)
+	}
+
+	if len(ids) == 0 {
+		return
+	}
+
+	slices.Sort(ids)
+
+	n := mustGet(c.t, e, ids[c.r.IntN(len(ids))]).Clone()
+
+	pool := []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/24"),
+		netip.MustParsePrefix("10.0.0.0/16"),
+		netip.MustParsePrefix("100.64.0.0/24"),
+		netip.MustParsePrefix("fd7a:115c:a1e0::/120"),
+		netip.MustParsePrefix("8.8.8.0/24"),
+	}
+	exits := [][]netip.Prefix{
+		{netip.MustParsePrefix("0.0.0.0/0")},
+		{netip.MustParsePrefix("::/0")},
+		{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
+	}
+
+	pick := func() []netip.Prefix {
+		var out []netip.Prefix
+
+		for _, p := range pool {
+			if c.r.IntN(3) == 0 {
+				out = append(out, p)
+			}
+		}
+
+		if c.r.IntN(3) == 0 {
+			out = append(out, exits[c.r.IntN(len(exits))]...)
+		}
+
+		return out
+	}
+
+	announced, approved := pick(), pick()
+
+	switch c.r.IntN(4) {
+	case 0:
+		approved = announced
+	case 1:
+		announced = nil
+	case 2:
+		approved = nil
+	}
+
+	if n.Hostinfo == nil {
+		n.Hostinfo = &tailcfg.Hostinfo{}
+	} else {
+		n.Hostinfo = n.Hostinfo.Clone()
+	}
+
+	n.Hostinfo.RoutableIPs = announced
+	n.ApprovedRoutes = approved
+	e.Set(n.ID, n)
+}
+
+// filterChurn drives one seed over policies; with users unset, the user
+// list stays as it starts, so the policies' user tokens keep their owners.
+func filterChurn(t *testing.T, r *rand.Rand, policies []string, users bool) policyv2.FilterShapes {
+	t.Helper()
+
+	// Addresses of one width make merges across paths come up; the family
+	// op and M1's churn, which runs this audit too, give the rest.
+	c := &churnRun{t: t, r: r, uid: 3, aligned: true}
+
+	c.users = []types.User{{Name: "alice"}, {Name: "bob"}, {Name: "carol", Email: "carol@example.com"}}
+	for i := range c.users {
+		c.users[i].ID = uint(i + 1) //nolint:gosec // three users
+	}
+
+	w, err := newWorld(nil, slices.Clone(c.users), []byte(policies[0]), types.DNSView{})
+	require.NoError(t, err)
+
+	c.w = w
+
+	for range 8 {
+		n := c.randomNode()
+		w.PutNode(*n)
+	}
+
+	kinds := map[string]int{}
+	fresh := 0
+
+	var shapes policyv2.FilterShapes
+
+	for step := range 400 {
+		runs := FilterAuditRuns()
+
+		var kind string
+
+		switch op := r.IntN(24); {
+		case op < 8:
+			w.update(func(e *nodeEdit) { kind = c.nodeOp(e) })
+		case op < 10:
+			kind = "routes"
+
+			w.update(c.routeOp)
+		case op < 11:
+			kind = "share"
+
+			w.update(func(e *nodeEdit) {
+				switch r.IntN(3) {
+				case 0:
+					c.shareOp(e)
+				case 1:
+					kind = "family"
+
+					c.familyOp(e)
+				default:
+					kind = "router owner"
+
+					c.routerOwnerOp(e)
+				}
+			})
+		case op < 13:
+			// Writes landing in one commit.
+			w.update(func(e *nodeEdit) {
+				kind = "coalesced"
+
+				for range 2 + r.IntN(3) {
+					if r.IntN(2) == 0 {
+						c.routeOp(e)
+					} else {
+						c.nodeOp(e)
+					}
+				}
+			})
+		case op < 14:
+			kind = "concurrent"
+
+			var wg sync.WaitGroup
+			for range 4 {
+				wg.Go(func() { w.update(func(e *nodeEdit) { c.nodeOp(e) }) })
+			}
+
+			wg.Wait()
+		case op < 16 && !users:
+			w.update(func(e *nodeEdit) { kind = c.nodeOp(e) })
+		case op < 16:
+			kind = "users"
+
+			switch r.IntN(3) {
+			case 0:
+				c.uid++
+				u := types.User{ID: c.uid}
+				c.randomUserFields(&u)
+				c.users = append(c.users, u)
+			case 1:
+				if len(c.users) > 0 {
+					c.randomUserFields(&c.users[r.IntN(len(c.users))])
+				}
+			default:
+				r.Shuffle(len(c.users), func(i, j int) { c.users[i], c.users[j] = c.users[j], c.users[i] })
+			}
+
+			c.setUsers()
+		case op < 21:
+			kind = "policy"
+			src := policies[r.IntN(len(policies))]
+			_, err := w.SetPolicy([]byte(src), noCheck)
+			require.NoError(t, err, "step %d: %s", step, src)
+		case op < 22:
+			kind = "refused policy"
+			src := membershipChurnRefused[r.IntN(len(membershipChurnRefused))]
+			_, err := w.SetPolicy([]byte(src), noCheck)
+			require.NoError(t, err, "step %d: %s", step, src)
+		default:
+			// Writes no filter reads: nothing may be expanded.
+			kind = "quiet"
+			before := w.snapshot()
+			ids := before.ListNodes()
+
+			if ids.Len() > 0 {
+				id := ids.At(r.IntN(ids.Len())).ID()
+				w.UpdateNode(id, func(n *types.Node) {
+					n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(r.IntN(65535)))} //nolint:gosec // small
+					n.Unhealthy = !n.Unhealthy
+				})
+			}
+
+			assert.Equal(t, runs, FilterAuditRuns(), "step %d: a quiet write ran the filter audit", step)
+			assert.Equal(t, before.filterRevs().templates, w.snapshot().filterRevs().templates, "step %d: templates moved", step)
+		}
+
+		kinds[kind]++
+
+		after := w.snapshot()
+		rep := requireFilters(t, after, "step %d (%s)", step, kind)
+		shapes.Add(rep.Shapes)
+
+		if rep.Fresh {
+			fresh++
+		}
+
+		require.True(t, after.FilterAudited(), "step %d (%s): the last change was audited", step, kind)
+
+		if kind == "join" || kind == "leave" || kind == "tag" || kind == "routes" {
+			assert.LessOrEqual(t, FilterAuditRuns()-runs, uint64(1), "step %d: one commit, one audit", step)
+		}
+	}
+
+	for _, k := range []string{"join", "leave", "tag", "owner", "address", "routes", "share", "family", "router owner", "coalesced", "concurrent", "policy", "refused policy", "quiet"} {
+		assert.Positive(t, kinds[k], "no %s write", k)
+	}
+
+	if users {
+		assert.Positive(t, kinds["users"], "no users write")
+	}
+
+	assert.Positive(t, fresh, "no step audited against a compile afresh, as a refused document makes")
+
+	t.Logf("writes: %v; shapes: %+v", kinds, shapes)
+
+	return shapes
+}
+
+// TestWorldFilterFollowsMembershipUnderRefusedPolicy pins what the
+// expansion does while a refused document stands: the last good compile
+// keeps serving, compiled against the nodes of its time, so a node joining
+// since reaches no filter it serves; the expansion follows the join under
+// the same last good policy. That is the behaviour decided for the switch:
+// freezing filters there is a quirk of the compile, not intent. The audit
+// checks the expansion against that policy compiled afresh.
+func TestWorldFilterFollowsMembershipUnderRefusedPolicy(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+
+	failures := PolicyAuditFailures()
+
+	const good = `{"acls": [{"action": "accept", "src": ["alice@"], "dst": ["alice@:22"]}]}`
+
+	users := []types.User{{ID: 1, Name: "alice"}}
+
+	w, err := newWorld(types.Nodes{worldNode(1, &users[0], "100.64.0.1")}, users, []byte(good), types.DNSView{})
+	require.NoError(t, err)
+
+	_, err = w.SetPolicy([]byte(`{"acls": [`), noCheck)
+	require.NoError(t, err)
+	require.Error(t, w.snapshot().PolicyErr(), "the document does not compile")
+
+	w.PutNode(*worldNode(2, &users[0], "100.64.0.2"))
+
+	s := w.snapshot()
+	require.Error(t, s.PolicyErr(), "still refused")
+
+	node1, ok := s.GetNode(1)
+	require.True(t, ok)
+
+	served, err := s.Policy().FilterForNode(node1)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"100.64.0.1"}, served[0].SrcIPs, "the served filter is frozen at the last good compile's nodes")
+
+	rep := requireFilters(t, s)
+	assert.True(t, rep.Fresh, "audited against the last good document compiled afresh")
+	require.True(t, s.FilterAudited())
+
+	x, err := policyv2.NewExpansion(s.templates(), s.postings(), s.approvals().Strings(), s.GetNode)
+	require.NoError(t, err)
+
+	expanded := x.FilterForNode(node1)
+	assert.Equal(t, []string{"100.64.0.1", "100.64.0.2"}, expanded[0].SrcIPs, "the expansion follows the join under the last good policy")
+
+	assert.Zero(t, PolicyAuditFailures()-failures)
+}
+
+// shapeNode is a node of the shapes test: owner (nil for tagged), one or
+// both addresses, tags, routes announced and approved, routes approved only.
+func shapeNode(id types.NodeID, user *types.User, v4, v6 string, tags []string, routes, only []string) *types.Node {
+	n := worldNode(id, &types.User{}, "100.64.0.1")
+	n.IPv4, n.UserID, n.User, n.Tags = nil, nil, nil, tags
+	n.GivenName = fmt.Sprintf("n%d", id)
+
+	if user != nil {
+		n.User, n.UserID = user, &user.ID
+	}
+
+	if v4 != "" {
+		n.IPv4 = new(netip.MustParseAddr(v4))
+	}
+
+	if v6 != "" {
+		n.IPv6 = new(netip.MustParseAddr(v6))
+	}
+
+	for _, r := range routes {
+		p := netip.MustParsePrefix(r)
+		n.Hostinfo.RoutableIPs = append(n.Hostinfo.RoutableIPs, p)
+		n.ApprovedRoutes = append(n.ApprovedRoutes, p)
+	}
+
+	for _, r := range only {
+		n.ApprovedRoutes = append(n.ApprovedRoutes, netip.MustParsePrefix(r))
+	}
+
+	return n
+}
+
+// TestWorldFilterShapes runs, through the world's own cells and writes,
+// the shapes whose mistakes the random churn reaches rarely or not at all:
+// each world is audited as built and after one write that moves the shape.
+// The audit holds the expansion to the compile; the shapes are those of
+// TestExpanderQuirks, reached here incrementally.
+func TestWorldFilterShapes(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+
+	failures := PolicyAuditFailures()
+
+	users := []types.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
+	alice, bob := &users[0], &users[1]
+
+	const owners = `"tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]}`
+
+	tests := []struct {
+		name   string
+		policy string
+		nodes  types.Nodes
+		write  func(w *world)
+	}{
+		{
+			// A tag whose members have no address places nothing.
+			name: "no-address-no-place",
+			policy: `{` + owners + `, "acls": [
+				{"action": "accept", "src": ["alice@"], "dst": ["tag:a:22"]},
+				{"action": "accept", "src": ["*"], "dst": ["*:*"]},
+				{"action": "accept", "src": ["alice@"], "dst": ["alice@:22"]}]}`,
+			nodes: types.Nodes{
+				shapeNode(1, alice, "100.64.0.1", "", nil, nil, nil),
+				shapeNode(2, nil, "", "", []string{"tag:a"}, nil, nil),
+			},
+			write: func(w *world) { w.PutNode(*shapeNode(3, alice, "100.64.0.3", "", nil, nil, nil)) },
+		},
+		{
+			// Unannounced exit routes make no exit node.
+			name: "unannounced-exit",
+			policy: `{` + owners + `, "acls": [
+				{"action": "accept", "src": ["alice@"], "dst": ["autogroup:self:22"]},
+				{"action": "accept", "src": ["*"], "dst": ["*:*"]},
+				{"action": "accept", "src": ["alice@"], "dst": ["tag:b:22"]}]}`,
+			nodes: types.Nodes{
+				shapeNode(1, alice, "100.64.0.1", "", nil, nil, nil),
+				shapeNode(2, nil, "100.64.0.30", "", []string{"tag:b"}, nil, []string{"0.0.0.0/0", "::/0"}),
+			},
+			write: func(w *world) { w.PutNode(*shapeNode(3, alice, "100.64.0.3", "", nil, nil, nil)) },
+		},
+		{
+			// Via takes announced approvals only.
+			name: "via-unannounced",
+			policy: `{` + owners + `, "grants": [
+				{"src": ["alice@"], "dst": ["100.64.0.0/24"], "ip": ["*"], "via": ["tag:b"]}]}`,
+			nodes: types.Nodes{
+				shapeNode(1, alice, "100.64.0.1", "", nil, nil, nil),
+				shapeNode(2, nil, "100.64.0.11", "", []string{"tag:b"}, nil, []string{"100.64.0.0/24"}),
+			},
+			write: func(w *world) { w.PutNode(*shapeNode(3, alice, "100.64.0.3", "", nil, nil, nil)) },
+		},
+		{
+			// * as a self source names only nodes inside its ranges.
+			name:   "self-wildcard-out-of-range",
+			policy: `{"acls": [{"action": "accept", "src": ["*"], "dst": ["autogroup:self:22"]}]}`,
+			nodes: types.Nodes{
+				shapeNode(1, alice, "100.64.0.1", "", nil, nil, nil),
+				shapeNode(2, alice, "192.168.0.2", "", nil, nil, nil),
+			},
+			write: func(w *world) { w.PutNode(*shapeNode(3, alice, "192.168.0.3", "fd00::3", nil, nil, nil)) },
+		},
+		{
+			// * next to an identity source adds the approved routes.
+			name:   "wildcard-with-identity",
+			policy: `{` + owners + `, "acls": [{"action": "accept", "src": ["*", "alice@"], "dst": ["tag:a:22"]}]}`,
+			nodes: types.Nodes{
+				shapeNode(1, alice, "100.64.0.1", "", nil, nil, nil),
+				shapeNode(2, nil, "100.64.0.10", "", []string{"tag:a"}, nil, nil),
+				shapeNode(3, nil, "100.64.0.20", "", []string{"tag:b"}, []string{"10.0.0.0/24"}, nil),
+			},
+			write: func(w *world) {
+				w.UpdateNode(3, func(n *types.Node) { n.ApprovedRoutes = append(n.ApprovedRoutes, netip.MustParsePrefix("10.1.0.0/24")) })
+			},
+		},
+		{
+			// An exit node routing one family: bob's self rule reaches
+			// nothing there and still places the merged rule.
+			name: "own-rule-on-exit",
+			policy: `{` + owners + `, "grants": [
+				{"src": ["bob@"], "dst": ["autogroup:self"], "ip": ["tcp:22"]},
+				{"src": ["*"], "dst": ["*"], "ip": ["*"]},
+				{"src": ["bob@"], "dst": ["tag:b"], "ip": ["tcp:22"]}]}`,
+			nodes: types.Nodes{
+				shapeNode(1, bob, "", "fd7a:115c:a1e0::2", nil, nil, nil),
+				shapeNode(2, nil, "100.64.0.30", "fd7a:115c:a1e0::1e", []string{"tag:b"}, []string{"0.0.0.0/0"}, nil),
+			},
+			write: func(w *world) {
+				w.UpdateNode(2, func(n *types.Node) {
+					n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}}
+				})
+			},
+		},
+		{
+			// An owner node without addresses that routes.
+			name: "own-rule-on-addressless-router",
+			policy: `{"acls": [
+				{"action": "accept", "src": ["alice@"], "dst": ["autogroup:self:22"]},
+				{"action": "accept", "src": ["*"], "dst": ["*:*"]},
+				{"action": "accept", "src": ["alice@"], "dst": ["10.0.0.0/24:22"]}]}`,
+			nodes: types.Nodes{
+				shapeNode(1, alice, "100.64.0.1", "", nil, nil, nil),
+				shapeNode(2, alice, "", "", nil, []string{"10.0.0.0/24"}, nil),
+			},
+			write: func(w *world) { w.PutNode(*shapeNode(3, bob, "100.64.0.3", "", nil, nil, nil)) },
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := newWorld(tc.nodes, users, []byte(tc.policy), types.DNSView{})
+			require.NoError(t, err)
+
+			requireFilters(t, w.snapshot(), "as built")
+			require.True(t, w.snapshot().FilterAudited())
+
+			tc.write(w)
+
+			requireFilters(t, w.snapshot(), "after the write")
+			require.True(t, w.snapshot().FilterAudited())
+		})
+	}
+
+	assert.Zero(t, PolicyAuditFailures()-failures, "audit failures")
+}

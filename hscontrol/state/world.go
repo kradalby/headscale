@@ -84,7 +84,12 @@ var (
 	policyAuditFailures atomic.Uint64
 	policyAuditRuns     atomic.Uint64
 	membershipAuditRuns atomic.Uint64
+	filterAuditRuns     atomic.Uint64
 )
+
+// FilterAuditRuns counts the filter audits that ran, so a test can prove
+// the audit is wired; their failures count in [PolicyAuditFailures].
+func FilterAuditRuns() uint64 { return filterAuditRuns.Load() }
 
 // MembershipAuditRuns counts the membership audits that ran, so a test
 // can prove the audit is wired; their failures count in
@@ -268,8 +273,17 @@ type world struct {
 	roles     graph.Derived[policyv2.Roles]
 	postings  graph.Derived[policyv2.Postings]
 
-	// membershipAudit is set, with auditing, only under the policy audit.
+	// The filter's other half, read only by the policy audit until the
+	// filter moves onto it: the policy's rules as templates naming
+	// selectors, which only a document edit reaches; and the approved
+	// subnet routes a * source adds, which only an approval reaches.
+	templates graph.Derived[*policyv2.Templates]
+	approvals graph.Derived[policyv2.SubnetApprovals]
+
+	// membershipAudit and filterAudit are set, with auditing, only under
+	// the policy audit.
 	membershipAudit graph.Derived[membershipAudit]
+	filterAudit     graph.Derived[filterAudit]
 	auditing        bool
 }
 
@@ -459,6 +473,16 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 	})
 	w.postings = graph.NewDerived(g, "postings", policyv2.Postings.Same,
 		func(s *graph.Snapshot, prev policyv2.Postings) policyv2.Postings { return prev.Update(s.Get(w.roles)) })
+	w.templates = graph.NewDerived(g, "templates", graph.Same[*policyv2.Templates],
+		func(s *graph.Snapshot, prev *policyv2.Templates) *policyv2.Templates {
+			return policyv2.BuildTemplates(prev, s.Get(w.selectors))
+		})
+	// From the nodes, not the policy's list: a list is rebuilt per change
+	// and a join would walk every node's routes.
+	w.approvals = graph.NewDerived(g, "subnet-approvals", policyv2.SubnetApprovals.Same,
+		func(s *graph.Snapshot, prev policyv2.SubnetApprovals) policyv2.SubnetApprovals {
+			return prev.Update(s.Get(w.nodes))
+		})
 
 	// Registered only under the audit, so once, here, where the compile
 	// audits read the knob at every compile: a derived cell is recomputed
@@ -470,6 +494,7 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 		w.auditing = true
 		w.membershipAudit = graph.NewDerived(g, "membership-audit",
 			func(membershipAudit, membershipAudit) bool { return true }, w.auditMembership)
+		w.filterAudit = graph.NewDerived(g, "filter-audit", func(filterAudit, filterAudit) bool { return true }, w.auditFilters)
 	}
 
 	snap, err := g.Update(func(*graph.Tx) error { return nil })
@@ -575,6 +600,66 @@ func (s *Snapshot) MembershipAudited() bool {
 	}
 
 	return s.s.Get(s.w.membershipAudit).rev == last
+}
+
+// filterAudit is the revision the filter audit last checked, and the
+// templates it last found equal to a build from scratch.
+type filterAudit struct {
+	rev       uint64
+	templates *policyv2.Templates
+}
+
+// auditFilters checks, at every commit that changes the compile, its users
+// or node list, the templates, the postings or the approved routes, that
+// every node's filter expanded from templates and postings equals the
+// compile's. It reads the policy's node list, not the nodes: no input of
+// either side changes on an endpoint or health write, so neither does the
+// verdict, and the audit costs nothing there.
+func (w *world) auditFilters(s *graph.Snapshot, prev filterAudit) filterAudit {
+	filterAuditRuns.Add(1)
+
+	cp := s.Get(w.policy)
+	pm, _ := cp.pm.(*policyv2.PolicyManager)
+	templates := s.Get(w.templates)
+
+	_, err := policyv2.AuditFilters(policyv2.FilterAudit{
+		Templates: templates,
+		Postings:  s.Get(w.postings),
+		Approvals: s.Get(w.approvals),
+		Nodes:     s.Get(w.policyNodes).list,
+		Users:     s.Get(w.policyUsers),
+		Policy:    pm,
+		Current:   cp.err == nil,
+		// A build from scratch costs the policy's size; a node write
+		// leaves the templates it checked as they were.
+		TemplatesAudited: prev.templates == templates,
+	})
+	if err != nil {
+		policyAuditFailures.Add(1)
+		log.Error().Err(err).Msg("policy audit: filter")
+
+		templates = nil
+	}
+
+	return filterAudit{rev: s.Rev(), templates: templates}
+}
+
+// FilterAudited reports, for tests, whether the filter audit checked s at
+// the last commit that changed what it reads: false without the audit.
+func (s *Snapshot) FilterAudited() bool {
+	if !s.w.auditing {
+		return false
+	}
+
+	last := uint64(0)
+	for _, rev := range []uint64{
+		graph.ChangedAt(s.s, s.w.policy), graph.ChangedAt(s.s, s.w.policyUsers), graph.ChangedAt(s.s, s.w.policyNodes),
+		graph.ChangedAt(s.s, s.w.templates), graph.ChangedAt(s.s, s.w.postings), graph.ChangedAt(s.s, s.w.approvals),
+	} {
+		last = max(last, rev)
+	}
+
+	return s.s.Get(s.w.filterAudit).rev == last
 }
 
 // derivePeers is the peers cell: the peer classes of the compiled policy
