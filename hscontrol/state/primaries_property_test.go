@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/graph"
-	"github.com/juanfont/headscale/hscontrol/internal/propcheck"
+	"github.com/juanfont/headscale/hscontrol/propcheck"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"pgregory.net/rapid"
 	"tailscale.com/envknob"

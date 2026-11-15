@@ -1,6 +1,7 @@
 package mapper
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,11 +25,14 @@ import (
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/graph"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
+	"github.com/juanfont/headscale/hscontrol/propcheck"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go4.org/mem"
 	"gorm.io/gorm"
+	"pgregory.net/rapid"
 	"tailscale.com/envknob"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
@@ -7723,4 +7727,1990 @@ func TestRoutedCandidatesAfterElectionCollection(t *testing.T) {
 	got := st.r.routedCandidates(snap, mustNode(t, s, st.nodeID), st.r.lastKey, false)
 	want := []tailcfg.NodeID{winner.NodeID(), streams[10].nodeID.NodeID()}
 	require.ElementsMatch(t, want, got, "collected history must include exactly the losing and gaining routers")
+}
+
+type hubModelSession struct {
+	session   *Session
+	stream    *Stream
+	token     uint64
+	stops     int
+	wantStops int
+	pending   *sentView
+	wake      bool
+	pings     []*tailcfg.PingRequest
+}
+
+// TestHubRapidLifecycle models what a client might hold, without the hub's
+// shared slices or folding. Only a confirmed view at least as new as every
+// attempted view may discard possible peers. TTL expiry and deletion are the
+// other reset points; capacity eviction is tested separately below.
+func TestHubRapidLifecycle(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		h := NewHub()
+		defer h.Close()
+
+		now := time.Unix(1, 0)
+		h.now = func() time.Time { return now }
+
+		var sessions []*hubModelSession
+
+		model := newPeerHistoryModel(maxConcurrentMapSessionsPerNode, peerHistoryTTL)
+		current := sentView{rev: 1}
+		views := [][]types.NodeID{nil}
+
+		var reads [][2][]types.NodeID
+
+		live := func(id types.NodeID) []*hubModelSession {
+			var out []*hubModelSession
+
+			for _, s := range sessions {
+				if model.Live(s.token) && s.session.NodeID == id {
+					out = append(out, s)
+				}
+			}
+
+			return out
+		}
+		pick := func(t *rapid.T) *hubModelSession {
+			if len(sessions) == 0 {
+				t.Skip("no admitted session yet")
+			}
+
+			return sessions[rapid.IntRange(0, len(sessions)-1).Draw(t, "session")]
+		}
+		node := func(t *rapid.T) types.NodeID { return types.NodeID(rapid.Uint64Range(1, 3).Draw(t, "node")) }
+
+		t.Repeat(map[string]func(*rapid.T){
+			"join": func(t *rapid.T) {
+				id := node(t)
+
+				token := uint64(len(sessions) + 1)
+				for _, evicted := range model.Join(token, id, now) {
+					sessions[evicted-1].wantStops++
+				}
+
+				s := &hubModelSession{token: token}
+				s.session = h.Join(id, func() { s.stops++ })
+				require.NotNil(t, s.session)
+				s.stream = &Stream{hub: h, nodeID: id}
+				s.stream.Attach(s.session)
+				sessions = append(sessions, s)
+			},
+			"leave": func(t *rapid.T) {
+				s := pick(t)
+				require.Equal(t, model.Leave(s.token, now), h.Leave(s.session))
+			},
+			"revision": func(t *rapid.T) {
+				current.rev++
+				if rapid.Bool().Draw(t, "restoreView") {
+					current.ids = rapid.SampledFrom(views).Draw(t, "oldView")
+				} else {
+					current.ids = hubRapidView(t)
+					views = append(views, current.ids)
+				}
+			},
+			"attempt": func(t *rapid.T) {
+				s := pick(t)
+				if s.pending != nil {
+					t.Skip("a stream finishes its write before rendering again")
+				}
+
+				v := current
+				s.pending = &v
+				s.stream.pending = &v
+				h.mayHavePeers(s.session, s.session.NodeID, v)
+				model.Attempt(s.token, v.rev, v.ids)
+			},
+			"deliver": func(t *rapid.T) {
+				s := pick(t)
+				if s.pending != nil {
+					model.Delivered(s.token, s.pending.rev, s.pending.ids)
+				}
+
+				s.stream.Delivered()
+				s.pending = nil
+				require.Nil(t, s.stream.pending)
+			},
+			"forget": func(t *rapid.T) {
+				id := node(t)
+				for _, token := range model.Forget(id) {
+					sessions[token-1].wantStops++
+				}
+
+				h.forget(id)
+			},
+			"clock": func(t *rapid.T) {
+				now = now.Add(rapid.SampledFrom([]time.Duration{0, time.Nanosecond, peerHistoryTTL - time.Nanosecond, peerHistoryTTL}).Draw(t, "elapsed"))
+				if rapid.Bool().Draw(t, "sweep") {
+					model.Expire(now)
+					h.expireHistory()
+				}
+			},
+			"wake": func(t *rapid.T) {
+				id, all := node(t), rapid.Bool().Draw(t, "all")
+				h.wake(all, map[types.NodeID]struct{}{id: {}})
+
+				for _, s := range sessions {
+					if model.Live(s.token) && (all || s.session.NodeID == id) {
+						s.wake = true
+					}
+				}
+			},
+			"ping": func(t *rapid.T) {
+				id := node(t)
+				for range rapid.IntRange(1, 12).Draw(t, "burst") {
+					pr := &tailcfg.PingRequest{URL: "http://example.test/ping"}
+					accepted := false
+
+					for _, s := range live(id) {
+						if len(s.pings) < 8 {
+							s.pings = append(s.pings, pr)
+							accepted = true
+						}
+					}
+
+					require.Equal(t, accepted, h.Ping(id, pr))
+				}
+			},
+			"drain": func(t *rapid.T) {
+				s := pick(t)
+				if s.wake {
+					select {
+					case <-s.session.Wakes():
+					default:
+						t.Fatal("missing wake")
+					}
+
+					s.wake = false
+				}
+
+				for _, pr := range s.pings {
+					select {
+					case got := <-s.session.Pings():
+						require.Same(t, pr, got)
+					default:
+						t.Fatal("missing ping")
+					}
+				}
+
+				s.pings = nil
+			},
+			"": func(t *rapid.T) {
+				connected := map[types.NodeID]int{}
+
+				for id := types.NodeID(1); id <= 3; id++ {
+					if n := len(live(id)); n > 0 {
+						connected[id] = n
+					}
+
+					require.Equal(t, connected[id] > 0, h.IsConnected(id))
+					require.Equal(t, model.HasHistory(id), h.HasPeerHistoryForTest(id), "node %d", id)
+					want := model.Possible(id)
+					got := h.lastPeers(id)
+					require.True(t, slices.Equal(want, got), "node %d: want %v, got %v", id, want, got)
+					reads = append(reads, [2][]types.NodeID{got, slices.Clone(got)})
+				}
+
+				require.Equal(t, connected, h.Connected())
+
+				for _, s := range sessions {
+					require.Equal(t, !model.Live(s.token), s.session.left)
+					require.Equal(t, s.wantStops, s.stops)
+					require.Equal(t, s.wake, len(s.session.Wakes()) == 1)
+					require.Len(t, s.session.Pings(), len(s.pings))
+				}
+
+				for _, read := range reads {
+					require.Equal(t, read[1], read[0], "a retained peer view changed")
+				}
+
+				hubRapidAccounting(t, h)
+			},
+		})
+
+		for _, token := range model.Close() {
+			sessions[token-1].wantStops++
+		}
+
+		h.Close()
+		require.Empty(t, model.Close())
+		h.Close()
+		require.Empty(t, h.Connected())
+		require.Nil(t, h.Join(1, func() { t.Fatal("rejected join called stop") }))
+		require.False(t, h.Ping(1, &tailcfg.PingRequest{}))
+
+		select {
+		case <-h.Done():
+		default:
+			t.Fatal("closed hub did not signal Done")
+		}
+
+		for _, s := range sessions {
+			require.Equal(t, s.wantStops, s.stops)
+			before := slices.Clone(h.lastPeers(s.session.NodeID))
+			s.stream.Delivered()
+			h.mayHavePeers(s.session, s.session.NodeID, current)
+			require.True(t, slices.Equal(before, h.lastPeers(s.session.NodeID)))
+		}
+	})
+}
+
+func hubRapidView(t *rapid.T) []types.NodeID {
+	ids := rapid.SliceOfNDistinct(rapid.Uint64Range(10, 30), 0, 8, func(id uint64) uint64 { return id }).Draw(t, "peers")
+
+	view := make([]types.NodeID, len(ids), len(ids)+rapid.IntRange(0, 3).Draw(t, "spareCapacity"))
+	for i, id := range ids {
+		view[i] = types.NodeID(id)
+	}
+
+	slices.Sort(view)
+
+	return view
+}
+
+// Recount storage from the histories, without using the maintained counters,
+// linked list, holdView, foldedCost, or mergeViews.
+func hubRapidAccounting(t *rapid.T, h *Hub) {
+	t.Helper()
+
+	cost := len(h.offlineAt)
+	refs := map[viewKey]int{}
+	arrays := map[*types.NodeID]int{}
+
+	for id, v := range h.sentPeers {
+		require.LessOrEqual(t, len(v.attempts), maxPeerAttempts)
+
+		if _, offline := h.offlineAt[id]; offline {
+			for _, ids := range append([][]types.NodeID{v.ids}, v.attempts...) {
+				if len(ids) > 0 {
+					arrays[&ids[0]] = cap(ids)
+					refs[viewKey{first: &ids[0], n: len(ids)}]++
+				}
+			}
+		} else if v.folded {
+			cost += cap(v.ids)
+		}
+	}
+
+	for _, capacity := range arrays {
+		cost += capacity
+	}
+
+	require.Equal(t, refs, h.views)
+	require.Equal(t, cost, h.retained)
+	require.LessOrEqual(t, cost, h.maxHistoryIDs)
+	require.Equal(t, len(h.offlineAt), h.offline.Len())
+}
+
+// The FIFO oracle counts view identities supplied by the generator, not the
+// hub's counters or backing-array keys. Empty histories still cost one entry.
+func TestHubRapidOfflineCapacity(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		h := NewHub()
+		defer h.Close()
+
+		h.now = func() time.Time { return time.Unix(1, 0) }
+		h.maxHistoryIDs = rapid.IntRange(0, 60).Draw(t, "limit")
+		views := [][]types.NodeID{nil, hubRapidView(t), hubRapidView(t), hubRapidView(t)}
+
+		type entry struct {
+			node types.NodeID
+			view int
+		}
+
+		var offline []entry
+
+		cost := func() int {
+			total := len(offline)
+
+			seen := map[int]bool{}
+			for _, e := range offline {
+				if !seen[e.view] && len(views[e.view]) > 0 {
+					total += cap(views[e.view])
+					seen[e.view] = true
+				}
+			}
+
+			return total
+		}
+
+		count := rapid.IntRange(1, 30).Draw(t, "nodes")
+		for i := range count {
+			id := types.NodeID(i + 1)
+			view := rapid.IntRange(0, len(views)-1).Draw(t, "view")
+			session := h.Join(id, func() {})
+			v := sentView{ids: views[view], rev: 1}
+			h.mayHavePeers(session, id, v)
+
+			if rapid.Bool().Draw(t, "confirmed") {
+				stream := &Stream{hub: h, nodeID: id, sess: session, pending: &v}
+				stream.Delivered()
+			}
+
+			if rapid.Bool().Draw(t, "overlap") {
+				other := h.Join(id, func() {})
+				require.True(t, h.Leave(session))
+				require.Equal(t, cost(), h.retained, "history is still online")
+
+				session = other
+			}
+
+			require.False(t, h.Leave(session))
+			require.False(t, h.Leave(session))
+
+			offline = append(offline, entry{node: id, view: view})
+			for cost() > h.maxHistoryIDs {
+				offline = offline[1:]
+			}
+
+			for old := types.NodeID(1); old <= id; old++ {
+				index := slices.IndexFunc(offline, func(e entry) bool { return e.node == old })
+				require.Equal(t, index >= 0, h.HasPeerHistoryForTest(old), "node %d", old)
+
+				if index >= 0 {
+					require.True(t, slices.Equal(views[offline[index].view], h.lastPeers(old)))
+				}
+			}
+
+			require.Equal(t, cost(), h.retained)
+			hubRapidAccounting(t, h)
+		}
+		// Removing shared holders must release a backing array only after the last.
+		for _, e := range slices.Clone(offline) {
+			h.forget(e.node)
+
+			offline = offline[1:]
+
+			require.Equal(t, cost(), h.retained)
+			hubRapidAccounting(t, h)
+		}
+
+		require.Empty(t, h.sentPeers)
+	})
+}
+
+func TestHubRapidConnectedCapacity(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		h := NewHub()
+		defer h.Close()
+
+		h.maxHistoryIDs = rapid.IntRange(0, 24).Draw(t, "limit")
+		keeper := h.Join(1, func() {})
+
+		count := rapid.IntRange(10, 60).Draw(t, "attempts")
+		possible := make([]types.NodeID, 0, count)
+		unfolded := 0
+
+		for i := range count {
+			// A second connection keeps the node online while each failed writer
+			// leaves. Each new peer disappears before the next attempted view.
+			s := h.Join(1, func() {})
+			peer := types.NodeID(i + 100)
+			v := sentView{ids: []types.NodeID{peer}, rev: uint64(i + 1)}
+			h.mayHavePeers(s, 1, v)
+
+			possible = append(possible, peer)
+
+			unfolded++
+			if unfolded > maxPeerAttempts {
+				unfolded = 0
+
+				if len(possible) > h.maxHistoryIDs {
+					possible = nil
+				}
+			}
+
+			require.True(t, slices.Equal(possible, h.lastPeers(1)))
+			require.True(t, h.Leave(s))
+			hubRapidAccounting(t, h)
+		}
+
+		require.False(t, h.Leave(keeper))
+		hubRapidAccounting(t, h)
+	})
+}
+
+func TestHubRapidExpiryBoundary(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		h := NewHub()
+		defer h.Close()
+
+		now := time.Unix(1, 0)
+		h.now = func() time.Time { return now }
+		model := newPeerHistoryModel(maxConcurrentMapSessionsPerNode, peerHistoryTTL)
+		view := hubRapidView(t)
+
+		model.Join(1, 1, now)
+		s := h.Join(1, func() {})
+
+		model.Attempt(1, 1, view)
+		h.mayHavePeers(s, 1, sentView{ids: view, rev: 1})
+		require.Equal(t, model.Leave(1, now), h.Leave(s))
+		now = now.Add(peerHistoryTTL - time.Nanosecond)
+		// A repeated Leave must not extend the original offline deadline.
+		require.Equal(t, model.Leave(1, now), h.Leave(s))
+		h.expireHistory()
+		model.Expire(now)
+		require.True(t, h.HasPeerHistoryForTest(1))
+
+		if rapid.Bool().Draw(t, "reconnect") {
+			model.Join(2, 1, now)
+			s = h.Join(1, func() {})
+			require.True(t, slices.Equal(model.Possible(1), h.lastPeers(1)))
+
+			now = now.Add(2 * peerHistoryTTL)
+
+			h.expireHistory()
+			model.Expire(now)
+			require.True(t, h.HasPeerHistoryForTest(1), "online history does not expire")
+			require.Equal(t, model.Leave(2, now), h.Leave(s))
+			now = now.Add(peerHistoryTTL - time.Nanosecond)
+		}
+
+		now = now.Add(time.Nanosecond)
+		if rapid.Bool().Draw(t, "lazyExpiry") {
+			model.Join(3, 1, now)
+			h.Join(1, func() {})
+		} else {
+			model.Expire(now)
+			h.expireHistory()
+		}
+
+		require.False(t, model.HasHistory(1))
+		require.False(t, h.HasPeerHistoryForTest(1))
+		hubRapidAccounting(t, h)
+	})
+}
+
+// Barriers put a completion after retirement and optional readmission. There is
+// no claim about scheduler-dependent ordering between concurrent operations.
+func TestHubRapidRetiredCompletion(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		h := NewHub()
+		defer h.Close()
+
+		model := newPeerHistoryModel(maxConcurrentMapSessionsPerNode, peerHistoryTTL)
+		now := time.Unix(1, 0)
+		model.Join(1, 1, now)
+		s := h.Join(1, func() {})
+		v := sentView{ids: hubRapidView(t), rev: 1}
+		h.mayHavePeers(s, 1, v)
+		model.Attempt(1, 1, v.ids)
+		stream := &Stream{hub: h, nodeID: 1, sess: s, pending: &v}
+
+		mode := rapid.SampledFrom([]string{"leave", "forget", "close", "admission"}).Draw(t, "retire")
+		switch mode {
+		case "leave":
+			model.Leave(1, now)
+			h.Leave(s)
+		case "forget":
+			model.Forget(1)
+			h.forget(1)
+		case "close":
+			model.Close()
+			h.Close()
+		case "admission":
+			for token := uint64(2); token <= uint64(maxConcurrentMapSessionsPerNode+1); token++ {
+				model.Join(token, 1, now)
+				h.Join(1, func() {})
+			}
+		}
+
+		if mode != "close" {
+			model.Join(10, 1, now)
+			fresh := h.Join(1, func() {})
+
+			model.Attempt(10, 2, nil)
+			model.Delivered(10, 2, nil)
+			h.mayHavePeers(fresh, 1, sentView{rev: 2})
+			(&Stream{hub: h, nodeID: 1, sess: fresh, pending: &sentView{rev: 2}}).Delivered()
+		}
+
+		release, done := make(chan struct{}), make(chan struct{})
+		go func() {
+			<-release
+			stream.Delivered()
+			h.mayHavePeers(s, 1, v)
+			close(done)
+		}()
+
+		model.Delivered(1, 1, v.ids)
+		model.Attempt(1, 1, v.ids)
+		close(release)
+		<-done
+		require.False(t, model.Live(1))
+		require.Equal(t, model.HasHistory(1), h.HasPeerHistoryForTest(1))
+		require.True(t, slices.Equal(model.Possible(1), h.lastPeers(1)))
+	})
+}
+
+func TestPeerHistoryModelOwnership(t *testing.T) {
+	now := time.Unix(1, 0)
+	m := newPeerHistoryModel(1, time.Second)
+	m.Join(1, 1, now)
+
+	ids := []types.NodeID{2}
+	m.Attempt(1, 1, ids)
+	m.Delivered(1, 1, ids)
+	ids[0] = 3
+
+	require.Equal(t, []types.NodeID{2}, m.Possible(1))
+	m.Attempt(1, 2, ids)
+	m.Delivered(1, 2, ids)
+	ids[0] = 4
+	read := m.Possible(1)
+	read[0] = 5
+
+	require.Equal(t, []types.NodeID{3}, m.Possible(1))
+	require.Equal(t, []uint64{1}, m.Join(2, 1, now))
+	require.False(t, m.Live(1))
+	require.False(t, m.Leave(2, now))
+	m.Expire(now.Add(time.Second))
+	require.False(t, m.HasHistory(1))
+	m.Close()
+	m.Join(3, 1, now)
+	require.False(t, m.Live(3))
+}
+
+// peerHistoryModel is a client-possibility ledger, independent of Hub storage.
+// Callers supply unique session tokens, immutable views consistent within each
+// revision, and at most one pending write per session. Attempt precedes Delivered;
+// a failed write ends its session. Retired tokens remain valid inputs for late
+// callbacks. Capacity eviction is deliberately tested by the focused driver.
+type peerHistoryModel struct {
+	limit    int
+	ttl      time.Duration
+	sessions map[uint64]types.NodeID
+	owners   map[uint64]types.NodeID
+	order    []uint64
+	history  map[types.NodeID]*peerHistoryEntry
+	closed   bool
+}
+
+type peerHistoryEntry struct {
+	peers   map[types.NodeID]bool
+	rev     uint64
+	offline time.Time
+}
+
+func newPeerHistoryModel(sessionLimit int, ttl time.Duration) *peerHistoryModel {
+	return &peerHistoryModel{
+		limit: sessionLimit, ttl: ttl,
+		sessions: map[uint64]types.NodeID{},
+		owners:   map[uint64]types.NodeID{},
+		history:  map[types.NodeID]*peerHistoryEntry{},
+	}
+}
+
+// Join returns the tokens whose oldest sessions admission evicted.
+func (m *peerHistoryModel) Join(token uint64, node types.NodeID, now time.Time) []uint64 {
+	if m.closed {
+		return nil
+	}
+
+	m.Expire(now)
+
+	if h := m.history[node]; h != nil {
+		h.offline = time.Time{}
+	}
+
+	var active []uint64
+
+	for _, old := range m.order {
+		if id, ok := m.sessions[old]; ok && id == node {
+			active = append(active, old)
+		}
+	}
+
+	var evicted []uint64
+	if len(active) >= m.limit {
+		evicted = active[:len(active)-m.limit+1]
+		for _, old := range evicted {
+			delete(m.sessions, old)
+		}
+	}
+
+	m.sessions[token] = node
+	m.owners[token] = node
+	m.order = append(m.order, token)
+
+	return evicted
+}
+
+// Leave returns whether another session still serves the token's node. The
+// owners map retains retired tokens so repeated leaves have the same owner.
+func (m *peerHistoryModel) Leave(token uint64, now time.Time) bool {
+	node, known := m.owners[token]
+	if !known {
+		return false
+	}
+
+	delete(m.sessions, token)
+
+	for _, id := range m.sessions {
+		if id == node {
+			return true
+		}
+	}
+
+	m.Expire(now)
+
+	if h := m.history[node]; h != nil && h.offline.IsZero() {
+		h.offline = now
+	}
+
+	return false
+}
+
+func (m *peerHistoryModel) Attempt(token, rev uint64, ids []types.NodeID) {
+	node, live := m.sessions[token]
+	if !live {
+		return
+	}
+
+	h := m.history[node]
+	if h == nil {
+		h = &peerHistoryEntry{peers: map[types.NodeID]bool{}}
+		m.history[node] = h
+	}
+
+	for _, id := range ids {
+		h.peers[id] = true
+	}
+
+	h.rev = max(h.rev, rev)
+}
+
+func (m *peerHistoryModel) Delivered(token, rev uint64, ids []types.NodeID) {
+	node, live := m.sessions[token]
+	if !live {
+		return
+	}
+
+	h := m.history[node]
+	if h != nil && h.rev > rev {
+		return
+	}
+
+	peers := map[types.NodeID]bool{}
+	for _, id := range ids {
+		peers[id] = true
+	}
+
+	m.history[node] = &peerHistoryEntry{peers: peers, rev: rev}
+}
+
+// Forget returns live tokens stopped by deletion, in admission order.
+func (m *peerHistoryModel) Forget(node types.NodeID) []uint64 {
+	var stopped []uint64
+
+	for _, token := range m.order {
+		if id, live := m.sessions[token]; live && id == node {
+			stopped = append(stopped, token)
+			delete(m.sessions, token)
+		}
+	}
+
+	delete(m.history, node)
+
+	return stopped
+}
+
+func (m *peerHistoryModel) Expire(now time.Time) {
+	for id, h := range m.history {
+		if !h.offline.IsZero() && now.Sub(h.offline) >= m.ttl {
+			delete(m.history, id)
+		}
+	}
+}
+
+// Possible returns an owned sorted set, including peers of unconfirmed writes.
+func (m *peerHistoryModel) Possible(node types.NodeID) []types.NodeID {
+	if h := m.history[node]; h != nil {
+		return slices.Sorted(maps.Keys(h.peers))
+	}
+
+	return nil
+}
+
+func (m *peerHistoryModel) Live(token uint64) bool {
+	_, ok := m.sessions[token]
+	return ok
+}
+
+func (m *peerHistoryModel) HasHistory(node types.NodeID) bool {
+	_, ok := m.history[node]
+	return ok
+}
+
+// Close retires all live tokens but does not discard history on shutdown.
+func (m *peerHistoryModel) Close() []uint64 {
+	m.closed = true
+
+	var stopped []uint64
+
+	for _, token := range m.order {
+		if m.Live(token) {
+			stopped = append(stopped, token)
+		}
+	}
+
+	clear(m.sessions)
+
+	return stopped
+}
+
+// These policies have deliberately different visibility, route and capability
+// effects. The first three also have a small, independent visibility oracle.
+var streamPropertyPolicies = []string{
+	`{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`,
+	`{"acls":[]}`,
+	`{"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`,
+	`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u2@"]},
+	  "acls":[{"action":"accept","src":["u1@"],"dst":["tag:a:*","10.0.0.0/24:*"]}],
+	  "ssh":[{"action":"accept","src":["u2@"],"dst":["tag:b"],"users":["root"]}]}`,
+	`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u2@"]},
+	  "grants":[{"src":["u1@","u2@"],"dst":["10.0.0.0/24"],"ip":["*"],"via":["tag:a"]},
+	            {"src":["*"],"dst":["*"],"ip":["*"]}]}`,
+	`{"nodeAttrs":[{"target":["u1@"],"attr":["disable-ipv4"]}],
+	  "acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`,
+	`{"acls":[{"action":"accept","src":["u2@"],"dst":["autogroup:internet:*"]}]}`,
+}
+
+var streamPropertyVersions = []tailcfg.CapabilityVersion{
+	capver.MinSupportedCapabilityVersion,
+	capver.FullNetmapRemovalsCapVer - 1,
+	capver.FullNetmapRemovalsCapVer,
+	tailcfg.CurrentCapabilityVersion,
+}
+
+type streamPropertySession struct {
+	stream     *Stream
+	client     *propertyClient
+	capVer     tailcfg.CapabilityVersion
+	down       bool
+	token      uint64
+	ids        []types.NodeID
+	pendingRev uint64
+	pending    bool
+}
+
+type streamPropertyPolicy struct {
+	doc  []byte
+	kind int
+}
+
+const maxStreamPropertyNodeID types.NodeID = 255
+
+type streamPropertySystem struct {
+	lastNodeID types.NodeID
+	dnsRecords []tailcfg.DNSRecord
+	viaOnly    bool
+	cfg        *types.Config
+	state      *state.State
+	hub        *Hub
+	sessions   map[types.NodeID]*streamPropertySession
+	policy     int
+	policyDoc  []byte
+	policies   []streamPropertyPolicy
+	world      propcheck.World
+	probes     propcheck.WorldProbes
+	routes     propcheck.RouteResult
+	history    *peerHistoryModel
+	token      uint64
+	reportSeq  uint64
+}
+
+// newStreamPropertySystem owns resources per Rapid case, including shrink
+// attempts. No assertion or Cleanup escapes to the outer testing.T.
+func newStreamPropertySystem(t *rapid.T) *streamPropertySystem {
+	dir, err := os.MkdirTemp("", "mapper-property-")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	p4 := netip.MustParsePrefix("100.64.0.0/10")
+	p6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+	cfg := &types.Config{
+		Database:  types.DatabaseConfig{Type: types.DatabaseSqlite, Sqlite: types.SqliteConfig{Path: dir + "/h.db"}},
+		ServerURL: "https://headscale.test",
+		Policy:    types.PolicyConfig{Mode: types.PolicyModeDB},
+		Prefixes:  types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential},
+		DNSConfig: types.DNSConfig{BaseDomain: "headscale.test", MagicDNS: true},
+	}
+	s, err := state.NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+	s.DB().DB.NowFunc = func() time.Time { return propertyEpoch }
+	hub := NewHub()
+	hub.now = func() time.Time { return propertyEpoch }
+	t.Cleanup(hub.Close)
+
+	p := &streamPropertySystem{
+		cfg: cfg, state: s, hub: hub, sessions: make(map[types.NodeID]*streamPropertySession),
+		world:   propcheck.World{Nodes: map[types.NodeID]*types.Node{}},
+		history: newPeerHistoryModel(maxConcurrentMapSessionsPerNode, peerHistoryTTL),
+		probes:  propcheck.WorldProbes{UserIDs: []types.UserID{0, 1, 2, 3}},
+	}
+
+	for i := range 3 {
+		u := types.User{ID: uint(i + 1), Name: fmt.Sprintf("u%d", i+1), CreatedAt: propertyEpoch, UpdatedAt: propertyEpoch}
+		got, err := s.CreateUser(u)
+		require.NoError(t, err)
+		require.Equal(t, u, *got)
+		p.world.Users = append(p.world.Users, u)
+	}
+
+	s.SetDERPMap(&tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: {RegionID: 1}}})
+
+	count := rapid.IntRange(3, 8).Draw(t, "nodes")
+	for i := range count {
+		p.insert(t, types.NodeID(i+1))
+	}
+
+	p.setPolicy(t, rapid.IntRange(0, len(streamPropertyPolicies)-1).Draw(t, "initial-policy"))
+
+	for _, node := range s.ListNodes().All() {
+		p.open(t, node.ID(), s.Snapshot(), false)
+	}
+
+	return p
+}
+
+var propertyEpoch = time.Unix(1_700_000_000, 0).UTC()
+
+func (p *streamPropertySystem) drawNode(t *rapid.T, id types.NodeID) *types.Node {
+	user := p.world.Users[(id-1)%3].Clone()
+
+	name := fmt.Sprintf("node-%d", id)
+
+	var raw [32]byte
+
+	raw[0], raw[31] = byte(id), rapid.Byte().Draw(t, "key-byte") //nolint:gosec // IDs are in [1, 255].
+	n := types.Node{
+		ID: id, UserID: &user.ID, User: user, GivenName: name, Hostname: name,
+		MachineKey: key.MachinePublicFromRaw32(mem.B(raw[:])),
+		NodeKey:    key.NodePublicFromRaw32(mem.B(raw[:])), DiscoKey: key.DiscoPublicFromRaw32(mem.B(raw[:])),
+		IPv4:      new(netip.AddrFrom4([4]byte{100, 64, 0, byte(id)})), //nolint:gosec // IDs are in [1, 255].
+		IPv6:      new(netip.MustParseAddr(fmt.Sprintf("fd7a:115c:a1e0::%x", id.Uint64()))),
+		Hostinfo:  &tailcfg.Hostinfo{Hostname: name, OS: "linux"},
+		CreatedAt: propertyEpoch, UpdatedAt: propertyEpoch, IsOnline: new(false),
+	}
+	// Start with both user-owned classes and a router whose creator is set.
+	if id == 3 {
+		n.Tags = []string{"tag:a", "tag:srv", "tag:router"}
+		n.Hostinfo.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}
+		n.ApprovedRoutes = slices.Clone(n.Hostinfo.RoutableIPs)
+		n.ActiveSessions, n.IsOnline = 1, new(true)
+		n.SessionStart = time.Unix(1_700_000_000, 0).UTC()
+	}
+
+	return &n
+}
+
+func (p *streamPropertySystem) insert(t *rapid.T, id types.NodeID) {
+	n := p.drawNode(t, id)
+	p.create(t, n)
+}
+
+func (p *streamPropertySystem) create(t *rapid.T, n *types.Node) {
+	// Persistent node IDs are never reused, including after deletion.
+	require.Greater(t, n.ID, p.lastNodeID)
+	require.LessOrEqual(t, n.ID, maxStreamPropertyNodeID)
+	require.NoError(t, p.state.DB().DB.Save(n.Clone()).Error)
+	p.lastNodeID = n.ID
+	p.probes.IDs = append(p.probes.IDs, n.ID)
+	p.put(t, n)
+}
+
+func (p *streamPropertySystem) put(t *rapid.T, n *types.Node) {
+	p.world.Put(n)
+	p.state.PutNodeInStoreForTest(*n.Clone())
+	p.checkWorld(t)
+}
+
+func (p *streamPropertySystem) setPolicy(t *rapid.T, index int) {
+	_, err := p.state.SetPolicy([]byte(streamPropertyPolicies[index]))
+	require.NoError(t, err)
+
+	p.policy = index
+	p.policyDoc = []byte(streamPropertyPolicies[index])
+	p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(p.policyDoc), kind: index})
+	p.checkWorld(t)
+}
+
+// applyStreamPropertyWire crosses the real encoder boundary. Removal frames
+// must stand alone, so even old delta-only consumers receive revocations.
+func applyStreamPropertyWire(t *rapid.T, hub *Hub, client *propertyClient, responses []*tailcfg.MapResponse) {
+	for _, response := range responses {
+		// Exercise both Hub.Encode slots without changing generated operation draws.
+		wireRoundTrip(t, hub, response, false)
+		wire := *wireRoundTrip(t, hub, response, true)
+
+		if len(wire.PeersRemoved) != 0 {
+			without := wire
+			without.PeersRemoved, without.ControlTime = nil, nil
+			require.Equal(t, tailcfg.MapResponse{}, without, "removals must be delta-only")
+			require.True(t, slices.IsSorted(wire.PeersRemoved))
+		}
+
+		for _, peers := range [][]*tailcfg.Node{wire.Peers, wire.PeersChanged} {
+			for i, peer := range peers {
+				if client.self != nil {
+					require.NotEqual(t, client.self.ID, peer.ID, "self leaked into peers")
+				}
+
+				if i > 0 {
+					require.Less(t, peers[i-1].ID, peer.ID, "peers must be sorted and unique")
+				}
+			}
+		}
+
+		client.apply(&wire)
+
+		if client.self != nil {
+			require.NotContains(t, client.peers, client.self.ID, "self leaked into the initial peer list")
+
+			for _, patch := range wire.PeersChangedPatch {
+				require.NotEqual(t, client.self.ID, patch.NodeID, "self leaked into peer patches")
+			}
+		}
+
+		require.Zero(t, client.unseenProfile(), "profile of an owner never visible to the client")
+	}
+}
+
+func (p *streamPropertySystem) open(t *rapid.T, id types.NodeID, snap *state.Snapshot, partial bool) {
+	previous := p.sessions[id]
+	cv := rapid.SampledFrom(streamPropertyVersions).Draw(t, "cap-version")
+
+	client := newPropertyClient(&tailcfg.MapResponse{})
+	if previous != nil {
+		client = previous.client
+		if !previous.down {
+			p.hub.Leave(previous.stream.sess)
+			p.history.Leave(previous.token, propertyEpoch)
+		}
+	}
+
+	p.token++
+	token := p.token
+	require.Empty(t, p.history.Join(token, id, propertyEpoch))
+	session := p.hub.Join(id, func() {})
+	require.NotNil(t, session)
+
+	st := NewStream(p.cfg, p.hub, id, cv)
+	st.Attach(session)
+	responses, err := st.Initial(snap)
+	require.NoError(t, err)
+
+	ids := p.expectedPeers(t, id, snap, cv)
+	p.history.Attempt(token, snap.Rev(), ids)
+
+	if partial {
+		applyStreamPropertyWire(t, p.hub, client, responses[:rapid.IntRange(0, len(responses)).Draw(t, "initial-prefix")])
+		p.hub.Leave(session)
+		p.history.Leave(token, propertyEpoch)
+	} else {
+		applyStreamPropertyWire(t, p.hub, client, responses)
+		st.Delivered()
+		p.history.Delivered(token, snap.Rev(), ids)
+	}
+
+	p.sessions[id] = &streamPropertySession{stream: st, client: client, capVer: cv, down: partial, token: token, ids: ids}
+	p.checkHistory(t)
+}
+
+func (p *streamPropertySystem) update(t *rapid.T, id types.NodeID, snap *state.Snapshot, mode int) {
+	session := p.sessions[id]
+	responses, err := session.stream.Update(snap)
+	require.NoError(t, err)
+
+	ids := p.expectedPeers(t, id, snap, session.capVer)
+	if len(responses) > 0 && !slices.Equal(session.ids, ids) {
+		session.pending, session.pendingRev = true, snap.Rev()
+		p.history.Attempt(session.token, snap.Rev(), ids)
+	}
+
+	session.ids = ids
+
+	switch mode {
+	case 1: // An unconfirmed prefix may have reached the client.
+		applyStreamPropertyWire(t, p.hub, session.client, responses[:rapid.IntRange(0, len(responses)).Draw(t, "update-prefix")])
+		p.hub.Leave(session.stream.sess)
+		p.history.Leave(session.token, propertyEpoch)
+		session.down = true
+	case 2: // An obsolete write confirmation must not replace new history.
+		stale := session.stream
+
+		p.open(t, id, snap, false)
+		stale.Delivered()
+
+		if session.pending {
+			p.history.Delivered(session.token, session.pendingRev, session.ids)
+		}
+	default:
+		applyStreamPropertyWire(t, p.hub, session.client, responses)
+		session.stream.Delivered()
+
+		if session.pending {
+			p.history.Delivered(session.token, session.pendingRev, session.ids)
+			session.pending = false
+		}
+
+		quiet, err := session.stream.Update(snap)
+		require.NoError(t, err)
+		require.Empty(t, quiet, "same snapshot must be quiet")
+	}
+
+	p.checkHistory(t)
+}
+
+func (p *streamPropertySystem) check(t *rapid.T, snap *state.Snapshot) {
+	for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+		session := p.sessions[id]
+		if session.down {
+			continue
+		}
+
+		freshHub := NewHub()
+		responses, err := NewStream(p.cfg, freshHub, id, session.capVer).Initial(snap)
+		require.NoError(t, err)
+
+		fresh := newPropertyClient(&tailcfg.MapResponse{})
+		applyStreamPropertyWire(t, freshHub, fresh, responses)
+		freshHub.Close()
+		session.client.check(t, fresh)
+		require.Len(t, session.client.deltaPeers, len(fresh.peers), "delta-only observer retained a removed peer")
+
+		for peer := range fresh.peers {
+			require.True(t, session.client.deltaPeers[peer], "delta-only observer missed peer %d", peer)
+		}
+
+		self := p.world.Nodes[id]
+		require.NotNil(t, self)
+
+		for _, peerID := range slices.Sorted(maps.Keys(p.world.Nodes)) {
+			peer := p.world.Nodes[peerID]
+			if peer.ID == id {
+				continue
+			}
+
+			wire, visible := session.client.peers[peer.ID.NodeID()]
+			// Same-user visibility is unconditional; tags never confer a
+			// creator's ownership, including when UserID remains populated.
+			if p.policy >= 0 && p.policy <= 2 {
+				want := p.policy == 0 || (len(self.Tags) == 0 && len(peer.Tags) == 0 && self.UserID != nil && peer.UserID != nil && *self.UserID == *peer.UserID)
+				require.Equal(t, want, visible, "policy %d: viewer %d peer %d", p.policy, id, peer.ID)
+			}
+
+			if visible {
+				require.Equal(t, peer.NodeKey, wire.Key, "peer identity")
+				require.Equal(t, peer.DiscoKey, wire.DiscoKey, "peer discovery key")
+				require.True(t, slices.Equal([]string(peer.Tags), wire.Tags), "peer tags")
+
+				owner := tailcfg.UserID(types.TaggedDevicesUserID)
+				if len(peer.Tags) == 0 && peer.UserID != nil {
+					owner = tailcfg.UserID(*peer.UserID) //nolint:gosec // Fixture user IDs are 1..3.
+				}
+
+				require.Equal(t, owner, wire.User, "peer ownership")
+
+				if p.policy == 0 {
+					var primaries []netip.Prefix
+
+					for prefix, winner := range p.routes.Global {
+						if winner == uint64(peer.ID) {
+							primaries = append(primaries, prefix)
+						}
+					}
+
+					require.ElementsMatch(t, primaries, wire.PrimaryRoutes, "independent primary routes")
+
+					allowed := []netip.Prefix{netip.PrefixFrom(*peer.IPv4, 32), netip.PrefixFrom(*peer.IPv6, 128)}
+					allowed = append(allowed, primaries...)
+
+					for _, prefix := range propertyApproved(peer) {
+						if prefix.Bits() == 0 {
+							allowed = append(allowed, prefix)
+						}
+					}
+
+					require.ElementsMatch(t, allowed, wire.AllowedIPs, "independent allowed routes")
+				}
+			}
+		}
+	}
+}
+
+// checkWorld reuses the exact scan assertions used by the focused state property.
+// Probes retain old keys as well as current ones to catch stale index entries.
+func (p *streamPropertySystem) checkWorld(t *rapid.T) {
+	for _, id := range slices.Sorted(maps.Keys(p.world.Nodes)) {
+		n := p.world.Nodes[id]
+		if !slices.Contains(p.probes.NodeKeys, n.NodeKey) {
+			p.probes.NodeKeys = append(p.probes.NodeKeys, n.NodeKey)
+		}
+
+		if !slices.Contains(p.probes.MachineKeys, n.MachineKey) {
+			p.probes.MachineKeys = append(p.probes.MachineKeys, n.MachineKey)
+		}
+	}
+
+	snap := p.state.Snapshot()
+	propcheck.CheckWorld(t, p.world, snap, p.probes)
+	require.True(t, slices.Equal(p.dnsRecords, snap.DNS().ExtraRecords().AsSlice()), "DNS reference")
+	require.Equal(t, string(p.policyDoc), string(snap.PolicySource()), "published policy input")
+
+	nodes := make([]propcheck.RouteNode, 0, len(p.world.Nodes))
+	for _, n := range p.world.Nodes {
+		nodes = append(nodes, propcheck.RouteNode{
+			ID: uint64(n.ID), Online: n.ActiveSessions > 0,
+			Expired: propertyExpired(n), Unhealthy: n.Unhealthy, SessionStart: n.SessionStart,
+			Announced: n.Hostinfo.RoutableIPs, Approved: n.ApprovedRoutes, Tags: n.Tags,
+		})
+	}
+
+	var scopes []propcheck.ViaScope
+
+	if p.policy == 4 || p.viaOnly {
+		var candidates []uint64
+
+		for _, n := range p.world.Nodes {
+			if slices.Contains(n.Tags, "tag:a") {
+				candidates = append(candidates, uint64(n.ID))
+			}
+		}
+
+		scopes = []propcheck.ViaScope{{Key: "tag:a", Prefix: netip.MustParsePrefix("10.0.0.0/24"), Candidates: candidates}}
+	}
+
+	p.routes = propcheck.ElectRoutes(nodes, p.routes.Global, scopes)
+
+	want := map[netip.Prefix]types.NodeID{}
+	for prefix, id := range p.routes.Global {
+		want[prefix] = types.NodeID(id)
+	}
+
+	require.Equal(t, want, snap.PrimaryRoutes(), "independent election after each write")
+}
+
+// Generated expiry dates are deliberately outside the campaign's time range.
+func propertyExpired(n *types.Node) bool {
+	return n.Expiry != nil && !n.Expiry.IsZero() && n.Expiry.Year() < 2020
+}
+
+func propertyPeerIDs(peers []*tailcfg.Node) []types.NodeID {
+	ids := make([]types.NodeID, 0, len(peers))
+	for _, peer := range peers {
+		ids = append(ids, types.NodeID(peer.ID)) //nolint:gosec // Fixture node IDs are 1..255.
+	}
+
+	slices.Sort(ids)
+
+	return ids
+}
+
+func (p *streamPropertySystem) checkHistory(t *rapid.T) {
+	for _, id := range p.probes.IDs {
+		want := p.history.Possible(id)
+		p.hub.mu.Lock()
+		actual, exists := p.hub.sentPeers[id]
+
+		got := slices.Clone(actual.ids)
+		for _, attempted := range actual.attempts {
+			got = append(got, attempted...)
+		}
+		p.hub.mu.Unlock()
+		slices.Sort(got)
+		got = slices.Compact(got)
+		// Shared class views may contain self; it is never a possible wire peer.
+		got = slices.DeleteFunc(got, func(peer types.NodeID) bool { return peer == id })
+
+		require.Equal(t, p.history.HasHistory(id), exists, "history existence for %d", id)
+		require.True(t, slices.Equal(want, got), "history for %d: want %v got %v", id, want, got)
+	}
+
+	for _, session := range p.sessions {
+		require.Equal(t, !session.down, p.history.Live(session.token))
+	}
+}
+
+// expectedPeers uses input intent for the three simple policies. Rich policies
+// use a separate fresh renderer as a secondary oracle, never the live stream's
+// sent state. The ledger itself only sees intended write events and peer sets.
+func (p *streamPropertySystem) expectedPeers(t *rapid.T, viewer types.NodeID, snap *state.Snapshot, version tailcfg.CapabilityVersion) []types.NodeID {
+	if p.policy >= 0 && p.policy <= 2 {
+		var peers []types.NodeID
+
+		self := p.world.Nodes[viewer]
+		for _, id := range slices.Sorted(maps.Keys(p.world.Nodes)) {
+			peer := p.world.Nodes[id]
+			if id != viewer && (p.policy == 0 || len(self.Tags) == 0 && len(peer.Tags) == 0 && self.UserID != nil && peer.UserID != nil && *self.UserID == *peer.UserID) {
+				peers = append(peers, id)
+			}
+		}
+
+		return peers
+	}
+
+	hub := NewHub()
+	responses, err := NewStream(p.cfg, hub, viewer, version).Initial(snap)
+	hub.Close()
+	require.NoError(t, err)
+
+	return propertyPeerIDs(responses[0].Peers)
+}
+
+// streamOperation contains all generated parameters before either model or
+// production state changes. Drawing reads only the independent reference.
+type streamOperation struct {
+	kind         string
+	node, before *types.Node
+	policy       int
+	doc          []byte
+	user         types.User
+	records      []tailcfg.DNSRecord
+	derp         *tailcfg.DERPMap
+	request      tailcfg.MapRequest
+}
+
+//nolint:gocyclo // One switch arm per generated operation keeps the input contract visible.
+func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) streamOperation {
+	ids := slices.Sorted(maps.Keys(p.world.Nodes))
+	id := rapid.SampledFrom(ids).Draw(t, "node")
+	n := p.world.Nodes[id].Clone()
+
+	operations := kinds
+	if len(operations) == 0 {
+		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "noop", "revert", "request", "stale-request", "invalid-policy"}
+		if len(ids) > 3 {
+			operations = append(operations, "delete")
+		}
+
+		if len(ids) < 8 && p.lastNodeID < maxStreamPropertyNodeID {
+			operations = append(operations, "add")
+		}
+	}
+
+	op := rapid.SampledFrom(operations).Draw(t, "operation")
+
+	result := streamOperation{kind: op, node: n, before: n.Clone()}
+	switch op {
+	case "endpoints", "revert":
+		n.Endpoints = nil
+		for range rapid.IntRange(0, 3).Draw(t, "endpoint-count") {
+			n.Endpoints = append(n.Endpoints, netip.AddrPortFrom(
+				netip.AddrFrom4([4]byte{192, 0, 2, rapid.ByteRange(1, 254).Draw(t, "endpoint-ip")}),
+				rapid.Uint16().Draw(t, "endpoint-port")))
+		}
+
+	case "hostinfo":
+		n.Hostinfo.OS = rapid.SampledFrom([]string{"linux", "windows", "android", ""}).Draw(t, "os")
+		n.Hostinfo.Hostname = fmt.Sprintf("reported-%d", rapid.IntRange(0, 10).Draw(t, "hostname"))
+		n.Hostinfo.NetInfo = &tailcfg.NetInfo{PreferredDERP: tailcfg.DERPRegionID(rapid.IntRange(0, 3).Draw(t, "home-derp"))}
+
+		n.Hostinfo.Services = nil
+		if rapid.Bool().Draw(t, "service") {
+			n.Hostinfo.Services = []tailcfg.Service{{Proto: "tcp", Port: rapid.Uint16().Draw(t, "service-port")}}
+		}
+
+	case "keys":
+		var raw [32]byte
+		copy(raw[:], rapid.SliceOfN(rapid.Byte(), 32, 32).Draw(t, "node-key"))
+		raw[0] |= 1 // Registered nodes cannot have a zero node key.
+		n.NodeKey = key.NodePublicFromRaw32(mem.B(raw[:]))
+
+		var disco [32]byte
+		if !rapid.Bool().Draw(t, "zero-disco") {
+			copy(disco[:], rapid.SliceOfN(rapid.Byte(), 32, 32).Draw(t, "disco-key"))
+		}
+
+		n.DiscoKey = key.DiscoPublicFromRaw32(mem.B(disco[:]))
+	case "expiry":
+		// Fixed distant dates make shrinking independent of wall time.
+		n.Expiry = rapid.SampledFrom([]*time.Time{nil, new(time.Time{}), new(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)), new(time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC))}).Draw(t, "expiry")
+		n.IsOnline = new(n.ActiveSessions > 0 && !propertyExpired(n))
+	case "online":
+		n.ActiveSessions = 1 - n.ActiveSessions
+		n.IsOnline = new(n.ActiveSessions > 0 && !propertyExpired(n))
+		n.LastSeen = new(time.Unix(1_700_000_000+rapid.Int64Range(0, 1000).Draw(t, "last-seen"), 0).UTC())
+		n.SessionStart = time.Unix(1_700_000_000+int64(n.ID), 0).UTC() //nolint:gosec // IDs are in [1, 255].
+	case "identity":
+		user := p.world.Users[rapid.IntRange(0, 2).Draw(t, "owner")].Clone()
+
+		n.UserID, n.User = &user.ID, user
+
+		n.Tags = rapid.SampledFrom([]types.Strings{nil, {"tag:a"}, {"tag:b"}, {"tag:a", "tag:b"}, {"tag:srv"}, {"tag:router"}}).Draw(t, "tags")
+		if len(n.Tags) > 0 && rapid.Bool().Draw(t, "clear-creator") {
+			n.UserID, n.User = nil, nil
+		}
+
+	case "routes":
+		routes := rapid.SampledFrom([][]netip.Prefix{
+			nil,
+			{netip.MustParsePrefix("10.0.0.0/24")},
+			{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
+			{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("10.1.0.0/24")},
+		}).Draw(t, "routes")
+		n.Hostinfo.RoutableIPs = slices.Clone(routes)
+
+		n.ApprovedRoutes = nil
+		if rapid.Bool().Draw(t, "approve") {
+			n.ApprovedRoutes = slices.Clone(routes)
+		}
+
+	case "health":
+		n.Unhealthy = !n.Unhealthy
+	case "policy":
+		result.policy = rapid.IntRange(0, len(streamPropertyPolicies)-1).Draw(t, "policy")
+		result.doc = []byte(streamPropertyPolicies[result.policy])
+	case "generated-policy":
+		result.policy, result.doc = -1, propcheck.DrawPolicy(t)
+	case "policy-order", "policy-duplicate":
+		result.policy, result.doc = p.policy, propcheck.ReorderPolicy(t, p.policyDoc, op == "policy-duplicate")
+	case "policy-restore":
+		saved := p.policies[rapid.IntRange(0, len(p.policies)-1).Draw(t, "policy-ancestor")]
+		result.policy, result.doc = saved.kind, slices.Clone(saved.doc)
+	case "user":
+		u := p.world.Users[rapid.IntRange(0, 2).Draw(t, "user")]
+
+		u.DisplayName = rapid.SampledFrom([]string{"", "Renamed", "Display ☃"}).Draw(t, "display-name")
+		if u.Name == fmt.Sprintf("u%d", u.ID) {
+			u.Name += "-renamed"
+		} else {
+			u.Name = fmt.Sprintf("u%d", u.ID)
+		}
+
+		result.user = u
+	case "dns":
+		result.records = propcheck.DrawDNSRecords(t)
+	case "derp":
+		regions := make(map[tailcfg.DERPRegionID]*tailcfg.DERPRegion)
+
+		for i := range rapid.IntRange(0, 3).Draw(t, "derp-count") {
+			id := tailcfg.DERPRegionID(i + 1)
+			regions[id] = &tailcfg.DERPRegion{RegionID: id, RegionName: fmt.Sprintf("region-%d", rapid.IntRange(0, 3).Draw(t, "derp-name"))}
+		}
+
+		result.derp = &tailcfg.DERPMap{Regions: regions}
+	case "add":
+		result.node = p.drawNode(t, p.lastNodeID+1)
+	case "request", "stale-request":
+		result.request = tailcfg.MapRequest{
+			NodeKey: n.NodeKey, DiscoKey: n.DiscoKey,
+			Endpoints: []netip.AddrPort{netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, rapid.ByteRange(1, 254).Draw(t, "request-ip")}), 41641)},
+		}
+		if rapid.Bool().Draw(t, "request-disco-clear") {
+			result.request.DiscoKey = key.DiscoPublic{}
+		}
+
+		if op == "stale-request" {
+			result.request.NodeKey = key.NodePublic{}
+		}
+	case "delete", "noop", "invalid-policy":
+	}
+
+	return result
+}
+
+// apply is the production adapter. Each model transition uses the generated
+// values; only validated server timestamps are adopted from a response.
+func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
+	audits := state.PolicyAuditFailures()
+	before := p.state.Snapshot()
+
+	switch op.kind {
+	case "policy", "generated-policy", "policy-order", "policy-duplicate", "policy-restore":
+		changed, err := p.state.SetPolicy(op.doc)
+		require.NoError(t, err, "generated policy: %s", op.doc)
+		expectedChange := !bytes.Equal(p.policyDoc, op.doc)
+		require.Equal(t, expectedChange, changed)
+
+		wantRev := before.Rev()
+		if expectedChange {
+			wantRev++
+		}
+
+		require.Equal(t, wantRev, p.state.Snapshot().Rev(), "policy publication")
+		p.policy, p.policyDoc = op.policy, slices.Clone(op.doc)
+		p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(op.doc), kind: op.policy})
+	case "invalid-policy":
+		_, err := p.state.SetPolicy([]byte(`{"grants":`))
+		require.Error(t, err)
+		require.Equal(t, before.Rev(), p.state.Snapshot().Rev(), "refused policy published")
+	case "user":
+		users := slices.Clone(p.world.Users)
+		users[op.user.ID-1] = op.user
+		p.world.SetUsers(users)
+		_, err := p.state.UpdateUser(types.UserID(op.user.ID), func(u *types.User) error { *u = op.user; return nil })
+		require.NoError(t, err)
+	case "dns":
+		p.state.SetExtraRecords(op.records)
+		p.dnsRecords = propcheck.CanonicalDNSRecords(op.records)
+
+		wantRev := before.Rev()
+		if !slices.Equal(before.DNS().ExtraRecords().AsSlice(), p.dnsRecords) {
+			wantRev++
+		}
+
+		require.Equal(t, wantRev, p.state.Snapshot().Rev(), "DNS publication equivalence")
+	case "derp":
+		p.state.SetDERPMap(op.derp)
+	case "delete":
+		p.world.Delete(op.node.ID)
+		p.state.DeleteNodeFromStoreForTest(op.node.ID)
+		p.hub.forget(op.node.ID)
+		p.history.Forget(op.node.ID)
+
+		if session := p.sessions[op.node.ID]; session != nil {
+			_, err := session.stream.Update(p.state.Snapshot())
+			require.ErrorIs(t, err, ErrNodeGone)
+		}
+
+		delete(p.sessions, op.node.ID)
+	case "add":
+		p.create(t, op.node)
+		p.open(t, op.node.ID, p.state.Snapshot(), false)
+	case "stale-request":
+		require.ErrorIs(t, p.state.UpdateNodeFromMapRequest(op.node.ID, op.request), state.ErrNodeKeyChanged)
+		require.Equal(t, before.Rev(), p.state.Snapshot().Rev(), "refused key published")
+	case "request":
+		start := time.Now()
+
+		require.NoError(t, p.state.UpdateNodeFromMapRequest(op.node.ID, op.request))
+
+		end := time.Now()
+		got, ok := p.state.Snapshot().GetNode(op.node.ID)
+		require.True(t, ok)
+
+		seen := got.LastSeen().Clone()
+		require.NotNil(t, seen)
+		require.False(t, seen.Before(start), "LastSeen precedes request")
+		require.False(t, seen.After(end), "LastSeen follows request completion")
+
+		n := op.before.Clone()
+		// Requests in this component have one endpoint and omit Hostinfo. A
+		// substantive endpoint/disco change receives the next report sequence.
+		if !slices.Equal(n.Endpoints, op.request.Endpoints) || n.DiscoKey != op.request.DiscoKey {
+			p.reportSeq++
+			n.ReportGen = p.reportSeq
+		}
+
+		n.Endpoints, n.DiscoKey, n.LastSeen = slices.Clone(op.request.Endpoints), op.request.DiscoKey, new(*seen)
+		if n.Unhealthy && len(propertyApproved(n)) == 0 {
+			n.Unhealthy = false
+		}
+
+		p.world.Put(n)
+		require.Equal(t, before.Rev()+1, p.state.Snapshot().Rev(), "MapRequest always publishes LastSeen")
+	default:
+		p.put(t, op.node)
+
+		if op.kind == "revert" {
+			p.put(t, op.before)
+		}
+
+		writes := uint64(1)
+		if op.kind == "revert" {
+			writes++
+		}
+
+		require.Equal(t, before.Rev()+writes, p.state.Snapshot().Rev(), "graph input publication")
+	}
+
+	p.checkWorld(t)
+	p.checkHistory(t)
+	require.Equal(t, audits, state.PolicyAuditFailures(), "policy audit after %s", op.kind)
+	p.checkCausal(t, before, p.state.Snapshot(), op)
+}
+
+func propertyApproved(n *types.Node) []netip.Prefix {
+	var routes []netip.Prefix
+
+	for _, prefix := range n.Hostinfo.RoutableIPs {
+		if slices.Contains(n.ApprovedRoutes, prefix) {
+			routes = append(routes, prefix)
+		}
+	}
+
+	return routes
+}
+
+// checkCausal checks one input's effect through render, diff, JSON and the
+// pinned client. It runs in focused histories and after each composed write,
+// independently of the aggregate's coalesced/partial delivery schedule.
+func (p *streamPropertySystem) checkCausal(t *rapid.T, before, after *state.Snapshot, op streamOperation) {
+	// Router removal can move another router's overlay; wider policies can
+	// change other peers' visibility. Those use the composed intent checks.
+	if op.kind == "delete" && (p.policy != 0 || len(propertyApproved(op.node)) != 0) {
+		return
+	}
+
+	switch op.kind {
+	case "endpoints", "hostinfo", "dns", "derp", "noop", "revert", "stale-request", "invalid-policy", "delete":
+	default:
+		return
+	}
+
+	for _, viewer := range before.ListNodes().All() {
+		if _, live := after.GetNode(viewer.ID()); !live {
+			continue
+		}
+
+		hub := NewHub()
+		stream := NewStream(p.cfg, hub, viewer.ID(), capVer)
+		initial, err := stream.Initial(before)
+		require.NoError(t, err)
+
+		expected, actual := newPropertyClient(&tailcfg.MapResponse{}), newPropertyClient(&tailcfg.MapResponse{})
+		applyStreamPropertyWire(t, hub, expected, initial)
+		applyStreamPropertyWire(t, hub, actual, initial)
+		stream.Delivered()
+		responses, err := stream.Update(after)
+		require.NoError(t, err)
+		applyStreamPropertyWire(t, hub, actual, responses)
+
+		freshHub := NewHub()
+		full, err := NewStream(p.cfg, freshHub, viewer.ID(), capVer).Initial(after)
+		require.NoError(t, err)
+
+		fresh := newPropertyClient(&tailcfg.MapResponse{})
+		applyStreamPropertyWire(t, freshHub, fresh, full)
+		freshHub.Close()
+		actual.check(t, fresh)
+
+		switch op.kind {
+		case "endpoints":
+			if peer := expected.peers[op.node.ID.NodeID()]; peer != nil {
+				peer.Endpoints = slices.Clone(op.node.Endpoints)
+			}
+
+			if expected.self.ID == op.node.ID.NodeID() {
+				expected.self.Endpoints = slices.Clone(op.node.Endpoints)
+			}
+		case "hostinfo":
+			subject := actual.peers[op.node.ID.NodeID()]
+
+			self := actual.self.ID == op.node.ID.NodeID()
+			if self {
+				subject = actual.self
+			}
+
+			if subject != nil {
+				require.Equal(t, op.node.Hostinfo.Hostname, subject.Hostinfo.Hostname(), "reported hostname")
+				require.Equal(t, wireJSON(t, op.node.Hostinfo.Services), wireJSON(t, subject.Hostinfo.Services().AsSlice()), "reported TCP services")
+
+				if !self {
+					require.Equal(t, op.node.Hostinfo.OS, subject.Hostinfo.OS(), "reported peer OS")
+				}
+
+				require.Equal(t, op.node.Hostinfo.NetInfo.PreferredDERP, subject.HomeDERP, "reported home DERP")
+			}
+			// Hostinfo can change platform-dependent capabilities on self; peers
+			// and globals unrelated to this node must still remain unchanged.
+			if expected.self.ID == op.node.ID.NodeID() {
+				expected.self = actual.self
+			}
+
+			if expected.peers[op.node.ID.NodeID()] != nil {
+				expected.peers[op.node.ID.NodeID()] = actual.peers[op.node.ID.NodeID()]
+			}
+		case "dns":
+			require.True(t, slices.Equal(propcheck.CanonicalDNSRecords(op.records), actual.dns.ExtraRecords), "DNS input to canonical wire records")
+			expected.dns = expected.dns.Clone()
+			expected.dns.ExtraRecords = propcheck.CanonicalDNSRecords(op.records)
+		case "derp":
+			require.Equal(t, wireJSON(t, op.derp), wireJSON(t, actual.derp))
+			expected.derp = actual.derp
+		case "delete":
+			delete(expected.peers, op.node.ID.NodeID())
+			delete(expected.deltaPeers, op.node.ID.NodeID())
+			// Policy-derived filters/profiles/DNS can legitimately change on removal.
+			expected.filter, expected.ssh, expected.dns = actual.filter, actual.ssh, actual.dns
+			expected.self, expected.profiles = actual.self, actual.profiles
+		}
+
+		actual.check(t, expected)
+
+		quiet, err := stream.Update(after)
+		require.NoError(t, err)
+		require.Empty(t, quiet, "same snapshot quiet after %s", op.kind)
+		hub.Close()
+	}
+}
+
+// TestRapidStreamSystem checks the entire world/policy/Route/render/diff/wire
+// path. Only Route's viewers receive updates; every other active viewer must
+// already equal an independent fresh stream. Rapid's default case and step
+// budgets bound CI work; -rapid.checks, -rapid.steps and -rapid.seed drive campaigns.
+func TestRapidStreamSystem(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+	rapid.Check(t, func(t *rapid.T) {
+		audits := state.PolicyAuditFailures()
+		p := newStreamPropertySystem(t)
+		last := p.state.Snapshot()
+		p.check(t, last)
+		t.Repeat(map[string]func(*rapid.T){"commit": func(t *rapid.T) {
+			// Keep an old snapshot and its wire model across writes and
+			// cache advancement; a late renderer must still read it correctly.
+			old := p.state.Snapshot()
+			oldWorld := p.world.Clone()
+			oldNode := old.ListNodes().At(0).ID()
+			oldHub := NewHub()
+			oldMap, err := NewStream(p.cfg, oldHub, oldNode, capVer).r.render(old)
+			require.NoError(t, err)
+
+			oldClient := newPropertyClient(&tailcfg.MapResponse{})
+			applyStreamPropertyWire(t, oldHub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, oldMap)})
+			oldHub.Close()
+
+			for range rapid.IntRange(1, 3).Draw(t, "coalesced-writes") {
+				p.apply(t, p.drawOperation(t))
+
+				if rapid.Bool().Draw(t, "intermediate-render") {
+					id := rapid.SampledFrom(slices.Sorted(maps.Keys(p.sessions))).Draw(t, "intermediate-viewer")
+
+					session := p.sessions[id]
+					if session.down {
+						p.open(t, id, p.state.Snapshot(), rapid.Bool().Draw(t, "partial-reconnect"))
+					} else {
+						p.update(t, id, p.state.Snapshot(), 0)
+					}
+				}
+			}
+
+			snap := p.state.Snapshot()
+			all, wake := Route(last, snap, snap.Since(last))
+			p.hub.advance(snap)
+
+			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+				session := p.sessions[id]
+				if session.down {
+					if rapid.Bool().Draw(t, "reconnect") {
+						p.open(t, id, snap, rapid.Bool().Draw(t, "partial-reconnect"))
+					}
+				} else if _, named := wake[id]; all || named {
+					p.update(t, id, snap, rapid.IntRange(0, 5).Draw(t, "delivery"))
+				}
+			}
+
+			p.check(t, snap)
+			propcheck.CheckWorld(t, oldWorld, old, p.probes)
+			lateMap, err := NewStream(p.cfg, p.hub, oldNode, capVer).r.render(old)
+			require.NoError(t, err)
+
+			lateClient := newPropertyClient(&tailcfg.MapResponse{})
+			applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, lateMap)})
+			lateClient.check(t, oldClient)
+
+			last = snap
+		}})
+
+		for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+			if p.sessions[id].down {
+				p.open(t, id, p.state.Snapshot(), false)
+			}
+		}
+
+		p.check(t, p.state.Snapshot())
+		require.Equal(t, audits, state.PolicyAuditFailures(), "incremental policy disagreed with full compile")
+	})
+}
+
+// Guard the reusable replay model's two less common patch fields without
+// claiming the system generator can create a node's KeySignature in State.
+func TestRapidStreamModelPatchFields(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		capability := tailcfg.CapabilityVersion(rapid.IntRange(1, 200).Draw(t, "cap"))
+		signature := rapid.SliceOfN(rapid.Byte(), 1, 64).Draw(t, "signature")
+		client := newPropertyClient(&tailcfg.MapResponse{Peers: []*tailcfg.Node{{ID: 2}}})
+		applyStreamPropertyWire(t, nil, client, []*tailcfg.MapResponse{{PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 2, Cap: capability, KeySignature: signature}}}})
+		require.Equal(t, capability, client.peers[2].Cap)
+		require.True(t, slices.Equal(signature, client.peers[2].KeySignature))
+	})
+}
+
+// The route oracle needs no policy compiler: with two approved routers and
+// exactly one healthy online router, that router must carry the subnet. Run
+// both ordinary grants and via grants, then withdraw and restore approvals.
+func TestRapidStreamRouteFailover(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t)
+		last := p.state.Snapshot()
+		route := netip.MustParsePrefix("10.0.0.0/24")
+
+		via := ""
+		if rapid.Bool().Draw(t, "via") {
+			via = `,"via":["tag:a"]`
+		}
+
+		_, err := p.state.SetPolicy([]byte(`{"tagOwners":{"tag:a":["u1@"]},"grants":[{"src":["u1@"],"dst":["10.0.0.0/24"],"ip":["*"]` + via + `}]}`))
+		require.NoError(t, err)
+
+		p.policy = 3 // This property's route oracle replaces the simple-policy oracle.
+		p.policyDoc = []byte(`{"tagOwners":{"tag:a":["u1@"]},"grants":[{"src":["u1@"],"dst":["10.0.0.0/24"],"ip":["*"]` + via + `}]}`)
+		p.viaOnly = via != ""
+		winner := rapid.SampledFrom([]types.NodeID{2, 3}).Draw(t, "healthy-router")
+
+		for _, id := range []types.NodeID{2, 3} {
+			router := p.world.Nodes[id].Clone()
+			router.Tags = []string{"tag:a"}
+			router.Hostinfo.RoutableIPs = []netip.Prefix{route}
+			router.ApprovedRoutes = []netip.Prefix{route}
+			router.ActiveSessions, router.IsOnline = 1, new(true)
+			router.Unhealthy = id != winner
+			router.SessionStart = time.Unix(1_700_000_000+int64(id), 0).UTC() //nolint:gosec // Router IDs are 2 and 3.
+			p.put(t, router)
+		}
+
+		for phase := range 4 {
+			if phase == 1 {
+				winner = 5 - winner
+			}
+
+			if phase > 0 {
+				for _, id := range []types.NodeID{2, 3} {
+					router := p.world.Nodes[id].Clone()
+					router.Unhealthy = id != winner
+
+					router.ApprovedRoutes = []netip.Prefix{route}
+					if phase == 2 {
+						router.ApprovedRoutes = nil
+					}
+
+					p.put(t, router)
+				}
+			}
+
+			snap := p.state.Snapshot()
+			all, wake := Route(last, snap, snap.Since(last))
+			p.hub.advance(snap)
+
+			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+				if _, named := wake[id]; all || named {
+					p.update(t, id, snap, 0)
+				}
+			}
+
+			p.check(t, snap)
+
+			for _, id := range []types.NodeID{2, 3} {
+				peer := p.sessions[1].client.peers[id.NodeID()]
+
+				winners := p.routes.Global
+				if p.viaOnly {
+					winners = p.routes.Via["tag:a"]
+				}
+
+				want := winners[route] == uint64(id)
+				require.Equal(t, want, phase != 2 && id == winner, "election oracle and directed scenario agree")
+
+				if want {
+					require.NotNil(t, peer, "healthy router must be visible")
+				}
+
+				if peer != nil {
+					require.Equal(t, want, slices.Contains(peer.AllowedIPs, route), "phase %d router %d", phase, id)
+					require.Equal(t, want, slices.Contains(peer.PrimaryRoutes, route), "phase %d router %d", phase, id)
+				}
+			}
+
+			last = snap
+		}
+	})
+}
+
+// Visibility changes must revoke peers through deltas as well as full maps;
+// reconnecting clients retain profiles, but never learn a hidden owner.
+func TestRapidStreamVisibilityTransitions(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t)
+
+		last := p.state.Snapshot()
+		for _, policy := range []int{0, 1, 0, 2} {
+			p.setPolicy(t, policy)
+			snap := p.state.Snapshot()
+			all, wake := Route(last, snap, snap.Since(last))
+			p.hub.advance(snap)
+
+			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+				if _, named := wake[id]; all || named {
+					p.update(t, id, snap, 0)
+				}
+			}
+
+			p.check(t, snap)
+			id := rapid.SampledFrom(slices.Sorted(maps.Keys(p.sessions))).Draw(t, "reconnecting-viewer")
+			p.open(t, id, snap, false)
+			p.check(t, snap)
+			last = snap
+		}
+	})
+}
+
+// Focused callers draw subsets of the same operations and invoke the same
+// world, election, causal-delta and replay assertions as the composed driver.
+func TestRapidStreamOperationContracts(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+
+	for _, kinds := range [][]string{
+		{"endpoints", "hostinfo", "dns", "derp", "noop", "revert"},
+		{"request", "stale-request", "invalid-policy"},
+		{"generated-policy", "policy-order", "policy-duplicate", "policy-restore"},
+	} {
+		t.Run(kinds[0], func(t *testing.T) {
+			rapid.Check(t, func(t *rapid.T) {
+				audits := state.PolicyAuditFailures()
+				p := newStreamPropertySystem(t)
+
+				last := p.state.Snapshot()
+				for range rapid.IntRange(1, 12).Draw(t, "operations") {
+					p.apply(t, p.drawOperation(t, kinds...))
+					snap := p.state.Snapshot()
+					all, wake := Route(last, snap, snap.Since(last))
+					p.hub.advance(snap)
+
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if _, named := wake[id]; all || named {
+							p.update(t, id, snap, 0)
+						}
+					}
+
+					p.check(t, snap)
+					last = snap
+				}
+
+				require.Equal(t, audits, state.PolicyAuditFailures(), "incremental policy audit")
+			})
+		})
+	}
+}
+
+func TestRapidStreamSimplePolicyEdits(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t)
+		kind := rapid.IntRange(0, 2).Draw(t, "simple-policy")
+		p.setPolicy(t, kind)
+
+		p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: kind}}
+		for _, operation := range []string{"policy-order", "policy-duplicate", "policy-restore"} {
+			op := p.drawOperation(t, operation)
+			require.Equal(t, kind, op.policy, "simple intent survives %s", operation)
+			p.apply(t, op)
+			require.Equal(t, kind, p.policy)
+		}
+	})
+}
+
+// Persistent IDs identify one lifetime. Deletion never makes an ID available
+// for another node, and the byte-based fixture stops allocating at 255.
+func TestRapidStreamFreshNodeIDs(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t)
+		if len(p.world.Nodes) == 3 {
+			p.apply(t, p.drawOperation(t, "add"))
+		}
+
+		for range rapid.IntRange(1, 8).Draw(t, "lifetimes") {
+			removed := p.drawOperation(t, "delete")
+			previousID := p.lastNodeID
+			p.apply(t, removed)
+			added := p.drawOperation(t, "add")
+			require.Equal(t, previousID+1, added.node.ID)
+			require.NotEqual(t, removed.node.ID, added.node.ID)
+			p.apply(t, added)
+			require.Contains(t, p.probes.IDs, removed.node.ID, "deleted IDs remain world/history probes")
+			require.Contains(t, p.probes.IDs, added.node.ID)
+			require.GreaterOrEqual(t, len(p.world.Nodes), 3)
+			require.LessOrEqual(t, len(p.world.Nodes), 8)
+		}
+
+		if len(p.world.Nodes) == 8 {
+			p.apply(t, p.drawOperation(t, "delete"))
+		}
+
+		p.lastNodeID = maxStreamPropertyNodeID - 1
+		last := p.drawOperation(t, "add")
+		require.Equal(t, maxStreamPropertyNodeID, last.node.ID)
+		require.Equal(t, netip.MustParseAddr("100.64.0.255"), *last.node.IPv4)
+		p.apply(t, last)
+		// Keep room in the live fleet so the exhausted-ID guard is exercised.
+		p.apply(t, p.drawOperation(t, "delete"))
+
+		for range 20 {
+			require.NotEqual(t, "add", p.drawOperation(t).kind)
+		}
+	})
+}
+
+// TestStreamRouteOverlaySurvivesStaleCacheAndMembership is an intentionally
+// failing diagnostic: rendering a retained snapshot must not make a later
+// membership change discard an unrelated router's routes.
+func TestStreamRouteOverlaySurvivesStaleCacheAndMembership(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	viewer, removed, routerID := ids[0], ids[1], ids[2]
+	route := netip.MustParsePrefix("10.0.0.0/24")
+	router := mustNode(t, s, routerID).AsStruct()
+	router.Tags = []string{"tag:a"}
+	router.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+	router.ApprovedRoutes = []netip.Prefix{route}
+	s.PutNodeInStoreForTest(*router)
+	s.Connect(routerID)
+
+	hub := NewHub()
+	t.Cleanup(hub.Close)
+	stream := NewStream(cfg, hub, viewer, capVer)
+	old := s.Snapshot()
+	_, err := stream.Initial(old)
+	require.NoError(t, err)
+	stream.Delivered()
+
+	checkRoute := func() {
+		t.Helper()
+
+		peer, ok := stream.sent.peer(routerID.NodeID())
+		require.True(t, ok)
+		require.Contains(t, peer.AllowedIPs, route)
+		require.Contains(t, peer.PrimaryRoutes, route)
+	}
+	checkRoute()
+
+	updateViewer := func(port uint16) {
+		n := mustNode(t, s, viewer).AsStruct()
+		n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), port)}
+		s.PutNodeInStoreForTest(*n)
+		_, err := stream.Update(s.Snapshot())
+		require.NoError(t, err)
+		stream.Delivered()
+	}
+	updateViewer(1)
+	checkRoute()
+
+	// A delayed renderer can still render a snapshot captured before the
+	// endpoint update, sharing the current session's peer-render cache.
+	_, err = NewStream(cfg, hub, viewer, capVer).r.render(old)
+	require.NoError(t, err)
+
+	s.DeleteNodeFromStoreForTest(removed)
+	_, err = stream.Update(s.Snapshot())
+	require.NoError(t, err)
+	stream.Delivered()
+	checkRoute()
+
+	updateViewer(2)
+
+	freshHub := NewHub()
+	t.Cleanup(freshHub.Close)
+	fresh, err := NewStream(cfg, freshHub, viewer, capVer).Initial(s.Snapshot())
+	require.NoError(t, err)
+	require.Contains(t, peerSet(fresh[0]), routerID.NodeID())
+
+	for _, peer := range fresh[0].Peers {
+		if peer.ID == routerID.NodeID() {
+			require.Contains(t, peer.AllowedIPs, route, "fresh renderer still serves the route")
+		}
+	}
+
+	checkRoute()
 }

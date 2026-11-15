@@ -8,6 +8,11 @@ use the same components below. This is sampled contract testing, not an
 exhaustive proof. Enabled diagnostic properties currently expose known bugs;
 a failing aggregate is not a green acceptance suite.
 
+Shared generators and reference models live in `hscontrol/propcheck`.
+Package-local properties stay in the matching source test files; DNS reference
+properties live in `propcheck/dns_test.go` so they can use the public DNS view
+without creating a test import cycle.
+
 ## Reusable components
 
 | Component                                                   | Focused callers                                                                                           | Composed caller and contract                                                                                                                                                                                                                                                                                                          |
@@ -15,7 +20,7 @@ a failing aggregate is not a green acceptance suite.
 | `propcheck.World`, `CheckWorld`, `WorldProbes`              | `state.TestWorldMutationProperty`, `TestWorldReferenceOwnership`                                          | `streamPropertySystem.checkWorld` after every write: owned node/user values, sorted membership, user ownership, node-key winners, machine-key buckets, retained old keys and snapshots. Native maps and scans; no graph, State, policy or mapper implementation imports.                                                              |
 | `propcheck.DrawPolicy`, `ReorderPolicy`                     | `policy/v2.TestIncrementalPolicyRapidHistory`                                                             | `drawOperation` draws valid ACL/grant/SSH/capability/via policies, duplicates/reorders rules and restores earlier documents. The fleet supplies u1/u2/u3, tag:srv/router, and matching IPv4/IPv6 addresses. Duplicate app grants retain multiplicity. Known policy classifications survive reorder, duplicate and historical restore. |
 | `propcheck.ElectRoutes`                                     | State route-election properties                                                                           | `checkWorld` predicts global winners after every write, preserving previous winners. Allow-all wire checks predict AllowedIPs and PrimaryRoutes. `TestRapidStreamRouteFailover` uses the same result for ordinary and tag:a via grants. Rich policy alias resolution remains a separate compiler oracle.                              |
-| `propcheck.DrawDNSRecords`, `CanonicalDNSRecords`           | External `types` DNS properties                                                                           | DNS operations and causal checks use the same record domain and normalization. Expected graph records and client records come from input; equivalent canonical records must not publish a revision.                                                                                                                                   |
+| `propcheck.DrawDNSRecords`, `CanonicalDNSRecords`           | `propcheck.TestDNSViewProperty*`                                                                          | DNS operations and causal checks use the same record domain and normalization. Expected graph records and client records come from input; equivalent canonical records must not publish a revision.                                                                                                                                   |
 | `wirePeers`, `wireUpgrade`, `wirePatchable`, `wireSemantic` | `TestRapidWire*`, `TestWireReachableFailures`, `TestPropertyClientContracts`                              | `propertyClient` uses the exact same pinned peer replay, including PeersChanged patchification. LastSeen is ignored only while Online is true. Zero DiscoKey, expiry clears and lost offline fields remain observable.                                                                                                                |
 | `propertyClient`                                            | `TestPropertyClientContracts`, `TestRapidStreamModelPatchFields`, operation contracts                     | Tracks self, peers, named packet filters, SSH, DNS, DERP, domain, service collection, sticky profiles and a delta-only removal observer. Unseen owner profiles fail.                                                                                                                                                                  |
 | `peerHistoryModel`                                          | `TestHubRapid*`, `TestPeerHistoryModel*`                                                                  | `open`, `update`, deletion and `checkHistory` share attempted/confirmed/retired/reconnect transitions. Simple-policy membership comes from World inputs; rich-policy membership comes from a separate fresh renderer, never the live stream's sent state. Hub class views may contain self; comparisons remove that non-wire member.  |
@@ -88,8 +93,9 @@ The broad stream property with seed 20261115 and request subset with seed
 20261125 reproduce zero-DiscoKey loss. Existing deterministic diagnostics remain
 enabled: `TestWireReachableFailures` (zero DiscoKey and offline LastSeen loss),
 `TestStreamRouteOverlaySurvivesStaleCacheAndMembership` (lost route overlay), and
-`TestIncrementalDuplicateAppGrantInvalidatesFilter` (stale reduced filter and
-missed destination notification). Refactoring must not make these disappear.
+`TestIncrementalDuplicateAppGrantInvalidatesFilter` and
+`TestIncrementalAppGrantOrderInvalidatesFilter` (stale reduced filters and
+missed destination notifications after duplicate or reordered app grants). Refactoring must not make these disappear.
 
 ## Remaining limits
 
