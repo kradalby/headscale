@@ -83,7 +83,13 @@ var (
 	policyAudit         = envknob.RegisterBool("HEADSCALE_DEBUG_POLICY_AUDIT")
 	policyAuditFailures atomic.Uint64
 	policyAuditRuns     atomic.Uint64
+	membershipAuditRuns atomic.Uint64
 )
+
+// MembershipAuditRuns counts the membership audits that ran, so a test
+// can prove the audit is wired; their failures count in
+// [PolicyAuditFailures].
+func MembershipAuditRuns() uint64 { return membershipAuditRuns.Load() }
 
 // PolicyAuditFailures counts the compiles the policy audit found to
 // differ from a compile from scratch.
@@ -187,6 +193,8 @@ func (e *nodeEdit) nameTaken(self types.NodeID, name string) bool {
 //	users ───────────────────────────┤
 //	policySrc ───────────────────────┘
 //	index, nodes, policy ──► primaries
+//	policy ──► selectors ──► userSets ◄── users
+//	userSets, nodes ──► roles ──► postings
 //
 // The nodes, users and policySrc inputs are written only through the
 // methods below, which serialise on the graph.
@@ -248,6 +256,21 @@ type world struct {
 	nodeCaps  graph.Derived[*capsMap]
 	peers     graph.Derived[*policyv2.PeerClasses]
 	primaries graph.Derived[primaryRoutes]
+
+	// Membership, read only by the policy audit until the compile moves
+	// onto it: the selectors the policy in force names;
+	// the users each user selector names; each node's role set; and each
+	// role's nodes. Each recomputes only for what its inputs changed, so
+	// a user outside every selector, an endpoint or a Hostinfo write
+	// reaches no role, and a join reaches one node's.
+	selectors graph.Derived[*policyv2.Selectors]
+	userSets  graph.Derived[*policyv2.UserSets]
+	roles     graph.Derived[policyv2.Roles]
+	postings  graph.Derived[policyv2.Postings]
+
+	// membershipAudit is set, with auditing, only under the policy audit.
+	membershipAudit graph.Derived[membershipAudit]
+	auditing        bool
 }
 
 // nodeIndex holds the lookups every reader needs. Each part moves only
@@ -410,6 +433,45 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 	w.peers = graph.NewDerived(g, "peers", (*policyv2.PeerClasses).Same, w.derivePeers)
 	w.primaries = graph.NewDerived(g, "primaries", samePrimaries, w.electPrimaries)
 
+	// From the compile in force, not the document: a compile that fails
+	// keeps serving the last good policy, and membership must describe the
+	// policy served. A recompile of the same document reuses its parse, so
+	// node writes reach no further than here.
+	w.selectors = graph.NewDerived(g, "selectors", graph.Same[*policyv2.Selectors],
+		func(s *graph.Snapshot, prev *policyv2.Selectors) *policyv2.Selectors {
+			pm, _ := s.Get(w.policy).pm.(*policyv2.PolicyManager)
+
+			return policyv2.SelectorsFor(prev, pm)
+		})
+	w.userSets = graph.NewDerived(g, "user-sets", graph.Same[*policyv2.UserSets],
+		func(s *graph.Snapshot, prev *policyv2.UserSets) *policyv2.UserSets {
+			return policyv2.NewUserSets(prev, s.Get(w.selectors), s.Get(w.policyUsers))
+		})
+	w.roles = graph.NewDerived(g, "roles", policyv2.Roles.Same, func(s *graph.Snapshot, prev policyv2.Roles) policyv2.Roles {
+		// A changed user's nodes all carry its copy.
+		holders := func(uid uint) []types.NodeID {
+			ids, _ := s.Get(w.index).byUserCopy.Groups.Get(uid)
+
+			return ids
+		}
+
+		return prev.Update(s.Get(w.userSets), s.Get(w.nodes), holders)
+	})
+	w.postings = graph.NewDerived(g, "postings", policyv2.Postings.Same,
+		func(s *graph.Snapshot, prev policyv2.Postings) policyv2.Postings { return prev.Update(s.Get(w.roles)) })
+
+	// Registered only under the audit, so once, here, where the compile
+	// audits read the knob at every compile: a derived cell is recomputed
+	// at every commit that changes what it read, whether or not anything
+	// reads it, and this one reads the nodes; production must not carry
+	// it, and a graph takes no cells once it runs. Setting the knob on a
+	// running server therefore starts the compile audits only.
+	if policyAudit() {
+		w.auditing = true
+		w.membershipAudit = graph.NewDerived(g, "membership-audit",
+			func(membershipAudit, membershipAudit) bool { return true }, w.auditMembership)
+	}
+
 	snap, err := g.Update(func(*graph.Tx) error { return nil })
 	if err != nil {
 		return nil, err
@@ -453,6 +515,66 @@ func (w *world) deriveNodeCaps(s *graph.Snapshot, prev *capsMap) *capsMap {
 	}
 
 	return e.Done()
+}
+
+// membershipAudit is the revision the membership audit last checked, and
+// the selectors whose table it last found complete.
+type membershipAudit struct {
+	rev   uint64
+	table *policyv2.Selectors
+}
+
+// auditMembership checks the membership cells against a build from
+// scratch and against the compile's resolution of every selector, at every
+// commit that changes the policy, the users or the nodes.
+func (w *world) auditMembership(s *graph.Snapshot, prev membershipAudit) membershipAudit {
+	membershipAuditRuns.Add(1)
+
+	cp := s.Get(w.policy)
+	pm, _ := cp.pm.(*policyv2.PolicyManager)
+	sel := s.Get(w.selectors)
+
+	_, err := policyv2.AuditMembership(policyv2.Membership{
+		Selectors: sel,
+		UserSets:  s.Get(w.userSets),
+		Roles:     s.Get(w.roles),
+		Postings:  s.Get(w.postings),
+		Users:     s.Get(w.policyUsers),
+		Nodes:     s.Get(w.nodes),
+		Policy:    pm,
+		Current:   cp.err == nil,
+		// The completeness walk costs the policy's size; a node write
+		// leaves the selectors it checked as they were.
+		TableAudited: prev.table == sel,
+	})
+	if err != nil {
+		policyAuditFailures.Add(1)
+		log.Error().Err(err).Msg("policy audit: membership")
+
+		sel = nil
+	}
+
+	return membershipAudit{rev: s.Rev(), table: sel}
+}
+
+// MembershipAudited reports, for tests, whether the membership audit
+// checked the membership of s at the last commit that changed it: false
+// without the audit.
+func (s *Snapshot) MembershipAudited() bool {
+	if !s.w.auditing {
+		return false
+	}
+
+	last := uint64(0)
+	for _, rev := range []uint64{
+		graph.ChangedAt(s.s, s.w.policy), graph.ChangedAt(s.s, s.w.policyUsers), graph.ChangedAt(s.s, s.w.nodes),
+		graph.ChangedAt(s.s, s.w.selectors), graph.ChangedAt(s.s, s.w.userSets),
+		graph.ChangedAt(s.s, s.w.roles), graph.ChangedAt(s.s, s.w.postings),
+	} {
+		last = max(last, rev)
+	}
+
+	return s.s.Get(s.w.membershipAudit).rev == last
 }
 
 // derivePeers is the peers cell: the peer classes of the compiled policy

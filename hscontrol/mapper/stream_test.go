@@ -1502,6 +1502,10 @@ func testStreamsConverge(t *testing.T, r *rand.Rand) oracleReach {
 
 		snap := s.Snapshot()
 
+		// The snapshot every session renders was audited at the commit that
+		// last changed its membership.
+		require.True(t, snap.MembershipAudited(), "step %d: the last change to membership was audited", step)
+
 		advanceOracleSessions(t, r, cfg, hub, snap, wake(snap), sessions)
 		requireOracleConverged(t, step, cfg, snap, sessions)
 

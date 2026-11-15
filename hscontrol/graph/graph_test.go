@@ -59,6 +59,37 @@ func TestDerivedRecomputesOnlyOnChange(t *testing.T) {
 	}
 }
 
+// TestUnreadDerivedRecomputes pins that cells are computed at commit, not
+// on read: a derived cell nothing reads still costs its computation at
+// every commit changing what it read.
+func TestUnreadDerivedRecomputes(t *testing.T) {
+	g := New()
+	a := g.NewInput("a", 1, Same[int])
+
+	runs := 0
+	_ = NewDerived(g, "unread", Same[int], func(s *Snapshot, _ int) int {
+		runs++
+
+		return s.Get(a)
+	})
+
+	_, err := g.Update(func(*Tx) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range 3 {
+		_, err := g.Update(func(tx *Tx) error { Set(tx, a, 10+i); return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if runs != 4 {
+		t.Fatalf("unread cell ran %d times over a first and three changing commits, want 4", runs)
+	}
+}
+
 func TestSnapshotsAreImmutable(t *testing.T) {
 	g := New()
 	a := g.NewInput("a", "x", Same[string])
