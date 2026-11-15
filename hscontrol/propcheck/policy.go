@@ -580,3 +580,234 @@ func CheckAppIntent(t require.TestingT, m World, intent *AppIntent, destination 
 
 	return peers
 }
+
+// SSHGrant selects whole user/tag identities, never literal addresses. Self
+// means the source's user-owned devices; tagged creators confer no ownership.
+type SSHGrant struct {
+	Src    PacketSelector
+	DstTag string
+	Self   bool
+	Check  bool
+	Users  []string
+}
+
+// SSHIntent and its login slices are immutable after construction. The domain
+// excludes nonroot/localpart, OS accounts, authentication and network access.
+type SSHIntent struct {
+	Grants []SSHGrant
+}
+
+// AppendDocument adds SSH to an existing packet/app document without replacing
+// its grants, tag owners or DERP overlay. Callers carry explicit packet intent.
+func (s *SSHIntent) AppendDocument(t require.TestingT, doc []byte) []byte {
+	var pol map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(doc, &pol))
+
+	tags := map[string][]string{}
+	if b, ok := pol["tagOwners"]; ok {
+		require.NoError(t, json.Unmarshal(b, &tags))
+	}
+
+	rules := make([]any, 0, len(s.Grants))
+	for _, g := range s.Grants {
+		require.False(t, g.Src.IP.IsValid(), "SSH literal selectors are outside the intent domain")
+		require.NotEqual(t, g.Src.User == "", g.Src.Tag == "", "SSH source must be one user or tag")
+		require.NotEqual(t, g.Self, g.DstTag != "", "SSH destination must be self or tag")
+		require.False(t, g.Src.Tag != "" && (g.Check || g.Self), "check/self sources must be users")
+
+		for _, login := range g.Users {
+			require.Contains(t, []string{"root", "alice", "bob"}, login)
+		}
+
+		for _, tag := range []string{g.Src.Tag, g.DstTag} {
+			if tag != "" {
+				if _, exists := tags[tag]; !exists {
+					tags[tag] = []string{}
+				}
+			}
+		}
+
+		dst, action := g.DstTag, "accept"
+		if g.Self {
+			dst = "autogroup:self"
+		}
+
+		if g.Check {
+			action = "check"
+		}
+
+		rules = append(rules, map[string]any{"src": []string{g.Src.alias()}, "dst": []string{dst}, "users": g.Users, "action": action})
+	}
+
+	pol["ssh"], pol["tagOwners"] = policyJSON(t, rules), policyJSON(t, tags)
+
+	return policyJSON(t, pol)
+}
+
+func (s *SSHIntent) Reordered(duplicate bool) *SSHIntent {
+	next := &SSHIntent{Grants: slices.Clone(s.Grants)}
+	slices.Reverse(next.Grants)
+
+	if duplicate && len(next.Grants) > 0 {
+		next.Grants = append(next.Grants, next.Grants[0])
+	}
+
+	return next
+}
+
+func DrawSSHIntent(t *rapid.T, m World) *SSHIntent {
+	sources := make([]PacketSelector, 0, 2+len(m.Users))
+
+	sources = append(sources, PacketSelector{Tag: "tag:srv"}, PacketSelector{Tag: "tag:router"})
+	for _, u := range m.Users {
+		sources = append(sources, PacketSelector{User: u.Name})
+	}
+
+	s := &SSHIntent{}
+	for range rapid.IntRange(1, 4).Draw(t, "ssh grants") {
+		g := SSHGrant{
+			Src:    rapid.SampledFrom(sources).Draw(t, "ssh source"),
+			DstTag: rapid.SampledFrom([]string{"tag:srv", "tag:router"}).Draw(t, "ssh destination"),
+			Users:  rapid.SliceOfNDistinct(rapid.SampledFrom([]string{"root", "alice", "bob"}), 1, 3, func(s string) string { return s }).Draw(t, "ssh logins"),
+		}
+		if g.Src.User != "" {
+			g.Check = rapid.Bool().Draw(t, "ssh check")
+
+			g.Self = rapid.Bool().Draw(t, "ssh self")
+			if g.Self {
+				g.DstTag = ""
+			}
+		}
+
+		s.Grants = append(s.Grants, g)
+	}
+
+	return s
+}
+
+// Decision depends only on input identities and grants. Check dominates accept
+// regardless of document order; this does not predict callback authorization.
+func (s *SSHIntent) Decision(m World, source, destination types.NodeID, login string) string {
+	src, dst := m.Nodes[source], m.Nodes[destination]
+	decision := "deny"
+
+	for _, g := range s.Grants {
+		if !slices.Contains(g.Users, login) || !g.Src.matches(m, src, netip.Addr{}) {
+			continue
+		}
+
+		matches := slices.Contains(dst.Tags, g.DstTag)
+		if g.Self {
+			matches = len(src.Tags) == 0 && len(dst.Tags) == 0 && src.UserID != nil && dst.UserID != nil && *src.UserID == *dst.UserID
+		}
+
+		if matches {
+			if g.Check {
+				return "check"
+			}
+
+			decision = "accept"
+		}
+	}
+
+	return decision
+}
+
+// CheckSSHIntent interprets only the pinned tailcfg SSH protocol's bounded
+// emitted shape. The actual tailssh evaluator is unexported; this is not an SSH
+// login test. Strict whole-struct checks reject unsupported fields rather than
+// silently overlooking a principal, expiration, mapping or action restriction.
+func CheckSSHIntent(t require.TestingT, m World, intent *SSHIntent, destination types.NodeID, policy *tailcfg.SSHPolicy, serverURL string) {
+	require.NotNil(t, policy, "SSH policy must explicitly clear revoked rules")
+	require.NotNil(t, m.Nodes[destination])
+
+	sources := map[netip.Addr]types.NodeID{
+		netip.MustParseAddr("192.0.2.254"): 0, netip.MustParseAddr("2001:db8::ffff"): 0,
+	}
+
+	for id, n := range m.Nodes {
+		for _, ip := range []*netip.Addr{n.IPv4, n.IPv6} {
+			if ip != nil {
+				sources[*ip] = id
+			}
+		}
+	}
+
+	for _, rule := range policy.Rules {
+		require.NotNil(t, rule, "unsupported SSH rule")
+		require.Equal(t, &tailcfg.SSHRule{Principals: rule.Principals, SSHUsers: rule.SSHUsers, Action: rule.Action}, rule, "unsupported SSH rule fields")
+
+		for _, principal := range rule.Principals {
+			require.NotNil(t, principal, "unsupported SSH principal")
+			require.Equal(t, &tailcfg.SSHPrincipal{NodeIP: principal.NodeIP}, principal, "unsupported SSH principal fields")
+			ip, err := netip.ParseAddr(principal.NodeIP)
+			require.NoError(t, err, "SSH principal must be one address")
+
+			if _, live := sources[ip]; !live {
+				sources[ip] = 0 // Also probe stale or invented emitted addresses.
+			}
+		}
+
+		for login, local := range rule.SSHUsers {
+			require.Contains(t, []string{"root", "alice", "bob", "charlie", "0"}, login, "unsupported SSH login")
+			require.True(t, local == "" || (login != "0" && local == login), "unsupported SSH mapping")
+		}
+
+		require.NotNil(t, rule.Action, "unsupported SSH action")
+
+		wantAction := tailcfg.SSHAction{}
+
+		switch {
+		case rule.Action.Reject:
+			wantAction.Reject = true
+		case rule.Action.Accept:
+			wantAction = tailcfg.SSHAction{Accept: true, AllowAgentForwarding: true, AllowLocalPortForwarding: true, AllowRemotePortForwarding: true}
+		default:
+			wantAction.HoldAndDelegate = serverURL + "/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID?local_user=$LOCAL_USER"
+		}
+
+		require.Equal(t, &wantAction, rule.Action, "unsupported SSH action fields")
+	}
+
+	for _, ip := range slices.SortedFunc(maps.Keys(sources), netip.Addr.Compare) {
+		for _, login := range []string{"root", "alice", "bob", "charlie", "0"} {
+			want := "deny"
+			if id := sources[ip]; id != 0 {
+				want = intent.Decision(m, id, destination, login)
+			}
+
+			require.Equal(t, want, sshDecision(policy, ip, login), "SSH decision source=%s destination=%d login=%s", ip, destination, login)
+		}
+	}
+}
+
+// Pinned tailssh matchRuleWithUserLookup processes the first matching rule;
+// Reject bypasses SSHUsers. Wildcard and '=' are rejected above because they
+// require account lookup outside this domain. An empty exact mapping denies.
+func sshDecision(policy *tailcfg.SSHPolicy, source netip.Addr, login string) string {
+	for _, rule := range policy.Rules {
+		matches := slices.ContainsFunc(rule.Principals, func(p *tailcfg.SSHPrincipal) bool {
+			ip, _ := netip.ParseAddr(p.NodeIP)
+			return ip == source
+		})
+		if !matches {
+			continue
+		}
+
+		if rule.Action.Reject {
+			return "deny"
+		}
+
+		if rule.SSHUsers[login] == "" {
+			continue
+		}
+
+		if rule.Action.Accept {
+			return "accept"
+		}
+
+		return "check"
+	}
+
+	return "deny"
+}

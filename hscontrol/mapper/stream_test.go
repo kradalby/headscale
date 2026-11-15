@@ -8503,6 +8503,7 @@ type streamPropertyPolicy struct {
 	kind      int
 	intent    *propcheck.PacketIntent
 	appIntent *propcheck.AppIntent
+	sshIntent *propcheck.SSHIntent
 }
 
 const maxStreamPropertyNodeID types.NodeID = 255
@@ -8521,6 +8522,7 @@ type streamPropertySystem struct {
 	policyDoc    []byte
 	packetIntent *propcheck.PacketIntent
 	appIntent    *propcheck.AppIntent
+	sshIntent    *propcheck.SSHIntent
 	policies     []streamPropertyPolicy
 	stagedPolicy streamOperation
 	world        propcheck.World
@@ -8674,7 +8676,7 @@ func (p *streamPropertySystem) stagePolicy(t *rapid.T, op streamOperation) {
 		require.NoError(t, os.Rename(p.cfg.Policy.Path+".next", p.cfg.Policy.Path))
 	}
 
-	p.stagedPolicy = streamOperation{doc: slices.Clone(op.doc), policy: op.policy, intent: op.intent, appIntent: op.appIntent, reject: op.reject}
+	p.stagedPolicy = streamOperation{doc: slices.Clone(op.doc), policy: op.policy, intent: op.intent, appIntent: op.appIntent, sshIntent: op.sshIntent, reject: op.reject}
 }
 
 // Active expectations advance only after acceptance. Refused files remain on
@@ -8725,7 +8727,8 @@ func (p *streamPropertySystem) inputPolicy(t *rapid.T, op streamOperation) {
 
 	require.Equal(t, wantRev, p.state.Snapshot().Rev(), "policy publication")
 	p.policy, p.policyDoc, p.packetIntent, p.appIntent = op.policy, slices.Clone(op.doc), op.intent, op.appIntent
-	p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(op.doc), kind: op.policy, intent: op.intent, appIntent: op.appIntent})
+	p.sshIntent = op.sshIntent
+	p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(op.doc), kind: op.policy, intent: op.intent, appIntent: op.appIntent, sshIntent: op.sshIntent})
 }
 
 // applyStreamPropertyWire crosses the real encoder boundary. Removal frames
@@ -8878,6 +8881,11 @@ func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *s
 	t.Helper()
 	checkStreamPacketIntent(t, p.world, streamPacketIntent(p.world, p.policy, p.packetIntent), id, session.client)
 	checkStreamAppIntent(t, p.world, p.appIntent, id, session.client)
+
+	if p.sshIntent != nil {
+		propcheck.CheckSSHIntent(t, p.world, p.sshIntent, id, session.client.ssh, p.cfg.ServerURL)
+	}
+
 	checkStreamNodeInputs(t, p.world, id, session.client, p.cfg.DNSConfig.BaseDomain, p.packetIntent != nil || (p.policy >= 0 && p.policy <= 2))
 
 	freshHub := NewHub()
@@ -9098,6 +9106,7 @@ type streamOperation struct {
 	doc          []byte
 	intent       *propcheck.PacketIntent
 	appIntent    *propcheck.AppIntent
+	sshIntent    *propcheck.SSHIntent
 	reject       bool
 	user         types.User
 	records      []tailcfg.DNSRecord
@@ -9113,7 +9122,7 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 
 	operations := kinds
 	if len(operations) == 0 {
-		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request", "invalid-policy"}
+		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "ssh-policy", "ssh-deny", "ssh-mixed", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request", "invalid-policy"}
 		if len(ids) > 3 {
 			operations = append(operations, "delete")
 		}
@@ -9216,6 +9225,21 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 		}
 
 		result.policy, result.doc = -1, result.appIntent.Document(t, result.intent)
+	case "ssh-policy", "ssh-deny", "ssh-mixed":
+		result.intent, result.appIntent = &propcheck.PacketIntent{}, &propcheck.AppIntent{}
+
+		result.sshIntent = &propcheck.SSHIntent{}
+		if op != "ssh-deny" {
+			result.sshIntent = propcheck.DrawSSHIntent(t, p.world)
+		}
+
+		if op == "ssh-mixed" {
+			result.intent = propcheck.DrawPacketIntent(t, p.world)
+			result.appIntent = propcheck.DrawAppIntent(t, p.world)
+		}
+
+		result.policy = -1
+		result.doc = result.sshIntent.AppendDocument(t, result.appIntent.Document(t, result.intent))
 	case "policy-order", "policy-duplicate":
 		doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
 		require.NoError(t, err)
@@ -9236,9 +9260,15 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 			result.doc, err = json.Marshal(previous)
 			require.NoError(t, err)
 		}
+
+		if p.sshIntent != nil {
+			result.sshIntent = p.sshIntent.Reordered(op == "policy-duplicate")
+			result.doc = result.sshIntent.AppendDocument(t, result.doc)
+		}
 	case "policy-restore":
 		saved := p.policies[rapid.IntRange(0, len(p.policies)-1).Draw(t, "policy-ancestor")]
 		result.policy, result.doc, result.intent, result.appIntent = saved.kind, slices.Clone(saved.doc), saved.intent, saved.appIntent
+		result.sshIntent = saved.sshIntent
 	case "user":
 		u := p.world.Users[rapid.IntRange(0, 2).Draw(t, "user")]
 
@@ -9272,6 +9302,7 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 		require.NoError(t, err)
 
 		result.policy, result.intent, result.appIntent = p.policy, p.packetIntent, p.appIntent
+		result.sshIntent = p.sshIntent
 	case "add":
 		result.node = p.drawNode(t, p.lastNodeID+1)
 	case "request", "stale-request":
@@ -9332,10 +9363,18 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 			result.appIntent = propcheck.DrawAppIntent(t, p.world)
 			result.doc = result.appIntent.Document(t, result.intent)
 		}
+
+		if p.sshIntent != nil {
+			result.sshIntent = propcheck.DrawSSHIntent(t, p.world)
+			result.doc = result.sshIntent.AppendDocument(t, result.doc)
+		}
 	case "file-reload":
 		result.policy, result.doc, result.intent, result.appIntent, result.reject = p.stagedPolicy.policy, slices.Clone(p.stagedPolicy.doc), p.stagedPolicy.intent, p.stagedPolicy.appIntent, p.stagedPolicy.reject
+		result.sshIntent = p.stagedPolicy.sshIntent
 	case "file-same", "file-comment":
 		result.policy, result.doc, result.intent, result.appIntent = p.policy, slices.Clone(p.policyDoc), p.packetIntent, p.appIntent
+
+		result.sshIntent = p.sshIntent
 		if op == "file-comment" {
 			doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
 			require.NoError(t, err)
@@ -9362,7 +9401,7 @@ func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 	beforeDERP := p.effectiveDERP(t)
 
 	switch op.kind {
-	case "policy", "generated-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "policy-order", "policy-duplicate", "policy-restore", "derp-policy", "file-stage", "file-reload", "file-same", "file-comment", "file-empty", "file-missing", "file-test-failure":
+	case "policy", "generated-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "ssh-policy", "ssh-deny", "ssh-mixed", "policy-order", "policy-duplicate", "policy-restore", "derp-policy", "file-stage", "file-reload", "file-same", "file-comment", "file-empty", "file-missing", "file-test-failure":
 		p.inputPolicy(t, op)
 	case "invalid-policy":
 		op.doc, op.reject = []byte(`{"grants":`), true
@@ -9730,10 +9769,14 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 				initial = "app-policy"
 			}
 
+			if slices.Contains(kinds, "ssh-policy") {
+				initial = "ssh-policy"
+			}
+
 			p.apply(t, p.drawOperation(t, initial))
 
 			if mode != types.PolicyModeFile {
-				p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: p.policy, intent: p.packetIntent, appIntent: p.appIntent}}
+				p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: p.policy, intent: p.packetIntent, appIntent: p.appIntent, sshIntent: p.sshIntent}}
 			}
 
 			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
@@ -9750,6 +9793,7 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			oldWorld := p.world.Clone()
 			oldIntent := streamPacketIntent(oldWorld, p.policy, p.packetIntent)
 			oldAppIntent := p.appIntent
+			oldSSHIntent := p.sshIntent
 			oldIdentityAddresses := oldIntent != nil || (p.policy >= 0 && p.policy <= 2)
 			oldDERP := p.effectiveDERP(t)
 			oldNode := old.ListNodes().At(0).ID()
@@ -9761,6 +9805,11 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			applyStreamPropertyWire(t, oldHub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, oldMap)})
 			checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, oldClient)
 			checkStreamAppIntent(t, oldWorld, oldAppIntent, oldNode, oldClient)
+
+			if oldSSHIntent != nil {
+				propcheck.CheckSSHIntent(t, oldWorld, oldSSHIntent, oldNode, oldClient.ssh, p.cfg.ServerURL)
+			}
+
 			checkStreamNodeInputs(t, oldWorld, oldNode, oldClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses)
 			oldHub.Close()
 
@@ -9806,6 +9855,11 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 
 			checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, lateClient)
 			checkStreamAppIntent(t, oldWorld, oldAppIntent, oldNode, lateClient)
+
+			if oldSSHIntent != nil {
+				propcheck.CheckSSHIntent(t, oldWorld, oldSSHIntent, oldNode, lateClient.ssh, p.cfg.ServerURL)
+			}
+
 			checkStreamNodeInputs(t, oldWorld, oldNode, lateClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses)
 
 			last = snap
@@ -9823,6 +9877,10 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			mandatory := []string{"policy-order", "policy-duplicate", "packet-deny", "policy-restore", "packet-policy", "identity"}
 			if slices.Contains(kinds, "app-policy") {
 				mandatory = []string{"app-deny", "policy-restore", "mixed-policy", "app-policy", "identity", "policy-order", "policy-duplicate"}
+			}
+
+			if slices.Contains(kinds, "ssh-policy") {
+				mandatory = []string{"ssh-deny", "policy-restore", "ssh-policy", "identity", "policy-order", "policy-duplicate", "ssh-mixed"}
 			}
 
 			for _, operation := range mandatory {
@@ -11092,4 +11150,146 @@ func checkStreamSubscription(t *rapid.T, domain string) {
 	p.check(t, final)
 	p.checkWorld(t)
 	p.checkHistory(t)
+}
+
+func TestRapidStreamSSHIntent(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			runRapidStreamSystem(t, mode, "ssh-policy", "ssh-deny", "ssh-mixed", "policy-order", "policy-duplicate", "policy-restore", "identity", "user", "derp-policy", "noop")
+		})
+	}
+}
+
+// Keep revocation and restoration reachable even when broader generated policy
+// histories stop first at an existing representation/audit diagnostic.
+func TestStreamSSHIntentHistory(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+			rapid.Check(t, func(t *rapid.T) {
+				p := newStreamPropertySystem(t, mode)
+				packet, app := &propcheck.PacketIntent{}, &propcheck.AppIntent{}
+				first := &propcheck.SSHIntent{Grants: []propcheck.SSHGrant{
+					{Src: propcheck.PacketSelector{User: "u1"}, DstTag: "tag:srv", Users: []string{"alice", "bob"}},
+					{Src: propcheck.PacketSelector{User: "u1"}, DstTag: "tag:srv", Check: true, Users: []string{"alice"}},
+					{Src: propcheck.PacketSelector{User: "u1"}, Self: true, Users: []string{"root"}},
+					{Src: propcheck.PacketSelector{Tag: "tag:router"}, DstTag: "tag:srv", Users: []string{"bob"}},
+				}}
+				second := &propcheck.SSHIntent{Grants: []propcheck.SSHGrant{
+					{Src: propcheck.PacketSelector{User: "u2"}, DstTag: "tag:srv", Users: []string{"root"}},
+				}}
+				last := p.state.Snapshot()
+				flush := func() {
+					snap := p.state.Snapshot()
+					all, wake := Route(last, snap, snap.Since(last))
+					p.hub.advance(snap)
+
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if p.sessions[id].down {
+							p.open(t, id, snap, false)
+						} else if _, named := wake[id]; all || named {
+							p.update(t, id, snap, rapid.IntRange(0, 2).Draw(t, "ssh delivery"))
+						}
+					}
+					// Unwoken clients must already be correct before reconnects.
+					p.check(t, snap)
+					// Finish all destinations while revoked policy still exists.
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if p.sessions[id].down {
+							p.open(t, id, snap, false)
+						}
+					}
+
+					last = snap
+				}
+				set := func(ssh *propcheck.SSHIntent) {
+					p.apply(t, streamOperation{kind: "ssh-policy", policy: -1, doc: ssh.AppendDocument(t, app.Document(t, packet)), intent: packet, appIntent: app, sshIntent: ssh})
+					flush()
+				}
+				set(first)
+				require.Equal(t, "check", first.Decision(p.world, 1, 3, "alice"))
+				require.Empty(t, p.sessions[3].client.peers, "SSH alone must not imply peer permission")
+				old, oldWorld := p.state.Snapshot(), p.world.Clone()
+				oldPacket, oldApp := packet, app
+
+				for _, ssh := range []*propcheck.SSHIntent{second, {}, first} {
+					set(ssh)
+				}
+
+				packet = &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{{
+					Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{Tag: "tag:srv"}, Protocol: ipproto.TCP, First: 22, Last: 22,
+				}}}
+				app = &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+					Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{Tag: "tag:srv"}, Caps: tailcfg.PeerCapMap{"example.com/cap/read": {`{"role":"read"}`}},
+				}}}
+
+				set(first)
+
+				packet, app = oldPacket, oldApp
+
+				set(first)
+
+				if mode == types.PolicyModeFile {
+					p.apply(t, streamOperation{kind: "file-stage", policy: -1, doc: second.AppendDocument(t, app.Document(t, packet)), intent: packet, appIntent: app, sshIntent: second})
+					flush()
+					require.Same(t, first, p.sshIntent)
+					p.apply(t, p.drawOperation(t, "file-reload"))
+					flush()
+					require.Same(t, second, p.sshIntent)
+
+					for _, kind := range []string{"file-same", "file-comment", "invalid-policy", "file-reload", "file-empty", "file-reload", "file-missing", "file-reload", "file-test-failure", "file-reload"} {
+						p.apply(t, p.drawOperation(t, kind))
+						flush()
+						require.Same(t, second, p.sshIntent)
+					}
+
+					set(first)
+				}
+
+				saved := p.policies[len(p.policies)-1]
+
+				set(second)
+
+				p.policies = []streamPropertyPolicy{saved}
+				p.apply(t, p.drawOperation(t, "policy-restore"))
+				flush()
+				require.Same(t, first, p.sshIntent)
+
+				for _, id := range []types.NodeID{1, 3} {
+					before := p.world.Nodes[id].Clone()
+					changed := before.Clone()
+
+					changed.Tags = []string{"tag:other"}
+					if id == 3 {
+						changed.Tags = nil
+					}
+
+					p.apply(t, streamOperation{kind: "identity", before: before, node: changed})
+					flush()
+					p.apply(t, streamOperation{kind: "identity", before: changed, node: before})
+					flush()
+				}
+
+				for _, kind := range []string{"derp-policy", "policy-order", "policy-duplicate"} {
+					p.apply(t, p.drawOperation(t, kind))
+					flush()
+				}
+
+				p.apply(t, streamOperation{kind: "delete", node: p.world.Nodes[1].Clone()})
+				flush()
+
+				late, err := NewStream(p.cfg, p.hub, 3, capVer).r.render(old)
+				require.NoError(t, err)
+
+				client := newPropertyClient(&tailcfg.MapResponse{})
+				applyStreamPropertyWire(t, p.hub, client, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
+				propcheck.CheckSSHIntent(t, oldWorld, first, 3, client.ssh, p.cfg.ServerURL)
+				checkStreamPacketIntent(t, oldWorld, oldPacket, 3, client)
+				checkStreamAppIntent(t, oldWorld, oldApp, 3, client)
+				p.setPolicy(t, 1)
+				flush()
+				require.Nil(t, p.sshIntent, "unrelated policy must clear SSH metadata")
+			})
+		})
+	}
 }

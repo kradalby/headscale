@@ -7960,18 +7960,18 @@ func TestIncrementalAppGrantOrderInvalidatesFilter(t *testing.T) {
 // Lost grants, broadened ports and creator-as-owner mistakes must disagree with
 // this input model even when incremental and full compiles agree with each other.
 func TestIncrementalPolicyRapidPacketIntent(t *testing.T) {
-	runIncrementalPolicyIntent(t, false, true)
+	runIncrementalPolicyIntent(t, false, false, true)
 }
 
 func TestIncrementalPolicyRapidAppIntent(t *testing.T) {
-	runIncrementalPolicyIntent(t, true, true)
+	runIncrementalPolicyIntent(t, true, false, true)
 }
 
 func TestIncrementalPolicyRapidAppReplacements(t *testing.T) {
-	runIncrementalPolicyIntent(t, true, false)
+	runIncrementalPolicyIntent(t, true, false, false)
 }
 
-func runIncrementalPolicyIntent(t *testing.T, apps, reorder bool) {
+func runIncrementalPolicyIntent(t *testing.T, apps, ssh, reorder bool) {
 	t.Helper()
 	rapid.Check(t, func(t *rapid.T) {
 		in := incrementalInput{users: []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}, {ID: 3, Name: "u3"}}}
@@ -7996,10 +7996,17 @@ func runIncrementalPolicyIntent(t *testing.T, apps, reorder bool) {
 			in.doc = appIntent.Document(t, intent)
 		}
 
+		var sshIntent *propcheck.SSHIntent
+		if ssh {
+			sshIntent = propcheck.DrawSSHIntent(t, world(in))
+			in.doc = sshIntent.AppendDocument(t, in.doc)
+		}
+
 		type savedPolicy struct {
 			doc       []byte
 			intent    *propcheck.PacketIntent
 			appIntent *propcheck.AppIntent
+			sshIntent *propcheck.SSHIntent
 		}
 
 		// Every history replaces and restores a document; generated steps add
@@ -8014,12 +8021,13 @@ func runIncrementalPolicyIntent(t *testing.T, apps, reorder bool) {
 
 		ops = append(ops, rapid.SliceOfN(rapid.SampledFrom(choices), 1, 8).Draw(t, "intent operations")...)
 		history := make([]savedPolicy, 1, 1+len(ops))
-		history[0] = savedPolicy{in.doc, intent, appIntent}
+		history[0] = savedPolicy{in.doc, intent, appIntent, sshIntent}
 
 		type retained struct {
 			world     propcheck.World
 			intent    *propcheck.PacketIntent
 			appIntent *propcheck.AppIntent
+			sshIntent *propcheck.SSHIntent
 			manager   *PolicyManager
 		}
 
@@ -8035,10 +8043,10 @@ func runIncrementalPolicyIntent(t *testing.T, apps, reorder bool) {
 			require.NoError(t, err)
 
 			m := world(in)
-			snapshots = append(snapshots, retained{m, intent, appIntent, next})
+			snapshots = append(snapshots, retained{m, intent, appIntent, sshIntent, next})
 			// Packet order is not authorization. Existing equivalence properties
 			// retain their stronger representation diagnostics separately.
-			for _, saved := range append(slices.Clone(snapshots), retained{m, intent, appIntent, fresh}) {
+			for _, saved := range append(slices.Clone(snapshots), retained{m, intent, appIntent, sshIntent, fresh}) {
 				classes := saved.manager.BuildPeerClasses(saved.manager.nodes, nil)
 				for _, id := range slices.Sorted(maps.Keys(saved.world.Nodes)) {
 					n := saved.world.Nodes[id]
@@ -8047,6 +8055,14 @@ func runIncrementalPolicyIntent(t *testing.T, apps, reorder bool) {
 
 					for _, peer := range propcheck.CheckPacketIntent(t, saved.world, saved.intent, id, rules) {
 						require.Contains(t, classes.Peers(id), peer, "required incoming/outgoing packet peer")
+					}
+
+					if saved.sshIntent != nil {
+						for _, url := range incrementalURLs {
+							policy, err := saved.manager.SSHPolicy(url, n.View())
+							require.NoError(t, err)
+							propcheck.CheckSSHIntent(t, saved.world, saved.sshIntent, id, policy, url)
+						}
 					}
 
 					if saved.appIntent != nil {
@@ -8071,7 +8087,7 @@ func runIncrementalPolicyIntent(t *testing.T, apps, reorder bool) {
 				in.doc = intent.Document(t)
 			case "restore":
 				saved := history[rapid.IntRange(0, len(history)-1).Draw(t, "intent ancestor")]
-				in.doc, intent, appIntent = slices.Clone(saved.doc), saved.intent, saved.appIntent
+				in.doc, intent, appIntent, sshIntent = slices.Clone(saved.doc), saved.intent, saved.appIntent, saved.sshIntent
 			case "order", "duplicate":
 				if appIntent != nil {
 					appIntent = appIntent.Reordered(op == "duplicate")
@@ -8092,9 +8108,22 @@ func runIncrementalPolicyIntent(t *testing.T, apps, reorder bool) {
 				in.doc = appIntent.Document(t, intent)
 			}
 
+			if ssh {
+				switch op {
+				case "policy":
+					sshIntent = propcheck.DrawSSHIntent(t, world(in))
+				case "deny":
+					sshIntent = &propcheck.SSHIntent{}
+				case "order", "duplicate":
+					sshIntent = sshIntent.Reordered(op == "duplicate")
+				}
+
+				in.doc = sshIntent.AppendDocument(t, in.doc)
+			}
+
 			check()
 
-			history = append(history, savedPolicy{slices.Clone(in.doc), intent, appIntent})
+			history = append(history, savedPolicy{slices.Clone(in.doc), intent, appIntent, sshIntent})
 		}
 	})
 }
@@ -8413,6 +8442,139 @@ func TestAppIntentRejectsCorruptedConsumerRules(t *testing.T) {
 			// both compiler paths must still fail this input-derived check.
 			require.PanicsWithValue(t, failure, func() {
 				propcheck.CheckAppIntent(failure, m, want, nodes[1].ID, rules)
+			})
+			require.Contains(t, failure.message, message)
+		})
+	}
+}
+
+func TestIncrementalPolicyRapidSSHIntent(t *testing.T) {
+	runIncrementalPolicyIntent(t, false, true, true)
+}
+
+func TestSSHIntentOwnershipAndProtocol(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: users}
+
+	nodes := make(types.Nodes, 0, 5)
+
+	for i, owner := range []int{0, 0, 1, 0, 1} {
+		n := node(fmt.Sprintf("n%d", i), fmt.Sprintf("100.64.0.%d", i+1), fmt.Sprintf("fd7a:115c:a1e0::%d", i+1), users[owner])
+
+		n.ID = types.NodeID(i + 1) //nolint:gosec // Five positive IDs.
+		if i >= 3 {
+			n.Tags = []string{"tag:srv"}
+		}
+
+		m.Put(n)
+		nodes = append(nodes, n)
+	}
+
+	intent := &propcheck.SSHIntent{Grants: []propcheck.SSHGrant{
+		{Src: propcheck.PacketSelector{User: "u1"}, DstTag: "tag:srv", Users: []string{"alice", "bob"}},
+		{Src: propcheck.PacketSelector{User: "u1"}, DstTag: "tag:srv", Check: true, Users: []string{"alice"}},
+		{Src: propcheck.PacketSelector{User: "u1"}, Self: true, Users: []string{"root"}},
+		{Src: propcheck.PacketSelector{Tag: "tag:srv"}, DstTag: "tag:srv", Users: []string{"bob"}},
+	}}
+	for _, tc := range []struct {
+		src, dst        types.NodeID
+		login, decision string
+	}{
+		{1, 4, "alice", "check"},
+		{1, 4, "bob", "accept"},
+		{1, 4, "root", "deny"},
+		{1, 4, "charlie", "deny"},
+		{4, 5, "alice", "deny"},
+		{4, 5, "bob", "accept"},
+		{1, 2, "root", "accept"},
+		{1, 3, "root", "deny"},
+		{4, 2, "root", "deny"},
+	} {
+		require.Equal(t, tc.decision, intent.Decision(m, tc.src, tc.dst, tc.login))
+		require.Equal(t, tc.decision, intent.Reordered(true).Decision(m, tc.src, tc.dst, tc.login))
+	}
+
+	packet := &propcheck.PacketIntent{}
+	for _, in := range []*propcheck.SSHIntent{intent, intent.Reordered(true), {}, intent} {
+		pm, err := NewPolicyManager(in.AppendDocument(t, packet.Document(t)), users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		for id, n := range m.Nodes {
+			policy, err := pm.SSHPolicy("https://control.test", n.View())
+			require.NoError(t, err)
+			propcheck.CheckSSHIntent(t, m, in, id, policy, "https://control.test")
+
+			rules, err := pm.FilterForNode(n.View())
+			require.NoError(t, err)
+			require.Empty(t, propcheck.CheckPacketIntent(t, m, packet, id, rules))
+		}
+	}
+}
+
+// Literal wire rules anchor the protocol interpretation independently of the
+// compiler. Each corruption calls the same checker used by delivered streams.
+func TestSSHIntentRejectsCorruptedRules(t *testing.T) {
+	user := types.User{ID: 1, Name: "u1"}
+	src := node("source", "100.64.0.1", "fd7a:115c:a1e0::1", user)
+	dst := node("server", "100.64.0.2", "fd7a:115c:a1e0::2", user)
+	src.ID, dst.ID, dst.Tags = 1, 2, []string{"tag:srv"}
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{1: src, 2: dst}, Users: []types.User{user}}
+	intent := &propcheck.SSHIntent{Grants: []propcheck.SSHGrant{
+		{Src: propcheck.PacketSelector{User: "u1"}, DstTag: "tag:srv", Users: []string{"alice", "bob"}},
+		{Src: propcheck.PacketSelector{User: "u1"}, DstTag: "tag:srv", Check: true, Users: []string{"alice"}},
+	}}
+
+	const url = "https://control.test"
+
+	literal := `{"rules":[{"principals":[{"nodeIP":"100.64.0.1"},{"nodeIP":"fd7a:115c:a1e0::1"}],"sshUsers":{"alice":"alice","root":"","0":""},"action":{"holdAndDelegate":"https://control.test/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID?local_user=$LOCAL_USER"}},{"principals":[{"nodeIP":"100.64.0.1"},{"nodeIP":"fd7a:115c:a1e0::1"}],"sshUsers":{"alice":"alice","bob":"bob","root":"","0":""},"action":{"accept":true,"allowAgentForwarding":true,"allowLocalPortForwarding":true,"allowRemotePortForwarding":true}}]}`
+
+	var valid tailcfg.SSHPolicy
+	require.NoError(t, json.Unmarshal([]byte(literal), &valid))
+	propcheck.CheckSSHIntent(t, m, intent, 2, &valid, url)
+	propcheck.CheckSSHIntent(t, m, &propcheck.SSHIntent{}, 2, &tailcfg.SSHPolicy{}, url)
+	// Reject bypasses SSHUsers and stops before a later accepting rule.
+	rejected := &tailcfg.SSHPolicy{Rules: append([]*tailcfg.SSHRule{{Principals: valid.Rules[0].Principals, Action: &tailcfg.SSHAction{Reject: true}}}, valid.Rules...)}
+	propcheck.CheckSSHIntent(t, m, &propcheck.SSHIntent{}, 2, rejected, url)
+
+	for _, mutation := range []string{"principal", "login", "root", "foreign", "deleted-source", "revoked", "order", "wildcard", "any", "duration", "url"} {
+		t.Run(mutation, func(t *testing.T) {
+			var policy tailcfg.SSHPolicy
+			require.NoError(t, json.Unmarshal([]byte(literal), &policy))
+
+			want, world, message := intent, m.Clone(), "SSH decision"
+
+			switch mutation {
+			case "principal":
+				policy.Rules[1].Principals = policy.Rules[1].Principals[1:]
+			case "login":
+				delete(policy.Rules[1].SSHUsers, "bob")
+			case "root":
+				policy.Rules[1].SSHUsers["root"] = "root"
+			case "foreign":
+				policy.Rules[1].Principals = append(policy.Rules[1].Principals, &tailcfg.SSHPrincipal{NodeIP: "198.51.100.123"})
+			case "deleted-source":
+				delete(world.Nodes, 1)
+			case "revoked":
+				want = &propcheck.SSHIntent{}
+			case "order":
+				slices.Reverse(policy.Rules)
+			case "wildcard":
+				policy.Rules[1].SSHUsers["*"] = "="
+				message = "unsupported SSH login"
+			case "any":
+				policy.Rules[1].Principals[0].Any = true
+				message = "unsupported SSH principal fields"
+			case "duration":
+				policy.Rules[0].Action.SessionDuration = time.Hour
+				message = "unsupported SSH action fields"
+			case "url":
+				policy.Rules[0].Action.HoldAndDelegate = "https://wrong.test"
+				message = "unsupported SSH action fields"
+			}
+
+			failure := &appIntentFailure{}
+			require.PanicsWithValue(t, failure, func() {
+				propcheck.CheckSSHIntent(failure, world, want, 2, &policy, url)
 			})
 			require.Contains(t, failure.message, message)
 		})

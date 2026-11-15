@@ -501,3 +501,73 @@ transport timing. Existing properties retain those separate domains. Deletion
 is deliberately excluded because the shared operation adapter manually forgets
 sessions, which would mask watcher cleanup. No socket, HTTP, Noise or Tailscale
 process is exercised, and quiescence establishes no latency/performance claim.
+
+## Independent SSH authorization intent
+
+`propcheck.SSHIntent` owns immutable grants with one user or tag source and one
+explicit tag or `Self` destination. It reuses `PacketSelector` ownership: tagged
+nodes do not inherit their creator's user permissions, and self means devices
+owned by the same user. Check and self sources are user-only. Logins are explicit
+`root`, `alice` and `bob`; `charlie` and numeric `0` remain denied. Check dominates
+accept regardless of input rule order. `Decision` reads only those inputs and
+`World`, never compiled policy, fresh output or Headscale's SSH test evaluator.
+
+`AppendDocument` adds the SSH rules and missing tag declarations to an existing
+packet/app document. Explicit empty packet intent checks that SSH-only documents
+deny the bounded TCP/UDP probes between distinct nodes. Empty app intent also checks capability denial. Mixed
+histories carry all three intents; unrelated policy replacements clear the SSH
+metadata. Active, staged, restored, commented, reordered, duplicated and DERP-only
+documents retain the corresponding immutable intent. Historical checks retain
+both the old World and old intent; late rendering uses `r.render(old)` plus
+`fullResponse`, because `Initial(old)` may intentionally advance to Hub's latest
+snapshot.
+
+The pinned Tailscale evaluator is unexported. `CheckSSHIntent` instead checks a
+small, strict interpretation of the delivered protocol. Its source contracts are
+[`tailcfg.SSHPolicy`, `SSHRule`, `SSHPrincipal` and `SSHAction`](https://github.com/tailscale/tailscale/blob/f7c1b8e52600/tailcfg/tailcfg.go#L2672)
+and [`matchRuleWithUserLookup` / `mapLocalUser`](https://github.com/tailscale/tailscale/blob/f7c1b8e52600/ssh/tailssh/tailssh.go#L1608).
+Rules are first-match; principals match individual NodeIP addresses, empty exact
+login mappings do not match, reject bypasses login matching, and accept/delegate
+remain distinct. Whole-struct shape checks reject other principal fields,
+expiration, environment rules, recording and unsupported action fields. The
+check URL must use the configured ServerURL and known substitution placeholders;
+SessionDuration must be zero. Check periods are server-side, not session limits.
+Wildcard and `=` mappings are rejected, so no OS-account or root-UID assumption
+is hidden in the checker. The high-level check precedence and self semantics
+follow the [SSH policy contract](https://tailscale.com/docs/reference/syntax/policy-file#ssh).
+
+Checks cover every live source address, including source equal to destination,
+all five probe logins, two reserved foreign addresses, and every emitted
+principal address. An emitted address absent from World must deny, covering
+stale deleted sources and arbitrary foreign broadening. Literal protocol rules
+anchor accept, delegate, empty denial and reject precedence. Corruption controls
+call the same checker and require its assertion panic and message: dropped
+principal/login, broadened root/foreign address, deleted source, stale revoked
+rules, accept before check, wildcard/Any fields, wrong delegate URL and duration.
+They do not rely on warm/fresh disagreement.
+
+`TestIncrementalPolicyRapidSSHIntent` shares the incremental packet/app history
+and checks old, warm and fresh managers independently, including both server
+URLs, identity/address-family changes, reorder/duplicate and replace/deny/restore.
+`TestRapidStreamSSHIntent` shares the composed DB/file driver and keeps all audit
+diagnostics enabled. Every completed session map is checked before later writes.
+`TestStreamSSHIntentHistory` keeps fixed positive phases reachable: competing
+accept/check rules, login replacement, clear/restore, packet/app composition,
+staging/reload/refusal, source/destination ownership changes, DERP edits,
+reorder/duplicate and source deletion. Unwoken clients are checked before any
+forced reconnect; all destinations finish revoked states before restoration.
+Its SSH-only tagged destination has no ordinary peers.
+
+```sh
+go test -p 1 ./hscontrol/policy/v2 -run '^(TestSSHIntentOwnershipAndProtocol|TestSSHIntentRejectsCorruptedRules|TestIncrementalPolicyRapidSSHIntent)$' -count=1 -rapid.seed=2026111591 -rapid.checks=300 -rapid.nofailfile
+go test -p 1 ./hscontrol/mapper -run '^TestStreamSSHIntentHistory$' -count=1 -rapid.seed=2026111591 -rapid.checks=20 -rapid.nofailfile
+go test -p 1 ./hscontrol/mapper -run '^TestRapidStreamSSHIntent$' -count=1 -rapid.seed=2026111591 -rapid.checks=3 -rapid.nofailfile
+```
+
+This is control-plane authorization evidence, not a successful SSH connection.
+It excludes literal-IP selectors, general aliases, nonroot/localpart, local
+account databases, posture, authentication callbacks, check cookies, recording,
+OS behavior and network processes. The strict emitted shape deliberately fails
+if the compiler starts emitting another form; extend the documented protocol
+domain before accepting it. No production behavior or subscription fixture is
+changed.
