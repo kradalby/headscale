@@ -235,6 +235,8 @@ func checkRouteSnapshot(t *rapid.T, snap *Snapshot, records []propcheck.RouteNod
 
 // TestPrimaryRoutesProperty uses the shared pure reference after every commit,
 // retaining global incumbents across membership, policy and availability edits.
+//
+//nolint:gocyclo // Keep each generated input transition beside its production write.
 func TestPrimaryRoutesProperty(t *testing.T) {
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
 	rapid.Check(t, func(t *rapid.T) {
@@ -418,6 +420,7 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 				online, unhealthy := rapid.Bool().Draw(t, "online"), rapid.Bool().Draw(t, "unhealthy")
 
 				updates := make(map[types.NodeID]UpdateNodeFunc)
+
 				for i := types.NodeID(1); i <= 5; i++ {
 					update(uint64(i), func(record *propcheck.RouteNode) { record.Online, record.Unhealthy = online, unhealthy })
 					updates[i] = func(n *types.Node) { n.IsOnline, n.Unhealthy = new(online), unhealthy }

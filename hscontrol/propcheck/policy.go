@@ -97,6 +97,7 @@ func DrawPolicy(t *rapid.T) []byte {
 
 	pol["ssh"] = ssh
 	pol["nodeAttrs"] = []any{map[string]any{"target": pick(aliases), "attr": pick([]string{"foo", "bar", "randomize-client-port"})}}
+
 	pol["randomizeClientPort"] = rapid.Bool().Draw(t, "randomize port")
 	if dm := DrawDERPMap(t, true); dm != nil {
 		pol["derpMap"] = dm
