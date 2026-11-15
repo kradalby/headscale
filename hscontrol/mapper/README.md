@@ -29,7 +29,9 @@ without creating a test import cycle.
 Graph transactions, persistent maps and concurrency properties remain local to
 the graph package. Exporting their private test drivers would not add a shared
 contract to this composition. Existing `TestHubCoalescedCommitsConverge`
-exercises real graph subscriptions and Hub coalescing; existing
+exercises fixed graph subscription and Hub coalescing boundaries;
+`TestRapidStreamSubscription` adds generated subscription histories using the
+shared composed fixture and downstream checks described below. Existing
 `TestStreamCatchesUpFromBeyondTheEditLog` exercises recovery beyond retained
 history. These remain enabled rather than being copied into another driver.
 
@@ -367,3 +369,54 @@ go test -p 1 ./hscontrol/mapper -run '^TestStreamMapRequestHistory$' -count=1 -r
 go test -p 1 ./hscontrol/mapper -run '^TestRapidStreamOperationContracts$/^request-hostinfo$' -count=1 -rapid.seed=2026111572 -rapid.checks=100 -rapid.nofailfile
 CGO_ENABLED=1 go test -race -p 1 ./hscontrol/mapper -run '^TestStreamMapRequestHistory$' -count=1 -rapid.seed=2026111573 -rapid.checks=10 -rapid.nofailfile
 ```
+
+## Generated subscription bridge
+
+`TestRapidStreamSubscription` bridges owned input histories through the real
+State graph subscription, `Hub.watch`, and `Session.Wakes`. It reuses
+`streamPropertySystem`, its operations and input adapters, complete `update`
+delivery, Hub JSON/zstd framing, cumulative client replay, World/node checks,
+route election, and the peer-history ledger. Each completed intermediate map
+runs `checkSession` before later writes can hide an incorrect delivery.
+
+Three bounded domains run separately: endpoint copies/changes/reversions under
+one simple policy; simple-policy replacements/reversions; and mixed bursts.
+Policies are allow-all, deny-all and member-to-self. Each history has zero to
+four prefix operations, optional completed intermediate consumers, and a
+mandatory positive witness. Endpoint witnesses use same-user nodes 1 and 4;
+policy witnesses use viewer 1, which always has same-user and cross-user peers.
+The fixture adds node 4 when its original fleet has only three nodes. Endpoint
+and policy reversion domains restore the watcher's original semantic inputs
+while a consumer retains a completed intermediate map.
+
+The required-wake model owns each viewer's last completed input projection:
+self and independently visible peer endpoints, peer membership, and directed
+live-node packet permission bits. Simple-policy visibility reuses the existing
+World-based reference. Permission bits follow the three literal policy intents,
+not compiled filters. A difference from final input requires a wake. The model
+never reads Route decisions, live Stream sent state, cache revisions or rendered
+outputs. This is a necessary-wake lower bound; additional conservative wakes
+are accepted. Endpoint lists are copied, and nil/empty lists are equivalent.
+
+The subscription starts before the batch, but the watcher starts only after all
+writes and intermediate deliveries complete. Empty session wake channels are
+asserted before starting it. A Rapid synctest bubble owns the fixture and all
+channels; `synctest.Wait` establishes quiescence after enqueue, rather than
+assuming `hub.latest` advancement means wakes were sent. Missing required wakes
+fail immediately without sleeps or a timing oracle. Only actual received wakes
+trigger final delivery. Every unwoken client must already satisfy the same final
+checks. The original World snapshot is checked against its retained owned copy.
+Every attempt closes and joins the watcher and closes its subscription, even
+when Rapid shrinks a failure. There is no global barrier write.
+
+```sh
+go test -p 1 ./hscontrol/mapper -run '^TestRapidStreamSubscription$' -count=1 -timeout=10m -rapid.seed=2026111570 -rapid.checks=100 -rapid.nofailfile
+CGO_ENABLED=1 go test -race -p 1 ./hscontrol/mapper -run '^TestRapidStreamSubscription$' -count=1 -timeout=10m -rapid.seed=2026111571 -rapid.checks=20 -rapid.nofailfile
+```
+
+This bridge does not model partial delivery, reconnect, membership deletion,
+history overrun, TTL/capacity, arbitrary policies, concurrent MapRequests, or
+transport timing. Existing properties retain those separate domains. Deletion
+is deliberately excluded because the shared operation adapter manually forgets
+sessions, which would mask watcher cleanup. No socket, HTTP, Noise or Tailscale
+process is exercised, and quiescence establishes no latency/performance claim.

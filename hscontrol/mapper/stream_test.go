@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unsafe"
 	"weak"
@@ -10668,4 +10669,153 @@ func TestStreamMapRequestHistory(t *testing.T) {
 			})
 		})
 	}
+}
+
+// streamSubscriptionInput owns the observable inputs last completed by one
+// viewer. It is a necessary-wake oracle, not a model of Route's invalidations.
+type streamSubscriptionInput struct {
+	endpoints map[types.NodeID][]netip.AddrPort
+	allowed   map[types.NodeID]bool
+}
+
+func (p *streamPropertySystem) subscriptionInput(t *rapid.T, viewer types.NodeID) streamSubscriptionInput {
+	require.Contains(t, []int{0, 1, 2}, p.policy)
+
+	input := streamSubscriptionInput{
+		endpoints: map[types.NodeID][]netip.AddrPort{},
+		allowed:   map[types.NodeID]bool{},
+	}
+	// expectedPeers takes only the owned World/simple-policy branch here.
+	peers := p.expectedPeers(t, viewer, nil, 0)
+	for _, id := range append(peers, viewer) {
+		input.endpoints[id] = append([]netip.AddrPort(nil), p.world.Nodes[id].Endpoints...)
+	}
+
+	self := p.world.Nodes[viewer]
+	for _, id := range peers {
+		peer := p.world.Nodes[id]
+		sameUser := len(self.Tags) == 0 && len(peer.Tags) == 0 && self.UserID != nil && peer.UserID != nil && *self.UserID == *peer.UserID
+		// Every simple-policy rule permits all ports/protocols; a directed
+		// live-node permission therefore needs only one input-owned bit.
+		input.allowed[id] = p.policy == 0 || p.policy == 2 && sameUser
+	}
+
+	return input
+}
+
+func TestRapidStreamSubscription(t *testing.T) {
+	for _, domain := range []string{"endpoint-revert", "policy-revert", "mixed"} {
+		t.Run(domain, func(t *testing.T) {
+			rapid.Check(t, func(t *rapid.T) {
+				rapid.SyncTest(t, func(t *rapid.T) {
+					checkStreamSubscription(t, domain)
+				})
+			})
+		})
+	}
+}
+
+func checkStreamSubscription(t *rapid.T, domain string) {
+	p := newStreamPropertySystem(t)
+	// Nodes 1 and 4 are same-user witnesses even under deny/self policy.
+	if len(p.world.Nodes) == 3 {
+		p.insert(t, 4)
+		p.open(t, 4, p.state.Snapshot(), false)
+	}
+
+	initialPolicy := rapid.IntRange(0, 2).Draw(t, "subscription-policy")
+	p.setPolicy(t, initialPolicy)
+	ids := slices.Sorted(maps.Keys(p.sessions))
+	delivered := map[types.NodeID]streamSubscriptionInput{}
+
+	complete := func(id types.NodeID) {
+		p.update(t, id, p.state.Snapshot(), 0)
+		delivered[id] = p.subscriptionInput(t, id)
+	}
+	for _, id := range ids {
+		complete(id)
+	}
+
+	sub := p.state.Subscribe()
+	defer sub.Close()
+
+	before, ownedBefore := p.state.Snapshot(), p.world.Clone()
+
+	for range rapid.IntRange(0, 4).Draw(t, "coalesced-prefix") {
+		if domain == "policy-revert" || domain == "mixed" && rapid.Bool().Draw(t, "policy-write") {
+			p.setPolicy(t, rapid.IntRange(0, 2).Draw(t, "simple-policy"))
+		} else {
+			p.apply(t, p.drawOperation(t, "endpoints", "noop", "revert"))
+		}
+
+		if rapid.Bool().Draw(t, "intermediate-completion") {
+			complete(rapid.SampledFrom(ids).Draw(t, "intermediate-viewer"))
+		}
+	}
+
+	if domain == "policy-revert" {
+		p.setPolicy(t, (initialPolicy+rapid.IntRange(1, 2).Draw(t, "policy-offset"))%3)
+		complete(1)
+		p.setPolicy(t, initialPolicy)
+	} else {
+		// Reserve an address outside the prefix generator's 192.0.2.0/24
+		// range so the intermediate witness always differs from its restore.
+		n := p.world.Nodes[1].Clone()
+		n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("198.51.100.1"), rapid.Uint16().Draw(t, "witness-port"))}
+		p.apply(t, streamOperation{kind: "endpoints", node: n, before: p.world.Nodes[1].Clone()})
+		complete(4)
+
+		if domain == "endpoint-revert" {
+			for _, id := range ids {
+				p.apply(t, streamOperation{kind: "endpoints", node: ownedBefore.Nodes[id].Clone(), before: p.world.Nodes[id].Clone()})
+			}
+		} else {
+			n = n.Clone()
+			n.Endpoints = nil
+			p.apply(t, streamOperation{kind: "endpoints", node: n, before: p.world.Nodes[1].Clone()})
+		}
+	}
+
+	final := p.state.Snapshot()
+	required := map[types.NodeID]bool{}
+
+	for _, id := range ids {
+		if !reflect.DeepEqual(delivered[id], p.subscriptionInput(t, id)) {
+			required[id] = true
+		}
+
+		select {
+		case <-p.sessions[id].stream.sess.Wakes():
+			t.Fatalf("viewer %d had a wake before the gated watcher started", id)
+		default:
+		}
+	}
+
+	require.NotEmpty(t, required, "each history must leave an input-owned required wake")
+	propcheck.CheckWorld(t, ownedBefore, before, p.probes)
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+
+		p.hub.watch(p.state, sub, before)
+	}()
+
+	t.Cleanup(func() { p.hub.Close(); <-finished })
+	// All channels belong to this bubble. Quiescence follows wake enqueue,
+	// unlike observing hub.latest, and makes missed wakes fail immediately.
+	synctest.Wait()
+
+	for _, id := range ids {
+		select {
+		case <-p.sessions[id].stream.sess.Wakes():
+			complete(id)
+		default:
+			require.False(t, required[id], "required subscription wake missing for viewer %d in %s", id, domain)
+		}
+	}
+
+	p.check(t, final)
+	p.checkWorld(t)
+	p.checkHistory(t)
 }
