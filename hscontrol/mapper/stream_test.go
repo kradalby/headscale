@@ -8535,6 +8535,7 @@ type streamPropertySystem struct {
 	history      *peerHistoryModel
 	token        uint64
 	reportSeq    uint64
+	control      map[types.NodeID][]uint64
 }
 
 // newStreamPropertySystem owns resources per Rapid case, including shrink
@@ -8905,6 +8906,7 @@ func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *s
 	}
 
 	checkStreamNodeInputs(t, p.world, id, session.client, p.cfg.DNSConfig.BaseDomain, p.packetIntent != nil || (p.policy >= 0 && p.policy <= 2), p.attrIntent)
+	checkStreamConnectivityInputs(t, p.world, id, session.client)
 
 	freshHub := NewHub()
 	responses, err := NewStream(p.cfg, freshHub, id, session.capVer).Initial(snap)
@@ -9013,6 +9015,12 @@ func (p *streamPropertySystem) checkWorld(t *rapid.T) {
 
 		if !slices.Contains(p.probes.MachineKeys, n.MachineKey) {
 			p.probes.MachineKeys = append(p.probes.MachineKeys, n.MachineKey)
+		}
+	}
+
+	if p.control != nil {
+		for id, n := range p.world.Nodes {
+			require.Len(t, p.control[id], n.ActiveSessions, "owned control count for node %d", id)
 		}
 	}
 
@@ -9138,6 +9146,7 @@ type streamOperation struct {
 	records      []tailcfg.DNSRecord
 	derp         *tailcfg.DERPMap
 	request      tailcfg.MapRequest
+	epoch        uint64
 }
 
 //nolint:gocyclo // One switch arm per generated operation keeps the input contract visible.
@@ -9192,10 +9201,44 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 		}
 
 		n.DiscoKey = key.DiscoPublicFromRaw32(mem.B(disco[:]))
-	case "expiry":
+	case "expiry", "public-expiry":
 		// Fixed distant dates make shrinking independent of wall time.
 		n.Expiry = rapid.SampledFrom([]*time.Time{nil, new(time.Time{}), new(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)), new(time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC))}).Draw(t, "expiry")
 		n.IsOnline = new(n.ActiveSessions > 0 && !propertyExpired(n))
+	case "connect", "connect-request":
+		result.request.NodeKey = n.NodeKey
+	case "stale-connect":
+		var raw [32]byte
+
+		raw[0] = 254
+		result.request.NodeKey = key.NodePublicFromRaw32(mem.B(raw[:]))
+		require.NotEqual(t, n.NodeKey, result.request.NodeKey)
+	case "zero-connect":
+	case "missing-connect", "missing-expiry":
+		result.request.NodeKey = n.NodeKey
+		n.ID = maxStreamPropertyNodeID + 1
+	case "disconnect":
+		require.NotNil(t, p.control, "public sessions require an owned ledger")
+
+		var live []types.NodeID
+
+		for _, candidate := range ids {
+			if len(p.control[candidate]) > 0 {
+				live = append(live, candidate)
+			}
+		}
+
+		if len(live) == 0 {
+			result.kind = "connect"
+		} else {
+			id = rapid.SampledFrom(live).Draw(t, "release-node")
+			result.node, result.before = p.world.Nodes[id].Clone(), p.world.Nodes[id].Clone()
+			result.epoch = rapid.SampledFrom(p.control[id]).Draw(t, "release-epoch")
+		}
+	case "invalid-expiry":
+		n.Expiry = new(time.Date(rapid.SampledFrom([]int{-1, 10000}).Draw(t, "invalid-year"), 1, 1, 0, 0, 0, 0, time.UTC))
+	case "utc-expiry":
+		n.Expiry = new(time.Date(9999, 1, 1, 0, 0, 0, 0, time.FixedZone("input", 3600)))
 	case "online":
 		n.ActiveSessions = 1 - n.ActiveSessions
 		n.IsOnline = new(n.ActiveSessions > 0 && !propertyExpired(n))
@@ -9456,11 +9499,19 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 // apply is the production adapter. Each model transition uses the generated
 // values; only validated server timestamps are adopted from a response.
 func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
+	if p.control != nil {
+		require.NotContains(t, []string{"online", "keys", "identity", "delete", "add", "expiry"}, op.kind, "direct lifecycle edits cannot share the public-session ledger")
+	}
+
 	audits := state.PolicyAuditFailures()
 	before := p.state.Snapshot()
 	beforeDERP := p.effectiveDERP(t)
 
 	switch op.kind {
+	case "connect", "connect-request", "stale-connect", "zero-connect", "missing-connect", "disconnect":
+		p.inputControl(t, op)
+	case "public-expiry", "utc-expiry", "invalid-expiry", "missing-expiry":
+		p.inputExpiry(t, op)
 	case "policy", "generated-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "ssh-policy", "ssh-deny", "ssh-mixed", "attrs-policy", "attrs-clear", "attrs-mixed", "policy-order", "policy-duplicate", "policy-restore", "derp-policy", "file-stage", "file-reload", "file-same", "file-comment", "file-empty", "file-missing", "file-test-failure":
 		p.inputPolicy(t, op)
 	case "invalid-policy":
@@ -9823,6 +9874,11 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 
 		p := newStreamPropertySystem(t, mode)
 
+		control := slices.Contains(kinds, "connect")
+		if control {
+			p.enableControl(t)
+		}
+
 		if len(kinds) > 0 {
 			initial := "packet-policy"
 			if slices.Contains(kinds, "app-policy") {
@@ -9837,7 +9893,11 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 				initial = "attrs-policy"
 			}
 
-			p.apply(t, p.drawOperation(t, initial))
+			if control {
+				p.setPolicy(t, 0)
+			} else {
+				p.apply(t, p.drawOperation(t, initial))
+			}
 
 			if mode != types.PolicyModeFile {
 				p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: p.policy, intent: p.packetIntent, appIntent: p.appIntent, sshIntent: p.sshIntent, attrIntent: p.attrIntent}}
@@ -9876,6 +9936,7 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			}
 
 			checkStreamNodeInputs(t, oldWorld, oldNode, oldClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses, oldAttrIntent)
+			checkStreamConnectivityInputs(t, oldWorld, oldNode, oldClient)
 			oldHub.Close()
 
 			for range rapid.IntRange(1, 3).Draw(t, "coalesced-writes") {
@@ -9926,6 +9987,7 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			}
 
 			checkStreamNodeInputs(t, oldWorld, oldNode, lateClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses, oldAttrIntent)
+			checkStreamConnectivityInputs(t, oldWorld, oldNode, lateClient)
 
 			last = snap
 		}
@@ -9952,6 +10014,10 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 				mandatory = []string{"attrs-clear", "policy-restore", "attrs-policy", "identity", "policy-order", "policy-duplicate", "attrs-mixed"}
 			}
 
+			if control {
+				mandatory = []string{"connect", "connect-request", "public-expiry", "disconnect", "stale-connect", "zero-connect", "missing-connect", "invalid-expiry", "utc-expiry", "missing-expiry"}
+			}
+
 			for _, operation := range mandatory {
 				operations = []string{operation}
 
@@ -9966,6 +10032,8 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 		} else {
 			t.Repeat(map[string]func(*rapid.T){"commit": commit})
 		}
+
+		p.releaseControls(t, last)
 
 		for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
 			if p.sessions[id].down {
@@ -11769,3 +11837,441 @@ func (f *streamNodeInputFailure) Errorf(format string, args ...any) {
 }
 
 func (f *streamNodeInputFailure) FailNow() { panic(f) }
+
+// enableControl removes the fixture's synthetic router session before any
+// public acquisition; map-delivery sessions and control leases are independent.
+func (p *streamPropertySystem) enableControl(t *rapid.T) {
+	require.Nil(t, p.control)
+
+	for _, id := range slices.Sorted(maps.Keys(p.world.Nodes)) {
+		n := p.world.Nodes[id].Clone()
+		n.ActiveSessions, n.IsOnline, n.SessionStart = 0, new(false), time.Time{}
+		p.put(t, n)
+	}
+
+	p.control = make(map[types.NodeID][]uint64)
+}
+
+func (p *streamPropertySystem) inputControl(t *rapid.T, op streamOperation) {
+	require.NotNil(t, p.control, "public sessions require an owned ledger")
+	before, oldWorld := p.state.Snapshot(), p.world.Clone()
+
+	id := op.node.ID
+	if op.kind == "stale-connect" || op.kind == "zero-connect" || op.kind == "missing-connect" {
+		require.Zero(t, p.state.ConnectForMapRequest(id, op.request.NodeKey))
+
+		if op.kind == "missing-connect" {
+			require.Zero(t, p.state.Connect(id))
+		}
+
+		require.Equal(t, before.Rev(), p.state.Snapshot().Rev(), "refused admission published")
+
+		return
+	}
+
+	n := op.before.Clone()
+	require.Len(t, p.control[id], n.ActiveSessions, "owned session count")
+
+	start := time.Now()
+
+	if op.kind == "disconnect" {
+		index := slices.Index(p.control[id], op.epoch)
+		require.NotEqual(t, -1, index, "each acquired lease releases exactly once")
+
+		n.ActiveSessions--
+		if n.ActiveSessions == 0 {
+			n.IsOnline, n.Unhealthy = new(false), false
+		}
+
+		require.NoError(t, p.state.Disconnect(id, op.epoch))
+		p.control[id] = slices.Delete(p.control[id], index, index+1)
+	} else {
+		n.SessionEpoch++
+		n.ActiveSessions++
+		n.IsOnline, n.Unhealthy = new(!propertyExpired(n)), false
+
+		var epoch uint64
+		if op.kind == "connect-request" {
+			epoch = p.state.ConnectForMapRequest(id, op.request.NodeKey)
+		} else {
+			epoch = p.state.Connect(id)
+		}
+
+		require.Equal(t, n.SessionEpoch, epoch, "independent acquisition epoch")
+		p.control[id] = append(p.control[id], epoch)
+	}
+
+	end := time.Now()
+
+	got, ok := p.state.Snapshot().GetNode(id)
+	require.True(t, ok)
+
+	if op.kind == "disconnect" && n.ActiveSessions == 0 {
+		seen := got.LastSeen().Clone()
+		require.NotNil(t, seen)
+		require.False(t, seen.Before(start), "LastSeen precedes release")
+		require.False(t, seen.After(end), "LastSeen follows release")
+		n.LastSeen = new(*seen)
+	} else if op.kind != "disconnect" && op.before.ActiveSessions == 0 {
+		started := got.SessionStart()
+		require.False(t, started.Before(start), "SessionStart precedes admission")
+		require.False(t, started.After(end), "SessionStart follows admission")
+		n.SessionStart = started
+	}
+
+	p.world.Put(n)
+	require.Equal(t, before.Rev()+1, p.state.Snapshot().Rev(), "control publication")
+	propcheck.CheckWorld(t, oldWorld, before, p.probes)
+}
+
+func (p *streamPropertySystem) inputExpiry(t *rapid.T, op streamOperation) {
+	before, oldWorld := p.state.Snapshot(), p.world.Clone()
+
+	var expiry *time.Time
+	if op.node.Expiry != nil {
+		expiry = new(*op.node.Expiry)
+	}
+
+	_, err := p.state.SetNodeExpiry(op.node.ID, expiry)
+	if op.kind == "invalid-expiry" || op.kind == "missing-expiry" {
+		if op.kind == "invalid-expiry" {
+			require.ErrorIs(t, err, types.ErrExpiryOutOfRange)
+		} else {
+			require.ErrorIs(t, err, state.ErrNodeNotInNodeStore)
+		}
+
+		require.Equal(t, before.Rev(), p.state.Snapshot().Rev(), "refused expiry published")
+
+		return
+	}
+
+	require.NoError(t, err)
+
+	n := op.before.Clone()
+
+	n.Expiry = nil
+	if expiry != nil {
+		require.Equal(t, *op.node.Expiry, *expiry, "expiry input mutated")
+		n.Expiry = new(expiry.UTC())
+		*expiry = time.Date(1999, 1, 1, 0, 0, 0, 0, time.UTC)
+	}
+
+	n.IsOnline = new(n.ActiveSessions > 0 && !propertyExpired(n))
+	p.world.Put(n)
+	require.Equal(t, before.Rev()+1, p.state.Snapshot().Rev(), "expiry publication")
+	propcheck.CheckWorld(t, oldWorld, before, p.probes)
+}
+
+// Expected connectivity comes only from owned inputs. The replay contract keeps
+// LastSeen sticky while online, but offline timestamps must remain observable.
+func checkStreamConnectivityInputs(t require.TestingT, world propcheck.World, viewer types.NodeID, client *propertyClient) {
+	wires := make([]*tailcfg.Node, 0, 1+len(client.peers))
+
+	wires = append(wires, client.self)
+	for _, id := range slices.Sorted(maps.Keys(client.peers)) {
+		wires = append(wires, client.peers[id])
+	}
+
+	for _, wire := range wires {
+		require.NotNil(t, wire)
+		n := world.Nodes[types.NodeID(wire.ID)] //nolint:gosec // Fixture IDs are 1..255.
+		require.NotNil(t, n)
+		self := n.ID == viewer
+		expired := propertyExpired(n)
+
+		var expiry time.Time
+		if n.Expiry != nil {
+			expiry = n.Expiry.UTC()
+		}
+
+		require.True(t, expiry.Equal(wire.KeyExpiry), "node %d KeyExpiry", n.ID)
+		require.Equal(t, !self && expired, wire.Expired, "node %d Expired", n.ID)
+		endpoints := n.Endpoints
+
+		var derp tailcfg.DERPRegionID
+		if n.Hostinfo != nil && n.Hostinfo.NetInfo != nil {
+			derp = n.Hostinfo.NetInfo.PreferredDERP
+		}
+
+		if !self && expired {
+			endpoints, derp = nil, 0
+		}
+
+		require.True(t, slices.Equal(endpoints, wire.Endpoints), "node %d Endpoints: want %v got %v", n.ID, endpoints, wire.Endpoints)
+		require.Equal(t, derp, wire.HomeDERP, "node %d HomeDERP", n.ID)
+
+		if self {
+			require.Nil(t, wire.Online, "self Online")
+			require.Nil(t, wire.LastSeen, "self LastSeen")
+
+			continue
+		}
+
+		online := n.IsOnline
+		if expired && n.ActiveSessions > 0 {
+			online = new(true)
+		}
+
+		require.Equal(t, online, wire.Online, "node %d Online", n.ID)
+
+		if online != nil && *online {
+			continue
+		}
+
+		var seen *time.Time
+		if online != nil && n.LastSeen != nil {
+			seen = new(n.LastSeen.UTC())
+		}
+
+		require.Equal(t, seen, wire.LastSeen, "node %d offline LastSeen", n.ID)
+	}
+}
+
+func TestStreamConnectivityInputContracts(t *testing.T) {
+	endpoint := netip.MustParseAddrPort("192.0.2.1:41641")
+	seen := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+	past := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	future := time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name   string
+		expiry *time.Time
+		online *bool
+		count  int
+		peer   *tailcfg.Node
+	}{
+		{"offline", nil, new(false), 0, &tailcfg.Node{ID: 2, Online: new(false), LastSeen: &seen, Endpoints: []netip.AddrPort{endpoint}, HomeDERP: 2}},
+		{"unknown", new(time.Time{}), nil, 0, &tailcfg.Node{ID: 2, Endpoints: []netip.AddrPort{endpoint}, HomeDERP: 2}},
+		{"online-sticky-seen", &future, new(true), 1, &tailcfg.Node{ID: 2, KeyExpiry: future, Online: new(true), LastSeen: &past, Endpoints: []netip.AddrPort{endpoint}, HomeDERP: 2}},
+		{"expired-offline", &past, new(false), 0, &tailcfg.Node{ID: 2, KeyExpiry: past, Expired: true, Online: new(false), LastSeen: &seen}},
+		{"expired-connected", &past, new(false), 2, &tailcfg.Node{ID: 2, KeyExpiry: past, Expired: true, Online: new(true)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := &types.Node{ID: 2, Expiry: tc.expiry, IsOnline: tc.online, ActiveSessions: tc.count, LastSeen: &seen, Endpoints: []netip.AddrPort{endpoint}, Hostinfo: &tailcfg.Hostinfo{NetInfo: &tailcfg.NetInfo{PreferredDERP: 2}}}
+			world := propcheck.World{Nodes: map[types.NodeID]*types.Node{1: {ID: 1}, 2: n}}
+			checkStreamConnectivityInputs(t, world, 1, newPropertyClient(&tailcfg.MapResponse{Node: &tailcfg.Node{ID: 1}, Peers: []*tailcfg.Node{tc.peer}}))
+			self := &tailcfg.Node{ID: 2, KeyExpiry: tc.peer.KeyExpiry, Endpoints: []netip.AddrPort{endpoint}, HomeDERP: 2}
+			checkStreamConnectivityInputs(t, world, 2, newPropertyClient(&tailcfg.MapResponse{Node: self}))
+		})
+	}
+}
+
+func TestRapidStreamControlSessions(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			runRapidStreamSystem(t, mode, "connect", "connect-request", "disconnect", "stale-connect", "zero-connect", "missing-connect", "public-expiry", "utc-expiry", "invalid-expiry", "missing-expiry", "endpoints", "request-hostinfo", "policy", "dns", "derp", "noop")
+		})
+	}
+}
+
+func TestStreamControlSessionHistory(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			rapid.Check(t, func(t *rapid.T) {
+				p := newStreamPropertySystem(t, mode)
+				p.setPolicy(t, 0)
+
+				route := netip.MustParsePrefix("10.0.0.0/24")
+
+				for _, id := range []types.NodeID{2, 3} {
+					n := p.world.Nodes[id].Clone()
+					n.Hostinfo.RoutableIPs, n.ApprovedRoutes = []netip.Prefix{route}, []netip.Prefix{route}
+					n.Hostinfo.NetInfo = &tailcfg.NetInfo{PreferredDERP: 2}
+					n.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.2:41641")}
+					n.Unhealthy = true
+					p.put(t, n)
+				}
+
+				p.enableControl(t)
+
+				for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+					p.update(t, id, p.state.Snapshot(), 0)
+				}
+
+				phase := func(kind string, id types.NodeID, epoch uint64, expiry *time.Time, winner uint64) {
+					t.Logf("control phase %s node=%d epoch=%d", kind, id, epoch)
+
+					old, oldWorld := p.state.Snapshot(), p.world.Clone()
+					oldMap, err := NewStream(p.cfg, p.hub, 1, capVer).r.render(old)
+					require.NoError(t, err)
+
+					oldClient := newPropertyClient(&tailcfg.MapResponse{})
+					applyStreamPropertyWire(t, p.hub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, oldMap)})
+					checkStreamConnectivityInputs(t, oldWorld, 1, oldClient)
+
+					n := p.world.Nodes[id].Clone()
+
+					op := streamOperation{kind: kind, node: n, before: n.Clone(), epoch: epoch, request: tailcfg.MapRequest{NodeKey: n.NodeKey}}
+					if strings.Contains(kind, "expiry") {
+						op.node.Expiry = expiry
+					}
+
+					if kind == "zero-connect" {
+						op.request.NodeKey = key.NodePublic{}
+					}
+
+					if kind == "stale-connect" {
+						op.request.NodeKey = p.world.Nodes[1].NodeKey
+					}
+
+					if strings.HasPrefix(kind, "missing-") {
+						op.node.ID = maxStreamPropertyNodeID + 1
+					}
+
+					p.apply(t, op)
+					snap := p.state.Snapshot()
+					all, wake := Route(old, snap, snap.Since(old))
+					p.hub.advance(snap)
+
+					for _, viewer := range slices.Sorted(maps.Keys(p.sessions)) {
+						if _, named := wake[viewer]; all || named {
+							p.update(t, viewer, snap, 0)
+						}
+					}
+
+					p.check(t, snap)
+					require.Equal(t, winner, p.routes.Global[route], "mandatory route election")
+					propcheck.CheckWorld(t, oldWorld, old, p.probes)
+					lateMap, err := NewStream(p.cfg, p.hub, 1, capVer).r.render(old)
+					require.NoError(t, err)
+
+					lateClient := newPropertyClient(&tailcfg.MapResponse{})
+					applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, lateMap)})
+					checkStreamConnectivityInputs(t, oldWorld, 1, lateClient)
+					lateClient.check(t, oldClient)
+				}
+
+				phase("connect", 2, 0, nil, 2)
+
+				first := p.control[2][0]
+
+				phase("connect-request", 2, 0, nil, 2)
+
+				second := p.control[2][1]
+
+				phase("connect-request", 3, 0, nil, 2)
+
+				third := p.control[3][0]
+
+				phase("disconnect", 2, second, nil, 2)
+				phase("disconnect", 2, first, nil, 3)
+
+				past := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+				phase("public-expiry", 3, 0, &past, 3)
+				phase("public-expiry", 3, 0, nil, 3)
+				phase("public-expiry", 3, 0, &past, 3)
+				phase("public-expiry", 3, 0, new(time.Time{}), 3)
+				phase("public-expiry", 2, 0, &past, 3)
+				phase("connect-request", 2, 0, nil, 3)
+
+				fourth := p.control[2][0]
+
+				phase("utc-expiry", 2, 0, new(time.Date(9999, 1, 1, 0, 0, 0, 0, time.FixedZone("input", 3600))), 3)
+
+				for _, kind := range []string{"stale-connect", "zero-connect", "missing-connect", "missing-expiry"} {
+					phase(kind, 2, 0, nil, 3)
+				}
+
+				for _, year := range []int{-1, 10000} {
+					phase("invalid-expiry", 2, 0, new(time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)), 3)
+				}
+
+				phase("disconnect", 3, third, nil, 2)
+				phase("disconnect", 2, fourth, nil, 2)
+
+				for _, id := range []types.NodeID{2, 3} {
+					require.Empty(t, p.control[id])
+					require.Zero(t, p.world.Nodes[id].ActiveSessions)
+					require.Equal(t, new(false), p.world.Nodes[id].IsOnline)
+				}
+				// Every unwoken client was checked before a reconnect can repair it.
+				p.open(t, 1, p.state.Snapshot(), false)
+				p.check(t, p.state.Snapshot())
+			})
+		})
+	}
+}
+
+// releaseControls balances every acquired lease before the shared driver finishes.
+func (p *streamPropertySystem) releaseControls(t *rapid.T, last *state.Snapshot) {
+	if p.control == nil {
+		return
+	}
+
+	for _, id := range slices.Sorted(maps.Keys(p.control)) {
+		for _, epoch := range slices.Clone(p.control[id]) {
+			n := p.world.Nodes[id].Clone()
+			p.apply(t, streamOperation{kind: "disconnect", node: n, before: n.Clone(), epoch: epoch})
+		}
+	}
+
+	snap := p.state.Snapshot()
+	all, wake := Route(last, snap, snap.Since(last))
+	p.hub.advance(snap)
+
+	for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+		if _, named := wake[id]; !p.sessions[id].down && (all || named) {
+			p.update(t, id, snap, 0)
+		}
+	}
+
+	p.check(t, snap)
+}
+
+// Only require assertion panics count as corruption detection.
+type streamConnectivityFailure struct{ message string }
+
+func (f *streamConnectivityFailure) Errorf(format string, args ...any) {
+	f.message = fmt.Sprintf(format, args...)
+}
+
+func (f *streamConnectivityFailure) FailNow() { panic(f) }
+
+func TestStreamConnectivityRejectsCorruptions(t *testing.T) {
+	past := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	seen := propertyEpoch
+	endpoint := netip.MustParseAddrPort("192.0.2.1:41641")
+	world := propcheck.World{Nodes: map[types.NodeID]*types.Node{
+		1: {ID: 1, Expiry: &past, Endpoints: []netip.AddrPort{endpoint}, Hostinfo: &tailcfg.Hostinfo{NetInfo: &tailcfg.NetInfo{PreferredDERP: 2}}},
+		2: {ID: 2, Expiry: &past, ActiveSessions: 1, IsOnline: new(false)},
+		3: {ID: 3, IsOnline: new(false), LastSeen: &seen},
+	}}
+	initial := &tailcfg.MapResponse{
+		Node: &tailcfg.Node{ID: 1, KeyExpiry: past, Endpoints: []netip.AddrPort{endpoint}, HomeDERP: 2},
+		Peers: []*tailcfg.Node{
+			{ID: 2, KeyExpiry: past, Expired: true, Online: new(true)},
+			{ID: 3, Online: new(false), LastSeen: &seen},
+		},
+	}
+	checkStreamConnectivityInputs(t, world, 1, newPropertyClient(initial))
+
+	for _, tc := range []struct {
+		name, message string
+		corrupt       func(*propertyClient)
+	}{
+		{"expiry-clear", "KeyExpiry", func(c *propertyClient) { c.peers[2].KeyExpiry = time.Time{} }},
+		{"expired-clear", "Expired", func(c *propertyClient) { c.peers[2].Expired = false }},
+		{"expired-online", "Online", func(c *propertyClient) { c.peers[2].Online = new(false) }},
+		{"expired-endpoints", "Endpoints", func(c *propertyClient) { c.peers[2].Endpoints = []netip.AddrPort{endpoint} }},
+		{"expired-derp", "HomeDERP", func(c *propertyClient) { c.peers[2].HomeDERP = 2 }},
+		{"offline-seen", "LastSeen", func(c *propertyClient) { c.peers[3].LastSeen = nil }},
+		{"offline-stale-seen", "LastSeen", func(c *propertyClient) { c.peers[3].LastSeen = &past }},
+		{"offline-online", "Online", func(c *propertyClient) { c.peers[3].Online = new(true) }},
+		{"self-expired", "Expired", func(c *propertyClient) { c.self.Expired = true }},
+		{"self-endpoints", "Endpoints", func(c *propertyClient) { c.self.Endpoints = nil }},
+		{"self-derp", "HomeDERP", func(c *propertyClient) { c.self.HomeDERP = 0 }},
+		{"self-online", "self Online", func(c *propertyClient) { c.self.Online = new(true) }},
+		{"self-seen", "self LastSeen", func(c *propertyClient) { c.self.LastSeen = &seen }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newPropertyClient(initial)
+			tc.corrupt(client)
+
+			failure := &streamConnectivityFailure{}
+			require.PanicsWithValue(t, failure, func() { checkStreamConnectivityInputs(failure, world, 1, client) })
+			require.Contains(t, failure.message, tc.message)
+		})
+	}
+}

@@ -645,3 +645,67 @@ This is a bounded marker oracle, not a general nodeAttrs interpreter: no IP
 selectors, groups, aliases, IP pools, companion data, parameterized capabilities,
 top-level randomizeClientPort, or baseline-capability model. Input slices are
 immutable after construction; transformations copy the outer grant slice only.
+
+## Public control sessions and expiry
+
+`TestRapidStreamControlSessions` reuses `runRapidStreamSystem` with public
+`State.Connect`, `ConnectForMapRequest`, `Disconnect` and `SetNodeExpiry`
+operations. DB and policy-file histories retain the same World, election,
+Route-selected delivery, Hub JSON/zstd encoding, partial delivery, reconnect
+and retained-snapshot checks. Existing graph-input histories keep their domain.
+
+An opt-in control ledger records every acquired epoch per node. The fixture's
+synthetic router session is explicitly normalized to zero before activation;
+subsequent counts come only from successful public acquisitions. Every acquired
+lease is released exactly once, in generated order, including final draining.
+Epochs identify leases; they do not impose release order. Hub/map-delivery
+sessions remain separate from these logical control leases. The component does
+not claim to exercise the HTTP poll handler's acquisition/release wiring.
+
+The adapter predicts SessionEpoch, ActiveSessions, Online, unhealthy clearing
+and unchanged fields from owned World inputs. First admission and final release
+validate SessionStart and LastSeen against their measured API call intervals,
+then adopt only those timestamps. Stale/zero keys and missing nodes refuse
+without publication. Direct graph online, key, identity, deletion, addition and
+expiry edits are rejected while the ledger is active; endpoint/Hostinfo,
+policy, DNS and DERP histories still compose. This restriction prevents direct
+count edits or deleted leases from masquerading as supported transport events.
+
+Expiry inputs are nil, zero, far-past year 2000, far-future year 9999 and a
+non-UTC future date. Expected UTC normalization comes from the submitted value.
+Years outside the wire range refuse before publication. Caller pointer reuse
+must not mutate current or retained snapshots. Memory-first DB error behavior
+is outside the domain; successful calls do not establish restart durability.
+
+`checkStreamConnectivityInputs` independently checks delivered KeyExpiry,
+Expired, Online, offline LastSeen, Endpoints and HomeDERP beside the existing
+identity projection. Every completed current map and retained/late map uses
+its own captured World. Expired peers with active control sessions retain
+Online=true for NeedsLogin but lose endpoints and DERP; expired self retains
+connectivity and has Expired=false, absent Online and absent LastSeen. LastSeen
+is ignored only while Online=true, matching pinned sticky replay. Offline
+fields, zero DiscoKey and expiry-clear diagnostics remain observable.
+`TestStreamConnectivityInputContracts` anchors literal self/peer examples;
+`TestStreamConnectivityRejectsCorruptions` proves that the actual checker
+rejects lost expiry, wrong online/expired state, retained expired connectivity,
+lost or stale offline timestamps and wrong self overrides.
+
+`TestStreamControlSessionHistory` guarantees overlapping sessions, release of
+the newer epoch before the older final release, final offline state, expired
+admission, expiry clear/restore while connected, refusal cases and two-router
+failover. All Route-selected consumers complete each phase, and unwoken clients
+are checked before reconnect. The existing independent route reference remains
+authoritative: when no router is available, an approving incumbent remains the
+global fallback. Expired/offline does not imply route withdrawal. Both backends
+retain old World/snapshots and re-render them after each transition.
+
+```sh
+go test -p 1 ./hscontrol/mapper -run '^(TestStreamConnectivityInputContracts|TestStreamConnectivityRejectsCorruptions|TestStreamControlSessionHistory)$' -count=1 -timeout=10m -rapid.seed=2026111613 -rapid.checks=20 -rapid.nofailfile
+go test -p 1 ./hscontrol/mapper -run '^TestRapidStreamControlSessions$' -count=1 -timeout=10m -rapid.seed=2026111612 -rapid.checks=20 -rapid.nofailfile
+```
+
+The generated file campaign can expose the existing DERP score-clear diagnostic
+(reproduction seed 2026111690); that supported input remains enabled. This
+component excludes real clock-crossing expiry sweeps, reauthentication,
+registration, SSH callbacks, ephemeral GC, concurrent transport ordering and
+DB failure/retry. It adds no production changes or new clock model.
