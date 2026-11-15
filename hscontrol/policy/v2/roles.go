@@ -17,6 +17,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"go4.org/netipx"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/views"
 )
 
@@ -351,6 +352,67 @@ func (p Postings) Update(roles Roles) Postings {
 			func(was, is RoleSet) bool { return was == is }),
 		table: roles.users.table,
 	}
+}
+
+// SubnetApprovals are the approved subnet routes of every node, which a *
+// source adds to its addresses: approved, announced or not, as SaaS keeps
+// a route an admin approved after its node withdrew it. They are route
+// facts, apart from roles, so only a change of approvals reaches them.
+type SubnetApprovals struct {
+	byRoute graph.Grouped[types.NodeID, *types.Node, netip.Prefix]
+	strs    []string
+}
+
+// Same reports whether a and b hold the same routes: the list is kept
+// while the routes stay, so its identity says.
+func (a SubnetApprovals) Same(b SubnetApprovals) bool {
+	return len(a.strs) == len(b.strs) && (len(a.strs) == 0 || &a.strs[0] == &b.strs[0])
+}
+
+// Strings returns the routes as the compile writes them: sorted as text,
+// each once. It is shared.
+func (a SubnetApprovals) Strings() []string { return a.strs }
+
+// Update returns the approvals of nodes, moving only the nodes whose
+// approved routes changed since a.
+func (a SubnetApprovals) Update(nodes *NodeMap) SubnetApprovals {
+	next := graph.GroupBy(a.byRoute, nodes, func(_ types.NodeID, n *types.Node) []netip.Prefix {
+		var out []netip.Prefix
+
+		for _, p := range n.ApprovedRoutes {
+			if !tsaddr.IsExitRoute(p) {
+				out = append(out, p)
+			}
+		}
+
+		return out
+	}, func(was, is *types.Node) bool { return slices.Equal(was.ApprovedRoutes, is.ApprovedRoutes) })
+
+	if a.byRoute.Groups != nil {
+		moved := false
+
+		for _, p := range graph.Changes(a.byRoute.Groups, next.Groups) {
+			_, was := a.byRoute.Groups.Get(p)
+			if _, is := next.Groups.Get(p); was != is {
+				moved = true
+
+				break
+			}
+		}
+
+		if !moved {
+			return SubnetApprovals{byRoute: next, strs: a.strs}
+		}
+	}
+
+	strs := []string{}
+	for p := range next.Groups.All() {
+		strs = append(strs, p.String())
+	}
+
+	slices.Sort(strs)
+
+	return SubnetApprovals{byRoute: next, strs: strs}
 }
 
 var errMembershipAudit = errors.New("membership differs")

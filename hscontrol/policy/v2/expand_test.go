@@ -1,13 +1,17 @@
 package v2
 
 import (
+	"fmt"
 	"net/netip"
+	"reflect"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 )
 
 // exampleTailnet is the worked-example tailnet as headscale stores it.
@@ -260,4 +264,148 @@ func TestExpandCompareBlindToClientQuirks(t *testing.T) {
 			}
 		})
 	}
+}
+
+// BenchmarkExpansionAllFilters measures every node's filter from scratch
+// both ways: the compile and its FilterForNode, and membership, templates
+// and the expansion. The expander is to serve the filter, so the two
+// must stay of the same order as the tailnet grows.
+func BenchmarkExpansionAllFilters(b *testing.B) {
+	for _, pol := range benchPolicies {
+		for _, n := range []int{500, 2000} {
+			users, nodes := benchNodes(n)
+
+			b.Run(fmt.Sprintf("%s/compile/n=%d", pol.name, n), func(b *testing.B) {
+				b.ReportAllocs()
+
+				for b.Loop() {
+					pm, err := NewPolicyManager([]byte(pol.policy), users, nodes.ViewSlice())
+					require.NoError(b, err)
+
+					for _, node := range nodes {
+						_, err := pm.FilterForNode(node.View())
+						require.NoError(b, err)
+					}
+				}
+			})
+
+			b.Run(fmt.Sprintf("%s/expand/n=%d", pol.name, n), func(b *testing.B) {
+				b.ReportAllocs()
+
+				for b.Loop() {
+					sel, err := NewSelectors(nil, []byte(pol.policy))
+					require.NoError(b, err)
+
+					all := nodeMapOf(nodes)
+					roles := Roles{}.Update(NewUserSets(nil, sel, users), all, nil)
+
+					x, err := NewExpansion(BuildTemplates(nil, sel), Postings{}.Update(roles), SubnetApprovals{}.Update(all).Strings(), lookupIn(all))
+					require.NoError(b, err)
+
+					for _, node := range nodes {
+						x.FilterForNode(node.View())
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestExpandCapSourcesKeepsCapabilityRuleFromNobody holds expanding a
+// capability rule whose cap has no holders to what the compile writes for
+// an app grant whose sources resolve to nothing: the rule, with empty
+// sources, where a port rule would be dropped.
+func TestExpandCapSourcesKeepsCapabilityRuleFromNobody(t *testing.T) {
+	t.Parallel()
+
+	users := types.Users{{ID: 1, Name: "alice"}}
+	nodes := quirkNodes(quirkNode{name: "ta", v4: "100.64.0.10", tags: []string{"tag:a"}})
+
+	pm, err := NewPolicyManager([]byte(`{"tagOwners": {"tag:a": ["alice@"]}, "grants": [
+		{"src": ["nobody@"], "dst": ["tag:a"], "app": {"example.com/cap/x": [{}]}},
+		{"src": ["nobody@"], "dst": ["tag:a"], "ip": ["tcp:22"]}]}`), users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	compiled, err := pm.FilterForNode(nodes[0].View())
+	require.NoError(t, err)
+
+	grant := []tailcfg.CapGrant{{Dsts: []netip.Prefix{host("100.64.0.10")}, CapMap: tailcfg.PeerCapMap{"example.com/cap/x": {"{}"}}}}
+	capForm := []tailcfg.FilterRule{
+		{SrcIPs: []string{capSourcePrefix + capEmpty}, CapGrant: grant},
+		capRule(web1Dsts(22, 22), []int{ProtocolTCP}, capSourcePrefix+capEmpty),
+	}
+
+	got := expandCapSources(capForm, nil, func(nodecap.Cap) []netip.Addr { return nil })
+
+	require.Equal(t, []tailcfg.FilterRule{{SrcIPs: []string{}, CapGrant: grant}}, compiled, "the compile keeps the capability rule, with empty sources")
+
+	if !reflect.DeepEqual(compiled, got) {
+		t.Errorf("expanded differs from the compile (-compile +expanded):\n%s", cmp.Diff(compiled, got, inOrderOpts...))
+	}
+}
+
+// TestExpansionCostFollowsReceiver holds one receiver's filter to the rules
+// that reach it: every receiver of a rule shares its sources expanded once,
+// so a member's filter under a mesh costs the same at any tailnet size.
+// Expanding them again per receiver made every filter cost the tailnet.
+func TestExpansionCostFollowsReceiver(t *testing.T) {
+	const mesh = `{"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:member:*"]}]}`
+
+	allocs := map[int]float64{}
+
+	for _, n := range []int{100, 1000} {
+		users, nodes := benchNodes(n)
+
+		sel, err := NewSelectors(nil, []byte(mesh))
+		require.NoError(t, err)
+
+		all := nodeMapOf(nodes)
+		roles := Roles{}.Update(NewUserSets(nil, sel, users), all, nil)
+
+		x, err := NewExpansion(BuildTemplates(nil, sel), Postings{}.Update(roles), SubnetApprovals{}.Update(all).Strings(), lookupIn(all))
+		require.NoError(t, err)
+
+		member := nodes[1].View()
+		require.False(t, member.IsTagged())
+		require.Len(t, x.FilterForNode(member), 1)
+
+		allocs[n] = testing.AllocsPerRun(20, func() { x.FilterForNode(member) })
+	}
+
+	t.Logf("allocations of one member's filter: %v", allocs)
+	assert.LessOrEqual(t, allocs[1000], allocs[100]+2, "a receiver's filter grows with the tailnet")
+}
+
+// TestAuditFiltersRequiresSortedNodes holds the audit to the order the
+// expansion assumes: the compile lists an owner's nodes in list order, the
+// postings in ID order, so the two agree only on a list sorted by ID.
+func TestAuditFiltersRequiresSortedNodes(t *testing.T) {
+	t.Parallel()
+
+	users := types.Users{{ID: 1, Name: "alice"}}
+	alice := &users[0]
+	nodes := quirkNodes(
+		quirkNode{name: "a1", user: alice, v4: "100.64.0.1"},
+		quirkNode{name: "a2", user: alice, v4: "100.64.0.2"},
+	)
+	reversed := types.Nodes{nodes[1], nodes[0]}
+
+	const src = `{"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:22"]}]}`
+
+	audit := func(list types.Nodes) error {
+		pm, err := NewPolicyManager([]byte(src), users, list.ViewSlice())
+		require.NoError(t, err)
+
+		x, roles := expansionOf(t, pm, users, nodeMapOf(list))
+
+		_, err = AuditFilters(FilterAudit{
+			Templates: x.t, Postings: Postings{}.Update(roles), Approvals: SubnetApprovals{}.Update(nodeMapOf(list)),
+			Nodes: list.ViewSlice(), Users: users, Policy: pm, Current: true,
+		})
+
+		return err
+	}
+
+	require.NoError(t, audit(nodes))
+	require.ErrorIs(t, audit(reversed), errFilterAuditOrder)
 }
