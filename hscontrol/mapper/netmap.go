@@ -127,6 +127,8 @@ type renderer struct {
 	lastKey     renderKey
 	lastPeerIDs []types.NodeID // the snapshot's shared view, see [state.Snapshot.PeerView]
 	lastSelf    types.NodeView
+	lastNodes   state.NodesVersion
+	lastCaps    state.CapsVersion
 	// overlays counts peers with viewer-specific routes, so losing the
 	// last overlay restores the shared class map.
 	overlays         int
@@ -463,7 +465,7 @@ func (r *renderer) renderPeers(
 	}
 
 	view := snap.PeerView(r.nodeID)
-	class, profiles := r.classes.get(r.cfg, r.renders, snap, view, r.peerCapVer, key.policy, capMaps)
+	class, profiles, nodes := r.classes.get(r.cfg, r.renders, snap, view, r.peerCapVer, key.policy, capMaps)
 	nm.peers, nm.profiles = class, profiles
 
 	base := nm.base
@@ -473,7 +475,7 @@ func (r *renderer) renderPeers(
 	if base != nil {
 		// The class map remembers changed renders, including view changes;
 		// falling beyond its edit log compares only this class's peers.
-		candidates = graph.Changes(r.lastClass, class)
+		candidates = r.peerCandidates(snap, class, view)
 		if base.peers != r.lastClass {
 			// Keep this viewer's route overlays while applying class edits.
 			nm.peers = base.peers
@@ -581,9 +583,49 @@ func (r *renderer) renderPeers(
 
 	// Only a render that completed moves the cursor; a failed one is
 	// retried from the same place.
-	r.markRendered(snap, key, self, class)
+	r.markRendered(snap, key, self, class, nodes)
 
 	return nil
+}
+
+// peerCandidates keeps membership churn from comparing unrelated class maps:
+// their sorted views name membership edits; node and cap edits cover survivors.
+func (r *renderer) peerCandidates(snap *state.Snapshot, class *peerMap, view []types.NodeID) []tailcfg.NodeID {
+	old := r.lastPeerIDs
+	if len(old) == len(view) && (len(view) == 0 || &old[0] == &view[0]) {
+		return graph.Changes(r.lastClass, class)
+	}
+
+	touched, ok := snap.NodesTouchedSince(r.lastNodes)
+	// A tiny view can cost less to compare than a coalesced global edit log.
+	if !ok || len(touched) > len(old)+len(view) {
+		return graph.Changes(r.lastClass, class)
+	}
+
+	var candidates []tailcfg.NodeID
+
+	for _, id := range append(touched, snap.CapsChangedSince(r.lastCaps)...) {
+		if inView(old, id) || inView(view, id) {
+			candidates = append(candidates, id.NodeID())
+		}
+	}
+
+	// Both views are sorted; walk their symmetric difference without map reads.
+	for i, j := 0, 0; i < len(old) || j < len(view); {
+		switch {
+		case j == len(view) || i < len(old) && old[i] < view[j]:
+			candidates = append(candidates, old[i].NodeID())
+			i++
+		case i == len(old) || view[j] < old[i]:
+			candidates = append(candidates, view[j].NodeID())
+			j++
+		default:
+			i++
+			j++
+		}
+	}
+
+	return candidates
 }
 
 func (nm *netMap) recordPeerChanges(base *netMap, candidates []tailcfg.NodeID, self tailcfg.NodeID) {
@@ -664,9 +706,10 @@ func sameRouteFacts(a, b types.NodeView) bool {
 		slices.Equal(a.AllApprovedRoutes(), b.AllApprovedRoutes())
 }
 
-func (r *renderer) markRendered(snap *state.Snapshot, key renderKey, self types.NodeView, class *peerMap) {
+func (r *renderer) markRendered(snap *state.Snapshot, key renderKey, self types.NodeView, class *peerMap, nodes state.NodesVersion) {
 	r.lastClass, r.lastKey = class, key
 	r.lastPeerIDs, r.lastSelf = snap.PeerView(r.nodeID), self
+	r.lastNodes, r.lastCaps = nodes, snap.CapsVersion()
 
 	via := weak.Make(snap.ViaElection())
 	if via != r.routedVia {
@@ -786,6 +829,7 @@ func (e classOwnersEdit) set(id tailcfg.NodeID, owner types.UserView) {
 // profiles of their owners. It updates the class's latest maps by the
 // nodes and caps changed since, or rebuilds them from the view when that is
 // too far back to tell.
+// The node version is shared with the class, so sessions need no new cursor.
 func (cm *classMaps) get(
 	cfg *types.Config,
 	renders *peerRenders,
@@ -794,7 +838,7 @@ func (cm *classMaps) get(
 	capVer tailcfg.CapabilityVersion,
 	policy uint64,
 	capMaps map[types.NodeID]tailcfg.NodeCapMap,
-) (*peerMap, *profileMap) {
+) (*peerMap, *profileMap, state.NodesVersion) {
 	renders.advance(snap.Rev())
 
 	cm.mu.Lock()
@@ -806,7 +850,7 @@ func (cm *classMaps) get(
 
 	if len(view) == 0 {
 		cm.mu.Unlock()
-		return newPeerMap(), newProfileMap()
+		return newPeerMap(), newProfileMap(), state.NodesVersion{}
 	}
 
 	key := classKey{view: &view[0], n: len(view)}
@@ -826,7 +870,7 @@ func (cm *classMaps) get(
 
 	cur := entry.cur
 	if cur != nil && cur.rev == snap.Rev() {
-		return cur.peers, cur.owners.profiles
+		return cur.peers, cur.owners.profiles, cur.nodes
 	}
 
 	var (
@@ -926,7 +970,7 @@ func (cm *classMaps) get(
 		entry.cur = next
 	}
 
-	return next.peers, next.owners.profiles
+	return next.peers, next.owners.profiles, next.nodes
 }
 
 // advance drops obsolete classes even when no session renders the new
