@@ -62,7 +62,7 @@ history. These remain enabled rather than being copied into another driver.
   not the durable policy API. The explicit file fixture uses `State.ReloadPolicy`
   as described below.
 - **Independent intent:** allow-all, deny-all and self/member policies predict
-  peer membership from World. `checkStreamNodeInputs` checks self and peer
+  peer membership and sampled TCP/UDP permissions from World. `checkStreamNodeInputs` checks self and peer
   identity, names, keys, tags, creation time and ownership against owned inputs.
   Packet-intent and simple-policy maps independently check own addresses;
   allow-all maps also predict subnet winners and approved exit routes. Rich policies use the shared
@@ -188,6 +188,19 @@ viewer being validated; other sessions may legitimately lag. Denied packets do n
 peers: same-user visibility remains unconditional.
 
 The existing stream history stores immutable intent beside each policy document.
+When explicit packet intent is absent, `streamPacketIntent` interprets only
+the three literal simple-policy fixtures: wildcard allow-all, explicit deny-all,
+and member-to-self using each current owned user's name. TCP and UDP cover ports
+0–65535 with the bounded probes above. Tagged nodes never inherit creator
+permissions. This temporary intent is rebuilt for each check, never stored in
+policy metadata; retained full and late maps share intent captured from their
+old World and policy before writes. Rich policies retain the existing
+fresh-render boundary unless they carry explicit input intent.
+`TestStreamSimplePolicyIdentityHistory` checks same-user permission through
+rename, tag revocation, restoration and deny, while retaining the old self-policy
+map. `TestRapidStreamSimplePolicyEdits` checks delivered permissions after
+reordering, duplication and historical restoration of each simple policy.
+
 `packet-policy` and `packet-deny` are operations in the broad driver. Reorder,
 duplicate, historical restore and DERP-only policy edits retain intent metadata;
 unrelated richer policies clear it. The same check reads the client's cumulative
@@ -223,9 +236,11 @@ go test -p 1 ./hscontrol/mapper -run '^TestStreamPacketIntentHistory$' -count=1 
 go test -p 1 ./hscontrol/mapper -run '^TestRapidStreamPacketIntent$' -count=1 -rapid.seed=20261115 -rapid.checks=10 -rapid.nofailfile
 ```
 
-This domain excludes self traffic, return traffic, external/subnet destinations,
-CIDRs, groups, hosts, autogroups, ACL syntax, SSH, app capabilities and OIDC/email
-alias resolution. It samples selected ports rather than every possible packet.
+The generated packet domain excludes self traffic, return traffic,
+external/subnet destinations, CIDRs, groups, hosts, general autogroups and ACL
+syntax, SSH, app capabilities and OIDC/email alias resolution. Only the three
+literal ACL fixtures above receive the simple-policy fallback. These checks
+sample selected ports rather than every possible packet.
 Full Tailscale processes and network transport remain outside this fixture.
 
 ## Successive policy files
@@ -441,6 +456,9 @@ State graph subscription, `Hub.watch`, and `Session.Wakes`. It reuses
 delivery, Hub JSON/zstd framing, cumulative client replay, World/node checks,
 route election, and the peer-history ledger. Each completed intermediate map
 runs `checkSession` before later writes can hide an incorrect delivery.
+That shared check independently validates delivered simple-policy TCP/UDP
+permissions and necessary incoming/outgoing peers, including final unwoken
+clients; the required-wake model below remains a separate input reference.
 
 Three bounded domains run separately: endpoint copies/changes/reversions under
 one simple policy; simple-policy replacements/reversions; and mixed bursts.

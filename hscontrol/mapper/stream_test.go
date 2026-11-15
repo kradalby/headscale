@@ -8876,7 +8876,7 @@ func (p *streamPropertySystem) check(t *rapid.T, snap *state.Snapshot) {
 // Only this viewer is current; other sessions may legitimately still lag.
 func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *state.Snapshot, session *streamPropertySession) {
 	t.Helper()
-	checkStreamPacketIntent(t, p.world, p.packetIntent, id, session.client)
+	checkStreamPacketIntent(t, p.world, streamPacketIntent(p.world, p.policy, p.packetIntent), id, session.client)
 	checkStreamAppIntent(t, p.world, p.appIntent, id, session.client)
 	checkStreamNodeInputs(t, p.world, id, session.client, p.cfg.DNSConfig.BaseDomain, p.packetIntent != nil || (p.policy >= 0 && p.policy <= 2))
 
@@ -9748,7 +9748,7 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			// cache advancement; a late renderer must still read it correctly.
 			old := p.state.Snapshot()
 			oldWorld := p.world.Clone()
-			oldIntent := p.packetIntent
+			oldIntent := streamPacketIntent(oldWorld, p.policy, p.packetIntent)
 			oldAppIntent := p.appIntent
 			oldIdentityAddresses := oldIntent != nil || (p.policy >= 0 && p.policy <= 2)
 			oldDERP := p.effectiveDERP(t)
@@ -10034,6 +10034,10 @@ func TestRapidStreamSimplePolicyEdits(t *testing.T) {
 			require.Equal(t, kind, op.policy, "simple intent survives %s", operation)
 			p.apply(t, op)
 			require.Equal(t, kind, p.policy)
+
+			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+				p.update(t, id, p.state.Snapshot(), 0)
+			}
 		}
 	})
 }
@@ -10449,6 +10453,94 @@ func TestStreamNodeInputContracts(t *testing.T) {
 			checkStreamNodeInputs(t, world, 9, newPropertyClient(&tailcfg.MapResponse{Node: taggedSelf, Peers: []*tailcfg.Node{user}}), tt.domain, true)
 		})
 	}
+}
+
+// Same-user permissions survive a rename, but tags revoke creator ownership.
+// Retained maps keep their old users and policy through both changes.
+func TestStreamSimplePolicyIdentityHistory(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t)
+		if len(p.world.Nodes) == 3 {
+			p.insert(t, 4)
+			p.open(t, 4, p.state.Snapshot(), false)
+		}
+
+		p.setPolicy(t, 2)
+		old, oldWorld := p.state.Snapshot(), p.world.Clone()
+		oldIntent := streamPacketIntent(oldWorld, p.policy, p.packetIntent)
+
+		oldHub := NewHub()
+		defer oldHub.Close()
+
+		responses, err := NewStream(p.cfg, oldHub, 4, capVer).Initial(old)
+		require.NoError(t, err)
+
+		oldClient := newPropertyClient(&tailcfg.MapResponse{})
+		applyStreamPropertyWire(t, oldHub, oldClient, responses)
+		checkStreamPacketIntent(t, oldWorld, oldIntent, 4, oldClient)
+
+		for _, phase := range []string{"same-user", "rename", "tag", "restore", "deny"} {
+			switch phase {
+			case "rename":
+				user := p.world.Users[0]
+				user.Name = "renamed-user"
+				p.apply(t, streamOperation{kind: "user", user: user})
+			case "tag", "restore":
+				n := p.world.Nodes[1].Clone()
+
+				n.Tags = nil
+				if phase == "tag" {
+					n.Tags = []string{"tag:srv"}
+				}
+
+				p.put(t, n)
+			case "deny":
+				p.setPolicy(t, 1)
+			}
+
+			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+				p.update(t, id, p.state.Snapshot(), 0)
+			}
+
+			require.Nil(t, p.packetIntent, "derived intent must not become policy metadata")
+			late, err := NewStream(p.cfg, p.hub, 4, capVer).r.render(old)
+			require.NoError(t, err)
+
+			lateClient := newPropertyClient(&tailcfg.MapResponse{})
+			applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
+			checkStreamPacketIntent(t, oldWorld, oldIntent, 4, lateClient)
+			lateClient.check(t, oldClient)
+			propcheck.CheckWorld(t, oldWorld, old, p.probes)
+		}
+	})
+}
+
+// Interpret only the three literal simple policies, using current owned users
+// so renames cannot leave stale selectors in policy history metadata.
+func streamPacketIntent(world propcheck.World, kind int, explicit *propcheck.PacketIntent) *propcheck.PacketIntent {
+	if explicit != nil || kind < 0 || kind > 2 {
+		return explicit
+	}
+
+	intent := &propcheck.PacketIntent{}
+	selectors := []propcheck.PacketSelector{}
+
+	switch kind {
+	case 0:
+		selectors = append(selectors, propcheck.PacketSelector{})
+	case 2:
+		for _, user := range world.Users {
+			selectors = append(selectors, propcheck.PacketSelector{User: user.Name})
+		}
+	}
+
+	for _, selector := range selectors {
+		for _, protocol := range []ipproto.Proto{ipproto.TCP, ipproto.UDP} {
+			intent.Grants = append(intent.Grants, propcheck.PacketGrant{Src: selector, Dst: selector, Protocol: protocol, Last: 65535})
+		}
+	}
+
+	return intent
 }
 
 // Only fully delivered sessions must reflect current intent; partial prefixes
