@@ -677,14 +677,6 @@ func (c *modelClient) apply(r *tailcfg.MapResponse) {
 			p.DiscoKey = *pc.DiscoKey
 		}
 
-		if pc.Cap != 0 {
-			p.Cap = pc.Cap
-		}
-
-		if pc.KeySignature != nil {
-			p.KeySignature = slices.Clone(pc.KeySignature)
-		}
-
 		if pc.Online != nil {
 			p.Online = new(*pc.Online)
 			// The client keeps a LastSeen the patch cannot clear; compare

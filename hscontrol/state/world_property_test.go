@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/juanfont/headscale/hscontrol/internal/propcheck"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
@@ -15,16 +16,9 @@ import (
 	"tailscale.com/types/key"
 )
 
-// worldModel deliberately uses full scans and owned records, not graph indexes
-// or the world's change predicates. Nodes are replaced, never edited in place.
-type worldModel struct {
-	nodes map[types.NodeID]*types.Node
-	users []types.User
-}
-
 type worldModelSnapshot struct {
 	snap    *Snapshot
-	model   worldModel
+	model   propcheck.World
 	touched map[types.NodeID]bool
 }
 
@@ -40,119 +34,6 @@ func worldModelKeys(t *rapid.T) ([]key.NodePublic, []key.MachinePublic) {
 	}
 
 	return nodes, machines
-}
-
-func (m worldModel) name(id types.NodeID, base string) string {
-	if base == "" {
-		base = "node"
-	}
-
-	for suffix := 0; ; suffix++ {
-		candidate := base
-		if suffix > 0 {
-			candidate = fmt.Sprintf("%s-%d", base, suffix)
-		}
-
-		busy := false
-		for other, n := range m.nodes {
-			busy = busy || other != id && strings.EqualFold(n.GivenName, candidate)
-		}
-
-		if !busy {
-			return candidate
-		}
-	}
-}
-
-func (m worldModel) check(t *rapid.T, snap *Snapshot, nodeKeys []key.NodePublic, machineKeys []key.MachinePublic) {
-	t.Helper()
-
-	require.Equal(t, m.users, snap.Users())
-	require.NoError(t, snap.PolicyErr())
-
-	ids := slices.Sorted(maps.Keys(m.nodes))
-	got := snap.ListNodes()
-	require.Equal(t, len(ids), got.Len())
-
-	for i, id := range ids {
-		require.Equal(t, id, got.At(i).ID())
-		require.Equal(t, m.nodes[id], got.At(i).AsStruct(), "node %d", id)
-	}
-
-	for id := types.NodeID(1); id <= 8; id++ {
-		n, ok := snap.GetNode(id)
-		require.Equal(t, m.nodes[id] != nil, ok)
-
-		if ok {
-			require.Equal(t, m.nodes[id], n.AsStruct())
-		}
-	}
-
-	for uid := types.UserID(0); uid <= 3; uid++ {
-		want := []types.NodeID{}
-
-		for _, id := range ids {
-			n := m.nodes[id]
-			if len(n.Tags) == 0 && n.UserID != nil && types.UserID(*n.UserID) == uid {
-				want = append(want, id)
-			}
-		}
-
-		gotIDs := []types.NodeID{}
-		for _, n := range snap.ListNodesByUser(uid).All() {
-			gotIDs = append(gotIDs, n.ID())
-			require.Equal(t, m.nodes[n.ID()], n.AsStruct())
-		}
-
-		require.Equal(t, want, gotIDs, "user %d", uid)
-	}
-
-	for _, k := range nodeKeys {
-		var want types.NodeID
-		for id, n := range m.nodes {
-			if n.NodeKey == k && id > want {
-				want = id // Re-registration explicitly chooses the highest ID.
-			}
-		}
-
-		n, ok := snap.GetNodeByNodeKey(k)
-		require.Equal(t, want != 0, ok)
-
-		if ok {
-			require.Equal(t, m.nodes[want], n.AsStruct())
-		}
-	}
-
-	for _, k := range machineKeys {
-		want := map[types.UserID][]types.NodeID{}
-
-		for _, id := range ids {
-			n := m.nodes[id]
-			if n.MachineKey != k {
-				continue
-			}
-
-			var uid types.UserID
-			if len(n.Tags) == 0 && n.UserID != nil {
-				uid = types.UserID(*n.UserID)
-			}
-
-			want[uid] = append(want[uid], id)
-		}
-
-		got := snap.GetNodesByMachineKeyAllUsers(k)
-		require.Len(t, got, len(want))
-
-		for uid, candidates := range want {
-			n, ok := got[uid]
-			require.True(t, ok)
-			// Multiple registrations for one owner have no documented winner.
-			require.Contains(t, candidates, n.ID())
-			require.Equal(t, m.nodes[n.ID()], n.AsStruct())
-		}
-	}
-
-	checkPeersMatchFullBuild(t, snap)
 }
 
 func checkWorldModelHistory(t *rapid.T, history []worldModelSnapshot, old int) {
@@ -195,21 +76,20 @@ func checkWorldModelHistory(t *rapid.T, history []worldModelSnapshot, old int) {
 func TestWorldMutationProperty(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		nodeKeys, machineKeys := worldModelKeys(t)
-		m := worldModel{
-			nodes: map[types.NodeID]*types.Node{},
-			users: []types.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}},
+		m := propcheck.World{
+			Nodes: map[types.NodeID]*types.Node{},
+			Users: []types.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}},
 		}
-		w, err := newWorld(nil, m.users, nil, types.DNSView{})
+		w, err := newWorld(nil, m.Users, nil, types.DNSView{})
 		require.NoError(t, err)
 
 		history := make([]worldModelSnapshot, 1, 61)
 		history[0] = worldModelSnapshot{snap: w.snapshot(), model: m}
-		m.check(t, w.snapshot(), nodeKeys, machineKeys)
+		checkWorldReference(t, m, w.snapshot(), nodeKeys, machineKeys)
 		require.True(t, w.snapshot().Since(nil).Global)
 
 		for range rapid.IntRange(1, 60).Draw(t, "steps") {
-			m.nodes = maps.Clone(m.nodes)
-			m.users = slices.Clone(m.users)
+			m = m.Clone()
 			before := w.snapshot()
 			touched := map[types.NodeID]bool{}
 			commit := false
@@ -219,7 +99,7 @@ func TestWorldMutationProperty(t *testing.T) {
 			op := rapid.SampledFrom([]string{"put", "delete", "ownership", "keys", "rename", "user", "batch", "noop", "copy", "payload", "stale"}).Draw(t, "op")
 			switch op {
 			case "put":
-				u := m.users[rapid.IntRange(0, 1).Draw(t, "owner")]
+				u := m.Users[rapid.IntRange(0, 1).Draw(t, "owner")]
 				ip := netip.MustParseAddr(fmt.Sprintf("100.64.0.%d", id))
 
 				n := &types.Node{
@@ -233,20 +113,20 @@ func TestWorldMutationProperty(t *testing.T) {
 				}
 
 				got := w.PutNode(*n)
-				n.GivenName = m.name(id, name)
-				m.nodes[id] = n
+				n.GivenName = m.Name(id, name)
+				m.Put(n)
 				require.Equal(t, n, got.AsStruct())
 
 				touched[id], commit = true, true
 			case "delete":
 				w.DeleteNode(id)
 
-				if m.nodes[id] != nil {
-					delete(m.nodes, id)
+				if m.Nodes[id] != nil {
+					m.Delete(id)
 					touched[id], commit = true, true
 				}
 			case "ownership", "keys", "payload":
-				u := m.users[rapid.IntRange(0, 1).Draw(t, "owner")]
+				u := m.Users[rapid.IntRange(0, 1).Draw(t, "owner")]
 				tagged := rapid.Bool().Draw(t, "tagged")
 				keepCreator := rapid.Bool().Draw(t, "keep-creator")
 				k := rapid.IntRange(0, 4).Draw(t, "key")
@@ -268,18 +148,18 @@ func TestWorldMutationProperty(t *testing.T) {
 					}
 				}
 				prev, next, ok := w.UpdateNodeDiff(id, edit)
-				require.Equal(t, m.nodes[id] != nil, ok)
+				require.Equal(t, m.Nodes[id] != nil, ok)
 
-				if n := m.nodes[id]; n != nil {
+				if n := m.Nodes[id]; n != nil {
 					require.Equal(t, n, prev.AsStruct())
 					updated := n.Clone()
 					edit(updated)
 
 					if updated.GivenName != n.GivenName {
-						updated.GivenName = m.name(id, updated.GivenName)
+						updated.GivenName = m.Name(id, updated.GivenName)
 					}
 
-					m.nodes[id] = updated
+					m.Put(updated)
 					require.Equal(t, updated, next.AsStruct())
 
 					touched[id], commit = true, true
@@ -290,11 +170,11 @@ func TestWorldMutationProperty(t *testing.T) {
 				var want error
 
 				switch {
-				case m.nodes[id] == nil:
+				case m.Nodes[id] == nil:
 					want = ErrNodeNotFound
 				case label == "" || label == "bad label" || len(label) > 63:
 					want = ErrGivenNameInvalid
-				case m.name(id, label) != label:
+				case m.Name(id, label) != label:
 					want = ErrGivenNameTaken
 				}
 
@@ -304,9 +184,9 @@ func TestWorldMutationProperty(t *testing.T) {
 				} else {
 					require.NoError(t, err)
 
-					n := m.nodes[id].Clone()
+					n := m.Nodes[id].Clone()
 					n.GivenName = label
-					m.nodes[id] = n
+					m.Put(n)
 					require.Equal(t, n, got.AsStruct())
 
 					touched[id], commit = true, true
@@ -315,27 +195,27 @@ func TestWorldMutationProperty(t *testing.T) {
 				i := rapid.IntRange(0, 1).Draw(t, "user")
 				name := rapid.SampledFrom([]string{"", "Alice", "Renamed"}).Draw(t, "display-name")
 
-				updated := m.users[i]
+				updated := m.Users[i]
 				if rapid.Bool().Draw(t, "login-name") {
 					updated.Name = fmt.Sprintf("user%d-%s", i, name)
 				} else {
 					updated.DisplayName = name
 				}
 
-				if m.users[i] != updated {
-					m.users[i] = updated
+				if m.Users[i] != updated {
+					m.Users[i] = updated
 					commit = true
 
-					for id, n := range m.nodes {
-						if n.User != nil && n.User.ID == m.users[i].ID {
-							n = n.Clone()
-							n.User = m.users[i].Clone()
-							m.nodes[id], touched[id] = n, true
+					for id, n := range m.Nodes {
+						if n.User != nil && n.User.ID == m.Users[i].ID {
+							touched[id] = true
 						}
 					}
+
+					m.SetUsers(m.Users)
 				}
 
-				require.NoError(t, w.SetUsers(m.users))
+				require.NoError(t, w.SetUsers(m.Users))
 			case "batch":
 				ids := rapid.SliceOfNDistinct(rapid.Uint64Range(1, 8), 0, 8, func(id uint64) uint64 { return id }).Draw(t, "batch")
 				parity := rapid.Uint64Range(0, 2).Draw(t, "accept-parity")
@@ -345,10 +225,10 @@ func TestWorldMutationProperty(t *testing.T) {
 					id := types.NodeID(raw)
 
 					updates[id] = func(n *types.Node) { n.Hostname = name }
-					if n := m.nodes[id]; n != nil && uint64(id)%2 == parity {
+					if n := m.Nodes[id]; n != nil && uint64(id)%2 == parity {
 						n = n.Clone()
 						n.Hostname = name
-						m.nodes[id], touched[id], commit = n, true, true
+						m.Nodes[id], touched[id], commit = n, true, true
 					}
 				}
 
@@ -356,32 +236,32 @@ func TestWorldMutationProperty(t *testing.T) {
 				require.Equal(t, commit, applied)
 			case "noop":
 				w.UpdateNodes(nil)
-				require.NoError(t, w.SetUsers(slices.Clone(m.users)))
+				require.NoError(t, w.SetUsers(slices.Clone(m.Users)))
 				require.False(t, w.UpdateNodesIf(map[types.NodeID]UpdateNodeFunc{id: func(*types.Node) { t.Fatal("rejected callback ran") }}, func(*types.Node) bool { return false }))
 			case "copy":
 				_, ok := w.UpdateNode(id, func(*types.Node) {})
-				require.Equal(t, m.nodes[id] != nil, ok)
+				require.Equal(t, m.Nodes[id] != nil, ok)
 
 				if ok {
 					// An identical node copy is still a published write.
 					touched[id], commit = true, true
 				}
 			case "stale":
-				old := history[rapid.IntRange(0, len(history)-1).Draw(t, "stale-snapshot")].model.nodes[id]
+				old := history[rapid.IntRange(0, len(history)-1).Draw(t, "stale-snapshot")].model.Nodes[id]
 				if old != nil {
 					n := old.Clone()
 					got := w.PutNode(*n)
 
-					n.GivenName = m.name(id, n.GivenName)
+					n.GivenName = m.Name(id, n.GivenName)
 					if n.User != nil {
-						for _, u := range m.users {
+						for _, u := range m.Users {
 							if u.ID == n.User.ID {
 								n.User = u.Clone()
 							}
 						}
 					}
 
-					m.nodes[id] = n
+					m.Put(n)
 					require.Equal(t, n, got.AsStruct())
 
 					touched[id], commit = true, true
@@ -397,15 +277,15 @@ func TestWorldMutationProperty(t *testing.T) {
 
 			require.Equal(t, wantRev, after.Rev(), "operation %s", op)
 			history = append(history, worldModelSnapshot{snap: after, model: m, touched: touched})
-			m.check(t, after, nodeKeys, machineKeys)
+			checkWorldReference(t, m, after, nodeKeys, machineKeys)
 			old := rapid.IntRange(0, len(history)-1).Draw(t, "retained")
-			history[old].model.check(t, history[old].snap, nodeKeys, machineKeys)
+			checkWorldReference(t, history[old].model, history[old].snap, nodeKeys, machineKeys)
 			checkWorldModelHistory(t, history, old)
 			checkWorldModelHistory(t, history, len(history)-2)
 		}
 
 		for i, old := range history {
-			old.model.check(t, old.snap, nodeKeys, machineKeys)
+			checkWorldReference(t, old.model, old.snap, nodeKeys, machineKeys)
 			checkWorldModelHistory(t, history, i)
 		}
 	})
@@ -465,4 +345,29 @@ func TestWorldHistoryProperty(t *testing.T) {
 		require.Equal(t, n, *latest.ListNodes().At(0).AsStruct())
 		checkPeersMatchFullBuild(t, latest)
 	})
+}
+
+func checkWorldReference(t *rapid.T, m propcheck.World, snap *Snapshot, nodeKeys []key.NodePublic, machineKeys []key.MachinePublic) {
+	propcheck.CheckWorld(t, m, snap, propcheck.WorldProbes{
+		IDs: []types.NodeID{1, 2, 3, 4, 5, 6, 7, 8}, UserIDs: []types.UserID{0, 1, 2, 3}, NodeKeys: nodeKeys, MachineKeys: machineKeys,
+	})
+	checkPeersMatchFullBuild(t, snap)
+}
+
+func TestWorldReferenceOwnership(t *testing.T) {
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: []types.User{{ID: 1, Name: "one"}}}
+	n := &types.Node{ID: 1, GivenName: "Name", UserID: new(uint(1)), User: &types.User{ID: 1}, Tags: []string{"tag:srv"}, Hostinfo: &tailcfg.Hostinfo{Hostname: "first"}}
+	m.Put(n)
+	n.Hostinfo.Hostname, n.Tags[0] = "mutated", "tag:other"
+	require.Equal(t, "first", m.Nodes[1].Hostinfo.Hostname)
+	require.Equal(t, []string{"tag:srv"}, []string(m.Nodes[1].Tags))
+	require.Equal(t, "name-1", m.Name(2, "name"))
+	clone := m.Clone()
+	users := []types.User{{ID: 1, Name: "renamed"}}
+	m.SetUsers(users)
+	users[0].Name = "mutated"
+	require.Equal(t, "renamed", m.Nodes[1].User.Name)
+	require.Equal(t, "one", clone.Nodes[1].User.Name)
+	m.Delete(1)
+	require.Contains(t, clone.Nodes, types.NodeID(1))
 }
