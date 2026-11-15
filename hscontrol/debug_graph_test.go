@@ -1013,3 +1013,119 @@ func TestDebugGraphDetailAfterChurn(t *testing.T) {
 	code, _ = summary(shown.Revision)
 	assert.Equal(t, http.StatusConflict, code, "retention is bounded")
 }
+
+func TestDebugGraphNetworkHTTP(t *testing.T) {
+	app := createTestApp(t)
+	_, err := app.state.SetPolicy([]byte(`{"grants":[{"src":["*"],"dst":["*"],"ip":["*"]}]}`))
+	require.NoError(t, err)
+
+	user := app.state.CreateUserForTest("network-user")
+	node := app.state.CreateRegisteredNodeForTest(user, "network-node")
+	app.state.PutNodeInStoreForTest(*node)
+	handler := app.debugHTTPServer().Handler
+	request := func(path, remote string) *httptest.ResponseRecorder {
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
+		r.RemoteAddr = remote
+		r.Host = "localhost"
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+
+		return w
+	}
+
+	for _, operation := range []string{"inventory", "topology", "access", "explain", "source"} {
+		path := "/debug/graph/network/" + operation + "?category=nodes"
+		denied := request(path, "192.168.1.5:1234")
+		require.Equal(t, http.StatusForbidden, denied.Code, path)
+
+		for _, foreign := range []bool{false, true} {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
+			req.RemoteAddr = "127.0.0.1:1234"
+
+			req.Host = "localhost"
+			if foreign {
+				req.Header.Set("Origin", "https://attacker.example")
+			} else {
+				req.Header.Set("Sec-Fetch-Site", "cross-site")
+			}
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			require.Equal(t, http.StatusForbidden, rec.Code, path)
+		}
+	}
+
+	base := "/debug/graph/network/"
+	w := request(base+"inventory?category=nodes", "127.0.0.1:1234")
+	require.Equal(t, 200, w.Code, w.Body.String())
+
+	var page struct {
+		Revision string                `json:"revision"`
+		Items    []state.NetworkObject `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &page))
+	require.Len(t, page.Items, 1)
+	revision := url.QueryEscape(page.Revision)
+
+	for _, path := range []string{"topology", "topology?search=does-not-match", "topology?identity=user:missing"} {
+		w = request(base+path, "127.0.0.1:1234")
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		var topology state.NetworkTopology
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &topology))
+		require.Equal(t, page.Revision, topology.Revision)
+
+		if path != "topology" {
+			require.Empty(t, topology.Objects)
+		}
+	}
+
+	w = request(base+"topology?id=node:999999&revision="+revision, "127.0.0.1:1234")
+	require.Equal(t, http.StatusNotFound, w.Code)
+	w = request(base+"topology?revision=other:1", "127.0.0.1:1234")
+	require.Equal(t, http.StatusConflict, w.Code)
+
+	id := url.QueryEscape(page.Items[0].ID)
+	w = request(base+"source?pointer=/grants/0&revision="+revision, "127.0.0.1:1234")
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var chunk struct {
+		Revision string `json:"revision"`
+		Text     string `json:"text"`
+		Total    int    `json:"total"`
+		Next     *int   `json:"nextOffset"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &chunk))
+	require.Equal(t, page.Revision, chunk.Revision)
+	require.Contains(t, chunk.Text, `"src":["*"]`)
+	require.Equal(t, len(chunk.Text), chunk.Total)
+	require.Nil(t, chunk.Next)
+
+	w = request(base+"access?id="+id+"&direction=outgoing&onlyPermitted=invalid&revision="+revision, "127.0.0.1:1234")
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	w = request(base+"source?pointer=/grants/0&revision=other:1", "127.0.0.1:1234")
+	require.Equal(t, http.StatusConflict, w.Code)
+
+	for _, path := range []string{"topology?id=" + id, "access?id=" + id + "&direction=outgoing", "explain?source=" + id + "&destination=" + id + "&protocol=6&port=80"} {
+		w = request(base+path+"&revision="+revision, "127.0.0.1:1234")
+		require.Equal(t, 200, w.Code, w.Body.String())
+	}
+
+	for _, path := range []string{"source?pointer=/grants/0", "source?pointer=/grants/0&offset=-1&revision=" + revision, "source?pointer=/absent&revision=" + revision, "explain?source=" + id + "&destination=" + id + "&protocol=6&port=80&evidenceOffset=-1&revision=" + revision, "explain?source=" + id + "&destination=" + id + "&protocol=6&port=80&evidenceResult=100&revision=" + revision, "inventory?category=no", "inventory?category=nodes&limit=101", "inventory?category=nodes&offset=-1", "inventory?category=nodes&offset=1", "topology?id=" + id, "access?id=" + id + "&direction=sideways&revision=" + revision, "explain?source=" + id + "&destination=" + id + "&protocol=6&revision=" + revision, "explain?source=" + id + "&destination=" + id + "&protocol=1&port=80&revision=" + revision, "inventory?category=nodes&search=" + strings.Repeat("x", 513)} {
+		w = request(base+path, "127.0.0.1:1234")
+		require.Equal(t, 400, w.Code, path+" "+w.Body.String())
+	}
+
+	for _, operation := range []string{"inventory", "topology", "access", "explain", "source"} {
+		w = request(base+operation+"?category=nodes", "203.0.113.1:1234")
+		require.Equal(t, http.StatusForbidden, w.Code)
+	}
+
+	w = request(base+"inventory?category=nodes&revision=other:1", "127.0.0.1:1234")
+	require.Equal(t, 409, w.Code)
+	app.state.SetDERPMap(&tailcfg.DERPMap{})
+
+	w = request(base+"inventory?category=nodes&revision="+revision, "127.0.0.1:1234")
+	require.Equal(t, 409, w.Code)
+}

@@ -20,6 +20,7 @@ func TestDebugGraphUnavailable(t *testing.T) {
 		"/debug/graph/", "/debug/graph/elm.js", "/debug/graph/app.js", "/debug/graph/style.css",
 		"/debug/graph/logo.svg", "/debug/graph/favicon.png", "/debug/graph/snapshot",
 		"/debug/graph/detail", "/debug/graph/events",
+		"/debug/graph/network/inventory", "/debug/graph/network/topology", "/debug/graph/network/access", "/debug/graph/network/explain",
 	} {
 		r := httptest.NewRequestWithContext(ctx, http.MethodGet, path, nil)
 		r.Host = "localhost"

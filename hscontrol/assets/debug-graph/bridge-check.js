@@ -11,12 +11,17 @@ const deliveries = [],
   lifecycle = {},
   visibility = {};
 let command;
+let geometryMutation;
+let graphMounted = true;
+let geometryObservations = 0;
+let geometryDisconnects = 0;
 const logoRequests = [];
 const logo = {
   set src(value) {
     logoRequests.push(new URL(value));
   },
 };
+const documentBody = {};
 const canvas = {
   getBoundingClientRect: () => ({ width: 900, height: 600, left: 20, top: 60 }),
   addEventListener() {},
@@ -61,10 +66,24 @@ const context = {
     },
   },
   ResizeObserver: class {
-    observe() {}
+    observe() {
+      geometryObservations += 1;
+    }
+    disconnect() {
+      geometryDisconnects += 1;
+    }
+  },
+  MutationObserver: class {
+    constructor(callback) {
+      geometryMutation = callback;
+    }
+    observe(target) {
+      assert.equal(target, documentBody, "geometry observes the stable body after Elm replaces its mount node");
+    }
   },
   document: {
-    getElementById: () => canvas,
+    body: documentBody,
+    getElementById: (id) => (id === "app" ? null : graphMounted ? canvas : null),
     querySelector: (selector) => (selector === "[data-headscale-logo]" ? logo : null),
     visibilityState: "visible",
     addEventListener: (type, fn) => {
@@ -182,6 +201,52 @@ async function check() {
   lifecycle.pageshow({ persisted: true });
   assert.equal(deliveries.length, cached + 1);
   assert.equal(deliveries.at(-1).type, "restore");
+
+  command({
+    action: "network",
+    generation: 11,
+    operation: "inventory",
+    fields: { category: "nodes", search: "alpha" },
+  });
+  const firstNetwork = requests.at(-1);
+  assert.equal(firstNetwork.url.pathname, "/debug/graph/network/inventory");
+  assert.equal(firstNetwork.url.searchParams.get("debugkey"), "a&b");
+  command({ action: "network", generation: 12, operation: "access", fields: { id: "node:1", direction: "incoming" } });
+  const secondNetwork = requests.at(-1);
+  assert.equal(firstNetwork.options.signal.aborted, true);
+  firstNetwork.resolve({ ok: true, json: async () => ({ revision: "stale-network" }) });
+  secondNetwork.resolve({ ok: true, json: async () => ({ revision: "current-network" }) });
+  await flush();
+  assert.equal(deliveries.filter((value) => value.type === "network").length, 1);
+  assert.equal(deliveries.at(-1).data.revision, "current-network");
+  graphMounted = false;
+  geometryMutation();
+  assert.equal(geometryDisconnects, 1);
+  graphMounted = true;
+  geometryMutation();
+  assert.equal(geometryObservations, 2, "returning from Network reattaches graph geometry");
+  command({
+    action: "network",
+    generation: 13,
+    operation: "explain",
+    fields: { source: "node:1", destination: "node:2", protocol: "6", port: "22" },
+  });
+  const explanation = requests.at(-1);
+  scene(14);
+  assert.equal(explanation.options.signal.aborted, true);
+  explanation.resolve({ ok: true, json: async () => ({ revision: "obsolete-explanation" }) });
+  await flush();
+  assert.equal(deliveries.filter((value) => value.type === "network").length, 1);
+
+  command({ action: "network", generation: 15, operation: "access", fields: { id: "node:1", onlyPermitted: "true" } });
+  requests.at(-1).resolve({ ok: false, status: 400, text: async () => "Policy compilation failed: invalid selector" });
+  await flush();
+  assert.equal(deliveries.at(-1).type, "networkError");
+  assert.equal(
+    deliveries.at(-1).data,
+    "Policy compilation failed: invalid selector",
+    "policy failures must not look like empty permissions",
+  );
 
   const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
   for (const location of [context.location, { href: "http://localhost/debug/graph/", origin: "http://localhost" }]) {

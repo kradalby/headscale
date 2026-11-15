@@ -5,6 +5,9 @@ import Graph
 import Json.Decode as D
 import Json.Encode as E
 import Main
+import Network
+import NetworkData
+import NetworkTopology as Canvas
 import Platform
 import Set
 
@@ -42,6 +45,11 @@ run msg model =
 
 checks : List ( String, Bool )
 checks =
+    networkChecks ++ networkExplorationChecks ++ graphChecks
+
+
+graphChecks : List ( String, Bool )
+graphChecks =
     case ( ( D.decodeString Graph.sceneDecoder sceneJson, D.decodeString Graph.patchDecoder patchJson ), ( D.decodeString D.value sceneJson, D.decodeString D.value patchJson ) ) of
         ( ( Ok scene, Ok patch ), ( Ok sceneValue, Ok patchValue ) ) ->
             let
@@ -411,3 +419,259 @@ isError result =
 
         Ok _ ->
             False
+
+
+networkChecks : List ( String, Bool )
+networkChecks =
+    let
+        ( loaded, _ ) =
+            Network.load 7 Network.initial
+
+        ( paged, _ ) =
+            Network.update (Network.Page 50) loaded
+
+        ( changed, _ ) =
+            Network.update (Network.Category "users") paged
+
+        ( direction, _ ) =
+            Network.update (Network.Direction "incoming") paged
+
+        ( refreshed, _ ) =
+            Network.update Network.Refresh paged
+
+        ( icmp, _ ) =
+            Network.update (Network.Field "protocol" "1") { loaded | source = "node:1", destination = "node:2", port_ = "invalid" }
+
+        ( explained, shouldExplain ) =
+            Network.update Network.Explain icmp
+
+        payload =
+            E.object [ ( "generation", E.int 6 ), ( "type", E.string "networkError" ), ( "data", E.string "stale" ) ]
+
+        ( opened, _ ) =
+            Main.update Main.OpenNetwork Main.initial
+
+        ( returned, _ ) =
+            Main.update (Main.Perspective "world") opened
+    in
+    [ ( "evidence pagination preserves snapshot and selects address result"
+      , let
+            ( page, fetch ) =
+                Network.update (Network.EvidencePage 2 100) { loaded | revision = "process:7" }
+
+            ( _, query ) =
+                Network.load 8 page
+        in
+        fetch && page.evidenceOffset == 100 && page.evidenceResult == 2 && page.revision == "process:7" && (D.decodeValue (D.at [ "fields", "evidenceOffset" ] D.string) query == Ok "100") && (D.decodeValue (D.at [ "fields", "evidenceResult" ] D.string) query == Ok "2")
+      )
+    , ( "source chunks preserve revision and pointer"
+      , let
+            ( page, fetch ) =
+                Network.update (Network.SourcePage "/grants/100" 8192) { loaded | revision = "process:7" }
+
+            ( _, query ) =
+                Network.load 8 page
+        in
+        fetch && page.operation == "source" && (D.decodeValue (D.at [ "fields", "pointer" ] D.string) query == Ok "/grants/100") && (D.decodeValue (D.at [ "fields", "offset" ] D.string) query == Ok "8192") && (D.decodeValue (D.at [ "fields", "revision" ] D.string) query == Ok "process:7")
+      )
+    , ( "source chunk decoder accepts bounded continuation", not (isError (D.decodeString (NetworkData.responseDecoder "source") "{\"revision\":\"process:7\",\"pointer\":\"/grants/0\",\"offset\":0,\"total\":9000,\"nextOffset\":8192,\"text\":\"original source\"}")) )
+    , ( "access identity input updates independently", (Network.update (Network.Field "accessIdentity" "tag:tag:web") loaded |> Tuple.first).accessIdentity == "tag:tag:web" && (Network.update (Network.Field "accessIdentity" "tag:tag:web") loaded |> Tuple.first).sshUser == "" )
+    , ( "access protocol input updates independently and resets port", (Network.update (Network.Field "accessProtocol" "1") { loaded | accessPort = "443" } |> Tuple.first).accessProtocol == "1" && (Network.update (Network.Field "accessProtocol" "1") { loaded | accessPort = "443" } |> Tuple.first).accessPort == "" && (Network.update (Network.Field "accessProtocol" "1") loaded |> Tuple.first).sshUser == "" )
+    , ( "access port input updates independently", (Network.update (Network.Field "accessPort" "80") loaded |> Tuple.first).accessPort == "80" && (Network.update (Network.Field "accessPort" "80") loaded |> Tuple.first).sshUser == "" )
+    , ( "network inventory decoder accepts empty complete page", not (isError (D.decodeString (NetworkData.responseDecoder "inventory") "{\"revision\":\"process:7\",\"timestamp\":\"now\",\"total\":0,\"matched\":0,\"nextOffset\":null,\"items\":[]}")) )
+    , ( "network numeric revision rejected", isError (D.decodeString (NetworkData.responseDecoder "inventory") "{\"revision\":7,\"timestamp\":\"now\",\"total\":0,\"matched\":0,\"nextOffset\":null,\"items\":[]}") )
+    , ( "network category resets paging", changed.offset == 0 && changed.category == "users" )
+    , ( "network direction resets paging", direction.offset == 0 && direction.direction == "incoming" )
+    , ( "network refresh invalidates revision and pages", refreshed.revision == "" && refreshed.offset == 0 )
+    , ( "network ignores stale responses", (Network.incoming payload loaded).error == "" )
+    , ( "ICMP explanation ignores stale port input", shouldExplain && explained.operation == "explain" )
+    , ( "network return restores graph screen", opened.networkOpen && not returned.networkOpen && returned.perspective == "world" && returned.generation > opened.generation )
+    ]
+
+
+networkExplorationChecks : List ( String, Bool )
+networkExplorationChecks =
+    let
+        fixture =
+            """[{"id":"user:1","kind":"user","label":"user:1","nodeId":"","addresses":[],"ownerId":"","tags":[],"online":null,"expired":false,"relatedIds":[],"provenance":"","protocol":"","firstPort":0,"lastPort":0,"advertised":false,"approved":false,"sourceVisible":false,"selected":false,"memberCount":2},{"id":"node:1","kind":"node","label":"node:1","nodeId":"1","addresses":[],"ownerId":"user:1","tags":[],"online":true,"expired":false,"relatedIds":["user:1"],"provenance":"","protocol":"","firstPort":0,"lastPort":0,"advertised":false,"approved":false,"sourceVisible":false,"selected":false,"memberCount":0},{"id":"node:2","kind":"node","label":"node:2","nodeId":"2","addresses":[],"ownerId":"user:1","tags":[],"online":true,"expired":false,"relatedIds":["user:1"],"provenance":"","protocol":"","firstPort":0,"lastPort":0,"advertised":false,"approved":false,"sourceVisible":false,"selected":false,"memberCount":0}]"""
+
+        envelope generation data =
+            E.object [ ( "generation", E.int generation ), ( "type", E.string "network" ), ( "data", data ) ]
+
+        decoded =
+            D.decodeString (D.list NetworkData.object) fixture
+
+        value =
+            D.decodeString D.value fixture |> Result.withDefault E.null
+
+        metadata fields =
+            E.object (( "revision", E.string "process:7" ) :: ( "timestamp", E.string "now" ) :: fields)
+
+        step message model =
+            Network.update message model |> Tuple.first
+
+        near a b =
+            abs (a - b) < 0.00001
+    in
+    case decoded of
+        Ok [ owner, source, target ] ->
+            let
+                ( baseline, overviewQuery ) =
+                    Network.load 7 Network.initial
+
+                overview =
+                    Network.incoming (envelope 7 (metadata [ ( "objects", value ), ( "relationships", E.list identity [] ), ( "omitted", E.int 0 ) ])) baseline
+
+                ( members, fetchMembers ) =
+                    Network.update (Network.Select owner) overview
+
+                ( _, memberQuery ) =
+                    Network.load 8 members
+
+                memberAccess =
+                    step (Network.Select source) members
+
+                restoredMembers =
+                    step (Network.BackTo owner) memberAccess
+
+                ( access, fetchAccess ) =
+                    Network.update (Network.Select source) overview
+
+                range =
+                    { source = "100.64.0.1", destination = "100.64.0.2", protocols = [ 6 ], first = 80, last = 80, capabilities = [] }
+
+                edge =
+                    { source = source.id, target = target.id, kind = "Packet access" }
+
+                canvas =
+                    Canvas.setScene [ source, target ] [ edge ] Canvas.init |> Canvas.update (Canvas.Pan 63 27)
+
+                accessScene =
+                    { access | objects = [ source, target ], relationships = [ edge ], access = [ { node = target, ranges = [ range ], capabilities = [], visible = True, error = "" } ], canvas = canvas }
+
+                ( connection, fetchExplain ) =
+                    Network.update (Network.SelectEdge edge) accessScene
+
+                ( _, explainQuery ) =
+                    Network.load 8 connection
+
+                capabilityPayload =
+                    metadata
+                        [ ( "total", E.int 1 )
+                        , ( "matched", E.int 1 )
+                        , ( "nextOffset", E.null )
+                        , ( "items"
+                          , E.list identity
+                                [ E.object
+                                    [ ( "node", D.decodeValue (D.index 2 D.value) value |> Result.withDefault E.null )
+                                    , ( "ranges"
+                                      , E.list identity
+                                            [ E.object
+                                                [ ( "source", E.string "100.64.0.1" )
+                                                , ( "destination", E.string "100.64.0.2" )
+                                                , ( "protocols", E.list E.int [] )
+                                                , ( "first", E.int 0 )
+                                                , ( "last", E.int 0 )
+                                                , ( "capabilities", E.list E.string [ "example.com/application" ] )
+                                                ]
+                                            ]
+                                      )
+                                    , ( "capabilities", E.list E.string [ "example.com/application" ] )
+                                    , ( "visible", E.bool True )
+                                    , ( "error", E.string "" )
+                                    ]
+                                ]
+                          )
+                        ]
+
+                capabilityScene =
+                    Network.incoming (envelope accessScene.generation capabilityPayload) accessScene
+
+                ( blocked, fetchBlocked ) =
+                    Network.update Network.Blocked { accessScene | offset = 24 }
+
+                queryField name model =
+                    Network.load 8 model |> Tuple.second |> D.decodeValue (D.at [ "fields", name ] D.string)
+
+                capabilityConnection =
+                    capabilityScene.relationships |> List.head |> Maybe.map (\relationship -> step (Network.SelectEdge relationship) capabilityScene)
+
+                newConnection =
+                    step (Network.SelectEdge edge) { accessScene | sourceIP = "100.64.99.99" }
+
+                incomingEdge =
+                    { edge | source = target.id, target = source.id }
+
+                incomingScene =
+                    { accessScene | direction = "incoming", relationships = [ incomingEdge ] }
+
+                incomingConnection =
+                    step (Network.SelectEdge incomingEdge) incomingScene
+
+                selectedTarget =
+                    step (Network.Select target) accessScene
+
+                ( sourcePage, _ ) =
+                    Network.update (Network.SourcePage "/grants/0" 0) connection
+
+                chunk =
+                    metadata [ ( "pointer", E.string "/grants/0" ), ( "offset", E.int 0 ), ( "total", E.int 3 ), ( "nextOffset", E.null ), ( "text", E.string "raw" ) ]
+
+                withChunk =
+                    Network.incoming (envelope 7 chunk) sourcePage
+
+                fitted =
+                    Canvas.fit [ source, target ] canvas
+
+                inside p =
+                    p.x * fitted.zoom + fitted.x >= 0 && p.y * fitted.zoom + fitted.y >= 0 && (p.x + 198) * fitted.zoom + fitted.x <= fitted.width && (p.y + 66) * fitted.zoom + fitted.y <= fitted.height
+
+                start =
+                    Canvas.update (Canvas.Start (Just source.id) { x = 10, y = 20 }) canvas
+
+                dragged =
+                    start |> Canvas.update (Canvas.Move { x = 70, y = 50 }) |> Canvas.update Canvas.End
+
+                clicked =
+                    start |> Canvas.update (Canvas.Move { x = 11, y = 21 }) |> Canvas.update Canvas.End
+
+                cursor =
+                    { x = 240, y = 170 }
+
+                zoomed =
+                    Canvas.update (Canvas.Wheel cursor -120) canvas
+
+                oldPosition =
+                    Dict.get source.id canvas.positions
+
+                newPosition =
+                    Dict.get source.id dragged.positions
+            in
+            [ ( "Network starts with a whole-network topology overview", baseline.operation == "topology" && baseline.sceneMode == "overview" && D.decodeValue (D.field "operation" D.string) overviewQuery == Ok "topology" && D.decodeValue (D.at [ "fields", "id" ] D.string) overviewQuery == Ok "" )
+            , ( "overview retains identity groups and sampled devices", List.length overview.objects == 3 && List.any (\object -> object.id == owner.id && object.memberCount == 2) overview.objects )
+            , ( "selecting an identity requests its device members", fetchMembers && members.sceneMode == "members" && members.anchor == Just owner && D.decodeValue (D.at [ "fields", "identity" ] D.string) memberQuery == Ok owner.id && D.decodeValue (D.field "operation" D.string) memberQuery == Ok "inventory" )
+            , ( "drilling from a group into its device retains the group breadcrumb", List.map .id memberAccess.trail == [ owner.id ] && memberAccess.anchor == Just source && memberAccess.sceneMode == "access" )
+            , ( "group breadcrumb restores the member graph scope", restoredMembers.sceneMode == "members" && restoredMembers.identity == owner.id && restoredMembers.anchor == Just owner && restoredMembers.operation == "inventory" )
+            , ( "selecting a device requests outgoing access", fetchAccess && access.sceneMode == "access" && access.anchor == Just source && access.direction == "outgoing" )
+            , ( "selecting an access edge requests its directed tuple and range", fetchExplain && connection.operation == "explain" && connection.source == source.id && connection.destination == target.id && D.decodeValue (D.at [ "fields", "port" ] D.string) explainQuery == Ok "80" && D.decodeValue (D.at [ "fields", "protocol" ] D.string) explainQuery == Ok "6" )
+            , ( "access pages request permitted candidates by default", queryField "onlyPermitted" accessScene == Ok "true" )
+            , ( "showing blocked candidates requests a fresh first page", fetchBlocked && blocked.showBlocked && blocked.offset == 0 && blocked.operation == "access" && queryField "onlyPermitted" blocked /= Ok "true" )
+            , ( "access search includes blocked candidates", queryField "onlyPermitted" { accessScene | search = "destination" } /= Ok "true" )
+            , ( "capability-only response decodes before scene projection", capabilityScene.error == "" && List.length capabilityScene.access == 1 )
+            , ( "capability-only ranges remain separate from packet access", List.map .kind capabilityScene.relationships == [ "Capabilities only" ] )
+            , ( "capability-only edge inspection checks a real default packet port", Maybe.map .port_ capabilityConnection == Just "443" && Maybe.map .protocol capabilityConnection == Just "6" )
+            , ( "selecting another connection clears its predecessor custom source address", newConnection.sourceIP == "" )
+            , ( "access edge inspection preserves graph and camera", connection.objects == accessScene.objects && connection.relationships == accessScene.relationships && connection.canvas == canvas && connection.selectedEdge == Just edge )
+            , ( "selecting an access destination inspects its existing edge", selectedTarget.operation == "explain" && selectedTarget.selectedEdge == Just edge && selectedTarget.anchor == Just source )
+            , ( "incoming access explains candidate toward the anchor", incomingConnection.source == target.id && incomingConnection.destination == source.id && incomingConnection.selected == Just target && incomingConnection.port_ == "80" )
+            , ( "source response preserves graph camera and selected connection", withChunk.error == "" && not withChunk.loading && withChunk.objects == connection.objects && withChunk.relationships == connection.relationships && withChunk.canvas == canvas && withChunk.selectedEdge == Just edge )
+            , ( "stale network scene cannot replace the current graph", Network.incoming (envelope 6 chunk) accessScene == accessScene )
+            , ( "network fit contains every object", List.all inside (Dict.values fitted.positions) )
+            , ( "network wheel zoom stays anchored at the cursor", near ((cursor.x - canvas.x) / canvas.zoom) ((cursor.x - zoomed.x) / zoomed.zoom) && near ((cursor.y - canvas.y) / canvas.zoom) ((cursor.y - zoomed.y) / zoomed.zoom) )
+            , ( "network drag pins and suppresses its ensuing click", dragged.moved && dragged.drag == Nothing && Set.member source.id dragged.pinned && oldPosition /= newPosition )
+            , ( "network click threshold keeps objects unpinned", not clicked.moved && Set.isEmpty clicked.pinned && clicked.positions == canvas.positions )
+            , ( "refreshing the same scene preserves pinned positions", (Canvas.setScene [ source, target ] [ edge ] dragged).positions == dragged.positions && (Canvas.setScene [ source, target ] [ edge ] dragged).pinned == dragged.pinned )
+            ]
+
+        _ ->
+            [ ( "network exploration object fixtures decode", False ) ]
