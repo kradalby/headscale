@@ -1168,6 +1168,9 @@ type nodeChange struct {
 	users    map[uint]struct{}
 	routes   bool // a node's approved routes changed
 	untagged bool // an untagged node, an autogroup:member, changed
+	// addrs are the changed nodes' addresses, before and after: a self
+	// source names nodes by address, so a node sharing one moves too.
+	addrs map[netip.Addr]struct{}
 
 	// Current identities of changed owners, populated by indexUsers.
 	userNames map[string]struct{}
@@ -1216,11 +1219,15 @@ func (c *nodeChange) movesSSH(rule SSH) bool {
 }
 
 func diffNodes(prev map[types.NodeID]types.NodeView, nodes views.Slice[types.NodeView]) *nodeChange {
-	c := &nodeChange{tags: map[Tag]struct{}{}, users: map[uint]struct{}{}}
+	c := &nodeChange{tags: map[Tag]struct{}{}, users: map[uint]struct{}{}, addrs: map[netip.Addr]struct{}{}}
 
 	note := func(n types.NodeView) {
 		for _, t := range n.Tags().All() {
 			c.tags[Tag(t)] = struct{}{}
+		}
+
+		for _, ip := range n.IPs() {
+			c.addrs[ip] = struct{}{}
 		}
 
 		// By UserID, not User: a node can carry one without the other,

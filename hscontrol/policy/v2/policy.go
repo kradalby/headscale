@@ -729,8 +729,9 @@ func (pm *PolicyManager) FilterChangedNodes(prev *PolicyManager) ([]types.NodeID
 // ownRulesChangedNodes returns the nodes whose own rules can differ
 // between prev and pm, compiles of the same document and users: for a
 // self grant that compiled differently, the nodes of the users whose
-// nodes changed, and every exit node, which carries every user's self
-// rules; for a via grant, every node with one of its via tags.
+// nodes changed, of the users holding an address one of those nodes held
+// or holds, and every exit node, which carries every user's self rules;
+// for a via grant, every node with one of its via tags.
 func (pm *PolicyManager) ownRulesChangedNodes(prev *PolicyManager) ([]types.NodeID, bool) {
 	if len(pm.grantResults) != len(prev.grantResults) {
 		return nil, true
@@ -756,7 +757,8 @@ func (pm *PolicyManager) ownRulesChangedNodes(prev *PolicyManager) ([]types.Node
 			switch {
 			case cg == nil:
 			case cg.category == grantCategorySelf:
-				// A user's self rules then follow only their own nodes.
+				// A user's self rules then follow their own nodes, and the
+				// nodes sharing their addresses.
 				if slices.ContainsFunc(g.Sources, notUserSource) {
 					return nil, true
 				}
@@ -774,9 +776,27 @@ func (pm *PolicyManager) ownRulesChangedNodes(prev *PolicyManager) ([]types.Node
 		return nil, false
 	}
 
-	var users map[uint]struct{}
+	var (
+		users map[uint]struct{}
+		moved map[netip.Addr]struct{}
+	)
+
 	if self {
-		users = diffNodes(prev.nodesByID, pm.nodes).users
+		change := diffNodes(prev.nodesByID, pm.nodes)
+		users, moved = change.users, change.addrs
+
+		// A self source names an owner's node by address: a changed node
+		// sharing an address with another user's node moves that user's
+		// self rules, to all of that user's nodes.
+		for _, m := range []*PolicyManager{prev, pm} {
+			for uid, nodes := range m.userNodeIdx {
+				if slices.ContainsFunc(nodes, func(n types.NodeView) bool {
+					return slices.ContainsFunc(n.IPs(), func(ip netip.Addr) bool { _, ok := moved[ip]; return ok })
+				}) {
+					users[uid] = struct{}{}
+				}
+			}
+		}
 	}
 
 	var out []types.NodeID

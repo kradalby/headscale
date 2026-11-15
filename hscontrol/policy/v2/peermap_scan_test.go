@@ -1860,7 +1860,14 @@ func ownRulesNode(id int, user *types.User, tags []string, routes ...string) *ty
 }
 
 func TestFilterChangedNodesReachesOwnRules(t *testing.T) {
-	u1, u2 := &scanUsers[0], &scanUsers[1]
+	u1, u2, u3 := &scanUsers[0], &scanUsers[1], &scanUsers[2]
+
+	// sharing returns n holding other's addresses.
+	sharing := func(n, other *types.Node) *types.Node {
+		n.IPv4, n.IPv6 = other.IPv4, other.IPv6
+
+		return n
+	}
 
 	tests := []struct {
 		name          string
@@ -1875,6 +1882,26 @@ func TestFilterChangedNodesReachesOwnRules(t *testing.T) {
 			policy: `{"tagOwners":{"tag:x":["u1@"]},"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`,
 			before: types.Nodes{ownRulesNode(1, u1, nil), ownRulesNode(2, u1, nil), ownRulesNode(3, nil, []string{"tag:x"}, "0.0.0.0/0", "::/0")},
 			after:  types.Nodes{ownRulesNode(1, nil, []string{"tag:x"}), ownRulesNode(2, u1, nil), ownRulesNode(3, nil, []string{"tag:x"}, "0.0.0.0/0", "::/0")},
+			want:   []types.NodeID{2, 3},
+		},
+		{
+			// n2 moving from u2 to u3 gives u3@ the address n1 shares
+			// with it: a self source names nodes by address, so u1's self
+			// rules from u3@ change though no u1 node did.
+			name:   "self-shared-address",
+			policy: `{"acls":[{"action":"accept","src":["u3@"],"dst":["autogroup:self:22"]}]}`,
+			before: types.Nodes{ownRulesNode(1, u1, nil), sharing(ownRulesNode(2, u2, nil), ownRulesNode(1, u1, nil))},
+			after:  types.Nodes{ownRulesNode(1, u1, nil), sharing(ownRulesNode(2, u3, nil), ownRulesNode(1, u1, nil))},
+			want:   []types.NodeID{1},
+		},
+		{
+			// n1 leaving u1 takes the address it shares with u3's n2 out of
+			// u1@: u3's self rule from u1@ goes, from both of u3's nodes,
+			// though n3 shares nothing.
+			name:   "self-shared-address-owner",
+			policy: `{"tagOwners":{"tag:x":["u1@"]},"acls":[{"action":"accept","src":["u1@"],"dst":["autogroup:self:22"]}]}`,
+			before: types.Nodes{sharing(ownRulesNode(1, u1, nil), ownRulesNode(2, u3, nil)), ownRulesNode(2, u3, nil), ownRulesNode(3, u3, nil)},
+			after:  types.Nodes{sharing(ownRulesNode(1, nil, []string{"tag:x"}), ownRulesNode(2, u3, nil)), ownRulesNode(2, u3, nil), ownRulesNode(3, u3, nil)},
 			want:   []types.NodeID{2, 3},
 		},
 		{
