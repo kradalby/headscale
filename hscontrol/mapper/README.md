@@ -344,7 +344,9 @@ approved route means stale Unhealthy clears. Re-advertisement does not restore
 removed automatic approval. Broad Hostinfo operations preserve advertisements
 because richer policies contain auto-approvers outside this reference domain.
 An unsupported route-changing policy fails an explicit precondition rather than
-silently skipping a case or adopting production approvals.
+silently skipping a case or adopting production approvals. The file history also
+composes a valid commented policy with a route-changing request: raw active,
+modeled and retained policy bytes stay unchanged, and only the node write publishes.
 
 Every accepted request is checked for caller nonmutation. After acceptance the
 adapter overwrites its submitted Hostinfo, NetInfo, service/tag/route slices and

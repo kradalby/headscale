@@ -9447,7 +9447,7 @@ func (p *streamPropertySystem) inputRequest(t *rapid.T, op streamOperation) {
 		if !slices.Equal(n.Hostinfo.RoutableIPs, hi.RoutableIPs) {
 			var policy map[string]json.RawMessage
 
-			doc, err := hujson.Standardize(p.policyDoc)
+			doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
 			require.NoError(t, err)
 			require.NoError(t, json.Unmarshal(doc, &policy))
 			require.NotContains(t, policy, "autoApprovers", "route request requires independently modeled approvals")
@@ -10585,6 +10585,25 @@ func TestStreamMapRequestHistory(t *testing.T) {
 				router.Unhealthy = true
 				p.put(t, router)
 				flush(true)
+
+				if mode == types.PolicyModeFile {
+					p.apply(t, p.drawOperation(t, "file-comment"))
+					flush(true)
+
+					before := p.state.Snapshot()
+					rawPolicy := slices.Clone(p.policyDoc)
+					n := p.world.Nodes[1].Clone()
+					hi := n.Hostinfo.Clone()
+					hi.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}
+					p.apply(t, streamOperation{kind: "request-routes", node: n, before: n.Clone(), request: tailcfg.MapRequest{
+						NodeKey: n.NodeKey, DiscoKey: n.DiscoKey, Endpoints: slices.Clone(n.Endpoints), Hostinfo: hi,
+					}})
+					require.Equal(t, rawPolicy, p.policyDoc, "route request preserves raw policy model")
+					require.Equal(t, rawPolicy, p.state.Snapshot().PolicySource(), "route request preserves raw active policy")
+					require.Equal(t, rawPolicy, before.PolicySource(), "route request preserves retained raw policy")
+					require.Equal(t, before.Rev()+1, p.state.Snapshot().Rev(), "only the node report publishes")
+					flush(true)
+				}
 
 				for _, id := range []types.NodeID{1, 3} {
 					for _, phase := range []string{"report", "same", "nil", "omit-netinfo", "derp-two", "derp-clear", "empty-name", "withdraw", "reannounce", "withdraw-again"} {
