@@ -4,363 +4,21 @@ import (
 	"fmt"
 	"maps"
 	"net/netip"
+	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/graph"
+	"github.com/juanfont/headscale/hscontrol/internal/propcheck"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"pgregory.net/rapid"
+	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/types/views"
 )
-
-// model mirrors the expected primary-route assignment given the
-// operations applied so far. It is intentionally simple — close to
-// what computePrimaries (node_store.go) prescribes — so divergence
-// between the model and the snapshot's primaries map flags a bug in
-// the algorithm.
-//
-// The model lives in the test file because the algorithm under test
-// is the one inside snapshotFromNodes; the model's job is to predict
-// the same answer from a separate, deliberately direct implementation.
-type primariesModel struct {
-	// connected mirrors IsOnline; since holds the step at which the
-	// node's current session opened.
-	connected map[types.NodeID]bool
-	since     map[types.NodeID]int
-	// announced mirrors Hostinfo.RoutableIPs — what the client says
-	// it can route. The election does not look at this directly; it
-	// is used to recompute the effective set whenever ApprovedRoutes
-	// changes without a Hostinfo update.
-	announced map[types.NodeID][]netip.Prefix
-	// approved mirrors node.ApprovedRoutes — what the admin policy
-	// allows. SetApprovedRoutes touches this without touching
-	// announced; ConnectAdvertise / ApprovedRoutesChange touch both.
-	approved map[types.NodeID][]netip.Prefix
-	// prefixes is the effective per-node route set —
-	// AllApprovedRoutes in the implementation, i.e. (announced ∩
-	// approved) excluding exit routes. This is what the election
-	// sees, and what the model uses in advertisersByPrefix.
-	prefixes  map[types.NodeID][]netip.Prefix
-	unhealthy map[types.NodeID]bool
-
-	// primary[p] is the current primary for prefix p. With no router
-	// available the implementation keeps the previous primary, so the
-	// model has to track this across operations rather than recompute
-	// a fresh choice each time.
-	primary map[netip.Prefix]types.NodeID
-}
-
-func newPrimariesModel() *primariesModel {
-	return &primariesModel{
-		connected: map[types.NodeID]bool{},
-		since:     map[types.NodeID]int{},
-		announced: map[types.NodeID][]netip.Prefix{},
-		approved:  map[types.NodeID][]netip.Prefix{},
-		prefixes:  map[types.NodeID][]netip.Prefix{},
-		unhealthy: map[types.NodeID]bool{},
-		primary:   map[netip.Prefix]types.NodeID{},
-	}
-}
-
-// recomputeEffective sets m.prefixes[id] to the intersection of
-// m.announced[id] and m.approved[id]. Empty intersections clear the
-// node from m.prefixes entirely. Matches Node.AllApprovedRoutes /
-// SubnetRoutes semantics (exit routes excluded — none of the test
-// prefixes hit that branch).
-func (m *primariesModel) recomputeEffective(id types.NodeID) {
-	ann := m.announced[id]
-	app := m.approved[id]
-
-	if len(ann) == 0 || len(app) == 0 {
-		delete(m.prefixes, id)
-		return
-	}
-
-	eff := make([]netip.Prefix, 0, len(ann))
-	for _, p := range ann {
-		if slices.Contains(app, p) {
-			eff = append(eff, p)
-		}
-	}
-
-	if len(eff) == 0 {
-		delete(m.prefixes, id)
-	} else {
-		m.prefixes[id] = eff
-	}
-}
-
-// advertisersByPrefix returns the connected nodes that announce each
-// prefix, sorted by NodeID (matches computePrimaries' iteration).
-func (m *primariesModel) advertisersByPrefix() map[netip.Prefix][]types.NodeID {
-	out := map[netip.Prefix][]types.NodeID{}
-
-	for p, nodes := range m.approversByPrefix() {
-		for _, n := range nodes {
-			if m.connected[n] {
-				out[p] = append(out[p], n)
-			}
-		}
-	}
-
-	return out
-}
-
-// approversByPrefix returns every node that approves each prefix, connected
-// or not, sorted by NodeID.
-func (m *primariesModel) approversByPrefix() map[netip.Prefix][]types.NodeID {
-	out := map[netip.Prefix][]types.NodeID{}
-
-	for n, prefs := range m.prefixes {
-		for _, p := range prefs {
-			out[p] = append(out[p], n)
-		}
-	}
-
-	for _, nodes := range out {
-		slices.Sort(nodes)
-	}
-
-	return out
-}
-
-// connect mirrors a session opening on node n at step.
-func (m *primariesModel) connect(n types.NodeID, step int) {
-	if !m.connected[n] {
-		m.since[n] = step
-	}
-
-	m.connected[n] = true
-}
-
-// available reports whether n may win an election: connected and healthy.
-func (m *primariesModel) available(n types.NodeID) bool {
-	return m.connected[n] && !m.unhealthy[n]
-}
-
-// updatePrimaries reapplies the algorithm to recompute the primary
-// for each prefix. Called after every operation.
-func (m *primariesModel) updatePrimaries() {
-	approvers := m.approversByPrefix()
-
-	// Drop primaries for prefixes no node approves any more.
-	for p := range m.primary {
-		if _, ok := approvers[p]; !ok {
-			delete(m.primary, p)
-		}
-	}
-
-	for p, nodes := range approvers {
-		// The oldest session wins; nodes ascend, so a tie keeps the
-		// lower ID.
-		var oldest types.NodeID
-
-		for _, n := range nodes {
-			if m.available(n) && (oldest == 0 || m.since[n] < m.since[oldest]) {
-				oldest = n
-			}
-		}
-
-		if oldest != 0 {
-			m.primary[p] = oldest
-
-			continue
-		}
-
-		cur, hasPrev := m.primary[p]
-		hasPrev = hasPrev && slices.Contains(nodes, cur)
-
-		// No router available: the previous primary keeps the prefix,
-		// else the lowest-ID approver the prober has not declared
-		// unreachable; with neither the prefix is unmapped.
-		if hasPrev {
-			continue
-		}
-
-		if i := slices.IndexFunc(nodes, func(n types.NodeID) bool {
-			return !m.unhealthy[n]
-		}); i >= 0 {
-			m.primary[p] = nodes[i]
-		} else {
-			delete(m.primary, p)
-		}
-	}
-}
-
-// allPrefixes returns every prefix any node approves.
-func (m *primariesModel) allPrefixes() []netip.Prefix {
-	return slices.Collect(maps.Keys(m.approversByPrefix()))
-}
-
-func samePrefixSet(a, b []netip.Prefix) bool {
-	if len(a) != len(b) {
-		return false
-	}
-
-	aa := slices.Clone(a)
-	bb := slices.Clone(b)
-
-	slices.SortFunc(aa, netip.Prefix.Compare)
-	slices.SortFunc(bb, netip.Prefix.Compare)
-
-	return slices.Equal(aa, bb)
-}
-
-// checkPrimariesProperties asserts every rule we expect of the snapshot's
-// primaries map given the model. prevSnapshotPrimaries is the snapshot's
-// PrimaryRoutes() reading taken before the just-applied op, the primary
-// that may stay unhealthy while no router is available.
-func checkPrimariesProperties(
-	rt *rapid.T,
-	ns *world,
-	m *primariesModel,
-	nodeIDs []types.NodeID,
-	prevSnapshotPrimaries map[netip.Prefix]types.NodeID,
-) {
-	rt.Helper()
-
-	expectedByNode := map[types.NodeID][]netip.Prefix{}
-	for p, owner := range m.primary {
-		expectedByNode[owner] = append(expectedByNode[owner], p)
-	}
-
-	for _, id := range nodeIDs {
-		got := ns.snapshot().PrimaryRoutesForNode(id)
-		want := expectedByNode[id]
-
-		if !samePrefixSet(got, want) {
-			rt.Fatalf(
-				"PrimaryRoutesForNode(%d) = %v, model expected %v",
-				id, got, want,
-			)
-		}
-
-		if want := !m.unhealthy[id]; ns.snapshot().IsNodeHealthy(id) != want {
-			rt.Fatalf(
-				"IsNodeHealthy(%d) = %v, want %v",
-				id, ns.snapshot().IsNodeHealthy(id), want,
-			)
-		}
-	}
-
-	// Every prefix the model maps must have the same primary in the
-	// snapshot: a prefix silently losing its primary after a
-	// disconnect/reconnect cycle would leave peers without a route.
-	for _, p := range m.allPrefixes() {
-		want, expectExists := m.primary[p]
-		if !expectExists {
-			continue
-		}
-
-		got, ok := ns.snapshot().PrimaryRouteFor(p)
-		if !ok {
-			rt.Fatalf(
-				"prefix %s has a primary in the model but none in NodeStore",
-				p,
-			)
-		}
-
-		if want != got {
-			rt.Fatalf(
-				"prefix %s: snapshot primary = %d, model expected %d",
-				p, got, want,
-			)
-		}
-	}
-
-	// Structural invariants on the live snapshot, independent of the
-	// model. These catch shapes the model alone cannot — e.g. an owner
-	// that no longer approves the prefix attributed to it.
-	snapshotPrimaries := ns.snapshot().PrimaryRoutes()
-
-	// A primary that owns ≥1 prefix in `routes` must also light up
-	// `isPrimaryRoute` (PrimaryRoutesForNode returns nil unless the
-	// id is in that map). The inverse check — PrimaryRoutesForNode
-	// returning the right prefixes — is already covered above; this
-	// catches the reverse direction.
-	ownersInRoutes := map[types.NodeID]bool{}
-	for _, owner := range snapshotPrimaries {
-		ownersInRoutes[owner] = true
-	}
-
-	for owner := range ownersInRoutes {
-		if got := ns.snapshot().PrimaryRoutesForNode(owner); len(got) == 0 {
-			rt.Fatalf(
-				"node %d owns a prefix in routes but PrimaryRoutesForNode is empty",
-				owner,
-			)
-		}
-	}
-
-	// Per-owner structural checks: every primary must currently
-	// advertise the prefix it owns, and be available whenever any of
-	// its approvers is.
-	advertisersByPrefix := m.advertisersByPrefix()
-	approversByPrefix := m.approversByPrefix()
-
-	for prefix, owner := range snapshotPrimaries {
-		nv, ok := ns.snapshot().GetNode(owner)
-		if !ok || !nv.Valid() {
-			rt.Fatalf(
-				"prefix %s primary %d not present in NodeStore",
-				prefix, owner,
-			)
-		}
-
-		// An offline primary is only allowed while no approver could
-		// move packets for the prefix.
-		online, known := nv.IsOnline().GetOk()
-		if (!known || !online) &&
-			slices.ContainsFunc(approversByPrefix[prefix], m.available) {
-			rt.Fatalf(
-				"prefix %s primary %d is not online but %v had an available router",
-				prefix, owner, approversByPrefix[prefix],
-			)
-		}
-
-		// Primary advertises the prefix: AllApprovedRoutes (subnet ∪
-		// exit) must contain it. A primary that no longer advertises
-		// is a stale assignment the snapshot rebuild failed to clear.
-		approved := nv.AllApprovedRoutes()
-		if !slices.Contains(approved, prefix) {
-			rt.Fatalf(
-				"prefix %s primary %d does not advertise it (approved=%v)",
-				prefix, owner, approved,
-			)
-		}
-
-		// Healthy preference: if any approver for this prefix is
-		// healthy, the elected primary must also be healthy, unless it
-		// is the previous primary kept while no router is available.
-		// Leaving the prefix unmapped is fine; moving it to an
-		// unhealthy router while a healthy one was there is not.
-		candidates := advertisersByPrefix[prefix]
-		anyHealthy := slices.ContainsFunc(approversByPrefix[prefix], func(n types.NodeID) bool {
-			return !m.unhealthy[n]
-		})
-
-		if anyHealthy && m.unhealthy[owner] && owner != prevSnapshotPrimaries[prefix] {
-			rt.Fatalf(
-				"prefix %s primary %d is unhealthy but %v had a healthy candidate",
-				prefix, owner, candidates,
-			)
-		}
-
-		// Oldest session: no available router opened its control
-		// session before the primary's. A router that reconnects joins
-		// as a standby; one that keeps its session wins again.
-		for _, c := range approversByPrefix[prefix] {
-			cv, _ := ns.snapshot().GetNode(c)
-			if m.available(c) && cv.SessionStart().Before(nv.SessionStart()) {
-				rt.Fatalf(
-					"prefix %s primary %d holds it over %d, whose session is older",
-					prefix, owner, c,
-				)
-			}
-		}
-	}
-}
 
 // nodeForRapid builds a minimal types.Node for use in property
 // tests. Tests drive (IsOnline, Hostinfo.RoutableIPs, ApprovedRoutes,
@@ -381,245 +39,509 @@ func nodeForRapid(id types.NodeID) types.Node {
 	}
 }
 
-// snapshotPrimariesCopy returns a defensive copy of the snapshot's
-// prefix→primary map so the caller can compare against a later
-// snapshot without aliasing the live map.
-func snapshotPrimariesCopy(ns *world) map[netip.Prefix]types.NodeID {
-	live := ns.snapshot().PrimaryRoutes()
-
-	out := make(map[netip.Prefix]types.NodeID, len(live))
-	maps.Copy(out, live)
-
-	return out
+// The route domain includes overlapping networks, public subnets, exit routes,
+// and host routes inside the configured node ranges. Sampling with replacement
+// deliberately produces duplicate announcements and approvals.
+func propertyRoutePrefixes() []netip.Prefix {
+	return []netip.Prefix{
+		mp("10.0.0.0/16"), mp("10.0.0.0/24"),
+		mp("fd00:1::/48"), mp("fd00:1::/64"),
+		mp("8.8.8.0/24"), mp("2001:4860::/48"),
+		mp("0.0.0.0/0"), mp("::/0"),
+		mp("100.64.0.99/32"), mp("fd7a:115c:a1e0::99/128"),
+	}
 }
 
-// TestPrimaryRoutesProperty drives NodeStore with a randomised
-// sequence of high-level operations and checks that the snapshot's
-// primaries map matches a reference model after every step.
-//
-// Op set (covers the dual-disconnect, batched-probe, and
-// all-unhealthy-fallback shapes that election has to handle):
-//
-//   - ConnectAdvertise: online + advertise prefs, clear Unhealthy
-//   - Disconnect: offline; ApprovedRoutes persists
-//   - ProbeUnhealthy: set Unhealthy
-//   - ProbeHealthy: clear Unhealthy
-//   - ApprovedRoutesChange: change advertised prefs without touching health
-//   - BatchProbeResults: apply a batch of health flips through
-//     UpdateNodes so the election runs once for the cycle, matching
-//     State.BatchSetNodeHealth
-//   - SimultaneousDisconnect: mark multiple nodes offline atomically
-//     via UpdateNodes (the dual-cable-pull shape)
-//   - SetApprovedRoutes: change ApprovedRoutes while leaving
-//     Hostinfo.RoutableIPs alone — exercises the asymmetry between
-//     announced and approved
-//   - OfflineExpiry: IsOnline=false WITHOUT clearing Unhealthy
-//     (matches the Disconnect path's actual semantics versus
-//     ConnectAdvertise's full reset)
+func drawRouteNode(t *rapid.T, id uint64) propcheck.RouteNode {
+	prefixes := rapid.SliceOfN(rapid.SampledFrom(propertyRoutePrefixes()), 0, 6)
+
+	return propcheck.RouteNode{
+		ID:           id,
+		Online:       rapid.Bool().Draw(t, "online"),
+		Expired:      rapid.Bool().Draw(t, "expired"),
+		Unhealthy:    rapid.Bool().Draw(t, "unhealthy"),
+		SessionStart: rapid.SampledFrom([]time.Time{{}, time.Unix(0, 0), time.Unix(1, 0), time.Unix(2, 0)}).Draw(t, "start"),
+		Announced:    prefixes.Draw(t, "announced"),
+		Approved:     prefixes.Draw(t, "approved"),
+		Tags:         rapid.SampledFrom([][]string{nil, {"tag:a"}, {"tag:b"}, {"tag:a", "tag:b"}}).Draw(t, "tags"),
+	}
+}
+
+// Deterministic records avoid unrelated key generation in shrinkable histories.
+func nodeFromRouteRecord(record propcheck.RouteNode) *types.Node {
+	user := &types.User{Name: "rapid"}
+	user.ID = 1
+
+	n := &types.Node{
+		ID:        types.NodeID(record.ID),
+		Hostname:  fmt.Sprintf("route-%d", record.ID),
+		GivenName: fmt.Sprintf("route-%d", record.ID),
+		UserID:    new(uint(1)), User: user,
+		IPv4:     new(netip.MustParseAddr(fmt.Sprintf("100.64.0.%d", record.ID))),
+		IsOnline: new(record.Online), Unhealthy: record.Unhealthy,
+		SessionStart:   record.SessionStart,
+		Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: slices.Clone(record.Announced)},
+		ApprovedRoutes: slices.Clone(record.Approved), Tags: slices.Clone(record.Tags),
+	}
+	if record.Expired {
+		n.Expiry = new(time.Unix(1, 0))
+	}
+
+	return n
+}
+
+func routeRecords(snap *Snapshot) []propcheck.RouteNode {
+	var records []propcheck.RouteNode
+
+	for _, n := range snap.ListNodes().All() {
+		if n.ID() > 5 {
+			continue
+		}
+
+		records = append(records, propcheck.RouteNode{
+			ID: uint64(n.ID()), Online: n.IsOnline().GetOr(false),
+			// Generated expirations are either absent or the fixed Unix epoch.
+			Expired:   !n.Expiry().GetOr(time.Time{}).IsZero(),
+			Unhealthy: n.Unhealthy(), SessionStart: n.SessionStart(),
+			Announced: slices.Clone(n.Hostinfo().RoutableIPs().AsSlice()),
+			Approved:  slices.Clone(n.ApprovedRoutes().AsSlice()), Tags: slices.Clone(n.Tags().AsSlice()),
+		})
+	}
+
+	return records
+}
+
+func propertyViaScopes(records []propcheck.RouteNode) []propcheck.ViaScope {
+	var scopes []propcheck.ViaScope
+
+	for _, tag := range []string{"tag:a", "tag:b"} {
+		var ids []uint64
+
+		for _, n := range records {
+			if slices.Contains(n.Tags, tag) {
+				ids = append(ids, n.ID)
+			}
+		}
+
+		for _, p := range propertyRoutePrefixes() {
+			if p.Bits() != 0 {
+				scopes = append(scopes, propcheck.ViaScope{Key: tag, Prefix: p, Candidates: ids})
+			}
+		}
+	}
+
+	return scopes
+}
+
+func propertyRoutePolicy(reverse bool) []byte {
+	dst := `"10.0.0.0/8","fd00::/8","8.8.8.0/24","2001:4860::/48","100.64.0.99/32","fd7a:115c:a1e0::99/128"`
+
+	grants := []string{
+		`{"src":["100.64.0.10"],"dst":[` + dst + `],"ip":["*"]}`,
+		`{"src":["100.64.0.11"],"dst":[` + dst + `],"ip":["*"],"via":["tag:a"]}`,
+		`{"src":["100.64.0.12"],"dst":[` + dst + `],"ip":["*"],"via":["tag:b"]}`,
+	}
+	if reverse {
+		slices.Reverse(grants)
+	}
+
+	return []byte(`{"tagOwners":{"tag:a":["rapid@"],"tag:b":["rapid@"]},"grants":[` + strings.Join(grants, ",") + `]}`)
+}
+
+func checkRouteSnapshot(t *rapid.T, snap *Snapshot, records []propcheck.RouteNode, want propcheck.RouteResult) {
+	t.Helper()
+
+	if !reflect.DeepEqual(routeRecords(snap), records) {
+		t.Fatal("retained snapshot's route records changed")
+	}
+
+	got := make(map[netip.Prefix]uint64)
+	for p, id := range snap.PrimaryRoutes() {
+		got[p] = uint64(id)
+	}
+
+	if !maps.Equal(got, want.Global) {
+		t.Fatalf("global routes = %v, reference = %v; records=%+v", got, want.Global, records)
+	}
+
+	if hasOutage(snap) != (want.GlobalOutage || want.ViaOutage) {
+		t.Fatalf("outage=%v, global=%v via=%v", hasOutage(snap), want.GlobalOutage, want.ViaOutage)
+	}
+
+	for viewerID := types.NodeID(10); viewerID <= 12; viewerID++ {
+		viewer, _ := snap.GetNode(viewerID)
+
+		matchers, err := snap.Policy().MatchersForNode(viewer)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		winners := want.Global
+
+		switch viewerID {
+		case 11:
+			winners = want.Via["tag:a"]
+		case 12:
+			winners = want.Via["tag:b"]
+		}
+
+		for _, record := range records {
+			peer, _ := snap.GetNode(types.NodeID(record.ID))
+
+			var expected []netip.Prefix
+
+			for prefix, id := range winners {
+				// These host routes name nodes, so approval must not publish them.
+				if id == record.ID && prefix != mp("100.64.0.99/32") && prefix != mp("fd7a:115c:a1e0::99/128") {
+					expected = append(expected, prefix)
+				}
+			}
+
+			actual := snap.RoutesForPeer(viewer, peer, matchers)
+			// Public-IP grants also authorize exit selection. The reference
+			// predicts subnet ownership, while exits remain per-node approvals.
+			for _, p := range actual {
+				if p.Bits() == 0 && (!slices.Contains(record.Announced, p) || !slices.Contains(record.Approved, p)) {
+					t.Fatalf("peer %d exposes unapproved exit route %s", record.ID, p)
+				}
+			}
+
+			actual = slices.DeleteFunc(actual, func(p netip.Prefix) bool { return p.Bits() == 0 })
+
+			slices.SortFunc(expected, netip.Prefix.Compare)
+			slices.SortFunc(actual, netip.Prefix.Compare)
+
+			if !slices.Equal(actual, expected) {
+				t.Fatalf("viewer %d peer %d: routes=%v, reference=%v", viewerID, record.ID, actual, expected)
+			}
+		}
+	}
+	// HA secondaries need their primary even with no matching ACL grant.
+	for _, record := range records {
+		viewer, _ := snap.GetNode(types.NodeID(record.ID))
+		for prefix, id := range want.Global {
+			if prefix.IsSingleIP() || id == record.ID || !slices.Contains(record.Announced, prefix) || !slices.Contains(record.Approved, prefix) {
+				continue
+			}
+
+			peer, _ := snap.GetNode(types.NodeID(id))
+			if !slices.Contains(snap.RoutesForPeer(viewer, peer, nil), prefix) {
+				t.Fatalf("secondary %d cannot route %s through primary %d", record.ID, prefix, id)
+			}
+		}
+	}
+}
+
+// TestPrimaryRoutesProperty uses the shared pure reference after every commit,
+// retaining global incumbents across membership, policy and availability edits.
 func TestPrimaryRoutesProperty(t *testing.T) {
-	rapid.Check(t, func(rt *rapid.T) {
-		const numNodes = 4
-
-		nodeIDs := make([]types.NodeID, 0, numNodes)
-		for i := 1; i <= numNodes; i++ {
-			nodeIDs = append(nodeIDs, types.NodeID(i))
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+	rapid.Check(t, func(t *rapid.T) {
+		var viewers types.Nodes
+		for id := uint64(10); id <= 12; id++ {
+			viewers = append(viewers, nodeFromRouteRecord(propcheck.RouteNode{ID: id, Online: true}))
 		}
 
-		prefixes := []netip.Prefix{
-			netip.MustParsePrefix("10.0.0.0/24"),
-			netip.MustParsePrefix("10.0.1.0/24"),
+		w, err := newWorld(viewers, []types.User{*viewers[0].User}, propertyRoutePolicy(false), types.DNSView{})
+		if err != nil {
+			t.Fatal(err)
 		}
 
-		ns := newTestWorld(t)
+		cfg := &types.Config{Prefixes: types.PrefixesConfig{V4: new(mp("100.64.0.0/10")), V6: new(mp("fd7a:115c:a1e0::/48"))}}
+		w.servesRoute = cfg.ServesRoute
+		runs, failures := PolicyAuditRuns(), PolicyAuditFailures()
 
-		for _, id := range nodeIDs {
-			ns.PutNode(nodeForRapid(id))
+		type retained struct {
+			snap    *Snapshot
+			records []propcheck.RouteNode
+			want    propcheck.RouteResult
 		}
 
-		m := newPrimariesModel()
-
-		nodeGen := rapid.SampledFrom(nodeIDs)
-		prefixSubsetGen := rapid.SliceOfNDistinct(
-			rapid.SampledFrom(prefixes),
-			0, len(prefixes),
-			func(p netip.Prefix) string { return p.String() },
-		)
-		// nodeSubsetGen draws 1..N distinct node IDs for the batched
-		// ops. SliceOfNDistinct's lower bound is inclusive, so 1 is
-		// the smallest sensible batch — a zero-size batch is a no-op
-		// the rapid harness should not waste shrinking cycles on.
-		nodeSubsetGen := rapid.SliceOfNDistinct(
-			nodeGen,
-			1, numNodes,
-			func(id types.NodeID) types.NodeID { return id },
+		var (
+			history  []retained
+			previous map[netip.Prefix]uint64
 		)
 
-		opCount := rapid.IntRange(5, 200).Draw(rt, "opCount")
-		for step := range opCount {
-			op := rapid.IntRange(0, 8).Draw(rt, fmt.Sprintf("op_%d", step))
+		check := func() {
+			snap := w.snapshot()
+			records := routeRecords(snap)
+			want := propcheck.ElectRoutes(records, previous, propertyViaScopes(records))
+			checkRouteSnapshot(t, snap, records, want)
+			history = append(history, retained{snap, records, want})
+			previous = want.Global
+		}
+		check()
+		// Every generated history reaches a scoped outage with a healthy global
+		// router, then a global outage, deletion and reinsertion. Audit assertions
+		// therefore cannot pass merely because their counters stayed at zero.
+		prefix := rapid.SampledFrom(propertyRoutePrefixes()[:6]).Draw(t, "shared-prefix")
 
-			// connect opens a session, as State.Connect does, when the
-			// node is offline.
-			connect := func(n *types.Node) {
-				if !n.Online() {
-					n.SessionStart = time.Unix(int64(step), 0)
-				}
-
-				n.IsOnline = new(true)
+		for id := uint64(1); id <= 3; id++ {
+			tag := "tag:a"
+			if id == 3 {
+				tag = "tag:b"
 			}
 
-			// Snapshot primaries before applying the op so the
-			// healthy-preference check knows the previous primary.
-			// Reading after the model has already changed would compare
-			// a stale snapshot to a moved model.
-			prevPrimaries := snapshotPrimariesCopy(ns)
+			n := nodeFromRouteRecord(propcheck.RouteNode{ID: id, Online: true, SessionStart: time.Unix(int64(3-id), 0), Announced: []netip.Prefix{prefix}, Approved: []netip.Prefix{prefix}, Tags: []string{tag}})
+			w.PutNode(*n)
+			check()
+		}
 
-			switch op {
-			case 0: // ConnectAdvertise — Connect path clears Unhealthy.
-				id := nodeGen.Draw(rt, fmt.Sprintf("id_%d", step))
-				prefs := prefixSubsetGen.Draw(rt, fmt.Sprintf("prefs_%d", step))
+		st := &State{world: w}
+		st.BatchSetNodeHealth(map[types.NodeID]bool{1: false, 2: false})
+		check()
 
-				ns.UpdateNode(id, func(n *types.Node) {
-					connect(n)
-					n.Unhealthy = false
-					n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: prefs}
-					n.ApprovedRoutes = prefs
-				})
+		if !history[len(history)-1].want.ViaOutage || history[len(history)-1].want.GlobalOutage {
+			t.Fatal("setup did not reach a via-only outage")
+		}
 
-				m.announced[id] = prefs
-				m.approved[id] = prefs
-				m.recomputeEffective(id)
-				m.connect(id, step)
+		st.BatchSetNodeHealth(map[types.NodeID]bool{3: false})
+		check()
 
-				delete(m.unhealthy, id)
+		if !history[len(history)-1].want.GlobalOutage {
+			t.Fatal("setup did not reach a global outage")
+		}
 
-			case 1: // Disconnect — IsOnline=false; ApprovedRoutes persists.
-				id := nodeGen.Draw(rt, fmt.Sprintf("id_%d", step))
-				ns.UpdateNode(id, func(n *types.Node) {
-					n.IsOnline = new(false)
-				})
-				delete(m.connected, id)
+		deleted, _ := w.snapshot().GetNode(1)
+		w.DeleteNode(1)
+		check()
+		w.PutNode(*deleted.AsStruct())
+		check()
 
-			case 2: // ProbeUnhealthy — HA prober marks node bad.
-				id := nodeGen.Draw(rt, fmt.Sprintf("id_%d", step))
-				ns.UpdateNode(id, func(n *types.Node) {
-					n.Unhealthy = true
-				})
-				m.unhealthy[id] = true
+		prefixes := rapid.SliceOfN(rapid.SampledFrom(propertyRoutePrefixes()), 0, 8)
 
-			case 3: // ProbeHealthy — HA prober marks node good.
-				id := nodeGen.Draw(rt, fmt.Sprintf("id_%d", step))
-				ns.UpdateNode(id, func(n *types.Node) {
-					n.Unhealthy = false
-				})
-				delete(m.unhealthy, id)
+		steps := rapid.IntRange(1, 60).Draw(t, "steps")
+		for range steps {
+			id := types.NodeID(rapid.Uint64Range(1, 5).Draw(t, "id"))
+			switch rapid.IntRange(0, 10).Draw(t, "operation") {
+			case 0:
+				n := nodeFromRouteRecord(drawRouteNode(t, uint64(id)))
+				n.SessionEpoch = rapid.Uint64Range(0, 3).Draw(t, "epoch")
+				w.PutNode(*n)
+			case 1:
+				w.DeleteNode(id)
+			case 2:
+				prefs := prefixes.Draw(t, "announced")
 
-			case 4: // ApprovedRoutesChange — change advertised prefs without touching health.
-				id := nodeGen.Draw(rt, fmt.Sprintf("id_%d", step))
-				prefs := prefixSubsetGen.Draw(rt, fmt.Sprintf("prefs_%d", step))
+				w.UpdateNode(id, func(n *types.Node) { n.Hostinfo.RoutableIPs = prefs })
+			case 3:
+				prefs := prefixes.Draw(t, "approved")
 
-				ns.UpdateNode(id, func(n *types.Node) {
-					connect(n)
-					n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: prefs}
-					n.ApprovedRoutes = prefs
-				})
+				w.UpdateNode(id, func(n *types.Node) { n.ApprovedRoutes = prefs })
+			case 4:
+				r := drawRouteNode(t, uint64(id))
+				epoch := rapid.Uint64Range(0, 3).Draw(t, "epoch")
 
-				m.announced[id] = prefs
-				m.approved[id] = prefs
-				m.recomputeEffective(id)
-				m.connect(id, step)
+				w.UpdateNode(id, func(n *types.Node) {
+					n.IsOnline, n.SessionStart, n.SessionEpoch = new(r.Online), r.SessionStart, epoch
 
-			case 5: // BatchProbeResults — atomic health flips per cycle.
-				// Mirrors State.BatchSetNodeHealth: per-node
-				// (id, unhealthy) pairs applied through UpdateNodes
-				// so the election runs once on the post-batch state.
-				// Per-call publication would let an intermediate
-				// "one unhealthy, one healthy" snapshot re-elect off
-				// the still-healthy node before the second flip
-				// landed.
-				ids := nodeSubsetGen.Draw(rt, fmt.Sprintf("batch_ids_%d", step))
-
-				results := make(map[types.NodeID]bool, len(ids))
-				for i, id := range ids {
-					unhealthy := rapid.Bool().Draw(rt, fmt.Sprintf("batch_h_%d_%d", step, i))
-					results[id] = unhealthy
-				}
-
-				fns := make(map[types.NodeID]UpdateNodeFunc, len(results))
-				for id, unhealthy := range results {
-					fns[id] = func(n *types.Node) {
-						n.Unhealthy = unhealthy
+					n.Expiry = nil
+					if r.Expired {
+						n.Expiry = new(time.Unix(1, 0))
 					}
-				}
+				})
+			case 5:
+				updates := rapid.MapOfN(rapid.SampledFrom([]types.NodeID{1, 2, 3, 4, 5, 99}), rapid.Bool(), 0, 6).Draw(t, "health")
+				st.BatchSetNodeHealth(updates)
+			case 6:
+				tags := rapid.SampledFrom([][]string{nil, {"tag:a"}, {"tag:b"}, {"tag:a", "tag:b"}}).Draw(t, "tags")
 
-				ns.UpdateNodes(fns)
-
-				for id, unhealthy := range results {
-					if unhealthy {
-						m.unhealthy[id] = true
-					} else {
-						delete(m.unhealthy, id)
-					}
-				}
-
-			case 6: // SimultaneousDisconnect — multiple offline in one batch.
-				// Dual-cable-pull shape: two HA routers' poll
-				// sessions both close in the same NodeStore tick.
-				// Per-call Disconnect could leave the snapshot
-				// momentarily pointing at an offline owner; the
-				// batched form forces a single rebuild.
-				ids := nodeSubsetGen.Draw(rt, fmt.Sprintf("disc_ids_%d", step))
-
-				fns := make(map[types.NodeID]UpdateNodeFunc, len(ids))
-				for _, id := range ids {
-					fns[id] = func(n *types.Node) {
-						n.IsOnline = new(false)
-					}
-				}
-
-				ns.UpdateNodes(fns)
-
-				for _, id := range ids {
-					delete(m.connected, id)
-				}
-
-			case 7: // SetApprovedRoutes — change ApprovedRoutes only.
-				// SetApprovedRoutes in production updates only
-				// node.ApprovedRoutes; Hostinfo.RoutableIPs (what
-				// the client announced) is set by the next
-				// MapRequest. SubnetRoutes intersects the two, so
-				// dropping ApprovedRoutes mid-flight shrinks the
-				// advertised set immediately while announcement
-				// alone never extends it.
-				id := nodeGen.Draw(rt, fmt.Sprintf("setapp_id_%d", step))
-				prefs := prefixSubsetGen.Draw(rt, fmt.Sprintf("setapp_prefs_%d", step))
-
-				ns.UpdateNode(id, func(n *types.Node) {
-					n.ApprovedRoutes = prefs
+				w.UpdateNode(id, func(n *types.Node) { n.Tags = slices.Clone(tags) })
+			case 7:
+				w.UpdateNode(id, func(n *types.Node) {
+					slices.Reverse(n.Hostinfo.RoutableIPs)
+					slices.Reverse(n.ApprovedRoutes)
+					slices.Reverse(n.Tags)
 				})
 
-				m.approved[id] = prefs
-				m.recomputeEffective(id)
+				_, err := w.SetPolicy(propertyRoutePolicy(rapid.Bool().Draw(t, "reverse-policy")), func(*Snapshot) error { return nil })
+				if err != nil {
+					t.Fatal(err)
+				}
+			case 8:
+				before := w.snapshot().Rev()
 
-			case 8: // OfflineExpiry — IsOnline=false, KEEP Unhealthy.
-				// The Disconnect path does not clear Unhealthy
-				// (only ConnectAdvertise does on the way back
-				// up). A probe that marks unhealthy and a grace-
-				// period disconnect that lands later leaves the
-				// node with a stale Unhealthy bit; the test
-				// exercises that shape.
-				id := nodeGen.Draw(rt, fmt.Sprintf("expire_id_%d", step))
-				ns.UpdateNode(id, func(n *types.Node) {
-					n.IsOnline = new(false)
-				})
+				applied := w.UpdateNodesIf(map[types.NodeID]UpdateNodeFunc{id: healthSetter(false)}, func(*types.Node) bool { return false })
+				if applied || w.snapshot().Rev() != before {
+					t.Fatal("refused health write published")
+				}
+			case 9:
+				online, unhealthy := rapid.Bool().Draw(t, "online"), rapid.Bool().Draw(t, "unhealthy")
 
-				delete(m.connected, id)
-				// m.unhealthy[id] is intentionally NOT cleared.
+				updates := make(map[types.NodeID]UpdateNodeFunc)
+				for i := types.NodeID(1); i <= 5; i++ {
+					updates[i] = func(n *types.Node) { n.IsOnline, n.Unhealthy = new(online), unhealthy }
+				}
+
+				w.UpdateNodes(updates)
+			case 10:
+				prefs := prefixes.Draw(t, "both")
+
+				w.UpdateNode(id, func(n *types.Node) { n.Hostinfo.RoutableIPs, n.ApprovedRoutes = prefs, slices.Clone(prefs) })
 			}
 
-			m.updatePrimaries()
+			check()
+		}
 
-			checkPrimariesProperties(rt, ns, m, nodeIDs, prevPrimaries)
+		for _, old := range history {
+			checkRouteSnapshot(t, old.snap, old.records, old.want)
+		}
+
+		if PolicyAuditRuns() <= runs || PolicyAuditFailures() != failures {
+			t.Fatalf("audit runs=%d failures=%d", PolicyAuditRuns()-runs, PolicyAuditFailures()-failures)
+		}
+	})
+}
+
+// Election ranking is independent of input order, duplicates, epochs, and
+// dangling candidate IDs. All-unavailable fallback is intentionally scoped.
+func TestRouteElectionReferenceProperty(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		prefix := rapid.SampledFrom(propertyRoutePrefixes()[:6]).Draw(t, "prefix")
+
+		var records []propcheck.RouteNode
+
+		stored := make(map[types.NodeID]*types.Node)
+
+		count := rapid.Uint64Range(0, 6).Draw(t, "count")
+		for id := uint64(1); id <= count; id++ {
+			r := drawRouteNode(t, id)
+			r.Announced, r.Approved = []netip.Prefix{prefix, prefix}, []netip.Prefix{prefix, prefix}
+			records = append(records, r)
+			n := nodeFromRouteRecord(r)
+			n.SessionEpoch = rapid.Uint64Range(0, 3).Draw(t, "epoch")
+			stored[n.ID] = n
+		}
+
+		ids := rapid.SliceOfN(rapid.Uint64Range(1, 8), 0, 10).Draw(t, "candidates")
+
+		var (
+			candidates = make([]types.NodeID, 0, len(ids))
+			selected   []propcheck.RouteNode
+		)
+
+		for _, id := range ids {
+			candidates = append(candidates, types.NodeID(id))
+		}
+
+		for _, n := range records {
+			if slices.Contains(ids, n.ID) {
+				selected = append(selected, n)
+			}
+		}
+
+		previous := rapid.Uint64Range(0, 8).Draw(t, "previous")
+		want := propcheck.ElectRoutes(selected, map[netip.Prefix]uint64{prefix: previous}, []propcheck.ViaScope{{Key: "scope", Prefix: prefix, Candidates: ids}})
+		nodes := graph.NewMap(graph.Same[*types.Node], stored)
+		global, ok := electPrimary(nodes, views.SliceOf(candidates), types.NodeID(previous))
+
+		via, viaOK := electViaPrimary(nodes, views.SliceOf(candidates), types.NodeID(previous))
+		if uint64(global) != want.Global[prefix] || ok != (want.Global[prefix] != 0) || uint64(via) != want.Via["scope"][prefix] || viaOK != (want.Via["scope"][prefix] != 0) {
+			t.Fatalf("global=%d/%v via=%d/%v reference=%+v", global, ok, via, viaOK, want)
+		}
+
+		slices.Reverse(selected)
+		slices.Reverse(ids)
+
+		reordered := propcheck.ElectRoutes(selected, map[netip.Prefix]uint64{prefix: previous}, []propcheck.ViaScope{{Key: "scope", Prefix: prefix, Candidates: ids}})
+		if !reflect.DeepEqual(reordered, want) {
+			t.Fatal("reference depends on candidate order")
+		}
+	})
+}
+
+// A probe observes candidacy before queueing; withdrawal ahead of its write
+// must reject the stale unhealthy result, while another router's recovery in
+// that same batch must still apply. Channels fix ordering without sleeps.
+func TestQueuedRouteHealthProperty(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		prefix := rapid.SampledFrom(propertyRoutePrefixes()[:6]).Draw(t, "prefix")
+		withdraw := rapid.Bool().Draw(t, "withdraw-routes")
+		records := []propcheck.RouteNode{
+			{ID: 1, Online: true, SessionStart: time.Unix(1, 0), Announced: []netip.Prefix{prefix}, Approved: []netip.Prefix{prefix}},
+			{ID: 2, Online: true, Unhealthy: true, Announced: []netip.Prefix{prefix}, Approved: []netip.Prefix{prefix}},
+		}
+
+		w, err := newWorld(types.Nodes{nodeFromRouteRecord(records[0]), nodeFromRouteRecord(records[1])}, nil, nil, types.DNSView{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		before := w.snapshot()
+		initial := propcheck.ElectRoutes(records, nil, nil)
+		departure := &nodeWrite{done: make(chan writeResult, 1), fn: func(e *nodeEdit) {
+			n, _ := e.Get(1)
+
+			n = n.Clone()
+			if withdraw {
+				n.ApprovedRoutes = nil
+			} else {
+				n.IsOnline = new(false)
+			}
+
+			e.Set(1, n)
+		}}
+		// Stage the first arrival, then let the public health API enqueue the
+		// second. No leader runs until both writes are waiting in the queue.
+		w.batchSize, w.batchTimeout = 2, time.Hour
+		w.writes, w.committing = []*nodeWrite{departure}, true
+		changed := make(chan bool, 1)
+
+		go func() {
+			st := &State{world: w}
+			changed <- st.BatchSetNodeHealth(map[types.NodeID]bool{1: false, 2: true, 99: false})
+		}()
+
+		<-w.full
+		w.commitWrites()
+
+		moved := <-changed
+
+		result := <-departure.done
+		if result.panic != nil {
+			t.Fatalf("queued write panicked: %v", result.panic)
+		}
+
+		if withdraw {
+			records[0].Approved = nil
+		} else {
+			records[0].Online = false
+		}
+
+		records[1].Unhealthy = false
+		want := propcheck.ElectRoutes(records, initial.Global, nil)
+
+		after := w.snapshot()
+		if !reflect.DeepEqual(routeRecords(after), records) {
+			t.Fatalf("queued health gate: got %+v, want %+v", routeRecords(after), records)
+		}
+
+		if !moved || after.Rev() != before.Rev()+1 || result.snap.Rev() != after.Rev() {
+			t.Fatalf("batch must publish one election: moved=%v revisions=%d/%d/%d", moved, before.Rev(), after.Rev(), result.snap.Rev())
+		}
+
+		got := make(map[netip.Prefix]uint64)
+		for p, id := range after.PrimaryRoutes() {
+			got[p] = uint64(id)
+		}
+
+		if !maps.Equal(got, want.Global) || hasOutage(after) != want.GlobalOutage {
+			t.Fatalf("queued election=%v outage=%v, reference=%+v", got, hasOutage(after), want)
+		}
+
+		if w.outageStores.Load() == 0 || w.inOutage.Load() != want.GlobalOutage {
+			t.Fatal("batch did not refresh outage state")
+		}
+
+		stores := w.outageStores.Load()
+		w.storeOutage(before)
+
+		if w.outageStores.Load() != stores || w.outageRev != after.Rev() {
+			t.Fatal("an old snapshot overwrote the newer outage state")
+		}
+
+		if id, ok := before.PrimaryRouteFor(prefix); !ok || uint64(id) != initial.Global[prefix] {
+			t.Fatal("queued batch changed its old snapshot")
 		}
 	})
 }
