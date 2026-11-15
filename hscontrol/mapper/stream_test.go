@@ -38,6 +38,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/dnstype"
+	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
 	"tailscale.com/util/zstdframe"
@@ -8496,31 +8497,33 @@ type streamPropertySession struct {
 }
 
 type streamPropertyPolicy struct {
-	doc  []byte
-	kind int
+	doc    []byte
+	kind   int
+	intent *propcheck.PacketIntent
 }
 
 const maxStreamPropertyNodeID types.NodeID = 255
 
 type streamPropertySystem struct {
-	lastNodeID types.NodeID
-	dnsRecords []tailcfg.DNSRecord
-	derpMap    *tailcfg.DERPMap
-	derpMaps   []*tailcfg.DERPMap
-	viaOnly    bool
-	cfg        *types.Config
-	state      *state.State
-	hub        *Hub
-	sessions   map[types.NodeID]*streamPropertySession
-	policy     int
-	policyDoc  []byte
-	policies   []streamPropertyPolicy
-	world      propcheck.World
-	probes     propcheck.WorldProbes
-	routes     propcheck.RouteResult
-	history    *peerHistoryModel
-	token      uint64
-	reportSeq  uint64
+	lastNodeID   types.NodeID
+	dnsRecords   []tailcfg.DNSRecord
+	derpMap      *tailcfg.DERPMap
+	derpMaps     []*tailcfg.DERPMap
+	viaOnly      bool
+	cfg          *types.Config
+	state        *state.State
+	hub          *Hub
+	sessions     map[types.NodeID]*streamPropertySession
+	policy       int
+	policyDoc    []byte
+	packetIntent *propcheck.PacketIntent
+	policies     []streamPropertyPolicy
+	world        propcheck.World
+	probes       propcheck.WorldProbes
+	routes       propcheck.RouteResult
+	history      *peerHistoryModel
+	token        uint64
+	reportSeq    uint64
 }
 
 // newStreamPropertySystem owns resources per Rapid case, including shrink
@@ -8640,6 +8643,7 @@ func (p *streamPropertySystem) setPolicy(t *rapid.T, index int) {
 	require.NoError(t, err)
 
 	p.policy = index
+	p.packetIntent = nil
 	p.policyDoc = []byte(streamPropertyPolicies[index])
 	p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(p.policyDoc), kind: index})
 	p.checkWorld(t)
@@ -8726,6 +8730,10 @@ func (p *streamPropertySystem) open(t *rapid.T, id types.NodeID, snap *state.Sna
 
 	p.sessions[id] = &streamPropertySession{stream: st, client: client, capVer: cv, down: partial, token: token, ids: ids}
 	p.checkHistory(t)
+
+	if !partial {
+		p.checkSession(t, id, snap, p.sessions[id])
+	}
 }
 
 func (p *streamPropertySystem) update(t *rapid.T, id types.NodeID, snap *state.Snapshot, mode int) {
@@ -8771,81 +8779,91 @@ func (p *streamPropertySystem) update(t *rapid.T, id types.NodeID, snap *state.S
 	}
 
 	p.checkHistory(t)
+
+	if mode != 2 && !session.down {
+		p.checkSession(t, id, snap, session)
+	}
 }
 
 func (p *streamPropertySystem) check(t *rapid.T, snap *state.Snapshot) {
 	for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
-		session := p.sessions[id]
-		if session.down {
+		if session := p.sessions[id]; !session.down {
+			p.checkSession(t, id, snap, session)
+		}
+	}
+}
+
+// A later coalesced write must not hide an incorrect intermediate delivery.
+// Only this viewer is current; other sessions may legitimately still lag.
+func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *state.Snapshot, session *streamPropertySession) {
+	t.Helper()
+	checkStreamPacketIntent(t, p.world, p.packetIntent, id, session.client)
+
+	freshHub := NewHub()
+	responses, err := NewStream(p.cfg, freshHub, id, session.capVer).Initial(snap)
+	require.NoError(t, err)
+
+	fresh := newPropertyClient(&tailcfg.MapResponse{})
+	applyStreamPropertyWire(t, freshHub, fresh, responses)
+	freshHub.Close()
+	session.client.check(t, fresh)
+	require.Equal(t, wireJSON(t, streamDERPSemantic(p.effectiveDERP(t))), wireJSON(t, session.client.derp), "DERP input to client")
+	require.Len(t, session.client.deltaPeers, len(fresh.peers), "delta-only observer retained a removed peer")
+
+	for peer := range fresh.peers {
+		require.True(t, session.client.deltaPeers[peer], "delta-only observer missed peer %d", peer)
+	}
+
+	self := p.world.Nodes[id]
+	require.NotNil(t, self)
+
+	for _, peerID := range slices.Sorted(maps.Keys(p.world.Nodes)) {
+		peer := p.world.Nodes[peerID]
+		if peer.ID == id {
 			continue
 		}
 
-		freshHub := NewHub()
-		responses, err := NewStream(p.cfg, freshHub, id, session.capVer).Initial(snap)
-		require.NoError(t, err)
-
-		fresh := newPropertyClient(&tailcfg.MapResponse{})
-		applyStreamPropertyWire(t, freshHub, fresh, responses)
-		freshHub.Close()
-		session.client.check(t, fresh)
-		require.Equal(t, wireJSON(t, streamDERPSemantic(p.effectiveDERP(t))), wireJSON(t, session.client.derp), "DERP input to client")
-		require.Len(t, session.client.deltaPeers, len(fresh.peers), "delta-only observer retained a removed peer")
-
-		for peer := range fresh.peers {
-			require.True(t, session.client.deltaPeers[peer], "delta-only observer missed peer %d", peer)
+		wire, visible := session.client.peers[peer.ID.NodeID()]
+		// Same-user visibility is unconditional; tags never confer a
+		// creator's ownership, including when UserID remains populated.
+		if p.policy >= 0 && p.policy <= 2 {
+			want := p.policy == 0 || (len(self.Tags) == 0 && len(peer.Tags) == 0 && self.UserID != nil && peer.UserID != nil && *self.UserID == *peer.UserID)
+			require.Equal(t, want, visible, "policy %d: viewer %d peer %d", p.policy, id, peer.ID)
 		}
 
-		self := p.world.Nodes[id]
-		require.NotNil(t, self)
+		if visible {
+			require.Equal(t, peer.NodeKey, wire.Key, "peer identity")
+			require.Equal(t, peer.DiscoKey, wire.DiscoKey, "peer discovery key")
+			require.True(t, slices.Equal([]string(peer.Tags), wire.Tags), "peer tags")
 
-		for _, peerID := range slices.Sorted(maps.Keys(p.world.Nodes)) {
-			peer := p.world.Nodes[peerID]
-			if peer.ID == id {
-				continue
+			owner := tailcfg.UserID(types.TaggedDevicesUserID)
+			if len(peer.Tags) == 0 && peer.UserID != nil {
+				owner = tailcfg.UserID(*peer.UserID) //nolint:gosec // Fixture user IDs are 1..3.
 			}
 
-			wire, visible := session.client.peers[peer.ID.NodeID()]
-			// Same-user visibility is unconditional; tags never confer a
-			// creator's ownership, including when UserID remains populated.
-			if p.policy >= 0 && p.policy <= 2 {
-				want := p.policy == 0 || (len(self.Tags) == 0 && len(peer.Tags) == 0 && self.UserID != nil && peer.UserID != nil && *self.UserID == *peer.UserID)
-				require.Equal(t, want, visible, "policy %d: viewer %d peer %d", p.policy, id, peer.ID)
-			}
+			require.Equal(t, owner, wire.User, "peer ownership")
 
-			if visible {
-				require.Equal(t, peer.NodeKey, wire.Key, "peer identity")
-				require.Equal(t, peer.DiscoKey, wire.DiscoKey, "peer discovery key")
-				require.True(t, slices.Equal([]string(peer.Tags), wire.Tags), "peer tags")
+			if p.policy == 0 {
+				var primaries []netip.Prefix
 
-				owner := tailcfg.UserID(types.TaggedDevicesUserID)
-				if len(peer.Tags) == 0 && peer.UserID != nil {
-					owner = tailcfg.UserID(*peer.UserID) //nolint:gosec // Fixture user IDs are 1..3.
+				for prefix, winner := range p.routes.Global {
+					if winner == uint64(peer.ID) {
+						primaries = append(primaries, prefix)
+					}
 				}
 
-				require.Equal(t, owner, wire.User, "peer ownership")
+				require.ElementsMatch(t, primaries, wire.PrimaryRoutes, "independent primary routes")
 
-				if p.policy == 0 {
-					var primaries []netip.Prefix
+				allowed := []netip.Prefix{netip.PrefixFrom(*peer.IPv4, 32), netip.PrefixFrom(*peer.IPv6, 128)}
+				allowed = append(allowed, primaries...)
 
-					for prefix, winner := range p.routes.Global {
-						if winner == uint64(peer.ID) {
-							primaries = append(primaries, prefix)
-						}
+				for _, prefix := range propertyApproved(peer) {
+					if prefix.Bits() == 0 {
+						allowed = append(allowed, prefix)
 					}
-
-					require.ElementsMatch(t, primaries, wire.PrimaryRoutes, "independent primary routes")
-
-					allowed := []netip.Prefix{netip.PrefixFrom(*peer.IPv4, 32), netip.PrefixFrom(*peer.IPv6, 128)}
-					allowed = append(allowed, primaries...)
-
-					for _, prefix := range propertyApproved(peer) {
-						if prefix.Bits() == 0 {
-							allowed = append(allowed, prefix)
-						}
-					}
-
-					require.ElementsMatch(t, allowed, wire.AllowedIPs, "independent allowed routes")
 				}
+
+				require.ElementsMatch(t, allowed, wire.AllowedIPs, "independent allowed routes")
 			}
 		}
 	}
@@ -9005,6 +9023,7 @@ type streamOperation struct {
 	node, before *types.Node
 	policy       int
 	doc          []byte
+	intent       *propcheck.PacketIntent
 	user         types.User
 	records      []tailcfg.DNSRecord
 	derp         *tailcfg.DERPMap
@@ -9019,7 +9038,7 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 
 	operations := kinds
 	if len(operations) == 0 {
-		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "stale-request", "invalid-policy"}
+		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "packet-policy", "packet-deny", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "stale-request", "invalid-policy"}
 		if len(ids) > 3 {
 			operations = append(operations, "delete")
 		}
@@ -9103,11 +9122,18 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 		result.doc = []byte(streamPropertyPolicies[result.policy])
 	case "generated-policy":
 		result.policy, result.doc = -1, propcheck.DrawPolicy(t)
+	case "packet-policy":
+		result.intent = propcheck.DrawPacketIntent(t, p.world)
+		result.policy, result.doc = -1, result.intent.Document(t)
+	case "packet-deny":
+		result.intent = &propcheck.PacketIntent{}
+		result.policy, result.doc = -1, result.intent.Document(t)
 	case "policy-order", "policy-duplicate":
+		result.intent = p.packetIntent
 		result.policy, result.doc = p.policy, propcheck.ReorderPolicy(t, p.policyDoc, op == "policy-duplicate")
 	case "policy-restore":
 		saved := p.policies[rapid.IntRange(0, len(p.policies)-1).Draw(t, "policy-ancestor")]
-		result.policy, result.doc = saved.kind, slices.Clone(saved.doc)
+		result.policy, result.doc, result.intent = saved.kind, slices.Clone(saved.doc), saved.intent
 	case "user":
 		u := p.world.Users[rapid.IntRange(0, 2).Draw(t, "user")]
 
@@ -9137,7 +9163,7 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 		result.doc, err = json.Marshal(policy)
 		require.NoError(t, err)
 
-		result.policy = p.policy
+		result.policy, result.intent = p.policy, p.packetIntent
 	case "add":
 		result.node = p.drawNode(t, p.lastNodeID+1)
 	case "request", "stale-request":
@@ -9166,7 +9192,7 @@ func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 	beforeDERP := p.effectiveDERP(t)
 
 	switch op.kind {
-	case "policy", "generated-policy", "policy-order", "policy-duplicate", "policy-restore", "derp-policy":
+	case "policy", "generated-policy", "packet-policy", "packet-deny", "policy-order", "policy-duplicate", "policy-restore", "derp-policy":
 		changed, err := p.state.SetPolicy(op.doc)
 		require.NoError(t, err, "generated policy: %s", op.doc)
 		expectedChange := !bytes.Equal(p.policyDoc, op.doc)
@@ -9178,8 +9204,8 @@ func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 		}
 
 		require.Equal(t, wantRev, p.state.Snapshot().Rev(), "policy publication")
-		p.policy, p.policyDoc = op.policy, slices.Clone(op.doc)
-		p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(op.doc), kind: op.policy})
+		p.policy, p.policyDoc, p.packetIntent = op.policy, slices.Clone(op.doc), op.intent
+		p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(op.doc), kind: op.policy, intent: op.intent})
 	case "invalid-policy":
 		_, err := p.state.SetPolicy([]byte(`{"grants":`))
 		require.Error(t, err)
@@ -9422,17 +9448,39 @@ func (p *streamPropertySystem) checkCausal(t require.TestingT, before, after *st
 // already equal an independent fresh stream. Rapid's default case and step
 // budgets bound CI work; -rapid.checks, -rapid.steps and -rapid.seed drive campaigns.
 func TestRapidStreamSystem(t *testing.T) {
+	runRapidStreamSystem(t)
+}
+
+func TestRapidStreamPacketIntent(t *testing.T) {
+	runRapidStreamSystem(t, "packet-policy", "packet-deny", "policy-order", "policy-duplicate", "policy-restore", "identity", "user", "noop")
+}
+
+func runRapidStreamSystem(t *testing.T, kinds ...string) {
+	t.Helper()
+
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
 	rapid.Check(t, func(t *rapid.T) {
+		operations := kinds
 		audits := state.PolicyAuditFailures()
+
 		p := newStreamPropertySystem(t)
+		if len(kinds) > 0 {
+			p.apply(t, p.drawOperation(t, "packet-policy"))
+
+			p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: p.policy, intent: p.packetIntent}}
+			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+				p.update(t, id, p.state.Snapshot(), 0)
+			}
+		}
+
 		last := p.state.Snapshot()
 		p.check(t, last)
-		t.Repeat(map[string]func(*rapid.T){"commit": func(t *rapid.T) {
+		commit := func(t *rapid.T) {
 			// Keep an old snapshot and its wire model across writes and
 			// cache advancement; a late renderer must still read it correctly.
 			old := p.state.Snapshot()
 			oldWorld := p.world.Clone()
+			oldIntent := p.packetIntent
 			oldDERP := p.effectiveDERP(t)
 			oldNode := old.ListNodes().At(0).ID()
 			oldHub := NewHub()
@@ -9441,10 +9489,11 @@ func TestRapidStreamSystem(t *testing.T) {
 
 			oldClient := newPropertyClient(&tailcfg.MapResponse{})
 			applyStreamPropertyWire(t, oldHub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, oldMap)})
+			checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, oldClient)
 			oldHub.Close()
 
 			for range rapid.IntRange(1, 3).Draw(t, "coalesced-writes") {
-				p.apply(t, p.drawOperation(t))
+				p.apply(t, p.drawOperation(t, operations...))
 
 				if rapid.Bool().Draw(t, "intermediate-render") {
 					id := rapid.SampledFrom(slices.Sorted(maps.Keys(p.sessions))).Draw(t, "intermediate-viewer")
@@ -9483,8 +9532,26 @@ func TestRapidStreamSystem(t *testing.T) {
 			applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, lateMap)})
 			lateClient.check(t, oldClient)
 
+			checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, lateClient)
+
 			last = snap
-		}})
+		}
+
+		if len(kinds) > 0 {
+			for _, operation := range []string{"policy-order", "policy-duplicate", "packet-deny", "policy-restore", "packet-policy", "identity"} {
+				operations = []string{operation}
+
+				commit(t)
+			}
+
+			operations = kinds
+
+			for range rapid.IntRange(1, 8).Draw(t, "packet commits") {
+				commit(t)
+			}
+		} else {
+			t.Repeat(map[string]func(*rapid.T){"commit": commit})
+		}
 
 		for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
 			if p.sessions[id].down {
@@ -9968,4 +10035,103 @@ func TestRouteWakesExitForCapabilitySource(t *testing.T) {
 	}
 
 	require.Equal(t, endpoints, client.peers[source.NodeID()].Endpoints, "exit retained stale source endpoints")
+}
+
+// Only fully delivered sessions must reflect current intent; partial prefixes
+// are checked after reconnect by the same cumulative client replay.
+func checkStreamPacketIntent(t require.TestingT, world propcheck.World, intent *propcheck.PacketIntent, id types.NodeID, client *propertyClient) {
+	if intent == nil {
+		return
+	}
+
+	for _, peer := range propcheck.CheckPacketIntent(t, world, intent, id, client.filter) {
+		require.Contains(t, client.peers, peer.NodeID(), "required incoming/outgoing packet peer")
+	}
+}
+
+// A fixed history keeps downstream revocation and identity checks reachable
+// even when broader generated documents stop at enabled compiler diagnostics.
+func TestStreamPacketIntentHistory(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t)
+		first := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{{
+			Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"},
+			Protocol: ipproto.TCP, First: 22, Last: 23,
+		}}}
+		second := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{{
+			Src: propcheck.PacketSelector{Tag: "tag:srv"}, Dst: propcheck.PacketSelector{User: "u2"},
+			Protocol: ipproto.UDP, First: 65535, Last: 65535,
+		}}}
+		last := p.state.Snapshot()
+		flush := func() {
+			snap := p.state.Snapshot()
+			all, wake := Route(last, snap, snap.Since(last))
+			p.hub.advance(snap)
+
+			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+				if p.sessions[id].down {
+					p.open(t, id, snap, false)
+				} else if _, named := wake[id]; all || named {
+					p.update(t, id, snap, rapid.IntRange(0, 2).Draw(t, "packet delivery"))
+				}
+			}
+
+			p.check(t, snap)
+			last = snap
+		}
+
+		for _, intent := range []*propcheck.PacketIntent{first, second, {}, first} {
+			p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: intent.Document(t), intent: intent})
+			flush()
+
+			p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: -1, intent: intent}}
+			for _, kind := range []string{"policy-order", "policy-duplicate", "policy-restore"} {
+				op := p.drawOperation(t, kind)
+				require.Same(t, intent, op.intent, "intent survives %s", kind)
+				p.apply(t, op)
+				flush()
+			}
+		}
+		// Preserve the creator while removing source and then destination user
+		// rights; both must be revoked through the consumer's cumulative filter.
+		for _, id := range []types.NodeID{1, 2} {
+			n := p.world.Nodes[id].Clone()
+			before := n.Clone()
+			n.Tags = []string{"tag:srv"}
+			p.apply(t, streamOperation{kind: "identity", node: n, before: before})
+			flush()
+			p.apply(t, streamOperation{kind: "identity", node: before, before: n})
+			flush()
+		}
+
+		// Deliver a policy replacement and restoration to one viewer before
+		// the batch flush; both intermediate maps must satisfy the full check.
+		if p.sessions[2].down {
+			p.open(t, 2, p.state.Snapshot(), false)
+		}
+
+		for _, intent := range []*propcheck.PacketIntent{second, first} {
+			p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: intent.Document(t), intent: intent})
+			p.update(t, 2, p.state.Snapshot(), 0)
+		}
+
+		flush()
+
+		if len(p.world.Nodes) < 8 {
+			added := p.drawOperation(t, "add")
+			p.apply(t, added)
+			flush()
+			p.apply(t, streamOperation{kind: "delete", node: added.node})
+			flush()
+		}
+
+		for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+			if p.sessions[id].down {
+				p.open(t, id, p.state.Snapshot(), false)
+			}
+		}
+
+		p.check(t, p.state.Snapshot())
+	})
 }

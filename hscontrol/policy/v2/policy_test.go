@@ -33,6 +33,7 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/types/ipproto"
 	"tailscale.com/types/views"
 	"tailscale.com/util/multierr"
 )
@@ -7954,4 +7955,169 @@ func TestIncrementalAppGrantOrderInvalidatesFilter(t *testing.T) {
 	}
 
 	require.Equal(t, want, got, "a warmed filter must preserve the new policy's grant order")
+}
+
+// Lost grants, broadened ports and creator-as-owner mistakes must disagree with
+// this input model even when incremental and full compiles agree with each other.
+func TestIncrementalPolicyRapidPacketIntent(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		in := incrementalInput{users: []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}, {ID: 3, Name: "u3"}}}
+		for i := range rapid.IntRange(4, 6).Draw(t, "nodes") {
+			in.nodes = append(in.nodes, incrementalNode(t, types.NodeID(i+1), in.users)) //nolint:gosec // Bounded positive IDs.
+		}
+
+		world := func(in incrementalInput) propcheck.World {
+			m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: slices.Clone(in.users)}
+			for _, n := range in.nodes {
+				m.Put(n)
+			}
+
+			return m
+		}
+		intent := propcheck.DrawPacketIntent(t, world(in))
+		in.doc = intent.Document(t)
+
+		type savedPolicy struct {
+			doc    []byte
+			intent *propcheck.PacketIntent
+		}
+
+		// Every history replaces and restores a document; generated steps add
+		// identity/family changes and further historical transformations.
+		ops := append([]string{"order", "duplicate", "deny", "restore", "policy"}, rapid.SliceOfN(rapid.SampledFrom([]string{"policy", "identity", "family", "order", "duplicate", "restore"}), 1, 8).Draw(t, "intent operations")...)
+		history := make([]savedPolicy, 1, 1+len(ops))
+		history[0] = savedPolicy{in.doc, intent}
+
+		type retained struct {
+			world   propcheck.World
+			intent  *propcheck.PacketIntent
+			manager *PolicyManager
+		}
+
+		var (
+			previous  *PolicyManager
+			snapshots []retained
+		)
+
+		check := func() {
+			next, err := NewPolicyManagerFrom(previous, in.doc, in.users, in.nodes.ViewSlice())
+			require.NoError(t, err)
+			fresh, err := NewPolicyManager(in.doc, in.users, in.nodes.ViewSlice())
+			require.NoError(t, err)
+
+			m := world(in)
+			snapshots = append(snapshots, retained{m, intent, next})
+			// Packet order is not authorization. Existing equivalence properties
+			// retain their stronger representation diagnostics separately.
+			for _, saved := range append(slices.Clone(snapshots), retained{m, intent, fresh}) {
+				classes := saved.manager.BuildPeerClasses(saved.manager.nodes, nil)
+				for _, id := range slices.Sorted(maps.Keys(saved.world.Nodes)) {
+					n := saved.world.Nodes[id]
+					rules, err := saved.manager.FilterForNode(n.View())
+					require.NoError(t, err)
+
+					for _, peer := range propcheck.CheckPacketIntent(t, saved.world, saved.intent, id, rules) {
+						require.Contains(t, classes.Peers(id), peer, "required incoming/outgoing packet peer")
+					}
+				}
+			}
+
+			previous = next
+		}
+		check()
+
+		for _, op := range ops {
+			switch op {
+			case "policy":
+				intent = propcheck.DrawPacketIntent(t, world(in))
+				in.doc = intent.Document(t)
+			case "deny":
+				intent = &propcheck.PacketIntent{}
+				in.doc = intent.Document(t)
+			case "restore":
+				saved := history[rapid.IntRange(0, len(history)-1).Draw(t, "intent ancestor")]
+				in.doc, intent = slices.Clone(saved.doc), saved.intent
+			default:
+				in = in.edit(t, op)
+			}
+
+			check()
+
+			history = append(history, savedPolicy{slices.Clone(in.doc), intent})
+		}
+	})
+}
+
+// Pin the independent model's ownership and boundary semantics with literal
+// expectations, so an always-deny oracle cannot validate missing wire grants.
+func TestPacketIntentOwnershipAndPorts(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: users}
+	for i := range 4 {
+		n := node(fmt.Sprintf("n%d", i+1), fmt.Sprintf("100.64.0.%d", i+1), fmt.Sprintf("fd7a:115c:a1e0::%d", i+1), users[i%2])
+
+		n.ID = types.NodeID(i + 1) //nolint:gosec // Four fixed node IDs.
+		switch i {
+		case 2:
+			n.Tags = []string{"tag:srv"}
+		case 3:
+			n.Tags = []string{"tag:router"}
+		}
+
+		m.Put(n)
+	}
+
+	intent := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{
+		{Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"}, Protocol: ipproto.TCP, First: 22, Last: 25},
+		{Src: propcheck.PacketSelector{Tag: "tag:srv"}, Dst: propcheck.PacketSelector{Tag: "tag:router"}, Protocol: ipproto.UDP, First: 65535, Last: 65535},
+		{Src: propcheck.PacketSelector{IP: *m.Nodes[1].IPv6}, Dst: propcheck.PacketSelector{IP: *m.Nodes[2].IPv6}, Protocol: ipproto.UDP, First: 0, Last: 0},
+	}}
+	for _, tc := range []struct {
+		src, dst types.NodeID
+		v6       bool
+		port     uint16
+		protocol ipproto.Proto
+		want     bool
+	}{
+		{1, 2, false, 21, ipproto.TCP, false},
+		{1, 2, false, 22, ipproto.TCP, true},
+		{1, 2, true, 23, ipproto.TCP, true},
+		{1, 2, true, 24, ipproto.TCP, true},
+		{1, 2, false, 25, ipproto.TCP, true},
+		{1, 2, true, 26, ipproto.TCP, false},
+		{1, 2, false, 22, ipproto.UDP, false},
+		{2, 1, false, 22, ipproto.TCP, false},
+		{3, 2, false, 22, ipproto.TCP, false},
+		{1, 4, false, 22, ipproto.TCP, false},
+		{3, 4, false, 65534, ipproto.UDP, false},
+		{3, 4, true, 65535, ipproto.UDP, true},
+		{3, 4, true, 65535, ipproto.TCP, false},
+		{1, 2, true, 0, ipproto.UDP, true},
+		{1, 2, false, 0, ipproto.UDP, false},
+		{1, 2, true, 1, ipproto.UDP, false},
+	} {
+		src, dst := m.Nodes[tc.src].IPv4, m.Nodes[tc.dst].IPv4
+		if tc.v6 {
+			src, dst = m.Nodes[tc.src].IPv6, m.Nodes[tc.dst].IPv6
+		}
+
+		require.Equal(t, tc.want, intent.Allows(m, tc.src, tc.dst, *src, *dst, tc.port, tc.protocol), "%+v", tc)
+	}
+
+	nodes := make(types.Nodes, 0, len(m.Nodes))
+	for _, id := range slices.Sorted(maps.Keys(m.Nodes)) {
+		nodes = append(nodes, m.Nodes[id])
+	}
+
+	pm, err := NewPolicyManager(intent.Document(t), users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	peers := map[types.NodeID][]types.NodeID{1: {2}, 2: {1}, 3: {4}, 4: {3}}
+
+	for _, n := range nodes {
+		rules, err := pm.FilterForNode(n.View())
+		require.NoError(t, err)
+		require.Equal(t, peers[n.ID], propcheck.CheckPacketIntent(t, m, intent, n.ID, rules), "incoming and outgoing required peers")
+	}
 }

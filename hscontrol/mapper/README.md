@@ -154,3 +154,63 @@ RegionScore; JSON omitempty can therefore preserve stale scores after a clear.
 Do not exclude these supported reload inputs to make a campaign pass. Stream
 comparisons normalize absent/empty HomeParams and explicit score 1.0 to default
 latency weights; every non-default score remains observable.
+
+## Shared packet intent
+
+`propcheck.PacketIntent` is a bounded input model shared by
+`policy/v2.TestIncrementalPolicyRapidPacketIntent`,
+`mapper.TestRapidStreamPacketIntent`, and `TestStreamPacketIntentHistory`.
+`DrawPacketIntent` generates one to four directed TCP/UDP grants with wildcard,
+user-name, tag or literal-IP selectors and inclusive port ranges. Each generated
+replacement includes a live literal-IP witness. Explicit empty intent denies
+all traffic. Expected permissions scan owned `propcheck.World` nodes and users;
+tags exclude creator user rights even when UserID remains populated.
+
+`CheckPacketIntent` checks both address families between distinct nodes. It
+probes every port in each generated range, adjacent ports, ports 0 and 65535,
+and denied port 32768 for both protocols. Wider manually constructed ranges
+remain bounded: their first four ports, midpoint and endpoint are probed. Actual rules pass through the pinned Tailscale
+`wgengine/filter.MatchesFromFilterRules`, `filter.New`, and `Filter.Check`.
+TCP checks synthesize SYN packets; UDP checks start without outgoing conntrack.
+The expected side never reads compiled policy, FilterRules or fresh rendering.
+Allowed traffic requires reciprocal peer visibility. The shared checker returns
+a necessary peer union for incoming and outgoing flows, checked only against the
+viewer being validated; other sessions may legitimately lag. Denied packets do not imply absent
+peers: same-user visibility remains unconditional.
+
+The existing stream history stores immutable intent beside each policy document.
+`packet-policy` and `packet-deny` are operations in the broad driver. Reorder,
+duplicate, historical restore and DERP-only policy edits retain intent metadata;
+unrelated richer policies clear it. The same check reads the client's cumulative
+filter after JSON/delta replay and checks retained snapshots against their old
+World and intent. Every successful open/update runs the same extracted
+`checkSession` assertions: full fresh-snapshot comparison and existing independent
+fields as well as packet intent. This includes intermediate deliveries later
+restored within a coalesced batch. Batch-end `check` still validates unwoken
+clients. Failed partial prefixes are checked only after successful reconnect.
+The dedicated generated packet driver reuses the broad commit/delivery driver,
+with six mandatory history phases and one to eight additional commits per case;
+`-rapid.checks` extends that campaign. The broad driver retains `-rapid.steps`.
+The fixed history keeps ownership revocation/restoration, document replacement,
+deny/restore, membership and reconnect checks reachable independently of earlier
+failures in broader generated histories.
+
+The focused policy history evaluates both incremental and fresh managers against
+intent and retains old managers/worlds. It deliberately does not use the older
+byte-order equivalence helper: reordered packet grants can preserve authorization
+while changing rule order. Existing representation checks and compiler audits
+remain enabled and unchanged. `TestRapidStreamPacketIntent` currently reaches
+that audit diagnostic on reordered packet grants; this does not by itself prove
+an authorization mismatch. The original richer generator remains a secondary
+compiler/fresh-render oracle, not an independent general policy interpreter.
+
+```sh
+go test -p 1 ./hscontrol/policy/v2 -run '^(TestIncrementalPolicyRapidPacketIntent|TestPacketIntentOwnershipAndPorts)$' -count=1 -rapid.seed=20261116 -rapid.checks=300 -rapid.nofailfile
+go test -p 1 ./hscontrol/mapper -run '^TestStreamPacketIntentHistory$' -count=1 -rapid.seed=20261116 -rapid.checks=20 -rapid.nofailfile
+go test -p 1 ./hscontrol/mapper -run '^TestRapidStreamPacketIntent$' -count=1 -rapid.seed=20261115 -rapid.checks=10 -rapid.nofailfile
+```
+
+This domain excludes self traffic, return traffic, external/subnet destinations,
+CIDRs, groups, hosts, autogroups, ACL syntax, SSH, app capabilities and OIDC/email
+alias resolution. It samples selected ports rather than every possible packet.
+Full Tailscale processes and network transport remain outside this fixture.
