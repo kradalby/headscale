@@ -106,3 +106,38 @@ steps, then spaces visible cards without moving pinned objects. Pairwise
 repulsion is quadratic in the visible object count and intended for the bounded
 debug scene. Camera actions cancel pending settling; live updates do not
 automatically restart it. No additional layout dependency is required.
+
+## Network administration
+
+Network is a separate Elm screen with inventory, selected topology, and access
+exploration. `Network.elm` owns its screen state and `NetworkData.elm` decodes
+semantic network responses; neither depends on graph cells or `Graph.elm`.
+The host application provides navigation and the existing JS bridge provides
+same-origin transport, debug-key propagation, cancellation, and browser geometry.
+
+Read-only endpoints under `/debug/graph/network/` provide inventory, topology,
+directional access, connection explanations, and paged policy source. They use the same protected
+debug listener and process-qualified snapshot revisions as graph inspection.
+The semantic operations stay separate from HTTP so a future admin frontend can
+reuse them with an appropriate authentication adapter. This build does not add
+standalone hosting or a public admin API.
+
+Inventory searches the entire tailnet and pages results independently of topology
+bounds. Access examines one selected source or destination, never an all-pairs
+permission graph. Network refresh is explicit. Continuations and details reject
+changed revisions instead of presenting mixed snapshots.
+Rule evidence has its own pagination, and full original rule text is available
+in revision-bound chunks without increasing the response limit. Selected-result
+details remain bounded even when an address has several router candidates.
+
+Policy explanations reuse retained compiled grant contributions and report
+original ACL/grant references before merging erases attribution. Packet access,
+SSH check conditions, capabilities, peer visibility, and route selection are
+distinct results. Reported services and policy-derived endpoints are labeled
+separately; they are not a complete discovered service registry or a reachability
+measurement. See the [operator documentation](../../../docs/ref/debug.md).
+
+New state and HTTP tests use the `TestDebugGraphNetwork` prefix so the existing
+debug Go check includes them. Policy explanation tests run in `./hscontrol/policy/v2`.
+Frontend assertions and bridge checks cover Network decoding, navigation, stale
+responses, and returning to graph geometry after screen changes.

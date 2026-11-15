@@ -5,6 +5,8 @@ import Graph
 import Json.Decode as D
 import Json.Encode as E
 import Main
+import Network
+import NetworkData
 import Platform
 import Set
 
@@ -42,6 +44,11 @@ run msg model =
 
 checks : List ( String, Bool )
 checks =
+    networkChecks ++ graphChecks
+
+
+graphChecks : List ( String, Bool )
+graphChecks =
     case ( ( D.decodeString Graph.sceneDecoder sceneJson, D.decodeString Graph.patchDecoder patchJson ), ( D.decodeString D.value sceneJson, D.decodeString D.value patchJson ) ) of
         ( ( Ok scene, Ok patch ), ( Ok sceneValue, Ok patchValue ) ) ->
             let
@@ -411,3 +418,71 @@ isError result =
 
         Ok _ ->
             False
+
+
+networkChecks : List ( String, Bool )
+networkChecks =
+    let
+        ( loaded, _ ) =
+            Network.load 7 Network.initial
+
+        ( paged, _ ) =
+            Network.update (Network.Page 50) loaded
+
+        ( changed, _ ) =
+            Network.update (Network.Category "users") paged
+
+        ( direction, _ ) =
+            Network.update (Network.Direction "incoming") paged
+
+        ( refreshed, _ ) =
+            Network.update Network.Refresh paged
+
+        ( icmp, _ ) =
+            Network.update (Network.Field "protocol" "1") { loaded | source = "node:1", destination = "node:2", port_ = "invalid" }
+
+        ( explained, shouldExplain ) =
+            Network.update Network.Explain icmp
+
+        payload =
+            E.object [ ( "generation", E.int 6 ), ( "type", E.string "networkError" ), ( "data", E.string "stale" ) ]
+
+        ( opened, _ ) =
+            Main.update Main.OpenNetwork Main.initial
+
+        ( returned, _ ) =
+            Main.update (Main.Perspective "world") opened
+    in
+    [ ( "evidence pagination preserves snapshot and selects address result"
+      , let
+            ( page, fetch ) =
+                Network.update (Network.EvidencePage 2 100) { loaded | revision = "process:7" }
+
+            ( _, query ) =
+                Network.load 8 page
+        in
+        fetch && page.evidenceOffset == 100 && page.evidenceResult == 2 && page.revision == "process:7" && (D.decodeValue (D.at [ "fields", "evidenceOffset" ] D.string) query == Ok "100") && (D.decodeValue (D.at [ "fields", "evidenceResult" ] D.string) query == Ok "2")
+      )
+    , ( "source chunks preserve revision and pointer"
+      , let
+            ( page, fetch ) =
+                Network.update (Network.SourcePage "/grants/100" 8192) { loaded | revision = "process:7" }
+
+            ( _, query ) =
+                Network.load 8 page
+        in
+        fetch && page.operation == "source" && (D.decodeValue (D.at [ "fields", "pointer" ] D.string) query == Ok "/grants/100") && (D.decodeValue (D.at [ "fields", "offset" ] D.string) query == Ok "8192") && (D.decodeValue (D.at [ "fields", "revision" ] D.string) query == Ok "process:7")
+      )
+    , ( "source chunk decoder accepts bounded continuation", not (isError (D.decodeString (NetworkData.responseDecoder "source") "{\"revision\":\"process:7\",\"pointer\":\"/grants/0\",\"offset\":0,\"total\":9000,\"nextOffset\":8192,\"text\":\"original source\"}")) )
+    , ( "access identity input updates independently", (Network.update (Network.Field "accessIdentity" "tag:tag:web") loaded |> Tuple.first).accessIdentity == "tag:tag:web" && (Network.update (Network.Field "accessIdentity" "tag:tag:web") loaded |> Tuple.first).sshUser == "" )
+    , ( "access protocol input updates independently and resets port", (Network.update (Network.Field "accessProtocol" "1") { loaded | accessPort = "443" } |> Tuple.first).accessProtocol == "1" && (Network.update (Network.Field "accessProtocol" "1") { loaded | accessPort = "443" } |> Tuple.first).accessPort == "" && (Network.update (Network.Field "accessProtocol" "1") loaded |> Tuple.first).sshUser == "" )
+    , ( "access port input updates independently", (Network.update (Network.Field "accessPort" "80") loaded |> Tuple.first).accessPort == "80" && (Network.update (Network.Field "accessPort" "80") loaded |> Tuple.first).sshUser == "" )
+    , ( "network inventory decoder accepts empty complete page", not (isError (D.decodeString (NetworkData.responseDecoder "inventory") "{\"revision\":\"process:7\",\"timestamp\":\"now\",\"total\":0,\"matched\":0,\"nextOffset\":null,\"items\":[]}")) )
+    , ( "network numeric revision rejected", isError (D.decodeString (NetworkData.responseDecoder "inventory") "{\"revision\":7,\"timestamp\":\"now\",\"total\":0,\"matched\":0,\"nextOffset\":null,\"items\":[]}") )
+    , ( "network category resets paging", changed.offset == 0 && changed.category == "users" )
+    , ( "network direction resets paging", direction.offset == 0 && direction.direction == "incoming" )
+    , ( "network refresh invalidates revision and pages", refreshed.revision == "" && refreshed.offset == 0 )
+    , ( "network ignores stale responses", (Network.incoming payload loaded).error == "" )
+    , ( "ICMP explanation ignores stale port input", shouldExplain && explained.operation == "explain" )
+    , ( "network return restores graph screen", opened.networkOpen && not returned.networkOpen && returned.perspective == "world" && returned.generation > opened.generation )
+    ]

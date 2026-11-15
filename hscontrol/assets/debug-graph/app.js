@@ -9,6 +9,8 @@
   let detailRequest = null;
   let detailSequence = 0;
   let hiddenStream = false;
+  let networkRequest = null;
+  let networkSequence = 0;
 
   const url = (path, fields = {}) => {
     const result = new URL(`/debug/graph/${path}`, location.origin);
@@ -29,6 +31,9 @@
     if (detailRequest) detailRequest.abort();
     stream = snapshotRequest = detailRequest = null;
     detailSequence += 1;
+    if (networkRequest) networkRequest.abort();
+    networkRequest = null;
+    networkSequence += 1;
   };
   const json = async (target, controller) => {
     const response = await fetch(target, {
@@ -39,14 +44,28 @@
     });
     if (response.status === 409)
       throw new Error(
-        "Details are unavailable at this revision. Refresh the paused snapshot or wait for the next live update.",
+        "Snapshot changed. Refresh Network or the paused graph snapshot, or wait for the next live graph update.",
       );
     if (!response.ok) throw new Error(`Request failed (${response.status}). Check debug access and retry.`);
     return response.json();
   };
 
   app.ports.request.subscribe((message) => {
-    if (message.action === "scene" || message.action === "stop") {
+    if (message.action === "network") {
+      stop();
+      hiddenStream = false;
+      generation = message.generation;
+      networkRequest = new AbortController();
+      const sequence = ++networkSequence;
+      json(url(`network/${message.operation}`, message.fields), networkRequest)
+        .then((data) => {
+          if (sequence === networkSequence) deliver(message.generation, "network", data);
+        })
+        .catch((error) => {
+          if (error.name !== "AbortError" && sequence === networkSequence)
+            deliver(message.generation, "networkError", error.message);
+        });
+    } else if (message.action === "scene" || message.action === "stop") {
       stop();
       hiddenStream = false;
       generation = message.generation;
@@ -107,42 +126,55 @@
   });
 
   // Measurements augment native events; camera and drag calculations stay in Elm.
-  const canvas = document.getElementById("graph-canvas");
-  const minimap = document.getElementById("graph-minimap");
-  const measure = () => {
-    const bounds = canvas.getBoundingClientRect();
-    deliver(generation, "geometry", { width: Math.max(1, bounds.width), height: Math.max(1, bounds.height) });
-  };
-  new ResizeObserver(measure).observe(canvas);
-  measure();
-  canvas.addEventListener(
-    "wheel",
-    (event) => {
+  let mountedCanvas = null;
+  let mountedMinimap = null;
+  let resizeObserver = null;
+  const mountGeometry = () => {
+    const canvas = document.getElementById("graph-canvas");
+    const minimap = document.getElementById("graph-minimap");
+    if (canvas === mountedCanvas && minimap === mountedMinimap) return;
+    if (resizeObserver) resizeObserver.disconnect();
+    mountedCanvas = canvas;
+    mountedMinimap = minimap;
+    if (!canvas || !minimap) return;
+    const measure = () => {
       const bounds = canvas.getBoundingClientRect();
-      event.graphPoint = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
-    },
-    { capture: true, passive: true },
-  );
-  minimap.addEventListener(
-    "click",
-    (event) => {
-      const bounds = minimap.getBoundingClientRect();
-      event.miniPoint = {
-        x: (event.clientX - bounds.left) / bounds.width,
-        y: (event.clientY - bounds.top) / bounds.height,
-      };
-    },
-    true,
-  );
-  canvas.addEventListener(
-    "pointerdown",
-    (event) => {
-      if (event.button !== 0) return;
-      const target = event.target.closest(".vertex, .edge") || canvas;
-      target.setPointerCapture(event.pointerId);
-    },
-    true,
-  );
+      deliver(generation, "geometry", { width: Math.max(1, bounds.width), height: Math.max(1, bounds.height) });
+    };
+    resizeObserver = new ResizeObserver(measure);
+    resizeObserver.observe(canvas);
+    measure();
+    canvas.addEventListener(
+      "wheel",
+      (event) => {
+        const bounds = canvas.getBoundingClientRect();
+        event.graphPoint = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+      },
+      { capture: true, passive: true },
+    );
+    minimap.addEventListener(
+      "click",
+      (event) => {
+        const bounds = minimap.getBoundingClientRect();
+        event.miniPoint = {
+          x: (event.clientX - bounds.left) / bounds.width,
+          y: (event.clientY - bounds.top) / bounds.height,
+        };
+      },
+      true,
+    );
+    canvas.addEventListener(
+      "pointerdown",
+      (event) => {
+        if (event.button !== 0) return;
+        const target = event.target.closest(".vertex, .edge") || canvas;
+        target.setPointerCapture(event.pointerId);
+      },
+      true,
+    );
+  };
+  new MutationObserver(mountGeometry).observe(document.body, { childList: true, subtree: true });
+  mountGeometry();
   const logo = document.querySelector("[data-headscale-logo]");
   if (logo) logo.src = url("logo.svg").href;
   const debugLink = document.querySelector(".brand");

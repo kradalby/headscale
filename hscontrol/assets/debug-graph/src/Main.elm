@@ -10,6 +10,7 @@ import Html.Events as Events
 import Html.Lazy as Lazy
 import Json.Decode as D
 import Json.Encode as E
+import Network
 import Process
 import Set exposing (Set)
 import Svg as S
@@ -37,7 +38,9 @@ type alias Drag =
 
 
 type alias Model =
-    { scene : Maybe Scene
+    { network : Network.Model
+    , networkOpen : Bool
+    , scene : Maybe Scene
     , generation : Int
     , perspective : String
     , search : String
@@ -67,7 +70,9 @@ type alias Model =
 
 
 type Msg
-    = Incoming D.Value
+    = NetworkMsg Network.Msg
+    | OpenNetwork
+    | Incoming D.Value
     | Search String
     | Submit
     | Perspective String
@@ -100,7 +105,7 @@ type Msg
 
 initial : Model
 initial =
-    { scene = Nothing, generation = 0, perspective = "core", search = "", submitted = "", focus = "", live = False, status = "Loading", error = "", selected = Nothing, inspectorOpen = False, detail = "", detailRequest = Nothing, positions = Dict.empty, pinned = Set.empty, hidden = Set.empty, hiddenRelations = Set.empty, camera = { x = 60, y = 70, zoom = 1 }, width = 900, height = 650, settling = Nothing, suppressClick = False, drag = Nothing, highlights = Dict.empty, recent = [], notice = "" }
+    { network = Network.initial, networkOpen = False, scene = Nothing, generation = 0, perspective = "core", search = "", submitted = "", focus = "", live = False, status = "Loading", error = "", selected = Nothing, inspectorOpen = False, detail = "", detailRequest = Nothing, positions = Dict.empty, pinned = Set.empty, hidden = Set.empty, hiddenRelations = Set.empty, camera = { x = 60, y = 70, zoom = 1 }, width = 900, height = 650, settling = Nothing, suppressClick = False, drag = Nothing, highlights = Dict.empty, recent = [], notice = "" }
 
 
 main : Program () Model Msg
@@ -129,6 +134,28 @@ load model =
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
+        OpenNetwork ->
+            let
+                ( network, payload ) =
+                    Network.load (model.generation + 1) model.network
+            in
+            ( { model | networkOpen = True, network = network, generation = model.generation + 1, settling = Nothing, drag = Nothing }, request payload )
+
+        NetworkMsg networkMsg ->
+            let
+                ( next, shouldLoad ) =
+                    Network.update networkMsg model.network
+            in
+            if shouldLoad then
+                let
+                    ( network, payload ) =
+                        Network.load (model.generation + 1) next
+                in
+                ( { model | network = network, generation = model.generation + 1 }, request payload )
+
+            else
+                ( { model | network = next }, Cmd.none )
+
         Search value ->
             ( { model | search = value }, Cmd.none )
 
@@ -149,7 +176,7 @@ update msg model =
                 }
 
         Perspective value ->
-            load { model | perspective = value, focus = "", scene = Nothing, selected = Nothing, positions = Dict.empty, pinned = Set.empty, hidden = Set.empty, hiddenRelations = Set.empty }
+            load { model | networkOpen = False, perspective = value, focus = "", scene = Nothing, selected = Nothing, positions = Dict.empty, pinned = Set.empty, hidden = Set.empty, hiddenRelations = Set.empty }
 
         ToggleLive ->
             if model.live then
@@ -312,7 +339,11 @@ update msg model =
             ( { model | settling = Nothing, camera = { x = model.width / 2 - (bounds.left + point.x * bounds.width) * model.camera.zoom, y = model.height / 2 - (bounds.top + point.y * bounds.height) * model.camera.zoom, zoom = model.camera.zoom } }, Cmd.none )
 
         Incoming value ->
-            incoming value model
+            if model.networkOpen then
+                ( { model | network = Network.incoming value model.network }, Cmd.none )
+
+            else
+                incoming value model
 
 
 {-| inspect requests the selection's details at the scene's revision. A
@@ -932,6 +963,18 @@ button label msg =
 
 view : Model -> Html Msg
 view model =
+    if model.networkOpen then
+        H.div [ A.class "app network-app" ]
+            [ H.header [ A.class "toolbar" ] [ H.a [ A.class "brand", A.href "/debug/" ] [ H.text "Headscale" ], button "Core" (Perspective "core"), button "World" (Perspective "world"), button "Network" OpenNetwork ]
+            , H.map NetworkMsg (Network.view model.network)
+            ]
+
+    else
+        graphView model
+
+
+graphView : Model -> Html Msg
+graphView model =
     H.div [ A.class "app" ]
         [ H.header [ A.class "toolbar" ]
             [ H.a [ A.class "brand", A.href "/debug/" ] [ H.img [ A.class "brand-logo", A.attribute "data-headscale-logo" "", A.alt "Headscale", A.width 98, A.height 44 ] [], H.span [ A.class "brand-section" ] [ H.text "Graph" ] ]
@@ -959,6 +1002,7 @@ view model =
                     )
                 ]
             , button "Refresh" Refresh
+            , button "Network" OpenNetwork
             ]
         , H.div [ A.class "workspace" ]
             [ sidebar model

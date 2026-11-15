@@ -156,6 +156,33 @@ Bounds and cost:
 - Details are answered for the last eight scenes sent to any viewer. Older revisions answer 409 and the page asks for
   a refresh. The retained snapshots share unchanged state with the current one.
 
+### Exploring the network
+
+The optional Elm explorer includes a **Network** screen for administrators alongside the **Core** and **World**
+developer views. Build it with `nix build .#headscale-debug`, start the resulting Headscale binary with your usual
+configuration, and open `/debug/graph/` on the private metrics/debug listener. Normal release builds omit this UI.
+
+Use **Inventory** to search and page through nodes, users, tags, routes, and services. Select an object to explore
+its **Topology**, or select a node to inspect incoming and outgoing **Access**. Topology is bounded; inventory
+search and pagination reach objects beyond the visible neighborhood.
+
+An access explanation evaluates a source node, destination node or address, protocol, and port against the current
+policy. It separates packet permission from peer visibility, route state, node state, application capabilities,
+and Tailscale SSH authorization. SSH queries also need a local username; permission to connect to TCP port 22
+does not establish permission to log in through Tailscale SSH. Matching source rules include their original policy
+text and comments when available. Denied traffic usually has no matching allow rule, rather than an explicit deny.
+Rule evidence is paged independently of the verdict. Select a result to inspect its evidence, and use the source
+viewer to read complete policy rules in bounded chunks at the same snapshot revision.
+
+Reported services come from node host information and may include only PeerAPI advertisements. Policy-derived
+endpoints describe allowed protocol/port ranges, not discovered applications. Neither establishes that a service
+is listening. Likewise, policy permission and an available route do not prove actual connectivity; the explorer
+does not send probes or know every client-side route selection.
+
+Network queries use one immutable snapshot and refresh explicitly. If state changes between a page and its
+details, refresh before continuing; the UI does not combine an old inventory with a new policy explanation.
+Keep this listener private: its existing debug access protection is not a standalone administrator login system.
+
 ### Checking control-plane progress
 
 These signals describe different stages of an update:

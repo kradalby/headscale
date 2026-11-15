@@ -938,3 +938,232 @@ pre {
     transition: none !important;
   }
 }
+
+/* Network keeps semantic navigation independent of the graph canvas. */
+.network-app {
+  display: block;
+  overflow: auto;
+}
+.network {
+  padding: 1.5rem;
+  max-width: 1600px;
+  margin: auto;
+}
+.network-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.network h1 {
+  margin-bottom: 0.3rem;
+}
+.network-revision,
+.network small {
+  color: var(--muted, #666);
+  overflow-wrap: anywhere;
+}
+.network-tabs,
+.network-actions,
+.network-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 1rem 0;
+}
+.network-tabs button[aria-pressed="true"] {
+  background: #8a3153;
+  color: white;
+}
+.network-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 330px);
+  gap: 1.5rem;
+}
+.network-results,
+.network-inspector {
+  min-width: 0;
+}
+.network-inspector {
+  border-left: 1px solid #ddd;
+  padding-left: 1.5rem;
+}
+.network-list {
+  list-style: none;
+  padding: 0;
+}
+.network-object {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.7rem 0;
+  border-bottom: 1px solid #ddd;
+}
+.network-object small {
+  flex: 1;
+  min-width: 80px;
+}
+.network-topology {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.7rem;
+}
+.network-topology section {
+  background: #f6f4f3;
+  padding: 0.7rem;
+  border-radius: 0.5rem;
+}
+.network-topology h2 {
+  font-size: 1rem;
+}
+.network-relationships {
+  padding-left: 1.2rem;
+}
+.network-relationships li {
+  margin: 0.6rem 0;
+}
+.network-form {
+  display: grid;
+  gap: 0.7rem;
+  margin-top: 2rem;
+}
+.network-form label {
+  display: grid;
+  gap: 0.3rem;
+}
+.network-form input,
+.network-form select {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 0.6rem;
+}
+.network-form p,
+.network-inspector dd {
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+.network pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: #f6f4f3;
+  padding: 0.7rem;
+}
+.network-explanation article,
+.network-access {
+  border-bottom: 1px solid #ddd;
+  padding: 1rem 0;
+}
+.network details {
+  margin: 0.7rem 0;
+}
+.network code {
+  overflow-wrap: anywhere;
+}
+.network dt {
+  margin-top: 0.6rem;
+  font-weight: bold;
+}
+.network dd {
+  margin-left: 0;
+}
+@media (max-width: 850px) {
+  .network {
+    padding: 1rem;
+  }
+  .network-workspace {
+    grid-template-columns: 1fr;
+  }
+  .network-inspector {
+    border-left: 0;
+    border-top: 1px solid #ddd;
+    padding: 1rem 0;
+  }
+  .network-topology {
+    grid-template-columns: 1fr;
+  }
+}
+.network-access-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.7rem;
+  margin: 0.7rem 0;
+}
+.network-access-filters label {
+  display: grid;
+  gap: 0.3rem;
+  flex: 1;
+  min-width: 120px;
+}
+.network-access-filters input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.5rem;
+}
+.network-access-filters p {
+  flex-basis: 100%;
+  font-size: 0.85rem;
+}
+.network-topology-canvas {
+  overflow: auto;
+  max-height: 650px;
+  border: 1px solid #ddd;
+  border-radius: 0.5rem;
+  background: #faf9f8;
+  margin: 1rem 0;
+}
+.network-topology-canvas svg {
+  display: block;
+  min-width: 950px;
+}
+.network-topology-heading {
+  fill: #4c4548;
+  font-size: 15px;
+  font-weight: 700;
+}
+.network-topology-edge {
+  fill: none;
+  stroke: #8a3153;
+  stroke-width: 1.5;
+  opacity: 0.55;
+}
+.network-topology-edge:hover {
+  opacity: 1;
+  stroke-width: 3;
+}
+.network-topology-node {
+  cursor: pointer;
+}
+.network-topology-node rect {
+  fill: #fff;
+  stroke: #c2b9bc;
+  stroke-width: 1.5;
+}
+.network-topology-node.user rect,
+.network-topology-node.tag rect {
+  fill: #f6edf1;
+}
+.network-topology-node.route rect,
+.network-topology-node.service rect {
+  fill: #edf3f1;
+}
+.network-topology-node:focus {
+  outline: none;
+}
+.network-topology-node:focus rect,
+.network-topology-node:hover rect {
+  stroke: #8a3153;
+  stroke-width: 3;
+}
+.network-topology-label {
+  fill: #292427;
+  font-size: 13px;
+  font-weight: 600;
+}
+.network-topology-kind {
+  fill: #665c61;
+  font-size: 11px;
+}

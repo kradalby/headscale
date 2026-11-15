@@ -22,18 +22,20 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/assets"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"tailscale.com/tsweb"
 )
 
 const (
-	debugGraphInterval      = 250 * time.Millisecond
-	debugGraphHeartbeat     = 15 * time.Second
-	debugGraphWriteTimeout  = 10 * time.Second
-	debugGraphQueryLimit    = 512
-	debugGraphResponseLimit = 2 << 20
-	debugGraphMaxViewers    = 4
-	debugGraphRecentScenes  = 8
+	debugNetworkAccessOperation = "access"
+	debugGraphInterval          = 250 * time.Millisecond
+	debugGraphHeartbeat         = 15 * time.Second
+	debugGraphWriteTimeout      = 10 * time.Second
+	debugGraphQueryLimit        = 512
+	debugGraphResponseLimit     = 2 << 20
+	debugGraphMaxViewers        = 4
+	debugGraphRecentScenes      = 8
 	// A live stream ends after this and the browser's EventSource
 	// reconnects for a new baseline. Heartbeats land in the kernel's send
 	// buffer, so a viewer that vanished without closing its connection is
@@ -72,6 +74,11 @@ func (h *Headscale) registerDebugGraph(mux *http.ServeMux, debug *tsweb.DebugHan
 
 	// Details include policy source, filters and SSH rules: use the gate of
 	// /debug/policy, not protectedDebugHandler's private-network allowance.
+	for _, operation := range []string{"inventory", "topology", debugNetworkAccessOperation, "explain", "source"} {
+		mux.Handle("GET /debug/graph/network/"+operation, tsweb.Protected(sameSiteGraph(func(w http.ResponseWriter, r *http.Request) {
+			h.debugNetwork(w, r, g.instance, operation)
+		})))
+	}
 	mux.Handle("GET /debug/graph/", tsweb.Protected(http.StripPrefix("/debug/graph/", http.FileServerFS(static))))
 	mux.Handle("GET /debug/graph/logo.svg", tsweb.Protected(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/svg+xml")
@@ -469,4 +476,239 @@ func diffGraphScene(previous, next state.DebugGraphScene) debugGraphPatch {
 	}
 
 	return patch
+}
+
+func (h *Headscale) debugNetwork(w http.ResponseWriter, r *http.Request, instance, operation string) {
+	q, ok := debugNetworkQuery(w, r, operation)
+	if !ok {
+		return
+	}
+
+	v := r.URL.Query()
+
+	snapshot := h.state.Snapshot()
+	revision := instance + ":" + strconv.FormatUint(snapshot.Rev(), 10)
+
+	requested := v.Get("revision")
+	if requested == "" && (operation != "inventory" || q.Offset > 0) {
+		http.Error(w, "revision is required", http.StatusBadRequest)
+		return
+	}
+
+	if requested != "" {
+		_, number, found := strings.Cut(requested, ":")
+
+		_, err := strconv.ParseUint(number, 10, 64)
+		if !found || err != nil {
+			http.Error(w, "invalid revision", http.StatusBadRequest)
+			return
+		}
+
+		if requested != revision {
+			http.Error(w, "snapshot changed; refresh the network", http.StatusConflict)
+			return
+		}
+	}
+
+	switch operation {
+	case "inventory":
+		p := snapshot.DebugNetworkInventory(q)
+		p.Revision = revision
+		writeGraphJSON(w, p)
+	case "topology":
+		p := snapshot.DebugNetworkTopology(q.ID)
+		if len(p.Objects) == 0 {
+			http.NotFound(w, r)
+			return
+		}
+
+		p.Revision = revision
+		writeGraphJSON(w, p)
+	case debugNetworkAccessOperation:
+		p, err := snapshot.DebugNetworkAccess(r.Context(), q)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		p.Revision = revision
+		writeGraphJSON(w, p)
+	case "source":
+		chunk, total, next, err := policyv2.AccessSourceChunk(snapshot.PolicySource(), v.Get("pointer"), q.Offset)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		writeGraphJSON(w, struct {
+			Revision   string `json:"revision"`
+			Pointer    string `json:"pointer"`
+			Offset     int    `json:"offset"`
+			Total      int    `json:"total"`
+			NextOffset *int   `json:"nextOffset"`
+			Text       string `json:"text"`
+		}{revision, v.Get("pointer"), q.Offset, total, next, chunk})
+	case "explain":
+		h.debugNetworkExplain(w, r, snapshot, revision)
+	}
+}
+
+func (h *Headscale) debugNetworkExplain(w http.ResponseWriter, r *http.Request, snapshot *state.Snapshot, revision string) {
+	v := r.URL.Query()
+	parse := func(key string, maximum int) (int, bool) {
+		if v.Get(key) == "" {
+			return 0, true
+		}
+
+		n, err := strconv.Atoi(v.Get(key))
+
+		return n, err == nil && n >= 0 && n <= maximum
+	}
+
+	protocol, ok := parse("protocol", 255)
+	if !ok || v.Get("protocol") == "" {
+		http.Error(w, "protocol must be 0 to 255", http.StatusBadRequest)
+		return
+	}
+
+	port, ok := parse("port", 65535)
+	if !ok {
+		http.Error(w, "invalid port", http.StatusBadRequest)
+		return
+	}
+
+	portBearing := protocol == 6 || protocol == 17 || protocol == 132
+	if portBearing && v.Get("port") == "" || !portBearing && v.Get("port") != "" {
+		http.Error(w, "port required only for port-bearing protocol", http.StatusBadRequest)
+		return
+	}
+
+	offset, ok := parse("evidenceOffset", 1000000000)
+	if !ok {
+		http.Error(w, "invalid evidence offset", http.StatusBadRequest)
+		return
+	}
+
+	result, ok := parse("evidenceResult", 99)
+	if !ok {
+		http.Error(w, "invalid evidence result", http.StatusBadRequest)
+		return
+	}
+
+	p, err := snapshot.DebugNetworkExplain(r.Context(), state.NetworkExplainQuery{Source: v.Get("source"), Destination: v.Get("destination"), SourceIP: v.Get("sourceIP"), SSHUser: v.Get("sshUser"), Protocol: networkProtocol(protocol), Port: networkPort(port), EvidenceOffset: offset, EvidenceResult: result})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	p.Revision = revision
+	writeGraphJSON(w, p)
+}
+
+func networkProtocol(value int) uint8 {
+	n, _ := strconv.ParseUint(strconv.Itoa(value), 10, 8)
+	return uint8(n)
+}
+
+func debugNetworkQuery(w http.ResponseWriter, r *http.Request, operation string) (state.NetworkQuery, bool) {
+	v := r.URL.Query()
+	for _, values := range v {
+		for _, value := range values {
+			if len(value) > debugGraphQueryLimit {
+				http.Error(w, "query value exceeds 512 bytes", http.StatusBadRequest)
+				return state.NetworkQuery{}, false
+			}
+		}
+	}
+
+	q := state.NetworkQuery{Category: v.Get("category"), Search: v.Get("search"), Identity: v.Get("identity"), ID: v.Get("id"), Direction: v.Get("direction"), Limit: 50}
+	parse := func(key string, fallback, maximum int) (int, bool) {
+		if v.Get(key) == "" {
+			return fallback, true
+		}
+
+		n, err := strconv.Atoi(v.Get(key))
+
+		return n, err == nil && n >= 0 && n <= maximum
+	}
+
+	var ok bool
+
+	q.Offset, ok = parse("offset", 0, 1000000000)
+	if !ok {
+		http.Error(w, "invalid offset", http.StatusBadRequest)
+		return state.NetworkQuery{}, false
+	}
+
+	q.Limit, ok = parse("limit", 50, 100)
+	if !ok || q.Limit == 0 {
+		http.Error(w, "limit must be 1 to 100", http.StatusBadRequest)
+		return state.NetworkQuery{}, false
+	}
+
+	if operation == "inventory" {
+		switch q.Category {
+		case "nodes", "users", "tags", "routes", "services":
+		default:
+			http.Error(w, "invalid inventory category", http.StatusBadRequest)
+			return state.NetworkQuery{}, false
+		}
+	}
+
+	if operation == "topology" || operation == debugNetworkAccessOperation {
+		if q.ID == "" {
+			http.Error(w, "id is required", http.StatusBadRequest)
+			return state.NetworkQuery{}, false
+		}
+	}
+
+	if operation == debugNetworkAccessOperation && q.Direction != "incoming" && q.Direction != "outgoing" {
+		http.Error(w, "invalid direction", http.StatusBadRequest)
+		return state.NetworkQuery{}, false
+	}
+
+	if operation == debugNetworkAccessOperation && !debugNetworkAccessFilters(w, v, &q) {
+		return state.NetworkQuery{}, false
+	}
+
+	return q, true
+}
+
+func networkPort(value int) uint16 {
+	n, _ := strconv.ParseUint(strconv.Itoa(value), 10, 16)
+	return uint16(n)
+}
+
+func debugNetworkAccessFilters(w http.ResponseWriter, v url.Values, q *state.NetworkQuery) bool {
+	parse := func(key string, fallback, maximum int) (int, bool) {
+		if v.Get(key) == "" {
+			return fallback, true
+		}
+
+		n, err := strconv.Atoi(v.Get(key))
+
+		return n, err == nil && n >= 0 && n <= maximum
+	}
+
+	if v.Get("protocol") != "" {
+		n, ok := parse("protocol", 0, 255)
+		if !ok {
+			http.Error(w, "invalid protocol", http.StatusBadRequest)
+			return false
+		}
+
+		q.Protocol = new(n)
+	}
+
+	if v.Get("port") != "" {
+		n, ok := parse("port", 0, 65535)
+		if !ok || q.Protocol == nil || (*q.Protocol != 6 && *q.Protocol != 17 && *q.Protocol != 132) {
+			http.Error(w, "port requires a port-bearing protocol", http.StatusBadRequest)
+			return false
+		}
+
+		q.Port = new(networkPort(n))
+	}
+
+	return true
 }
