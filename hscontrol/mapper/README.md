@@ -597,3 +597,51 @@ OS behavior and network processes. The strict emitted shape deliberately fails
 if the compiler starts emitting another form; extend the documented protocol
 domain before accepting it. No production behavior or subscription fixture is
 changed.
+
+## Shared node-attribute intent
+
+`propcheck.NodeAttrIntent` shares the owned World and user/tag/wildcard
+`PacketSelector` domain with packet intent. Its immutable grants contain only
+`custom:probe`, `custom:other`, `randomize-client-port`, and `disable-ipv4`.
+Each generated replacement includes a live witness. The fixed four-key universe
+keeps denied and revoked keys observable even when current intent is empty.
+`AppendDocument` preserves packet/app/SSH grants, DERP overlays and existing tag
+owners; reorder and duplicate operations retain immutable historical intent.
+
+`TestIncrementalPolicyRapidNodeAttrIntent` extends the shared policy history:
+old, incremental and fresh managers are checked against owned inputs through
+identity/family changes, replacements, clears, restoration and duplication.
+`TestRapidStreamNodeAttrIntent` uses the existing composed DB/file driver,
+including staged files, failed reloads, comments, DERP edits and retained maps.
+Mixed documents retain packet/app/SSH diagnostics; those known failures remain
+enabled and can stop generated histories before later attribute checks.
+
+`checkStreamNodeInputs` checks delivered self marker membership and requires
+those markers to be absent from peers. Baseline capabilities are outside this
+four-key comparison. Compiler and raw wire markers have null payloads;
+`CheckNodeAttrWire` checks the existing encoding/replay adapter before replay.
+The pinned `tailcfg.Node.Clone` turns nil capability slices into empty slices,
+so the consumer checker requires empty payloads while preserving key presence.
+The helper treats simple/owned packet documents without attribute metadata as
+empty attribute intent; unmodeled rich policies remain outside this oracle.
+
+IPv4 self identity depends on the node's own flag. Peer identity depends on
+either the peer's or viewer's flag. IPv6 remains present. The allow-all route
+check still predicts subnet winners and exit prefixes from owned route inputs;
+removing IPv4 identity must not remove advertised IPv4 subnet or exit routes.
+Packet intent continues to describe ACL permission on World IPs, not actual
+link connectivity after address suppression.
+
+`TestStreamNodeAttrIntentHistory` guarantees completed enable/clear/restore and
+ownership phases for both DB and actual policy-file fixtures. Two viewers with
+different flags reuse one Hub peer cache. A routed peer retains its IPv4 subnet
+and exit routes. Route-selected sessions and unwoken clients are checked before
+reconnect; retained maps use old inputs and direct rendering. Literal node
+contracts also corrupt actual shared-checker inputs to prove detection of
+missing/stale/peer-leaked markers, IPv4 identity leaks and IPv6 loss. Separate
+marker controls cover unexpected keys, nonempty payloads and raw non-null values.
+
+This is a bounded marker oracle, not a general nodeAttrs interpreter: no IP
+selectors, groups, aliases, IP pools, companion data, parameterized capabilities,
+top-level randomizeClientPort, or baseline-capability model. Input slices are
+immutable after construction; transformations copy the outer grant slice only.

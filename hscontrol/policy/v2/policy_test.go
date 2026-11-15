@@ -7960,18 +7960,19 @@ func TestIncrementalAppGrantOrderInvalidatesFilter(t *testing.T) {
 // Lost grants, broadened ports and creator-as-owner mistakes must disagree with
 // this input model even when incremental and full compiles agree with each other.
 func TestIncrementalPolicyRapidPacketIntent(t *testing.T) {
-	runIncrementalPolicyIntent(t, false, false, true)
+	runIncrementalPolicyIntent(t, false, false, false, true)
 }
 
 func TestIncrementalPolicyRapidAppIntent(t *testing.T) {
-	runIncrementalPolicyIntent(t, true, false, true)
+	runIncrementalPolicyIntent(t, true, false, false, true)
 }
 
 func TestIncrementalPolicyRapidAppReplacements(t *testing.T) {
-	runIncrementalPolicyIntent(t, true, false, false)
+	runIncrementalPolicyIntent(t, true, false, false, false)
 }
 
-func runIncrementalPolicyIntent(t *testing.T, apps, ssh, reorder bool) {
+//nolint:gocyclo // Keep shared component transitions and retained consumer checks in one history.
+func runIncrementalPolicyIntent(t *testing.T, apps, ssh, attrs, reorder bool) {
 	t.Helper()
 	rapid.Check(t, func(t *rapid.T) {
 		in := incrementalInput{users: []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}, {ID: 3, Name: "u3"}}}
@@ -8002,11 +8003,18 @@ func runIncrementalPolicyIntent(t *testing.T, apps, ssh, reorder bool) {
 			in.doc = sshIntent.AppendDocument(t, in.doc)
 		}
 
+		var attrIntent *propcheck.NodeAttrIntent
+		if attrs {
+			attrIntent = propcheck.DrawNodeAttrIntent(t, world(in))
+			in.doc = attrIntent.AppendDocument(t, in.doc)
+		}
+
 		type savedPolicy struct {
-			doc       []byte
-			intent    *propcheck.PacketIntent
-			appIntent *propcheck.AppIntent
-			sshIntent *propcheck.SSHIntent
+			doc        []byte
+			intent     *propcheck.PacketIntent
+			appIntent  *propcheck.AppIntent
+			sshIntent  *propcheck.SSHIntent
+			attrIntent *propcheck.NodeAttrIntent
 		}
 
 		// Every history replaces and restores a document; generated steps add
@@ -8021,14 +8029,15 @@ func runIncrementalPolicyIntent(t *testing.T, apps, ssh, reorder bool) {
 
 		ops = append(ops, rapid.SliceOfN(rapid.SampledFrom(choices), 1, 8).Draw(t, "intent operations")...)
 		history := make([]savedPolicy, 1, 1+len(ops))
-		history[0] = savedPolicy{in.doc, intent, appIntent, sshIntent}
+		history[0] = savedPolicy{in.doc, intent, appIntent, sshIntent, attrIntent}
 
 		type retained struct {
-			world     propcheck.World
-			intent    *propcheck.PacketIntent
-			appIntent *propcheck.AppIntent
-			sshIntent *propcheck.SSHIntent
-			manager   *PolicyManager
+			world      propcheck.World
+			intent     *propcheck.PacketIntent
+			appIntent  *propcheck.AppIntent
+			sshIntent  *propcheck.SSHIntent
+			attrIntent *propcheck.NodeAttrIntent
+			manager    *PolicyManager
 		}
 
 		var (
@@ -8043,13 +8052,14 @@ func runIncrementalPolicyIntent(t *testing.T, apps, ssh, reorder bool) {
 			require.NoError(t, err)
 
 			m := world(in)
-			snapshots = append(snapshots, retained{m, intent, appIntent, sshIntent, next})
+			snapshots = append(snapshots, retained{m, intent, appIntent, sshIntent, attrIntent, next})
 			// Packet order is not authorization. Existing equivalence properties
 			// retain their stronger representation diagnostics separately.
-			for _, saved := range append(slices.Clone(snapshots), retained{m, intent, appIntent, sshIntent, fresh}) {
+			for _, saved := range append(slices.Clone(snapshots), retained{m, intent, appIntent, sshIntent, attrIntent, fresh}) {
 				classes := saved.manager.BuildPeerClasses(saved.manager.nodes, nil)
 				for _, id := range slices.Sorted(maps.Keys(saved.world.Nodes)) {
 					n := saved.world.Nodes[id]
+					propcheck.CheckNodeAttrIntent(t, saved.world, saved.attrIntent, id, saved.manager.NodeCapMap(id), true)
 					rules, err := saved.manager.FilterForNode(n.View())
 					require.NoError(t, err)
 
@@ -8087,7 +8097,7 @@ func runIncrementalPolicyIntent(t *testing.T, apps, ssh, reorder bool) {
 				in.doc = intent.Document(t)
 			case "restore":
 				saved := history[rapid.IntRange(0, len(history)-1).Draw(t, "intent ancestor")]
-				in.doc, intent, appIntent, sshIntent = slices.Clone(saved.doc), saved.intent, saved.appIntent, saved.sshIntent
+				in.doc, intent, appIntent, sshIntent, attrIntent = slices.Clone(saved.doc), saved.intent, saved.appIntent, saved.sshIntent, saved.attrIntent
 			case "order", "duplicate":
 				if appIntent != nil {
 					appIntent = appIntent.Reordered(op == "duplicate")
@@ -8121,9 +8131,22 @@ func runIncrementalPolicyIntent(t *testing.T, apps, ssh, reorder bool) {
 				in.doc = sshIntent.AppendDocument(t, in.doc)
 			}
 
+			if attrs {
+				switch op {
+				case "policy":
+					attrIntent = propcheck.DrawNodeAttrIntent(t, world(in))
+				case "deny":
+					attrIntent = &propcheck.NodeAttrIntent{}
+				case "order", "duplicate":
+					attrIntent = attrIntent.Reordered(op == "duplicate")
+				}
+
+				in.doc = attrIntent.AppendDocument(t, in.doc)
+			}
+
 			check()
 
-			history = append(history, savedPolicy{slices.Clone(in.doc), intent, appIntent, sshIntent})
+			history = append(history, savedPolicy{slices.Clone(in.doc), intent, appIntent, sshIntent, attrIntent})
 		}
 	})
 }
@@ -8449,7 +8472,7 @@ func TestAppIntentRejectsCorruptedConsumerRules(t *testing.T) {
 }
 
 func TestIncrementalPolicyRapidSSHIntent(t *testing.T) {
-	runIncrementalPolicyIntent(t, false, true, true)
+	runIncrementalPolicyIntent(t, false, true, false, true)
 }
 
 func TestSSHIntentOwnershipAndProtocol(t *testing.T) {
@@ -8579,4 +8602,106 @@ func TestSSHIntentRejectsCorruptedRules(t *testing.T) {
 			require.Contains(t, failure.message, message)
 		})
 	}
+}
+
+func TestIncrementalPolicyRapidNodeAttrIntent(t *testing.T) {
+	runIncrementalPolicyIntent(t, false, false, true, true)
+}
+
+func TestNodeAttrIntentOwnershipAndMarkers(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: users}
+	nodes := make(types.Nodes, 0, 3)
+
+	for i := range 3 {
+		n := node(fmt.Sprintf("n%d", i+1), fmt.Sprintf("100.64.0.%d", i+1), fmt.Sprintf("fd7a:115c:a1e0::%d", i+1), users[i%2])
+
+		n.ID = types.NodeID(i + 1) //nolint:gosec // Three fixed node IDs.
+		if i == 2 {
+			n.Tags = []string{"tag:srv"}
+		}
+
+		m.Put(n)
+		nodes = append(nodes, n)
+	}
+
+	intent := &propcheck.NodeAttrIntent{Grants: []propcheck.NodeAttrGrant{
+		{Target: propcheck.PacketSelector{User: "u1"}, Attrs: []nodecap.Cap{"custom:probe", "disable-ipv4"}},
+		{Target: propcheck.PacketSelector{Tag: "tag:srv"}, Attrs: []nodecap.Cap{"custom:other"}},
+		{Attrs: []nodecap.Cap{nodecap.RandomizeClientPort}},
+	}}
+	require.Equal(t, tailcfg.NodeCapMap{"custom:probe": nil, "disable-ipv4": nil, nodecap.RandomizeClientPort: nil}, intent.Capabilities(m, 1))
+	require.Equal(t, tailcfg.NodeCapMap{nodecap.RandomizeClientPort: nil}, intent.Capabilities(m, 2))
+	require.Equal(t, tailcfg.NodeCapMap{"custom:other": nil, nodecap.RandomizeClientPort: nil}, intent.Capabilities(m, 3))
+
+	base := []byte(`{"grants":[{"src":["u1@"],"dst":["u2@"],"app":{"example.com/cap/read":[{"role":"read"}]},"ip":["tcp:22"]}],"ssh":[{"action":"accept","src":["u1@"],"dst":["tag:srv"],"users":["root"]}],"derpMap":{"Regions":{}},"tagOwners":{"tag:srv":["u1@"],"tag:unrelated":["u2@"]}}`)
+	original := slices.Clone(base)
+
+	var originalFields, composedFields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(base, &originalFields))
+	require.NoError(t, json.Unmarshal(intent.AppendDocument(t, base), &composedFields))
+
+	for field, value := range originalFields {
+		require.JSONEq(t, string(value), string(composedFields[field]), "attribute append preserves %s", field)
+	}
+
+	require.Equal(t, original, base, "attribute append must not mutate its document")
+
+	before := intent.AppendDocument(t, (&propcheck.PacketIntent{}).Document(t))
+	for _, in := range []*propcheck.NodeAttrIntent{intent, intent.Reordered(true), {}, intent} {
+		pm, err := NewPolicyManager(in.AppendDocument(t, (&propcheck.PacketIntent{}).Document(t)), users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		for _, n := range nodes {
+			propcheck.CheckNodeAttrIntent(t, m, in, n.ID, pm.NodeCapMap(n.ID), true)
+			propcheck.CheckNodeAttrWire(t, &tailcfg.Node{ID: n.ID.NodeID(), CapMap: pm.NodeCapMap(n.ID)}, true)
+		}
+	}
+
+	require.Equal(t, before, intent.AppendDocument(t, (&propcheck.PacketIntent{}).Document(t)), "reorder must retain immutable input")
+}
+
+func TestNodeAttrIntentRejectsCorruptedMarkers(t *testing.T) {
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{1: {ID: 1}}}
+	intent := &propcheck.NodeAttrIntent{Grants: []propcheck.NodeAttrGrant{{Attrs: []nodecap.Cap{"custom:probe", "disable-ipv4"}}}}
+	valid := tailcfg.NodeCapMap{"custom:probe": nil, "disable-ipv4": nil, nodecap.SSH: nil}
+	propcheck.CheckNodeAttrIntent(t, m, intent, 1, valid, true)
+	propcheck.CheckNodeAttrIntent(t, m, intent, 1, nil, false)
+
+	for _, mutation := range []string{"missing", "revoked", "peer-leak", "payload", "unexpected"} {
+		t.Run(mutation, func(t *testing.T) {
+			actual, want, self := maps.Clone(valid), intent, true
+			message := "membership"
+
+			switch mutation {
+			case "missing":
+				delete(actual, "disable-ipv4")
+			case "revoked":
+				want = &propcheck.NodeAttrIntent{}
+			case "peer-leak":
+				self = false
+			case "payload":
+				actual["custom:probe"] = []tailcfg.RawMessage{`true`}
+				message = "marker payload"
+			case "unexpected":
+				actual["custom:other"] = nil
+			}
+
+			failure := &appIntentFailure{}
+			require.PanicsWithValue(t, failure, func() { propcheck.CheckNodeAttrIntent(failure, m, want, 1, actual, self) })
+			require.Contains(t, failure.message, message)
+		})
+	}
+}
+
+func TestNodeAttrWireRejectsNonNullMarkers(t *testing.T) {
+	for _, self := range []bool{false, true} {
+		failure := &appIntentFailure{}
+		require.PanicsWithValue(t, failure, func() {
+			propcheck.CheckNodeAttrWire(failure, &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{"custom:probe": {}}}, self)
+		})
+		require.Contains(t, failure.message, "attribute custom:probe")
+	}
+
+	propcheck.CheckNodeAttrWire(t, &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{"custom:probe": nil}}, true)
 }

@@ -8501,11 +8501,12 @@ type streamPropertySession struct {
 }
 
 type streamPropertyPolicy struct {
-	doc       []byte
-	kind      int
-	intent    *propcheck.PacketIntent
-	appIntent *propcheck.AppIntent
-	sshIntent *propcheck.SSHIntent
+	doc        []byte
+	kind       int
+	intent     *propcheck.PacketIntent
+	appIntent  *propcheck.AppIntent
+	sshIntent  *propcheck.SSHIntent
+	attrIntent *propcheck.NodeAttrIntent
 }
 
 const maxStreamPropertyNodeID types.NodeID = 255
@@ -8525,6 +8526,7 @@ type streamPropertySystem struct {
 	packetIntent *propcheck.PacketIntent
 	appIntent    *propcheck.AppIntent
 	sshIntent    *propcheck.SSHIntent
+	attrIntent   *propcheck.NodeAttrIntent
 	policies     []streamPropertyPolicy
 	stagedPolicy streamOperation
 	world        propcheck.World
@@ -8678,7 +8680,7 @@ func (p *streamPropertySystem) stagePolicy(t *rapid.T, op streamOperation) {
 		require.NoError(t, os.Rename(p.cfg.Policy.Path+".next", p.cfg.Policy.Path))
 	}
 
-	p.stagedPolicy = streamOperation{doc: slices.Clone(op.doc), policy: op.policy, intent: op.intent, appIntent: op.appIntent, sshIntent: op.sshIntent, reject: op.reject}
+	p.stagedPolicy = streamOperation{doc: slices.Clone(op.doc), policy: op.policy, intent: op.intent, appIntent: op.appIntent, sshIntent: op.sshIntent, attrIntent: op.attrIntent, reject: op.reject}
 }
 
 // Active expectations advance only after acceptance. Refused files remain on
@@ -8730,7 +8732,8 @@ func (p *streamPropertySystem) inputPolicy(t *rapid.T, op streamOperation) {
 	require.Equal(t, wantRev, p.state.Snapshot().Rev(), "policy publication")
 	p.policy, p.policyDoc, p.packetIntent, p.appIntent = op.policy, slices.Clone(op.doc), op.intent, op.appIntent
 	p.sshIntent = op.sshIntent
-	p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(op.doc), kind: op.policy, intent: op.intent, appIntent: op.appIntent, sshIntent: op.sshIntent})
+	p.attrIntent = op.attrIntent
+	p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(op.doc), kind: op.policy, intent: op.intent, appIntent: op.appIntent, sshIntent: op.sshIntent, attrIntent: op.attrIntent})
 }
 
 // applyStreamPropertyWire crosses the real encoder boundary. Removal frames
@@ -8740,6 +8743,19 @@ func applyStreamPropertyWire(t require.TestingT, hub *Hub, client *propertyClien
 		// Exercise both Hub.Encode slots without changing generated operation draws.
 		wireRoundTrip(t, hub, response, false)
 		wire := *wireRoundTrip(t, hub, response, true)
+		propcheck.CheckNodeAttrWire(t, wire.Node, true)
+
+		for _, peer := range wire.Peers {
+			propcheck.CheckNodeAttrWire(t, peer, false)
+		}
+
+		for _, peer := range wire.PeersChanged {
+			propcheck.CheckNodeAttrWire(t, peer, false)
+		}
+
+		for _, peer := range wire.PeersChangedPatch {
+			propcheck.CheckNodeAttrWire(t, &tailcfg.Node{ID: peer.NodeID, CapMap: peer.CapMap}, false)
+		}
 
 		if len(wire.PeersRemoved) != 0 {
 			without := wire
@@ -8888,7 +8904,7 @@ func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *s
 		propcheck.CheckSSHIntent(t, p.world, intent, id, session.client.ssh, p.cfg.ServerURL)
 	}
 
-	checkStreamNodeInputs(t, p.world, id, session.client, p.cfg.DNSConfig.BaseDomain, p.packetIntent != nil || (p.policy >= 0 && p.policy <= 2))
+	checkStreamNodeInputs(t, p.world, id, session.client, p.cfg.DNSConfig.BaseDomain, p.packetIntent != nil || (p.policy >= 0 && p.policy <= 2), p.attrIntent)
 
 	freshHub := NewHub()
 	responses, err := NewStream(p.cfg, freshHub, id, session.capVer).Initial(snap)
@@ -8934,7 +8950,14 @@ func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *s
 
 				require.ElementsMatch(t, primaries, wire.PrimaryRoutes, "independent primary routes")
 
-				allowed := []netip.Prefix{netip.PrefixFrom(*peer.IPv4, 32), netip.PrefixFrom(*peer.IPv6, 128)}
+				allowed := []netip.Prefix{netip.PrefixFrom(*peer.IPv6, 128)}
+				_, ownDisabled := p.attrIntent.Capabilities(p.world, peer.ID)["disable-ipv4"]
+
+				_, viewerDisabled := p.attrIntent.Capabilities(p.world, id)["disable-ipv4"]
+				if !ownDisabled && !viewerDisabled {
+					allowed = append(allowed, netip.PrefixFrom(*peer.IPv4, 32))
+				}
+
 				allowed = append(allowed, primaries...)
 
 				for _, prefix := range propertyApproved(peer) {
@@ -9109,6 +9132,7 @@ type streamOperation struct {
 	intent       *propcheck.PacketIntent
 	appIntent    *propcheck.AppIntent
 	sshIntent    *propcheck.SSHIntent
+	attrIntent   *propcheck.NodeAttrIntent
 	reject       bool
 	user         types.User
 	records      []tailcfg.DNSRecord
@@ -9124,7 +9148,7 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 
 	operations := kinds
 	if len(operations) == 0 {
-		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "ssh-policy", "ssh-deny", "ssh-mixed", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request", "invalid-policy"}
+		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "ssh-policy", "ssh-deny", "ssh-mixed", "attrs-policy", "attrs-clear", "attrs-mixed", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request", "invalid-policy"}
 		if len(ids) > 3 {
 			operations = append(operations, "delete")
 		}
@@ -9242,6 +9266,23 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 
 		result.policy = -1
 		result.doc = result.sshIntent.AppendDocument(t, result.appIntent.Document(t, result.intent))
+	case "attrs-policy", "attrs-clear", "attrs-mixed":
+		result.intent = &propcheck.PacketIntent{}
+
+		result.attrIntent = &propcheck.NodeAttrIntent{}
+		if op != "attrs-clear" {
+			result.attrIntent = propcheck.DrawNodeAttrIntent(t, p.world)
+		}
+
+		result.policy, result.doc = -1, result.intent.Document(t)
+		if op == "attrs-mixed" {
+			result.intent = propcheck.DrawPacketIntent(t, p.world)
+			result.appIntent = propcheck.DrawAppIntent(t, p.world)
+			result.sshIntent = propcheck.DrawSSHIntent(t, p.world)
+			result.doc = result.sshIntent.AppendDocument(t, result.appIntent.Document(t, result.intent))
+		}
+
+		result.doc = result.attrIntent.AppendDocument(t, result.doc)
 	case "policy-order", "policy-duplicate":
 		doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
 		require.NoError(t, err)
@@ -9267,10 +9308,16 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 			result.sshIntent = p.sshIntent.Reordered(op == "policy-duplicate")
 			result.doc = result.sshIntent.AppendDocument(t, result.doc)
 		}
+
+		if p.attrIntent != nil {
+			result.attrIntent = p.attrIntent.Reordered(op == "policy-duplicate")
+			result.doc = result.attrIntent.AppendDocument(t, result.doc)
+		}
 	case "policy-restore":
 		saved := p.policies[rapid.IntRange(0, len(p.policies)-1).Draw(t, "policy-ancestor")]
 		result.policy, result.doc, result.intent, result.appIntent = saved.kind, slices.Clone(saved.doc), saved.intent, saved.appIntent
 		result.sshIntent = saved.sshIntent
+		result.attrIntent = saved.attrIntent
 	case "user":
 		u := p.world.Users[rapid.IntRange(0, 2).Draw(t, "user")]
 
@@ -9307,6 +9354,7 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 
 		result.policy, result.intent, result.appIntent = p.policy, p.packetIntent, p.appIntent
 		result.sshIntent = p.sshIntent
+		result.attrIntent = p.attrIntent
 	case "add":
 		result.node = p.drawNode(t, p.lastNodeID+1)
 	case "request", "stale-request":
@@ -9372,13 +9420,21 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 			result.sshIntent = propcheck.DrawSSHIntent(t, p.world)
 			result.doc = result.sshIntent.AppendDocument(t, result.doc)
 		}
+
+		if p.attrIntent != nil {
+			result.attrIntent = propcheck.DrawNodeAttrIntent(t, p.world)
+			result.doc = result.attrIntent.AppendDocument(t, result.doc)
+		}
 	case "file-reload":
 		result.policy, result.doc, result.intent, result.appIntent, result.reject = p.stagedPolicy.policy, slices.Clone(p.stagedPolicy.doc), p.stagedPolicy.intent, p.stagedPolicy.appIntent, p.stagedPolicy.reject
 		result.sshIntent = p.stagedPolicy.sshIntent
+		result.attrIntent = p.stagedPolicy.attrIntent
 	case "file-same", "file-comment":
 		result.policy, result.doc, result.intent, result.appIntent = p.policy, slices.Clone(p.policyDoc), p.packetIntent, p.appIntent
 
 		result.sshIntent = p.sshIntent
+
+		result.attrIntent = p.attrIntent
 		if op == "file-comment" {
 			doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
 			require.NoError(t, err)
@@ -9405,7 +9461,7 @@ func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 	beforeDERP := p.effectiveDERP(t)
 
 	switch op.kind {
-	case "policy", "generated-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "ssh-policy", "ssh-deny", "ssh-mixed", "policy-order", "policy-duplicate", "policy-restore", "derp-policy", "file-stage", "file-reload", "file-same", "file-comment", "file-empty", "file-missing", "file-test-failure":
+	case "policy", "generated-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "ssh-policy", "ssh-deny", "ssh-mixed", "attrs-policy", "attrs-clear", "attrs-mixed", "policy-order", "policy-duplicate", "policy-restore", "derp-policy", "file-stage", "file-reload", "file-same", "file-comment", "file-empty", "file-missing", "file-test-failure":
 		p.inputPolicy(t, op)
 	case "invalid-policy":
 		op.doc, op.reject = []byte(`{"grants":`), true
@@ -9777,10 +9833,14 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 				initial = "ssh-policy"
 			}
 
+			if slices.Contains(kinds, "attrs-policy") {
+				initial = "attrs-policy"
+			}
+
 			p.apply(t, p.drawOperation(t, initial))
 
 			if mode != types.PolicyModeFile {
-				p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: p.policy, intent: p.packetIntent, appIntent: p.appIntent, sshIntent: p.sshIntent}}
+				p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: p.policy, intent: p.packetIntent, appIntent: p.appIntent, sshIntent: p.sshIntent, attrIntent: p.attrIntent}}
 			}
 
 			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
@@ -9798,6 +9858,7 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			oldIntent := streamPacketIntent(oldWorld, p.policy, p.packetIntent)
 			oldAppIntent := p.appIntent
 			oldSSHIntent := streamSSHIntent(t, p.policyDoc, p.sshIntent)
+			oldAttrIntent := p.attrIntent
 			oldIdentityAddresses := oldIntent != nil || (p.policy >= 0 && p.policy <= 2)
 			oldDERP := p.effectiveDERP(t)
 			oldNode := old.ListNodes().At(0).ID()
@@ -9814,7 +9875,7 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 				propcheck.CheckSSHIntent(t, oldWorld, oldSSHIntent, oldNode, oldClient.ssh, p.cfg.ServerURL)
 			}
 
-			checkStreamNodeInputs(t, oldWorld, oldNode, oldClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses)
+			checkStreamNodeInputs(t, oldWorld, oldNode, oldClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses, oldAttrIntent)
 			oldHub.Close()
 
 			for range rapid.IntRange(1, 3).Draw(t, "coalesced-writes") {
@@ -9864,7 +9925,7 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 				propcheck.CheckSSHIntent(t, oldWorld, oldSSHIntent, oldNode, lateClient.ssh, p.cfg.ServerURL)
 			}
 
-			checkStreamNodeInputs(t, oldWorld, oldNode, lateClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses)
+			checkStreamNodeInputs(t, oldWorld, oldNode, lateClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses, oldAttrIntent)
 
 			last = snap
 		}
@@ -9885,6 +9946,10 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 
 			if slices.Contains(kinds, "ssh-policy") {
 				mandatory = []string{"ssh-deny", "policy-restore", "ssh-policy", "identity", "policy-order", "policy-duplicate", "ssh-mixed"}
+			}
+
+			if slices.Contains(kinds, "attrs-policy") {
+				mandatory = []string{"attrs-clear", "policy-restore", "attrs-policy", "identity", "policy-order", "policy-duplicate", "attrs-mixed"}
 			}
 
 			for _, operation := range mandatory {
@@ -10393,10 +10458,15 @@ func TestRouteWakesExitForCapabilitySource(t *testing.T) {
 
 // Check input contracts even when fresh and incremental renders agree on the
 // same wrong output. The fixture's base domain is fixed at construction.
-// identityAddresses is true only for documents known to omit disable-ipv4.
-func checkStreamNodeInputs(t require.TestingT, world propcheck.World, viewer types.NodeID, client *propertyClient, baseDomain string, identityAddresses bool) {
+// identityAddresses is true for simple policies and documents with owned intent.
+func checkStreamNodeInputs(t require.TestingT, world propcheck.World, viewer types.NodeID, client *propertyClient, baseDomain string, identityAddresses bool, attrs *propcheck.NodeAttrIntent) {
 	require.NotNil(t, client.self, "viewer %d self", viewer)
 	require.Equal(t, viewer.NodeID(), client.self.ID, "self identity")
+
+	if identityAddresses && attrs == nil {
+		// These callers own a simple or packet document with no node attributes.
+		attrs = &propcheck.NodeAttrIntent{}
+	}
 
 	// Clients retain historical profiles; only current owners require current values.
 	checkProfile := func(want tailcfg.UserProfile) {
@@ -10475,16 +10545,27 @@ func checkStreamNodeInputs(t require.TestingT, world propcheck.World, viewer typ
 			require.Nil(t, wire.LastSeen, "self last-seen override")
 		}
 
+		propcheck.CheckNodeAttrIntent(t, world, attrs, input.ID, wire.CapMap, input.ID == viewer)
+
 		if identityAddresses {
+			ownCaps, viewerCaps := attrs.Capabilities(world, input.ID), attrs.Capabilities(world, viewer)
+			_, ownDisabled := ownCaps["disable-ipv4"]
+			_, viewerDisabled := viewerCaps["disable-ipv4"]
+			disabled := ownDisabled || (input.ID != viewer && viewerDisabled)
+
 			var addresses []netip.Prefix
 
 			for _, ip := range []*netip.Addr{input.IPv4, input.IPv6} {
-				if ip != nil {
+				if ip != nil && (!disabled || !ip.Is4()) {
 					addresses = append(addresses, netip.PrefixFrom(*ip, ip.BitLen()))
 				}
 			}
 
 			require.ElementsMatch(t, addresses, wire.Addresses, "node %d own addresses", input.ID)
+
+			if disabled && input.IPv4 != nil {
+				require.NotContains(t, wire.AllowedIPs, netip.PrefixFrom(*input.IPv4, 32), "node %d disabled IPv4 identity", input.ID)
+			}
 
 			for _, prefix := range addresses {
 				require.Contains(t, wire.AllowedIPs, prefix, "node %d own identity in AllowedIPs", input.ID)
@@ -10554,9 +10635,65 @@ func TestStreamNodeInputContracts(t *testing.T) {
 				t.Run(profile.name, func(t *testing.T) {
 					world.Users = []types.User{profile.input}
 					profiles := []tailcfg.UserProfile{profile.want, {ID: 2147455555, LoginName: "tagged-devices", DisplayName: "Tagged Devices"}, {ID: 2147455565, LoginName: tt.tagLogin, DisplayName: "router"}}
-					checkStreamNodeInputs(t, world, 7, newPropertyClient(&tailcfg.MapResponse{Node: userSelf, Peers: []*tailcfg.Node{tagged}, UserProfiles: profiles[:2]}), tt.domain, true)
-					checkStreamNodeInputs(t, world, 9, newPropertyClient(&tailcfg.MapResponse{Node: taggedSelf, Peers: []*tailcfg.Node{user}, UserProfiles: profiles}), tt.domain, true)
-					checkStreamNodeInputs(t, world, 9, newPropertyClient(&tailcfg.MapResponse{Node: taggedSelf, UserProfiles: profiles[1:]}), tt.domain, true)
+					checkStreamNodeInputs(t, world, 7, newPropertyClient(&tailcfg.MapResponse{Node: userSelf, Peers: []*tailcfg.Node{tagged}, UserProfiles: profiles[:2]}), tt.domain, true, nil)
+					checkStreamNodeInputs(t, world, 9, newPropertyClient(&tailcfg.MapResponse{Node: taggedSelf, Peers: []*tailcfg.Node{user}, UserProfiles: profiles}), tt.domain, true, nil)
+					checkStreamNodeInputs(t, world, 9, newPropertyClient(&tailcfg.MapResponse{Node: taggedSelf, UserProfiles: profiles[1:]}), tt.domain, true, nil)
+
+					for _, viewer := range []types.NodeID{7, 9} {
+						selector := propcheck.PacketSelector{}
+						self, peer := userSelf.Clone(), tagged.Clone()
+
+						if viewer == 9 {
+							selector = propcheck.PacketSelector{Tag: "tag:srv"}
+							self, peer = taggedSelf.Clone(), user.Clone()
+						}
+
+						attrs := &propcheck.NodeAttrIntent{Grants: []propcheck.NodeAttrGrant{{Target: selector, Attrs: []nodecap.Cap{"disable-ipv4"}}}}
+
+						self.CapMap = tailcfg.NodeCapMap{"disable-ipv4": nil}
+						if viewer == 7 {
+							self.Addresses, self.AllowedIPs = nil, nil
+						} else {
+							peer.Addresses, peer.AllowedIPs = nil, nil
+						}
+
+						valid := newPropertyClient(&tailcfg.MapResponse{Node: self, Peers: []*tailcfg.Node{peer}, UserProfiles: profiles})
+						checkStreamNodeInputs(t, world, viewer, valid, tt.domain, true, attrs)
+
+						for _, mutation := range []string{"missing-marker", "stale-marker", "peer-marker", "ipv4-address", "ipv4-allowed", "ipv6-loss"} {
+							client := *valid
+							client.self, client.peers = valid.self.Clone(), maps.Clone(valid.peers)
+							client.peers[peer.ID] = valid.peers[peer.ID].Clone()
+							want, message := attrs, "attribute"
+
+							ipv4, ipv6 := client.self, client.peers[peer.ID]
+							if viewer == 9 {
+								ipv4, ipv6 = client.peers[peer.ID], client.self
+							}
+
+							switch mutation {
+							case "missing-marker":
+								delete(client.self.CapMap, "disable-ipv4")
+							case "stale-marker":
+								want = &propcheck.NodeAttrIntent{}
+							case "peer-marker":
+								client.peers[peer.ID].CapMap = tailcfg.NodeCapMap{"disable-ipv4": nil}
+							case "ipv4-address":
+								ipv4.Addresses = []netip.Prefix{netip.MustParsePrefix("100.64.0.7/32")}
+								message = "own addresses"
+							case "ipv4-allowed":
+								ipv4.AllowedIPs = []netip.Prefix{netip.MustParsePrefix("100.64.0.7/32")}
+								message = "disabled IPv4 identity"
+							case "ipv6-loss":
+								ipv6.Addresses = nil
+								message = "own addresses"
+							}
+
+							failure := &streamNodeInputFailure{}
+							require.PanicsWithValue(t, failure, func() { checkStreamNodeInputs(failure, world, viewer, &client, tt.domain, true, want) })
+							require.Contains(t, failure.message, message, "viewer %d mutation %s", viewer, mutation)
+						}
+					}
 				})
 			}
 		})
@@ -10598,7 +10735,7 @@ func TestStreamProfileInputHistory(t *testing.T) {
 
 				oldClient := newPropertyClient(&tailcfg.MapResponse{})
 				applyStreamPropertyWire(t, oldHub, oldClient, responses)
-				checkStreamNodeInputs(t, oldWorld, 1, oldClient, p.cfg.DNSConfig.BaseDomain, true)
+				checkStreamNodeInputs(t, oldWorld, 1, oldClient, p.cfg.DNSConfig.BaseDomain, true, nil)
 
 				for _, phase := range []string{"rename", "display", "picture", "clear-picture", "clear-display", "tag", "deny", "hidden-user", "allow", "untag", "restore"} {
 					t.Logf("profile phase %s", phase)
@@ -10648,7 +10785,7 @@ func TestStreamProfileInputHistory(t *testing.T) {
 
 					lateClient := newPropertyClient(&tailcfg.MapResponse{})
 					applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
-					checkStreamNodeInputs(t, oldWorld, 1, lateClient, p.cfg.DNSConfig.BaseDomain, true)
+					checkStreamNodeInputs(t, oldWorld, 1, lateClient, p.cfg.DNSConfig.BaseDomain, true, nil)
 					lateClient.check(t, oldClient)
 					propcheck.CheckWorld(t, oldWorld, old, p.probes)
 				}
@@ -11484,3 +11621,151 @@ func TestStreamSSHIntentHistory(t *testing.T) {
 		})
 	}
 }
+
+func TestRapidStreamNodeAttrIntent(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			runRapidStreamSystem(t, mode, "attrs-policy", "attrs-clear", "attrs-mixed", "policy-order", "policy-duplicate", "policy-restore", "identity", "user", "derp-policy", "noop")
+		})
+	}
+}
+
+func TestStreamNodeAttrIntentHistory(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+			rapid.Check(t, func(t *rapid.T) {
+				p := newStreamPropertySystem(t, mode)
+				first := &propcheck.NodeAttrIntent{Grants: []propcheck.NodeAttrGrant{
+					{Target: propcheck.PacketSelector{User: "u1"}, Attrs: []nodecap.Cap{"custom:probe", "disable-ipv4"}},
+					{Target: propcheck.PacketSelector{Tag: "tag:srv"}, Attrs: []nodecap.Cap{"custom:other", "disable-ipv4"}},
+					{Attrs: []nodecap.Cap{nodecap.RandomizeClientPort}},
+				}}
+				second := &propcheck.NodeAttrIntent{Grants: []propcheck.NodeAttrGrant{
+					{Target: propcheck.PacketSelector{User: "u2"}, Attrs: []nodecap.Cap{"custom:other", "disable-ipv4"}},
+				}}
+				// Keep the existing independently elected subnet and both exit families.
+				router := p.world.Nodes[3].Clone()
+				router.Hostinfo.RoutableIPs = append(router.Hostinfo.RoutableIPs, netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"))
+				router.ApprovedRoutes = slices.Clone(router.Hostinfo.RoutableIPs)
+				p.put(t, router)
+				last := p.state.Snapshot()
+				flush := func() {
+					snap := p.state.Snapshot()
+					all, wake := Route(last, snap, snap.Since(last))
+					p.hub.advance(snap)
+
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if p.sessions[id].down {
+							p.open(t, id, snap, false)
+						} else if _, named := wake[id]; all || named {
+							p.update(t, id, snap, rapid.IntRange(0, 2).Draw(t, "attribute delivery"))
+						}
+					}
+
+					p.check(t, snap)
+
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if p.sessions[id].down {
+							p.open(t, id, snap, false)
+						}
+					}
+
+					last = snap
+				}
+				set := func(attrs *propcheck.NodeAttrIntent) {
+					p.apply(t, streamOperation{kind: "attrs-policy", policy: 0, doc: attrs.AppendDocument(t, []byte(streamPropertyPolicies[0])), attrIntent: attrs})
+					flush()
+				}
+				set(first)
+				// Both viewers share one Hub peer cache, but only viewer 1 disables IPv4.
+				require.NotContains(t, p.sessions[1].client.peers[2].Addresses, netip.PrefixFrom(*p.world.Nodes[2].IPv4, 32))
+				require.Contains(t, p.sessions[2].client.self.Addresses, netip.PrefixFrom(*p.world.Nodes[2].IPv4, 32))
+
+				for _, viewer := range []types.NodeID{1, 2} {
+					require.Contains(t, p.sessions[viewer].client.peers[3].AllowedIPs, netip.MustParsePrefix("10.0.0.0/24"))
+					require.Contains(t, p.sessions[viewer].client.peers[3].AllowedIPs, netip.MustParsePrefix("0.0.0.0/0"))
+				}
+
+				old, oldWorld := p.state.Snapshot(), p.world.Clone()
+
+				for _, attrs := range []*propcheck.NodeAttrIntent{second, {}, first} {
+					set(attrs)
+
+					if attrs == second {
+						prefix := netip.PrefixFrom(*p.world.Nodes[3].IPv4, 32)
+						require.Contains(t, p.sessions[1].client.peers[3].Addresses, prefix, "enabled viewer retains enabled peer IPv4")
+						require.NotContains(t, p.sessions[2].client.peers[3].Addresses, prefix, "disabled viewer strips same cached peer IPv4")
+					}
+				}
+
+				if mode == types.PolicyModeFile {
+					p.apply(t, streamOperation{kind: "file-stage", policy: 0, doc: second.AppendDocument(t, []byte(streamPropertyPolicies[0])), attrIntent: second})
+					flush()
+					require.Same(t, first, p.attrIntent)
+					p.apply(t, p.drawOperation(t, "file-reload"))
+					flush()
+					require.Same(t, second, p.attrIntent)
+
+					for _, kind := range []string{"file-same", "file-comment", "invalid-policy", "file-reload", "file-empty", "file-reload", "file-missing", "file-reload", "file-test-failure", "file-reload"} {
+						p.apply(t, p.drawOperation(t, kind))
+						flush()
+						require.Same(t, second, p.attrIntent)
+					}
+
+					set(first)
+				}
+
+				saved := p.policies[len(p.policies)-1]
+
+				set(second)
+
+				p.policies = []streamPropertyPolicy{saved}
+				p.apply(t, p.drawOperation(t, "policy-restore"))
+				flush()
+				require.Same(t, first, p.attrIntent)
+
+				for _, id := range []types.NodeID{1, 3} {
+					before := p.world.Nodes[id].Clone()
+					changed := before.Clone()
+
+					changed.Tags = []string{"tag:other"}
+					if id == 3 {
+						changed.Tags = nil
+					}
+
+					p.apply(t, streamOperation{kind: "identity", before: before, node: changed})
+					flush()
+					p.apply(t, streamOperation{kind: "identity", before: changed, node: before})
+					flush()
+				}
+
+				for _, kind := range []string{"derp-policy", "policy-order", "policy-duplicate"} {
+					p.apply(t, p.drawOperation(t, kind))
+					flush()
+				}
+
+				for _, viewer := range []types.NodeID{1, 2} {
+					late, err := NewStream(p.cfg, p.hub, viewer, capVer).r.render(old)
+					require.NoError(t, err)
+
+					client := newPropertyClient(&tailcfg.MapResponse{})
+					applyStreamPropertyWire(t, p.hub, client, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
+					checkStreamNodeInputs(t, oldWorld, viewer, client, p.cfg.DNSConfig.BaseDomain, true, first)
+				}
+
+				p.setPolicy(t, 0)
+				flush()
+				require.Nil(t, p.attrIntent, "unrelated policy must clear attribute metadata")
+			})
+		})
+	}
+}
+
+type streamNodeInputFailure struct{ message string }
+
+func (f *streamNodeInputFailure) Errorf(format string, args ...any) {
+	f.message = fmt.Sprintf(format, args...)
+}
+
+func (f *streamNodeInputFailure) FailNow() { panic(f) }

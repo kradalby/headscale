@@ -12,6 +12,7 @@ import (
 	"go4.org/netipx"
 	"pgregory.net/rapid"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/logger"
@@ -810,4 +811,150 @@ func sshDecision(policy *tailcfg.SSHPolicy, source netip.Addr, login string) str
 	}
 
 	return "deny"
+}
+
+// NodeAttrGrant selects whole nodes; literal IP selectors are outside this domain.
+type NodeAttrGrant struct {
+	Target PacketSelector
+	Attrs  []nodecap.Cap
+}
+
+// NodeAttrIntent and its attribute slices are immutable after construction.
+// Only these four marker capabilities are modeled; baseline capabilities are separate.
+type NodeAttrIntent struct {
+	Grants []NodeAttrGrant
+}
+
+var nodeAttrKeys = []nodecap.Cap{"custom:probe", "custom:other", nodecap.RandomizeClientPort, "disable-ipv4"}
+
+func (a *NodeAttrIntent) AppendDocument(t require.TestingT, doc []byte) []byte {
+	var pol map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(doc, &pol))
+
+	tags := map[string][]string{}
+	if b, ok := pol["tagOwners"]; ok {
+		require.NoError(t, json.Unmarshal(b, &tags))
+	}
+
+	rules := make([]any, 0, len(a.Grants))
+	for _, g := range a.Grants {
+		require.False(t, g.Target.IP.IsValid(), "node attribute literal selectors are outside the intent domain")
+		require.False(t, g.Target.User != "" && g.Target.Tag != "", "node attribute selector must be one user or tag")
+
+		for _, attr := range g.Attrs {
+			require.Contains(t, nodeAttrKeys, attr)
+		}
+
+		if g.Target.Tag != "" {
+			if _, exists := tags[g.Target.Tag]; !exists {
+				tags[g.Target.Tag] = []string{}
+			}
+		}
+
+		rules = append(rules, map[string]any{"target": []string{g.Target.alias()}, "attr": g.Attrs})
+	}
+
+	pol["nodeAttrs"], pol["tagOwners"] = policyJSON(t, rules), policyJSON(t, tags)
+
+	return policyJSON(t, pol)
+}
+
+func (a *NodeAttrIntent) Reordered(duplicate bool) *NodeAttrIntent {
+	next := &NodeAttrIntent{Grants: slices.Clone(a.Grants)}
+	slices.Reverse(next.Grants)
+
+	if duplicate && len(next.Grants) > 0 {
+		next.Grants = append(next.Grants, next.Grants[0])
+	}
+
+	return next
+}
+
+// DrawNodeAttrIntent always includes a live witness, plus broader owned selectors.
+func DrawNodeAttrIntent(t *rapid.T, m World) *NodeAttrIntent {
+	selectors := []PacketSelector{{}, {Tag: "tag:srv"}, {Tag: "tag:router"}}
+	for _, u := range m.Users {
+		selectors = append(selectors, PacketSelector{User: u.Name})
+	}
+
+	witnesses := []PacketSelector{{}}
+
+	for _, id := range slices.Sorted(maps.Keys(m.Nodes)) {
+		n := m.Nodes[id]
+		for _, tag := range n.Tags {
+			selectors = append(selectors, PacketSelector{Tag: tag})
+			witnesses = append(witnesses, PacketSelector{Tag: tag})
+		}
+
+		if len(n.Tags) == 0 && n.UserID != nil {
+			for _, u := range m.Users {
+				if u.ID == *n.UserID {
+					witnesses = append(witnesses, PacketSelector{User: u.Name})
+				}
+			}
+		}
+	}
+
+	a := &NodeAttrIntent{Grants: []NodeAttrGrant{{Target: rapid.SampledFrom(witnesses).Draw(t, "attribute witness")}}}
+	for range rapid.IntRange(0, 3).Draw(t, "attribute grants") {
+		a.Grants = append(a.Grants, NodeAttrGrant{Target: rapid.SampledFrom(selectors).Draw(t, "attribute target")})
+	}
+
+	for i := range a.Grants {
+		a.Grants[i].Attrs = rapid.SliceOfN(rapid.SampledFrom(nodeAttrKeys), 1, 4).Draw(t, "attributes")
+	}
+
+	return a
+}
+
+// Capabilities reads only owned identity inputs, never compiled policy outputs.
+func (a *NodeAttrIntent) Capabilities(m World, id types.NodeID) tailcfg.NodeCapMap {
+	caps := tailcfg.NodeCapMap{}
+	if a == nil || m.Nodes[id] == nil {
+		return caps
+	}
+
+	for _, g := range a.Grants {
+		if g.Target.matches(m, m.Nodes[id], netip.Addr{}) {
+			for _, attr := range g.Attrs {
+				caps[attr] = nil
+			}
+		}
+	}
+
+	return caps
+}
+
+// CheckNodeAttrIntent probes revoked keys even for empty intent. Peers must not
+// expose these self-only markers; unrelated baseline capabilities are ignored.
+func CheckNodeAttrIntent(t require.TestingT, m World, intent *NodeAttrIntent, id types.NodeID, actual tailcfg.NodeCapMap, self bool) {
+	if intent == nil {
+		return
+	}
+
+	want := intent.Capabilities(m, id)
+	for _, key := range nodeAttrKeys {
+		_, expected := want[key]
+		value, present := actual[key]
+		require.Equal(t, self && expected, present, "node %d attribute %s membership (self=%v)", id, key, self)
+
+		if present {
+			require.Empty(t, value, "node %d attribute %s marker payload", id, key)
+		}
+	}
+}
+
+// CheckNodeAttrWire preserves the null-payload contract before the pinned
+// Node.Clone replay normalizes nil slices to empty slices.
+func CheckNodeAttrWire(t require.TestingT, node *tailcfg.Node, self bool) {
+	if node == nil {
+		return
+	}
+
+	for _, key := range nodeAttrKeys {
+		if value, present := node.CapMap[key]; present {
+			require.True(t, self, "peer %d leaked attribute %s", node.ID, key)
+			require.Nil(t, value, "node %d attribute %s wire null payload", node.ID, key)
+		}
+	}
 }
