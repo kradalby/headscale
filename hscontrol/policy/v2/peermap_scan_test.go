@@ -1712,6 +1712,135 @@ func TestNewPolicyManagerFromMatchesFresh(t *testing.T) {
 	require.Greater(t, narrowedDoc, 20, "document changes narrowed")
 }
 
+func TestInheritFiltersNodeIdentity(t *testing.T) {
+	pol := []byte(`{"tagOwners":{"tag:srv":["u1@"]},"acls":[{"action":"accept","src":["u2@"],"dst":["tag:srv:443"]}],
+		"ssh":[{"action":"check","src":["u2@"],"dst":["tag:srv"],"users":["root"]}]}`)
+
+	for _, change := range []string{"identical", "equal clone", "changed rules"} {
+		t.Run(change, func(t *testing.T) {
+			nodes := types.Nodes{ownRulesNode(1, nil, []string{"tag:srv"}), ownRulesNode(2, &scanUsers[1], nil), ownRulesNode(3, &scanUsers[2], nil)}
+			prev, err := NewPolicyManager(pol, scanUsers, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			oldRules, err := prev.FilterForNode(nodes[0].View())
+			require.NoError(t, err)
+			require.NotEmpty(t, oldRules)
+
+			urls := []string{scanServerURL, "https://other.example.com"}
+
+			oldSSH := make([]*tailcfg.SSHPolicy, len(urls))
+			for i, url := range urls {
+				oldSSH[i], err = prev.SSHPolicy(url, nodes[0].View())
+				require.NoError(t, err)
+				require.NotEmpty(t, oldSSH[i].Rules)
+			}
+
+			frozenRules, err := json.Marshal(oldRules)
+			require.NoError(t, err)
+			frozenSSH, err := json.Marshal(oldSSH)
+			require.NoError(t, err)
+
+			after, source := slices.Clone(nodes), pol
+
+			switch change {
+			case "equal clone":
+				after[0] = nodes[0].Clone()
+			case "changed rules":
+				source = bytes.ReplaceAll(pol, []byte("u2@"), []byte("u3@"))
+			}
+
+			next, err := NewPolicyManagerFrom(prev, source, scanUsers, after.ViewSlice())
+			require.NoError(t, err)
+
+			carried, ok := next.filterRulesMap.Load(nodes[0].ID)
+			require.Equal(t, change != "changed rules", ok)
+
+			if ok {
+				require.Equal(t, oldRules, carried)
+			}
+
+			for i, url := range urls {
+				ssh, ok := next.sshPolicyMap.Load(sshKey{url, nodes[0].ID})
+				require.Equal(t, change != "changed rules", ok)
+
+				if ok {
+					require.Same(t, oldSSH[i], ssh)
+				}
+			}
+
+			require.NoError(t, next.Audit(source, scanUsers, after.ViewSlice()))
+			require.NoError(t, prev.Audit(pol, scanUsers, nodes.ViewSlice()))
+
+			stillRules, err := json.Marshal(oldRules)
+			require.NoError(t, err)
+			stillSSH, err := json.Marshal(oldSSH)
+			require.NoError(t, err)
+			require.Equal(t, frozenRules, stillRules, "old packet filter is immutable")
+			require.Equal(t, frozenSSH, stillSSH, "old SSH policies are immutable")
+		})
+	}
+}
+
+// BenchmarkPolicyWarmCacheChurn includes compilation and inheritance from fixed,
+// warmed packet and SSH caches; it excludes peer construction and map delivery.
+func BenchmarkPolicyWarmCacheChurn(b *testing.B) {
+	for _, size := range []int{100, 6600} {
+		b.Run(fmt.Sprintf("nodes=%d", size), func(b *testing.B) {
+			policy, users, before := userAliasFixture(b, size, min(size, 402), 402, false)
+			prev, err := NewPolicyManager(policy, users, before.ViewSlice())
+			require.NoError(b, err)
+
+			for _, n := range before {
+				_, err := prev.FilterForNode(n.View())
+				require.NoError(b, err)
+				_, err = prev.SSHPolicy(scanServerURL, n.View())
+				require.NoError(b, err)
+			}
+
+			require.Equal(b, size, prev.filterRulesMap.Size())
+			require.Equal(b, size, prev.sshPolicyMap.Size())
+
+			for _, change := range []string{"unchanged", "endpoint", "address", "join", "leave", "equal-clones"} {
+				b.Run(change, func(b *testing.B) {
+					after := slices.Clone(before)
+
+					switch change {
+					case "endpoint", "address":
+						after[0] = before[0].Clone()
+						if change == "endpoint" {
+							after[0].Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:12345")}
+						} else {
+							after[0].IPv4 = ap("100.65.0.1")
+						}
+					case "join":
+						joined := before[0].Clone()
+						joined.ID = types.NodeID(size + 1) //nolint:gosec // bounded fixture
+						joined.IPv4 = ap("100.65.0.1")
+						after = append(after, joined)
+					case "leave":
+						after = after[1:]
+					case "equal-clones":
+						for i, n := range before {
+							after[i] = n.Clone()
+						}
+					}
+
+					in := after.ViewSlice()
+
+					b.ReportAllocs()
+
+					for b.Loop() {
+						_, err := NewPolicyManagerFrom(prev, policy, users, in)
+						if err != nil {
+							b.Fatal(err)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
 func ownRulesNode(id int, user *types.User, tags []string, routes ...string) *types.Node {
 	v4 := netip.AddrFrom4([4]byte{100, 64, 0, byte(id)})                               //nolint:gosec
 	v6 := netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 15: byte(id)}) //nolint:gosec
