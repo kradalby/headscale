@@ -1845,8 +1845,13 @@ func requireOracleConverged(t *testing.T, step int, cfg *types.Config, snap *sta
 // for a tailnet of 10 users whose nodes, for "tags", carry one of 20 tags.
 // For "via", every tenth node is an online tag:r router sharing an HA
 // subnet with the next one, reached through a via grant, so every peer
-// render resolves via routes.
+// render resolves via routes. The churn shapes (mesh, group-all, routers,
+// selectors) are described with their policies in churn_test.go.
 var scalingPolicies = map[string]string{
+	"mesh":      meshPolicy,
+	"group-all": groupAllPolicy(false),
+	"routers":   routersPolicy(false),
+	"selectors": selectorsPolicy(false),
 	"allow-all": `{}`,
 	"users": func() string {
 		acls := make([]string, 0, 10)
@@ -1939,10 +1944,19 @@ func scalingTailnet(tb testing.TB, n int, shape string) (*state.State, []*Stream
 	database, err := db.NewHeadscaleDatabase(cfg)
 	require.NoError(tb, err)
 
+	// One fsync'd transaction per fixture node made setup, not the writes,
+	// the cost of a run on disk. Only this setup connection skips them: the
+	// state below reopens the file with its own settings.
+	require.NoError(tb, database.DB.Exec("PRAGMA synchronous = OFF").Error)
+
 	users := database.CreateUsersForTest(10, "u")
+
+	nodes := make([]*types.Node, 0, n)
 	for i, u := range users {
-		database.CreateRegisteredNodesForTest(u, n/10+min(1, max(0, n%10-i)), u.Name)
+		nodes = append(nodes, database.CreateRegisteredNodesForTest(u, n/10+min(1, max(0, n%10-i)), u.Name)...)
 	}
+
+	shapeFixture(tb, database, shape, nodes)
 
 	require.NoError(tb, database.Close())
 
@@ -1969,6 +1983,10 @@ func scalingTailnet(tb testing.TB, n int, shape string) (*state.State, []*Stream
 
 	if shape == "via" {
 		scalingRouters(tb, s)
+	}
+
+	if shape == "routers" {
+		subnetRouters(tb, s)
 	}
 
 	hub := NewHub()
@@ -2090,8 +2108,10 @@ func TestScalingEndpointWrite(t *testing.T) {
 // For policy writes, shape is the starting policy: setup opens visibility
 // to every node, and the loop only alternates its port. Endpoint writes use
 // the test store to update the immutable world without SQL. Every session
-// encodes its response and confirms delivery. BenchmarkSTUNEndpointReports
-// separately measures public MapRequests, including SQL persistence.
+// encodes its response and confirms delivery; encoded-bytes/op is what they
+// send, compressed. BenchmarkSTUNEndpointReports separately measures public
+// MapRequests, including SQL persistence. The churn kinds (join, leave, tag,
+// group) go through the production entry points instead; see churnWrites.
 func BenchmarkScalingWrites(b *testing.B) {
 	sizes := []int{100, 400, 1000}
 	if testing.Short() {
@@ -2106,10 +2126,24 @@ func BenchmarkScalingWrites(b *testing.B) {
 		sizes = []int{n}
 	}
 
-	for _, kind := range slices.Sorted(maps.Keys(scalingWrites)) {
+	kinds := slices.Concat(slices.Collect(maps.Keys(scalingWrites)), slices.Collect(maps.Keys(churnWrites)))
+	slices.Sort(kinds)
+
+	for _, kind := range kinds {
 		for _, shape := range slices.Sorted(maps.Keys(scalingPolicies)) {
+			churn, isChurn := churnWrites[kind]
+			if isChurn && !churn.applies(churnShapes[shape]) {
+				continue
+			}
+
 			for _, n := range sizes {
 				b.Run(fmt.Sprintf("%s/%s/nodes=%d", kind, shape, n), func(b *testing.B) {
+					if isChurn {
+						benchChurn(b, kind, shape, n)
+
+						return
+					}
+
 					s, streams := scalingTailnet(b, n, shape)
 					sc := newScalingRun(s, streams)
 
@@ -2130,6 +2164,7 @@ func BenchmarkScalingWrites(b *testing.B) {
 					b.ReportMetric(float64(sc.woken)/float64(i), "woken/op")
 					b.ReportMetric(float64(sc.updates)/float64(i), "updates/op")
 					b.ReportMetric(float64(sc.rendered)/float64(i), "peer-renders/op")
+					b.ReportMetric(float64(sc.encoded)/float64(i), "encoded-bytes/op")
 				})
 			}
 		}
@@ -2279,19 +2314,52 @@ func scalingEndpoint(tb testing.TB, s *state.State, id types.NodeID, i int) {
 // counts the work: sessions woken, those with something to send, and the
 // peers they rendered.
 type scalingRun struct {
+	scalingWork
+
 	s       *state.State
 	streams []*Stream
 	byNode  map[types.NodeID]*Stream
 	last    *state.Snapshot
 
+	// encode encodes each response sent; see sizedEncoder for the one
+	// that also measures them.
+	encode func(*tailcfg.MapResponse, bool) ([]byte, error)
+	sized  *sizedEncoder
+
+	// subjects are the nodes the write being delivered changed: what is
+	// sent to them is the write's own, not fan-out.
+	subjects map[types.NodeID]struct{}
+
+	// watch makes a delivery do what hub's watcher does for each commit
+	// besides waking sessions: advance its caches, and forget deleted
+	// nodes, whose sessions it ends.
+	watch bool
+	hub   *Hub
+}
+
+// scalingWork is the work deliveries counted.
+type scalingWork struct {
 	woken, updates, rendered int
 
 	// quiet counts writes that woke no session.
 	quiet int
+
+	// encoded counts the bytes sent, compressed, and commits the commits
+	// delivered.
+	encoded, commits int
+
+	// With a sizedEncoder, the JSON bytes sent split into packet filters
+	// sent to sessions other than the subjects', and how many of those
+	// sessions were sent one; packet filters sent to the subjects; and
+	// everything else.
+	filterBytes, filterSends, selfFilterBytes, restBytes int
 }
 
 func newScalingRun(s *state.State, streams []*Stream) *scalingRun {
-	sc := &scalingRun{s: s, streams: streams, byNode: make(map[types.NodeID]*Stream, len(streams)), last: s.Snapshot()}
+	sc := &scalingRun{
+		s: s, streams: streams, byNode: make(map[types.NodeID]*Stream, len(streams)), last: s.Snapshot(),
+		encode: benchEncode,
+	}
 	for _, st := range streams {
 		sc.byNode[st.nodeID] = st
 	}
@@ -2311,16 +2379,28 @@ func (sc *scalingRun) warm(tb testing.TB, kind string) {
 	}
 }
 
-// step makes write i on the i-th session's node and updates, encodes for
-// and confirms delivery to the sessions it wakes.
+// step makes write i on the i-th session's node and delivers it.
 func (sc *scalingRun) step(tb testing.TB, write func(testing.TB, *state.State, types.NodeID, int), i int) {
 	tb.Helper()
 
 	write(tb, sc.s, sc.streams[i%len(sc.streams)].nodeID, i)
+	sc.deliver(tb)
+}
+
+// deliver routes the commits since the last delivery as the hub does,
+// and updates, encodes for and confirms delivery to the sessions they wake.
+func (sc *scalingRun) deliver(tb testing.TB) {
+	tb.Helper()
 
 	snap := sc.s.Snapshot()
-	all, wake := Route(sc.last, snap, snap.Since(sc.last))
+	change := snap.Since(sc.last)
+	all, wake := Route(sc.last, snap, change)
+	sc.commits += int(snap.Rev() - sc.last.Rev()) //nolint:gosec // revisions only grow
 	sc.last = snap
+
+	if sc.watch {
+		sc.watched(snap, change)
+	}
 
 	// Visit the woken sessions only, as the hub does.
 	targets := sc.streams
@@ -2352,15 +2432,25 @@ func (sc *scalingRun) step(tb testing.TB, write func(testing.TB, *state.State, t
 		}
 
 		for _, resp := range out {
-			_, err := st.hub.Encode(resp, true, benchEncode)
+			data, err := st.hub.Encode(resp, true, sc.encode)
 			if err != nil {
 				tb.Fatal(err)
+			}
+
+			sc.encoded += len(data)
+
+			if sc.sized != nil && !sc.account(st.nodeID, resp) {
+				tb.Fatal("a response was sent that the sized encoder did not encode")
 			}
 		}
 
 		st.Delivered()
 
 		sc.rendered += st.r.rendered - before
+	}
+
+	if sc.sized != nil {
+		clear(sc.sized.sizes)
 	}
 }
 
@@ -2408,43 +2498,79 @@ func TestScalingWriteWork(t *testing.T) {
 	// only the routers the election steers to or from. The first online
 	// write also changes the router's own PrimaryRoutes. Rejoin
 	// restores its original SessionStart, so final wire state is unchanged.
+	//
+	// The routers shape's subnet routers re-render the same way after a
+	// write that moves the policy, and its first subject is a router,
+	// whose only viewers are group:eng's members.
 	ceilings := map[string][3]int{
 		"derp/allow-all":           {400, 400, 0},
+		"derp/group-all":           {400, 400, 0},
+		"derp/mesh":                {400, 400, 0},
+		"derp/routers":             {400, 400, 0},
+		"derp/selectors":           {400, 400, 0},
 		"derp/self":                {400, 400, 0},
 		"derp/tags":                {400, 400, 0},
 		"derp/users":               {400, 400, 0},
 		"derp/via":                 {400, 400, 0},
 		"endpoint/allow-all":       {400, 400, 396},
+		"endpoint/group-all":       {400, 400, 396},
+		"endpoint/mesh":            {400, 400, 396},
+		"endpoint/routers":         {341, 341, 337},
+		"endpoint/selectors":       {323, 323, 319},
 		"endpoint/self":            {40, 40, 36},
 		"endpoint/tags":            {44, 44, 40},
 		"endpoint/users":           {40, 40, 36},
 		"endpoint/via":             {400, 400, 396},
 		"endpoints-x16/allow-all":  {400, 400, 6336},
+		"endpoints-x16/group-all":  {400, 400, 5776},
+		"endpoints-x16/mesh":       {400, 400, 6336},
+		"endpoints-x16/routers":    {400, 400, 5349},
+		"endpoints-x16/selectors":  {400, 400, 5632},
 		"endpoints-x16/self":       {100, 100, 576},
 		"endpoints-x16/tags":       {360, 360, 640},
 		"endpoints-x16/users":      {100, 100, 576},
 		"endpoints-x16/via":        {400, 400, 6336},
 		"ignored-health/allow-all": {0, 0, 0},
+		"ignored-health/group-all": {0, 0, 0},
+		"ignored-health/mesh":      {0, 0, 0},
+		"ignored-health/routers":   {0, 0, 0},
+		"ignored-health/selectors": {0, 0, 0},
 		"ignored-health/self":      {0, 0, 0},
 		"ignored-health/tags":      {0, 0, 0},
 		"ignored-health/users":     {0, 0, 0},
 		"ignored-health/via":       {0, 0, 0},
 		"online/allow-all":         {400, 396, 396},
+		"online/group-all":         {400, 396, 396},
+		"online/mesh":              {400, 396, 396},
+		"online/routers":           {341, 337, 337},
+		"online/selectors":         {323, 319, 319},
 		"online/self":              {40, 36, 36},
 		"online/tags":              {44, 40, 40},
 		"online/users":             {40, 36, 36},
 		"online/via":               {400, 397, 495},
 		"policy/allow-all":         {500, 500, 0},
+		"policy/group-all":         {500, 500, 2000},
+		"policy/mesh":              {500, 500, 0},
+		"policy/routers":           {500, 500, 10700},
+		"policy/selectors":         {500, 500, 1860},
 		"policy/self":              {500, 500, 9000},
 		"policy/tags":              {500, 500, 8900},
 		"policy/users":             {500, 500, 9000},
 		"policy/via":               {500, 500, 2475},
 		"rejoin/allow-all":         {400, 0, 396},
+		"rejoin/group-all":         {400, 0, 396},
+		"rejoin/mesh":              {400, 0, 396},
+		"rejoin/routers":           {400, 0, 2737},
+		"rejoin/selectors":         {400, 0, 319},
 		"rejoin/self":              {400, 0, 36},
 		"rejoin/tags":              {400, 0, 40},
 		"rejoin/users":             {400, 0, 36},
 		"rejoin/via":               {400, 0, 2277},
 		"rename/allow-all":         {400, 400, 396},
+		"rename/group-all":         {400, 400, 396},
+		"rename/mesh":              {400, 400, 396},
+		"rename/routers":           {341, 341, 337},
+		"rename/selectors":         {323, 323, 319},
 		"rename/self":              {40, 40, 36},
 		"rename/tags":              {44, 44, 40},
 		"rename/users":             {40, 40, 36},
@@ -4270,72 +4396,114 @@ func TestClassOwnersProfileAndOwnershipChanges(t *testing.T) {
 func BenchmarkFirstMap(b *testing.B) {
 	for _, n := range []int{1000, 10000} {
 		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) {
-			s, streams := scalingTailnet(b, n, "allow-all")
-			st := streams[len(streams)/2]
-			snap := s.Snapshot()
-
-			for _, cache := range []string{"warm-hub", "cold-hub", "new-state"} {
-				for _, encoding := range []string{"json", "zstd"} {
-					b.Run(cache+"/"+encoding, func(b *testing.B) {
-						if cache == "warm-hub" {
-							first := NewStream(st.cfg, st.hub, st.nodeID, capVer)
-							resps, err := first.Initial(snap)
-							require.NoError(b, err)
-							_, err = st.hub.Encode(resps[0], encoding == "zstd", benchEncode)
-							require.NoError(b, err)
-							first.Delivered()
-						}
-
-						b.ReportAllocs()
-
-						var (
-							first *Stream
-							size  int
-						)
-
-						for b.Loop() {
-							hub, current := st.hub, snap
-							if cache != "warm-hub" {
-								hub = NewHub()
-							}
-
-							var reopened *state.State
-
-							if cache == "new-state" {
-								var err error
-
-								reopened, err = state.NewState(st.cfg)
-								require.NoError(b, err)
-
-								current = reopened.Snapshot()
-							}
-
-							first = NewStream(st.cfg, hub, st.nodeID, capVer)
-							resps, err := first.Initial(current)
-							require.NoError(b, err)
-							data, err := hub.Encode(resps[0], encoding == "zstd", benchEncode)
-							require.NoError(b, err)
-							first.Delivered()
-
-							size = len(data)
-
-							if reopened != nil {
-								require.NoError(b, reopened.Close())
-							}
-						}
-
-						require.NotNil(b, first)
-						require.Nil(b, first.pending, "successful reconnects confirm delivery even when attempts would fold")
-
-						if cache == "warm-hub" {
-							require.Empty(b, st.hub.sentPeers[st.nodeID].attempts, "successful reconnects leave no failed-write history")
-						}
-
-						b.ReportMetric(float64(size), "encoded-bytes/op")
-					})
-				}
-			}
+			benchFirstMap(b, n, "allow-all", nil)
 		})
+	}
+}
+
+// BenchmarkFirstMapShapes is [BenchmarkFirstMap] under policies whose peers
+// hold several source identities: users in groups, tagged nodes, a member
+// mesh. That is where a map naming sources by capability grows each peer's
+// CapMap. filter-bytes/op is the JSON of the map's packet filter, and
+// rest-bytes/op the JSON of everything else. HEADSCALE_SCALE_NODES runs one
+// size instead.
+func BenchmarkFirstMapShapes(b *testing.B) {
+	for _, shape := range []string{"mesh", "selectors", "tags"} {
+		for _, n := range benchSizes(b, 1000, 10000) {
+			b.Run(fmt.Sprintf("%s/nodes=%d", shape, n), func(b *testing.B) {
+				benchFirstMap(b, n, shape, newSizedEncoder())
+			})
+		}
+	}
+}
+
+// benchFirstMap runs [BenchmarkFirstMap] for one tailnet. A sized encoder,
+// when given, encodes in place of benchEncode and splits the bytes.
+func benchFirstMap(b *testing.B, n int, shape string, sized *sizedEncoder) {
+	b.Helper()
+
+	encode := benchEncode
+	if sized != nil {
+		encode = sized.fn
+	}
+
+	s, streams := scalingTailnet(b, n, shape)
+	st := streams[len(streams)/2]
+	snap := s.Snapshot()
+
+	for _, cache := range []string{"warm-hub", "cold-hub", "new-state"} {
+		for _, encoding := range []string{"json", "zstd"} {
+			b.Run(cache+"/"+encoding, func(b *testing.B) {
+				if cache == "warm-hub" {
+					first := NewStream(st.cfg, st.hub, st.nodeID, capVer)
+					resps, err := first.Initial(snap)
+					require.NoError(b, err)
+					_, err = st.hub.Encode(resps[0], encoding == "zstd", encode)
+					require.NoError(b, err)
+					first.Delivered()
+				}
+
+				b.ReportAllocs()
+
+				var (
+					first *Stream
+					size  int
+					split responseSize
+					found bool
+				)
+
+				for b.Loop() {
+					hub, current := st.hub, snap
+					if cache != "warm-hub" {
+						hub = NewHub()
+					}
+
+					var reopened *state.State
+
+					if cache == "new-state" {
+						var err error
+
+						reopened, err = state.NewState(st.cfg)
+						require.NoError(b, err)
+
+						current = reopened.Snapshot()
+					}
+
+					first = NewStream(st.cfg, hub, st.nodeID, capVer)
+					resps, err := first.Initial(current)
+					require.NoError(b, err)
+					data, err := hub.Encode(resps[0], encoding == "zstd", encode)
+					require.NoError(b, err)
+					first.Delivered()
+
+					size = len(data)
+
+					if sized != nil {
+						split, found = sized.sizes[resps[0]]
+						clear(sized.sizes)
+					}
+
+					if reopened != nil {
+						require.NoError(b, reopened.Close())
+					}
+				}
+
+				require.NotNil(b, first)
+				require.Nil(b, first.pending, "successful reconnects confirm delivery even when attempts would fold")
+
+				if cache == "warm-hub" {
+					require.Empty(b, st.hub.sentPeers[st.nodeID].attempts, "successful reconnects leave no failed-write history")
+				}
+
+				b.ReportMetric(float64(size), "encoded-bytes/op")
+
+				if sized != nil {
+					require.True(b, found, "the sized encoder encoded the first map")
+					b.ReportMetric(float64(split.filter), "filter-bytes/op")
+					b.ReportMetric(float64(split.json-split.filter), "rest-bytes/op")
+				}
+			})
+		}
 	}
 }
 
