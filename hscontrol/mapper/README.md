@@ -324,8 +324,30 @@ retain fresh-render address checks until independent attribute intent exists.
 Peer capability versions, connectivity, expiry and Hostinfo projection remain
 outside this helper; existing causal and fresh-render checks still apply.
 
+The same helper checks every currently required owner profile against owned
+`World.Users`: ID, LoginName, DisplayName, ProfilePicURL and empty Groups.
+LoginName takes the first nonempty email, name, provider identifier string or
+decimal ID; an empty display name falls back to that login. Expected values
+never call production user projection helpers. Tagged peers require the literal
+global Tagged Devices profile. Tagged self additionally requires its isolated
+profile, with the input FQDN minus its trailing dot and GivenName as display.
+Literal fixtures cover these fallbacks, both viewer roles and tagged self alone.
+Historical profiles may remain cached; the existing unseen-owner ledger still
+rejects profiles of owners never visible to the client.
+
+`TestStreamProfileInputHistory` runs DB and file fixtures through rename, display
+and picture changes, explicit clears, tagging, denial, hidden presentation edits,
+visibility restoration and untagging. Each phase completes Route-selected
+consumers and checks unwoken clients before restoration. Display/picture edits
+leave the policy document unchanged. Retained maps use their old World and direct
+old-snapshot rendering. Zero to three generated user edits follow the mandatory
+history; the shared user generator now includes nonempty and cleared pictures.
+Generated histories retain CLI names and display/picture fields; email/provider
+fallbacks are literal checker contracts, not expanded policy alias domains.
+
 ```sh
 go test -p 1 ./hscontrol/mapper -run '^TestStreamNodeInputContracts$' -count=1
+go test -p 1 ./hscontrol/mapper -run '^TestStreamProfileInputHistory$' -count=1 -rapid.seed=2026111584 -rapid.checks=20 -rapid.nofailfile
 go test -p 1 ./hscontrol/mapper -run '^(TestStreamPacketIntentHistory|TestStreamPolicyFileHistory)$' -count=1 -rapid.seed=2026111562 -rapid.checks=30 -rapid.nofailfile
 ```
 

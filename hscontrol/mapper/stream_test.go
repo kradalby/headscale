@@ -2,7 +2,9 @@ package mapper
 
 import (
 	"bytes"
+	"cmp"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9273,6 +9275,8 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 		u := p.world.Users[rapid.IntRange(0, 2).Draw(t, "user")]
 
 		u.DisplayName = rapid.SampledFrom([]string{"", "Renamed", "Display ☃"}).Draw(t, "display-name")
+		u.ProfilePicURL = rapid.SampledFrom([]string{"", "https://example.test/avatar.png", "https://example.test/other.png"}).Draw(t, "profile-picture")
+
 		if u.Name == fmt.Sprintf("u%d", u.ID) {
 			u.Name += "-renamed"
 		} else {
@@ -10394,6 +10398,17 @@ func checkStreamNodeInputs(t require.TestingT, world propcheck.World, viewer typ
 	require.NotNil(t, client.self, "viewer %d self", viewer)
 	require.Equal(t, viewer.NodeID(), client.self.ID, "self identity")
 
+	// Clients retain historical profiles; only current owners require current values.
+	checkProfile := func(want tailcfg.UserProfile) {
+		got, ok := client.profiles[want.ID]
+		require.True(t, ok, "viewer %d requires profile %d", viewer, want.ID)
+		require.Equal(t, want.ID, got.ID, "profile ID from owned input")
+		require.Equal(t, want.LoginName, got.LoginName, "profile %d LoginName from owned input", want.ID)
+		require.Equal(t, want.DisplayName, got.DisplayName, "profile %d DisplayName from owned input", want.ID)
+		require.Equal(t, want.ProfilePicURL, got.ProfilePicURL, "profile %d ProfilePicURL from owned input", want.ID)
+		require.Empty(t, got.Groups, "profile %d has no input groups", want.ID)
+	}
+
 	nodes := make([]*tailcfg.Node, 1, 1+len(client.peers))
 	nodes[0] = client.self
 
@@ -10434,6 +10449,23 @@ func checkStreamNodeInputs(t require.TestingT, world propcheck.World, viewer typ
 		}
 
 		require.Equal(t, owner, wire.User, "node %d ownership", input.ID)
+
+		if len(input.Tags) > 0 {
+			checkProfile(tailcfg.UserProfile{ID: 2147455555, LoginName: "tagged-devices", DisplayName: "Tagged Devices"})
+
+			if input.ID == viewer {
+				checkProfile(tailcfg.UserProfile{ID: owner, LoginName: strings.TrimSuffix(name, "."), DisplayName: input.GivenName})
+			}
+		} else if owner != 0 {
+			index := slices.IndexFunc(world.Users, func(user types.User) bool {
+				return uint64(user.ID) == uint64(owner) //nolint:gosec // Fixture user IDs fit int64.
+			})
+			require.NotEqual(t, -1, index, "node %d owner %d must exist in owned users", input.ID, owner)
+
+			user := world.Users[index]
+			login := cmp.Or(user.Email, user.Name, user.ProviderIdentifier.String, strconv.FormatUint(uint64(user.ID), 10))
+			checkProfile(tailcfg.UserProfile{ID: owner, LoginName: login, DisplayName: cmp.Or(user.DisplayName, login), ProfilePicURL: user.ProfilePicURL})
+		}
 
 		if input.ID == viewer {
 			require.True(t, wire.MachineAuthorized, "self authorized")
@@ -10485,10 +10517,10 @@ func TestStreamNodeInputContracts(t *testing.T) {
 	}}
 
 	for _, tt := range []struct {
-		name, domain, userName, tagName string
+		name, domain, userName, tagName, tagLogin string
 	}{
-		{"fqdn", "example.test", "laptop.example.test.", "router.example.test."},
-		{"without-base-domain", "", "laptop", "router"},
+		{"fqdn", "example.test", "laptop.example.test.", "router.example.test.", "router.example.test"},
+		{"without-base-domain", "", "laptop", "router", "router"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			user := &tailcfg.Node{
@@ -10507,8 +10539,125 @@ func TestStreamNodeInputContracts(t *testing.T) {
 			userSelf.MachineAuthorized, taggedSelf.MachineAuthorized = true, true
 			taggedSelf.User = 2147455565
 
-			checkStreamNodeInputs(t, world, 7, newPropertyClient(&tailcfg.MapResponse{Node: userSelf, Peers: []*tailcfg.Node{tagged}}), tt.domain, true)
-			checkStreamNodeInputs(t, world, 9, newPropertyClient(&tailcfg.MapResponse{Node: taggedSelf, Peers: []*tailcfg.Node{user}}), tt.domain, true)
+			for _, profile := range []struct {
+				name  string
+				input types.User
+				want  tailcfg.UserProfile
+			}{
+				{"explicit", types.User{ID: 41, Email: "mail@example.test", Name: "ignored", DisplayName: "Display ☃", ProfilePicURL: "https://example.test/avatar.png"}, tailcfg.UserProfile{ID: 41, LoginName: "mail@example.test", DisplayName: "Display ☃", ProfilePicURL: "https://example.test/avatar.png"}},
+				{"email", types.User{ID: 41, Email: "mail@example.test", Name: "ignored"}, tailcfg.UserProfile{ID: 41, LoginName: "mail@example.test", DisplayName: "mail@example.test"}},
+				{"name", types.User{ID: 41, Name: "alice", ProviderIdentifier: sql.NullString{String: "ignored", Valid: true}}, tailcfg.UserProfile{ID: 41, LoginName: "alice", DisplayName: "alice"}},
+				{"provider", types.User{ID: 41, ProviderIdentifier: sql.NullString{String: "issuer/subject", Valid: true}}, tailcfg.UserProfile{ID: 41, LoginName: "issuer/subject", DisplayName: "issuer/subject"}},
+				{"provider-string", types.User{ID: 41, ProviderIdentifier: sql.NullString{String: "issuer/subject"}}, tailcfg.UserProfile{ID: 41, LoginName: "issuer/subject", DisplayName: "issuer/subject"}},
+				{"decimal-id", types.User{ID: 41}, tailcfg.UserProfile{ID: 41, LoginName: "41", DisplayName: "41"}},
+			} {
+				t.Run(profile.name, func(t *testing.T) {
+					world.Users = []types.User{profile.input}
+					profiles := []tailcfg.UserProfile{profile.want, {ID: 2147455555, LoginName: "tagged-devices", DisplayName: "Tagged Devices"}, {ID: 2147455565, LoginName: tt.tagLogin, DisplayName: "router"}}
+					checkStreamNodeInputs(t, world, 7, newPropertyClient(&tailcfg.MapResponse{Node: userSelf, Peers: []*tailcfg.Node{tagged}, UserProfiles: profiles[:2]}), tt.domain, true)
+					checkStreamNodeInputs(t, world, 9, newPropertyClient(&tailcfg.MapResponse{Node: taggedSelf, Peers: []*tailcfg.Node{user}, UserProfiles: profiles}), tt.domain, true)
+					checkStreamNodeInputs(t, world, 9, newPropertyClient(&tailcfg.MapResponse{Node: taggedSelf, UserProfiles: profiles[1:]}), tt.domain, true)
+				})
+			}
+		})
+	}
+}
+
+// Presentation changes must reach consumers even when policy inputs stay fixed.
+func TestStreamProfileInputHistory(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			rapid.Check(t, func(t *rapid.T) {
+				p := newStreamPropertySystem(t, mode)
+				last := p.state.Snapshot()
+				flush := func() {
+					snap := p.state.Snapshot()
+					all, wake := Route(last, snap, snap.Since(last))
+					p.hub.advance(snap)
+
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if _, named := wake[id]; all || named {
+							p.update(t, id, snap, 0)
+						}
+					}
+
+					p.check(t, snap)
+					last = snap
+				}
+
+				p.setPolicy(t, 0)
+				flush()
+
+				old, oldWorld := p.state.Snapshot(), p.world.Clone()
+
+				oldHub := NewHub()
+				defer oldHub.Close()
+
+				responses, err := NewStream(p.cfg, oldHub, 1, capVer).Initial(old)
+				require.NoError(t, err)
+
+				oldClient := newPropertyClient(&tailcfg.MapResponse{})
+				applyStreamPropertyWire(t, oldHub, oldClient, responses)
+				checkStreamNodeInputs(t, oldWorld, 1, oldClient, p.cfg.DNSConfig.BaseDomain, true)
+
+				for _, phase := range []string{"rename", "display", "picture", "clear-picture", "clear-display", "tag", "deny", "hidden-user", "allow", "untag", "restore"} {
+					t.Logf("profile phase %s", phase)
+
+					switch phase {
+					case "tag", "untag":
+						before := p.world.Nodes[1].Clone()
+						node := before.Clone()
+						node.Tags = nil
+
+						if phase == "tag" {
+							node.Tags = []string{"tag:srv"}
+						}
+
+						p.apply(t, streamOperation{kind: "identity", before: before, node: node})
+					case "deny":
+						p.setPolicy(t, 1)
+					case "allow":
+						p.setPolicy(t, 0)
+					default:
+						user := p.world.Users[0]
+
+						switch phase {
+						case "rename":
+							user.Name = "renamed-user"
+						case "display":
+							user.DisplayName = "Display ☃"
+						case "picture":
+							user.ProfilePicURL = "https://example.test/avatar.png"
+						case "clear-picture":
+							user.ProfilePicURL = ""
+						case "clear-display":
+							user.DisplayName = ""
+						case "hidden-user":
+							user.DisplayName, user.ProfilePicURL = "Hidden change", "https://example.test/other.png"
+						case "restore":
+							user = oldWorld.Users[0]
+						}
+
+						p.apply(t, streamOperation{kind: "user", user: user})
+					}
+
+					flush()
+
+					late, err := NewStream(p.cfg, p.hub, 1, capVer).r.render(old)
+					require.NoError(t, err)
+
+					lateClient := newPropertyClient(&tailcfg.MapResponse{})
+					applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
+					checkStreamNodeInputs(t, oldWorld, 1, lateClient, p.cfg.DNSConfig.BaseDomain, true)
+					lateClient.check(t, oldClient)
+					propcheck.CheckWorld(t, oldWorld, old, p.probes)
+				}
+
+				for range rapid.IntRange(0, 3).Draw(t, "profile-edits") {
+					p.apply(t, p.drawOperation(t, "user"))
+					flush()
+				}
+			})
 		})
 	}
 }
