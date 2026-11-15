@@ -33,6 +33,7 @@ import (
 	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/util/zstdframe"
 )
 
 type delayedSuccessResponseWriter struct {
@@ -1899,6 +1900,319 @@ func TestWriteMapFrameReportsProgressPerChunk(t *testing.T) {
 
 	assert.GreaterOrEqual(t, calls-1, 4, "progress per chunk, chunks of at most 16 KiB; the length prefix spills into a fourth")
 	assert.Len(t, w.Body.Bytes(), reservedResponseHeaderSize+len(body))
+}
+
+func TestMapResponseEncodingMatchesJSON(t *testing.T) {
+	peer := &tailcfg.Node{ID: 2, Name: "peer<&>\u2028\u2029\xff.example."}
+
+	self := &tailcfg.Node{
+		ID: 1, Name: "self.example.",
+		Hostinfo: (&tailcfg.Hostinfo{Hostname: "self", OS: "linux", SSH_HostKeys: []string{"ssh-ed25519 self"}}).View(),
+		CapMap:   tailcfg.NodeCapMap{"test:cap": {tailcfg.RawMessage(`{"text":"<&>","number":1.2500}`)}},
+	}
+	for _, tc := range []struct {
+		name string
+		resp *tailcfg.MapResponse
+	}{
+		{"nil", nil},
+		{"keepalive", &keepAlive},
+		{"first", &tailcfg.MapResponse{Node: self, Peers: []*tailcfg.Node{peer}, Domain: "example."}},
+		{"changed", &tailcfg.MapResponse{Node: self, PeersChanged: []*tailcfg.Node{peer}}},
+		{"patch", &tailcfg.MapResponse{PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 2, Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1234")}}}}},
+		{"empty-peers", &tailcfg.MapResponse{Peers: []*tailcfg.Node{}, PeersChanged: []*tailcfg.Node{nil}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want, err := json.Marshal(tc.resp)
+			require.NoError(t, err)
+
+			for _, compress := range []bool{false, true} {
+				for _, flush := range []bool{false, true} {
+					// Encode twice to exercise both cold and cached node JSON.
+					for range 2 {
+						w := httptest.NewRecorder()
+						err := writeMapFrame(w, flush, tc.resp, compress, encodeMapResponse, nil)
+						require.NoError(t, err)
+
+						frame := w.Body.Bytes()
+						require.GreaterOrEqual(t, len(frame), reservedResponseHeaderSize)
+						body := frame[reservedResponseHeaderSize:]
+						require.Equal(t, uint32(len(body)), binary.LittleEndian.Uint32(frame)) //nolint:gosec // small test frame
+
+						if compress {
+							body, err = zstdframe.AppendDecode(nil, body)
+							require.NoError(t, err)
+						}
+
+						require.Equal(t, string(want), string(body))
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestMapResponseEncodingOwnsOutput(t *testing.T) {
+	saved := make([][]byte, 0, 8)
+
+	for i := range 8 {
+		if i%2 == 0 {
+			// Exercise cold pools while earlier owned outputs remain live.
+			runtime.GC()
+			runtime.GC()
+		}
+
+		resp := &tailcfg.MapResponse{Node: &tailcfg.Node{
+			ID: tailcfg.NodeID(i + 1), Name: fmt.Sprintf("self-%d.example.", i),
+			Hostinfo: (&tailcfg.Hostinfo{OS: strings.Repeat("x", 1000*(i+1))}).View(),
+		}}
+		want, err := json.Marshal(resp)
+		require.NoError(t, err)
+
+		got, err := encodeMapResponse(resp, true)
+		require.NoError(t, err)
+
+		saved = append(saved, got)
+
+		// A failed encode must release its partial JSON before the next frame.
+		bad := &tailcfg.MapResponse{Node: &tailcfg.Node{CapMap: tailcfg.NodeCapMap{"test:bad": {tailcfg.RawMessage(`{`)}}}}
+		out, err := encodeMapResponse(bad, true)
+		require.ErrorContains(t, err, "marshalling map response")
+		require.Nil(t, out)
+
+		body, err := zstdframe.AppendDecode(nil, got)
+		require.NoError(t, err)
+		require.Equal(t, string(want), string(body))
+	}
+
+	for i, got := range saved {
+		body, err := zstdframe.AppendDecode(nil, got)
+		require.NoError(t, err)
+
+		var resp tailcfg.MapResponse
+		require.NoError(t, json.Unmarshal(body, &resp))
+		require.Equal(t, fmt.Sprintf("self-%d.example.", i), resp.Node.Name)
+	}
+}
+
+func TestMapResponseMarshalToWriterError(t *testing.T) {
+	w := newBreakableResponseWriter()
+	w.broken.Store(true)
+	require.ErrorIs(t, mapper.MarshalTo(w, &tailcfg.MapResponse{KeepAlive: true}), io.ErrClosedPipe)
+}
+
+// BenchmarkMapResponseEncoding compares the production wire encoder with the
+// previous marshal-then-compress path, without rendering or transport costs.
+func BenchmarkMapResponseEncoding(b *testing.B) {
+	for _, n := range []int{1, 1000, 2500} {
+		resp, self := mapResponseEncodingFixture(n)
+
+		// Unique self renders share cached peers, as reconnecting clients do.
+		for _, node := range self {
+			resp.Node = node
+			_, err := encodeMapResponse(resp, true)
+			require.NoError(b, err)
+		}
+
+		for _, mode := range []string{"warm", "cold", "concurrent"} {
+			for _, legacy := range []bool{true, false} {
+				b.Run(fmt.Sprintf("peers=%d/mode=%s/legacy=%t", n, mode, legacy), func(b *testing.B) {
+					encode := encodeMapResponse
+					if legacy {
+						encode = func(resp *tailcfg.MapResponse, _ bool) ([]byte, error) {
+							data, err := mapper.Marshal(resp)
+							if err != nil {
+								return nil, err
+							}
+
+							return zstdframe.AppendEncode(nil, data, zstdframe.FastestCompression), nil
+						}
+					}
+
+					b.ReportAllocs()
+
+					var totalBytes atomic.Int64
+
+					if mode == "concurrent" {
+						b.SetParallelism(4)
+						b.RunParallel(func(pb *testing.PB) {
+							local := *resp
+
+							var bytes int64
+
+							for i := 0; pb.Next(); i++ {
+								local.Node = self[i%len(self)]
+
+								data, err := encode(&local, true)
+								if err != nil {
+									b.Error(err)
+									return
+								}
+
+								bytes += int64(len(data))
+							}
+
+							totalBytes.Add(bytes)
+						})
+					} else {
+						var bytes int64
+
+						for i := 0; b.Loop(); i++ {
+							if mode == "cold" {
+								b.StopTimer()
+								// Two GCs discard idle JSON and zstd pool entries.
+								runtime.GC()
+								runtime.GC()
+								b.StartTimer()
+							}
+
+							resp.Node = self[i%len(self)]
+							data, err := encode(resp, true)
+							require.NoError(b, err)
+
+							bytes += int64(len(data))
+						}
+
+						totalBytes.Store(bytes)
+					}
+
+					b.ReportMetric(float64(totalBytes.Load())/float64(b.N), "encoded-bytes/op")
+				})
+			}
+		}
+	}
+}
+
+func mapResponseEncodingFixture(n int) (*tailcfg.MapResponse, []*tailcfg.Node) {
+	peers := make([]*tailcfg.Node, n)
+	for i := range peers {
+		peers[i] = &tailcfg.Node{
+			ID: tailcfg.NodeID(i + 1), Name: fmt.Sprintf("peer-%d.example.", i),
+			Key: key.NewNode().Public(), DiscoKey: key.NewDisco().Public(),
+			Addresses: []netip.Prefix{netip.PrefixFrom(netip.AddrFrom4([4]byte{100, 64, byte(i >> 8), byte(i)}), 32)}, //nolint:gosec // test addresses
+			Hostinfo:  (&tailcfg.Hostinfo{Hostname: fmt.Sprintf("peer-%d", i), OS: "linux"}).View(),
+		}
+	}
+
+	resp := &tailcfg.MapResponse{Peers: peers}
+	if n == 1 {
+		resp = &tailcfg.MapResponse{PeersChanged: peers}
+	}
+
+	self := []*tailcfg.Node{{ID: 10001, Name: "linux.example."}, {ID: 10002, Name: "windows.example.", Hostinfo: (&tailcfg.Hostinfo{OS: "windows", SSH_HostKeys: []string{"ssh-ed25519 self"}}).View()}}
+
+	return resp, self
+}
+
+func TestMapResponseEncodingConcurrent(t *testing.T) {
+	resp, self := mapResponseEncodingFixture(1000)
+
+	var wg sync.WaitGroup
+	for worker := range 8 {
+		wg.Go(func() {
+			local := *resp
+			local.Node = self[worker%len(self)]
+
+			want, err := json.Marshal(&local)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+
+			saved := make([][]byte, 0, 8)
+
+			for range 8 {
+				got, err := encodeMapResponse(&local, true)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+
+				saved = append(saved, got)
+			}
+
+			for _, got := range saved {
+				body, err := zstdframe.AppendDecode(nil, got)
+				if assert.NoError(t, err) {
+					assert.Equal(t, string(want), string(body))
+				}
+			}
+		})
+	}
+
+	wg.Wait()
+}
+
+// Run each leaf in a fresh test process for comparable heap measurements.
+// Heap deltas are diagnostic: pool eviction and runtime caches are GC-dependent.
+func TestMapResponseEncodingRetainedHeap(t *testing.T) {
+	for _, legacy := range []bool{true, false} {
+		for _, workers := range []int{1, 8} {
+			t.Run(fmt.Sprintf("legacy=%t/encoders=%d", legacy, workers), func(t *testing.T) {
+				resp, self := mapResponseEncodingFixture(2500)
+				for _, node := range self {
+					resp.Node = node
+					_, err := mapper.Marshal(resp)
+					require.NoError(t, err)
+				}
+
+				runtime.GC()
+				runtime.GC()
+
+				var before, encoded, firstGC, secondGC runtime.MemStats
+				runtime.ReadMemStats(&before)
+
+				start := make(chan struct{})
+
+				var wg sync.WaitGroup
+				for worker := range workers {
+					wg.Go(func() {
+						local := *resp
+						local.Node = self[worker%len(self)]
+
+						<-start
+
+						var (
+							data []byte
+							err  error
+						)
+						if legacy {
+							data, err = mapper.Marshal(&local)
+							if err == nil {
+								data = zstdframe.AppendEncode(nil, data, zstdframe.FastestCompression)
+							}
+						} else {
+							data, err = encodeMapResponse(&local, true)
+						}
+
+						if err != nil {
+							t.Error(err)
+							return
+						}
+
+						runtime.KeepAlive(data)
+					})
+				}
+
+				close(start)
+				wg.Wait()
+				runtime.ReadMemStats(&encoded)
+				runtime.GC()
+				runtime.ReadMemStats(&firstGC)
+				runtime.GC()
+				runtime.ReadMemStats(&secondGC)
+				runtime.KeepAlive(resp)
+				runtime.KeepAlive(self)
+
+				for _, sample := range []struct {
+					name string
+					mem  runtime.MemStats
+				}{{"before", before}, {"encoded", encoded}, {"firstGC", firstGC}, {"secondGC", secondGC}} {
+					t.Logf("%s HeapAlloc=%d HeapInuse=%d HeapSys=%d HeapReleased=%d TotalAlloc=%d NumGC=%d", sample.name,
+						sample.mem.HeapAlloc, sample.mem.HeapInuse, sample.mem.HeapSys, sample.mem.HeapReleased, sample.mem.TotalAlloc, sample.mem.NumGC)
+				}
+			})
+		}
+	}
 }
 
 // pacedResponseWriter delays every write by delay, and with block set
