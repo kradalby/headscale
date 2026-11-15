@@ -3,9 +3,7 @@
 // centralized asset management.
 package assets
 
-import (
-	_ "embed"
-)
+import _ "embed"
 
 // Favicon is the embedded favicon.png file served at /favicon.ico
 //
