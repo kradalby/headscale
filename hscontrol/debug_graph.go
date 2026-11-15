@@ -490,7 +490,7 @@ func (h *Headscale) debugNetwork(w http.ResponseWriter, r *http.Request, instanc
 	revision := instance + ":" + strconv.FormatUint(snapshot.Rev(), 10)
 
 	requested := v.Get("revision")
-	if requested == "" && (operation != "inventory" || q.Offset > 0) {
+	if requested == "" && (operation != "inventory" || q.Offset > 0) && (operation != "topology" || q.ID != "") {
 		http.Error(w, "revision is required", http.StatusBadRequest)
 		return
 	}
@@ -516,8 +516,8 @@ func (h *Headscale) debugNetwork(w http.ResponseWriter, r *http.Request, instanc
 		p.Revision = revision
 		writeGraphJSON(w, p)
 	case "topology":
-		p := snapshot.DebugNetworkTopology(q.ID)
-		if len(p.Objects) == 0 {
+		p := snapshot.DebugNetworkTopology(q.ID, q)
+		if len(p.Objects) == 0 && q.ID != "" {
 			http.NotFound(w, r)
 			return
 		}
@@ -655,7 +655,7 @@ func debugNetworkQuery(w http.ResponseWriter, r *http.Request, operation string)
 		}
 	}
 
-	if operation == "topology" || operation == debugNetworkAccessOperation {
+	if operation == debugNetworkAccessOperation {
 		if q.ID == "" {
 			http.Error(w, "id is required", http.StatusBadRequest)
 			return state.NetworkQuery{}, false
@@ -680,6 +680,15 @@ func networkPort(value int) uint16 {
 }
 
 func debugNetworkAccessFilters(w http.ResponseWriter, v url.Values, q *state.NetworkQuery) bool {
+	if value := v.Get("onlyPermitted"); value != "" {
+		if value != "true" && value != "false" {
+			http.Error(w, "onlyPermitted must be true or false", http.StatusBadRequest)
+			return false
+		}
+
+		q.OnlyPermitted = value == "true"
+	}
+
 	parse := func(key string, fallback, maximum int) (int, bool) {
 		if v.Get(key) == "" {
 			return fallback, true

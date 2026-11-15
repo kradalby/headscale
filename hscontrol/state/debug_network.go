@@ -32,12 +32,14 @@ var errNetworkDestinationMissing = errors.New("destination not found")
 var errNetworkSSHDestination = errors.New("SSH requires a destination node")
 
 type NetworkQuery struct {
+	OnlyPermitted                             bool
 	Protocol                                  *int
 	Port                                      *uint16
 	Category, Search, Identity, ID, Direction string
 	Offset, Limit                             int
 }
 type NetworkObject struct {
+	MemberCount   int      `json:"memberCount"`
 	ID            string   `json:"id"`
 	Kind          string   `json:"kind"`
 	Label         string   `json:"label"`
@@ -253,7 +255,20 @@ func (s *Snapshot) DebugNetworkInventory(q NetworkQuery) NetworkPage {
 	return p
 }
 
-func (s *Snapshot) DebugNetworkTopology(id string) NetworkTopology {
+func (s *Snapshot) DebugNetworkTopology(id string, queries ...NetworkQuery) NetworkTopology {
+	if id == "" {
+		q := NetworkQuery{}
+		if len(queries) > 0 {
+			q = queries[0]
+		}
+
+		return s.debugNetworkOverview(q)
+	}
+
+	return s.debugNetworkFocusedTopology(id)
+}
+
+func (s *Snapshot) debugNetworkFocusedTopology(id string) NetworkTopology {
 	t := NetworkTopology{Revision: strconv.FormatUint(s.Rev(), 10), Timestamp: s.Time().UTC().Format(time.RFC3339Nano), Objects: []NetworkObject{}, Relationships: []NetworkRelationship{}, ObjectLimit: 200, EdgeLimit: 1000}
 
 	all := []NetworkObject{}
@@ -348,6 +363,162 @@ func (s *Snapshot) DebugNetworkTopology(id string) NetworkTopology {
 	return t
 }
 
+// debugNetworkOverview describes structural relationships; packet access is queried per node.
+func (s *Snapshot) debugNetworkOverview(q NetworkQuery) NetworkTopology {
+	t := NetworkTopology{Revision: strconv.FormatUint(s.Rev(), 10), Timestamp: s.Time().UTC().Format(time.RFC3339Nano), Objects: []NetworkObject{}, Relationships: []NetworkRelationship{}, ObjectLimit: 200, EdgeLimit: 1000}
+	all := []NetworkObject{}
+	byID := map[string]NetworkObject{}
+
+	for _, category := range []string{"users", "tags", "nodes", "routes", "services"} {
+		for _, o := range s.networkObjects(category) {
+			if _, exists := byID[o.ID]; !exists {
+				all = append(all, o)
+				byID[o.ID] = o
+			}
+		}
+	}
+	// Retain ownership context even if a deleted user's record is absent.
+	for _, o := range all {
+		if o.Kind == "node" && o.OwnerID != "" {
+			if _, exists := byID[o.OwnerID]; !exists {
+				owner := networkObject(o.OwnerID, "user", o.OwnerID)
+				byID[owner.ID] = owner
+				all = append(all, owner)
+			}
+		}
+	}
+
+	counts := map[string]int{}
+
+	for _, o := range all {
+		if o.Kind == "node" {
+			for _, id := range o.RelatedIDs {
+				counts[id]++
+			}
+		}
+	}
+
+	for i := range all {
+		if all[i].Kind == "user" || all[i].Kind == "tag" {
+			all[i].MemberCount = counts[all[i].ID]
+		}
+	}
+
+	rank := func(o NetworkObject) int {
+		switch o.Kind {
+		case "user", "tag":
+			return 0
+		case "node":
+			return 1
+		default:
+			return 2
+		}
+	}
+
+	slices.SortFunc(all, func(a, b NetworkObject) int {
+		if rank(a) != rank(b) {
+			return rank(a) - rank(b)
+		}
+
+		return strings.Compare(a.ID, b.ID)
+	})
+
+	eligible := networkOverviewSelection(all, byID, q)
+
+	present := map[string]bool{}
+
+	for _, o := range all {
+		if !eligible[o.ID] {
+			continue
+		}
+
+		connected := true
+
+		if o.Kind == "node" || o.Kind == "route" || o.Kind == "service" {
+			for _, id := range o.RelatedIDs {
+				if !present[id] {
+					connected = false
+					break
+				}
+			}
+		}
+
+		if len(t.Objects) == t.ObjectLimit || !connected {
+			t.Omitted++
+			continue
+		}
+
+		t.Objects = append(t.Objects, o)
+		present[o.ID] = true
+	}
+
+	t.Relationships = networkOverviewRelationships(t.Objects, present, t.EdgeLimit)
+
+	return t
+}
+
+func networkOverviewSelection(all []NetworkObject, byID map[string]NetworkObject, q NetworkQuery) map[string]bool {
+	eligible := map[string]bool{}
+	search := strings.ToLower(strings.TrimSpace(q.Search))
+
+	for _, o := range all {
+		node := o
+		if o.NodeID != "" && o.Kind != "node" {
+			node = byID["node:"+o.NodeID]
+		}
+
+		if q.Identity != "" && o.ID != q.Identity && !slices.Contains(node.RelatedIDs, q.Identity) {
+			continue
+		}
+
+		if search != "" && !strings.Contains(strings.ToLower(o.ID+" "+o.Label+" "+strings.Join(o.Addresses, " ")+" "+strings.Join(o.Tags, " ")), search) {
+			continue
+		}
+
+		eligible[o.ID] = true
+		if node.Kind == "node" {
+			eligible[node.ID] = true
+			for _, id := range node.RelatedIDs {
+				eligible[id] = true
+			}
+		}
+	}
+
+	return eligible
+}
+
+func networkOverviewRelationships(objects []NetworkObject, present map[string]bool, limit int) []NetworkRelationship {
+	relationships := []NetworkRelationship{}
+
+	for _, o := range objects {
+		for _, id := range o.RelatedIDs {
+			if !present[id] || len(relationships) == limit {
+				continue
+			}
+
+			kind := "related to"
+
+			switch o.Kind {
+			case "node":
+				kind = "owned by"
+				if strings.HasPrefix(id, "tag:") {
+					kind = "tag identity"
+				}
+			case "tag":
+				kind = "tag ownership permission"
+			case "route":
+				kind = "routed by"
+			case "service":
+				kind = "service on"
+			}
+
+			relationships = append(relationships, NetworkRelationship{o.ID, id, kind})
+		}
+	}
+
+	return relationships
+}
+
 type networkPolicy interface {
 	ExplainAccess(query policyv2.AccessQuery, raw []byte) policyv2.AccessExplanation
 	SummarizeAccess(source, destination types.NodeView) ([]policyv2.AccessRange, error)
@@ -393,7 +564,11 @@ func (s *Snapshot) DebugNetworkAccess(ctx context.Context, q NetworkQuery) (Netw
 	}
 
 	q.Category = "nodes"
+
 	p := s.DebugNetworkInventory(q)
+	if q.OnlyPermitted {
+		return s.debugNetworkPermittedAccess(ctx, q, p)
+	}
 
 	out := NetworkAccessPage{Revision: p.Revision, Timestamp: p.Timestamp, Direction: q.Direction, Total: p.Total, Matched: p.Matched, Offset: p.Offset, Limit: p.Limit, NextOffset: p.NextOffset, Items: []NetworkAccessItem{}}
 	for _, o := range p.Items {
@@ -402,48 +577,121 @@ func (s *Snapshot) DebugNetworkAccess(ctx context.Context, q NetworkQuery) (Netw
 			return out, err
 		}
 
-		otherID, _ := networkNodeID(o.ID)
-		other, _ := s.GetNode(otherID)
-
-		src, dst := selected, other
-		if q.Direction == "incoming" {
-			src, dst = other, selected
-		}
-
-		ranges, err := pm.SummarizeAccess(src, dst)
-		if q.Protocol != nil || q.Port != nil {
-			ranges = slices.DeleteFunc(ranges, func(r policyv2.AccessRange) bool {
-				if len(r.Capabilities) > 0 {
-					return false
-				}
-
-				if q.Protocol != nil && len(r.Protocols) > 0 && !slices.Contains(r.Protocols, *q.Protocol) {
-					return true
-				}
-
-				return q.Port != nil && (*q.Port < r.First || *q.Port > r.Last)
-			})
-		}
-
-		item := NetworkAccessItem{Node: o, Ranges: ranges, Capabilities: []string{}, Visible: slices.Contains(s.ListPeerIDs(src.ID()), dst.ID())}
-		if item.Ranges == nil {
-			item.Ranges = []policyv2.AccessRange{}
-		}
-
-		if s.PolicyErr() != nil {
-			item.Ranges = []policyv2.AccessRange{}
-			item.Error = s.PolicyErr().Error()
-		}
-
-		if err != nil {
-			item.Error = err.Error()
-		}
-
-		for _, r := range ranges {
-			item.Capabilities = append(item.Capabilities, r.Capabilities...)
-		}
+		item := s.networkAccessItem(pm, selected, o, q)
 
 		out.Items = append(out.Items, item)
+	}
+
+	return out, nil
+}
+
+func (s *Snapshot) networkAccessItem(pm networkPolicy, selected types.NodeView, o NetworkObject, q NetworkQuery) NetworkAccessItem {
+	otherID, _ := networkNodeID(o.ID)
+	other, _ := s.GetNode(otherID)
+
+	src, dst := selected, other
+	if q.Direction == "incoming" {
+		src, dst = other, selected
+	}
+
+	ranges, err := pm.SummarizeAccess(src, dst)
+	if q.Protocol != nil || q.Port != nil {
+		ranges = slices.DeleteFunc(ranges, func(r policyv2.AccessRange) bool {
+			if len(r.Capabilities) > 0 {
+				return false
+			}
+
+			if q.Protocol != nil && len(r.Protocols) > 0 && !slices.Contains(r.Protocols, *q.Protocol) {
+				return true
+			}
+
+			return q.Port != nil && (*q.Port < r.First || *q.Port > r.Last)
+		})
+	}
+
+	item := NetworkAccessItem{Node: o, Ranges: ranges, Capabilities: []string{}}
+	if !q.OnlyPermitted {
+		item.Visible = slices.Contains(s.ListPeerIDs(src.ID()), dst.ID())
+	}
+
+	if item.Ranges == nil {
+		item.Ranges = []policyv2.AccessRange{}
+	}
+
+	if s.PolicyErr() != nil {
+		item.Ranges = []policyv2.AccessRange{}
+		item.Error = s.PolicyErr().Error()
+	}
+
+	if err != nil {
+		item.Error = err.Error()
+	}
+
+	for _, r := range ranges {
+		item.Capabilities = append(item.Capabilities, r.Capabilities...)
+	}
+
+	return item
+}
+
+// Permission filtering precedes paging so blocked candidates cannot hide connections.
+func (s *Snapshot) debugNetworkPermittedAccess(ctx context.Context, q NetworkQuery, inventory NetworkPage) (NetworkAccessPage, error) {
+	out := NetworkAccessPage{Revision: inventory.Revision, Timestamp: inventory.Timestamp, Direction: q.Direction, Total: inventory.Matched, Offset: inventory.Offset, Limit: inventory.Limit, Items: []NetworkAccessItem{}}
+
+	err := s.PolicyErr()
+	if err != nil {
+		return out, err
+	}
+
+	id, _ := networkNodeID(q.ID)
+	selected, _ := s.GetNode(id)
+	pm, _ := s.Policy().(networkPolicy)
+	search := strings.ToLower(strings.TrimSpace(q.Search))
+
+	for _, o := range s.networkObjects("nodes") {
+		err := ctx.Err()
+		if err != nil {
+			return out, err
+		}
+
+		if o.ID == fmt.Sprintf("node:%d", id) {
+			continue
+		}
+
+		if q.Identity != "" && !slices.Contains(o.RelatedIDs, q.Identity) && o.ID != q.Identity {
+			continue
+		}
+
+		if search != "" && !strings.Contains(strings.ToLower(o.Label+" "+strings.Join(o.Addresses, " ")+" "+strings.Join(o.Tags, " ")), search) {
+			continue
+		}
+
+		item := s.networkAccessItem(pm, selected, o, q)
+		if item.Error != "" {
+			return out, fmt.Errorf("%w: %s", errNetworkPolicyUnavailable, item.Error)
+		}
+
+		if len(item.Ranges) == 0 && len(item.Capabilities) == 0 {
+			continue
+		}
+
+		if out.Matched >= out.Offset && len(out.Items) < out.Limit {
+			otherID, _ := networkNodeID(o.ID)
+
+			src, dst := id, otherID
+			if q.Direction == "incoming" {
+				src, dst = otherID, id
+			}
+
+			item.Visible = slices.Contains(s.ListPeerIDs(src), dst)
+			out.Items = append(out.Items, item)
+		}
+
+		out.Matched++
+	}
+
+	if out.Offset+len(out.Items) < out.Matched {
+		out.NextOffset = new(out.Offset + len(out.Items))
 	}
 
 	return out, nil

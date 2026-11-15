@@ -35,7 +35,7 @@
     networkRequest = null;
     networkSequence += 1;
   };
-  const json = async (target, controller) => {
+  const json = async (target, controller, explainError = false) => {
     const response = await fetch(target, {
       signal: controller.signal,
       credentials: "same-origin",
@@ -46,7 +46,10 @@
       throw new Error(
         "Snapshot changed. Refresh Network or the paused graph snapshot, or wait for the next live graph update.",
       );
-    if (!response.ok) throw new Error(`Request failed (${response.status}). Check debug access and retry.`);
+    if (!response.ok) {
+      const detail = explainError ? (await response.text()).trim().slice(0, 600) : "";
+      throw new Error(detail || `Request failed (${response.status}). Check debug access and retry.`);
+    }
     return response.json();
   };
 
@@ -57,7 +60,7 @@
       generation = message.generation;
       networkRequest = new AbortController();
       const sequence = ++networkSequence;
-      json(url(`network/${message.operation}`, message.fields), networkRequest)
+      json(url(`network/${message.operation}`, message.fields), networkRequest, true)
         .then((data) => {
           if (sequence === networkSequence) deliver(message.generation, "network", data);
         })

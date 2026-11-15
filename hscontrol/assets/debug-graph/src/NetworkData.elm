@@ -4,7 +4,7 @@ import Json.Decode as D exposing (Decoder)
 
 
 type alias Object =
-    { id : String, kind : String, label : String, nodeId : String, addresses : List String, ownerId : String, tags : List String, online : Maybe Bool, expired : Bool, relatedIds : List String, provenance : String, protocol : String, firstPort : Int, lastPort : Int, advertised : Bool, approved : Bool, sourceVisible : Bool, selected : Bool }
+    { id : String, kind : String, label : String, nodeId : String, addresses : List String, ownerId : String, tags : List String, online : Maybe Bool, expired : Bool, relatedIds : List String, provenance : String, protocol : String, firstPort : Int, lastPort : Int, advertised : Bool, approved : Bool, sourceVisible : Bool, selected : Bool, memberCount : Int }
 
 
 type alias Rule =
@@ -82,6 +82,7 @@ object =
         |> required "approved" D.bool
         |> required "sourceVisible" D.bool
         |> required "selected" D.bool
+        |> optional "memberCount" D.int 0
 
 
 rule : Decoder Rule

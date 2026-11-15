@@ -965,7 +965,11 @@ view : Model -> Html Msg
 view model =
     if model.networkOpen then
         H.div [ A.class "app network-app" ]
-            [ H.header [ A.class "toolbar" ] [ H.a [ A.class "brand", A.href "/debug/" ] [ H.text "Headscale" ], button "Core" (Perspective "core"), button "World" (Perspective "world"), button "Network" OpenNetwork ]
+            [ H.header [ A.class "toolbar network-toolbar" ]
+                [ H.a [ A.class "brand", A.href "/debug/" ] [ H.img [ A.class "brand-logo", A.attribute "data-headscale-logo" "", A.alt "Headscale", A.width 98, A.height 44 ] [], H.span [ A.class "brand-section" ] [ H.text "Network" ] ]
+                , H.map NetworkMsg (Network.controls model.network)
+                , H.nav [ A.class "network-app-nav", A.attribute "aria-label" "Debug views" ] [ button "Core" (Perspective "core"), button "World" (Perspective "world"), H.button [ A.type_ "button", A.attribute "aria-current" "page", Events.onClick OpenNetwork ] [ H.text "Network" ] ]
+                ]
             , H.map NetworkMsg (Network.view model.network)
             ]
 

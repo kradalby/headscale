@@ -1067,6 +1067,24 @@ func TestDebugGraphNetworkHTTP(t *testing.T) {
 	require.Len(t, page.Items, 1)
 	revision := url.QueryEscape(page.Revision)
 
+	for _, path := range []string{"topology", "topology?search=does-not-match", "topology?identity=user:missing"} {
+		w = request(base+path, "127.0.0.1:1234")
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		var topology state.NetworkTopology
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &topology))
+		require.Equal(t, page.Revision, topology.Revision)
+
+		if path != "topology" {
+			require.Empty(t, topology.Objects)
+		}
+	}
+
+	w = request(base+"topology?id=node:999999&revision="+revision, "127.0.0.1:1234")
+	require.Equal(t, http.StatusNotFound, w.Code)
+	w = request(base+"topology?revision=other:1", "127.0.0.1:1234")
+	require.Equal(t, http.StatusConflict, w.Code)
+
 	id := url.QueryEscape(page.Items[0].ID)
 	w = request(base+"source?pointer=/grants/0&revision="+revision, "127.0.0.1:1234")
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -1082,6 +1100,9 @@ func TestDebugGraphNetworkHTTP(t *testing.T) {
 	require.Contains(t, chunk.Text, `"src":["*"]`)
 	require.Equal(t, len(chunk.Text), chunk.Total)
 	require.Nil(t, chunk.Next)
+
+	w = request(base+"access?id="+id+"&direction=outgoing&onlyPermitted=invalid&revision="+revision, "127.0.0.1:1234")
+	require.Equal(t, http.StatusBadRequest, w.Code)
 
 	w = request(base+"source?pointer=/grants/0&revision=other:1", "127.0.0.1:1234")
 	require.Equal(t, http.StatusConflict, w.Code)

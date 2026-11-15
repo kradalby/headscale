@@ -109,8 +109,10 @@ automatically restart it. No additional layout dependency is required.
 
 ## Network administration
 
-Network is a separate Elm screen with inventory, selected topology, and access
-exploration. `Network.elm` owns its screen state and `NetworkData.elm` decodes
+Network is a separate Elm screen built around a persistent interactive graph.
+Identity drill-down, directed access edges, and the policy inspector share the
+same canvas; opening evidence preserves its position. `NetworkTopology.elm`
+owns graph layout, pan/zoom, dragging, keyboard navigation, and the minimap. `Network.elm` owns its screen state and `NetworkData.elm` decodes
 semantic network responses; neither depends on graph cells or `Graph.elm`.
 The host application provides navigation and the existing JS bridge provides
 same-origin transport, debug-key propagation, cancellation, and browser geometry.
@@ -122,9 +124,13 @@ The semantic operations stay separate from HTTP so a future admin frontend can
 reuse them with an appropriate authentication adapter. This build does not add
 standalone hosting or a public admin API.
 
-Inventory searches the entire tailnet and pages results independently of topology
-bounds. Access examines one selected source or destination, never an all-pairs
-permission graph. Network refresh is explicit. Continuations and details reject
+The initial bounded topology includes identity membership counts from the full
+snapshot and samples devices per identity. Search reaches the entire inventory;
+focused graph neighborhoods page through 12 members or connections (four on
+narrow screens). The
+`onlyPermitted` access query filters packet and capability grants before paging,
+evaluating each candidate once against the selected source or destination.
+This scan grows with tailnet size; it never computes an all-pairs permission graph. Network refresh is explicit. Continuations and details reject
 changed revisions instead of presenting mixed snapshots.
 Rule evidence has its own pagination, and full original rule text is available
 in revision-bound chunks without increasing the response limit. Selected-result

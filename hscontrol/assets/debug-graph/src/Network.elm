@@ -1,38 +1,142 @@
-module Network exposing (Model, Msg(..), incoming, initial, load, update, view)
+module Network exposing (Model, Msg(..), controls, incoming, initial, load, update, view)
 
+import Dict
 import Html as H exposing (Html)
 import Html.Attributes as A
 import Html.Events as Events
 import Json.Decode as D
 import Json.Encode as E
 import NetworkData as Data exposing (Response(..))
-import NetworkTopology
+import NetworkTopology as Canvas
+import Set exposing (Set)
 
 
 type alias Model =
-    { evidenceOffset : Int, evidenceResult : Int, sourcePointer : String, sourceOffset : Int, operation : String, category : String, search : String, identity : String, selected : Maybe Data.Object, revision : String, generation : Int, offset : Int, accessProtocol : String, accessPort : String, accessIdentity : String, direction : String, source : String, sourceIP : String, destination : String, protocol : String, port_ : String, sshUser : String, response : Maybe Response, error : String, loading : Bool }
+    { operation : String
+    , category : String
+    , search : String
+    , identity : String
+    , focus : String
+    , selected : Maybe Data.Object
+    , anchor : Maybe Data.Object
+    , trail : List Data.Object
+    , selectedEdge : Maybe Data.Relationship
+    , revision : String
+    , generation : Int
+    , offset : Int
+    , pageLimit : Int
+    , nextOffset : Maybe Int
+    , total : Int
+    , matched : Int
+    , omitted : Int
+    , accessProtocol : String
+    , accessPort : String
+    , accessIdentity : String
+    , direction : String
+    , source : String
+    , sourceIP : String
+    , destination : String
+    , protocol : String
+    , port_ : String
+    , sshUser : String
+    , evidenceOffset : Int
+    , evidenceResult : Int
+    , sourcePointer : String
+    , sourceOffset : Int
+    , response : Maybe Response
+    , error : String
+    , loading : Bool
+    , inspectorOpen : Bool
+    , objects : List Data.Object
+    , relationships : List Data.Relationship
+    , access : List Data.Access
+    , canvas : Canvas.Model
+    , hidden : Set String
+    , showBlocked : Bool
+    , sceneMode : String
+    }
 
 
 type Msg
-    = Category String
-    | Search String
+    = Search String
     | Submit
     | Select Data.Object
+    | Explore Data.Object
+    | BackTo Data.Object
+    | SelectEdge Data.Relationship
     | TopologyFor Data.Object
     | AccessFor String Data.Object
     | Direction String
     | Page Int
     | Refresh
     | InventoryMode
+    | Category String
+    | Layer String
+    | Blocked
+    | CloseInspector
     | Field String String
+    | Traffic String String
+    | ConnectionTraffic String String
     | Explain
     | EvidencePage Int Int
     | SourcePage String Int
+    | CanvasMsg Canvas.Msg
 
 
 initial : Model
 initial =
-    { evidenceOffset = 0, evidenceResult = 0, sourcePointer = "", sourceOffset = 0, operation = "inventory", category = "nodes", search = "", identity = "", selected = Nothing, revision = "", generation = 0, offset = 0, accessProtocol = "", accessPort = "", accessIdentity = "", direction = "outgoing", source = "", sourceIP = "", destination = "", protocol = "6", port_ = "443", sshUser = "", response = Nothing, error = "", loading = False }
+    { operation = "topology"
+    , category = "nodes"
+    , search = ""
+    , identity = ""
+    , focus = ""
+    , selected = Nothing
+    , anchor = Nothing
+    , trail = []
+    , selectedEdge = Nothing
+    , revision = ""
+    , generation = 0
+    , offset = 0
+    , pageLimit = 12
+    , nextOffset = Nothing
+    , total = 0
+    , matched = 0
+    , omitted = 0
+    , accessProtocol = ""
+    , accessPort = ""
+    , accessIdentity = ""
+    , direction = "outgoing"
+    , source = ""
+    , sourceIP = ""
+    , destination = ""
+    , protocol = "6"
+    , port_ = "443"
+    , sshUser = ""
+    , evidenceOffset = 0
+    , evidenceResult = 0
+    , sourcePointer = ""
+    , sourceOffset = 0
+    , response = Nothing
+    , error = ""
+    , loading = False
+    , inspectorOpen = False
+    , objects = []
+    , relationships = []
+    , access = []
+    , canvas = Canvas.init
+    , hidden = Set.empty
+    , showBlocked = False
+    , sceneMode = "overview"
+    }
+
+
+pageSize : Model -> Int
+pageSize model =
+    if model.canvas.width < 600 then
+        4
+
+    else
+        12
 
 
 load : Int -> Model -> ( Model, E.Value )
@@ -41,16 +145,31 @@ load generation model =
         fields =
             case model.operation of
                 "inventory" ->
-                    [ ( "category", model.category ), ( "search", model.search ), ( "identity", model.identity ), ( "offset", String.fromInt model.offset ), ( "limit", "50" ), ( "revision", model.revision ) ]
+                    [ ( "category", model.category ), ( "search", model.search ), ( "identity", model.identity ), ( "offset", String.fromInt model.offset ), ( "limit", String.fromInt (pageSize model) ) ]
 
                 "topology" ->
-                    [ ( "id", Maybe.map .id model.selected |> Maybe.withDefault "" ), ( "revision", model.revision ) ]
+                    [ ( "id", model.focus ), ( "search", model.search ), ( "identity", model.identity ) ]
 
                 "access" ->
-                    [ ( "id", Maybe.map .id model.selected |> Maybe.withDefault "" ), ( "identity", model.accessIdentity ), ( "protocol", model.accessProtocol ), ( "port", model.accessPort ), ( "direction", model.direction ), ( "search", model.search ), ( "offset", String.fromInt model.offset ), ( "limit", "50" ), ( "revision", model.revision ) ]
+                    [ ( "id", Maybe.map .id model.anchor |> Maybe.withDefault "" )
+                    , ( "identity", model.accessIdentity )
+                    , ( "protocol", model.accessProtocol )
+                    , ( "port", model.accessPort )
+                    , ( "direction", model.direction )
+                    , ( "onlyPermitted"
+                      , if model.showBlocked || model.search /= "" then
+                            ""
+
+                        else
+                            "true"
+                      )
+                    , ( "search", model.search )
+                    , ( "offset", String.fromInt model.offset )
+                    , ( "limit", String.fromInt (pageSize model) )
+                    ]
 
                 "source" ->
-                    [ ( "pointer", model.sourcePointer ), ( "offset", String.fromInt model.sourceOffset ), ( "revision", model.revision ) ]
+                    [ ( "pointer", model.sourcePointer ), ( "offset", String.fromInt model.sourceOffset ) ]
 
                 _ ->
                     [ ( "evidenceOffset", String.fromInt model.evidenceOffset )
@@ -67,50 +186,257 @@ load generation model =
                             ""
                       )
                     , ( "sshUser", model.sshUser )
-                    , ( "revision", model.revision )
                     ]
     in
-    ( { model | generation = generation, loading = True, error = "", response = Nothing }
-    , E.object [ ( "action", E.string "network" ), ( "generation", E.int generation ), ( "operation", E.string model.operation ), ( "fields", E.object (List.map (Tuple.mapSecond E.string) fields) ) ]
+    ( { model
+        | generation = generation
+        , loading = True
+        , error = ""
+        , response = Nothing
+        , pageLimit =
+            if List.member model.operation [ "inventory", "access" ] then
+                pageSize model
+
+            else
+                model.pageLimit
+      }
+    , E.object [ ( "action", E.string "network" ), ( "generation", E.int generation ), ( "operation", E.string model.operation ), ( "fields", E.object (List.map (Tuple.mapSecond E.string) (( "revision", model.revision ) :: fields)) ) ]
     )
+
+
+remember : Data.Object -> Model -> List Data.Object
+remember object model =
+    case model.anchor of
+        Just previous ->
+            if previous.id == object.id then
+                model.trail
+
+            else
+                List.take 8 (previous :: List.filter (\item -> item.id /= previous.id && item.id /= object.id) model.trail)
+
+        Nothing ->
+            model.trail
+
+
+earlier : String -> List Data.Object -> List Data.Object
+earlier id trail =
+    case trail of
+        [] ->
+            []
+
+        first :: rest ->
+            if first.id == id then
+                rest
+
+            else
+                earlier id rest
+
+
+explore : Data.Object -> Model -> ( Model, Bool )
+explore object model =
+    if object.kind == "node" then
+        update (AccessFor "outgoing" object) model
+
+    else if List.member object.kind [ "user", "tag" ] then
+        ( { model | operation = "inventory", sceneMode = "members", category = "nodes", identity = object.id, focus = "", anchor = Just object, trail = remember object model, selected = Just object, selectedEdge = Nothing, search = "", offset = 0, response = Nothing, inspectorOpen = True }, True )
+
+    else
+        update (TopologyFor object) model
 
 
 update : Msg -> Model -> ( Model, Bool )
 update msg model =
     case msg of
-        Category category ->
-            ( { model | operation = "inventory", category = category, offset = 0, identity = "", search = "" }, True )
+        CanvasMsg action ->
+            ( { model | canvas = Canvas.update action model.canvas }, False )
 
         Search search ->
             ( { model | search = search }, False )
 
         Submit ->
-            ( { model | offset = 0 }, True )
+            ( { model
+                | operation =
+                    if model.sceneMode == "access" then
+                        "access"
+
+                    else if model.sceneMode == "members" then
+                        "inventory"
+
+                    else
+                        "topology"
+                , offset = 0
+                , focus = ""
+                , response = Nothing
+                , selectedEdge = Nothing
+                , sceneMode =
+                    if List.member model.sceneMode [ "access", "members" ] then
+                        model.sceneMode
+
+                    else
+                        "overview"
+                , selected =
+                    if List.member model.sceneMode [ "access", "members" ] then
+                        model.anchor
+
+                    else
+                        Nothing
+                , anchor =
+                    if List.member model.sceneMode [ "access", "members" ] then
+                        model.anchor
+
+                    else
+                        Nothing
+                , trail =
+                    if List.member model.sceneMode [ "access", "members" ] then
+                        model.trail
+
+                    else
+                        []
+              }
+            , True
+            )
+
+        Category category ->
+            ( { model | operation = "inventory", category = category, identity = "", offset = 0, sceneMode = "search", selected = Nothing, anchor = Nothing, search = "" }, True )
 
         Select object ->
-            ( { model | selected = Just object }, False )
+            if model.sceneMode == "access" && object.kind == "node" && Maybe.map .id model.anchor /= Just object.id then
+                let
+                    edge =
+                        model.relationships |> List.filter (\r -> r.source == object.id || r.target == object.id) |> List.head
+                in
+                case edge of
+                    Just relationship ->
+                        update (SelectEdge relationship) model
+
+                    Nothing ->
+                        explore object model
+
+            else
+                explore object model
+
+        Explore object ->
+            explore object model
+
+        BackTo object ->
+            explore object { model | anchor = Nothing, trail = earlier object.id model.trail }
+
+        SelectEdge edge ->
+            if model.sceneMode == "access" then
+                let
+                    targetId =
+                        if model.direction == "incoming" then
+                            edge.source
+
+                        else
+                            edge.target
+
+                    entry =
+                        model.access |> List.filter (\a -> a.node.id == targetId) |> List.head
+
+                    range =
+                        entry |> Maybe.andThen (.ranges >> List.filter (\r -> List.isEmpty r.capabilities) >> List.head)
+
+                    protocol =
+                        if model.accessProtocol /= "" then
+                            model.accessProtocol
+
+                        else
+                            range |> Maybe.andThen (.protocols >> List.head) |> Maybe.map String.fromInt |> Maybe.withDefault "6"
+
+                    port_ =
+                        if model.accessPort /= "" then
+                            model.accessPort
+
+                        else
+                            range
+                                |> Maybe.map
+                                    (\r ->
+                                        if r.first == 0 && r.last == 65535 then
+                                            "443"
+
+                                        else
+                                            String.fromInt r.first
+                                    )
+                                |> Maybe.withDefault "443"
+                in
+                update Explain { model | source = edge.source, sourceIP = "", destination = edge.target, protocol = protocol, port_ = port_, selected = entry |> Maybe.map .node, selectedEdge = Just edge, inspectorOpen = True, sshUser = "", response = Nothing }
+
+            else
+                case model.objects |> List.filter (\o -> o.id == edge.target) |> List.head of
+                    Just object ->
+                        ( { model | selected = Just object, selectedEdge = Just edge, inspectorOpen = True }, False )
+
+                    Nothing ->
+                        ( model, False )
 
         TopologyFor object ->
-            ( { model | selected = Just object, operation = "topology", offset = 0 }, True )
+            ( { model | operation = "topology", sceneMode = "relationships", focus = object.id, identity = "", anchor = Just object, trail = remember object model, selected = Just object, selectedEdge = Nothing, search = "", offset = 0, response = Nothing, inspectorOpen = True }, True )
 
         AccessFor direction object ->
             if object.kind == "node" then
-                ( { model | selected = Just object, operation = "access", direction = direction, offset = 0, search = "" }, True )
+                ( { model | operation = "access", sceneMode = "access", direction = direction, anchor = Just object, trail = remember object model, selected = Just object, selectedEdge = Nothing, identity = "", search = "", offset = 0, response = Nothing, inspectorOpen = True }, True )
 
             else
-                ( { model | operation = "inventory", category = "nodes", identity = object.id, offset = 0, search = "" }, True )
+                explore object model
 
         Direction direction ->
-            ( { model | direction = direction, offset = 0 }, True )
+            ( { model | operation = "access", direction = direction, offset = 0, response = Nothing, selectedEdge = Nothing, selected = model.anchor, sourceIP = "" }, True )
 
         Page offset ->
-            ( { model | offset = offset }, True )
+            ( { model
+                | operation =
+                    if model.sceneMode == "access" then
+                        "access"
+
+                    else
+                        "inventory"
+                , offset = offset
+                , response = Nothing
+                , selectedEdge = Nothing
+              }
+            , True
+            )
 
         Refresh ->
-            ( { model | revision = "", operation = "inventory", offset = 0, selected = Nothing }, True )
+            ( { initial | generation = model.generation, canvas = model.canvas }, True )
 
         InventoryMode ->
-            ( { model | operation = "inventory", offset = 0 }, True )
+            ( { initial | revision = model.revision, generation = model.generation, canvas = model.canvas }, True )
+
+        Layer kind ->
+            ( { model
+                | hidden =
+                    if Set.member kind model.hidden then
+                        Set.remove kind model.hidden
+
+                    else
+                        Set.insert kind model.hidden
+              }
+            , False
+            )
+
+        Blocked ->
+            ( { model | showBlocked = not model.showBlocked, operation = "access", offset = 0, selectedEdge = Nothing, selected = model.anchor, response = Nothing }, True )
+
+        CloseInspector ->
+            ( { model | inspectorOpen = False }, False )
+
+        Traffic protocol port_ ->
+            ( { model | operation = "access", accessProtocol = protocol, accessPort = port_, offset = 0, response = Nothing, selectedEdge = Nothing, selected = model.anchor }, True )
+
+        ConnectionTraffic protocol port_ ->
+            update Explain
+                { model
+                    | protocol = protocol
+                    , port_ = port_
+                    , sshUser =
+                        if port_ == "22" then
+                            "root"
+
+                        else
+                            ""
+                }
 
         Field field value ->
             ( case field of
@@ -154,43 +480,232 @@ update msg model =
 
         Explain ->
             if model.source == "" || model.destination == "" then
-                ( { model | error = "Choose a concrete source node and a destination node or address." }, False )
+                ( { model | error = "Select a device, then a connection on the graph." }, False )
 
-            else if String.toInt model.protocol |> Maybe.map (\protocolNumber -> protocolNumber < 0 || protocolNumber > 255) |> Maybe.withDefault True then
-                ( { model | error = "Enter an IP protocol from 0 to 255." }, False )
+            else if String.toInt model.protocol |> Maybe.map (\n -> n < 0 || n > 255) |> Maybe.withDefault True then
+                ( { model | error = "IP protocol must be between 0 and 255." }, False )
 
-            else if List.member model.protocol [ "6", "17", "132" ] && (String.toInt model.port_ |> Maybe.map (\portNumber -> portNumber < 0 || portNumber > 65535) |> Maybe.withDefault True) then
-                ( { model | error = "Enter a port from 0 to 65535." }, False )
+            else if List.member model.protocol [ "6", "17", "132" ] && (String.toInt model.port_ |> Maybe.map (\n -> n < 0 || n > 65535) |> Maybe.withDefault True) then
+                ( { model | error = "Port must be between 0 and 65535." }, False )
 
             else
-                ( { model | operation = "explain", evidenceOffset = 0, evidenceResult = 0 }, True )
+                ( { model | operation = "explain", evidenceOffset = 0, evidenceResult = 0, inspectorOpen = True }, True )
+
+
+setScene : List Data.Object -> List Data.Relationship -> Model -> Model
+setScene objects relationships model =
+    let
+        unique =
+            objects |> List.map (\o -> ( o.id, o )) |> Dict.fromList |> Dict.values
+
+        ids =
+            Set.fromList (List.map .id unique)
+
+        edges =
+            List.filter (\e -> Set.member e.source ids && Set.member e.target ids) relationships
+    in
+    { model | objects = unique, relationships = edges, canvas = Canvas.setScene unique edges model.canvas }
+
+
+overview : List Data.Object -> List Data.Relationship -> Model -> Model
+overview objects relationships model =
+    let
+        identities =
+            List.filter (\o -> List.member o.kind [ "user", "tag" ]) objects
+
+        devices =
+            List.filter (\o -> o.kind == "node") objects
+
+        samples =
+            if model.canvas.width < 600 && not (List.isEmpty identities) then
+                []
+
+            else if List.isEmpty identities then
+                List.take 24 devices
+
+            else
+                List.concatMap (\identity -> devices |> List.filter (\o -> List.member identity.id o.relatedIds) |> List.take 5) identities
+
+        nodeIds =
+            Set.fromList (List.map .id samples)
+
+        endpoints =
+            objects |> List.filter (\o -> List.member o.kind [ "route", "service" ] && List.any (\id -> Set.member id nodeIds) o.relatedIds) |> List.take 8
+    in
+    setScene (identities ++ samples ++ endpoints) relationships model
+
+
+accessKind : Data.Access -> String
+accessKind entry =
+    if entry.error /= "" then
+        "Unavailable"
+
+    else if List.any (\r -> List.isEmpty r.capabilities) entry.ranges then
+        "Packet access"
+
+    else if not (List.isEmpty entry.capabilities) || List.any (\r -> not (List.isEmpty r.capabilities)) entry.ranges then
+        "Capabilities only"
+
+    else
+        "No packet grant"
+
+
+buildAccess : Model -> Model
+buildAccess model =
+    case model.anchor of
+        Nothing ->
+            model
+
+        Just anchor ->
+            let
+                entries =
+                    model.access |> List.filter (\a -> a.node.id /= anchor.id && (model.showBlocked || model.search /= "" || not (List.isEmpty a.ranges) || not (List.isEmpty a.capabilities) || a.error /= ""))
+
+                edges =
+                    entries
+                        |> List.map
+                            (\a ->
+                                if model.direction == "incoming" then
+                                    { source = a.node.id, target = anchor.id, kind = accessKind a }
+
+                                else
+                                    { source = anchor.id, target = a.node.id, kind = accessKind a }
+                            )
+            in
+            setScene (anchor :: List.map .node entries) edges model
 
 
 incoming : D.Value -> Model -> Model
 incoming value model =
-    case D.decodeValue (D.field "generation" D.int) value of
-        Ok generation ->
-            if generation /= model.generation then
-                model
+    if D.decodeValue (D.field "generation" D.int) value /= Ok model.generation then
+        model
 
-            else
-                case D.decodeValue (D.field "type" D.string) value of
-                    Ok "network" ->
-                        case D.decodeValue (D.field "data" (Data.responseDecoder model.operation)) value of
-                            Ok response ->
-                                { model | response = Just response, revision = Data.responseRevision response, loading = False, error = "" }
+    else
+        case D.decodeValue (D.field "type" D.string) value of
+            Ok "geometry" ->
+                case D.decodeValue (D.field "data" (D.map2 Tuple.pair (D.field "width" D.float) (D.field "height" D.float))) value of
+                    Ok ( width, height ) ->
+                        let
+                            resized =
+                                Canvas.update (Canvas.Resize width height) model.canvas
 
-                            Err error ->
-                                { model | error = D.errorToString error, loading = False }
+                            next =
+                                { model
+                                    | canvas =
+                                        if (width < 600) /= (model.canvas.width < 600) then
+                                            Canvas.layout model.objects resized
 
-                    Ok "networkError" ->
-                        { model | error = D.decodeValue (D.field "data" D.string) value |> Result.withDefault "Request failed. Refresh the Network snapshot.", loading = False }
+                                        else
+                                            Canvas.fit model.objects resized
+                                }
+                        in
+                        case model.response of
+                            Just (Topology data) ->
+                                if model.sceneMode == "overview" && model.search == "" then
+                                    overview data.objects data.relationships next
 
-                    _ ->
+                                else
+                                    next
+
+                            _ ->
+                                next
+
+                    Err _ ->
                         model
 
-        Err _ ->
-            model
+            Ok "network" ->
+                case D.decodeValue (D.field "data" (Data.responseDecoder model.operation)) value of
+                    Err error ->
+                        { model | error = D.errorToString error, loading = False }
+
+                    Ok response ->
+                        let
+                            next =
+                                { model | response = Just response, revision = Data.responseRevision response, loading = False, error = "" }
+                        in
+                        case response of
+                            Topology data ->
+                                if model.sceneMode == "overview" && model.search == "" then
+                                    overview data.objects data.relationships { next | omitted = data.omitted }
+
+                                else
+                                    setScene data.objects data.relationships { next | omitted = data.omitted }
+
+                            Inventory data ->
+                                let
+                                    anchors =
+                                        Maybe.map List.singleton model.anchor |> Maybe.withDefault []
+
+                                    edges =
+                                        data.items |> List.concatMap (\o -> List.map (\id -> { source = o.id, target = id, kind = "Identity" }) o.relatedIds)
+                                in
+                                setScene (anchors ++ data.items) edges { next | total = data.total, matched = data.matched, nextOffset = data.nextOffset, omitted = 0 }
+
+                            AccessPage data ->
+                                buildAccess { next | access = data.items, total = data.total, matched = data.matched, nextOffset = data.nextOffset, omitted = 0 }
+
+                            Explanation data ->
+                                case model.selectedEdge of
+                                    Nothing ->
+                                        next
+
+                                    Just edge ->
+                                        let
+                                            verdicts =
+                                                List.map (.policy >> .packet) data.results |> Set.fromList |> Set.toList
+
+                                            verdict =
+                                                case verdicts of
+                                                    [ only ] ->
+                                                        only
+
+                                                    _ ->
+                                                        "mixed results"
+
+                                            label =
+                                                (if model.protocol == "6" then
+                                                    "TCP"
+
+                                                 else if model.protocol == "17" then
+                                                    "UDP"
+
+                                                 else
+                                                    "IP " ++ model.protocol
+                                                )
+                                                    ++ (if List.member model.protocol [ "6", "17", "132" ] then
+                                                            " " ++ model.port_
+
+                                                        else
+                                                            ""
+                                                       )
+                                                    ++ " · "
+                                                    ++ verdict
+
+                                            inspected =
+                                                { edge | kind = label }
+                                        in
+                                        { next
+                                            | selectedEdge = Just inspected
+                                            , relationships =
+                                                List.map
+                                                    (\r ->
+                                                        if r.source == edge.source && r.target == edge.target then
+                                                            inspected
+
+                                                        else
+                                                            r
+                                                    )
+                                                    model.relationships
+                                        }
+
+                            _ ->
+                                next
+
+            Ok "networkError" ->
+                { model | error = D.decodeValue (D.field "data" D.string) value |> Result.withDefault "Unable to load this snapshot. Refresh to try again.", loading = False }
+
+            _ ->
+                model
 
 
 button : String -> Msg -> Html Msg
@@ -198,165 +713,450 @@ button label msg =
     H.button [ A.type_ "button", Events.onClick msg ] [ H.text label ]
 
 
-view : Model -> Html Msg
-view model =
-    H.main_ [ A.class "network", A.id "network-main" ]
-        [ H.div [ A.class "network-heading" ]
-            [ H.div [] [ H.h1 [] [ H.text "Network" ], H.p [] [ H.text "Inventory, relationships and directional policy access" ] ]
-            , button "Refresh Network" Refresh
+pressed : String -> Bool -> Msg -> Html Msg
+pressed label active msg =
+    H.button
+        [ A.type_ "button"
+        , A.attribute "aria-pressed"
+            (if active then
+                "true"
+
+             else
+                "false"
+            )
+        , Events.onClick msg
+        ]
+        [ H.text label ]
+
+
+controls : Model -> Html Msg
+controls model =
+    H.div [ A.class "network-toolbar-controls" ]
+        [ H.form [ A.class "search", Events.onSubmit Submit ]
+            [ H.input
+                [ A.type_ "search"
+                , A.placeholder
+                    (if model.sceneMode == "access" then
+                        "Find a destination, including blocked devices…"
+
+                     else
+                        "Find a device, identity, route or service…"
+                    )
+                , A.attribute "aria-label" "Search network"
+                , A.value model.search
+                , A.maxlength 512
+                , Events.onInput Search
+                ]
+                []
+            , H.button [ A.type_ "submit" ] [ H.text "Search" ]
             ]
-        , H.p [ A.class "network-revision" ]
-            [ H.text
-                (if model.revision == "" then
-                    "Requesting a snapshot"
+        , H.span [ A.class "connection", A.attribute "role" "status" ]
+            [ H.span
+                [ A.class
+                    (if model.loading then
+                        "status-dot"
+
+                     else
+                        "status-dot live"
+                    )
+                ]
+                []
+            , H.text
+                (if model.loading then
+                    "Loading"
 
                  else
-                    "Snapshot " ++ model.revision ++ " · explicit refresh"
+                    "Snapshot"
                 )
             ]
-        , H.nav [ A.class "network-tabs", A.attribute "aria-label" "Inventory categories" ]
-            (List.map
-                (\category ->
-                    H.button
-                        [ A.type_ "button"
-                        , A.attribute "aria-pressed"
-                            (if model.operation == "inventory" && model.category == category then
-                                "true"
-
-                             else
-                                "false"
-                            )
-                        , Events.onClick (Category category)
-                        ]
-                        [ H.text category ]
-                )
-                [ "nodes", "users", "tags", "routes", "services" ]
-            )
-        , H.div [ A.class "network-workspace" ]
-            [ H.section [ A.class "network-results" ]
-                [ if model.operation == "inventory" || model.operation == "access" then
-                    H.form [ A.class "search", Events.onSubmit Submit ] [ H.input [ A.type_ "search", A.value model.search, A.maxlength 512, A.placeholder "Search the complete inventory", A.attribute "aria-label" "Search complete inventory or access candidates", Events.onInput Search ] [], H.button [ A.type_ "submit" ] [ H.text "Search" ] ]
-
-                  else
-                    button "Back to inventory" InventoryMode
-                , if model.operation == "access" then
-                    H.div [ A.class "network-tabs" ] [ button "Outgoing access" (Direction "outgoing"), button "Incoming access" (Direction "incoming"), H.p [] [ H.text (model.direction ++ " · " ++ (Maybe.map .label model.selected |> Maybe.withDefault "")) ] ]
-
-                  else
-                    H.text ""
-                , if model.operation == "access" then
-                    H.form [ A.class "network-access-filters", Events.onSubmit Submit ]
-                        [ H.label [] [ H.text "Identity ID", H.input [ A.value model.accessIdentity, A.placeholder "user:1 or tag:tag:web", Events.onInput (Field "accessIdentity") ] [] ]
-                        , H.label [] [ H.text "IP protocol", H.input [ A.value model.accessProtocol, A.placeholder "All, or 0–255", Events.onInput (Field "accessProtocol") ] [] ]
-                        , H.label [] [ H.text "Port", H.input [ A.value model.accessPort, A.disabled (not (List.member model.accessProtocol [ "6", "17", "132" ])), A.placeholder "All, or 0–65535", Events.onInput (Field "accessPort") ] [] ]
-                        , H.button [ A.type_ "submit" ] [ H.text "Filter access" ]
-                        , H.p [] [ H.text "Pages count candidate nodes. Empty ranges mean no packet range for these filters; capabilities remain separate." ]
-                        ]
-
-                  else
-                    H.text ""
-                , H.p [ A.attribute "role" "status" ]
-                    [ H.text
-                        (if model.loading then
-                            "Loading snapshot…"
-
-                         else
-                            ""
-                        )
-                    ]
-                , if model.error /= "" then
-                    H.div [ A.class "error", A.attribute "role" "alert" ] [ H.text model.error, button "Refresh Network" Refresh ]
-
-                  else
-                    H.text ""
-                , Maybe.map (responseView model) model.response |> Maybe.withDefault (H.text "")
-                ]
-            , H.aside [ A.class "network-inspector", A.attribute "aria-label" "Network selection and connection explanation" ]
-                [ Maybe.map objectInspector model.selected |> Maybe.withDefault (H.p [] [ H.text "Select an object to inspect its identity and relationships." ])
-                , explanationForm model
-                ]
-            ]
-        , H.p [ A.class "semantic-note" ] [ H.text "Policy, peer visibility, route state and reported online state are separate facts. Live reachability and application listening state are unknown. No packet probe runs." ]
+        , button "Refresh" Refresh
         ]
 
 
-objectInspector : Data.Object -> Html Msg
-objectInspector object =
-    H.section []
-        [ H.h2 [] [ H.text object.label ]
-        , H.code [] [ H.text object.id ]
-        , H.dl []
-            [ H.dt [] [ H.text "Identity" ]
-            , H.dd []
-                [ H.text
-                    (if List.isEmpty object.tags then
-                        object.ownerId
+view : Model -> Html Msg
+view model =
+    let
+        objects =
+            model.objects |> List.filter (\o -> not (Set.member o.kind model.hidden))
 
-                     else
-                        String.join ", " object.tags
-                    )
-                ]
-            , H.dt [] [ H.text "Addresses" ]
-            , H.dd [] [ H.text (String.join ", " object.addresses) ]
-            , H.dt [] [ H.text "Reported online" ]
-            , H.dd []
-                [ H.text
-                    (Maybe.map
-                        (\online ->
-                            if online then
-                                "Yes"
+        ids =
+            Set.fromList (List.map .id objects)
 
-                            else
-                                "No"
+        relationships =
+            model.relationships |> List.filter (\e -> Set.member e.source ids && Set.member e.target ids)
+
+        anchorLabel =
+            Maybe.map .label model.anchor |> Maybe.withDefault "Network"
+
+        title =
+            if model.sceneMode == "access" then
+                (if model.direction == "incoming" then
+                    "Access to "
+
+                 else
+                    "Access from "
+                )
+                    ++ anchorLabel
+
+            else if model.sceneMode == "members" then
+                anchorLabel
+
+            else if model.sceneMode == "relationships" then
+                "Around " ++ anchorLabel
+
+            else
+                "Your network"
+    in
+    H.div [ A.class "workspace network-workspace", A.id "network-main" ]
+        [ H.aside [ A.class "sidebar network-sidebar", A.attribute "aria-label" "Network exploration" ]
+            [ H.h2 [] [ H.text "Explore" ]
+            , H.div [ A.class "network-scope" ] [ pressed "Whole network" (model.sceneMode == "overview") InventoryMode ]
+            , if model.sceneMode == "access" then
+                H.section [ A.class "network-lens" ]
+                    [ H.h2 [] [ H.text "Direction" ]
+                    , pressed "Outgoing access" (model.direction == "outgoing") (Direction "outgoing")
+                    , pressed "Incoming access" (model.direction == "incoming") (Direction "incoming")
+                    , H.h2 [] [ H.text "Traffic" ]
+                    , H.div [ A.class "network-presets" ] (List.map (\( label, protocol, port_ ) -> pressed label (model.accessProtocol == protocol && model.accessPort == port_) (Traffic protocol port_)) [ ( "Any", "", "" ), ( "HTTPS", "6", "443" ), ( "SSH", "6", "22" ), ( "DNS", "17", "53" ) ])
+                    , H.label [ A.class "network-check" ] [ H.input [ A.type_ "checkbox", A.checked model.showBlocked, Events.onCheck (\_ -> Blocked) ] [], H.text "Show blocked candidates" ]
+                    ]
+
+              else
+                H.text ""
+            , H.h2 [] [ H.text "Show on graph" ]
+            , H.div [ A.class "network-layers" ] (List.map (\( kind, label ) -> H.label [ A.class ("network-check " ++ kind) ] [ H.input [ A.type_ "checkbox", A.checked (not (Set.member kind model.hidden)), Events.onCheck (\_ -> Layer kind) ] [], H.span [ A.class ("swatch " ++ kind) ] [], H.text label ]) [ ( "node", "Devices" ), ( "user", "People" ), ( "tag", "Tags" ), ( "route", "Routes" ), ( "service", "Services" ) ])
+            , H.div [ A.class "network-reading-key" ] [ H.h2 [] [ H.text "Connections" ], H.p [] [ H.span [ A.class "edge-key structural" ] [], H.text "Ownership / relationship" ], H.p [] [ H.span [ A.class "edge-key allowed" ] [], H.text "Packet access" ], H.p [] [ H.span [ A.class "edge-key denied" ] [], H.text "No packet grant" ] ]
+            , H.p [ A.class "sidebar-note" ] [ H.text "Click an identity to explore its devices. Click a device to follow access. Click a connection to understand why." ]
+            ]
+        , H.main_ [ A.class "scene-panel network-scene" ]
+            [ H.div [ A.class "scene-heading" ]
+                [ H.div []
+                    [ H.nav [ A.class "network-breadcrumb", A.attribute "aria-label" "Exploration path" ]
+                        ([ button "Network" InventoryMode ]
+                            ++ List.concatMap (\object -> [ H.span [] [ H.text "/" ], button object.label (BackTo object) ]) (List.reverse model.trail)
+                            ++ [ if model.anchor /= Nothing then
+                                    H.span [] [ H.text ("/ " ++ anchorLabel) ]
+
+                                 else
+                                    H.text ""
+                               ]
                         )
-                        object.online
-                        |> Maybe.withDefault "Unknown"
-                    )
+                    , H.h1 [] [ H.text title ]
+                    , H.p []
+                        [ H.text
+                            (if model.sceneMode == "overview" then
+                                if model.canvas.width < 600 then
+                                    "Select an identity to explore its devices."
+
+                                else
+                                    "Identity groups and a sample of their devices. Select a group to go deeper."
+
+                             else if model.sceneMode == "access" then
+                                "Follow a connection to inspect its policy, ports and visibility."
+
+                             else
+                                "Explore the objects and relationships in this neighborhood."
+                            )
+                        ]
+                    ]
+                , H.span [ A.class "revision", A.title model.revision ] [ H.text ("Revision " ++ (String.split ":" model.revision |> List.reverse |> List.head |> Maybe.withDefault "—")) ]
                 ]
-            , H.dt [] [ H.text "Expired" ]
-            , H.dd []
-                [ H.text
-                    (if object.expired then
-                        "Yes"
+            , if model.error /= "" then
+                H.div [ A.class "banner error", A.attribute "role" "alert" ] [ H.text model.error, button "Refresh" Refresh ]
+
+              else
+                H.text ""
+            , H.div
+                [ A.class "network-canvas-area"
+                , A.attribute "aria-busy"
+                    (if model.loading then
+                        "true"
 
                      else
-                        "No"
+                        "false"
                     )
                 ]
-            , H.dt [] [ H.text "Provenance" ]
-            , H.dd [] [ H.text object.provenance ]
-            ]
-        , H.div [ A.class "network-actions" ]
-            [ button "Topology" (TopologyFor object)
-            , button "Outgoing access" (AccessFor "outgoing" object)
-            , button "Incoming access" (AccessFor "incoming" object)
-            , if object.kind == "node" then
-                button "Use as source" (Field "source" object.id)
+                [ Canvas.view { onMsg = CanvasMsg, onSelect = Select, onEdge = SelectEdge, selected = Maybe.map .id model.selected, selectedEdge = model.selectedEdge } objects relationships model.canvas
+                , if model.loading then
+                    H.div [ A.class "network-canvas-loading", A.attribute "role" "status" ] [ H.text "Updating graph…" ]
 
-              else
-                H.text ""
-            , if object.kind == "node" then
-                button "Use as destination" (Field "destination" object.id)
+                  else
+                    H.text ""
+                , if List.isEmpty objects && not model.loading then
+                    H.div [ A.class "empty" ] [ H.h2 [] [ H.text "No objects in this view" ], H.p [] [ H.text "Try another search or return to the whole network." ], button "Whole network" InventoryMode ]
 
-              else
-                H.text ""
+                  else
+                    H.text ""
+                , if model.sceneMode == "access" && List.isEmpty relationships && not model.loading then
+                    H.div [ A.class "network-empty-access" ]
+                        [ H.text "No permitted connections for these filters."
+                        , button "Show blocked candidates" Blocked
+                        , if model.nextOffset /= Nothing then
+                            button "Next devices" (Page (Maybe.withDefault 0 model.nextOffset))
+
+                          else
+                            H.text ""
+                        ]
+
+                  else
+                    H.text ""
+                ]
+            , H.footer [ A.class "scene-footer network-footer" ]
+                [ H.span [] [ H.text (String.fromInt (List.length objects) ++ " objects · " ++ String.fromInt (List.length relationships) ++ " connections") ]
+                , if List.member model.sceneMode [ "members", "access", "search" ] then
+                    H.div [ A.class "network-pagination" ]
+                        [ H.span []
+                            [ H.text
+                                ((if model.sceneMode == "access" && not model.showBlocked && model.search == "" then
+                                    "Connections "
+
+                                  else
+                                    "Candidates "
+                                 )
+                                    ++ String.fromInt (min model.matched (model.offset + 1))
+                                    ++ "–"
+                                    ++ String.fromInt (min model.matched (model.offset + model.pageLimit))
+                                    ++ " of "
+                                    ++ String.fromInt model.matched
+                                )
+                            ]
+                        , H.button [ A.disabled (model.offset == 0), Events.onClick (Page (max 0 (model.offset - model.pageLimit))) ] [ H.text "Previous" ]
+                        , H.button [ A.disabled (model.nextOffset == Nothing), Events.onClick (Page (Maybe.withDefault 0 model.nextOffset)) ] [ H.text "Next" ]
+                        ]
+
+                  else
+                    H.span []
+                        [ H.text
+                            (if model.sceneMode == "overview" && model.search == "" then
+                                if model.canvas.width < 600 then
+                                    "Select a group to explore its devices"
+
+                                else
+                                    "Up to 5 devices per identity · search reaches the whole network"
+
+                             else if model.omitted > 0 then
+                                String.fromInt model.omitted ++ " objects beyond this view · narrow the search"
+
+                             else
+                                "Select an object to explore"
+                            )
+                        ]
+                ]
             ]
-        , if object.kind /= "node" then
-            H.p [] [ H.text "Identity selection narrows the node inventory. Choose a concrete node for a verdict." ]
+        , inspector model
+        ]
+
+
+inspector : Model -> Html Msg
+inspector model =
+    H.aside
+        [ A.class
+            ("network-inspector"
+                ++ (if model.inspectorOpen then
+                        " is-open"
+
+                    else
+                        ""
+                   )
+            )
+        , A.attribute "aria-label" "Network inspector"
+        ]
+        [ H.div [ A.class "inspector-heading" ]
+            [ H.h2 []
+                [ H.text
+                    (if model.selectedEdge /= Nothing then
+                        "Connection"
+
+                     else
+                        "Details"
+                    )
+                ]
+            , H.button [ A.type_ "button", A.attribute "aria-label" "Close inspector", Events.onClick CloseInspector ] [ H.text "×" ]
+            ]
+        , if not model.inspectorOpen then
+            H.div [ A.class "network-inspector-hint" ] [ H.div [ A.class "network-hint-glyph", A.attribute "aria-hidden" "true" ] [ H.text "↗" ], H.h3 [] [ H.text "Follow a connection" ], H.p [] [ H.text "Choose a device or identity on the graph. Its connections and policy evidence appear here." ] ]
+
+          else
+            H.div [ A.class "network-inspector-content" ]
+                [ if model.selectedEdge /= Nothing && List.member model.operation [ "explain", "source" ] then
+                    H.div [] [ connectionControls model, detailView model ]
+
+                  else
+                    Maybe.map (objectInspector model) model.selected |> Maybe.withDefault (H.text "")
+                , H.p [ A.class "network-observation" ] [ H.text "Control-plane state. Online status and policy permission do not prove that an application is reachable." ]
+                ]
+        ]
+
+
+objectInspector : Model -> Data.Object -> Html Msg
+objectInspector model object =
+    H.section []
+        [ H.span [ A.class ("network-object-kind " ++ object.kind) ]
+            [ H.text
+                (if object.kind == "node" then
+                    "Device"
+
+                 else
+                    object.kind
+                )
+            ]
+        , H.h3 [] [ H.text object.label ]
+        , if object.kind == "node" then
+            H.p [ A.class "network-online" ]
+                [ H.span
+                    [ A.class
+                        (if object.online == Just True then
+                            "status-dot live"
+
+                         else
+                            "status-dot"
+                        )
+                    ]
+                    []
+                , H.text
+                    (if object.expired then
+                        "Expired"
+
+                     else if object.online == Just True then
+                        "Online"
+
+                     else if object.online == Just False then
+                        "Offline"
+
+                     else
+                        "Status unknown"
+                    )
+                ]
 
           else
             H.text ""
+        , if object.memberCount > 0 then
+            H.p [] [ H.text (String.fromInt object.memberCount ++ " devices") ]
+
+          else
+            H.text ""
+        , H.dl []
+            [ if not (List.isEmpty object.addresses) then
+                H.div [] [ H.dt [] [ H.text "Addresses" ], H.dd [] (List.map (\ip -> H.div [] [ H.code [] [ H.text ip ] ]) object.addresses) ]
+
+              else
+                H.text ""
+            , if not (List.isEmpty object.tags) then
+                H.div [] [ H.dt [] [ H.text "Identity" ], H.dd [] (List.map (\tag -> identityLink model ("tag:" ++ tag) tag) object.tags) ]
+
+              else if object.ownerId /= "" then
+                H.div [] [ H.dt [] [ H.text "Owner" ], H.dd [] [ identityLink model object.ownerId object.ownerId ] ]
+
+              else
+                H.text ""
+            ]
+        , H.div [ A.class "network-actions" ]
+            (if object.kind == "node" then
+                [ button "Explore outgoing access" (AccessFor "outgoing" object), button "Explore incoming access" (AccessFor "incoming" object), button "Show relationships" (TopologyFor object) ]
+
+             else
+                [ button "Explore this group" (Explore object) ]
+            )
         , if object.kind == "route" then
-            H.p [] [ H.text ("Advertised: " ++ bool object.advertised ++ " · approved: " ++ bool object.approved ++ " · selected: " ++ bool object.selected) ]
+            H.dl [] [ H.dt [] [ H.text "Advertised" ], H.dd [] [ H.text (bool object.advertised) ], H.dt [] [ H.text "Approved" ], H.dd [] [ H.text (bool object.approved) ], H.dt [] [ H.text "Selected router" ], H.dd [] [ H.text (bool object.selected) ] ]
 
           else
             H.text ""
         , if object.kind == "service" then
-            H.p [] [ H.text (object.protocol ++ " " ++ ports object.firstPort object.lastPort ++ " · " ++ object.provenance ++ ". Reported services are unverified observations; policy endpoints are permissions, not discovered applications.") ]
+            H.p [] [ H.text (object.protocol ++ " " ++ ports object.firstPort object.lastPort ++ " · " ++ object.provenance) ]
+
+          else
+            H.text ""
+        , if model.sceneMode == "access" then
+            H.p [ A.class "network-tip" ] [ H.text "Select another device or its connection to inspect access. Search can also find a blocked destination." ]
 
           else
             H.text ""
         ]
+
+
+identityLink : Model -> String -> String -> Html Msg
+identityLink model id label =
+    case model.objects |> List.filter (\o -> o.id == id) |> List.head of
+        Just object ->
+            button object.label (Explore object)
+
+        Nothing ->
+            H.span [ A.class "network-tag" ] [ H.text label ]
+
+
+connectionControls : Model -> Html Msg
+connectionControls model =
+    let
+        name id =
+            model.objects |> List.filter (\o -> o.id == id) |> List.head |> Maybe.map .label |> Maybe.withDefault id
+
+        field label key value =
+            H.label [] [ H.span [] [ H.text label ], H.input [ A.value value, A.maxlength 512, Events.onInput (Field key) ] [] ]
+    in
+    H.section [ A.class "network-connection" ]
+        [ H.div [ A.class "network-connection-path" ] [ H.strong [] [ H.text (name model.source) ], H.span [ A.attribute "aria-hidden" "true" ] [ H.text "↓" ], H.strong [] [ H.text (name model.destination) ] ]
+        , H.p [ A.class "network-transport" ]
+            [ H.text
+                ((if model.protocol == "6" then
+                    "TCP"
+
+                  else if model.protocol == "17" then
+                    "UDP"
+
+                  else
+                    "IP protocol " ++ model.protocol
+                 )
+                    ++ (if List.member model.protocol [ "6", "17", "132" ] then
+                            " port " ++ model.port_
+
+                        else
+                            ""
+                       )
+                )
+            ]
+        , H.div [ A.class "network-presets" ] (List.map (\( label, protocol, port_ ) -> pressed label (model.protocol == protocol && model.port_ == port_) (ConnectionTraffic protocol port_)) [ ( "HTTPS", "6", "443" ), ( "HTTP", "6", "80" ), ( "SSH", "6", "22" ), ( "Postgres", "6", "5432" ) ])
+        , H.details [ A.class "network-custom-connection" ]
+            [ H.summary [] [ H.text "Custom protocol, port or address" ]
+            , H.form [ A.class "network-form", Events.onSubmit Explain ]
+                [ field "IP protocol" "protocol" model.protocol
+                , field "Destination port" "port" model.port_
+                , field "Source address (optional)" "sourceIP" model.sourceIP
+                , field "Destination node or address" "destination" model.destination
+                , field "SSH username (optional)" "sshUser" model.sshUser
+                , H.button [ A.type_ "submit", A.disabled model.loading ] [ H.text "Check access" ]
+                ]
+            ]
+        ]
+
+
+detailView : Model -> Html Msg
+detailView model =
+    if model.loading then
+        H.p [ A.class "network-loading", A.attribute "role" "status" ] [ H.text "Checking policy…" ]
+
+    else
+        case model.response of
+            Just (Explanation data) ->
+                H.section [ A.class "network-explanation" ]
+                    [ H.h2 [] [ H.text "Why this connection" ]
+                    , H.div [] (List.indexedMap resultView data.results)
+                    , H.details [] [ H.summary [] [ H.text "Route and observation details" ], H.p [] [ H.text data.routing ], H.p [] [ H.text data.observation ] ]
+                    , Maybe.map (\o -> button ("Explore " ++ o.label) (Explore o)) model.selected |> Maybe.withDefault (H.text "")
+                    ]
+
+            Just (SourceChunk data) ->
+                H.section [ A.class "network-source" ]
+                    [ H.h2 [] [ H.text ("Original source " ++ data.pointer) ]
+                    , H.pre [] [ H.text data.text ]
+                    , H.p [] [ H.text ("Bytes " ++ String.fromInt data.offset ++ "–" ++ String.fromInt (Maybe.withDefault data.total data.nextOffset) ++ " of " ++ String.fromInt data.total) ]
+                    , button "First chunk" (SourcePage data.pointer 0)
+                    , H.button [ A.disabled (data.nextOffset == Nothing), Events.onClick (SourcePage data.pointer (Maybe.withDefault 0 data.nextOffset)) ] [ H.text "Next chunk" ]
+                    , button "Back to evidence" (EvidencePage model.evidenceResult model.evidenceOffset)
+                    ]
+
+            _ ->
+                H.text ""
 
 
 bool : Bool -> String
@@ -380,125 +1180,99 @@ ports first last =
         String.fromInt first ++ "–" ++ String.fromInt last
 
 
-objectCard : Data.Object -> Html Msg
-objectCard object =
-    H.li [ A.class "network-object" ] [ button object.label (Select object), H.small [] [ H.text (object.kind ++ " · " ++ String.join ", " object.addresses) ], button "Explore" (TopologyFor object) ]
-
-
-pagination : Model -> Int -> Int -> Maybe Int -> Html Msg
-pagination model total matched next =
-    H.div [ A.class "network-pagination" ]
-        [ H.p [] [ H.text (String.fromInt total ++ " total · " ++ String.fromInt matched ++ " matched · page starting at " ++ String.fromInt (model.offset + 1)) ]
-        , H.button [ A.type_ "button", A.disabled (model.offset == 0), Events.onClick (Page (max 0 (model.offset - 50))) ] [ H.text "Previous" ]
-        , H.button [ A.type_ "button", A.disabled (next == Nothing), Events.onClick (Page (Maybe.withDefault 0 next)) ] [ H.text "Next" ]
-        ]
-
-
-responseView : Model -> Response -> Html Msg
-responseView model response =
-    case response of
-        Inventory data ->
-            H.div [] [ H.p [] [ H.text (String.fromInt (List.length data.items) ++ " displayed · " ++ data.timestamp) ], H.ul [ A.class "network-list" ] (List.map objectCard data.items), pagination model data.total data.matched data.nextOffset ]
-
-        Topology data ->
-            let
-                label id =
-                    data.objects |> List.filter (\object -> object.id == id) |> List.head |> Maybe.map .label |> Maybe.withDefault id
-
-                target id =
-                    data.objects |> List.filter (\object -> object.id == id) |> List.head |> Maybe.map (\object -> button (label id) (TopologyFor object)) |> Maybe.withDefault (H.text id)
-            in
-            H.div []
-                [ H.p [] [ H.text ("Bounded neighborhood · " ++ String.fromInt (List.length data.objects) ++ " objects · " ++ String.fromInt data.omitted ++ " omitted. Use inventory for every matching object.") ]
-                , NetworkTopology.view TopologyFor data.objects data.relationships
-                , H.h2 [] [ H.text "Relationships" ]
-                , H.ul [ A.class "network-relationships" ] (List.map (\edge -> H.li [] [ target edge.source, H.span [] [ H.text (" → " ++ edge.kind ++ " → ") ], target edge.target ]) data.relationships)
-                ]
-
-        AccessPage data ->
-            H.div []
-                [ H.ul [ A.class "network-list" ]
-                    (List.map
-                        (\entry ->
-                            H.li [ A.class "network-access" ]
-                                [ button entry.node.label (Select entry.node)
-                                , H.p [] [ H.text ("Peer visible: " ++ bool entry.visible) ]
-                                , H.ul [] (List.map (\range -> H.li [] [ H.text (range.source ++ " → " ++ range.destination ++ " · IP protocol " ++ String.join ", " (List.map String.fromInt range.protocols) ++ " · ports " ++ ports range.first range.last) ]) entry.ranges)
-                                , H.p [] [ H.text ("Application capabilities: " ++ String.join ", " entry.capabilities) ]
-                                , H.p [] [ H.text entry.error ]
-                                , button "Use as destination" (Field "destination" entry.node.id)
-                                ]
-                        )
-                        data.items
-                    )
-                , pagination model data.total data.matched data.nextOffset
-                ]
-
-        Explanation data ->
-            H.section [ A.class "network-explanation" ]
-                [ H.h2 [] [ H.text "Connection explanation" ]
-                , H.p [] [ H.text ("Source state · expired " ++ bool data.source.expired ++ " · reported online " ++ (Maybe.map bool data.source.online |> Maybe.withDefault "unknown")) ]
-                , H.p [] [ H.text ("Destination state · expired " ++ bool data.destination.expired ++ " · reported online " ++ (Maybe.map bool data.destination.online |> Maybe.withDefault "unknown")) ]
-                , H.p [] [ H.text data.routing ]
-                , H.p [] [ H.text data.observation ]
-                , H.div [] (List.indexedMap resultView data.results)
-                ]
-
-        SourceChunk data ->
-            H.section []
-                [ H.h2 [] [ H.text ("Original source " ++ data.pointer) ]
-                , H.p [] [ H.text ("Bytes " ++ String.fromInt data.offset ++ "–" ++ String.fromInt (Maybe.withDefault data.total data.nextOffset) ++ " of " ++ String.fromInt data.total ++ ". Source and comments are shown incrementally at this snapshot revision.") ]
-                , H.pre [] [ H.text data.text ]
-                , button "First source chunk" (SourcePage data.pointer 0)
-                , H.button [ A.type_ "button", A.disabled (data.nextOffset == Nothing), Events.onClick (SourcePage data.pointer (Maybe.withDefault 0 data.nextOffset)) ] [ H.text "Next source chunk" ]
-                , button "Back to evidence" (EvidencePage model.evidenceResult model.evidenceOffset)
-                ]
-
-
 resultView : Int -> Data.Result -> Html Msg
 resultView index result =
-    H.article []
-        [ H.h3 [] [ H.text (result.sourceIP ++ " → " ++ result.destinationIP) ]
-        , H.p []
-            [ H.text
-                (if String.contains ":" result.destinationIP then
-                    "IPv6 result"
+    H.article [ A.class ("network-verdict " ++ result.policy.packet) ]
+        [ H.div [ A.class "network-verdict-heading" ]
+            [ H.strong [] [ H.text result.policy.packet ]
+            , H.span []
+                [ H.text
+                    (if String.contains ":" result.destinationIP then
+                        "IPv6"
 
-                 else
-                    "IPv4 result"
-                )
+                     else
+                        "IPv4"
+                    )
+                ]
             ]
-        , H.dl [] [ H.dt [] [ H.text "Packet policy" ], H.dd [] [ H.text result.policy.packet ], H.dt [] [ H.text "Tailscale SSH" ], H.dd [] [ H.text result.policy.ssh ], H.dt [] [ H.text "Visibility" ], H.dd [] [ H.text (bool result.visible) ], H.dt [] [ H.text "Router" ], H.dd [] [ H.text result.routerId ] ]
-        , H.p [] [ H.text result.policy.reason ]
-        , H.p [] [ H.text result.policy.diagnostic ]
-        , H.h4 [] [ H.text "Route evidence" ]
-        , H.ul [] (List.map (\route -> H.li [] [ H.text (route.label ++ " · advertised " ++ bool route.advertised ++ " · approved " ++ bool route.approved ++ " · selected " ++ bool route.selected ++ " · source-visible " ++ bool route.sourceVisible) ]) result.routeEvidence)
-        , button "Inspect evidence for this address/router result" (EvidencePage index 0)
+        , H.p [ A.class "network-address-pair" ] [ H.text (result.sourceIP ++ " → " ++ result.destinationIP) ]
+        , if result.policy.reason /= "" then
+            H.p [] [ H.text result.policy.reason ]
+
+          else
+            H.text ""
+        , if result.policy.diagnostic /= "" then
+            H.p [] [ H.text result.policy.diagnostic ]
+
+          else
+            H.text ""
+        , H.div [ A.class "network-facts" ]
+            [ H.span []
+                [ H.text
+                    (if result.visible then
+                        "Peer visible"
+
+                     else
+                        "Peer not visible"
+                    )
+                ]
+            , H.span [] [ H.text ("SSH: " ++ result.policy.ssh) ]
+            ]
         , if result.evidenceSelected then
             evidenceView index result.policy
 
           else
-            H.p [] [ H.text "Select this result to inspect its independently paged evidence." ]
+            button "Inspect this address result" (EvidencePage index 0)
+        , if List.isEmpty result.routeEvidence then
+            H.text ""
+
+          else
+            H.details []
+                [ H.summary [] [ H.text "Route evidence" ]
+                , H.ul [] (List.map (\route -> H.li [] [ H.text (route.label ++ " · advertised " ++ bool route.advertised ++ " · approved " ++ bool route.approved ++ " · selected " ++ bool route.selected ++ " · visible " ++ bool route.sourceVisible) ]) result.routeEvidence)
+                ]
         ]
 
 
 evidenceView : Int -> Data.Policy -> Html Msg
 evidenceView index policy =
-    H.section []
-        [ H.h4 [] [ H.text "Contributing source rules" ]
-        , H.div [] (List.map ruleView policy.rules)
-        , H.p [] [ H.text (String.fromInt policy.rulesTotal ++ " contributing rules · " ++ String.fromInt policy.rulesOmitted ++ " omitted") ]
-        , H.h4 [] [ H.text "Rule matching checks" ]
-        , H.p [] [ H.text "Checks summarize the furthest condition across compiled contributions; they are not a unique cause or a suggested fix. Membership witnesses show one original selector resolving to each chosen address; pair-dependent self selectors are evaluated by the compiler." ]
-        , H.p [] [ H.text (String.fromInt policy.checksTotal ++ " checked · " ++ String.fromInt policy.checksOmitted ++ " omitted") ]
-        , H.div [] (List.map (\check -> H.section [] [ H.p [] [ H.text check.reason ], ruleView check.rule ]) policy.checks)
-        , H.h4 [] [ H.text ("Tailscale SSH source rules · " ++ String.fromInt policy.sshRulesTotal ++ " total") ]
-        , H.div [] (List.map ruleView policy.sshRules)
-        , H.h4 [] [ H.text ("Application capability references · " ++ String.fromInt policy.capabilitiesTotal ++ " total (separate from packet permission)") ]
-        , H.div [] (List.map (\capability -> H.section [] [ H.strong [] [ H.text capability.name ], H.div [] (List.map ruleView capability.rules) ]) policy.capabilities)
-        , H.p [] [ H.text ("Evidence page starts at " ++ String.fromInt (policy.evidenceOffset + 1) ++ "; each evidence category pages independently in groups of 10. Capability names longer than 256 bytes are previewed; original source contains full names.") ]
-        , H.button [ A.type_ "button", A.disabled (policy.evidenceOffset == 0), Events.onClick (EvidencePage index (max 0 (policy.evidenceOffset - 10))) ] [ H.text "Previous evidence" ]
-        , H.button [ A.type_ "button", A.disabled (policy.evidenceNext == Nothing), Events.onClick (EvidencePage index (Maybe.withDefault 0 policy.evidenceNext)) ] [ H.text "Next evidence" ]
+    H.section [ A.class "network-evidence" ]
+        [ if List.isEmpty policy.rules then
+            H.text ""
+
+          else
+            H.div [] [ H.h4 [] [ H.text "Allowed by policy" ], H.div [] (List.map ruleView policy.rules) ]
+        , if List.isEmpty policy.checks then
+            H.text ""
+
+          else
+            H.details []
+                [ H.summary [] [ H.text ("Rule matching checks (" ++ String.fromInt policy.checksTotal ++ ")") ]
+                , H.div [] (List.map (\check -> H.section [] [ H.p [] [ H.text check.reason ], ruleView check.rule ]) policy.checks)
+                ]
+        , if List.isEmpty policy.sshRules then
+            H.text ""
+
+          else
+            H.details [] [ H.summary [] [ H.text "SSH policy evidence" ], H.div [] (List.map ruleView policy.sshRules) ]
+        , if List.isEmpty policy.capabilities then
+            H.text ""
+
+          else
+            H.details []
+                [ H.summary [] [ H.text "Application capabilities" ]
+                , H.p [] [ H.text "Capability grants are separate from packet permission." ]
+                , H.div [] (List.map (\capability -> H.section [] [ H.strong [] [ H.text capability.name ], H.div [] (List.map ruleView capability.rules) ]) policy.capabilities)
+                ]
+        , if policy.evidenceNext /= Nothing || policy.evidenceOffset > 0 then
+            H.div [ A.class "network-evidence-pages" ]
+                [ H.p [] [ H.text ("Showing up to 10 entries per category, from " ++ String.fromInt (policy.evidenceOffset + 1)) ]
+                , H.button [ A.type_ "button", A.disabled (policy.evidenceOffset == 0), Events.onClick (EvidencePage index (max 0 (policy.evidenceOffset - 10))) ] [ H.text "Previous evidence" ]
+                , H.button [ A.type_ "button", A.disabled (policy.evidenceNext == Nothing), Events.onClick (EvidencePage index (Maybe.withDefault 0 policy.evidenceNext)) ] [ H.text "Next evidence" ]
+                ]
+
+          else
+            H.text ""
         ]
 
 
@@ -506,43 +1280,25 @@ ruleView : Data.Rule -> Html Msg
 ruleView rule =
     let
         witness side value =
-            Maybe.map (\m -> H.p [] [ H.text (side ++ " selector " ++ m.selector ++ " (" ++ m.kind ++ ") resolves to " ++ m.address ++ " · node " ++ m.nodeId ++ " · ownership " ++ m.ownership ++ " · user " ++ m.userId) ]) value |> Maybe.withDefault (H.text "")
+            Maybe.map (\m -> H.p [] [ H.text (side ++ ": " ++ m.selector ++ " resolves to " ++ m.address ++ " (" ++ m.ownership ++ ")") ]) value |> Maybe.withDefault (H.text "")
     in
-    H.details []
-        [ H.summary [] [ H.text (rule.pointer ++ " · line " ++ String.fromInt rule.line) ]
-        , H.code [] [ H.text ("Source digest " ++ rule.digest) ]
-        , witness "Source" rule.sourceMatch
-        , witness "Destination" rule.destinationMatch
-        , H.pre [] [ H.text rule.comments ]
-        , H.pre [] [ H.text rule.excerpt ]
-        , if rule.truncated then
-            H.p [] [ H.text "Source preview truncated. Inspect original source for the complete rule and comments." ]
-
-          else
+    H.div [ A.class "network-rule" ]
+        [ H.div [ A.class "network-rule-location" ] [ H.code [] [ H.text rule.pointer ], H.span [] [ H.text ("line " ++ String.fromInt rule.line) ] ]
+        , if String.trim rule.comments == "" then
             H.text ""
-        , button "Inspect original source and comments" (SourcePage rule.pointer 0)
-        ]
-
-
-explanationForm : Model -> Html Msg
-explanationForm model =
-    let
-        field label name value placeholder =
-            H.label [] [ H.span [] [ H.text label ], H.input [ A.value value, A.placeholder placeholder, Events.onInput (Field name), A.maxlength 512 ] [] ]
-    in
-    H.form [ A.class "network-form", Events.onSubmit Explain ]
-        [ H.h2 [] [ H.text "Explain a connection" ]
-        , field "Source node ID" "source" model.source "node:1"
-        , field "Source IP (optional)" "sourceIP" model.sourceIP "Explicit IPv4 or IPv6 address"
-        , field "Destination node ID or address" "destination" model.destination "node:2 or 100.64.0.2"
-        , H.label [] [ H.span [] [ H.text "IP protocol" ], H.select [ A.value model.protocol, Events.onInput (Field "protocol") ] (List.map (\( value, label ) -> H.option [ A.value value ] [ H.text label ]) [ ( "6", "TCP (6)" ), ( "17", "UDP (17)" ), ( "1", "ICMP (1)" ), ( "58", "ICMPv6 (58)" ), ( "132", "SCTP (132)" ), ( "47", "GRE (47)" ) ]) ]
-        , field "Numeric IP protocol (0–255)" "protocol" model.protocol "6"
-        , if List.member model.protocol [ "6", "17", "132" ] then
-            field "Destination port" "port" model.port_ "443"
 
           else
-            H.p [] [ H.text "This protocol has no destination port." ]
-        , field "Tailscale SSH local username (optional)" "sshUser" model.sshUser "alice"
-        , H.p [] [ H.text "SSH requires a destination node and local username. TCP/22 packet permission is evaluated separately. Node destinations produce separate IPv4 and IPv6 results." ]
-        , H.button [ A.type_ "submit", A.disabled model.loading ] [ H.text "Explain connection" ]
+            H.p [ A.class "network-rule-comment" ] [ H.text (String.replace "//" "" rule.comments |> String.trim) ]
+        , H.details []
+            [ H.summary [] [ H.text "View rule source" ]
+            , H.pre [] [ H.text rule.excerpt ]
+            , witness "Source" rule.sourceMatch
+            , witness "Destination" rule.destinationMatch
+            , if rule.truncated then
+                H.p [] [ H.text "Preview truncated. Open the original source for the complete rule." ]
+
+              else
+                H.text ""
+            , button "Inspect original source and comments" (SourcePage rule.pointer 0)
+            ]
         ]

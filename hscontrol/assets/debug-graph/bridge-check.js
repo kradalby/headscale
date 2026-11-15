@@ -202,7 +202,12 @@ async function check() {
   assert.equal(deliveries.length, cached + 1);
   assert.equal(deliveries.at(-1).type, "restore");
 
-  command({ action: "network", generation: 11, operation: "inventory", fields: { category: "nodes", search: "alpha" } });
+  command({
+    action: "network",
+    generation: 11,
+    operation: "inventory",
+    fields: { category: "nodes", search: "alpha" },
+  });
   const firstNetwork = requests.at(-1);
   assert.equal(firstNetwork.url.pathname, "/debug/graph/network/inventory");
   assert.equal(firstNetwork.url.searchParams.get("debugkey"), "a&b");
@@ -232,6 +237,16 @@ async function check() {
   explanation.resolve({ ok: true, json: async () => ({ revision: "obsolete-explanation" }) });
   await flush();
   assert.equal(deliveries.filter((value) => value.type === "network").length, 1);
+
+  command({ action: "network", generation: 15, operation: "access", fields: { id: "node:1", onlyPermitted: "true" } });
+  requests.at(-1).resolve({ ok: false, status: 400, text: async () => "Policy compilation failed: invalid selector" });
+  await flush();
+  assert.equal(deliveries.at(-1).type, "networkError");
+  assert.equal(
+    deliveries.at(-1).data,
+    "Policy compilation failed: invalid selector",
+    "policy failures must not look like empty permissions",
+  );
 
   const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
   for (const location of [context.location, { href: "http://localhost/debug/graph/", origin: "http://localhost" }]) {
