@@ -35,11 +35,11 @@ func TestRapidStreamSystem(t *testing.T) {
 			oldNode := old.ListNodes().At(0).ID()
 			oldHub := NewHub()
 			oldMap, err := NewStream(p.cfg, oldHub, oldNode, capVer).r.render(old)
-			oldHub.Close()
 			require.NoError(t, err)
 
 			oldClient := newPropertyClient(&tailcfg.MapResponse{})
-			applyStreamPropertyWire(t, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, oldMap)})
+			applyStreamPropertyWire(t, oldHub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, oldMap)})
+			oldHub.Close()
 
 			for range rapid.IntRange(1, 3).Draw(t, "coalesced-writes") {
 				p.apply(t, p.drawOperation(t))
@@ -77,7 +77,7 @@ func TestRapidStreamSystem(t *testing.T) {
 			require.NoError(t, err)
 
 			lateClient := newPropertyClient(&tailcfg.MapResponse{})
-			applyStreamPropertyWire(t, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, lateMap)})
+			applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, lateMap)})
 			lateClient.check(t, oldClient)
 
 			last = snap
@@ -101,7 +101,7 @@ func TestRapidStreamModelPatchFields(t *testing.T) {
 		capability := tailcfg.CapabilityVersion(rapid.IntRange(1, 200).Draw(t, "cap"))
 		signature := rapid.SliceOfN(rapid.Byte(), 1, 64).Draw(t, "signature")
 		client := newPropertyClient(&tailcfg.MapResponse{Peers: []*tailcfg.Node{{ID: 2}}})
-		applyStreamPropertyWire(t, client, []*tailcfg.MapResponse{{PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 2, Cap: capability, KeySignature: signature}}}})
+		applyStreamPropertyWire(t, nil, client, []*tailcfg.MapResponse{{PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 2, Cap: capability, KeySignature: signature}}}})
 		require.Equal(t, capability, client.peers[2].Cap)
 		require.True(t, slices.Equal(signature, client.peers[2].KeySignature))
 	})
@@ -261,4 +261,20 @@ func TestRapidStreamOperationContracts(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestRapidStreamSimplePolicyEdits(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t)
+		kind := rapid.IntRange(0, 2).Draw(t, "simple-policy")
+		p.setPolicy(t, kind)
+
+		p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: kind}}
+		for _, operation := range []string{"policy-order", "policy-duplicate", "policy-restore"} {
+			op := p.drawOperation(t, operation)
+			require.Equal(t, kind, op.policy, "simple intent survives %s", operation)
+			p.apply(t, op)
+			require.Equal(t, kind, p.policy)
+		}
+	})
 }

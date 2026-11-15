@@ -171,15 +171,11 @@ func TestRapidWireDiffReplay(t *testing.T) {
 
 				for _, resp := range cached {
 					shared := hub.frames.share(resp)
-					data, err := hub.Encode(shared, false, func(r *tailcfg.MapResponse, _ bool) ([]byte, error) { return Marshal(r) })
-					require.NoError(t, err)
-
-					var decoded tailcfg.MapResponse
-					require.NoError(t, json.Unmarshal(data, &decoded))
-					require.Equal(t, wireJSON(t, resp), wireJSON(t, &decoded))
+					wireRoundTrip(t, hub, shared, false)
+					decoded := wireRoundTrip(t, hub, shared, true)
 
 					if repeat == 0 {
-						client.apply(&decoded)
+						client.apply(decoded)
 					}
 				}
 			}

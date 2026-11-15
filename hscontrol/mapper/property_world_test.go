@@ -1,7 +1,6 @@
 package mapper
 
 import (
-	"encoding/json"
 	"fmt"
 	"maps"
 	"net/netip"
@@ -55,6 +54,11 @@ type streamPropertySession struct {
 	pending    bool
 }
 
+type streamPropertyPolicy struct {
+	doc  []byte
+	kind int
+}
+
 type streamPropertySystem struct {
 	dnsRecords []tailcfg.DNSRecord
 	viaOnly    bool
@@ -64,7 +68,7 @@ type streamPropertySystem struct {
 	sessions   map[types.NodeID]*streamPropertySession
 	policy     int
 	policyDoc  []byte
-	policies   [][]byte
+	policies   []streamPropertyPolicy
 	world      propcheck.World
 	probes     propcheck.WorldProbes
 	routes     propcheck.RouteResult
@@ -182,22 +186,17 @@ func (p *streamPropertySystem) setPolicy(t *rapid.T, index int) {
 
 	p.policy = index
 	p.policyDoc = []byte(streamPropertyPolicies[index])
-	p.policies = append(p.policies, slices.Clone(p.policyDoc))
+	p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(p.policyDoc), kind: index})
 	p.checkWorld(t)
 }
 
 // applyStreamPropertyWire crosses the real encoder boundary. Removal frames
 // must stand alone, so even old delta-only consumers receive revocations.
-func applyStreamPropertyWire(t *rapid.T, client *propertyClient, responses []*tailcfg.MapResponse) {
+func applyStreamPropertyWire(t *rapid.T, hub *Hub, client *propertyClient, responses []*tailcfg.MapResponse) {
 	for _, response := range responses {
-		data, err := Marshal(response)
-		require.NoError(t, err)
-		standard, err := json.Marshal(response)
-		require.NoError(t, err)
-		require.JSONEq(t, string(standard), string(data), "cached encoding changed the response")
-
-		var wire tailcfg.MapResponse
-		require.NoError(t, json.Unmarshal(data, &wire))
+		// Exercise both Hub.Encode slots without changing generated operation draws.
+		wireRoundTrip(t, hub, response, false)
+		wire := *wireRoundTrip(t, hub, response, true)
 
 		if len(wire.PeersRemoved) != 0 {
 			without := wire
@@ -260,11 +259,11 @@ func (p *streamPropertySystem) open(t *rapid.T, id types.NodeID, snap *state.Sna
 	p.history.Attempt(token, snap.Rev(), ids)
 
 	if partial {
-		applyStreamPropertyWire(t, client, responses[:rapid.IntRange(0, len(responses)).Draw(t, "initial-prefix")])
+		applyStreamPropertyWire(t, p.hub, client, responses[:rapid.IntRange(0, len(responses)).Draw(t, "initial-prefix")])
 		p.hub.Leave(session)
 		p.history.Leave(token, propertyEpoch)
 	} else {
-		applyStreamPropertyWire(t, client, responses)
+		applyStreamPropertyWire(t, p.hub, client, responses)
 		st.Delivered()
 		p.history.Delivered(token, snap.Rev(), ids)
 	}
@@ -288,7 +287,7 @@ func (p *streamPropertySystem) update(t *rapid.T, id types.NodeID, snap *state.S
 
 	switch mode {
 	case 1: // An unconfirmed prefix may have reached the client.
-		applyStreamPropertyWire(t, session.client, responses[:rapid.IntRange(0, len(responses)).Draw(t, "update-prefix")])
+		applyStreamPropertyWire(t, p.hub, session.client, responses[:rapid.IntRange(0, len(responses)).Draw(t, "update-prefix")])
 		p.hub.Leave(session.stream.sess)
 		p.history.Leave(session.token, propertyEpoch)
 		session.down = true
@@ -302,7 +301,7 @@ func (p *streamPropertySystem) update(t *rapid.T, id types.NodeID, snap *state.S
 			p.history.Delivered(session.token, session.pendingRev, session.ids)
 		}
 	default:
-		applyStreamPropertyWire(t, session.client, responses)
+		applyStreamPropertyWire(t, p.hub, session.client, responses)
 		session.stream.Delivered()
 
 		if session.pending {
@@ -327,11 +326,11 @@ func (p *streamPropertySystem) check(t *rapid.T, snap *state.Snapshot) {
 
 		freshHub := NewHub()
 		responses, err := NewStream(p.cfg, freshHub, id, session.capVer).Initial(snap)
-		freshHub.Close()
 		require.NoError(t, err)
 
 		fresh := newPropertyClient(&tailcfg.MapResponse{})
-		applyStreamPropertyWire(t, fresh, responses)
+		applyStreamPropertyWire(t, freshHub, fresh, responses)
+		freshHub.Close()
 		session.client.check(t, fresh)
 		require.Len(t, session.client.deltaPeers, len(fresh.peers), "delta-only observer retained a removed peer")
 

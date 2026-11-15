@@ -124,9 +124,10 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 	case "generated-policy":
 		result.policy, result.doc = -1, propcheck.DrawPolicy(t)
 	case "policy-order", "policy-duplicate":
-		result.policy, result.doc = -1, propcheck.ReorderPolicy(t, p.policyDoc, op == "policy-duplicate")
+		result.policy, result.doc = p.policy, propcheck.ReorderPolicy(t, p.policyDoc, op == "policy-duplicate")
 	case "policy-restore":
-		result.policy, result.doc = -1, slices.Clone(p.policies[rapid.IntRange(0, len(p.policies)-1).Draw(t, "policy-ancestor")])
+		saved := p.policies[rapid.IntRange(0, len(p.policies)-1).Draw(t, "policy-ancestor")]
+		result.policy, result.doc = saved.kind, slices.Clone(saved.doc)
 	case "user":
 		u := p.world.Users[rapid.IntRange(0, 2).Draw(t, "user")]
 
@@ -197,7 +198,7 @@ func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 
 		require.Equal(t, wantRev, p.state.Snapshot().Rev(), "policy publication")
 		p.policy, p.policyDoc = op.policy, slices.Clone(op.doc)
-		p.policies = append(p.policies, slices.Clone(op.doc))
+		p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(op.doc), kind: op.policy})
 	case "invalid-policy":
 		_, err := p.state.SetPolicy([]byte(`{"grants":`))
 		require.Error(t, err)
@@ -327,20 +328,20 @@ func (p *streamPropertySystem) checkCausal(t *rapid.T, before, after *state.Snap
 		require.NoError(t, err)
 
 		expected, actual := newPropertyClient(&tailcfg.MapResponse{}), newPropertyClient(&tailcfg.MapResponse{})
-		applyStreamPropertyWire(t, expected, initial)
-		applyStreamPropertyWire(t, actual, initial)
+		applyStreamPropertyWire(t, hub, expected, initial)
+		applyStreamPropertyWire(t, hub, actual, initial)
 		stream.Delivered()
 		responses, err := stream.Update(after)
 		require.NoError(t, err)
-		applyStreamPropertyWire(t, actual, responses)
+		applyStreamPropertyWire(t, hub, actual, responses)
 
 		freshHub := NewHub()
 		full, err := NewStream(p.cfg, freshHub, viewer.ID(), capVer).Initial(after)
-		freshHub.Close()
 		require.NoError(t, err)
 
 		fresh := newPropertyClient(&tailcfg.MapResponse{})
-		applyStreamPropertyWire(t, fresh, full)
+		applyStreamPropertyWire(t, freshHub, fresh, full)
+		freshHub.Close()
 		actual.check(t, fresh)
 
 		switch op.kind {
@@ -381,7 +382,8 @@ func (p *streamPropertySystem) checkCausal(t *rapid.T, before, after *state.Snap
 			}
 		case "dns":
 			require.True(t, slices.Equal(propcheck.CanonicalDNSRecords(op.records), actual.dns.ExtraRecords), "DNS input to canonical wire records")
-			expected.dns = actual.dns
+			expected.dns = expected.dns.Clone()
+			expected.dns.ExtraRecords = propcheck.CanonicalDNSRecords(op.records)
 		case "derp":
 			require.Equal(t, wireJSON(t, op.derp), wireJSON(t, actual.derp))
 			expected.derp = actual.derp

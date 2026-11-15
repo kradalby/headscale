@@ -10,6 +10,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
+	"tailscale.com/util/zstdframe"
 )
 
 // wirePeers models the peer state in Tailscale f7c1b8e52600's
@@ -163,8 +164,32 @@ func wirePatchable(before, after *tailcfg.Node) bool {
 }
 
 func wireDecode(t require.TestingT, resp *tailcfg.MapResponse) *tailcfg.MapResponse {
-	data, err := Marshal(resp)
+	return wireRoundTrip(t, nil, resp, false)
+}
+
+// wireRoundTrip shares the real session Hub's encoded-frame cache when supplied.
+// Standalone model inputs use the same encoder without a Hub cache.
+func wireRoundTrip(t require.TestingT, hub *Hub, resp *tailcfg.MapResponse, compress bool) *tailcfg.MapResponse {
+	var (
+		data []byte
+		err  error
+	)
+	if hub == nil {
+		data, err = benchEncode(resp, compress)
+	} else {
+		data, err = hub.Encode(resp, compress, benchEncode)
+	}
+
 	require.NoError(t, err)
+
+	if compress {
+		data, err = zstdframe.AppendDecode(nil, data)
+		require.NoError(t, err)
+	}
+
+	standard, err := json.Marshal(resp)
+	require.NoError(t, err)
+	require.JSONEq(t, string(standard), string(data), "Hub encoding changed response content")
 
 	var decoded tailcfg.MapResponse
 	require.NoError(t, json.Unmarshal(data, &decoded))
@@ -240,7 +265,21 @@ func (c *propertyClient) apply(r *tailcfg.MapResponse) {
 	}
 
 	if r.DERPMap != nil {
-		c.derp = r.DERPMap
+		dm := r.DERPMap.Clone()
+		// The pinned client treats omitted DERP fields as unchanged.
+		if previous := c.derp; previous != nil {
+			if dm.Regions == nil {
+				dm.Regions, dm.OmitDefaultRegions = previous.Regions, previous.OmitDefaultRegions
+			}
+
+			if dm.HomeParams == nil {
+				dm.HomeParams = previous.HomeParams
+			} else if previous.HomeParams != nil && dm.HomeParams.RegionScore == nil {
+				dm.HomeParams.RegionScore = previous.HomeParams.RegionScore
+			}
+		}
+
+		c.derp = dm
 	}
 
 	if r.Domain != "" {
@@ -355,4 +394,45 @@ func TestPropertyClientContracts(t *testing.T) {
 	require.Equal(t, "b", client.filter[0].SrcIPs[0])
 	client.apply(&tailcfg.MapResponse{PacketFilters: map[string][]tailcfg.FilterRule{"*": nil}})
 	require.Empty(t, client.filter)
+}
+
+func TestPropertyClientDERPStickyFields(t *testing.T) {
+	initial := &tailcfg.DERPMap{
+		Regions:            map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: {RegionID: 1}},
+		OmitDefaultRegions: true,
+		HomeParams:         &tailcfg.DERPHomeParams{RegionScore: map[tailcfg.DERPRegionID]float64{1: 0.5}},
+	}
+	client := newPropertyClient(&tailcfg.MapResponse{DERPMap: initial})
+
+	for _, update := range []*tailcfg.DERPMap{{}, {HomeParams: &tailcfg.DERPHomeParams{}}} {
+		frozen := update.Clone()
+		client.apply(&tailcfg.MapResponse{DERPMap: update})
+		require.Equal(t, initial, client.derp, "nil fields retain previous values")
+		require.Equal(t, frozen, update, "replay owns the received map")
+	}
+
+	client.apply(&tailcfg.MapResponse{DERPMap: &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{}}})
+	require.Empty(t, client.derp.Regions)
+	require.False(t, client.derp.OmitDefaultRegions, "non-nil Regions replaces the associated flag")
+	require.Equal(t, initial.HomeParams, client.derp.HomeParams)
+
+	scores := map[tailcfg.DERPRegionID]float64{2: 2}
+	client.apply(&tailcfg.MapResponse{DERPMap: &tailcfg.DERPMap{HomeParams: &tailcfg.DERPHomeParams{RegionScore: scores}}})
+	require.Equal(t, scores, client.derp.HomeParams.RegionScore)
+	require.Empty(t, client.derp.Regions)
+	require.False(t, client.derp.OmitDefaultRegions)
+}
+
+func TestPropertyWireEncodingSlots(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	response := hub.frames.share(&tailcfg.MapResponse{ControlTime: new(propertyEpoch), DERPMap: &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: {RegionID: 1}}}})
+	require.Contains(t, hub.frames.byResp, response)
+
+	for range 2 {
+		for _, compress := range []bool{false, true} {
+			wireRoundTrip(t, hub, response, compress)
+		}
+	}
 }
