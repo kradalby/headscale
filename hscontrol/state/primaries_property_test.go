@@ -1,6 +1,7 @@
 package state
 
 import (
+	"cmp"
 	"fmt"
 	"maps"
 	"net/netip"
@@ -152,7 +153,7 @@ func checkRouteSnapshot(t *rapid.T, snap *Snapshot, records []propcheck.RouteNod
 	t.Helper()
 
 	if !reflect.DeepEqual(routeRecords(snap), records) {
-		t.Fatal("retained snapshot's route records changed")
+		t.Fatalf("snapshot route records differ from generated inputs: got=%+v want=%+v", routeRecords(snap), records)
 	}
 
 	got := make(map[netip.Prefix]uint64)
@@ -262,9 +263,34 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 			previous map[netip.Prefix]uint64
 		)
 
+		model := make(map[uint64]propcheck.RouteNode)
+		update := func(id uint64, change func(*propcheck.RouteNode)) {
+			if record, ok := model[id]; ok {
+				record.Announced = slices.Clone(record.Announced)
+				record.Approved = slices.Clone(record.Approved)
+				record.Tags = slices.Clone(record.Tags)
+				change(&record)
+				model[id] = record
+			}
+		}
+		health := func(updates map[types.NodeID]bool) {
+			for id, healthy := range updates {
+				update(uint64(id), func(record *propcheck.RouteNode) {
+					approved := slices.ContainsFunc(record.Announced, func(prefix netip.Prefix) bool {
+						return slices.Contains(record.Approved, prefix)
+					})
+					if healthy || record.Online && approved {
+						record.Unhealthy = !healthy
+					}
+				})
+			}
+		}
+
 		check := func() {
 			snap := w.snapshot()
-			records := routeRecords(snap)
+
+			records := slices.Collect(maps.Values(model))
+			slices.SortFunc(records, func(a, b propcheck.RouteNode) int { return cmp.Compare(a.ID, b.ID) })
 			want := propcheck.ElectRoutes(records, previous, propertyViaScopes(records))
 			checkRouteSnapshot(t, snap, records, want)
 			history = append(history, retained{snap, records, want})
@@ -282,12 +308,15 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 				tag = "tag:b"
 			}
 
-			n := nodeFromRouteRecord(propcheck.RouteNode{ID: id, Online: true, SessionStart: time.Unix(int64(3-id), 0), Announced: []netip.Prefix{prefix}, Approved: []netip.Prefix{prefix}, Tags: []string{tag}})
-			w.PutNode(*n)
+			record := propcheck.RouteNode{ID: id, Online: true, SessionStart: time.Unix(int64(3-id), 0), Announced: []netip.Prefix{prefix}, Approved: []netip.Prefix{prefix}, Tags: []string{tag}}
+			model[id] = record
+			w.PutNode(*nodeFromRouteRecord(record))
 			check()
 		}
 
 		st := &State{world: w}
+
+		health(map[types.NodeID]bool{1: false, 2: false})
 		st.BatchSetNodeHealth(map[types.NodeID]bool{1: false, 2: false})
 		check()
 
@@ -295,6 +324,7 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 			t.Fatal("setup did not reach a via-only outage")
 		}
 
+		health(map[types.NodeID]bool{3: false})
 		st.BatchSetNodeHealth(map[types.NodeID]bool{3: false})
 		check()
 
@@ -302,10 +332,13 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 			t.Fatal("setup did not reach a global outage")
 		}
 
-		deleted, _ := w.snapshot().GetNode(1)
+		deleted := model[1]
+		delete(model, 1)
 		w.DeleteNode(1)
 		check()
-		w.PutNode(*deleted.AsStruct())
+
+		model[1] = deleted
+		w.PutNode(*nodeFromRouteRecord(deleted))
 		check()
 
 		prefixes := rapid.SliceOfN(rapid.SampledFrom(propertyRoutePrefixes()), 0, 8)
@@ -315,22 +348,31 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 			id := types.NodeID(rapid.Uint64Range(1, 5).Draw(t, "id"))
 			switch rapid.IntRange(0, 10).Draw(t, "operation") {
 			case 0:
-				n := nodeFromRouteRecord(drawRouteNode(t, uint64(id)))
+				record := drawRouteNode(t, uint64(id))
+				model[uint64(id)] = record
+				n := nodeFromRouteRecord(record)
 				n.SessionEpoch = rapid.Uint64Range(0, 3).Draw(t, "epoch")
 				w.PutNode(*n)
 			case 1:
+				delete(model, uint64(id))
 				w.DeleteNode(id)
 			case 2:
 				prefs := prefixes.Draw(t, "announced")
 
+				update(uint64(id), func(record *propcheck.RouteNode) { record.Announced = slices.Clone(prefs) })
 				w.UpdateNode(id, func(n *types.Node) { n.Hostinfo.RoutableIPs = prefs })
 			case 3:
 				prefs := prefixes.Draw(t, "approved")
 
+				update(uint64(id), func(record *propcheck.RouteNode) { record.Approved = slices.Clone(prefs) })
 				w.UpdateNode(id, func(n *types.Node) { n.ApprovedRoutes = prefs })
 			case 4:
 				r := drawRouteNode(t, uint64(id))
 				epoch := rapid.Uint64Range(0, 3).Draw(t, "epoch")
+
+				update(uint64(id), func(record *propcheck.RouteNode) {
+					record.Online, record.SessionStart, record.Expired = r.Online, r.SessionStart, r.Expired
+				})
 
 				w.UpdateNode(id, func(n *types.Node) {
 					n.IsOnline, n.SessionStart, n.SessionEpoch = new(r.Online), r.SessionStart, epoch
@@ -342,12 +384,19 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 				})
 			case 5:
 				updates := rapid.MapOfN(rapid.SampledFrom([]types.NodeID{1, 2, 3, 4, 5, 99}), rapid.Bool(), 0, 6).Draw(t, "health")
+				health(updates)
 				st.BatchSetNodeHealth(updates)
 			case 6:
 				tags := rapid.SampledFrom([][]string{nil, {"tag:a"}, {"tag:b"}, {"tag:a", "tag:b"}}).Draw(t, "tags")
 
+				update(uint64(id), func(record *propcheck.RouteNode) { record.Tags = slices.Clone(tags) })
 				w.UpdateNode(id, func(n *types.Node) { n.Tags = slices.Clone(tags) })
 			case 7:
+				update(uint64(id), func(record *propcheck.RouteNode) {
+					slices.Reverse(record.Announced)
+					slices.Reverse(record.Approved)
+					slices.Reverse(record.Tags)
+				})
 				w.UpdateNode(id, func(n *types.Node) {
 					slices.Reverse(n.Hostinfo.RoutableIPs)
 					slices.Reverse(n.ApprovedRoutes)
@@ -370,6 +419,7 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 
 				updates := make(map[types.NodeID]UpdateNodeFunc)
 				for i := types.NodeID(1); i <= 5; i++ {
+					update(uint64(i), func(record *propcheck.RouteNode) { record.Online, record.Unhealthy = online, unhealthy })
 					updates[i] = func(n *types.Node) { n.IsOnline, n.Unhealthy = new(online), unhealthy }
 				}
 
@@ -377,6 +427,9 @@ func TestPrimaryRoutesProperty(t *testing.T) {
 			case 10:
 				prefs := prefixes.Draw(t, "both")
 
+				update(uint64(id), func(record *propcheck.RouteNode) {
+					record.Announced, record.Approved = slices.Clone(prefs), slices.Clone(prefs)
+				})
 				w.UpdateNode(id, func(n *types.Node) { n.Hostinfo.RoutableIPs, n.ApprovedRoutes = prefs, slices.Clone(prefs) })
 			}
 
