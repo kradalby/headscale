@@ -44,7 +44,7 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 			operations = append(operations, "delete")
 		}
 
-		if len(ids) < 8 {
+		if len(ids) < 8 && p.lastNodeID < maxStreamPropertyNodeID {
 			operations = append(operations, "add")
 		}
 	}
@@ -91,7 +91,7 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 		n.ActiveSessions = 1 - n.ActiveSessions
 		n.IsOnline = new(n.ActiveSessions > 0 && !propertyExpired(n))
 		n.LastSeen = new(time.Unix(1_700_000_000+rapid.Int64Range(0, 1000).Draw(t, "last-seen"), 0).UTC())
-		n.SessionStart = time.Unix(1_700_000_000+int64(n.ID), 0).UTC() //nolint:gosec // IDs are in [1, 8].
+		n.SessionStart = time.Unix(1_700_000_000+int64(n.ID), 0).UTC() //nolint:gosec // IDs are in [1, 255].
 	case "identity":
 		user := p.world.Users[rapid.IntRange(0, 2).Draw(t, "owner")].Clone()
 
@@ -151,15 +151,7 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 
 		result.derp = &tailcfg.DERPMap{Regions: regions}
 	case "add":
-		var absent []types.NodeID
-
-		for id := types.NodeID(1); id <= 8; id++ {
-			if p.world.Nodes[id] == nil {
-				absent = append(absent, id)
-			}
-		}
-
-		result.node = p.drawNode(t, rapid.SampledFrom(absent).Draw(t, "insert-id"))
+		result.node = p.drawNode(t, p.lastNodeID+1)
 	case "request", "stale-request":
 		result.request = tailcfg.MapRequest{
 			NodeKey: n.NodeKey, DiscoKey: n.DiscoKey,

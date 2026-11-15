@@ -59,7 +59,10 @@ type streamPropertyPolicy struct {
 	kind int
 }
 
+const maxStreamPropertyNodeID types.NodeID = 255
+
 type streamPropertySystem struct {
+	lastNodeID types.NodeID
 	dnsRecords []tailcfg.DNSRecord
 	viaOnly    bool
 	cfg        *types.Config
@@ -106,7 +109,7 @@ func newStreamPropertySystem(t *rapid.T) *streamPropertySystem {
 		cfg: cfg, state: s, hub: hub, sessions: make(map[types.NodeID]*streamPropertySession),
 		world:   propcheck.World{Nodes: map[types.NodeID]*types.Node{}},
 		history: newPeerHistoryModel(maxConcurrentMapSessionsPerNode, peerHistoryTTL),
-		probes:  propcheck.WorldProbes{IDs: []types.NodeID{1, 2, 3, 4, 5, 6, 7, 8}, UserIDs: []types.UserID{0, 1, 2, 3}},
+		probes:  propcheck.WorldProbes{UserIDs: []types.UserID{0, 1, 2, 3}},
 	}
 
 	for i := range 3 {
@@ -142,12 +145,12 @@ func (p *streamPropertySystem) drawNode(t *rapid.T, id types.NodeID) *types.Node
 
 	var raw [32]byte
 
-	raw[0], raw[31] = byte(id), rapid.Byte().Draw(t, "key-byte") //nolint:gosec // IDs are in [1, 8].
+	raw[0], raw[31] = byte(id), rapid.Byte().Draw(t, "key-byte") //nolint:gosec // IDs are in [1, 255].
 	n := types.Node{
 		ID: id, UserID: &user.ID, User: user, GivenName: name, Hostname: name,
 		MachineKey: key.MachinePublicFromRaw32(mem.B(raw[:])),
 		NodeKey:    key.NodePublicFromRaw32(mem.B(raw[:])), DiscoKey: key.DiscoPublicFromRaw32(mem.B(raw[:])),
-		IPv4:      new(netip.AddrFrom4([4]byte{100, 64, 0, byte(id)})), //nolint:gosec // IDs are in [1, 8].
+		IPv4:      new(netip.AddrFrom4([4]byte{100, 64, 0, byte(id)})), //nolint:gosec // IDs are in [1, 255].
 		IPv6:      new(netip.MustParseAddr(fmt.Sprintf("fd7a:115c:a1e0::%x", id.Uint64()))),
 		Hostinfo:  &tailcfg.Hostinfo{Hostname: name, OS: "linux"},
 		CreatedAt: propertyEpoch, UpdatedAt: propertyEpoch, IsOnline: new(false),
@@ -170,7 +173,12 @@ func (p *streamPropertySystem) insert(t *rapid.T, id types.NodeID) {
 }
 
 func (p *streamPropertySystem) create(t *rapid.T, n *types.Node) {
+	// Persistent node IDs are never reused, including after deletion.
+	require.Greater(t, n.ID, p.lastNodeID)
+	require.LessOrEqual(t, n.ID, maxStreamPropertyNodeID)
 	require.NoError(t, p.state.DB().DB.Save(n.Clone()).Error)
+	p.lastNodeID = n.ID
+	p.probes.IDs = append(p.probes.IDs, n.ID)
 	p.put(t, n)
 }
 
@@ -454,7 +462,7 @@ func propertyExpired(n *types.Node) bool {
 func propertyPeerIDs(peers []*tailcfg.Node) []types.NodeID {
 	ids := make([]types.NodeID, 0, len(peers))
 	for _, peer := range peers {
-		ids = append(ids, types.NodeID(peer.ID)) //nolint:gosec // Fixture node IDs are 1..8.
+		ids = append(ids, types.NodeID(peer.ID)) //nolint:gosec // Fixture node IDs are 1..255.
 	}
 
 	slices.Sort(ids)

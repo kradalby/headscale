@@ -93,7 +93,12 @@ missed destination notification). Refactoring must not make these disappear.
 
 ## Remaining limits
 
-The fixture is bounded to 3–8 nodes and four capability-version boundaries.
+The fixture keeps 3–8 live nodes and allocates monotonically increasing IDs
+from 1 through 255. Deleted IDs remain probes and are never reused; additions
+stop when the finite range is exhausted. This matches persistent node lifetimes
+and prevents identity reuse from manufacturing a LastSeen clear. Lower-level
+map/world branching properties retain their broader domains. The fixture uses
+four capability-version boundaries.
 There is no Noise/HTTP transport, real Tailscale process, PostgreSQL, process
 restart, registration authorization, certificate issuance, or durable policy
 failure/retry path in this driver. Hub TTL, capacity and concurrent session

@@ -278,3 +278,44 @@ func TestRapidStreamSimplePolicyEdits(t *testing.T) {
 		}
 	})
 }
+
+// Persistent IDs identify one lifetime. Deletion never makes an ID available
+// for another node, and the byte-based fixture stops allocating at 255.
+func TestRapidStreamFreshNodeIDs(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t)
+		if len(p.world.Nodes) == 3 {
+			p.apply(t, p.drawOperation(t, "add"))
+		}
+
+		for range rapid.IntRange(1, 8).Draw(t, "lifetimes") {
+			removed := p.drawOperation(t, "delete")
+			previousID := p.lastNodeID
+			p.apply(t, removed)
+			added := p.drawOperation(t, "add")
+			require.Equal(t, previousID+1, added.node.ID)
+			require.NotEqual(t, removed.node.ID, added.node.ID)
+			p.apply(t, added)
+			require.Contains(t, p.probes.IDs, removed.node.ID, "deleted IDs remain world/history probes")
+			require.Contains(t, p.probes.IDs, added.node.ID)
+			require.GreaterOrEqual(t, len(p.world.Nodes), 3)
+			require.LessOrEqual(t, len(p.world.Nodes), 8)
+		}
+
+		if len(p.world.Nodes) == 8 {
+			p.apply(t, p.drawOperation(t, "delete"))
+		}
+
+		p.lastNodeID = maxStreamPropertyNodeID - 1
+		last := p.drawOperation(t, "add")
+		require.Equal(t, maxStreamPropertyNodeID, last.node.ID)
+		require.Equal(t, netip.MustParseAddr("100.64.0.255"), *last.node.IPv4)
+		p.apply(t, last)
+		// Keep room in the live fleet so the exhausted-ID guard is exercised.
+		p.apply(t, p.drawOperation(t, "delete"))
+
+		for range 20 {
+			require.NotEqual(t, "add", p.drawOperation(t).kind)
+		}
+	})
+}
