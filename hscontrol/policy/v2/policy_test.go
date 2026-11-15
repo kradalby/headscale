@@ -8121,3 +8121,73 @@ func TestPacketIntentOwnershipAndPorts(t *testing.T) {
 		require.Equal(t, peers[n.ID], propcheck.CheckPacketIntent(t, m, intent, n.ID, rules), "incoming and outgoing required peers")
 	}
 }
+
+func TestPacketIntentRevocation(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+	nodes := types.Nodes{
+		node("n1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
+		node("n2", "100.64.0.2", "fd7a:115c:a1e0::2", users[1]),
+	}
+	nodes[0].ID, nodes[1].ID = 1, 2
+
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: users}
+	for _, n := range nodes {
+		m.Put(n)
+	}
+
+	initial := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{
+		{Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"}, Protocol: ipproto.TCP, First: 22, Last: 23},
+	}}
+	replacement := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{
+		{Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"}, Protocol: ipproto.UDP, First: 65535, Last: 65535},
+	}}
+
+	var previous *PolicyManager
+
+	for _, step := range []struct {
+		name     string
+		intent   *propcheck.PacketIntent
+		allowTCP bool
+		allowUDP bool
+	}{
+		{"allow", initial, true, false},
+		{"deny", &propcheck.PacketIntent{}, false, false},
+		{"restore", initial, true, false},
+		{"replacement", replacement, false, true},
+	} {
+		doc := step.intent.Document(t)
+		next, err := NewPolicyManagerFrom(previous, doc, users, nodes.ViewSlice())
+		require.NoError(t, err)
+		fresh, err := NewPolicyManager(doc, users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		previous = next
+
+		t.Run(step.name, func(t *testing.T) {
+			for family, src := range []*netip.Addr{nodes[0].IPv4, nodes[0].IPv6} {
+				dst := []*netip.Addr{nodes[1].IPv4, nodes[1].IPv6}[family]
+				for _, port := range []uint16{22, 23} {
+					require.Equal(t, step.allowTCP, step.intent.Allows(m, 1, 2, *src, *dst, port, ipproto.TCP))
+				}
+
+				require.Equal(t, step.allowUDP, step.intent.Allows(m, 1, 2, *src, *dst, 65535, ipproto.UDP))
+			}
+
+			for _, subject := range []struct {
+				name    string
+				manager *PolicyManager
+			}{
+				{"incremental", next},
+				{"fresh", fresh},
+			} {
+				t.Run(subject.name, func(t *testing.T) {
+					for _, n := range nodes {
+						rules, err := subject.manager.FilterForNode(n.View())
+						require.NoError(t, err)
+						propcheck.CheckPacketIntent(t, m, step.intent, n.ID, rules)
+					}
+				})
+			}
+		})
+	}
+}

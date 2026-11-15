@@ -228,6 +228,10 @@ func (p *PacketIntent) Document(t require.TestingT) []byte {
 	return policyJSON(t, map[string]any{"grants": grants, "tagOwners": tags})
 }
 
+const packetMaxPortWidth = 3
+
+var packetPortStarts = []uint16{0, 1, 22, 53, 443, 65534, 65535}
+
 // DrawPacketIntent includes a live literal-IP witness, then up to three broader
 // grants. Fixed port islands leave denied neighbors even when selectors are *.
 func DrawPacketIntent(t *rapid.T, m World) *PacketIntent {
@@ -280,8 +284,8 @@ func DrawPacketIntent(t *rapid.T, m World) *PacketIntent {
 	for i := range p.Grants {
 		g := &p.Grants[i]
 		g.Protocol = rapid.SampledFrom([]ipproto.Proto{ipproto.TCP, ipproto.UDP}).Draw(t, "packet protocol")
-		g.First = rapid.SampledFrom([]uint16{0, 1, 22, 53, 443, 65534, 65535}).Draw(t, "first port")
-		g.Last = g.First + rapid.Uint16Range(0, min(3, 65535-g.First)).Draw(t, "port width")
+		g.First = rapid.SampledFrom(packetPortStarts).Draw(t, "first port")
+		g.Last = g.First + rapid.Uint16Range(0, min(packetMaxPortWidth, 65535-g.First)).Draw(t, "port width")
 	}
 
 	return p
@@ -304,6 +308,8 @@ func (p *PacketIntent) Allows(m World, src, dst types.NodeID, srcIP, dstIP netip
 // Tailscale filter (new TCP SYN or UDP, no shared conntrack). It returns the union
 // of peers with incoming or outgoing allowed witnesses. This is necessary
 // visibility, not exact membership: same-user peers may have no allowed flow.
+// Probes cover every generated range and its neighbors even after revocation;
+// wider manual ranges retain bounded probes only while present in the intent.
 func CheckPacketIntent(t require.TestingT, m World, intent *PacketIntent, destination types.NodeID, rules []tailcfg.FilterRule) []types.NodeID {
 	dst := m.Nodes[destination]
 	require.NotNil(t, dst)
@@ -324,6 +330,17 @@ func CheckPacketIntent(t require.TestingT, m World, intent *PacketIntent, destin
 	actual := filter.New(matches, nil, localNets, nil, nil, logger.Discard)
 
 	ports := []uint16{0, 32768, 65535}
+
+	for _, first := range packetPortStarts {
+		if first > 0 {
+			ports = append(ports, first-1)
+		}
+
+		for port := uint32(first); port <= min(uint32(first)+packetMaxPortWidth+1, 65535); port++ {
+			ports = append(ports, uint16(port)) //nolint:gosec // Bounded by 65535.
+		}
+	}
+
 	for _, g := range intent.Grants {
 		// Generated ranges have at most four ports; larger manual ranges
 		// stay bounded with the first four ports, midpoint and endpoint.
