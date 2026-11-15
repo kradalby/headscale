@@ -95,7 +95,12 @@ enabled: `TestWireReachableFailures` (zero DiscoKey and offline LastSeen loss),
 `TestStreamRouteOverlaySurvivesStaleCacheAndMembership` (lost route overlay), and
 `TestIncrementalDuplicateAppGrantInvalidatesFilter` and
 `TestIncrementalAppGrantOrderInvalidatesFilter` (stale reduced filters and
-missed destination notifications after duplicate or reordered app grants). Refactoring must not make these disappear.
+missed destination notifications after duplicate or reordered app grants).
+`TestRouteWakesExitForCapabilitySource` pins a missed exit-node wake after a
+normal endpoint request: app-only grants to public destinations intentionally
+make the exit see its source without granting reciprocal visibility. Routing
+must account for those consumers while preserving policy intent. Refactoring
+must not make these diagnostics disappear.
 
 ## Remaining limits
 
@@ -128,8 +133,10 @@ JSON, checks snapshots after every write and compares delivered clients against
 that independent expectation as well as fresh streams. Configured writes,
 policy overlays, identical copies and historical restoration share the same
 operations in `TestRapidStreamOperationContracts/derp` and the broad driver.
-Configured publication follows complete input equality; global wakes and DERP
-deltas follow effective equality. Retained snapshots keep their old DERP value.
+Configured publication follows complete input equality, and configured-only
+global wakes follow effective equality. Policy document edits may additionally
+wake every client for per-node rules; unchanged effective maps still emit no
+DERP delta. Retained snapshots keep their old DERP value.
 `TestRapidStreamDERPMaskedPublication` checks masked configured writes, ignored
 policy scores, null removal and restoration without relying on random discovery.
 

@@ -9279,7 +9279,10 @@ func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 	after := p.state.Snapshot()
 	if strings.HasPrefix(op.kind, "derp") {
 		changed := !reflect.DeepEqual(beforeDERP, p.effectiveDERP(t))
-		require.Equal(t, changed, after.Since(before).Global, "effective DERP global wake")
+		// Per-node policies can wake all clients on any document edit.
+		if op.kind != "derp-policy" || changed {
+			require.Equal(t, changed, after.Since(before).Global, "effective DERP global wake")
+		}
 	}
 
 	p.checkCausal(t, before, after, op)
@@ -9852,6 +9855,13 @@ func TestStreamDERPScoreClearConverges(t *testing.T) {
 func TestRapidStreamDERPMaskedPublication(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		p := newStreamPropertySystem(t)
+		p.setPolicy(t, 2)
+		unchanged := p.effectiveDERP(t)
+		p.apply(t, streamOperation{
+			kind: "derp-policy", policy: 2,
+			doc: []byte(`{"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}],"derpMap":null}`),
+		})
+		require.Equal(t, unchanged, p.effectiveDERP(t))
 		p.setPolicy(t, 0)
 		base := p.derpMap.Clone()
 		custom := base.Regions[1].Clone()
