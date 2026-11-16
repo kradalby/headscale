@@ -1055,3 +1055,45 @@ retain an older cached rule order: `changedRules` compares rule presence while
 from `TestStreamSubnetIntentHistory`, whose audit remains enabled throughout
 its non-reordering history. Focused policy histories still evaluate reordered
 and duplicated filters semantically against the same input intent.
+
+## Bounded same-node requests
+
+`TestRapidStreamSameNodeRequests` sends two successful public MapRequests to node
+1, reusing `expectRequest` and `concurrentInputDelivery`. Before each burst the
+model computes both sequential orders from owned inputs. Each candidate includes
+the complete final node and its exact substantive ReportGen count; omitted
+Hostinfo or NetInfo can preserve fields from the first writer. Candidate choice
+compares the whole record, never one identifying field. Only LastSeen is bound
+from output, after checking that candidate's final writer call interval.
+
+Nine mandatory pairs cover conflicting endpoints/OS/services/DERP, convergence
+to identical requests, no-content-change repeats, omitted NetInfo in both
+orientations, omitted Hostinfo/endpoints, explicit clear, repeated clear and
+restore. Both conflicting endpoints have distinct addresses; OS, service ports
+and DERP also differ after shrinking. Input draws precede workers. Keys, names,
+ownership and routes remain fixed. Other nodes must remain unchanged. Request
+buffers are checked for nonmutation, then poisoned before shared current and
+retained World and map assertions.
+
+The two nonpanic writes publish one or two revisions. Each candidate increments
+the owned global report counter only for substantive changes in that order.
+Persistence completion order does not determine graph order: persistence reads
+the current graph record under a row lock and can acknowledge an already durable
+report. Local atomic invocation/return events reject any candidate contradicting
+observed nonoverlapping calls. Equal synctest timestamps limit timestamp
+sensitivity; event ordering and whole-record checks remain independent of clock
+resolution. There are no sleeps, forced graph schedules or intermediate maps.
+This checks bounded final outcomes and real subscription delivery, not general
+linearizability, arbitrary scheduling, panic retry or persistence failures.
+
+`TestStreamSameNodeRequestContracts` uses the exact outcome assertion to accept
+both orders and legal omission-preserved mixed fields. It rejects a missing last
+write, an impossible explicit-field hybrid, a wrong counter, a timestamp outside
+the matching final writer's interval and a reversed nonoverlapping order. No
+production mutation is needed. Existing distinct-node counter checks and
+policy/DNS no-op zero-wake assertions remain unchanged.
+
+```sh
+go test -p 1 ./hscontrol/mapper -run '^(TestRapidStreamSameNodeRequests|TestStreamSameNodeRequestContracts)$' -count=1 -timeout=10m -rapid.seed=2026111621 -rapid.checks=100 -rapid.nofailfile
+CGO_ENABLED=1 go test -race -p 1 ./hscontrol/mapper -run '^(TestRapidStreamSameNodeRequests|TestStreamSameNodeRequestContracts)$' -count=1 -timeout=10m -rapid.seed=2026111622 -rapid.checks=20 -rapid.nofailfile
+```

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -12804,23 +12805,224 @@ func (p *streamPropertySystem) concurrentRequests(t *rapid.T, requests [2]tailcf
 	}
 }
 
+// Both orders are input-owned; omissions may legally retain the other writer's fields.
+type streamRequestOutcome struct {
+	node      *types.Node
+	reportSeq uint64
+}
+
+type streamRequestCall struct {
+	started, ended    time.Time
+	invoked, returned uint64
+}
+
+func (p *streamPropertySystem) sameNodeRequestOutcomes(t *rapid.T, requests [2]tailcfg.MapRequest) [2]streamRequestOutcome {
+	var outcomes [2]streamRequestOutcome
+	for last := range outcomes {
+		n, seq := p.world.Nodes[1].Clone(), p.reportSeq
+
+		for _, i := range [2]int{1 - last, last} {
+			var changed bool
+
+			n, changed = p.expectRequest(t, streamOperation{before: n, request: requests[i]})
+			if changed {
+				seq++
+				n.ReportGen = seq
+			}
+		}
+
+		outcomes[last] = streamRequestOutcome{node: n, reportSeq: seq}
+	}
+
+	return outcomes
+}
+
+func checkStreamSameNodeOutcome(t require.TestingT, outcomes [2]streamRequestOutcome, got *types.Node, calls [2]streamRequestCall) streamRequestOutcome {
+	require.NotNil(t, got.LastSeen, "same-node LastSeen")
+
+	for last, outcome := range outcomes {
+		call := calls[last]
+		if call.returned < calls[1-last].invoked || got.LastSeen.Before(call.started) || got.LastSeen.After(call.ended) {
+			continue
+		}
+
+		want := outcome.node.Clone()
+
+		want.LastSeen = new(*got.LastSeen)
+		if reflect.DeepEqual(want, got) {
+			return streamRequestOutcome{node: want, reportSeq: outcome.reportSeq}
+		}
+	}
+
+	require.FailNow(t, "same-node outcome outside both input-owned orders", "got: %+v; candidates: %+v / %+v", got, outcomes[0].node, outcomes[1].node)
+
+	return streamRequestOutcome{}
+}
+
+func (p *streamPropertySystem) drawSameNodeRequests(t *rapid.T) [][2]tailcfg.MapRequest {
+	positive := p.drawConcurrentRequests(t)[0]
+	a, b := positive[0], positive[1]
+	b.NodeKey, b.DiscoKey, b.Hostinfo.Hostname = a.NodeKey, a.DiscoKey, a.Hostinfo.Hostname
+	// Endpoint addresses already differ; these fields must conflict even after shrinking.
+	b.Hostinfo.OS = "linux"
+	if a.Hostinfo.OS == b.Hostinfo.OS {
+		b.Hostinfo.OS = "windows"
+	}
+
+	b.Hostinfo.Services[0].Port = a.Hostinfo.Services[0].Port%65535 + 1
+	b.Hostinfo.NetInfo.PreferredDERP = a.Hostinfo.NetInfo.PreferredDERP%3 + 1
+	omittedA, omittedB := a, b
+	omittedA.Hostinfo, omittedB.Hostinfo = a.Hostinfo.Clone(), b.Hostinfo.Clone()
+	omittedA.Hostinfo.NetInfo, omittedB.Hostinfo.NetInfo = nil, nil
+	lite := tailcfg.MapRequest{NodeKey: a.NodeKey, DiscoKey: a.DiscoKey}
+	cleared := lite
+	cleared.Endpoints = []netip.AddrPort{}
+	cleared.Hostinfo = &tailcfg.Hostinfo{Hostname: a.Hostinfo.Hostname, OS: "linux", NetInfo: &tailcfg.NetInfo{}}
+
+	return [][2]tailcfg.MapRequest{{a, b}, {a, a}, {a, a}, {a, omittedB}, {a, lite}, {b, omittedA}, {cleared, cleared}, {cleared, cleared}, {a, a}}
+}
+
+func (p *streamPropertySystem) concurrentSameNodeRequests(t *rapid.T, requests [2]tailcfg.MapRequest) {
+	before, audits := p.state.Snapshot(), state.PolicyAuditFailures()
+	outcomes := p.sameNodeRequestOutcomes(t, requests)
+
+	var submitted [2]tailcfg.MapRequest
+	for i, req := range requests {
+		submitted[i] = req
+		submitted[i].Hostinfo, submitted[i].Endpoints = req.Hostinfo.Clone(), slices.Clone(req.Endpoints)
+	}
+
+	var (
+		calls   [2]streamRequestCall
+		errs    [2]error
+		events  atomic.Uint64
+		workers sync.WaitGroup
+	)
+
+	start := make(chan struct{})
+
+	for i := range submitted {
+		workers.Go(func() {
+			<-start
+
+			calls[i].invoked = events.Add(1)
+			calls[i].started = time.Now()
+			errs[i] = p.state.UpdateNodeFromMapRequest(1, submitted[i])
+			calls[i].ended = time.Now()
+			calls[i].returned = events.Add(1)
+		})
+	}
+
+	close(start)
+	workers.Wait()
+
+	final := p.state.Snapshot()
+	require.GreaterOrEqual(t, final.Rev(), before.Rev()+1, "every request stamps LastSeen")
+	require.LessOrEqual(t, final.Rev(), before.Rev()+2, "two writes may share one commit")
+	require.Equal(t, audits, state.PolicyAuditFailures(), "same-node policy audit")
+
+	for i := range requests {
+		require.NoError(t, errs[i])
+		require.Equal(t, requests[i], submitted[i], "State mutated the submitted request")
+	}
+
+	got, ok := final.GetNode(1)
+	require.True(t, ok)
+	outcome := checkStreamSameNodeOutcome(t, outcomes, got.AsStruct(), calls)
+	p.world.Put(outcome.node)
+	p.reportSeq = outcome.reportSeq
+
+	for _, req := range submitted {
+		if req.Hostinfo != nil {
+			req.Hostinfo.Hostname = "mutated-after-request"
+			if req.Hostinfo.NetInfo != nil {
+				req.Hostinfo.NetInfo.PreferredDERP = 99
+			}
+
+			if len(req.Hostinfo.Services) > 0 {
+				req.Hostinfo.Services[0].Port++
+			}
+		}
+
+		if len(req.Endpoints) > 0 {
+			req.Endpoints[0] = netip.MustParseAddrPort("192.0.2.99:1")
+		}
+	}
+}
+
+func TestRapidStreamSameNodeRequests(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+	rapid.Check(t, func(t *rapid.T) {
+		rapid.SyncTest(t, func(t *rapid.T) { checkStreamConcurrentInputs(t, "same-node") })
+	})
+}
+
+func TestStreamSameNodeRequestContracts(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		n := &types.Node{ID: 1, Hostname: "node-1", GivenName: "node-1", ReportGen: 17, Hostinfo: &tailcfg.Hostinfo{Hostname: "node-1", OS: "linux"}}
+		p := &streamPropertySystem{world: propcheck.World{Nodes: map[types.NodeID]*types.Node{1: n}}, reportSeq: 17}
+		a := tailcfg.MapRequest{Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1")}, Hostinfo: &tailcfg.Hostinfo{Hostname: n.Hostname, OS: "windows", NetInfo: &tailcfg.NetInfo{PreferredDERP: 1}}}
+		b := tailcfg.MapRequest{Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.2:2")}, Hostinfo: &tailcfg.Hostinfo{Hostname: n.Hostname, OS: "darwin", NetInfo: &tailcfg.NetInfo{PreferredDERP: 2}}}
+		outcomes := p.sameNodeRequestOutcomes(t, [2]tailcfg.MapRequest{a, b})
+		calls := [2]streamRequestCall{{propertyEpoch, propertyEpoch, 1, 3}, {propertyEpoch, propertyEpoch, 2, 4}}
+
+		for _, outcome := range outcomes {
+			got := outcome.node.Clone()
+			got.LastSeen = new(propertyEpoch)
+			require.Equal(t, uint64(19), checkStreamSameNodeOutcome(t, outcomes, got, calls).reportSeq)
+		}
+
+		for _, corruption := range []string{"missing-last-write", "hybrid", "counter", "timestamp", "real-time"} {
+			got, intervals := outcomes[0].node.Clone(), calls
+			got.LastSeen = new(propertyEpoch)
+
+			switch corruption {
+			case "missing-last-write":
+				got, _ = p.expectRequest(t, streamOperation{before: n, request: a})
+				got.ReportGen, got.LastSeen = 18, new(propertyEpoch)
+			case "hybrid":
+				got.Hostinfo = outcomes[1].node.Hostinfo.Clone()
+			case "counter":
+				got.ReportGen++
+			case "timestamp":
+				intervals[0].started, intervals[0].ended = propertyEpoch.Add(time.Second), propertyEpoch.Add(time.Second)
+			case "real-time":
+				intervals[0].returned, intervals[1].invoked = 2, 3
+			}
+
+			failure := &streamConnectivityFailure{}
+			require.PanicsWithValue(t, failure, func() { checkStreamSameNodeOutcome(failure, outcomes, got, intervals) }, corruption)
+			require.Contains(t, failure.message, "same-node outcome", corruption)
+		}
+		// Omitted NetInfo legally mixes B's endpoint/OS with A's DERP.
+		b.Hostinfo.NetInfo = nil
+		outcomes = p.sameNodeRequestOutcomes(t, [2]tailcfg.MapRequest{a, b})
+		mixed := outcomes[1].node.Clone()
+		require.True(t, slices.Equal(b.Endpoints, mixed.Endpoints))
+		require.Equal(t, b.Hostinfo.OS, mixed.Hostinfo.OS)
+		require.Equal(t, a.Hostinfo.NetInfo.PreferredDERP, mixed.Hostinfo.NetInfo.PreferredDERP)
+		mixed.LastSeen = new(propertyEpoch)
+		checkStreamSameNodeOutcome(t, outcomes, mixed, calls)
+	})
+}
+
 func TestRapidStreamConcurrentInputs(t *testing.T) {
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
 	rapid.Check(t, func(t *rapid.T) {
-		rapid.SyncTest(t, func(t *rapid.T) { checkStreamConcurrentInputs(t, false) })
+		rapid.SyncTest(t, func(t *rapid.T) { checkStreamConcurrentInputs(t, "policy-dns") })
 	})
 }
 
 func TestRapidStreamConcurrentRequests(t *testing.T) {
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
 	rapid.Check(t, func(t *rapid.T) {
-		rapid.SyncTest(t, func(t *rapid.T) { checkStreamConcurrentInputs(t, true) })
+		rapid.SyncTest(t, func(t *rapid.T) { checkStreamConcurrentInputs(t, "requests") })
 	})
 }
 
-func checkStreamConcurrentInputs(t *rapid.T, requests bool) {
+func checkStreamConcurrentInputs(t *rapid.T, mode string) {
 	p := newStreamPropertySystem(t)
-	if requests {
+	if mode != "policy-dns" {
 		p.setPolicy(t, 0)
 	} else {
 		p.setPolicy(t, 1)
@@ -12838,9 +13040,13 @@ func checkStreamConcurrentInputs(t *rapid.T, requests bool) {
 		phases []streamOperation
 		pairs  [][2]tailcfg.MapRequest
 	)
-	if requests {
+
+	switch mode {
+	case "same-node":
+		pairs = p.drawSameNodeRequests(t)
+	case "requests":
 		pairs = p.drawConcurrentRequests(t)
-	} else {
+	default:
 		// Draw the complete history before starting any concurrent input workers.
 		records := []tailcfg.DNSRecord{{Name: "service.example.com", Type: "A", Value: fmt.Sprintf("100.64.0.%d", rapid.ByteRange(1, 254).Draw(t, "DNS witness"))}}
 		equivalent := slices.Clone(records)
@@ -12874,7 +13080,13 @@ func checkStreamConcurrentInputs(t *rapid.T, requests bool) {
 	synctest.Wait()
 
 	for _, pair := range pairs {
-		p.concurrentInputDelivery(t, frozenDNS, func() { p.concurrentRequests(t, pair) })
+		p.concurrentInputDelivery(t, frozenDNS, func() {
+			if mode == "same-node" {
+				p.concurrentSameNodeRequests(t, pair)
+			} else {
+				p.concurrentRequests(t, pair)
+			}
+		})
 	}
 
 	for _, op := range phases {
