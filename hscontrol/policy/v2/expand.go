@@ -7,11 +7,14 @@ import (
 	"net/netip"
 	"reflect"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/puzpuzpuz/xsync/v4"
 	"go4.org/netipx"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
@@ -141,29 +144,57 @@ func mergeKey(class string, rule tailcfg.FilterRule) string {
 // of the rules merged, their destinations in rule order. Capability rules
 // stay as they are, at their own anchor.
 func mergeAnchored(rules []tailcfg.FilterRule, keys []string, anchors []int64) []tailcfg.FilterRule {
+	// A group is its first rule and the rules merged into it.
 	type group struct {
-		anchor  int64
-		members []int
+		anchor int64
+		first  int
+		more   []int
 	}
+
+	// A filter is mostly a few rules: a scan finds a key faster than a map
+	// is built.
+	const scanned = 8
 
 	var (
 		groups = make([]group, 0, len(rules))
-		byKey  = make(map[string]int, len(rules))
+		byKey  map[string]int
 	)
+
+	if len(rules) > scanned {
+		byKey = make(map[string]int, len(rules))
+	}
+
+	find := func(key string) (int, bool) {
+		if byKey != nil {
+			g, ok := byKey[key]
+
+			return g, ok
+		}
+
+		for g := range groups {
+			if f := groups[g].first; len(rules[f].CapGrant) == 0 && keys[f] == key {
+				return g, true
+			}
+		}
+
+		return 0, false
+	}
 
 	for i, rule := range rules {
 		if len(rule.CapGrant) == 0 {
-			if g, ok := byKey[keys[i]]; ok {
-				groups[g].members = append(groups[g].members, i)
+			if g, ok := find(keys[i]); ok {
+				groups[g].more = append(groups[g].more, i)
 				groups[g].anchor = min(groups[g].anchor, anchors[i])
 
 				continue
 			}
 
-			byKey[keys[i]] = len(groups)
+			if byKey != nil {
+				byKey[keys[i]] = len(groups)
+			}
 		}
 
-		groups = append(groups, group{anchor: anchors[i], members: []int{i}})
+		groups = append(groups, group{anchor: anchors[i], first: i})
 	}
 
 	slices.SortStableFunc(groups, func(a, b group) int { return cmp.Compare(a.anchor, b.anchor) })
@@ -171,7 +202,7 @@ func mergeAnchored(rules []tailcfg.FilterRule, keys []string, anchors []int64) [
 	out := make([]tailcfg.FilterRule, 0, len(groups))
 
 	for _, g := range groups {
-		first := rules[g.members[0]]
+		first := rules[g.first]
 		if len(first.CapGrant) > 0 {
 			out = append(out, first)
 
@@ -180,14 +211,16 @@ func mergeAnchored(rules []tailcfg.FilterRule, keys []string, anchors []int64) [
 
 		dsts := slices.Clip(first.DstPorts)
 
-		if len(g.members) > 1 {
-			n := 0
-			for _, m := range g.members {
+		if len(g.more) > 0 {
+			n := len(first.DstPorts)
+			for _, m := range g.more {
 				n += len(rules[m].DstPorts)
 			}
 
 			dsts = make([]tailcfg.NetPortRange, 0, n)
-			for _, m := range g.members {
+
+			dsts = append(dsts, first.DstPorts...)
+			for _, m := range g.more {
 				dsts = append(dsts, rules[m].DstPorts...)
 			}
 		}
@@ -532,8 +565,8 @@ func (x *Expansion) hasDsts(gt *GrantTemplate, ports []tailcfg.PortRange) bool {
 // receiver is what cutting a filter reads of the node receiving it.
 type receiver struct {
 	n types.NodeView
-	// ips are its addresses, ascending; reach those and every route it
-	// serves, approved and announced, exits included.
+	// ips are its addresses, ascending; reach those and, on a router,
+	// every route it serves, approved and announced, exits included.
 	ips    []netip.Addr
 	reach  *netipx.IPSet
 	routed bool
@@ -543,21 +576,36 @@ func newReceiver(n types.NodeView) receiver {
 	rc := receiver{n: n, ips: slices.Clone(n.IPs())}
 	slices.SortFunc(rc.ips, netip.Addr.Compare)
 
+	subnets, exits := n.SubnetRoutes(), n.ExitRoutes()
+	rc.routed = len(subnets) > 0 || len(exits) > 0
+
+	// Most receivers reach their own addresses only, which need no set.
+	if !rc.routed {
+		return rc
+	}
+
 	var b netipx.IPSetBuilder
 
 	for _, ip := range rc.ips {
 		b.Add(ip)
 	}
 
-	subnets, exits := n.SubnetRoutes(), n.ExitRoutes()
 	for _, p := range slices.Concat(subnets, exits) {
 		b.AddPrefix(p)
 	}
 
 	rc.reach, _ = b.IPSet()
-	rc.routed = len(subnets) > 0 || len(exits) > 0
 
 	return rc
+}
+
+// overlaps reports whether r reaches the receiver.
+func (rc receiver) overlaps(r netipx.IPRange) bool {
+	if rc.routed {
+		return rc.reach.OverlapsRange(r)
+	}
+
+	return slices.ContainsFunc(rc.ips, r.Contains)
 }
 
 // reachesAny reports whether a * destination reaches the receiver.
@@ -584,6 +632,190 @@ func (rc receiver) hostPrefixes(sets ...ResolvedAddresses) []netip.Prefix {
 // ID, that the templates and postings describe, n among them.
 func (x *Expansion) FilterForNode(n types.NodeView) []tailcfg.FilterRule {
 	return expandFilter(x.capFilterFor(n, nil), x.holders)
+}
+
+// Filter returns the rules every node's filter is reduced from, without
+// each receiver's own: what [PolicyManager.Filter] gives, for debugging
+// and the policy's tests. Its rules are in IP form.
+func (x *Expansion) Filter() []tailcfg.FilterRule {
+	var (
+		rules []tailcfg.FilterRule
+		keys  []string
+	)
+
+	for g, gt := range x.t.grants {
+		if gt.none || gt.kind == grantVia {
+			continue
+		}
+
+		ge := &x.grants[g]
+
+		for i, ipr := range gt.ip {
+			if ge.keys[i] == "" {
+				continue
+			}
+
+			rules = append(rules, tailcfg.FilterRule{SrcIPs: ge.srcStrs, DstPorts: x.allDstPorts(gt, ipr.ports), IPProto: ipr.proto})
+			keys = append(keys, ge.keys[i])
+		}
+
+		if !ge.capGrant {
+			continue
+		}
+
+		srcs := ge.srcStrs
+		if srcs == nil {
+			srcs = []string{}
+		}
+
+		var grants []tailcfg.CapGrant
+
+		for _, id := range gt.dsts {
+			res, err := x.resolve(id)
+			if err == nil && res != nil {
+				grants = append(grants, tailcfg.CapGrant{Dsts: res.Prefixes(), CapMap: gt.app})
+			}
+		}
+
+		rules = append(rules, tailcfg.FilterRule{SrcIPs: srcs, CapGrant: grants})
+		keys = append(keys, "")
+
+		// Never nil, as the compile writes a companion to nobody.
+		srcPrefixes := make([]netip.Prefix, 0, 2*len(ge.srcSets))
+		for _, set := range ge.srcSets {
+			srcPrefixes = append(srcPrefixes, set.Prefixes()...)
+		}
+
+		for _, rule := range companionCapGrantRules(ge.dstIPs, srcPrefixes, gt.app) {
+			rules = append(rules, rule)
+			keys = append(keys, "")
+		}
+	}
+
+	return mergeKeyedRules(rules, keys)
+}
+
+// allDstPorts returns every destination of a rule of gt over ports, in the
+// compile's order: by destination, address, then port.
+func (x *Expansion) allDstPorts(gt *GrantTemplate, ports []tailcfg.PortRange) []tailcfg.NetPortRange {
+	var out []tailcfg.NetPortRange
+
+	add := func(ip string) {
+		for _, p := range ports {
+			out = append(out, tailcfg.NetPortRange{IP: ip, Ports: p})
+		}
+	}
+
+	for _, id := range gt.dsts {
+		switch s := x.table.Selector(id); {
+		case s.Kind == SelectorWildcard:
+			add("*")
+		case s.Kind.HoldsNodes():
+			for _, ip := range x.resolved[id].Strings() {
+				add(ip)
+			}
+		default:
+			for _, e := range x.t.literals[id].entries {
+				add(e.str)
+			}
+		}
+	}
+
+	return out
+}
+
+// Filters serves packet filters from templates, postings and the approved
+// subnet routes over one node list: the expansion is built on first use and
+// each node's filter once, so it costs the sessions that render, not every
+// commit. A change to any of its inputs makes new Filters, so a cached
+// filter lives until the next commit moving a policy fact of any node.
+type Filters struct {
+	t      *Templates
+	posts  Postings
+	routes []string
+	// nodes is the node list the policy compiles against, sorted by ID.
+	nodes views.Slice[types.NodeView]
+
+	once sync.Once
+	x    *Expansion
+	err  error
+
+	byNode     *xsync.Map[types.NodeID, []tailcfg.FilterRule]
+	globalOnce sync.Once
+	global     []tailcfg.FilterRule
+}
+
+// NewFilters returns the filters t expands to under posts, with approvals
+// the approved subnet routes of nodes, the node list sorted by ID.
+func NewFilters(t *Templates, posts Postings, approvals SubnetApprovals, nodes views.Slice[types.NodeView]) *Filters {
+	return &Filters{
+		t: t, posts: posts, routes: approvals.Strings(), nodes: nodes,
+		byNode: xsync.NewMap[types.NodeID, []tailcfg.FilterRule](),
+	}
+}
+
+func (f *Filters) expansion() (*Expansion, error) {
+	f.once.Do(func() {
+		f.x, f.err = NewExpansion(f.t, f.posts, f.routes, f.node)
+	})
+
+	return f.x, f.err
+}
+
+// node looks id up in the sorted node list.
+func (f *Filters) node(id types.NodeID) (types.NodeView, bool) {
+	i, found := sort.Find(f.nodes.Len(), func(i int) int { return cmp.Compare(id, f.nodes.At(i).ID()) })
+	if !found {
+		return types.NodeView{}, false
+	}
+
+	return f.nodes.At(i), true
+}
+
+var errUnlisted = errors.New("node is not in the policy's node list")
+
+// filterCuts counts the node filters [Filters.ForNode] cut, cached or not.
+var filterCuts atomic.Uint64
+
+// FilterCuts returns how many node filters served filters have cut, so a
+// benchmark can tell what a cache keyed on input changes recomputes.
+func FilterCuts() uint64 { return filterCuts.Load() }
+
+// ForNode returns the packet filter of node id, cut for the list's own
+// view of it, so no caller's view can stand for another snapshot's facts:
+// the same slice for every caller. Concurrent misses keep the first.
+func (f *Filters) ForNode(id types.NodeID) ([]tailcfg.FilterRule, error) {
+	if rules, ok := f.byNode.Load(id); ok {
+		return rules, nil
+	}
+
+	n, ok := f.node(id)
+	if !ok {
+		return nil, fmt.Errorf("%w: %d", errUnlisted, id)
+	}
+
+	x, err := f.expansion()
+	if err != nil {
+		return nil, err
+	}
+
+	filterCuts.Add(1)
+
+	rules, _ := f.byNode.LoadOrStore(id, x.FilterForNode(n))
+
+	return rules, nil
+}
+
+// Global returns [Expansion.Filter], built once.
+func (f *Filters) Global() ([]tailcfg.FilterRule, error) {
+	x, err := f.expansion()
+	if err != nil {
+		return nil, err
+	}
+
+	f.globalOnce.Do(func() { f.global = x.Filter() })
+
+	return f.global, nil
 }
 
 // FilterShapes counts the shapes cutting filters met, so a test can tell
@@ -631,10 +863,12 @@ const (
 	shapeVia
 )
 
-// cut collects one receiver's cap-form filter.
+// cut collects one receiver's cap-form filter. pos and shapes are kept
+// only when counting.
 type cut struct {
 	f      capFilter
 	rc     receiver
+	count  bool
 	pos    []int64
 	shapes []ruleShape
 
@@ -651,17 +885,32 @@ type cut struct {
 // rule of key at the least of anchor and the receiver's own rules of key.
 // srcs are its sources expanded, when the cut knows them.
 func (c *cut) emit(rule tailcfg.FilterRule, class, key string, srcs []string, anchor, pos int64, shape ruleShape) {
+	// Classes stay nil, every rule regular, until a via rule needs one.
+	if class != "" && c.f.classes == nil {
+		c.f.classes = make([]string, len(c.f.rules), cap(c.f.rules))
+	}
+
+	if c.f.classes != nil {
+		c.f.classes = append(c.f.classes, class)
+	}
+
 	c.f.rules = append(c.f.rules, rule)
-	c.f.classes = append(c.f.classes, class)
 	c.f.keys = append(c.f.keys, key)
 	c.f.srcs = append(c.f.srcs, srcs)
 	c.f.anchors = append(c.f.anchors, anchor)
-	c.pos = append(c.pos, pos)
-	c.shapes = append(c.shapes, shape)
+
+	if c.count {
+		c.pos = append(c.pos, pos)
+		c.shapes = append(c.shapes, shape)
+	}
 }
 
 // placeOwn records a rule of the receiver's own at pos, emitted or not.
 func (c *cut) placeOwn(key string, pos int64) {
+	if c.own == nil {
+		c.own = map[string]int64{}
+	}
+
 	if at, ok := c.own[key]; !ok || pos < at {
 		c.own[key] = pos
 	}
@@ -753,7 +1002,7 @@ func (c *cut) finish(st *FilterShapes) {
 // every node's filter is cut from, each with where it merges. st, when not
 // nil, counts what it cut.
 func (x *Expansion) capFilterFor(n types.NodeView, st *FilterShapes) capFilter {
-	c := &cut{f: capFilter{anchors: []int64{}}, rc: newReceiver(n), own: map[string]int64{}}
+	c := &cut{f: capFilter{anchors: []int64{}}, rc: newReceiver(n), count: st != nil}
 
 	for g, gt := range x.t.grants {
 		if gt.none {
@@ -881,7 +1130,7 @@ func (x *Expansion) dstPorts(gt *GrantTemplate, ports []tailcfg.PortRange, rc re
 			}
 		default:
 			for _, e := range x.t.literals[id].entries {
-				if rc.reach.OverlapsRange(e.r) {
+				if rc.overlaps(e.r) {
 					add(e.str)
 				}
 			}
@@ -962,7 +1211,7 @@ func cutOwn(o ownRule, rc receiver) (tailcfg.FilterRule, bool) {
 	var dsts []tailcfg.NetPortRange
 
 	for i, d := range rule.DstPorts {
-		if rc.reach.OverlapsRange(o.ranges[i]) {
+		if rc.overlaps(o.ranges[i]) {
 			dsts = append(dsts, d)
 		}
 	}
@@ -1161,7 +1410,7 @@ func (x *Expansion) cutVia(c *cut, g int, gt *GrantTemplate, ge *grantExpansion)
 		var ports []tailcfg.NetPortRange
 
 		for _, d := range dsts {
-			if !rc.reach.OverlapsRange(d.r) {
+			if !rc.overlaps(d.r) {
 				continue
 			}
 
@@ -1220,6 +1469,11 @@ type FilterAudit struct {
 	// TemplatesAudited reports that these templates matched a build from
 	// scratch already: templates never change, so they still do.
 	TemplatesAudited bool
+
+	// Served, when set, is what the world serves from these inputs: its
+	// filters, as sessions have cached them, are held against the oracle
+	// as well as an expansion built here.
+	Served *Filters
 }
 
 // FilterReport counts what an audit compared.
@@ -1305,8 +1559,34 @@ func AuditFilters(a FilterAudit) (FilterReport, error) {
 			return rep, fmt.Errorf("%w: node %d:\ncompile  %v\nexpanded %v", errFilterAudit, n.ID(), want, got)
 		}
 
+		if a.Served != nil {
+			served, err := a.Served.ForNode(n.ID())
+			if err != nil {
+				return rep, err
+			}
+
+			if !reflect.DeepEqual(want, served) {
+				return rep, fmt.Errorf("%w: node %d:\ncompile %v\nserved  %v", errFilterAudit, n.ID(), want, served)
+			}
+		}
+
 		rep.Nodes++
 		rep.Rules += len(got)
+	}
+
+	if got := x.Filter(); !reflect.DeepEqual(oracle.filter, got) {
+		return rep, fmt.Errorf("%w: global filter:\ncompile  %v\nexpanded %v", errFilterAudit, oracle.filter, got)
+	}
+
+	if a.Served != nil {
+		served, err := a.Served.Global()
+		if err != nil {
+			return rep, err
+		}
+
+		if !reflect.DeepEqual(oracle.filter, served) {
+			return rep, fmt.Errorf("%w: global filter:\ncompile %v\nserved  %v", errFilterAudit, oracle.filter, served)
+		}
 	}
 
 	rep.Shapes.SelfByAddress = x.byAddress

@@ -22,11 +22,13 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/juanfont/headscale/hscontrol/graph"
+	"github.com/juanfont/headscale/hscontrol/policy/policyutil"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/views"
 )
 
 // expansionOf builds the expansion of src's compile pm over users and
@@ -95,9 +97,110 @@ func requireExpandsLikeCompile(t *testing.T, x *Expansion, pm *PolicyManager, no
 		rules += len(got)
 	}
 
+	if got := x.Filter(); !reflect.DeepEqual(pm.filter, got) {
+		require.Failf(t, "expanded global filter differs from the compile's", "%s:\n%s",
+			fmt.Sprint(msgAndArgs...), cmp.Diff(pm.filter, got, inOrderOpts...))
+	}
+
+	// Filters look nodes up in a list sorted by ID, as the world keeps it.
+	list := slices.Clone(nodes)
+	slices.SortFunc(list, func(a, b *types.Node) int { return int(a.ID) - int(b.ID) }) //nolint:gosec // node IDs fit
+
+	f := NewFilters(x.t, x.posts, SubnetApprovals{strs: x.routes}, list.ViewSlice())
+	requireServedAgreesWithGlobal(t, f, list.ViewSlice(), msgAndArgs...)
+
 	shapes.SelfByAddress = x.byAddress
 
 	return rules, shapes
+}
+
+// globalAgreement counts, per top-level test, the nodes whose served filter
+// requireServedAgreesWithGlobal held to the global filter's reduction and
+// those with rules of their own, which it cannot be.
+var globalAgreement = struct {
+	sync.Mutex
+
+	counts map[string][2]int
+}{counts: map[string][2]int{}}
+
+// agreementOf returns the counts of the top-level test t runs under.
+func agreementOf(t *testing.T) (int, int) {
+	t.Helper()
+
+	globalAgreement.Lock()
+	defer globalAgreement.Unlock()
+
+	root, _, _ := strings.Cut(t.Name(), "/")
+	c := globalAgreement.counts[root]
+
+	return c[0], c[1]
+}
+
+// requireServedAgreesWithGlobal ties what nodes are served to the global
+// filter the policy's tests, State.Filter and the debug dump read, which an
+// independent construction writes ([Expansion.Filter] against the cut of
+// [Expansion.capFilterFor]): for every node without rules of its own, the
+// global filter reduced to it as the compile reduces it is exactly what it
+// is served. A node with rules of its own — an owner under an
+// autogroup:self grant, every exit node under one, a node carrying a via
+// grant's tag — is sent rules the global filter does not hold, which can
+// also merge with shared ones and move where merged rules sit, so it is
+// only counted.
+func requireServedAgreesWithGlobal(t *testing.T, f *Filters, nodes views.Slice[types.NodeView], msgAndArgs ...any) {
+	t.Helper()
+
+	global, err := f.Global()
+	require.NoError(t, err)
+
+	x, err := f.expansion()
+	require.NoError(t, err)
+
+	reducer := policyutil.NewReducer(global)
+
+	var checked, own int
+
+	for _, n := range nodes.All() {
+		if hasOwnRules(x, n) {
+			own++
+
+			continue
+		}
+
+		served, err := f.ForNode(n.ID())
+		require.NoError(t, err)
+
+		if want := reducer.Reduce(n); !reflect.DeepEqual(want, served) {
+			require.Failf(t, "the global filter reduced to a node differs from what it is served", "node %d %s:\n%s",
+				n.ID(), fmt.Sprint(msgAndArgs...), cmp.Diff(want, served, inOrderOpts...))
+		}
+
+		checked++
+	}
+
+	root, _, _ := strings.Cut(t.Name(), "/")
+
+	globalAgreement.Lock()
+	c := globalAgreement.counts[root]
+	globalAgreement.counts[root] = [2]int{c[0] + checked, c[1] + own}
+	globalAgreement.Unlock()
+}
+
+// hasOwnRules reports whether n gets, or places merged rules by, a rule
+// only it receives: a self or via rule, reaching it or not.
+func hasOwnRules(x *Expansion, n types.NodeView) bool {
+	c := &cut{f: capFilter{anchors: []int64{}}, rc: newReceiver(n), count: true}
+
+	for g, gt := range x.t.grants {
+		switch {
+		case gt.none:
+		case gt.kind == grantSelf:
+			x.cutSelf(c, g)
+		case gt.kind == grantVia:
+			x.cutVia(c, g, gt, &x.grants[g])
+		}
+	}
+
+	return len(c.f.rules) > 0 || len(c.own) > 0 || c.unreached > 0
 }
 
 type expandTally struct {
@@ -144,6 +247,8 @@ func TestGoldenExpander(t *testing.T) {
 		slices.Sort(tally.netmapRouted)
 		t.Logf("  announcing routes: %v", tally.netmapRouted)
 
+		checked, own := agreementOf(t)
+		t.Logf("served ≡ global filter reduced: %d node filters held to it, %d nodes with rules of their own skipped", checked, own)
 		t.Logf("incremental: %d policy loads replayed by joins and leaves; policy-generation: %d steps, %d captured filters against SaaS",
 			tally.incremental, tally.steps, tally.stepFilters)
 	})

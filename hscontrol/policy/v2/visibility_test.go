@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"net/netip"
 	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -1503,10 +1504,32 @@ func TestSidesRandomDifferential(t *testing.T) {
 					}
 
 					rep.Add(got)
+
+					// The same states serve filters: each node's against the
+					// compile, and against the global filter reduced to it.
+					filters := NewFilters(m.t, m.posts, m.appr, m.list.ViewSlice())
+					for _, n := range m.list {
+						want, err := m.pm.FilterForNode(n.View())
+						require.NoError(t, err)
+
+						served, err := filters.ForNode(n.ID)
+						require.NoError(t, err)
+
+						if !reflect.DeepEqual(want, served) {
+							t.Fatalf("HEADSCALE_SIDES_SEED=%d public=%t round %d step %d: node %d served %v, the compile %v\npolicy:\n%s\nnodes:\n%s",
+								seed, public, round, step, n.ID, served, want, pol, describeNodes(m.list))
+						}
+					}
+
+					requireServedAgreesWithGlobal(t, filters, m.list.ViewSlice(), "seed", seed, "public", public, "round", round, "step", step)
 				}
 			}
 
-			t.Logf("compiled %d of %d: %+v", compiled, rounds, rep)
+			checked, own := agreementOf(t)
+			t.Logf("compiled %d of %d: %+v; served ≡ global filter reduced on %d node filters (%d with own rules skipped)",
+				compiled, rounds, rep, checked, own)
+			require.Positive(t, checked, "node filters held to the global filter")
+			require.Positive(t, own, "nodes with own rules met")
 			require.Greater(t, compiled, rounds/2, "policies compiled")
 
 			// A short run is too few rounds to reach the rarest shapes.

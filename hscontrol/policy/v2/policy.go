@@ -2853,15 +2853,24 @@ func (pm *PolicyManager) viaPrep() *viaPrep {
 	return pm.via
 }
 
-// ViaRoutes binds immutable live elections to the policy defining their scopes.
-// An empty election still applies that policy's exclusions and exit steering.
+// ViaRoutes binds immutable live elections to what defines their scopes
+// and steering: a via plan and the side sets it steers by, as served (see
+// [ElectViaPlan]), or a compiled policy, which the policy audit holds the
+// served elections against. An empty election still applies its binding's
+// exclusions and exit steering.
 type ViaRoutes struct {
-	policy  *PolicyManager
+	policy *PolicyManager
+
+	plan  *ViaPlan
+	sides Sides
+
 	winners *graph.Map[viaKey, types.NodeID]
 }
 
-// WithoutPolicy retains election winners for change tracking without owning the
-// compiled policy. The result supports ChangedNodes, not policy-based rendering.
+// WithoutPolicy retains only the election winners, for change tracking,
+// dropping the binding — a compiled policy, or a via plan and the sides —
+// so a holder pins neither. The result supports ChangedNodes, not
+// steering.
 func (v *ViaRoutes) WithoutPolicy() *ViaRoutes {
 	if v == nil {
 		return nil
@@ -3095,9 +3104,22 @@ func sameNodeIDSlice(a, b views.Slice[types.NodeID]) bool {
 	return true
 }
 
-// ForPeer resolves routes using only this result's policy and live elections.
+// ForPeer resolves routes using only this result's binding and live
+// elections.
 func (v *ViaRoutes) ForPeer(viewer, peer types.NodeView) types.ViaRouteResult {
 	if v == nil {
+		return types.ViaRouteResult{}
+	}
+
+	if v.plan != nil {
+		return v.plan.Steer(v.sides, viewer, peer, func(key string, prefix netip.Prefix) types.NodeID {
+			id, _ := v.winners.Get(viaKey{key, prefix})
+
+			return id
+		})
+	}
+
+	if v.policy == nil {
 		return types.ViaRouteResult{}
 	}
 
@@ -3150,8 +3172,14 @@ func (v *ViaRoutes) HasOutage(available func(types.NodeID) bool) bool {
 		return false
 	}
 
-	prep := v.policy.viaPrep()
-	if prep == nil {
+	var scopes map[netip.Prefix][]viaScope
+
+	switch {
+	case v.plan != nil:
+		scopes = v.plan.scopes
+	case v.policy.viaPrep() != nil:
+		scopes = v.policy.viaPrep().scopes
+	default:
 		return false
 	}
 
@@ -3166,7 +3194,7 @@ func (v *ViaRoutes) HasOutage(available func(types.NodeID) bool) bool {
 		// is not one.
 		scoped, anyAvailable := false, false
 
-		for _, scope := range prep.scopes[k.prefix] {
+		for _, scope := range scopes[k.prefix] {
 			if scope.via != k.via {
 				continue
 			}
@@ -3404,6 +3432,21 @@ func (pm *PolicyManager) DebugString() string {
 		return "PolicyManager is not setup"
 	}
 
+	return pm.debugString("Compiled filter (this compile's own global rules)", pm.filter)
+}
+
+// DebugStringFor is [PolicyManager.DebugString] showing filter, the global
+// filter served, and its matchers, in place of the compile's.
+func (pm *PolicyManager) DebugStringFor(filter []tailcfg.FilterRule) string {
+	if pm == nil {
+		return "PolicyManager is not setup"
+	}
+
+	return pm.debugString("Served global filter (expanded from the policy's templates and membership; "+
+		"each node is sent its reduction, with its own autogroup:self and via rules)", filter)
+}
+
+func (pm *PolicyManager) debugString(filterLabel string, filter []tailcfg.FilterRule) string {
 	var sb strings.Builder
 
 	fmt.Fprintf(&sb, "PolicyManager (v%d):\n\n", pm.Version())
@@ -3419,7 +3462,7 @@ func (pm *PolicyManager) DebugString() string {
 		}
 	}
 
-	fmt.Fprintf(&sb, "AutoApprover (%d):\n", len(pm.autoApproveMap))
+	fmt.Fprintf(&sb, "AutoApprover (%d, the compile's):\n", len(pm.autoApproveMap))
 
 	for prefix, approveAddrs := range pm.autoApproveMap {
 		fmt.Fprintf(&sb, "\t%s:\n", prefix)
@@ -3431,7 +3474,7 @@ func (pm *PolicyManager) DebugString() string {
 
 	sb.WriteString("\n\n")
 
-	fmt.Fprintf(&sb, "TagOwner (%d):\n", len(pm.tagOwnerMap))
+	fmt.Fprintf(&sb, "TagOwner (%d, the compile's):\n", len(pm.tagOwnerMap))
 
 	for prefix, tagOwners := range pm.tagOwnerMap {
 		fmt.Fprintf(&sb, "\t%s:\n", prefix)
@@ -3443,26 +3486,25 @@ func (pm *PolicyManager) DebugString() string {
 
 	sb.WriteString("\n\n")
 
-	if pm.filter != nil {
-		filter, err := json.MarshalIndent(pm.filter, "", "  ")
+	if filter != nil {
+		out, err := json.MarshalIndent(filter, "", "  ")
 		if err == nil {
-			sb.WriteString("Compiled filter:\n")
-			sb.Write(filter)
+			sb.WriteString(filterLabel + ":\n")
+			sb.Write(out)
 			sb.WriteString("\n\n")
 		}
 	}
 
 	sb.WriteString("\n\n")
-	sb.WriteString("Matchers:\n")
-	sb.WriteString("an internal structure used to filter nodes and routes\n")
+	sb.WriteString("Matchers of that filter:\n")
 
-	for _, match := range pm.matchers {
+	for _, match := range matcher.MatchesFromFilterRules(filter) {
 		sb.WriteString(match.DebugString())
 		sb.WriteString("\n")
 	}
 
 	sb.WriteString("\n\n")
-	sb.WriteString("Nodes:\n")
+	sb.WriteString("Nodes the compile ran against:\n")
 
 	for _, node := range pm.nodes.All() {
 		sb.WriteString(node.String())

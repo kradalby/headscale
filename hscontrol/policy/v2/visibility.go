@@ -2151,14 +2151,31 @@ func unionSorted(lists [][]types.NodeID) []types.NodeID {
 
 // view returns id's view.
 func (kc *keyedClasses) view(id types.NodeID) []types.NodeID {
+	v, _ := kc.viewOf(id)
+
+	return v
+}
+
+// viewOf returns id's view and the side set it is keyed by.
+func (kc *keyedClasses) viewOf(id types.NodeID) ([]types.NodeID, RoleSet) {
 	rs, ok := kc.sides.sets.Get(id)
 	if !ok {
-		return nil
+		return nil, RoleSet{}
 	}
 
 	v, _ := kc.views.Get(rs)
 
-	return v
+	return v, rs
+}
+
+// ViewAndSideSet is [PeerClasses.View] with the side set id's class is
+// keyed by, the one [Sides.Of] gives: classes keyed otherwise have none.
+func (c *PeerClasses) ViewAndSideSet(id types.NodeID) ([]types.NodeID, RoleSet) {
+	if c == nil || c.keyed == nil {
+		return c.View(id), RoleSet{}
+	}
+
+	return c.keyed.viewOf(id)
 }
 
 // ViewsComputed returns how many class views and atom views every update
@@ -2866,17 +2883,87 @@ func ElectVia(previous *ViaWinners, plan *ViaPlan, touched map[netip.Prefix]stru
 	return &ViaWinners{plan: plan, winners: e.Done()}
 }
 
+// ElectViaPlan is [ElectVia] over previous's winners, bound to plan and
+// sides for steering: the via elections the world serves. It reports
+// whether a winner moved.
+func ElectViaPlan(
+	previous *ViaRoutes,
+	plan *ViaPlan,
+	sides Sides,
+	touched map[netip.Prefix]struct{},
+	elect func(views.Slice[types.NodeID], types.NodeID) (types.NodeID, bool),
+) (*ViaRoutes, bool) {
+	var (
+		prev *ViaWinners
+		was  *graph.Map[viaKey, types.NodeID]
+	)
+
+	if previous != nil {
+		prev, was = &ViaWinners{plan: previous.plan, winners: previous.winners}, previous.winners
+	}
+
+	won := ElectVia(prev, plan, touched, elect)
+
+	// A first election that elects nobody moves nothing.
+	moved := won.winners != was && (was != nil || won.winners.Len() > 0)
+
+	// An unmoved election keeps its binding, so sessions see no new one.
+	if previous != nil && won.winners == was && previous.plan == plan && previous.sides.Same(sides) {
+		return previous, false
+	}
+
+	return &ViaRoutes{plan: plan, sides: sides, winners: won.winners}, moved
+}
+
+// WithSides returns v steering by sides, v itself when they are the sides
+// it steers by.
+func (v *ViaRoutes) WithSides(sides Sides) *ViaRoutes {
+	if v == nil || v.plan == nil || v.sides.Same(sides) {
+		return v
+	}
+
+	return &ViaRoutes{plan: v.plan, sides: sides, winners: v.winners}
+}
+
+// Plan returns the via plan v is bound to, nil for a compiled policy's.
+func (v *ViaRoutes) Plan() *ViaPlan {
+	if v == nil {
+		return nil
+	}
+
+	return v.plan
+}
+
 // Elects reports whether r holds exactly the winners elect gives v's
 // scopes, each seeded with r's own winner. It allocates nothing while they
 // agree, so an audit can run it at every election.
 func (v *ViaPlan) Elects(r *ViaRoutes, elect func(views.Slice[types.NodeID], types.NodeID) (types.NodeID, bool)) bool {
+	return electsScopes(v.scopes, r, elect)
+}
+
+// ElectsVia is [ViaPlan.Elects] over the via scopes of pm's compile: the
+// policy audit's check that the elections served are the compile's.
+func (pm *PolicyManager) ElectsVia(r *ViaRoutes, elect func(views.Slice[types.NodeID], types.NodeID) (types.NodeID, bool)) bool {
+	var scopes map[netip.Prefix][]viaScope
+	if prep := pm.viaPrep(); prep != nil {
+		scopes = prep.scopes
+	}
+
+	return electsScopes(scopes, r, elect)
+}
+
+func electsScopes(
+	scopes map[netip.Prefix][]viaScope,
+	r *ViaRoutes,
+	elect func(views.Slice[types.NodeID], types.NodeID) (types.NodeID, bool),
+) bool {
 	var winners *graph.Map[viaKey, types.NodeID]
 	if r != nil {
 		winners = r.winners
 	}
 
-	for p, scopes := range v.scopes {
-		for _, scope := range scopes {
+	for p, ss := range scopes {
+		for _, scope := range ss {
 			k := viaKey{scope.via, p}
 			incumbent, had := winners.Get(k)
 
@@ -2888,7 +2975,13 @@ func (v *ViaPlan) Elects(r *ViaRoutes, elect func(views.Slice[types.NodeID], typ
 	}
 
 	for k := range winners.All() {
-		if _, ok := v.candidates(k); !ok {
+		scoped := false
+
+		for _, s := range scopes[k.prefix] {
+			scoped = scoped || s.via == k.via
+		}
+
+		if !scoped {
 			return false
 		}
 	}

@@ -138,3 +138,15 @@ func PolicyManagerFuncsForTest(pol []byte) []func([]types.User, views.Slice[type
 func ValidatePolicy(pol []byte, users []types.User, nodes views.Slice[types.NodeView]) error {
 	return policyv2.ValidatePolicy(pol, users, nodes)
 }
+
+// ValidatePolicyAgainst is [ValidatePolicy] with the tests run against the
+// global filter global expands for the candidate, see
+// [policyv2.ValidatePolicyAgainst].
+func ValidatePolicyAgainst(
+	pol []byte,
+	users []types.User,
+	nodes views.Slice[types.NodeView],
+	global func(*policyv2.PolicyManager) ([]tailcfg.FilterRule, error),
+) error {
+	return policyv2.ValidatePolicyAgainst(pol, users, nodes, global)
+}

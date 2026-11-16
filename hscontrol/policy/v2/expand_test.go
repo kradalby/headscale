@@ -409,3 +409,43 @@ func TestAuditFiltersRequiresSortedNodes(t *testing.T) {
 	require.NoError(t, audit(nodes))
 	require.ErrorIs(t, audit(reversed), errFilterAuditOrder)
 }
+
+// TestFiltersServeTheirOwnNodes pins the served filters' cache: a node's
+// filter is cut once, from the list's own view of the node, and shared; a
+// node the list lacks gets an error, not an empty filter.
+func TestFiltersServeTheirOwnNodes(t *testing.T) {
+	t.Parallel()
+
+	users := types.Users{{ID: 1, Name: "alice"}}
+	alice := &users[0]
+	nodes := quirkNodes(
+		quirkNode{name: "a1", user: alice, v4: "100.64.0.1"},
+		quirkNode{name: "a2", user: alice, v4: "100.64.0.2"},
+	)
+
+	const src = `{"acls": [{"action": "accept", "src": ["alice@"], "dst": ["alice@:22"]}]}`
+
+	pm, err := NewPolicyManager([]byte(src), users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	x, roles := expansionOf(t, pm, users, nodeMapOf(nodes))
+	f := NewFilters(x.t, Postings{}.Update(roles), SubnetApprovals{}.Update(nodeMapOf(nodes)), nodes.ViewSlice())
+
+	first, err := f.ForNode(nodes[0].ID)
+	require.NoError(t, err)
+
+	want, err := pm.FilterForNode(nodes[0].View())
+	require.NoError(t, err)
+	require.Equal(t, want, first)
+
+	again, err := f.ForNode(nodes[0].ID)
+	require.NoError(t, err)
+	assert.Same(t, &first[0], &again[0], "readers of one node share its filter")
+
+	_, err = f.ForNode(99)
+	require.ErrorIs(t, err, errUnlisted)
+
+	global, err := f.Global()
+	require.NoError(t, err)
+	assert.Equal(t, pm.filter, global)
+}

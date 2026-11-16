@@ -182,14 +182,37 @@ func (rs RoleSet) String() string {
 // only by the user they carry, not the UserID they record, as the
 // compile matches users through the loaded user.
 func (us *UserSets) roleSetOf(n *types.Node) RoleSet {
+	var uid uint
+	if n.User != nil {
+		uid = n.User.ID
+	}
+
+	return us.roleSetFor(n.IsTagged(), views.SliceOf(n.Tags), uid, n.User != nil)
+}
+
+// roleSetOfView is roleSetOf for a node's view.
+func (us *UserSets) roleSetOfView(n types.NodeView) RoleSet {
+	u := n.User()
+
+	var uid uint
+	if u.Valid() {
+		uid = u.ID()
+	}
+
+	return us.roleSetFor(n.IsTagged(), n.Tags(), uid, u.Valid())
+}
+
+// roleSetFor is the roles of a node tagged with tags, or untagged with the
+// loaded user uid when it has one.
+func (us *UserSets) roleSetFor(tagged bool, tags views.Slice[string], uid uint, hasUser bool) RoleSet {
 	t := us.table
 
 	var buf [8]Role
 
 	roles := buf[:0]
 
-	if n.IsTagged() {
-		for _, tag := range n.Tags {
+	if tagged {
+		for _, tag := range tags.All() {
 			if id, ok := t.tags[tag]; ok {
 				roles = append(roles, SelectorRole(id))
 			}
@@ -203,14 +226,14 @@ func (us *UserSets) roleSetOf(n *types.Node) RoleSet {
 			roles = append(roles, SelectorRole(t.member))
 		}
 
-		if n.User != nil {
-			sels, _ := us.byUser.Get(n.User.ID)
+		if hasUser {
+			sels, _ := us.byUser.Get(uid)
 			for _, id := range sels {
 				roles = append(roles, SelectorRole(id))
 			}
 
 			if t.self {
-				roles = append(roles, OwnerRole(n.User.ID))
+				roles = append(roles, OwnerRole(uid))
 			}
 		}
 	}
@@ -336,6 +359,17 @@ func buildRoles(us *UserSets, nodes *NodeMap) Roles {
 	return Roles{sets: graph.NewMap(graph.Same[RoleSet], sets), users: us, from: nodes, computed: len(sets)}
 }
 
+// rolesOfViews computes every listed node's role set, for a caller holding
+// views rather than the node table; the result cannot be updated.
+func rolesOfViews(us *UserSets, list views.Slice[types.NodeView]) Roles {
+	sets := make(map[types.NodeID]RoleSet, list.Len())
+	for _, n := range list.All() {
+		sets[n.ID()] = us.roleSetOfView(n)
+	}
+
+	return Roles{sets: graph.NewMap(graph.Same[RoleSet], sets), users: us, computed: len(sets)}
+}
+
 // Postings holds, for each role, the nodes holding it: the members of
 // each selector, and each owner's untagged nodes. Updating it edits only
 // the lists of the roles a node entered or left.
@@ -443,6 +477,29 @@ func (a SubnetApprovals) Update(nodes *NodeMap) SubnetApprovals {
 	slices.Sort(strs)
 
 	return SubnetApprovals{byRoute: next, strs: strs}
+}
+
+// approvalsOfViews is [SubnetApprovals.Update] from scratch over views; the
+// result cannot be updated.
+func approvalsOfViews(list views.Slice[types.NodeView]) SubnetApprovals {
+	seen := map[netip.Prefix]struct{}{}
+
+	for _, n := range list.All() {
+		for _, p := range n.ApprovedRoutes().All() {
+			if !tsaddr.IsExitRoute(p) {
+				seen[p] = struct{}{}
+			}
+		}
+	}
+
+	strs := make([]string, 0, len(seen))
+	for p := range seen {
+		strs = append(strs, p.String())
+	}
+
+	slices.Sort(strs)
+
+	return SubnetApprovals{strs: strs}
 }
 
 var errMembershipAudit = errors.New("membership differs")
