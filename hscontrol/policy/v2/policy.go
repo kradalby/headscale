@@ -1503,6 +1503,13 @@ func (pm *PolicyManager) addNodeOnlyPeers(c *PeerClasses, nodes views.Slice[type
 		if os := intersectSorted(owners, srcs); len(os) > 0 {
 			give(os, dsts)
 			give(dsts, os)
+
+			// Exit nodes list the sources of a capability to the internet,
+			// a node's own rules' as well as the shared ones', as the pair
+			// scan does.
+			if m.CapDestsIsTheInternet() {
+				give(idx.exits, os)
+			}
 		}
 
 		if od := intersectSorted(owners, dsts); len(od) > 0 {

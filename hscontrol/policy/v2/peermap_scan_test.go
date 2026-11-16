@@ -2906,3 +2906,31 @@ func BenchmarkMatcherSideRemap(b *testing.B) {
 func bitSet(side []uint64, k int) bool {
 	return side != nil && side[k/64]&(1<<(k%64)) != 0 //nolint:mnd
 }
+
+// TestPeerClassesListOwnCapabilitySourcesOnExit pins that an exit node
+// lists the sources of a node's own capability to the internet, as the pair
+// scan does: a self app grant whose owner holds a public address gives the
+// owner's self rules a capability to the internet, and those rules are the
+// owner's own, not the shared ones. The classes once listed only the shared
+// rules' sources, so the exit node saw nobody there.
+func TestPeerClassesListOwnCapabilitySourcesOnExit(t *testing.T) {
+	alice := &scanUsers[0]
+	exit := []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}
+	public, private := netip.MustParseAddr("8.8.8.1"), netip.MustParseAddr("100.64.0.2")
+	nodes := types.Nodes{
+		{ID: 1, IPv4: &public, User: alice, UserID: &alice.ID, Hostinfo: &tailcfg.Hostinfo{}},
+		{ID: 2, IPv4: &private, User: alice, UserID: &alice.ID, Hostinfo: &tailcfg.Hostinfo{}},
+		{ID: 3, IPv4: new(netip.MustParseAddr("100.64.0.3")), Tags: []string{"tag:exit"}, Hostinfo: &tailcfg.Hostinfo{RoutableIPs: exit}, ApprovedRoutes: exit},
+	}
+
+	pol := []byte(`{"tagOwners": {"tag:exit": []}, "grants": [
+		{"src": ["autogroup:member"], "dst": ["autogroup:self"], "app": {"example.com/cap/x": [{}]}}]}`)
+
+	pm, err := NewPolicyManager(pol, scanUsers, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	classes := pm.BuildPeerClasses(nodes.ViewSlice(), nil)
+	require.Equal(t, []types.NodeID{1, 2}, classes.Peers(3), "the exit node lists the owner nodes its own rule's capability reaches the internet from")
+	require.Equal(t, []types.NodeID{2}, classes.Peers(1), "the listing is one-way")
+	require.NoError(t, pm.AuditPeers(classes, nodes.ViewSlice()))
+}
