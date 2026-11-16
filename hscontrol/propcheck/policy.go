@@ -148,7 +148,8 @@ func policyJSON(t require.TestingT, v any) []byte {
 }
 
 // PacketSelector is one bounded input selector, not a policy parser. The zero
-// value selects every node; at most one field is populated by the generator.
+// value selects every address in the bounded tailnet domain; at most one field
+// is populated by the generator.
 type PacketSelector struct {
 	User string
 	Tag  string
@@ -171,7 +172,7 @@ func (s PacketSelector) alias() string {
 func (s PacketSelector) matches(m World, n *types.Node, ip netip.Addr) bool {
 	switch {
 	case s.User != "":
-		if len(n.Tags) != 0 || n.UserID == nil {
+		if n == nil || len(n.Tags) != 0 || n.UserID == nil {
 			return false
 		}
 
@@ -183,7 +184,7 @@ func (s PacketSelector) matches(m World, n *types.Node, ip netip.Addr) bool {
 
 		return false
 	case s.Tag != "":
-		return slices.Contains(n.Tags, s.Tag)
+		return n != nil && slices.Contains(n.Tags, s.Tag)
 	case s.IP.IsValid():
 		return s.IP == ip
 	default:
@@ -199,7 +200,7 @@ type PacketGrant struct {
 
 // PacketIntent is immutable after construction so document history can retain
 // it across replacements, reordering and duplicate grants without aliasing.
-// It specifies only new TCP/UDP flows between distinct nodes, not return traffic,
+// It specifies only new TCP/UDP filter decisions to live nodes, not return traffic,
 // subnet routing, SSH, app capabilities or general alias interpretation.
 type PacketIntent struct {
 	Grants []PacketGrant
@@ -324,13 +325,37 @@ func (p *PacketIntent) Allows(m World, src, dst types.NodeID, srcIP, dstIP netip
 	return false
 }
 
+// packetSources resolves probes against this World, including retained Worlds.
+// Extra addresses are owned test inputs in the wildcard tailnet address domain;
+// absence removes identity, not literal-IP or wildcard authorization.
+func packetSources(m World, extra []netip.Addr) map[netip.Addr]types.NodeID {
+	sources := map[netip.Addr]types.NodeID{
+		netip.MustParseAddr("100.64.255.254"):       0,
+		netip.MustParseAddr("fd7a:115c:a1e0::ffff"): 0,
+	}
+	for _, ip := range extra {
+		sources[ip] = 0
+	}
+
+	for id, n := range m.Nodes {
+		for _, ip := range []*netip.Addr{n.IPv4, n.IPv6} {
+			if ip != nil {
+				sources[*ip] = id
+			}
+		}
+	}
+
+	return sources
+}
+
 // CheckPacketIntent evaluates the consumer's actual rules using the pinned
 // Tailscale filter (new TCP SYN or UDP, no shared conntrack). It returns the union
 // of peers with incoming or outgoing allowed witnesses. This is necessary
 // visibility, not exact membership: same-user peers may have no allowed flow.
 // Probes cover every generated range and its neighbors even after revocation;
 // wider manual ranges retain bounded probes only while present in the intent.
-func CheckPacketIntent(t require.TestingT, m World, intent *PacketIntent, destination types.NodeID, rules []tailcfg.FilterRule) []types.NodeID {
+// Extra sources retain retired input addresses; only current owners require peers.
+func CheckPacketIntent(t require.TestingT, m World, intent *PacketIntent, destination types.NodeID, rules []tailcfg.FilterRule, extraSources ...netip.Addr) []types.NodeID {
 	dst := m.Nodes[destination]
 	require.NotNil(t, dst)
 
@@ -383,34 +408,40 @@ func CheckPacketIntent(t require.TestingT, m World, intent *PacketIntent, destin
 
 	var peers []types.NodeID
 
-	for _, id := range slices.Sorted(maps.Keys(m.Nodes)) {
+	sources := packetSources(m, extraSources)
+	for _, srcIP := range slices.SortedFunc(maps.Keys(sources), netip.Addr.Compare) {
+		id := sources[srcIP]
 		if id == destination {
 			continue
 		}
 
-		src := m.Nodes[id]
+		dstIP := dst.IPv6
+		if srcIP.Is4() {
+			dstIP = dst.IPv4
+		}
+
+		if dstIP == nil {
+			continue
+		}
+
 		allowed := false
 
-		for family, srcIP := range []*netip.Addr{src.IPv4, src.IPv6} {
-			dstIP := []*netip.Addr{dst.IPv4, dst.IPv6}[family]
-			if srcIP == nil || dstIP == nil {
-				continue
-			}
-
-			for _, proto := range []ipproto.Proto{ipproto.TCP, ipproto.UDP} {
-				for _, port := range ports {
-					want := intent.Allows(m, id, destination, *srcIP, *dstIP, port, proto)
-					got := actual.Check(*srcIP, *dstIP, port, proto) == filter.Accept
-					require.Equal(t, want, got, "packet %d (%s) to %d (%s):%d proto %s", id, srcIP, destination, dstIP, port, proto)
-					allowed = allowed || want || intent.Allows(m, destination, id, *dstIP, *srcIP, port, proto)
-				}
+		for _, proto := range []ipproto.Proto{ipproto.TCP, ipproto.UDP} {
+			for _, port := range ports {
+				want := intent.Allows(m, id, destination, srcIP, *dstIP, port, proto)
+				got := actual.Check(srcIP, *dstIP, port, proto) == filter.Accept
+				require.Equal(t, want, got, "packet %d (%s) to %d (%s):%d proto %s", id, srcIP, destination, dstIP, port, proto)
+				allowed = allowed || want || intent.Allows(m, destination, id, *dstIP, srcIP, port, proto)
 			}
 		}
 
-		if allowed {
+		if id != 0 && allowed {
 			peers = append(peers, id)
 		}
 	}
+
+	slices.Sort(peers)
+	peers = slices.Compact(peers)
 
 	return peers
 }
@@ -422,7 +453,7 @@ type AppGrant struct {
 	Caps     tailcfg.PeerCapMap
 }
 
-// AppIntent specifies ordered node-to-node custom capability grants only.
+// AppIntent specifies ordered custom capability grants to live nodes only.
 // It excludes companion grants, via, public/subnet destinations and nodeAttrs.
 type AppIntent struct {
 	Grants []AppGrant
@@ -536,7 +567,8 @@ func (a *AppIntent) Capabilities(m World, src, dst types.NodeID, srcIP, dstIP ne
 // CheckAppIntent observes the pinned consumer, including unexpected keys after
 // revocation. Only destinations require matching sources as peers; app-only
 // grants do not imply symmetric visibility or permission to open network ports.
-func CheckAppIntent(t require.TestingT, m World, intent *AppIntent, destination types.NodeID, rules []tailcfg.FilterRule) []types.NodeID {
+// Extra sources share the packet checker's bounded tailnet address domain.
+func CheckAppIntent(t require.TestingT, m World, intent *AppIntent, destination types.NodeID, rules []tailcfg.FilterRule, extraSources ...netip.Addr) []types.NodeID {
 	dst := m.Nodes[destination]
 	require.NotNil(t, dst)
 
@@ -547,37 +579,39 @@ func CheckAppIntent(t require.TestingT, m World, intent *AppIntent, destination 
 
 	var peers []types.NodeID
 
-	for _, id := range slices.Sorted(maps.Keys(m.Nodes)) {
+	sources := packetSources(m, extraSources)
+	for _, srcIP := range slices.SortedFunc(maps.Keys(sources), netip.Addr.Compare) {
+		id := sources[srcIP]
 		if id == destination {
 			continue
 		}
 
-		src := m.Nodes[id]
-		visible := false
-
-		for family, srcIP := range []*netip.Addr{src.IPv4, src.IPv6} {
-			dstIP := []*netip.Addr{dst.IPv4, dst.IPv6}[family]
-			if srcIP == nil || dstIP == nil {
-				continue
-			}
-
-			want := intent.Capabilities(m, id, destination, *srcIP, *dstIP)
-			got := actual.CapsWithValues(*srcIP, *dstIP)
-			require.Len(t, got, len(want), "app keys %d (%s) to %d (%s): want=%v got=%v", id, srcIP, destination, dstIP, want, got)
-
-			for _, key := range slices.Sorted(maps.Keys(want)) {
-				values, present := got[key]
-				require.True(t, present, "missing app key %q from %d to %d", key, id, destination)
-				require.True(t, slices.Equal(want[key], values), "app values %q from %d (%s) to %d (%s): want=%v got=%v", key, id, srcIP, destination, dstIP, want[key], values)
-			}
-
-			visible = visible || len(want) > 0
+		dstIP := dst.IPv6
+		if srcIP.Is4() {
+			dstIP = dst.IPv4
 		}
 
-		if visible {
+		if dstIP == nil {
+			continue
+		}
+
+		want := intent.Capabilities(m, id, destination, srcIP, *dstIP)
+		got := actual.CapsWithValues(srcIP, *dstIP)
+		require.Len(t, got, len(want), "app keys %d (%s) to %d (%s): want=%v got=%v", id, srcIP, destination, dstIP, want, got)
+
+		for _, key := range slices.Sorted(maps.Keys(want)) {
+			values, present := got[key]
+			require.True(t, present, "missing app key %q from %d to %d", key, id, destination)
+			require.True(t, slices.Equal(want[key], values), "app values %q from %d (%s) to %d (%s): want=%v got=%v", key, id, srcIP, destination, dstIP, want[key], values)
+		}
+
+		if id != 0 && len(want) > 0 {
 			peers = append(peers, id)
 		}
 	}
+
+	slices.Sort(peers)
+	peers = slices.Compact(peers)
 
 	return peers
 }

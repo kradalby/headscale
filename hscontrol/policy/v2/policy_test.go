@@ -8045,7 +8045,17 @@ func runIncrementalPolicyIntent(t *testing.T, apps, ssh, attrs, reorder bool) {
 			snapshots []retained
 		)
 
+		var sourceProbes []netip.Addr
+
 		check := func() {
+			for _, n := range in.nodes {
+				for _, ip := range []*netip.Addr{n.IPv4, n.IPv6} {
+					if ip != nil && !slices.Contains(sourceProbes, *ip) {
+						sourceProbes = append(sourceProbes, *ip)
+					}
+				}
+			}
+
 			next, err := NewPolicyManagerFrom(previous, in.doc, in.users, in.nodes.ViewSlice())
 			require.NoError(t, err)
 			fresh, err := NewPolicyManager(in.doc, in.users, in.nodes.ViewSlice())
@@ -8063,7 +8073,7 @@ func runIncrementalPolicyIntent(t *testing.T, apps, ssh, attrs, reorder bool) {
 					rules, err := saved.manager.FilterForNode(n.View())
 					require.NoError(t, err)
 
-					for _, peer := range propcheck.CheckPacketIntent(t, saved.world, saved.intent, id, rules) {
+					for _, peer := range propcheck.CheckPacketIntent(t, saved.world, saved.intent, id, rules, sourceProbes...) {
 						require.Contains(t, classes.Peers(id), peer, "required incoming/outgoing packet peer")
 					}
 
@@ -8076,7 +8086,7 @@ func runIncrementalPolicyIntent(t *testing.T, apps, ssh, attrs, reorder bool) {
 					}
 
 					if saved.appIntent != nil {
-						for _, peer := range propcheck.CheckAppIntent(t, saved.world, saved.appIntent, id, rules) {
+						for _, peer := range propcheck.CheckAppIntent(t, saved.world, saved.appIntent, id, rules, sourceProbes...) {
 							require.Contains(t, classes.Peers(id), peer, "required app source")
 						}
 					}
@@ -8704,4 +8714,131 @@ func TestNodeAttrWireRejectsNonNullMarkers(t *testing.T) {
 	}
 
 	propcheck.CheckNodeAttrWire(t, &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{"custom:probe": nil}}, true)
+}
+
+func TestPacketAppIntentRetiredSources(t *testing.T) {
+	for _, selector := range []string{"user", "tag", "literal", "wildcard"} {
+		t.Run(selector, func(t *testing.T) {
+			users := types.Users{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+			src := node("source", "100.64.0.1", "fd7a:115c:a1e0::1", users[0])
+			dst := node("destination", "100.64.0.2", "fd7a:115c:a1e0::2", users[1])
+			src.ID, dst.ID = 1, 2
+			sources := []netip.Addr{*src.IPv4, *src.IPv6, *src.IPv4, *dst.IPv4}
+			selectors := []propcheck.PacketSelector{{}}
+
+			switch selector {
+			case "user":
+				selectors = []propcheck.PacketSelector{{User: "u1"}}
+			case "tag":
+				src.Tags = []string{"tag:srv"}
+				selectors = []propcheck.PacketSelector{{Tag: "tag:srv"}}
+			case "literal":
+				selectors = []propcheck.PacketSelector{{IP: *src.IPv4}, {IP: *src.IPv6}}
+			}
+
+			packet, app := &propcheck.PacketIntent{}, &propcheck.AppIntent{}
+			for _, source := range selectors {
+				packet.Grants = append(packet.Grants, propcheck.PacketGrant{
+					Src: source, Dst: propcheck.PacketSelector{User: "u2"}, Protocol: ipproto.TCP, First: 22, Last: 23,
+				})
+				app.Grants = append(app.Grants, propcheck.AppGrant{
+					Src: source, Dst: propcheck.PacketSelector{User: "u2"},
+					Caps: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`, `{"role":"read"}`}},
+				})
+			}
+
+			var (
+				previous      *PolicyManager
+				originalRules []tailcfg.FilterRule
+			)
+
+			for _, phase := range []string{"live", "no-v4", "no-v6", "deleted", "reassigned", "restored"} {
+				t.Run(phase, func(t *testing.T) {
+					current := src.Clone()
+					if phase == "reassigned" {
+						current.ID, current.User, current.UserID, current.Tags = 3, &users[1], &users[1].ID, nil
+					}
+
+					if phase == "no-v4" {
+						current.IPv4 = nil
+					}
+
+					if phase == "no-v6" {
+						current.IPv6 = nil
+					}
+
+					nodes := types.Nodes{dst}
+					if phase != "deleted" {
+						nodes = append(nodes, current)
+					}
+
+					world := propcheck.World{Users: users, Nodes: map[types.NodeID]*types.Node{}}
+					for _, n := range nodes {
+						world.Put(n)
+					}
+
+					doc := app.Document(t, packet)
+					next, err := NewPolicyManagerFrom(previous, doc, users, nodes.ViewSlice())
+					require.NoError(t, err)
+					fresh, err := NewPolicyManager(doc, users, nodes.ViewSlice())
+					require.NoError(t, err)
+
+					for _, manager := range []*PolicyManager{next, fresh} {
+						rules, err := manager.FilterForNode(dst.View())
+						require.NoError(t, err)
+						peers := propcheck.CheckPacketIntent(t, world, packet, 2, rules, sources...)
+
+						appPeers := propcheck.CheckAppIntent(t, world, app, 2, rules, sources...)
+						if phase == "deleted" {
+							require.Empty(t, peers)
+							require.Empty(t, appPeers)
+						}
+
+						if phase == "reassigned" {
+							if selector == "literal" || selector == "wildcard" {
+								require.Equal(t, []types.NodeID{3}, peers)
+								require.Equal(t, []types.NodeID{3}, appPeers)
+							} else {
+								require.Empty(t, peers)
+								require.Empty(t, appPeers)
+							}
+						}
+
+						if phase == "live" {
+							originalRules = rules
+						}
+					}
+
+					if phase == "deleted" {
+						addressGrant := selector == "literal" || selector == "wildcard"
+
+						for family, ip := range []*netip.Addr{src.IPv4, src.IPv6} {
+							dstIP := []*netip.Addr{dst.IPv4, dst.IPv6}[family]
+							require.Equal(t, addressGrant, packet.Allows(world, 0, 2, *ip, *dstIP, 22, ipproto.TCP))
+							require.Equal(t, addressGrant, len(app.Capabilities(world, 0, 2, *ip, *dstIP)) > 0)
+						}
+
+						if addressGrant {
+							// A raw address grant remains legitimate after its node disappears.
+							propcheck.CheckPacketIntent(t, world, packet, 2, originalRules, sources...)
+							propcheck.CheckAppIntent(t, world, app, 2, originalRules, sources...)
+						} else {
+							// Corrupt the actual consumer input with the old identity rules.
+							failure := &appIntentFailure{}
+							require.PanicsWithValue(t, failure, func() {
+								propcheck.CheckPacketIntent(failure, world, packet, 2, originalRules, sources...)
+							})
+							require.Contains(t, failure.message, "packet 0")
+							require.PanicsWithValue(t, failure, func() {
+								propcheck.CheckAppIntent(failure, world, app, 2, originalRules, sources...)
+							})
+							require.Contains(t, failure.message, "app keys 0")
+						}
+					}
+
+					previous = next
+				})
+			}
+		})
+	}
 }

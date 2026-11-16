@@ -8531,6 +8531,7 @@ type streamPropertySystem struct {
 	stagedPolicy streamOperation
 	world        propcheck.World
 	probes       propcheck.WorldProbes
+	sourceProbes []netip.Addr
 	routes       propcheck.RouteResult
 	history      *peerHistoryModel
 	token        uint64
@@ -8655,6 +8656,15 @@ func (p *streamPropertySystem) create(t *rapid.T, n *types.Node) {
 	require.NoError(t, p.state.DB().DB.Save(n.Clone()).Error)
 	p.lastNodeID = n.ID
 	p.probes.IDs = append(p.probes.IDs, n.ID)
+	// Retain the first eight lifetimes without evicting revocation witnesses.
+	if n.ID <= 8 {
+		for _, ip := range []*netip.Addr{n.IPv4, n.IPv6} {
+			if ip != nil {
+				p.sourceProbes = append(p.sourceProbes, *ip)
+			}
+		}
+	}
+
 	p.put(t, n)
 }
 
@@ -8898,8 +8908,8 @@ func (p *streamPropertySystem) check(t *rapid.T, snap *state.Snapshot) {
 // Only this viewer is current; other sessions may legitimately still lag.
 func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *state.Snapshot, session *streamPropertySession) {
 	t.Helper()
-	checkStreamPacketIntent(t, p.world, streamPacketIntent(p.world, p.policy, p.packetIntent), id, session.client)
-	checkStreamAppIntent(t, p.world, p.appIntent, id, session.client)
+	checkStreamPacketIntent(t, p.world, streamPacketIntent(p.world, p.policy, p.packetIntent), id, session.client, p.sourceProbes...)
+	checkStreamAppIntent(t, p.world, p.appIntent, id, session.client, p.sourceProbes...)
 
 	if intent := streamSSHIntent(t, p.policyDoc, p.sshIntent); intent != nil {
 		propcheck.CheckSSHIntent(t, p.world, intent, id, session.client.ssh, p.cfg.ServerURL)
@@ -9933,8 +9943,8 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 
 			oldClient := newPropertyClient(&tailcfg.MapResponse{})
 			applyStreamPropertyWire(t, oldHub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, oldMap)})
-			checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, oldClient)
-			checkStreamAppIntent(t, oldWorld, oldAppIntent, oldNode, oldClient)
+			checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, oldClient, p.sourceProbes...)
+			checkStreamAppIntent(t, oldWorld, oldAppIntent, oldNode, oldClient, p.sourceProbes...)
 
 			if oldSSHIntent != nil {
 				propcheck.CheckSSHIntent(t, oldWorld, oldSSHIntent, oldNode, oldClient.ssh, p.cfg.ServerURL)
@@ -9984,8 +9994,8 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, lateMap)})
 			lateClient.check(t, oldClient)
 
-			checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, lateClient)
-			checkStreamAppIntent(t, oldWorld, oldAppIntent, oldNode, lateClient)
+			checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, lateClient, p.sourceProbes...)
+			checkStreamAppIntent(t, oldWorld, oldAppIntent, oldNode, lateClient, p.sourceProbes...)
 
 			if oldSSHIntent != nil {
 				propcheck.CheckSSHIntent(t, oldWorld, oldSSHIntent, oldNode, lateClient.ssh, p.cfg.ServerURL)
@@ -10877,7 +10887,7 @@ func TestStreamSimplePolicyIdentityHistory(t *testing.T) {
 
 		oldClient := newPropertyClient(&tailcfg.MapResponse{})
 		applyStreamPropertyWire(t, oldHub, oldClient, responses)
-		checkStreamPacketIntent(t, oldWorld, oldIntent, 4, oldClient)
+		checkStreamPacketIntent(t, oldWorld, oldIntent, 4, oldClient, p.sourceProbes...)
 
 		for _, phase := range []string{"same-user", "rename", "tag", "restore", "deny"} {
 			switch phase {
@@ -10908,7 +10918,7 @@ func TestStreamSimplePolicyIdentityHistory(t *testing.T) {
 
 			lateClient := newPropertyClient(&tailcfg.MapResponse{})
 			applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
-			checkStreamPacketIntent(t, oldWorld, oldIntent, 4, lateClient)
+			checkStreamPacketIntent(t, oldWorld, oldIntent, 4, lateClient, p.sourceProbes...)
 			lateClient.check(t, oldClient)
 			propcheck.CheckWorld(t, oldWorld, old, p.probes)
 		}
@@ -10987,12 +10997,12 @@ func TestStreamSSHIntentInputs(t *testing.T) {
 
 // Only fully delivered sessions must reflect current intent; partial prefixes
 // are checked after reconnect by the same cumulative client replay.
-func checkStreamPacketIntent(t require.TestingT, world propcheck.World, intent *propcheck.PacketIntent, id types.NodeID, client *propertyClient) {
+func checkStreamPacketIntent(t require.TestingT, world propcheck.World, intent *propcheck.PacketIntent, id types.NodeID, client *propertyClient, extraSources ...netip.Addr) {
 	if intent == nil {
 		return
 	}
 
-	for _, peer := range propcheck.CheckPacketIntent(t, world, intent, id, client.filter) {
+	for _, peer := range propcheck.CheckPacketIntent(t, world, intent, id, client.filter, extraSources...) {
 		require.Contains(t, client.peers, peer.NodeID(), "required incoming/outgoing packet peer")
 	}
 }
@@ -11255,12 +11265,12 @@ func TestStreamMapRequestHistory(t *testing.T) {
 	}
 }
 
-func checkStreamAppIntent(t require.TestingT, world propcheck.World, intent *propcheck.AppIntent, id types.NodeID, client *propertyClient) {
+func checkStreamAppIntent(t require.TestingT, world propcheck.World, intent *propcheck.AppIntent, id types.NodeID, client *propertyClient, extraSources ...netip.Addr) {
 	if intent == nil {
 		return
 	}
 
-	for _, peer := range propcheck.CheckAppIntent(t, world, intent, id, client.filter) {
+	for _, peer := range propcheck.CheckAppIntent(t, world, intent, id, client.filter, extraSources...) {
 		require.Contains(t, client.peers, peer.NodeID(), "required app source")
 	}
 }
@@ -11375,13 +11385,46 @@ func TestStreamAppIntentHistory(t *testing.T) {
 				flush()
 				require.Same(t, first, p.appIntent)
 
+				// Every selected source belongs to the retained first-eight pool.
+				// Complete user/tag revocation before changing to raw-address controls.
+				for _, id := range []types.NodeID{1, 3} {
+					source := p.world.Nodes[id]
+
+					selector := propcheck.PacketSelector{User: "u1"}
+					if id == 3 {
+						selector = propcheck.PacketSelector{Tag: "tag:srv"}
+					}
+
+					ports := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{{
+						Src: selector, Dst: first.Grants[0].Dst, Protocol: ipproto.TCP, First: 22, Last: 23,
+					}}}
+					app := &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+						Src: selector, Dst: first.Grants[0].Dst, Caps: first.Grants[0].Caps,
+					}}}
+					set(app, ports)
+					p.apply(t, streamOperation{kind: "delete", node: source})
+					flush()
+
+					for _, address := range []propcheck.PacketSelector{{IP: *source.IPv4}, {IP: *source.IPv6}, {}} {
+						ports = &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{{
+							Src: address, Dst: first.Grants[0].Dst, Protocol: ipproto.TCP, First: 22, Last: 23,
+						}}}
+						app = &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+							Src: address, Dst: first.Grants[0].Dst, Caps: first.Grants[0].Caps,
+						}}}
+						set(app, ports)
+					}
+
+					set(&propcheck.AppIntent{}, packet)
+				}
+
 				late, err := NewStream(p.cfg, p.hub, 2, capVer).r.render(old)
 				require.NoError(t, err)
 
 				client := newPropertyClient(&tailcfg.MapResponse{})
 				applyStreamPropertyWire(t, p.hub, client, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
-				checkStreamAppIntent(t, oldWorld, first, 2, client)
-				checkStreamPacketIntent(t, oldWorld, packet, 2, client)
+				checkStreamAppIntent(t, oldWorld, first, 2, client, p.sourceProbes...)
+				checkStreamPacketIntent(t, oldWorld, packet, 2, client, p.sourceProbes...)
 			})
 		})
 	}
@@ -11668,8 +11711,8 @@ func TestStreamSSHIntentHistory(t *testing.T) {
 				client := newPropertyClient(&tailcfg.MapResponse{})
 				applyStreamPropertyWire(t, p.hub, client, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
 				propcheck.CheckSSHIntent(t, oldWorld, first, 3, client.ssh, p.cfg.ServerURL)
-				checkStreamPacketIntent(t, oldWorld, oldPacket, 3, client)
-				checkStreamAppIntent(t, oldWorld, oldApp, 3, client)
+				checkStreamPacketIntent(t, oldWorld, oldPacket, 3, client, p.sourceProbes...)
+				checkStreamAppIntent(t, oldWorld, oldApp, 3, client, p.sourceProbes...)
 				p.setPolicy(t, 1)
 				flush()
 				require.Nil(t, p.sshIntent, "unrelated policy must clear SSH metadata")

@@ -175,14 +175,15 @@ replacement includes a live literal-IP witness. Explicit empty intent denies
 all traffic. Expected permissions scan owned `propcheck.World` nodes and users;
 tags exclude creator user rights even when UserID remains populated.
 
-`CheckPacketIntent` checks both address families between distinct nodes. It
+`CheckPacketIntent` checks both address families between distinct live nodes,
+plus the bounded source-address probes described below. It
 probes every port in each generated range, adjacent ports, ports 0 and 65535,
 and denied port 32768 for both protocols. Wider manually constructed ranges
 remain bounded: their first four ports, midpoint and endpoint are probed. Actual rules pass through the pinned Tailscale
 `wgengine/filter.MatchesFromFilterRules`, `filter.New`, and `Filter.Check`.
 TCP checks synthesize SYN packets; UDP checks start without outgoing conntrack.
 The expected side never reads compiled policy, FilterRules or fresh rendering.
-Allowed traffic requires reciprocal peer visibility. The shared checker returns
+Allowed traffic between live nodes requires reciprocal peer visibility. The shared checker returns
 a necessary peer union for incoming and outgoing flows, checked only against the
 viewer being validated; other sessions may legitimately lag. Denied packets do not imply absent
 peers: same-user visibility remains unconditional.
@@ -425,7 +426,7 @@ presence. `Capabilities` scans only owned World identities and grant inputs.
 `Filter.CapsWithValues`, compares every returned key and each ordered value,
 and requires matching sources to be visible to their destination. It does not
 require reciprocal visibility for app-only grants. Empty intent still checks
-all current node pairs, catching retained revoked capabilities.
+all current node pairs and bounded source probes, catching retained revoked capabilities.
 
 App metadata follows the same active/staged policy records, file reloads,
 comments, historical restores, DERP-only changes and old snapshots as packet
@@ -466,8 +467,8 @@ go test -p 1 ./hscontrol/policy/v2 -run '^TestIncrementalAppIntentConsumerInvali
 ```
 
 The domain excludes companion capabilities, via and public/subnet destinations,
-nodeAttrs capabilities, general aliases and self traffic. Current-pair probes do
-not independently test deleted nodes or removed addresses. Full clients, network
+nodeAttrs capabilities, general aliases and self traffic. Historical source
+coverage has the explicit bound below. Full clients, network
 transport and application-specific interpretation of JSON remain outside scope.
 
 ## Generated subscription bridge
@@ -709,3 +710,56 @@ The generated file campaign can expose the existing DERP score-clear diagnostic
 component excludes real clock-crossing expiry sweeps, reauthentication,
 registration, SSH callbacks, ephemeral GC, concurrent transport ordering and
 DB failure/retry. It adds no production changes or new clock model.
+
+## Bounded retired and foreign source addresses
+
+`CheckPacketIntent` and `CheckAppIntent` accept optional `extraSources ...netip.Addr`
+from owned operation inputs. Both checkers merge these with all current node
+addresses and two never-owned probes, `100.64.255.254` and
+`fd7a:115c:a1e0::ffff`. A shared input scan deduplicates addresses and resolves
+each address to its owner in the supplied World, or anonymous ID 0 when absent.
+Retained maps use their retained World, not current identities. A removed IP
+family does not retain the surviving node's user or tag identity. Self-address
+probes stay excluded. Anonymous sources never become required peers.
+
+User and tag selectors deny an absent identity. Literal-IP selectors still
+match their address, and wildcard selectors still match the bounded address
+domain. This is deliberately not unconditional denial after deletion. The
+source contract is `Username.resolve`, `Tag.resolve`, `Prefix.resolve` and
+`asterixResolved` in `policy/v2/types.go`: wildcard covers CGNAT and Tailscale
+ULA addresses, excluding the ChromeOS VM range. These probes stay within that
+domain; wildcard is not arbitrary Internet authorization. The pinned filter's
+`Check` and `CapsWithValues` remain the only actual consumers. These assertions
+measure filter predicates, not reachable packets, connections or applications.
+
+The stream fixture records both input addresses at creation for its first eight
+node lifetimes (IDs 1 through 8). It never evicts a retained witness. All current
+node pairs remain checked, including later lifetimes, but retired addresses from
+IDs above 8 are outside this historical bound. Existing creation inputs assign
+fixed addresses per ID; the focused incremental history accumulates each of its
+four to six nodes' input addresses as families appear or disappear (at most 12).
+No probe is taken from a compiler rule or production snapshot.
+
+At most 16 historical addresses plus two reserved addresses are added per stream
+map, independent of the possible 255 lifetimes. Deduplication removes live-address
+overlap. Each compatible source adds two protocol checks per existing packet
+port and one app-capability lookup; each checker constructs its consumer only
+once. Generated packet grants retain 28 fixed port probes, so the upper added
+packet cost is 1,008 checks per dual-stack destination (18 × 2 × 28), before
+manual-range probes. App checks add at most 18 lookups. This is test-time cost,
+not a production-performance claim.
+
+`TestPacketAppIntentRetiredSources` anchors both families, user/tag deletion,
+family removal, address reassignment, restoration, raw-IP/wildcard controls and ordered app payloads.
+It feeds stale identity rules to the same actual checkers and requires assertion
+failure; the original raw-address rules must still pass after deletion.
+`TestStreamAppIntentHistory` composes packet and app grants through both DB and
+real-file policies, deletes user source 1 and tagged source 3, and completes
+destination 2 before replacing revoked identity grants with literal/wildcard
+controls. Its existing flush checks unwoken clients before reconnect. All old
+packet-port, ownership, SSH-absence, attribute and online projections remain.
+
+```sh
+go test -p 1 ./hscontrol/policy/v2 -run '^(TestPacketAppIntentRetiredSources|TestIncrementalPolicyRapidPacketIntent|TestIncrementalPolicyRapidAppReplacements)$' -count=1 -rapid.seed=2026111621 -rapid.checks=300 -rapid.nofailfile
+go test -p 1 ./hscontrol/mapper -run '^TestStreamAppIntentHistory$' -count=1 -rapid.seed=2026111621 -rapid.checks=20 -rapid.nofailfile
+```
