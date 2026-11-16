@@ -917,3 +917,8 @@ aliases, recursive groups, hosts, autogroups, email/OIDC resolution and transpor
 remain outside these independent expectations; unknown rich aliases retain the
 existing compiler/fresh-render boundary. This is sampled semantic evidence,
 not a production performance claim.
+
+The mixed-control history also installs and clears a positive group grant before
+restoring its packet/app/SSH/attribute document, completing every state while an
+owned control lease remains. Generated mixed-control histories include group
+membership replacements through the same input adapter and intent checkers.

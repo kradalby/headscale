@@ -12667,7 +12667,7 @@ func TestRapidStreamMixedControl(t *testing.T) {
 				runRapidStreamSystem(t, mode,
 					"connect", "connect-request", "disconnect", "stale-connect", "zero-connect", "missing-connect",
 					"public-expiry", "utc-expiry", "invalid-expiry", "missing-expiry", "health", "endpoints", "request-hostinfo",
-					"attrs-mixed", "attrs-clear", "packet-policy", "packet-deny", "app-policy", "app-deny", "ssh-policy", "ssh-deny",
+					"attrs-mixed", "attrs-clear", "group-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "ssh-policy", "ssh-deny",
 					"policy-order", "policy-duplicate", "policy-restore", "invalid-policy", "dns", "derp", "derp-policy", "noop")
 			})
 		})
@@ -12812,6 +12812,13 @@ func (p *streamPropertySystem) mixedControlHistory(t *rapid.T, commit func(*rapi
 	require.NotEmpty(t, app.Capabilities(p.world, 1, 2, *p.world.Nodes[1].IPv4, *p.world.Nodes[2].IPv4))
 	require.Equal(t, "check", ssh.Decision(p.world, 1, 3, "alice"))
 	require.Contains(t, attrs.Capabilities(p.world, 1), nodecap.Cap("custom:probe"))
+	commit(t, &mixed)
+
+	doc, groupPacket, groupApp := propcheck.GroupPolicy(t, []string{"u1"}, []string{"u2"}, packet.Grants[0], app.Grants[0].Caps)
+	group := streamOperation{kind: "group-policy", policy: -1, doc: doc, intent: groupPacket, appIntent: groupApp}
+	commit(t, &group)
+	group.doc, group.intent, group.appIntent = propcheck.GroupPolicy(t, nil, []string{"u2"}, packet.Grants[0], app.Grants[0].Caps)
+	commit(t, &group)
 	commit(t, &mixed)
 
 	for _, kind := range []string{"health", "request-hostinfo", "public-expiry", "utc-expiry", "stale-connect", "zero-connect", "missing-connect", "invalid-expiry", "missing-expiry", "invalid-policy"} {
