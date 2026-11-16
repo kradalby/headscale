@@ -27,6 +27,26 @@ type roleKind uint8
 const (
 	roleSelector roleKind = iota
 	roleOwner
+
+	// Side atoms, held in a [Sides] set. There roleSelector and roleOwner
+	// mean holding an address of a member, or routing over one, which is
+	// how the compile's address sets put a node on a rule's side.
+	roleNamedPort      // an address of an owner a port self grant's source names
+	roleNamedApp       // the same for an app self grant
+	roleRouter         // an address of the via router with that node ID
+	roleLiteral        // in an address selector's literal, by address or route
+	roleAll            // any address or subnet route: inside "*" as written
+	roleApproved       // inside an approved subnet route, which "*" sources add
+	roleExit           // an exit node
+	roleClique         // untagged with that UserID: the same-user clique
+	roleHeldNamed      // an owner itself named by its user's self grants
+	roleHeldOwner      // an owner holding an address of its user's owners
+	roleExitHolder     // an exit owner whose user has a public address
+	roleSelfExitLink   // a named owner whose user's port self rules reach the internet
+	roleCapExitSeen    // an owner exits list for its own capability to the internet
+	roleViaSeen        // an addressed router of that via grant template
+	roleRouterOnSrc    // a via router among its own grant's sources
+	rolePubRouterOnSrc // such a router with a public address
 )
 
 // Role is one membership a node holds: a selector of a table, or, under
@@ -57,11 +77,21 @@ func compareRoles(a, b Role) int {
 }
 
 func (r Role) String() string {
-	if uid, ok := r.Owner(); ok {
-		return "owner:" + strconv.FormatUint(uint64(uid), 10)
+	name := "selector"
+	if int(r.kind) < len(roleKindNames) {
+		name = roleKindNames[r.kind]
 	}
 
-	return "selector:" + strconv.FormatUint(r.value, 10)
+	return name + ":" + strconv.FormatUint(r.value, 10)
+}
+
+var roleKindNames = [...]string{
+	roleSelector: "selector", roleOwner: "owner",
+	roleNamedPort: "named-port", roleNamedApp: "named-app", roleRouter: "router",
+	roleLiteral: "literal", roleAll: "all", roleApproved: "approved", roleExit: "exit",
+	roleClique: "clique", roleHeldNamed: "held-named", roleHeldOwner: "held-owner",
+	roleExitHolder: "exit-holder", roleSelfExitLink: "self-exit-link", roleCapExitSeen: "cap-exit-seen",
+	roleViaSeen: "via-seen", roleRouterOnSrc: "router-on-src", rolePubRouterOnSrc: "pub-router-on-src",
 }
 
 // RoleSet is the roles one node holds, interned: two sets are equal

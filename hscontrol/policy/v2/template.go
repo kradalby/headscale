@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
@@ -29,6 +30,10 @@ type Templates struct {
 	// err records a grant naming an alias the table lacks, which only a
 	// table that does not describe the policy can cause.
 	err error
+
+	// plan is what the templates say about sides, built on first use.
+	planOnce sync.Once
+	plan     *sidePlan
 }
 
 // literal is an address selector resolved as the compile resolves it,

@@ -1175,6 +1175,10 @@ type PeerClasses struct {
 
 	// sides keeps what the build learnt of each node, for the next.
 	sides *sideCache
+
+	// keyed holds classes keyed by side set, see [RolePeers]; classOf and
+	// views are then unused.
+	keyed *keyedClasses
 }
 
 // sideCache holds each node's matcher sides by matcher content: a
@@ -1197,6 +1201,10 @@ func (c *PeerClasses) View(id types.NodeID) []types.NodeID {
 		return nil
 	}
 
+	if c.keyed != nil {
+		return c.keyed.view(id)
+	}
+
 	if i, ok := c.classOf[id]; ok {
 		return c.views[i]
 	}
@@ -1211,7 +1219,79 @@ func (c *PeerClasses) Views() [][]types.NodeID {
 		return nil
 	}
 
+	if c.keyed != nil {
+		type key struct {
+			first *types.NodeID
+			n     int
+		}
+
+		var (
+			out   [][]types.NodeID
+			seen  = map[key]struct{}{}
+			empty bool
+		)
+
+		// Classes share views; each is listed once.
+		for _, v := range c.keyed.views.All() {
+			if len(v) == 0 {
+				if !empty {
+					empty = true
+
+					out = append(out, v)
+				}
+
+				continue
+			}
+
+			k := key{&v[0], len(v)}
+			if _, dup := seen[k]; !dup {
+				seen[k] = struct{}{}
+
+				out = append(out, v)
+			}
+		}
+
+		return out
+	}
+
 	return c.views
+}
+
+// nodes calls fn with every node c holds and its view.
+func (c *PeerClasses) nodes(fn func(types.NodeID, []types.NodeID)) {
+	if c.keyed != nil {
+		for id := range c.keyed.sides.sets.All() {
+			fn(id, c.keyed.view(id))
+		}
+
+		return
+	}
+
+	for id, i := range c.classOf {
+		fn(id, c.views[i])
+	}
+}
+
+// size returns the number of nodes c holds.
+func (c *PeerClasses) size() int {
+	if c.keyed != nil {
+		return c.keyed.sides.sets.Len()
+	}
+
+	return len(c.classOf)
+}
+
+// holds reports whether c holds node id.
+func (c *PeerClasses) holds(id types.NodeID) bool {
+	if c.keyed != nil {
+		_, ok := c.keyed.sides.sets.Get(id)
+
+		return ok
+	}
+
+	_, ok := c.classOf[id]
+
+	return ok
 }
 
 // Peers returns the nodes id sees, sorted, without id.
@@ -1228,7 +1308,8 @@ func (c *PeerClasses) Peers(id types.NodeID) []types.NodeID {
 // Reuse replaces each view of c that equals one of prev by prev's, so
 // readers that kept a view see it unchanged by identity.
 func (c *PeerClasses) Reuse(prev *PeerClasses) {
-	if c == nil || prev == nil {
+	// Keyed classes keep their unchanged views as they are built.
+	if c == nil || prev == nil || c.keyed != nil || prev.keyed != nil {
 		return
 	}
 
@@ -1259,7 +1340,7 @@ func (c *PeerClasses) Same(o *PeerClasses) bool {
 		return true
 	}
 
-	if c == nil || o == nil || len(c.classOf) != len(o.classOf) {
+	if c == nil || o == nil || c.size() != o.size() {
 		return false
 	}
 
@@ -1270,7 +1351,35 @@ func (c *PeerClasses) Same(o *PeerClasses) bool {
 // compared once per pair of classes.
 func (c *PeerClasses) Changed(old *PeerClasses) []types.NodeID {
 	if old == nil {
-		return slices.Collect(maps.Keys(c.classOf))
+		var out []types.NodeID
+
+		c.nodes(func(id types.NodeID, _ []types.NodeID) { out = append(out, id) })
+
+		return out
+	}
+
+	if c.keyed != nil || old.keyed != nil {
+		var out []types.NodeID
+
+		c.nodes(func(id types.NodeID, v []types.NodeID) {
+			if !old.holds(id) {
+				out = append(out, id)
+
+				return
+			}
+
+			if was := old.View(id); !sameSlice(was, v) && !slices.Equal(was, v) {
+				out = append(out, id)
+			}
+		})
+
+		old.nodes(func(id types.NodeID, _ []types.NodeID) {
+			if !c.holds(id) {
+				out = append(out, id)
+			}
+		})
+
+		return out
 	}
 
 	type pair struct{ a, b int }
