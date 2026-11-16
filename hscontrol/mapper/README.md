@@ -815,3 +815,16 @@ check maps delivered during a burst, establish full linearizability, guarantee
 particular lock schedules, or cover concurrent MapRequests, transport, database
 failure/retry, or restart durability. No generic scheduler or production hook is
 introduced. Existing sequential and known-failing domains remain unchanged.
+
+## Known app-free policy replacements
+
+`streamAppIntent` preserves explicit generated intent and derives an empty
+intent from owned policy bytes only when no `grants[].app` capability key exists.
+It uses the policy schema's case and delimiter matching, without consulting the
+compiler or renderer. Unknown nonempty application grants remain outside this
+oracle. Input bytes and active/staged history metadata stay unchanged.
+Current sessions and retained maps capture this derived expectation, so replacing
+an app policy with simple or packet-only policy still checks capability revocation.
+Fixed DB/file histories complete those replacements before restoring app grants.
+Literal live/retired IPv4/IPv6 controls prove the same checker rejects stale
+capability-only rules that packet permission and identical-render comparisons accept.

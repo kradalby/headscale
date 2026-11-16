@@ -24,6 +24,7 @@ import (
 	"unsafe"
 	"weak"
 
+	jsonv2 "github.com/go-json-experiment/json"
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/graph"
@@ -8909,7 +8910,7 @@ func (p *streamPropertySystem) check(t *rapid.T, snap *state.Snapshot) {
 func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *state.Snapshot, session *streamPropertySession) {
 	t.Helper()
 	checkStreamPacketIntent(t, p.world, streamPacketIntent(p.world, p.policy, p.packetIntent), id, session.client, p.sourceProbes...)
-	checkStreamAppIntent(t, p.world, p.appIntent, id, session.client, p.sourceProbes...)
+	checkStreamAppIntent(t, p.world, streamAppIntent(t, p.policyDoc, p.appIntent), id, session.client, p.sourceProbes...)
 
 	if intent := streamSSHIntent(t, p.policyDoc, p.sshIntent); intent != nil {
 		propcheck.CheckSSHIntent(t, p.world, intent, id, session.client.ssh, p.cfg.ServerURL)
@@ -9931,7 +9932,7 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 			old := p.state.Snapshot()
 			oldWorld := p.world.Clone()
 			oldIntent := streamPacketIntent(oldWorld, p.policy, p.packetIntent)
-			oldAppIntent := p.appIntent
+			oldAppIntent := streamAppIntent(t, p.policyDoc, p.appIntent)
 			oldSSHIntent := streamSSHIntent(t, p.policyDoc, p.sshIntent)
 			oldAttrIntent := p.attrIntent
 			oldIdentityAddresses := oldIntent != nil || (p.policy >= 0 && p.policy <= 2)
@@ -11265,6 +11266,63 @@ func TestStreamMapRequestHistory(t *testing.T) {
 	}
 }
 
+// Derive known app absence from owned documents without changing their metadata.
+func streamAppIntent(t require.TestingT, doc []byte, explicit *propcheck.AppIntent) *propcheck.AppIntent {
+	if explicit != nil {
+		return explicit
+	}
+
+	if len(doc) > 0 {
+		standard, err := hujson.Standardize(slices.Clone(doc))
+		require.NoError(t, err)
+
+		var fields struct {
+			Grants []struct {
+				App tailcfg.PeerCapMap `json:"app"`
+			} `json:"grants"`
+		}
+
+		// Match the policy schema's case and delimiter folding, not its compiler.
+		require.NoError(t, jsonv2.Unmarshal(standard, &fields, jsonv2.MatchCaseInsensitiveNames(true)))
+
+		for _, grant := range fields.Grants {
+			if len(grant.App) > 0 {
+				return nil
+			}
+		}
+	}
+
+	return &propcheck.AppIntent{}
+}
+
+func TestStreamAppIntentInputs(t *testing.T) {
+	for _, doc := range append([]string{
+		"", `{}`, `{"grants":null}`, `{"grants":[]}`,
+		`{"grants":[{"src":["*"],"dst":["*"],"ip":["*"],"app":null}]}`,
+		`{"grants":[{"src":["*"],"dst":["*"],"ip":["*"],"app":{}}]}`,
+		"{ // owned comment\n \"grants\": [], }",
+	}, streamPropertyPolicies...) {
+		input := []byte(doc)
+		before := slices.Clone(input)
+		intent := streamAppIntent(t, input, nil)
+		require.NotNil(t, intent, "known empty app authorization: %s", doc)
+		require.Empty(t, intent.Grants)
+		require.Equal(t, before, input, "owned policy bytes survive standardization")
+	}
+
+	explicit := &propcheck.AppIntent{}
+
+	for _, doc := range []string{
+		`{"grants":[{"src":["*"],"dst":["*"],"app":{"example.com/cap/read":null}}]}`,
+		`{"grants":[{"src":["*"],"dst":["*"],"app":{"example.com/cap/read":[]}}]}`,
+		`{"GRANTS":[{"SRC":["*"],"DST":["*"],"APP":{"example.com/cap/read":[]}}]}`,
+		`{"g-r_a_n_t_s":[{"src":["*"],"dst":["*"],"a-p_p":{"example.com/cap/read":[]}}]}`,
+	} {
+		require.Nil(t, streamAppIntent(t, []byte(doc), nil), "unmodeled app grants remain unknown")
+		require.Same(t, explicit, streamAppIntent(t, []byte(doc), explicit))
+	}
+}
+
 func checkStreamAppIntent(t require.TestingT, world propcheck.World, intent *propcheck.AppIntent, id types.NodeID, client *propertyClient, extraSources ...netip.Addr) {
 	if intent == nil {
 		return
@@ -11341,6 +11399,18 @@ func TestStreamAppIntentHistory(t *testing.T) {
 				for _, app := range []*propcheck.AppIntent{second, {}, first} {
 					set(app, packet)
 				}
+
+				for _, kind := range []int{0, 1, 2} {
+					p.setPolicy(t, kind)
+					flush()
+					require.Nil(t, p.appIntent, "simple replacement clears app metadata")
+					set(first, packet)
+				}
+
+				p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: packet.Document(t), intent: packet})
+				flush()
+				require.Nil(t, p.appIntent, "packet replacement clears app metadata")
+				set(first, packet)
 
 				set(first, mixed)
 				set(first, packet)
@@ -12533,5 +12603,56 @@ func TestStreamConcurrentInputContracts(t *testing.T) {
 			})
 			require.Contains(t, failure.message, message)
 		})
+	}
+}
+
+// App-free inputs must reject stale capabilities even when packet rules agree.
+func TestStreamAppAbsenceRejectsStaleCapabilities(t *testing.T) {
+	src4, src6 := netip.MustParseAddr("100.64.0.1"), netip.MustParseAddr("fd7a:115c:a1e0::1")
+	dst4, dst6 := netip.MustParseAddr("100.64.0.2"), netip.MustParseAddr("fd7a:115c:a1e0::2")
+
+	for _, retired := range []bool{false, true} {
+		for family, source := range []netip.Addr{src4, src6} {
+			t.Run(fmt.Sprintf("retired=%t/family=%d", retired, family), func(t *testing.T) {
+				destination := []netip.Addr{dst4, dst6}[family]
+
+				world := propcheck.World{Nodes: map[types.NodeID]*types.Node{
+					2: {ID: 2, IPv4: &dst4, IPv6: &dst6},
+				}}
+				if !retired {
+					world.Nodes[1] = &types.Node{ID: 1, IPv4: &src4, IPv6: &src6}
+				}
+
+				caps := tailcfg.PeerCapMap{"example.com/cap/stale": {`{"role":"read"}`}, "example.com/cap/empty": nil}
+				rules := []tailcfg.FilterRule{{
+					SrcIPs: []string{source.String()},
+					CapGrant: []tailcfg.CapGrant{{
+						Dsts: []netip.Prefix{netip.PrefixFrom(destination, destination.BitLen())}, CapMap: caps,
+					}},
+				}}
+				full := &tailcfg.MapResponse{Node: &tailcfg.Node{ID: 2}, PacketFilter: rules}
+				client, same := newPropertyClient(full), newPropertyClient(full)
+				probes := []netip.Addr{src4, src6}
+				positive := &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+					Src: propcheck.PacketSelector{IP: source}, Dst: propcheck.PacketSelector{IP: destination}, Caps: caps,
+				}}}
+				propcheck.CheckAppIntent(t, world, positive, 2, client.filter, probes...)
+
+				// The packet oracle and equality check accept identical app-only corruption.
+				checkStreamPacketIntent(t, world, &propcheck.PacketIntent{}, 2, client, probes...)
+				client.check(t, same)
+
+				for _, doc := range append([]string{`{"grants":[]}`}, streamPropertyPolicies[:3]...) {
+					intent := streamAppIntent(t, []byte(doc), nil)
+					require.NotNil(t, intent)
+
+					failure := &streamNodeInputFailure{}
+					require.PanicsWithValue(t, failure, func() {
+						checkStreamAppIntent(failure, world, intent, 2, client, probes...)
+					})
+					require.Contains(t, failure.message, "app keys")
+				}
+			})
+		}
 	}
 }
