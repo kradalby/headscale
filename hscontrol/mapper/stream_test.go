@@ -9046,7 +9046,7 @@ func (p *streamPropertySystem) effectiveDERP(t require.TestingT) *tailcfg.DERPMa
 	if len(p.policyDoc) > 0 {
 		doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
 		require.NoError(t, err)
-		require.NoError(t, json.Unmarshal(doc, &policy))
+		require.NoError(t, jsonv2.Unmarshal(doc, &policy, jsonv2.MatchCaseInsensitiveNames(true)))
 	}
 
 	return propcheck.EffectiveDERP(p.derpMap, policy.DERPMap)
@@ -13647,5 +13647,31 @@ func (p *streamPropertySystem) mixedControlHistory(t *rapid.T, commit func(*rapi
 
 	if generated {
 		commit(t, new(p.drawOperation(t, "attrs-mixed")))
+	}
+}
+
+func TestStreamDERPIntentFieldNames(t *testing.T) {
+	for _, doc := range []string{
+		`{"derpMap":{"Regions":{"1":null}}}`,
+		`{"DERPMAP":{"REGIONS":{"1":null}}}`,
+		`{"d-e_r_p_m_a_p":{"Regions":{"1":null}}}`,
+		`{"derpMap":{"r-e_g_i_o_n_s":{"1":null}}}`,
+		"{ // retained input comment\n \"derp_map\": {\"Regions\": {\"1\": null}}, }",
+	} {
+		t.Run(doc, func(t *testing.T) {
+			parsed, err := policyv2.ParsePolicy([]byte(doc))
+			require.NoError(t, err)
+			require.NotNil(t, parsed.DERPMap)
+			require.Contains(t, parsed.DERPMap.Regions, tailcfg.DERPRegionID(1))
+			require.Nil(t, parsed.DERPMap.Regions[1])
+
+			p := &streamPropertySystem{
+				policyDoc: []byte(doc),
+				derpMap:   &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: {RegionID: 1}}},
+			}
+			before := slices.Clone(p.policyDoc)
+			require.Equal(t, &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{}}, p.effectiveDERP(t))
+			require.Equal(t, before, p.policyDoc, "owned policy bytes")
+		})
 	}
 }

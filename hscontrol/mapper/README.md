@@ -1104,3 +1104,7 @@ remains disabled. The same check covers generic retained maps; concurrent retain
 maps reuse the completed-session boundary. Literal controls reject missing/wrong
 domains and enabled collection through that exact checker. This adds independent
 expectations for these two fields, not arbitrary debug or startup DNS settings.
+
+The owned DERP input decoder follows policy schema field-name folding, including
+case and accepted dash/underscore variants at both root and nested fields. Literal
+accepted-policy examples check the same effective-map helper and input-byte ownership.
