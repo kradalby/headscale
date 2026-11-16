@@ -12047,7 +12047,7 @@ func TestStreamConnectivityInputContracts(t *testing.T) {
 func TestRapidStreamControlSessions(t *testing.T) {
 	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
 		t.Run(string(mode), func(t *testing.T) {
-			runRapidStreamSystem(t, mode, "connect", "connect-request", "disconnect", "stale-connect", "zero-connect", "missing-connect", "public-expiry", "utc-expiry", "invalid-expiry", "missing-expiry", "endpoints", "request-hostinfo", "policy", "dns", "derp", "noop")
+			runRapidStreamSystem(t, mode, "connect", "connect-request", "disconnect", "stale-connect", "zero-connect", "missing-connect", "public-expiry", "utc-expiry", "invalid-expiry", "missing-expiry", "health", "endpoints", "request-hostinfo", "policy", "dns", "derp", "noop")
 		})
 	}
 }
@@ -12094,6 +12094,10 @@ func TestStreamControlSessionHistory(t *testing.T) {
 					op := streamOperation{kind: kind, node: n, before: n.Clone(), epoch: epoch, request: tailcfg.MapRequest{NodeKey: n.NodeKey}}
 					if strings.Contains(kind, "expiry") {
 						op.node.Expiry = expiry
+					}
+
+					if kind == "health" {
+						op.node.Unhealthy = true
 					}
 
 					if kind == "zero-connect" {
@@ -12167,6 +12171,7 @@ func TestStreamControlSessionHistory(t *testing.T) {
 				}
 
 				phase("disconnect", 3, third, nil, 2)
+				phase("health", 2, 0, nil, 2)
 				phase("disconnect", 2, fourth, nil, 2)
 
 				for _, id := range []types.NodeID{2, 3} {
