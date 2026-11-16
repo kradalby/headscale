@@ -763,3 +763,55 @@ packet-port, ownership, SSH-absence, attribute and online projections remain.
 go test -p 1 ./hscontrol/policy/v2 -run '^(TestPacketAppIntentRetiredSources|TestIncrementalPolicyRapidPacketIntent|TestIncrementalPolicyRapidAppReplacements)$' -count=1 -rapid.seed=2026111621 -rapid.checks=300 -rapid.nofailfile
 go test -p 1 ./hscontrol/mapper -run '^TestStreamAppIntentHistory$' -count=1 -rapid.seed=2026111621 -rapid.checks=20 -rapid.nofailfile
 ```
+
+## Concurrent policy and DNS inputs
+
+`TestRapidStreamConcurrentInputs` composes two public inputs on one shared State:
+`SetPolicy` with the existing allow-all, deny-all or member/self document, and
+`SetExtraRecords` with owned DNS records. This is the memory-only policy API;
+concurrent file reload and durable policy writes are outside this domain.
+Nodes and users remain fixed. `world.SetPolicy` writes only the policy source
+cell, while `world.SetExtraRecords` replaces records in the DNS cell and retains
+its frozen settings. These simple documents do not read DNS or contain route
+auto-approvers, embedded tests or SSH callbacks. Either publication order must
+therefore preserve both inputs. No production timestamp or report-generation
+assignment is adopted.
+
+The complete bounded history is drawn before workers start. Each pair launches
+two goroutines behind one start channel; both public calls finish before the
+owned model advances or Rapid asserts. Scheduler interleavings are not guaranteed
+or made deterministic by the seed. Mandatory phases cover simultaneous positive
+changes, canonical DNS no-op, completed denial and clear, empty no-op,
+restoration, policy-only change and DNS-only change. Up to four generated pairs
+follow. Policy acceptance and the exact sum of independent graph revisions are
+checked; equivalent pairs must publish no revision and enqueue no session wake.
+Submitted buffers are checked for mutation and then overwritten to test ownership.
+
+An actual State subscription and Hub watcher run throughout the history inside
+`rapid.SyncTest`. After both writers finish, `synctest.Wait` establishes wake
+enqueue quiescence. Only received session wakes cause delivery. Every completed
+map and every unwoken client passes the existing `checkSession`, owned packet,
+identity, connectivity, World, route and peer-history checks. Encoding still uses
+both Hub JSON/zstd cache slots and pinned client replay. DNS ExtraRecords derive
+from `propcheck.CanonicalDNSRecords`; all other DNS fields must preserve the
+completed baseline settings. That latter comparison checks preservation, not an
+independent startup DNS renderer. Policy audits remain enabled.
+
+Each pair retains the pre-burst World, snapshot, policy, DNS records and a full
+client map. After the burst, the retained map and a late render of the old snapshot
+pass the old input checks. Late rendering uses `r.render` plus `fullResponse`,
+because `Initial` may advance to the Hub's latest snapshot. Literal positive and
+cleared protocol maps in `TestStreamConcurrentInputContracts` anchor the same
+packet and DNS checkers. Five corruption controls reject lost policy, lost DNS,
+stale policy, stale DNS and lost frozen settings without a fresh-render oracle.
+
+```sh
+go test -p 1 ./hscontrol/mapper -run '^(TestRapidStreamConcurrentInputs|TestStreamConcurrentInputContracts)$' -count=1 -timeout=10m -rapid.seed=2026111602 -rapid.checks=100 -rapid.nofailfile
+CGO_ENABLED=1 go test -race -p 1 ./hscontrol/mapper -run '^(TestRapidStreamConcurrentInputs|TestStreamConcurrentInputContracts)$' -count=1 -timeout=10m -rapid.seed=2026111603 -rapid.checks=20 -rapid.nofailfile
+```
+
+This is final quiescent convergence for independent public writes. It does not
+check maps delivered during a burst, establish full linearizability, guarantee
+particular lock schedules, or cover concurrent MapRequests, transport, database
+failure/retry, or restart durability. No generic scheduler or production hook is
+introduced. Existing sequential and known-failing domains remain unchanged.

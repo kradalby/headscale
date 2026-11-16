@@ -12311,3 +12311,227 @@ func TestStreamConnectivityRejectsCorruptions(t *testing.T) {
 		})
 	}
 }
+
+func TestRapidStreamConcurrentInputs(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+	rapid.Check(t, func(t *rapid.T) {
+		rapid.SyncTest(t, checkStreamConcurrentInputs)
+	})
+}
+
+func checkStreamConcurrentInputs(t *rapid.T) {
+	p := newStreamPropertySystem(t)
+	p.setPolicy(t, 1)
+	ids := slices.Sorted(maps.Keys(p.sessions))
+	frozenDNS := make(map[types.NodeID]*tailcfg.DNSConfig, len(ids))
+
+	for _, id := range ids {
+		p.update(t, id, p.state.Snapshot(), 0)
+		frozenDNS[id] = p.sessions[id].client.dns.Clone()
+	}
+
+	// Draw the complete history before starting any concurrent input workers.
+	records := []tailcfg.DNSRecord{{Name: "service.example.com", Type: "A", Value: fmt.Sprintf("100.64.0.%d", rapid.ByteRange(1, 254).Draw(t, "DNS witness"))}}
+	equivalent := slices.Clone(records)
+	equivalent[0].Name = strings.ToUpper(equivalent[0].Name)
+	phases := make([]streamOperation, 0, 11)
+
+	phases = append(phases, []streamOperation{
+		{kind: "allow-and-DNS", policy: 0, records: records},
+		{kind: "canonical-noop", policy: 0, records: equivalent},
+		{kind: "deny-and-clear", policy: 1},
+		{kind: "empty-noop", policy: 1, records: []tailcfg.DNSRecord{}},
+		{kind: "restore", policy: 0, records: records},
+		{kind: "policy-only", policy: 2, records: records},
+		{kind: "DNS-only", policy: 2},
+	}...)
+	for range rapid.IntRange(0, 4).Draw(t, "concurrent suffix") {
+		phases = append(phases, streamOperation{kind: "generated", policy: rapid.IntRange(0, 2).Draw(t, "concurrent policy"), records: propcheck.DrawDNSRecords(t)})
+	}
+
+	sub := p.state.Subscribe()
+	before := p.state.Snapshot()
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+
+		p.hub.watch(p.state, sub, before)
+	}()
+
+	t.Cleanup(func() { p.hub.Close(); <-finished })
+	synctest.Wait()
+
+	for _, op := range phases {
+		t.Logf("concurrent phase %s", op.kind)
+		p.concurrentPolicyDNS(t, op, frozenDNS)
+	}
+}
+
+// These public writes own different graph inputs; nodes/users stay fixed and
+// simple policies neither read DNS nor approve routes. Only final delivery is modeled.
+func (p *streamPropertySystem) concurrentPolicyDNS(t *rapid.T, op streamOperation, frozenDNS map[types.NodeID]*tailcfg.DNSConfig) {
+	before := p.state.Snapshot()
+	old := *p
+	old.world, old.policyDoc, old.dnsRecords = p.world.Clone(), slices.Clone(p.policyDoc), slices.Clone(p.dnsRecords)
+	viewer := types.NodeID(1)
+	version := p.sessions[viewer].capVer
+	retained, err := NewStream(p.cfg, p.hub, viewer, version).r.render(before)
+	require.NoError(t, err)
+
+	oldClient := newPropertyClient(&tailcfg.MapResponse{})
+	applyStreamPropertyWire(t, p.hub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, retained)})
+	old.checkSession(t, viewer, before, &streamPropertySession{client: oldClient, capVer: version})
+	checkStreamDNSInputs(t, frozenDNS[viewer], old.dnsRecords, oldClient)
+
+	doc := []byte(streamPropertyPolicies[op.policy])
+	submittedDoc, submittedRecords := slices.Clone(doc), slices.Clone(op.records)
+	wantRecords := propcheck.CanonicalDNSRecords(op.records)
+	policyChanged := !bytes.Equal(p.policyDoc, doc)
+
+	wantRev := before.Rev()
+	if policyChanged {
+		wantRev++
+	}
+
+	if !slices.Equal(p.dnsRecords, wantRecords) {
+		wantRev++
+	}
+
+	audits := state.PolicyAuditFailures()
+	start := make(chan struct{})
+
+	var changed bool
+
+	var policyErr error
+
+	var workers sync.WaitGroup
+
+	workers.Go(func() {
+		<-start
+
+		changed, policyErr = p.state.SetPolicy(submittedDoc)
+	})
+	workers.Go(func() {
+		<-start
+		p.state.SetExtraRecords(submittedRecords)
+	})
+	close(start)
+	workers.Wait()
+
+	// No Rapid calls or owned-model writes run in the input goroutines.
+	require.NoError(t, policyErr)
+	require.Equal(t, policyChanged, changed, "concurrent policy acceptance")
+	require.Equal(t, doc, submittedDoc, "policy input mutated")
+	require.Equal(t, op.records, submittedRecords, "DNS input mutated")
+	p.policy, p.policyDoc, p.dnsRecords = op.policy, doc, wantRecords
+	require.Equal(t, wantRev, p.state.Snapshot().Rev(), "independent input publications")
+	require.Equal(t, audits, state.PolicyAuditFailures(), "concurrent policy audit")
+
+	// Reusing caller buffers must not alter current or retained input snapshots.
+	submittedDoc[0] = '!'
+
+	if len(submittedRecords) > 0 {
+		submittedRecords[0].Value = "192.0.2.99"
+	}
+
+	synctest.Wait()
+
+	final := p.state.Snapshot()
+	p.checkWorld(t)
+
+	for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+		select {
+		case <-p.sessions[id].stream.sess.Wakes():
+			require.NotEqual(t, wantRev, before.Rev(), "equivalent inputs must not wake clients")
+			p.update(t, id, final, 0)
+		default:
+		}
+
+		// Unwoken clients must already contain both final accepted inputs.
+		p.checkSession(t, id, final, p.sessions[id])
+		checkStreamDNSInputs(t, frozenDNS[id], p.dnsRecords, p.sessions[id].client)
+	}
+
+	p.checkHistory(t)
+	propcheck.CheckWorld(t, old.world, before, p.probes)
+	require.Equal(t, string(old.policyDoc), string(before.PolicySource()), "retained policy input")
+	require.True(t, slices.Equal(old.dnsRecords, before.DNS().ExtraRecords().AsSlice()), "retained DNS input")
+
+	late, err := NewStream(p.cfg, p.hub, viewer, version).r.render(before)
+	require.NoError(t, err)
+
+	lateClient := newPropertyClient(&tailcfg.MapResponse{})
+	applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
+
+	for _, client := range []*propertyClient{oldClient, lateClient} {
+		old.checkSession(t, viewer, before, &streamPropertySession{client: client, capVer: version})
+		checkStreamDNSInputs(t, frozenDNS[viewer], old.dnsRecords, client)
+	}
+
+	lateClient.check(t, oldClient)
+}
+
+// ExtraRecords come from owned inputs; other DNS fields retain the completed
+// baseline settings. This checks preservation, not independent startup rendering.
+func checkStreamDNSInputs(t require.TestingT, frozen *tailcfg.DNSConfig, records []tailcfg.DNSRecord, client *propertyClient) {
+	require.NotNil(t, client.dns, "DNS config missing")
+
+	want := frozen.Clone()
+	want.ExtraRecords = propcheck.CanonicalDNSRecords(records)
+	require.Equal(t, wireJSON(t, want), wireJSON(t, client.dns), "DNS inputs and frozen settings")
+}
+
+func TestStreamConcurrentInputContracts(t *testing.T) {
+	world := propcheck.World{Nodes: map[types.NodeID]*types.Node{
+		1: {ID: 1, IPv4: new(netip.MustParseAddr("100.64.0.1"))},
+		2: {ID: 2, IPv4: new(netip.MustParseAddr("100.64.0.2"))},
+	}}
+	allow, deny := streamPacketIntent(world, 0, nil), streamPacketIntent(world, 1, nil)
+	frozen := &tailcfg.DNSConfig{Proxied: true, Domains: []string{"headscale.test"}, Routes: map[string][]*dnstype.Resolver{"headscale.test": {}}}
+	records := []tailcfg.DNSRecord{{Name: "Service.Example.com", Type: "A", Value: "100.64.0.9"}}
+	positive := &tailcfg.MapResponse{
+		Node:         &tailcfg.Node{ID: 1},
+		Peers:        []*tailcfg.Node{{ID: 2}},
+		PacketFilter: []tailcfg.FilterRule{{SrcIPs: []string{"*"}, DstPorts: []tailcfg.NetPortRange{{IP: "*", Ports: tailcfg.PortRange{First: 0, Last: 65535}}}}},
+		DNSConfig:    frozen.Clone(),
+	}
+	positive.DNSConfig.ExtraRecords = []tailcfg.DNSRecord{{Name: "service.example.com", Type: "A", Value: "100.64.0.9"}}
+	client := newPropertyClient(positive)
+	checkStreamPacketIntent(t, world, allow, 1, client)
+	checkStreamDNSInputs(t, frozen, records, client)
+	cleared := newPropertyClient(&tailcfg.MapResponse{Node: &tailcfg.Node{ID: 1}, DNSConfig: frozen.Clone()})
+	checkStreamPacketIntent(t, world, deny, 1, cleared)
+	checkStreamDNSInputs(t, frozen, nil, cleared)
+
+	for _, mutation := range []string{"lost-policy", "lost-DNS", "stale-policy", "stale-DNS", "lost-settings"} {
+		t.Run(mutation, func(t *testing.T) {
+			client := newPropertyClient(positive)
+			client.dns = positive.DNSConfig.Clone()
+			wantIntent, wantRecords := allow, records
+			message := "DNS inputs and frozen settings"
+
+			switch mutation {
+			case "lost-policy":
+				client.filter = nil
+				message = "packet"
+			case "lost-DNS":
+				client.dns.ExtraRecords = nil
+			case "stale-policy":
+				wantIntent = deny
+				message = "packet"
+			case "stale-DNS":
+				wantRecords = nil
+			case "lost-settings":
+				client.dns.Routes = nil
+			}
+
+			failure := &streamConnectivityFailure{}
+			require.PanicsWithValue(t, failure, func() {
+				checkStreamPacketIntent(failure, world, wantIntent, 1, client)
+				checkStreamDNSInputs(failure, frozen, wantRecords, client)
+			})
+			require.Contains(t, failure.message, message)
+		})
+	}
+}
