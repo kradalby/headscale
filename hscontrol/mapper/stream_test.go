@@ -1506,6 +1506,8 @@ func testStreamsConverge(t *testing.T, r *rand.Rand) oracleReach {
 		// last changed its membership.
 		require.True(t, snap.MembershipAudited(), "step %d: the last change to membership was audited", step)
 		require.True(t, snap.FilterAudited(), "step %d: every filter was expanded from templates and checked at the last change", step)
+		require.True(t, snap.SidesAudited(), "step %d: peers, routes and via from roles were checked at the last change", step)
+		require.True(t, snap.ViaElectionAudited() || snap.PolicyErr() != nil, "step %d: the via elections were checked against the plan", step)
 
 		advanceOracleSessions(t, r, cfg, hub, snap, wake(snap), sessions)
 		requireOracleConverged(t, step, cfg, snap, sessions)
