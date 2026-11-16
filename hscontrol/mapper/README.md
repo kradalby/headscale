@@ -872,6 +872,43 @@ particular lock schedules, or cover concurrent MapRequests, transport, database
 failure/retry, or restart durability. No generic scheduler or production hook is
 introduced. Existing sequential and known-failing domains remain unchanged.
 
+## Concurrent public MapRequests
+
+`TestRapidStreamConcurrentRequests` reuses the subscription, retained snapshots,
+Hub JSON/zstd, cumulative replay and final-delivery checks above. Two existing
+nodes report concurrently under allow-all policy, sharing the graph's node input.
+Nine mandatory pairs cover both changing, identical repeat, omitted NetInfo,
+omitted Hostinfo/endpoints, explicit empty endpoints/services/NetInfo, repeated
+clear, restore, one changing while the other repeats, and restore again.
+Endpoint/service ports, OS and nonzero home DERP are drawn before any workers;
+there is no additional generated suffix. Names, keys, ownership and routes stay
+fixed. `expectRequest` derives semantics from owned inputs and also serves the
+sequential adapter, whose counter, revision, ownership and causal checks remain.
+
+After both calls return, each LastSeen must lie within its own call interval.
+Changed ReportGen values must be exactly the next contiguous counter permutation
+above the previous global bound; unchanged reports retain their counters. Only
+after validating that complete set does the model bind each returned counter.
+No returned semantic field or whole node supplies an expectation. This relies
+on the nonpanic domain: `world.commitWrites` retries callbacks only after a batch
+panic, while `graph.update` runs each transaction once under its mutex. Panic
+recovery and persistence failures are excluded. Two requests publish one or two
+revisions because they can batch; even content repeats publish LastSeen.
+
+Submitted buffers are checked, then poisoned. Current and retained World records
+must preserve both reports and unrelated fields. Delivered and retained Hostname,
+services and peer OS also match owned inputs, alongside the existing endpoint and
+HomeDERP checks. `TestStreamConcurrentRequestContracts` rejects literal stale
+Hostname/OS and lost services through that same checker. Existing connectivity
+corruption controls cover endpoints and DERP. This tests final quiescent delivery,
+not intermediate maps, particular schedules, same-node writes or linearizability.
+The policy/DNS property retains its separate exact-revision and zero-wake contract.
+
+```sh
+go test -p 1 ./hscontrol/mapper -run '^(TestRapidStreamConcurrentRequests|TestStreamConcurrentRequestContracts)$' -count=1 -timeout=10m -rapid.seed=2026111612 -rapid.checks=100 -rapid.nofailfile
+CGO_ENABLED=1 go test -race -p 1 ./hscontrol/mapper -run '^(TestRapidStreamConcurrentRequests|TestStreamConcurrentRequestContracts)$' -count=1 -timeout=10m -rapid.seed=2026111613 -rapid.checks=20 -rapid.nofailfile
+```
+
 ## Known app-free policy replacements
 
 `streamAppIntent` preserves explicit generated intent and derives an empty

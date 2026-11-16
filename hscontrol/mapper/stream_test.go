@@ -9671,13 +9671,11 @@ func TestStreamRequestGivenName(t *testing.T) {
 	}
 }
 
-// inputRequest predicts the supported report domain before calling State.
+// expectRequest derives report semantics only from owned inputs.
 // Latency jitter, general hostname sanitation and policy auto-approval are outside it.
-func (p *streamPropertySystem) inputRequest(t *rapid.T, op streamOperation) {
-	before, oldWorld := p.state.Snapshot(), p.world.Clone()
+func (p *streamPropertySystem) expectRequest(t *rapid.T, op streamOperation) (*types.Node, bool) {
 	n := op.before.Clone()
 	req := op.request
-	req.Hostinfo, req.Endpoints = req.Hostinfo.Clone(), slices.Clone(req.Endpoints)
 
 	oldEndpoints := slices.SortedFunc(slices.Values(n.Endpoints), netip.AddrPort.Compare)
 	newEndpoints := slices.SortedFunc(slices.Values(req.Endpoints), netip.AddrPort.Compare)
@@ -9729,13 +9727,24 @@ func (p *streamPropertySystem) inputRequest(t *rapid.T, op streamOperation) {
 		n.Hostinfo = hi
 	}
 
+	if n.Unhealthy && len(propertyApproved(n)) == 0 {
+		n.Unhealthy = false
+	}
+
+	return n, changed
+}
+
+// inputRequest predicts the supported report domain before calling State.
+// Latency jitter, general hostname sanitation and policy auto-approval are outside it.
+func (p *streamPropertySystem) inputRequest(t *rapid.T, op streamOperation) {
+	before, oldWorld := p.state.Snapshot(), p.world.Clone()
+	n, changed := p.expectRequest(t, op)
+	req := op.request
+	req.Hostinfo, req.Endpoints = req.Hostinfo.Clone(), slices.Clone(req.Endpoints)
+
 	if changed {
 		p.reportSeq++
 		n.ReportGen = p.reportSeq
-	}
-
-	if n.Unhealthy && len(propertyApproved(n)) == 0 {
-		n.Unhealthy = false
 	}
 
 	start := time.Now()
@@ -12492,16 +12501,145 @@ func TestStreamConnectivityRejectsCorruptions(t *testing.T) {
 	}
 }
 
+// The mandatory prefix exercises change, repeat, omission, clear and restore on both nodes.
+func (p *streamPropertySystem) drawConcurrentRequests(t *rapid.T) [][2]tailcfg.MapRequest {
+	var positive, omitted, cleared, lite [2]tailcfg.MapRequest
+	for i := range positive {
+		n := p.world.Nodes[types.NodeID(i+1)]
+		positive[i] = tailcfg.MapRequest{
+			NodeKey: n.NodeKey, DiscoKey: n.DiscoKey,
+			Endpoints: []netip.AddrPort{netip.AddrPortFrom(*n.IPv4, rapid.Uint16Range(1, 65535).Draw(t, "request port"))},
+			Hostinfo: &tailcfg.Hostinfo{
+				Hostname: n.Hostname, OS: rapid.SampledFrom([]string{"linux", "windows", "darwin"}).Draw(t, "request OS"),
+				Services: []tailcfg.Service{{Proto: "tcp", Port: rapid.Uint16Range(1, 65535).Draw(t, "service port")}},
+				NetInfo:  &tailcfg.NetInfo{PreferredDERP: rapid.SampledFrom([]tailcfg.DERPRegionID{1, 2, 3}).Draw(t, "request DERP")},
+			},
+		}
+		omitted[i] = positive[i]
+		omitted[i].Hostinfo = positive[i].Hostinfo.Clone()
+		omitted[i].Hostinfo.NetInfo = nil
+		cleared[i] = positive[i]
+		cleared[i].Endpoints = []netip.AddrPort{}
+		cleared[i].Hostinfo = &tailcfg.Hostinfo{Hostname: n.Hostname, OS: "linux", NetInfo: &tailcfg.NetInfo{}}
+		lite[i] = tailcfg.MapRequest{NodeKey: n.NodeKey, DiscoKey: n.DiscoKey}
+	}
+
+	return [][2]tailcfg.MapRequest{positive, positive, omitted, lite, cleared, cleared, positive, {cleared[0], positive[1]}, positive}
+}
+
+// Distinct nodes commute in this bounded domain; only the counter assignment is unordered.
+func (p *streamPropertySystem) concurrentRequests(t *rapid.T, requests [2]tailcfg.MapRequest) {
+	before, audits := p.state.Snapshot(), state.PolicyAuditFailures()
+
+	var (
+		expected                  [2]*types.Node
+		changed                   [2]bool
+		submitted                 [2]tailcfg.MapRequest
+		started, ended            [2]time.Time
+		errs                      [2]error
+		wantCounters, gotCounters []uint64
+	)
+
+	for i, req := range requests {
+		n := p.world.Nodes[types.NodeID(i+1)]
+		expected[i], changed[i] = p.expectRequest(t, streamOperation{before: n, request: req})
+		submitted[i] = req
+
+		submitted[i].Hostinfo, submitted[i].Endpoints = req.Hostinfo.Clone(), slices.Clone(req.Endpoints)
+		if changed[i] {
+			wantCounters = append(wantCounters, p.reportSeq+uint64(len(wantCounters))+1)
+		}
+	}
+
+	start := make(chan struct{})
+
+	var workers sync.WaitGroup
+	for i := range requests {
+		workers.Go(func() {
+			<-start
+
+			started[i] = time.Now()
+			errs[i] = p.state.UpdateNodeFromMapRequest(expected[i].ID, submitted[i])
+			ended[i] = time.Now()
+		})
+	}
+
+	close(start)
+	workers.Wait()
+
+	final := p.state.Snapshot()
+	require.GreaterOrEqual(t, final.Rev(), before.Rev()+1, "every request stamps LastSeen")
+	require.LessOrEqual(t, final.Rev(), before.Rev()+2, "two writes may share one commit")
+	require.Equal(t, audits, state.PolicyAuditFailures(), "concurrent request policy audit")
+
+	for i, n := range expected {
+		require.NoError(t, errs[i])
+		require.Equal(t, requests[i], submitted[i], "State mutated the submitted request")
+
+		got, ok := final.GetNode(n.ID)
+		require.True(t, ok)
+
+		seen := got.LastSeen().Clone()
+		require.NotNil(t, seen)
+		require.False(t, seen.Before(started[i]), "LastSeen precedes request")
+		require.False(t, seen.After(ended[i]), "LastSeen follows request completion")
+		n.LastSeen = new(*seen)
+
+		if changed[i] {
+			require.Greater(t, got.ReportGen(), p.reportSeq, "changed report exceeds old global bound")
+			gotCounters = append(gotCounters, got.ReportGen())
+		} else {
+			require.Equal(t, n.ReportGen, got.ReportGen(), "content repeat retains ReportGen")
+		}
+	}
+	// world.update retries only panicked batches; this domain has no panic-producing inputs.
+	require.ElementsMatch(t, wantCounters, gotCounters, "exact substantive report counter permutation")
+	p.reportSeq += uint64(len(wantCounters))
+
+	for i, n := range expected {
+		got, _ := final.GetNode(n.ID)
+		n.ReportGen = got.ReportGen()
+		p.world.Put(n)
+
+		if submitted[i].Hostinfo != nil {
+			submitted[i].Hostinfo.Hostname = "mutated-after-request"
+			if submitted[i].Hostinfo.NetInfo != nil {
+				submitted[i].Hostinfo.NetInfo.PreferredDERP = 99
+			}
+
+			if len(submitted[i].Hostinfo.Services) > 0 {
+				submitted[i].Hostinfo.Services[0].Port++
+			}
+		}
+
+		if len(submitted[i].Endpoints) > 0 {
+			submitted[i].Endpoints[0] = netip.MustParseAddrPort("192.0.2.99:1")
+		}
+	}
+}
+
 func TestRapidStreamConcurrentInputs(t *testing.T) {
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
 	rapid.Check(t, func(t *rapid.T) {
-		rapid.SyncTest(t, checkStreamConcurrentInputs)
+		rapid.SyncTest(t, func(t *rapid.T) { checkStreamConcurrentInputs(t, false) })
 	})
 }
 
-func checkStreamConcurrentInputs(t *rapid.T) {
+func TestRapidStreamConcurrentRequests(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+	rapid.Check(t, func(t *rapid.T) {
+		rapid.SyncTest(t, func(t *rapid.T) { checkStreamConcurrentInputs(t, true) })
+	})
+}
+
+func checkStreamConcurrentInputs(t *rapid.T, requests bool) {
 	p := newStreamPropertySystem(t)
-	p.setPolicy(t, 1)
+	if requests {
+		p.setPolicy(t, 0)
+	} else {
+		p.setPolicy(t, 1)
+	}
+
 	ids := slices.Sorted(maps.Keys(p.sessions))
 	frozenDNS := make(map[types.NodeID]*tailcfg.DNSConfig, len(ids))
 
@@ -12510,23 +12648,30 @@ func checkStreamConcurrentInputs(t *rapid.T) {
 		frozenDNS[id] = p.sessions[id].client.dns.Clone()
 	}
 
-	// Draw the complete history before starting any concurrent input workers.
-	records := []tailcfg.DNSRecord{{Name: "service.example.com", Type: "A", Value: fmt.Sprintf("100.64.0.%d", rapid.ByteRange(1, 254).Draw(t, "DNS witness"))}}
-	equivalent := slices.Clone(records)
-	equivalent[0].Name = strings.ToUpper(equivalent[0].Name)
-	phases := make([]streamOperation, 0, 11)
+	var (
+		phases []streamOperation
+		pairs  [][2]tailcfg.MapRequest
+	)
+	if requests {
+		pairs = p.drawConcurrentRequests(t)
+	} else {
+		// Draw the complete history before starting any concurrent input workers.
+		records := []tailcfg.DNSRecord{{Name: "service.example.com", Type: "A", Value: fmt.Sprintf("100.64.0.%d", rapid.ByteRange(1, 254).Draw(t, "DNS witness"))}}
+		equivalent := slices.Clone(records)
+		equivalent[0].Name = strings.ToUpper(equivalent[0].Name)
 
-	phases = append(phases, []streamOperation{
-		{kind: "allow-and-DNS", policy: 0, records: records},
-		{kind: "canonical-noop", policy: 0, records: equivalent},
-		{kind: "deny-and-clear", policy: 1},
-		{kind: "empty-noop", policy: 1, records: []tailcfg.DNSRecord{}},
-		{kind: "restore", policy: 0, records: records},
-		{kind: "policy-only", policy: 2, records: records},
-		{kind: "DNS-only", policy: 2},
-	}...)
-	for range rapid.IntRange(0, 4).Draw(t, "concurrent suffix") {
-		phases = append(phases, streamOperation{kind: "generated", policy: rapid.IntRange(0, 2).Draw(t, "concurrent policy"), records: propcheck.DrawDNSRecords(t)})
+		phases = append(phases, []streamOperation{
+			{kind: "allow-and-DNS", policy: 0, records: records},
+			{kind: "canonical-noop", policy: 0, records: equivalent},
+			{kind: "deny-and-clear", policy: 1},
+			{kind: "empty-noop", policy: 1, records: []tailcfg.DNSRecord{}},
+			{kind: "restore", policy: 0, records: records},
+			{kind: "policy-only", policy: 2, records: records},
+			{kind: "DNS-only", policy: 2},
+		}...)
+		for range rapid.IntRange(0, 4).Draw(t, "concurrent suffix") {
+			phases = append(phases, streamOperation{kind: "generated", policy: rapid.IntRange(0, 2).Draw(t, "concurrent policy"), records: propcheck.DrawDNSRecords(t)})
+		}
 	}
 
 	sub := p.state.Subscribe()
@@ -12542,6 +12687,10 @@ func checkStreamConcurrentInputs(t *rapid.T) {
 	t.Cleanup(func() { p.hub.Close(); <-finished })
 	synctest.Wait()
 
+	for _, pair := range pairs {
+		p.concurrentInputDelivery(t, frozenDNS, func() { p.concurrentRequests(t, pair) })
+	}
+
 	for _, op := range phases {
 		t.Logf("concurrent phase %s", op.kind)
 		p.concurrentPolicyDNS(t, op, frozenDNS)
@@ -12551,6 +12700,71 @@ func checkStreamConcurrentInputs(t *rapid.T) {
 // These public writes own different graph inputs; nodes/users stay fixed and
 // simple policies neither read DNS nor approve routes. Only final delivery is modeled.
 func (p *streamPropertySystem) concurrentPolicyDNS(t *rapid.T, op streamOperation, frozenDNS map[types.NodeID]*tailcfg.DNSConfig) {
+	p.concurrentInputDelivery(t, frozenDNS, func() {
+		before := p.state.Snapshot()
+		doc := []byte(streamPropertyPolicies[op.policy])
+		submittedDoc, submittedRecords := slices.Clone(doc), slices.Clone(op.records)
+		wantRecords := propcheck.CanonicalDNSRecords(op.records)
+		policyChanged := !bytes.Equal(p.policyDoc, doc)
+
+		wantRev := before.Rev()
+		if policyChanged {
+			wantRev++
+		}
+
+		if !slices.Equal(p.dnsRecords, wantRecords) {
+			wantRev++
+		}
+
+		audits := state.PolicyAuditFailures()
+		start := make(chan struct{})
+
+		var changed bool
+
+		var policyErr error
+
+		var workers sync.WaitGroup
+
+		workers.Go(func() {
+			<-start
+
+			changed, policyErr = p.state.SetPolicy(submittedDoc)
+		})
+		workers.Go(func() {
+			<-start
+			p.state.SetExtraRecords(submittedRecords)
+		})
+		close(start)
+		workers.Wait()
+
+		// No Rapid calls or owned-model writes run in the input goroutines.
+		require.NoError(t, policyErr)
+		require.Equal(t, policyChanged, changed, "concurrent policy acceptance")
+		require.Equal(t, doc, submittedDoc, "policy input mutated")
+		require.Equal(t, op.records, submittedRecords, "DNS input mutated")
+		p.policy, p.policyDoc, p.dnsRecords = op.policy, doc, wantRecords
+		require.Equal(t, wantRev, p.state.Snapshot().Rev(), "independent input publications")
+		require.Equal(t, audits, state.PolicyAuditFailures(), "concurrent policy audit")
+
+		// Reusing caller buffers must not alter current or retained input snapshots.
+		submittedDoc[0] = '!'
+
+		if len(submittedRecords) > 0 {
+			submittedRecords[0].Value = "192.0.2.99"
+		}
+
+		synctest.Wait()
+
+		for _, session := range p.sessions {
+			if len(session.stream.sess.Wakes()) > 0 {
+				require.NotEqual(t, wantRev, before.Rev(), "equivalent inputs must not wake clients")
+			}
+		}
+	})
+}
+
+// Keep the same retained-input and actual subscription checks for both public write pairs.
+func (p *streamPropertySystem) concurrentInputDelivery(t *rapid.T, frozenDNS map[types.NodeID]*tailcfg.DNSConfig, write func()) {
 	before := p.state.Snapshot()
 	old := *p
 	old.world, old.policyDoc, old.dnsRecords = p.world.Clone(), slices.Clone(p.policyDoc), slices.Clone(p.dnsRecords)
@@ -12562,58 +12776,10 @@ func (p *streamPropertySystem) concurrentPolicyDNS(t *rapid.T, op streamOperatio
 	oldClient := newPropertyClient(&tailcfg.MapResponse{})
 	applyStreamPropertyWire(t, p.hub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, retained)})
 	old.checkSession(t, viewer, before, &streamPropertySession{client: oldClient, capVer: version})
+	checkStreamRequestHostinfo(t, old.world, oldClient)
 	checkStreamDNSInputs(t, frozenDNS[viewer], old.dnsRecords, oldClient)
 
-	doc := []byte(streamPropertyPolicies[op.policy])
-	submittedDoc, submittedRecords := slices.Clone(doc), slices.Clone(op.records)
-	wantRecords := propcheck.CanonicalDNSRecords(op.records)
-	policyChanged := !bytes.Equal(p.policyDoc, doc)
-
-	wantRev := before.Rev()
-	if policyChanged {
-		wantRev++
-	}
-
-	if !slices.Equal(p.dnsRecords, wantRecords) {
-		wantRev++
-	}
-
-	audits := state.PolicyAuditFailures()
-	start := make(chan struct{})
-
-	var changed bool
-
-	var policyErr error
-
-	var workers sync.WaitGroup
-
-	workers.Go(func() {
-		<-start
-
-		changed, policyErr = p.state.SetPolicy(submittedDoc)
-	})
-	workers.Go(func() {
-		<-start
-		p.state.SetExtraRecords(submittedRecords)
-	})
-	close(start)
-	workers.Wait()
-
-	// No Rapid calls or owned-model writes run in the input goroutines.
-	require.NoError(t, policyErr)
-	require.Equal(t, policyChanged, changed, "concurrent policy acceptance")
-	require.Equal(t, doc, submittedDoc, "policy input mutated")
-	require.Equal(t, op.records, submittedRecords, "DNS input mutated")
-	p.policy, p.policyDoc, p.dnsRecords = op.policy, doc, wantRecords
-	require.Equal(t, wantRev, p.state.Snapshot().Rev(), "independent input publications")
-	require.Equal(t, audits, state.PolicyAuditFailures(), "concurrent policy audit")
-
-	// Reusing caller buffers must not alter current or retained input snapshots.
-	submittedDoc[0] = '!'
-
-	if len(submittedRecords) > 0 {
-		submittedRecords[0].Value = "192.0.2.99"
-	}
+	write()
 
 	synctest.Wait()
 
@@ -12623,13 +12789,13 @@ func (p *streamPropertySystem) concurrentPolicyDNS(t *rapid.T, op streamOperatio
 	for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
 		select {
 		case <-p.sessions[id].stream.sess.Wakes():
-			require.NotEqual(t, wantRev, before.Rev(), "equivalent inputs must not wake clients")
 			p.update(t, id, final, 0)
 		default:
 		}
 
 		// Unwoken clients must already contain both final accepted inputs.
 		p.checkSession(t, id, final, p.sessions[id])
+		checkStreamRequestHostinfo(t, p.world, p.sessions[id].client)
 		checkStreamDNSInputs(t, frozenDNS[id], p.dnsRecords, p.sessions[id].client)
 	}
 
@@ -12646,10 +12812,60 @@ func (p *streamPropertySystem) concurrentPolicyDNS(t *rapid.T, op streamOperatio
 
 	for _, client := range []*propertyClient{oldClient, lateClient} {
 		old.checkSession(t, viewer, before, &streamPropertySession{client: client, capVer: version})
+		checkStreamRequestHostinfo(t, old.world, client)
 		checkStreamDNSInputs(t, frozenDNS[viewer], old.dnsRecords, client)
 	}
 
 	lateClient.check(t, oldClient)
+}
+
+func checkStreamRequestHostinfo(t require.TestingT, world propcheck.World, client *propertyClient) {
+	for _, id := range slices.Sorted(maps.Keys(world.Nodes)) {
+		input, wire := world.Nodes[id], client.peers[id.NodeID()]
+		if id.NodeID() == client.self.ID {
+			wire = client.self
+		}
+
+		if wire == nil {
+			continue
+		}
+
+		require.Equal(t, input.Hostinfo.Hostname, wire.Hostinfo.Hostname(), "request Hostname")
+		require.Equal(t, wireJSON(t, input.Hostinfo.Services), wireJSON(t, wire.Hostinfo.Services().AsSlice()), "request Services")
+
+		if wire.ID != client.self.ID {
+			require.Equal(t, input.Hostinfo.OS, wire.Hostinfo.OS(), "request peer OS")
+		}
+	}
+}
+
+func TestStreamConcurrentRequestContracts(t *testing.T) {
+	hi := &tailcfg.Hostinfo{Hostname: "reported", OS: "linux", Services: []tailcfg.Service{{Proto: "tcp", Port: 443}}}
+	world := propcheck.World{Nodes: map[types.NodeID]*types.Node{1: {Hostinfo: hi.Clone()}, 2: {Hostinfo: hi.Clone()}}}
+	client := newPropertyClient(&tailcfg.MapResponse{
+		Node: &tailcfg.Node{ID: 1, Hostinfo: hi.Clone().View()}, Peers: []*tailcfg.Node{{ID: 2, Hostinfo: hi.Clone().View()}},
+	})
+	checkStreamRequestHostinfo(t, world, client)
+
+	for _, field := range []string{"Hostname", "OS", "Services"} {
+		t.Run(field, func(t *testing.T) {
+			corrupt := hi.Clone()
+
+			switch field {
+			case "Hostname":
+				corrupt.Hostname = "stale"
+			case "OS":
+				corrupt.OS = "windows"
+			case "Services":
+				corrupt.Services = nil
+			}
+
+			client.peers[2].Hostinfo = corrupt.View()
+			failure := &streamConnectivityFailure{}
+			require.PanicsWithValue(t, failure, func() { checkStreamRequestHostinfo(failure, world, client) })
+			require.Contains(t, failure.message, field)
+		})
+	}
 }
 
 // ExtraRecords come from owned inputs; other DNS fields retain the completed
