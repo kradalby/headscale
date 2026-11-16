@@ -929,6 +929,82 @@ func TestStreamRouteOverlaysFollowPeerVisibility(t *testing.T) {
 	}
 }
 
+// TestStreamRouteOverlaySurvivesRerenderedPeer pins a viewer's route overlay
+// while its class map holds an unchanged peer under another pointer than the
+// viewer's map: a session behind the viewer renders the peer's previous
+// version into the shared render cache, so the viewer's next class, rebuilt
+// for a join, renders the peer anew. When that peer and the router then
+// change together, the peer must not count as an overlay the viewer lost.
+func TestStreamRouteOverlaySurvivesRerenderedPeer(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	viewer, peer, router := ids[0], ids[1], ids[2]
+	route := netip.MustParsePrefix("10.0.0.0/24")
+
+	n := mustNode(t, s, router).AsStruct()
+	n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+	n.ApprovedRoutes = []netip.Prefix{route}
+	s.PutNodeInStoreForTest(*n)
+	s.Connect(router)
+
+	hub := NewHub()
+	t.Cleanup(hub.Close)
+
+	st := NewStream(cfg, hub, viewer, capVer)
+	initial, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+	st.Delivered()
+
+	behind := NewStream(cfg, hub, router, capVer)
+	_, err = behind.Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	client := newModelClient(initial[0])
+	update := func() {
+		t.Helper()
+
+		resps, err := st.Update(s.Snapshot())
+		require.NoError(t, err)
+
+		for _, resp := range resps {
+			client.apply(resp)
+		}
+
+		st.Delivered()
+	}
+
+	scalingEndpoint(t, s, peer, 1)
+	stale := s.Snapshot()
+	scalingEndpoint(t, s, peer, 2)
+	update()
+
+	// The router's session renders the snapshot it read before the last write.
+	_, err = behind.Update(stale)
+	require.NoError(t, err)
+
+	joined := mustNode(t, s, peer).AsStruct()
+	joined.ID = types.NodeID(1 << 40)
+	joined.Hostname, joined.GivenName = "joined", "joined"
+	joined.IPv4, joined.IPv6 = new(netip.MustParseAddr("100.100.100.100")), nil
+	s.PutNodeInStoreForTest(*joined)
+	update()
+
+	held, _ := st.sent.peer(peer.NodeID())
+	plain, _ := st.r.lastClass.Get(peer.NodeID())
+	require.NotSame(t, plain, held, "fixture must leave the viewer an equal render under another pointer")
+
+	scalingEndpoint(t, s, peer, 3)
+	scalingEndpoint(t, s, router, 1)
+	update()
+
+	sent, ok := st.sent.peer(router.NodeID())
+	require.True(t, ok)
+	assert.Contains(t, sent.AllowedIPs, route, "the router keeps the viewer's route")
+
+	fresh, err := NewStream(cfg, NewHub(), viewer, capVer).Initial(s.Snapshot())
+	require.NoError(t, err)
+	require.Empty(t, client.sameAs(newModelClient(fresh[0])))
+}
+
 // BenchmarkRoutedRender measures one endpoint update with unrelated routers,
 // including invisible routers whose routes never belong to the viewer.
 func BenchmarkRoutedRender(b *testing.B) {

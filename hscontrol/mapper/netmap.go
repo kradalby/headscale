@@ -129,9 +129,12 @@ type renderer struct {
 	lastSelf    types.NodeView
 	lastNodes   state.NodesVersion
 	lastCaps    state.CapsVersion
-	// overlays counts peers with viewer-specific routes, so losing the
-	// last overlay restores the shared class map.
-	overlays         int
+	// overlaid holds the peers this viewer has its own copy of, with its
+	// routes or without the IPv4 identity, so losing the last restores the
+	// shared class map. It is kept by ID, not told from the last class
+	// map: a rebuilt class can render an unchanged peer anew, an equal
+	// render under another pointer than this viewer holds.
+	overlaid         map[tailcfg.NodeID]struct{}
 	lastIPv4Disabled bool
 	// routedPrimaries are the primary routes each routed peer's routes were
 	// rendered with, and routedVia the via elections: a primary move that
@@ -494,20 +497,15 @@ func (r *renderer) renderPeers(
 	slices.Sort(candidates)
 	candidates = slices.Compact(candidates)
 	peers := nm.peers.Edit()
-	overlays := r.overlays
 
-	var routed []types.NodeID
+	var (
+		routed []types.NodeID
+		// overlaid are the candidates this render gives an overlay; the
+		// other peers keep what they had.
+		overlaid []tailcfg.NodeID
+	)
 
 	for _, id := range candidates {
-		if base != nil {
-			was, _ := base.peers.Get(id)
-
-			plain, _ := r.lastClass.Get(id)
-			if was != plain {
-				overlays--
-			}
-		}
-
 		tn, ok := class.Get(id)
 		if !ok {
 			peers.Delete(id)
@@ -526,7 +524,7 @@ func (r *renderer) renderPeers(
 			if ipv4Disabled && id != r.nodeID.NodeID() {
 				tn = withoutIPv4Identity(tn)
 				if plain, _ := class.Get(id); tn != plain {
-					overlays++
+					overlaid = append(overlaid, id)
 				}
 			}
 
@@ -560,7 +558,7 @@ func (r *renderer) renderPeers(
 			}
 
 			if tn != base {
-				overlays++
+				overlaid = append(overlaid, id.NodeID())
 			}
 
 			if old, _ := peers.Get(id.NodeID()); old != tn {
@@ -569,14 +567,26 @@ func (r *renderer) renderPeers(
 		}
 	}
 
+	for _, id := range candidates {
+		delete(r.overlaid, id)
+	}
+
+	if len(overlaid) > 0 && r.overlaid == nil {
+		r.overlaid = make(map[tailcfg.NodeID]struct{}, len(overlaid))
+	}
+
+	for _, id := range overlaid {
+		r.overlaid[id] = struct{}{}
+	}
+
 	// Only routed peers differ per viewer; a session without them
 	// shares its class's map outright.
 	nm.peers = peers.Done()
-	if overlays == 0 {
+	if len(r.overlaid) == 0 {
 		nm.peers = class
 	}
 
-	r.overlays, r.lastIPv4Disabled = overlays, ipv4Disabled
+	r.lastIPv4Disabled = ipv4Disabled
 
 	nm.recordPeerChanges(base, candidates, r.nodeID.NodeID())
 	r.rendered += len(nm.changed)
