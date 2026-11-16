@@ -10961,7 +10961,7 @@ func streamSSHIntent(t require.TestingT, doc []byte, explicit *propcheck.SSHInte
 			SSH []json.RawMessage `json:"ssh"`
 		}
 
-		require.NoError(t, json.Unmarshal(standard, &fields))
+		require.NoError(t, jsonv2.Unmarshal(standard, &fields, jsonv2.MatchCaseInsensitiveNames(true)))
 
 		if len(fields.SSH) > 0 {
 			return nil
@@ -10982,7 +10982,13 @@ func TestStreamSSHIntentInputs(t *testing.T) {
 	}
 
 	rich := []byte(streamPropertyPolicies[3])
-	require.Nil(t, streamSSHIntent(t, rich, nil), "unmodeled SSH rules remain unmodeled")
+	for _, field := range []string{"ssh", "SSH", "s-s_h"} {
+		doc := bytes.Replace(rich, []byte(`"ssh"`), []byte(strconv.Quote(field)), 1)
+		parsed, err := policyv2.ParsePolicy(doc)
+		require.NoError(t, err)
+		require.NotEmpty(t, parsed.SSHs, "accepted SSH field %s", field)
+		require.Nil(t, streamSSHIntent(t, doc, nil), "unmodeled SSH field %s remains unmodeled", field)
+	}
 
 	explicit := &propcheck.SSHIntent{Grants: []propcheck.SSHGrant{{Src: propcheck.PacketSelector{User: "u1"}, Self: true, Users: []string{"root"}}}}
 	require.Same(t, explicit, streamSSHIntent(t, rich, explicit))
