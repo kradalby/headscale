@@ -151,9 +151,10 @@ func policyJSON(t require.TestingT, v any) []byte {
 // value selects every address in the bounded tailnet domain; at most one field
 // is populated by the generator.
 type PacketSelector struct {
-	User string
-	Tag  string
-	IP   netip.Addr
+	User   string
+	Tag    string
+	IP     netip.Addr
+	Prefix netip.Prefix // Literal destination only in the explicit subnet domain.
 }
 
 func (s PacketSelector) alias() string {
@@ -164,6 +165,8 @@ func (s PacketSelector) alias() string {
 		return s.Tag
 	case s.IP.IsValid():
 		return s.IP.String()
+	case s.Prefix.IsValid():
+		return s.Prefix.String()
 	default:
 		return "*"
 	}
@@ -187,6 +190,8 @@ func (s PacketSelector) matches(m World, n *types.Node, ip netip.Addr) bool {
 		return n != nil && slices.Contains(n.Tags, s.Tag)
 	case s.IP.IsValid():
 		return s.IP == ip
+	case s.Prefix.IsValid():
+		return s.Prefix.Contains(ip)
 	default:
 		return true
 	}
@@ -200,10 +205,12 @@ type PacketGrant struct {
 
 // PacketIntent is immutable after construction so document history can retain
 // it across replacements, reordering and duplicate grants without aliasing.
-// It specifies only new TCP/UDP filter decisions to live nodes, not return traffic,
-// subnet routing, SSH, app capabilities or general alias interpretation.
+// It specifies new TCP/UDP filter decisions to live nodes and an optional literal
+// subnet domain, not return traffic, routing selection, SSH or app capabilities.
 type PacketIntent struct {
 	Grants []PacketGrant
+	// Subnets retains the probe domain even when all grants or routes are revoked.
+	Subnets []netip.Prefix
 }
 
 func (p *PacketIntent) Document(t require.TestingT) []byte {
@@ -374,37 +381,7 @@ func CheckPacketIntent(t require.TestingT, m World, intent *PacketIntent, destin
 
 	actual := filter.New(matches, nil, localNets, nil, nil, logger.Discard)
 
-	ports := []uint16{0, 32768, 65535}
-
-	for _, first := range packetPortStarts {
-		if first > 0 {
-			ports = append(ports, first-1)
-		}
-
-		for port := uint32(first); port <= min(uint32(first)+packetMaxPortWidth+1, 65535); port++ {
-			ports = append(ports, uint16(port)) //nolint:gosec // Bounded by 65535.
-		}
-	}
-
-	for _, g := range intent.Grants {
-		// Generated ranges have at most four ports; larger manual ranges
-		// stay bounded with the first four ports, midpoint and endpoint.
-		ports = append(ports, g.Last, g.First+(g.Last-g.First)/2)
-		for port := uint32(g.First); port <= uint32(g.Last) && port < uint32(g.First)+4; port++ {
-			ports = append(ports, uint16(port)) //nolint:gosec // Bounded by the uint16 Last field.
-		}
-
-		if g.First > 0 {
-			ports = append(ports, g.First-1)
-		}
-
-		if g.Last < 65535 {
-			ports = append(ports, g.Last+1)
-		}
-	}
-
-	slices.Sort(ports)
-	ports = slices.Compact(ports)
+	ports := packetPorts(intent)
 
 	var peers []types.NodeID
 
@@ -444,6 +421,152 @@ func CheckPacketIntent(t require.TestingT, m World, intent *PacketIntent, destin
 	peers = slices.Compact(peers)
 
 	return peers
+}
+
+// packetPorts keeps revocation probes independent of the current grants.
+func packetPorts(intent *PacketIntent) []uint16 {
+	ports := []uint16{0, 32768, 65535}
+
+	for _, first := range packetPortStarts {
+		if first > 0 {
+			ports = append(ports, first-1)
+		}
+
+		for port := uint32(first); port <= min(uint32(first)+packetMaxPortWidth+1, 65535); port++ {
+			ports = append(ports, uint16(port)) //nolint:gosec // Bounded by 65535.
+		}
+	}
+
+	for _, g := range intent.Grants {
+		// Generated ranges have at most four ports; larger manual ranges
+		// stay bounded with the first four ports, midpoint and endpoint.
+		ports = append(ports, g.Last, g.First+(g.Last-g.First)/2)
+		for port := uint32(g.First); port <= uint32(g.Last) && port < uint32(g.First)+4; port++ {
+			ports = append(ports, uint16(port)) //nolint:gosec // Bounded by the uint16 Last field.
+		}
+
+		if g.First > 0 {
+			ports = append(ports, g.First-1)
+		}
+
+		if g.Last < 65535 {
+			ports = append(ports, g.Last+1)
+		}
+	}
+
+	slices.Sort(ports)
+	ports = slices.Compact(ports)
+
+	return ports
+}
+
+// DrawSubnetPacketIntent gives each disjoint /24 a positive source witness.
+// Sources are owned user/tag identities or literal addresses; no wildcard semantics
+// are added to the existing node-only generator.
+func DrawSubnetPacketIntent(t *rapid.T, m World, source types.NodeID, subnets []netip.Prefix) *PacketIntent {
+	n := m.Nodes[source]
+	require.NotNil(t, n)
+	require.NotNil(t, n.IPv4)
+
+	selectors := []PacketSelector{{IP: *n.IPv4}}
+	for _, tag := range n.Tags {
+		selectors = append(selectors, PacketSelector{Tag: tag})
+	}
+
+	if len(n.Tags) == 0 && n.UserID != nil {
+		for _, u := range m.Users {
+			if u.ID == *n.UserID {
+				selectors = append(selectors, PacketSelector{User: u.Name})
+			}
+		}
+	}
+
+	intent := &PacketIntent{Subnets: slices.Clone(subnets)}
+	for _, subnet := range subnets {
+		first := rapid.SampledFrom(packetPortStarts).Draw(t, "subnet first port")
+		intent.Grants = append(intent.Grants, PacketGrant{
+			Src: rapid.SampledFrom(selectors).Draw(t, "subnet source"), Dst: PacketSelector{Prefix: subnet},
+			Protocol: rapid.SampledFrom([]ipproto.Proto{ipproto.TCP, ipproto.UDP}).Draw(t, "subnet protocol"),
+			First:    first, Last: first + rapid.Uint16Range(0, min(packetMaxPortWidth, 65535-first)).Draw(t, "subnet port width"),
+		})
+	}
+
+	return intent
+}
+
+// CheckSubnetPacketIntent observes reduced-rule authorization in a fixed local
+// forwarding envelope, so withdrawal cannot hide a stale rule behind localNets.
+// This is not a model of client preferences, primary selection or packet transport.
+// The domain is disjoint RFC1918 IPv4 /24 routes and exact literal CIDR grants.
+func CheckSubnetPacketIntent(t require.TestingT, m World, intent *PacketIntent, router types.NodeID, rules []tailcfg.FilterRule, extraSources ...netip.Addr) {
+	if intent == nil || len(intent.Subnets) == 0 {
+		return
+	}
+
+	n := m.Nodes[router]
+	require.NotNil(t, n)
+
+	for _, g := range intent.Grants {
+		require.Contains(t, intent.Subnets, g.Dst.Prefix, "subnet grants must name a probe route")
+		require.True(t, g.Src.User != "" || g.Src.Tag != "" || g.Src.IP.IsValid(), "subnet sources exclude wildcard")
+	}
+
+	var (
+		local        netipx.IPSetBuilder
+		destinations []netip.Addr
+	)
+
+	for i, subnet := range intent.Subnets {
+		require.True(t, subnet.Addr().Is4() && subnet.Addr().IsPrivate() && subnet.Bits() == 24 && subnet == subnet.Masked(), "subnet domain requires masked RFC1918 /24")
+
+		for _, other := range intent.Subnets[:i] {
+			require.False(t, subnet.Overlaps(other), "subnet domain is disjoint")
+		}
+
+		first := subnet.Addr()
+		last := first.As4()
+		last[3] = 255
+
+		end := netip.AddrFrom4(last)
+		for _, ip := range []netip.Addr{first.Prev(), first, first.Next(), end.Prev(), end, end.Next()} {
+			destinations = append(destinations, ip)
+			local.Add(ip)
+		}
+	}
+
+	localNets, err := local.IPSet()
+	require.NoError(t, err)
+	matches, err := filter.MatchesFromFilterRules(rules)
+	require.NoError(t, err)
+
+	actual := filter.New(matches, nil, localNets, nil, nil, logger.Discard)
+	ports := packetPorts(intent)
+
+	sources := packetSources(m, extraSources)
+	for _, srcIP := range slices.SortedFunc(maps.Keys(sources), netip.Addr.Compare) {
+		source := sources[srcIP]
+		if !srcIP.Is4() || source == router {
+			continue
+		}
+
+		for _, dstIP := range destinations {
+			served := false
+
+			if n.Hostinfo != nil {
+				for _, route := range n.Hostinfo.RoutableIPs {
+					served = served || (route.Contains(dstIP) && slices.Contains(n.ApprovedRoutes, route))
+				}
+			}
+
+			for _, proto := range []ipproto.Proto{ipproto.TCP, ipproto.UDP} {
+				for _, port := range ports {
+					want := served && intent.Allows(m, source, 0, srcIP, dstIP, port, proto)
+					got := actual.Check(srcIP, dstIP, port, proto) == filter.Accept
+					require.Equal(t, want, got, "subnet packet %d (%s) via %d to %s:%d proto %s", source, srcIP, router, dstIP, port, proto)
+				}
+			}
+		}
+	}
 }
 
 // AppGrant carries custom peer capabilities, never Node.CapMap or network ports.
@@ -718,7 +841,7 @@ func (s *SSHIntent) AppendDocument(t require.TestingT, doc []byte) []byte {
 
 	rules := make([]any, 0, len(s.Grants))
 	for _, g := range s.Grants {
-		require.False(t, g.Src.IP.IsValid(), "SSH literal selectors are outside the intent domain")
+		require.False(t, g.Src.IP.IsValid() || g.Src.Prefix.IsValid(), "SSH literal selectors are outside the intent domain")
 		require.NotEqual(t, g.Src.User == "", g.Src.Tag == "", "SSH source must be one user or tag")
 		require.NotEqual(t, g.Self, g.DstTag != "", "SSH destination must be self or tag")
 		require.False(t, g.Src.Tag != "" && (g.Check || g.Self), "check/self sources must be users")
@@ -945,7 +1068,7 @@ func (a *NodeAttrIntent) AppendDocument(t require.TestingT, doc []byte) []byte {
 
 	rules := make([]any, 0, len(a.Grants))
 	for _, g := range a.Grants {
-		require.False(t, g.Target.IP.IsValid(), "node attribute literal selectors are outside the intent domain")
+		require.False(t, g.Target.IP.IsValid() || g.Target.Prefix.IsValid(), "node attribute literal selectors are outside the intent domain")
 		require.False(t, g.Target.User != "" && g.Target.Tag != "", "node attribute selector must be one user or tag")
 
 		for _, attr := range g.Attrs {

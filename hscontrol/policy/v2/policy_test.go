@@ -9060,3 +9060,150 @@ func TestGroupPolicyGenerationWithoutNodes(t *testing.T) {
 		require.NoError(t, err, "group generation must not require a live app witness")
 	})
 }
+
+func TestSubnetPacketIntentHistory(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		users := []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+		nodes := types.Nodes{
+			node("source", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
+			node("router", "100.64.0.2", "fd7a:115c:a1e0::2", users[1]),
+		}
+		nodes[0].ID, nodes[1].ID = 1, 2
+		subnets := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("10.1.0.0/24")}
+		nodes[1].Hostinfo = &tailcfg.Hostinfo{RoutableIPs: slices.Clone(subnets)}
+		nodes[1].ApprovedRoutes = slices.Clone(subnets)
+
+		world := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: users}
+		for _, n := range nodes {
+			world.Put(n)
+		}
+
+		first := propcheck.DrawSubnetPacketIntent(t, world, 1, subnets)
+		intent := first
+		source := nodes[0].Clone()
+		router := nodes[1].Clone()
+		probes := []netip.Addr{*source.IPv4, *source.IPv6}
+
+		type retained struct {
+			world   propcheck.World
+			intent  *propcheck.PacketIntent
+			manager *PolicyManager
+		}
+
+		var previous *PolicyManager
+
+		history := make([]retained, 0, 13)
+
+		for _, phase := range []string{"allow", "unapprove", "restore", "withdraw", "restore", "deny", "restore", "tag", "tag-policy", "delete", "restore", "order", "duplicate"} {
+			nodes = types.Nodes{source.Clone(), router.Clone()}
+
+			switch phase {
+			case "unapprove":
+				nodes[1].ApprovedRoutes = nil
+			case "withdraw":
+				nodes[1].Hostinfo.RoutableIPs = nil
+			case "deny":
+				intent = &propcheck.PacketIntent{Subnets: slices.Clone(subnets)}
+			case "restore":
+				intent = first
+			case "tag", "tag-policy":
+				nodes[0].Tags = []string{"tag:srv"}
+			case "delete":
+				nodes = nodes[1:]
+			}
+
+			world = propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: users}
+			for _, n := range nodes {
+				world.Put(n)
+			}
+
+			if phase == "tag-policy" {
+				intent = propcheck.DrawSubnetPacketIntent(t, world, 1, subnets)
+			}
+
+			doc := intent.Document(t)
+			if phase == "order" || phase == "duplicate" {
+				doc = propcheck.ReorderPolicy(t, doc, phase == "duplicate")
+			}
+
+			next, err := NewPolicyManagerFrom(previous, doc, users, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			history = append(history, retained{world.Clone(), intent, next})
+			fresh, err := NewPolicyManager(doc, users, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			for _, old := range append(slices.Clone(history), retained{world.Clone(), intent, fresh}) {
+				for id, n := range old.world.Nodes {
+					rules, err := old.manager.FilterForNode(n.View())
+					require.NoError(t, err)
+					propcheck.CheckPacketIntent(t, old.world, old.intent, id, rules, probes...)
+					propcheck.CheckSubnetPacketIntent(t, old.world, old.intent, id, rules, probes...)
+				}
+			}
+
+			previous = next
+		}
+	})
+}
+
+func TestSubnetPacketIntentRejectsCorruptRules(t *testing.T) {
+	subnet := netip.MustParsePrefix("10.0.0.0/24")
+	source := netip.MustParseAddr("100.64.0.1")
+	world := propcheck.World{Nodes: map[types.NodeID]*types.Node{
+		1: {ID: 1, IPv4: &source},
+		2: {ID: 2, IPv4: new(netip.MustParseAddr("100.64.0.2")), Hostinfo: &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{subnet}}, ApprovedRoutes: []netip.Prefix{subnet}},
+	}}
+	intent := &propcheck.PacketIntent{Subnets: []netip.Prefix{subnet}, Grants: []propcheck.PacketGrant{{
+		Src: propcheck.PacketSelector{IP: source}, Dst: propcheck.PacketSelector{Prefix: subnet}, Protocol: ipproto.TCP, First: 22, Last: 23,
+	}}}
+	valid := []tailcfg.FilterRule{{SrcIPs: []string{source.String()}, IPProto: []int{6}, DstPorts: []tailcfg.NetPortRange{{IP: subnet.String(), Ports: tailcfg.PortRange{First: 22, Last: 23}}}}}
+	propcheck.CheckSubnetPacketIntent(t, world, intent, 2, valid)
+
+	for _, mutation := range []string{"lost", "port", "neighbor", "foreign", "deny", "unapprove", "withdraw"} {
+		t.Run(mutation, func(t *testing.T) {
+			rules := []tailcfg.FilterRule{{SrcIPs: slices.Clone(valid[0].SrcIPs), IPProto: []int{6}, DstPorts: slices.Clone(valid[0].DstPorts)}}
+			want, inputs := intent, world.Clone()
+
+			switch mutation {
+			case "lost":
+				rules = nil
+			case "port":
+				rules[0].DstPorts[0].Ports.Last = 24
+			case "neighbor":
+				rules[0].DstPorts[0].IP = "10.0.0.0/23"
+			case "foreign":
+				rules[0].SrcIPs = []string{"*"}
+			case "deny":
+				want = &propcheck.PacketIntent{Subnets: slices.Clone(intent.Subnets)}
+			case "unapprove":
+				inputs.Nodes[2].ApprovedRoutes = nil
+			case "withdraw":
+				inputs.Nodes[2].Hostinfo.RoutableIPs = nil
+			}
+
+			failure := &appIntentFailure{}
+			require.PanicsWithValue(t, failure, func() { propcheck.CheckSubnetPacketIntent(failure, inputs, want, 2, rules) })
+			require.Contains(t, failure.message, "subnet packet")
+		})
+	}
+
+	propcheck.CheckSubnetPacketIntent(t, world, intent, 2, valid)
+}
+
+func TestIntentRejectsSubnetSelectorsOutsidePacketDomain(t *testing.T) {
+	selector := propcheck.PacketSelector{Prefix: netip.MustParsePrefix("10.0.0.0/24")}
+
+	for _, build := range []func(require.TestingT){
+		func(t require.TestingT) {
+			(&propcheck.SSHIntent{Grants: []propcheck.SSHGrant{{Src: selector, DstTag: "tag:srv", Users: []string{"root"}}}}).AppendDocument(t, []byte(`{"grants":[]}`))
+		},
+		func(t require.TestingT) {
+			(&propcheck.NodeAttrIntent{Grants: []propcheck.NodeAttrGrant{{Target: selector, Attrs: []nodecap.Cap{"custom:probe"}}}}).AppendDocument(t, []byte(`{"grants":[]}`))
+		},
+	} {
+		failure := &appIntentFailure{}
+		require.PanicsWithValue(t, failure, func() { build(failure) })
+		require.Contains(t, failure.message, "literal selectors are outside the intent domain")
+	}
+}

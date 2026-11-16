@@ -11064,6 +11064,8 @@ func checkStreamPacketIntent(t require.TestingT, world propcheck.World, intent *
 		return
 	}
 
+	propcheck.CheckSubnetPacketIntent(t, world, intent, id, client.filter, extraSources...)
+
 	for _, peer := range propcheck.CheckPacketIntent(t, world, intent, id, client.filter, extraSources...) {
 		require.Contains(t, client.peers, peer.NodeID(), "required incoming/outgoing packet peer")
 	}
@@ -11072,14 +11074,26 @@ func checkStreamPacketIntent(t require.TestingT, world propcheck.World, intent *
 // A fixed history keeps downstream revocation and identity checks reachable
 // even when broader generated documents stop at enabled compiler diagnostics.
 func TestStreamPacketIntentHistory(t *testing.T) {
-	runStreamPacketIntentHistory(t, types.PolicyModeDB)
+	runStreamPacketIntentHistory(t, types.PolicyModeDB, false, true)
 }
 
 func TestStreamPolicyFileHistory(t *testing.T) {
-	runStreamPacketIntentHistory(t, types.PolicyModeFile)
+	runStreamPacketIntentHistory(t, types.PolicyModeFile, false, true)
 }
 
-func runStreamPacketIntentHistory(t *testing.T, mode types.PolicyMode) {
+func TestStreamSubnetIntentHistory(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) { runStreamPacketIntentHistory(t, mode, true, false) })
+	}
+}
+
+// The enabled order audit stays separate so known representation differences
+// cannot prevent repeated authorization histories from reaching revocation.
+func TestStreamSubnetIntentOrder(t *testing.T) {
+	runStreamPacketIntentHistory(t, types.PolicyModeDB, true, true)
+}
+
+func runStreamPacketIntentHistory(t *testing.T, mode types.PolicyMode, subnet, reorder bool) {
 	t.Helper()
 
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
@@ -11093,6 +11107,16 @@ func runStreamPacketIntentHistory(t *testing.T, mode types.PolicyMode) {
 			Src: propcheck.PacketSelector{Tag: "tag:srv"}, Dst: propcheck.PacketSelector{User: "u2"},
 			Protocol: ipproto.UDP, First: 65535, Last: 65535,
 		}}}
+
+		if subnet {
+			routes := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("10.1.0.0/24")}
+			first = propcheck.DrawSubnetPacketIntent(t, p.world, 1, routes)
+			tagged := p.world.Clone()
+			tagged.Nodes[1].Tags = []string{"tag:srv"}
+			second = propcheck.DrawSubnetPacketIntent(t, tagged, 1, routes)
+		}
+		// Scope belongs to the history, not to the currently allowed grants.
+		deny := &propcheck.PacketIntent{Subnets: slices.Clone(first.Subnets)}
 		last := p.state.Snapshot()
 		flush := func() {
 			snap := p.state.Snapshot()
@@ -11104,23 +11128,100 @@ func runStreamPacketIntentHistory(t *testing.T, mode types.PolicyMode) {
 					p.open(t, id, snap, false)
 				} else if _, named := wake[id]; all || named {
 					p.update(t, id, snap, rapid.IntRange(0, 2).Draw(t, "packet delivery"))
+				} else {
+					p.checkSession(t, id, snap, p.sessions[id])
 				}
+			}
+
+			if subnet {
+				// Every router denial completes before a following restoration.
+				require.NotNil(t, p.packetIntent)
+				require.Equal(t, first.Subnets, p.packetIntent.Subnets, "current routed scope survives replacement and restore")
+
+				if p.sessions[3].down {
+					p.open(t, 3, snap, false)
+				} else {
+					p.update(t, 3, snap, 0)
+				}
+
+				require.False(t, p.sessions[3].down)
 			}
 
 			p.check(t, snap)
 			last = snap
 		}
 
-		for _, intent := range []*propcheck.PacketIntent{first, second, {}, first} {
-			p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: intent.Document(t), intent: intent})
+		var (
+			oldWorld    propcheck.World
+			oldSnapshot *state.Snapshot
+			oldClient   *propertyClient
+		)
+
+		if subnet {
+			router := p.world.Nodes[3].Clone()
+			router.Hostinfo.RoutableIPs = slices.Clone(first.Subnets)
+			router.ApprovedRoutes = slices.Clone(first.Subnets)
+			p.apply(t, streamOperation{kind: "routes", node: router})
+			p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: first.Document(t), intent: first})
 			flush()
 
+			oldWorld, oldSnapshot = p.world.Clone(), p.state.Snapshot()
+			oldHub := NewHub()
+			responses, err := NewStream(p.cfg, oldHub, 3, capVer).Initial(p.state.Snapshot())
+			require.NoError(t, err)
+
+			oldClient = newPropertyClient(&tailcfg.MapResponse{})
+			applyStreamPropertyWire(t, oldHub, oldClient, responses)
+			oldHub.Close()
+			checkStreamPacketIntent(t, oldWorld, first, 3, oldClient, p.sourceProbes...)
+
+			for _, phase := range []string{"unapprove", "restore", "withdraw", "restore", "offline", "restore"} {
+				n := router.Clone()
+
+				switch phase {
+				case "unapprove":
+					n.ApprovedRoutes = nil
+				case "withdraw":
+					n.Hostinfo.RoutableIPs = nil
+				case "offline":
+					n.IsOnline, n.ActiveSessions = new(false), 0
+				}
+
+				p.apply(t, streamOperation{kind: "routes", node: n})
+				flush()
+				checkStreamPacketIntent(t, oldWorld, first, 3, oldClient, p.sourceProbes...)
+			}
+		}
+
+		if subnet {
+			source := p.world.Nodes[1].Clone()
+			tagged := source.Clone()
+			tagged.Tags = []string{"tag:srv"}
+			p.apply(t, streamOperation{kind: "identity", node: tagged, before: source})
+			p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: second.Document(t), intent: second})
+			flush()
+			p.apply(t, streamOperation{kind: "identity", node: source, before: tagged})
+			flush()
+		}
+
+		transform := func(intent *propcheck.PacketIntent) {
 			p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: -1, intent: intent}}
 			for _, kind := range []string{"policy-order", "policy-duplicate", "policy-restore"} {
 				op := p.drawOperation(t, kind)
 				require.Same(t, intent, op.intent, "intent survives %s", kind)
 				p.apply(t, op)
 				flush()
+			}
+		}
+
+		for _, intent := range []*propcheck.PacketIntent{first, second, deny, first} {
+			require.Equal(t, first.Subnets, intent.Subnets, "replacement retains the entire subnet probe scope")
+			p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: intent.Document(t), intent: intent})
+			flush()
+
+			p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: -1, intent: intent}}
+			if !subnet {
+				transform(intent)
 			}
 		}
 
@@ -11188,6 +11289,32 @@ func runStreamPacketIntentHistory(t *testing.T, mode types.PolicyMode) {
 			if p.sessions[id].down {
 				p.open(t, id, p.state.Snapshot(), false)
 			}
+		}
+
+		if subnet && reorder {
+			// Keep exact audit/reorder inputs enabled after mandatory revocations.
+			for _, intent := range []*propcheck.PacketIntent{first, second, deny, first} {
+				p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: intent.Document(t), intent: intent})
+				flush()
+				transform(intent)
+			}
+		}
+
+		if subnet {
+			// Retired source addresses still probe user/tag revocation and literal retention.
+			p.apply(t, streamOperation{kind: "delete", node: p.world.Nodes[1]})
+			flush()
+			checkStreamPacketIntent(t, oldWorld, first, 3, oldClient, p.sourceProbes...)
+
+			lateHub := NewHub()
+			responses, err := NewStream(p.cfg, lateHub, 3, capVer).Initial(oldSnapshot)
+			require.NoError(t, err)
+
+			lateClient := newPropertyClient(&tailcfg.MapResponse{})
+			applyStreamPropertyWire(t, lateHub, lateClient, responses)
+			lateHub.Close()
+			checkStreamPacketIntent(t, oldWorld, first, 3, lateClient, p.sourceProbes...)
+			lateClient.check(t, oldClient)
 		}
 
 		p.check(t, p.state.Snapshot())

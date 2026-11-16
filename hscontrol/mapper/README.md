@@ -1000,3 +1000,58 @@ Services and peer OS. Nil input requires absent wire Hostinfo; nonnil input requ
 it present. Peer services exclude `PeerAPIDNS`, while self services retain it.
 Other Hostinfo fields remain outside this independent checker; endpoint and DERP
 projection retain their separate checks. Concurrent delivery reuses this boundary.
+
+## Bounded subnet packet intent
+
+`PacketIntent.Subnets` is an immutable observation scope, independent of current
+permission. `TestSubnetPacketIntentHistory` and `TestStreamSubnetIntentHistory`
+use two disjoint RFC1918 IPv4 `/24`s and exact literal destination CIDRs. Sources
+are user/tag identities or literal IPv4 addresses. TCP SYN and UDP checks share
+the node packet checker's inclusive port islands and denied neighbors. The
+existing node packet checks and foreign/retired source probes remain active.
+SSH and node-attribute constructors reject prefix selectors.
+
+`CheckSubnetPacketIntent` derives authorization from owned grant, identity,
+address, announcement and manual-approval inputs. A matching grant permits its
+address/port only when the router announces that exact approved route. This
+bounded predicate follows `Node.SubnetRoutes` and the destination relevance
+contract in `policyutil/reduce.go`; it does not interpret arbitrary policies.
+Offline status and primary election do not revoke packet authorization.
+`AllowedIPs` and `PrimaryRoutes` retain their separate existing checks.
+
+The pinned `wgengine/filter` consumer receives a fixed local forwarding probe
+envelope, including adjacent denied addresses. Real clients build `localNets`
+from local addresses and advertised routes (`ipn/ipnlocal/local.go`), independently
+of server approval. Keeping the test envelope fixed exposes stale emitted rules
+after withdrawal instead of masking them with local forwarding rejection. This
+checks emitted-filter authorization, not client preferences or physical forwarding.
+
+Deny and replacement intents explicitly retain the whole history's subnet scope,
+even after removing the last grant. Reorder, duplicate, file staging/reload and
+restore retain those intent pointers. Retained Worlds, intents and maps keep
+their original scope and inputs; new current identities never rewrite them.
+The composed history extends the existing packet history and State/Hub driver,
+crosses both JSON/zstd encoder slots, checks cumulative client replay, and forces
+completed router delivery before restoring permissions. It checks approval
+removal, withdrawal, policy denial, source identity changes, deletion and late
+rendering of an old snapshot. Literal corrupted-filter controls detect lost
+permission, widened ports/destinations/sources, and stale permission after denial,
+unapproval or withdrawal.
+
+This domain excludes wildcard subnet semantics, overlapping or narrower CIDRs,
+IPv6 destinations, via, exit routes, app capabilities and transport. Existing
+wildcard node checks remain bounded to tailnet addresses. Existing production
+diagnostics stay enabled; these focused histories do not replace them.
+
+Generic `packet-policy`, `packet-deny`, mixed-policy and simple-policy operations
+outside this subnet-specific history do not acquire sticky subnet scope. A
+replacement intent without `Subnets` exits this routed oracle; node packet and
+fresh-convergence checks still run. No global routed coverage is claimed.
+
+`TestStreamSubnetIntentOrder` keeps the stronger reorder/duplicate audit enabled,
+after the mandatory authorization phases. Plain packet rule reordering can
+retain an older cached rule order: `changedRules` compares rule presence while
+`Audit` compares slices exactly. This known representation diagnostic is separate
+from `TestStreamSubnetIntentHistory`, whose audit remains enabled throughout
+its non-reordering history. Focused policy histories still evaluate reordered
+and duplicated filters semantically against the same input intent.
