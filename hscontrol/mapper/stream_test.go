@@ -1,13 +1,17 @@
 package mapper
 
 import (
+	"bytes"
+	"cmp"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"math/rand/v2"
 	"net/netip"
+	"net/url"
 	"os"
 	"reflect"
 	"runtime"
@@ -15,25 +19,33 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unsafe"
 	"weak"
 
+	jsonv2 "github.com/go-json-experiment/json"
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/graph"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
+	"github.com/juanfont/headscale/hscontrol/propcheck"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tailscale/hujson"
+	"go4.org/mem"
 	"gorm.io/gorm"
+	"pgregory.net/rapid"
 	"tailscale.com/envknob"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/dnstype"
+	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
 	"tailscale.com/util/zstdframe"
@@ -7723,4 +7735,5943 @@ func TestRoutedCandidatesAfterElectionCollection(t *testing.T) {
 	got := st.r.routedCandidates(snap, mustNode(t, s, st.nodeID), st.r.lastKey, false)
 	want := []tailcfg.NodeID{winner.NodeID(), streams[10].nodeID.NodeID()}
 	require.ElementsMatch(t, want, got, "collected history must include exactly the losing and gaining routers")
+}
+
+type hubModelSession struct {
+	session   *Session
+	stream    *Stream
+	token     uint64
+	stops     int
+	wantStops int
+	pending   *sentView
+	wake      bool
+	pings     []*tailcfg.PingRequest
+}
+
+// TestHubRapidLifecycle models what a client might hold, without the hub's
+// shared slices or folding. Only a confirmed view at least as new as every
+// attempted view may discard possible peers. TTL expiry and deletion are the
+// other reset points; capacity eviction is tested separately below.
+func TestHubRapidLifecycle(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		h := NewHub()
+		defer h.Close()
+
+		now := time.Unix(1, 0)
+		h.now = func() time.Time { return now }
+
+		var sessions []*hubModelSession
+
+		model := newPeerHistoryModel(maxConcurrentMapSessionsPerNode, peerHistoryTTL)
+		current := sentView{rev: 1}
+		views := [][]types.NodeID{nil}
+
+		var reads [][2][]types.NodeID
+
+		live := func(id types.NodeID) []*hubModelSession {
+			var out []*hubModelSession
+
+			for _, s := range sessions {
+				if model.Live(s.token) && s.session.NodeID == id {
+					out = append(out, s)
+				}
+			}
+
+			return out
+		}
+		pick := func(t *rapid.T) *hubModelSession {
+			if len(sessions) == 0 {
+				t.Skip("no admitted session yet")
+			}
+
+			return sessions[rapid.IntRange(0, len(sessions)-1).Draw(t, "session")]
+		}
+		node := func(t *rapid.T) types.NodeID { return types.NodeID(rapid.Uint64Range(1, 3).Draw(t, "node")) }
+
+		t.Repeat(map[string]func(*rapid.T){
+			"join": func(t *rapid.T) {
+				id := node(t)
+
+				token := uint64(len(sessions) + 1)
+				for _, evicted := range model.Join(token, id, now) {
+					sessions[evicted-1].wantStops++
+				}
+
+				s := &hubModelSession{token: token}
+				s.session = h.Join(id, func() { s.stops++ })
+				require.NotNil(t, s.session)
+				s.stream = &Stream{hub: h, nodeID: id}
+				s.stream.Attach(s.session)
+				sessions = append(sessions, s)
+			},
+			"leave": func(t *rapid.T) {
+				s := pick(t)
+				require.Equal(t, model.Leave(s.token, now), h.Leave(s.session))
+			},
+			"revision": func(t *rapid.T) {
+				current.rev++
+				if rapid.Bool().Draw(t, "restoreView") {
+					current.ids = rapid.SampledFrom(views).Draw(t, "oldView")
+				} else {
+					current.ids = hubRapidView(t)
+					views = append(views, current.ids)
+				}
+			},
+			"attempt": func(t *rapid.T) {
+				s := pick(t)
+				if s.pending != nil {
+					t.Skip("a stream finishes its write before rendering again")
+				}
+
+				v := current
+				s.pending = &v
+				s.stream.pending = &v
+				h.mayHavePeers(s.session, s.session.NodeID, v)
+				model.Attempt(s.token, v.rev, v.ids)
+			},
+			"deliver": func(t *rapid.T) {
+				s := pick(t)
+				if s.pending != nil {
+					model.Delivered(s.token, s.pending.rev, s.pending.ids)
+				}
+
+				s.stream.Delivered()
+				s.pending = nil
+				require.Nil(t, s.stream.pending)
+			},
+			"forget": func(t *rapid.T) {
+				id := node(t)
+				for _, token := range model.Forget(id) {
+					sessions[token-1].wantStops++
+				}
+
+				h.forget(id)
+			},
+			"clock": func(t *rapid.T) {
+				now = now.Add(rapid.SampledFrom([]time.Duration{0, time.Nanosecond, peerHistoryTTL - time.Nanosecond, peerHistoryTTL}).Draw(t, "elapsed"))
+				if rapid.Bool().Draw(t, "sweep") {
+					model.Expire(now)
+					h.expireHistory()
+				}
+			},
+			"wake": func(t *rapid.T) {
+				id, all := node(t), rapid.Bool().Draw(t, "all")
+				h.wake(all, map[types.NodeID]struct{}{id: {}})
+
+				for _, s := range sessions {
+					if model.Live(s.token) && (all || s.session.NodeID == id) {
+						s.wake = true
+					}
+				}
+			},
+			"ping": func(t *rapid.T) {
+				id := node(t)
+				for range rapid.IntRange(1, 12).Draw(t, "burst") {
+					pr := &tailcfg.PingRequest{URL: "http://example.test/ping"}
+					accepted := false
+
+					for _, s := range live(id) {
+						if len(s.pings) < 8 {
+							s.pings = append(s.pings, pr)
+							accepted = true
+						}
+					}
+
+					require.Equal(t, accepted, h.Ping(id, pr))
+				}
+			},
+			"drain": func(t *rapid.T) {
+				s := pick(t)
+				if s.wake {
+					select {
+					case <-s.session.Wakes():
+					default:
+						t.Fatal("missing wake")
+					}
+
+					s.wake = false
+				}
+
+				for _, pr := range s.pings {
+					select {
+					case got := <-s.session.Pings():
+						require.Same(t, pr, got)
+					default:
+						t.Fatal("missing ping")
+					}
+				}
+
+				s.pings = nil
+			},
+			"": func(t *rapid.T) {
+				connected := map[types.NodeID]int{}
+
+				for id := types.NodeID(1); id <= 3; id++ {
+					if n := len(live(id)); n > 0 {
+						connected[id] = n
+					}
+
+					require.Equal(t, connected[id] > 0, h.IsConnected(id))
+					require.Equal(t, model.HasHistory(id), h.HasPeerHistoryForTest(id), "node %d", id)
+					want := model.Possible(id)
+					got := h.lastPeers(id)
+					require.True(t, slices.Equal(want, got), "node %d: want %v, got %v", id, want, got)
+					reads = append(reads, [2][]types.NodeID{got, slices.Clone(got)})
+				}
+
+				require.Equal(t, connected, h.Connected())
+
+				for _, s := range sessions {
+					require.Equal(t, !model.Live(s.token), s.session.left)
+					require.Equal(t, s.wantStops, s.stops)
+					require.Equal(t, s.wake, len(s.session.Wakes()) == 1)
+					require.Len(t, s.session.Pings(), len(s.pings))
+				}
+
+				for _, read := range reads {
+					require.Equal(t, read[1], read[0], "a retained peer view changed")
+				}
+
+				hubRapidAccounting(t, h)
+			},
+		})
+
+		for _, token := range model.Close() {
+			sessions[token-1].wantStops++
+		}
+
+		h.Close()
+		require.Empty(t, model.Close())
+		h.Close()
+		require.Empty(t, h.Connected())
+		require.Nil(t, h.Join(1, func() { t.Fatal("rejected join called stop") }))
+		require.False(t, h.Ping(1, &tailcfg.PingRequest{}))
+
+		select {
+		case <-h.Done():
+		default:
+			t.Fatal("closed hub did not signal Done")
+		}
+
+		for _, s := range sessions {
+			require.Equal(t, s.wantStops, s.stops)
+			before := slices.Clone(h.lastPeers(s.session.NodeID))
+			s.stream.Delivered()
+			h.mayHavePeers(s.session, s.session.NodeID, current)
+			require.True(t, slices.Equal(before, h.lastPeers(s.session.NodeID)))
+		}
+	})
+}
+
+func hubRapidView(t *rapid.T) []types.NodeID {
+	ids := rapid.SliceOfNDistinct(rapid.Uint64Range(10, 30), 0, 8, func(id uint64) uint64 { return id }).Draw(t, "peers")
+
+	view := make([]types.NodeID, len(ids), len(ids)+rapid.IntRange(0, 3).Draw(t, "spareCapacity"))
+	for i, id := range ids {
+		view[i] = types.NodeID(id)
+	}
+
+	slices.Sort(view)
+
+	return view
+}
+
+// Recount storage from the histories, without using the maintained counters,
+// linked list, holdView, foldedCost, or mergeViews.
+func hubRapidAccounting(t *rapid.T, h *Hub) {
+	t.Helper()
+
+	cost := len(h.offlineAt)
+	refs := map[viewKey]int{}
+	arrays := map[*types.NodeID]int{}
+
+	for id, v := range h.sentPeers {
+		require.LessOrEqual(t, len(v.attempts), maxPeerAttempts)
+
+		if _, offline := h.offlineAt[id]; offline {
+			for _, ids := range append([][]types.NodeID{v.ids}, v.attempts...) {
+				if len(ids) > 0 {
+					arrays[&ids[0]] = cap(ids)
+					refs[viewKey{first: &ids[0], n: len(ids)}]++
+				}
+			}
+		} else if v.folded {
+			cost += cap(v.ids)
+		}
+	}
+
+	for _, capacity := range arrays {
+		cost += capacity
+	}
+
+	require.Equal(t, refs, h.views)
+	require.Equal(t, cost, h.retained)
+	require.LessOrEqual(t, cost, h.maxHistoryIDs)
+	require.Equal(t, len(h.offlineAt), h.offline.Len())
+}
+
+// The FIFO oracle counts view identities supplied by the generator, not the
+// hub's counters or backing-array keys. Empty histories still cost one entry.
+func TestHubRapidOfflineCapacity(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		h := NewHub()
+		defer h.Close()
+
+		h.now = func() time.Time { return time.Unix(1, 0) }
+		h.maxHistoryIDs = rapid.IntRange(0, 60).Draw(t, "limit")
+		views := [][]types.NodeID{nil, hubRapidView(t), hubRapidView(t), hubRapidView(t)}
+
+		type entry struct {
+			node types.NodeID
+			view int
+		}
+
+		var offline []entry
+
+		cost := func() int {
+			total := len(offline)
+
+			seen := map[int]bool{}
+			for _, e := range offline {
+				if !seen[e.view] && len(views[e.view]) > 0 {
+					total += cap(views[e.view])
+					seen[e.view] = true
+				}
+			}
+
+			return total
+		}
+
+		count := rapid.IntRange(1, 30).Draw(t, "nodes")
+		for i := range count {
+			id := types.NodeID(i + 1)
+			view := rapid.IntRange(0, len(views)-1).Draw(t, "view")
+			session := h.Join(id, func() {})
+			v := sentView{ids: views[view], rev: 1}
+			h.mayHavePeers(session, id, v)
+
+			if rapid.Bool().Draw(t, "confirmed") {
+				stream := &Stream{hub: h, nodeID: id, sess: session, pending: &v}
+				stream.Delivered()
+			}
+
+			if rapid.Bool().Draw(t, "overlap") {
+				other := h.Join(id, func() {})
+				require.True(t, h.Leave(session))
+				require.Equal(t, cost(), h.retained, "history is still online")
+
+				session = other
+			}
+
+			require.False(t, h.Leave(session))
+			require.False(t, h.Leave(session))
+
+			offline = append(offline, entry{node: id, view: view})
+			for cost() > h.maxHistoryIDs {
+				offline = offline[1:]
+			}
+
+			for old := types.NodeID(1); old <= id; old++ {
+				index := slices.IndexFunc(offline, func(e entry) bool { return e.node == old })
+				require.Equal(t, index >= 0, h.HasPeerHistoryForTest(old), "node %d", old)
+
+				if index >= 0 {
+					require.True(t, slices.Equal(views[offline[index].view], h.lastPeers(old)))
+				}
+			}
+
+			require.Equal(t, cost(), h.retained)
+			hubRapidAccounting(t, h)
+		}
+		// Removing shared holders must release a backing array only after the last.
+		for _, e := range slices.Clone(offline) {
+			h.forget(e.node)
+
+			offline = offline[1:]
+
+			require.Equal(t, cost(), h.retained)
+			hubRapidAccounting(t, h)
+		}
+
+		require.Empty(t, h.sentPeers)
+	})
+}
+
+func TestHubRapidConnectedCapacity(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		h := NewHub()
+		defer h.Close()
+
+		h.maxHistoryIDs = rapid.IntRange(0, 24).Draw(t, "limit")
+		keeper := h.Join(1, func() {})
+
+		count := rapid.IntRange(10, 60).Draw(t, "attempts")
+		possible := make([]types.NodeID, 0, count)
+		unfolded := 0
+
+		for i := range count {
+			// A second connection keeps the node online while each failed writer
+			// leaves. Each new peer disappears before the next attempted view.
+			s := h.Join(1, func() {})
+			peer := types.NodeID(i + 100)
+			v := sentView{ids: []types.NodeID{peer}, rev: uint64(i + 1)}
+			h.mayHavePeers(s, 1, v)
+
+			possible = append(possible, peer)
+
+			unfolded++
+			if unfolded > maxPeerAttempts {
+				unfolded = 0
+
+				if len(possible) > h.maxHistoryIDs {
+					possible = nil
+				}
+			}
+
+			require.True(t, slices.Equal(possible, h.lastPeers(1)))
+			require.True(t, h.Leave(s))
+			hubRapidAccounting(t, h)
+		}
+
+		require.False(t, h.Leave(keeper))
+		hubRapidAccounting(t, h)
+	})
+}
+
+func TestHubRapidExpiryBoundary(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		h := NewHub()
+		defer h.Close()
+
+		now := time.Unix(1, 0)
+		h.now = func() time.Time { return now }
+		model := newPeerHistoryModel(maxConcurrentMapSessionsPerNode, peerHistoryTTL)
+		view := hubRapidView(t)
+
+		model.Join(1, 1, now)
+		s := h.Join(1, func() {})
+
+		model.Attempt(1, 1, view)
+		h.mayHavePeers(s, 1, sentView{ids: view, rev: 1})
+		require.Equal(t, model.Leave(1, now), h.Leave(s))
+		now = now.Add(peerHistoryTTL - time.Nanosecond)
+		// A repeated Leave must not extend the original offline deadline.
+		require.Equal(t, model.Leave(1, now), h.Leave(s))
+		h.expireHistory()
+		model.Expire(now)
+		require.True(t, h.HasPeerHistoryForTest(1))
+
+		if rapid.Bool().Draw(t, "reconnect") {
+			model.Join(2, 1, now)
+			s = h.Join(1, func() {})
+			require.True(t, slices.Equal(model.Possible(1), h.lastPeers(1)))
+
+			now = now.Add(2 * peerHistoryTTL)
+
+			h.expireHistory()
+			model.Expire(now)
+			require.True(t, h.HasPeerHistoryForTest(1), "online history does not expire")
+			require.Equal(t, model.Leave(2, now), h.Leave(s))
+			now = now.Add(peerHistoryTTL - time.Nanosecond)
+		}
+
+		now = now.Add(time.Nanosecond)
+		if rapid.Bool().Draw(t, "lazyExpiry") {
+			model.Join(3, 1, now)
+			h.Join(1, func() {})
+		} else {
+			model.Expire(now)
+			h.expireHistory()
+		}
+
+		require.False(t, model.HasHistory(1))
+		require.False(t, h.HasPeerHistoryForTest(1))
+		hubRapidAccounting(t, h)
+	})
+}
+
+// Barriers put a completion after retirement and optional readmission. There is
+// no claim about scheduler-dependent ordering between concurrent operations.
+func TestHubRapidRetiredCompletion(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		h := NewHub()
+		defer h.Close()
+
+		model := newPeerHistoryModel(maxConcurrentMapSessionsPerNode, peerHistoryTTL)
+		now := time.Unix(1, 0)
+		model.Join(1, 1, now)
+		s := h.Join(1, func() {})
+		v := sentView{ids: hubRapidView(t), rev: 1}
+		h.mayHavePeers(s, 1, v)
+		model.Attempt(1, 1, v.ids)
+		stream := &Stream{hub: h, nodeID: 1, sess: s, pending: &v}
+
+		mode := rapid.SampledFrom([]string{"leave", "forget", "close", "admission"}).Draw(t, "retire")
+		switch mode {
+		case "leave":
+			model.Leave(1, now)
+			h.Leave(s)
+		case "forget":
+			model.Forget(1)
+			h.forget(1)
+		case "close":
+			model.Close()
+			h.Close()
+		case "admission":
+			for token := uint64(2); token <= uint64(maxConcurrentMapSessionsPerNode+1); token++ {
+				model.Join(token, 1, now)
+				h.Join(1, func() {})
+			}
+		}
+
+		if mode != "close" {
+			model.Join(10, 1, now)
+			fresh := h.Join(1, func() {})
+
+			model.Attempt(10, 2, nil)
+			model.Delivered(10, 2, nil)
+			h.mayHavePeers(fresh, 1, sentView{rev: 2})
+			(&Stream{hub: h, nodeID: 1, sess: fresh, pending: &sentView{rev: 2}}).Delivered()
+		}
+
+		release, done := make(chan struct{}), make(chan struct{})
+		go func() {
+			<-release
+			stream.Delivered()
+			h.mayHavePeers(s, 1, v)
+			close(done)
+		}()
+
+		model.Delivered(1, 1, v.ids)
+		model.Attempt(1, 1, v.ids)
+		close(release)
+		<-done
+		require.False(t, model.Live(1))
+		require.Equal(t, model.HasHistory(1), h.HasPeerHistoryForTest(1))
+		require.True(t, slices.Equal(model.Possible(1), h.lastPeers(1)))
+	})
+}
+
+func TestPeerHistoryModelOwnership(t *testing.T) {
+	now := time.Unix(1, 0)
+	m := newPeerHistoryModel(1, time.Second)
+	m.Join(1, 1, now)
+
+	ids := []types.NodeID{2}
+	m.Attempt(1, 1, ids)
+	m.Delivered(1, 1, ids)
+	ids[0] = 3
+
+	require.Equal(t, []types.NodeID{2}, m.Possible(1))
+	m.Attempt(1, 2, ids)
+	m.Delivered(1, 2, ids)
+	ids[0] = 4
+	read := m.Possible(1)
+	read[0] = 5
+
+	require.Equal(t, []types.NodeID{3}, m.Possible(1))
+	require.Equal(t, []uint64{1}, m.Join(2, 1, now))
+	require.False(t, m.Live(1))
+	require.False(t, m.Leave(2, now))
+	m.Expire(now.Add(time.Second))
+	require.False(t, m.HasHistory(1))
+	m.Close()
+	m.Join(3, 1, now)
+	require.False(t, m.Live(3))
+}
+
+// peerHistoryModel is a client-possibility ledger, independent of Hub storage.
+// Callers supply unique session tokens, immutable views consistent within each
+// revision, and at most one pending write per session. Attempt precedes Delivered;
+// a failed write ends its session. Retired tokens remain valid inputs for late
+// callbacks. Capacity eviction is deliberately tested by the focused driver.
+type peerHistoryModel struct {
+	limit    int
+	ttl      time.Duration
+	sessions map[uint64]types.NodeID
+	owners   map[uint64]types.NodeID
+	order    []uint64
+	history  map[types.NodeID]*peerHistoryEntry
+	closed   bool
+}
+
+type peerHistoryEntry struct {
+	peers   map[types.NodeID]bool
+	rev     uint64
+	offline time.Time
+}
+
+func newPeerHistoryModel(sessionLimit int, ttl time.Duration) *peerHistoryModel {
+	return &peerHistoryModel{
+		limit: sessionLimit, ttl: ttl,
+		sessions: map[uint64]types.NodeID{},
+		owners:   map[uint64]types.NodeID{},
+		history:  map[types.NodeID]*peerHistoryEntry{},
+	}
+}
+
+// Join returns the tokens whose oldest sessions admission evicted.
+func (m *peerHistoryModel) Join(token uint64, node types.NodeID, now time.Time) []uint64 {
+	if m.closed {
+		return nil
+	}
+
+	m.Expire(now)
+
+	if h := m.history[node]; h != nil {
+		h.offline = time.Time{}
+	}
+
+	var active []uint64
+
+	for _, old := range m.order {
+		if id, ok := m.sessions[old]; ok && id == node {
+			active = append(active, old)
+		}
+	}
+
+	var evicted []uint64
+	if len(active) >= m.limit {
+		evicted = active[:len(active)-m.limit+1]
+		for _, old := range evicted {
+			delete(m.sessions, old)
+		}
+	}
+
+	m.sessions[token] = node
+	m.owners[token] = node
+	m.order = append(m.order, token)
+
+	return evicted
+}
+
+// Leave returns whether another session still serves the token's node. The
+// owners map retains retired tokens so repeated leaves have the same owner.
+func (m *peerHistoryModel) Leave(token uint64, now time.Time) bool {
+	node, known := m.owners[token]
+	if !known {
+		return false
+	}
+
+	delete(m.sessions, token)
+
+	for _, id := range m.sessions {
+		if id == node {
+			return true
+		}
+	}
+
+	m.Expire(now)
+
+	if h := m.history[node]; h != nil && h.offline.IsZero() {
+		h.offline = now
+	}
+
+	return false
+}
+
+func (m *peerHistoryModel) Attempt(token, rev uint64, ids []types.NodeID) {
+	node, live := m.sessions[token]
+	if !live {
+		return
+	}
+
+	h := m.history[node]
+	if h == nil {
+		h = &peerHistoryEntry{peers: map[types.NodeID]bool{}}
+		m.history[node] = h
+	}
+
+	for _, id := range ids {
+		h.peers[id] = true
+	}
+
+	h.rev = max(h.rev, rev)
+}
+
+func (m *peerHistoryModel) Delivered(token, rev uint64, ids []types.NodeID) {
+	node, live := m.sessions[token]
+	if !live {
+		return
+	}
+
+	h := m.history[node]
+	if h != nil && h.rev > rev {
+		return
+	}
+
+	peers := map[types.NodeID]bool{}
+	for _, id := range ids {
+		peers[id] = true
+	}
+
+	m.history[node] = &peerHistoryEntry{peers: peers, rev: rev}
+}
+
+// Forget returns live tokens stopped by deletion, in admission order.
+func (m *peerHistoryModel) Forget(node types.NodeID) []uint64 {
+	var stopped []uint64
+
+	for _, token := range m.order {
+		if id, live := m.sessions[token]; live && id == node {
+			stopped = append(stopped, token)
+			delete(m.sessions, token)
+		}
+	}
+
+	delete(m.history, node)
+
+	return stopped
+}
+
+func (m *peerHistoryModel) Expire(now time.Time) {
+	for id, h := range m.history {
+		if !h.offline.IsZero() && now.Sub(h.offline) >= m.ttl {
+			delete(m.history, id)
+		}
+	}
+}
+
+// Possible returns an owned sorted set, including peers of unconfirmed writes.
+func (m *peerHistoryModel) Possible(node types.NodeID) []types.NodeID {
+	if h := m.history[node]; h != nil {
+		return slices.Sorted(maps.Keys(h.peers))
+	}
+
+	return nil
+}
+
+func (m *peerHistoryModel) Live(token uint64) bool {
+	_, ok := m.sessions[token]
+	return ok
+}
+
+func (m *peerHistoryModel) HasHistory(node types.NodeID) bool {
+	_, ok := m.history[node]
+	return ok
+}
+
+// Close retires all live tokens but does not discard history on shutdown.
+func (m *peerHistoryModel) Close() []uint64 {
+	m.closed = true
+
+	var stopped []uint64
+
+	for _, token := range m.order {
+		if m.Live(token) {
+			stopped = append(stopped, token)
+		}
+	}
+
+	clear(m.sessions)
+
+	return stopped
+}
+
+// These policies have deliberately different visibility, route and capability
+// effects. The first three also have a small, independent visibility oracle.
+var streamPropertyPolicies = []string{
+	`{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`,
+	`{"acls":[]}`,
+	`{"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`,
+	`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u2@"]},
+	  "acls":[{"action":"accept","src":["u1@"],"dst":["tag:a:*","10.0.0.0/24:*"]}],
+	  "ssh":[{"action":"accept","src":["u2@"],"dst":["tag:b"],"users":["root"]}]}`,
+	`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u2@"]},
+	  "grants":[{"src":["u1@","u2@"],"dst":["10.0.0.0/24"],"ip":["*"],"via":["tag:a"]},
+	            {"src":["*"],"dst":["*"],"ip":["*"]}]}`,
+	`{"nodeAttrs":[{"target":["u1@"],"attr":["disable-ipv4"]}],
+	  "acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`,
+	`{"acls":[{"action":"accept","src":["u2@"],"dst":["autogroup:internet:*"]}]}`,
+}
+
+var streamPropertyVersions = []tailcfg.CapabilityVersion{
+	capver.MinSupportedCapabilityVersion,
+	capver.FullNetmapRemovalsCapVer - 1,
+	capver.FullNetmapRemovalsCapVer,
+	tailcfg.CurrentCapabilityVersion,
+}
+
+type streamPropertySession struct {
+	stream     *Stream
+	client     *propertyClient
+	capVer     tailcfg.CapabilityVersion
+	down       bool
+	token      uint64
+	ids        []types.NodeID
+	pendingRev uint64
+	pending    bool
+}
+
+type streamPropertyPolicy struct {
+	doc        []byte
+	kind       int
+	intent     *propcheck.PacketIntent
+	appIntent  *propcheck.AppIntent
+	sshIntent  *propcheck.SSHIntent
+	attrIntent *propcheck.NodeAttrIntent
+}
+
+const maxStreamPropertyNodeID types.NodeID = 255
+
+type streamPropertySystem struct {
+	lastNodeID   types.NodeID
+	dnsRecords   []tailcfg.DNSRecord
+	derpMap      *tailcfg.DERPMap
+	derpMaps     []*tailcfg.DERPMap
+	viaOnly      bool
+	cfg          *types.Config
+	state        *state.State
+	hub          *Hub
+	sessions     map[types.NodeID]*streamPropertySession
+	policy       int
+	policyDoc    []byte
+	packetIntent *propcheck.PacketIntent
+	appIntent    *propcheck.AppIntent
+	sshIntent    *propcheck.SSHIntent
+	attrIntent   *propcheck.NodeAttrIntent
+	policies     []streamPropertyPolicy
+	stagedPolicy streamOperation
+	world        propcheck.World
+	probes       propcheck.WorldProbes
+	sourceProbes []netip.Addr
+	routes       propcheck.RouteResult
+	history      *peerHistoryModel
+	token        uint64
+	reportSeq    uint64
+	control      map[types.NodeID][]uint64
+}
+
+// newStreamPropertySystem owns resources per Rapid case, including shrink
+// attempts. No assertion or Cleanup escapes to the outer testing.T.
+func newStreamPropertySystem(t *rapid.T, mode ...types.PolicyMode) *streamPropertySystem {
+	dir, err := os.MkdirTemp("", "mapper-property-")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	p4 := netip.MustParsePrefix("100.64.0.0/10")
+	p6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+	cfg := &types.Config{
+		Database:  types.DatabaseConfig{Type: types.DatabaseSqlite, Sqlite: types.SqliteConfig{Path: dir + "/h.db"}},
+		ServerURL: "https://headscale.test",
+		Policy:    types.PolicyConfig{Mode: types.PolicyModeDB},
+		Prefixes:  types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential},
+		DNSConfig: types.DNSConfig{BaseDomain: "headscale.test", MagicDNS: true},
+	}
+	startup := &propcheck.PacketIntent{}
+
+	if len(mode) > 0 && mode[0] == types.PolicyModeFile {
+		cfg.Policy = types.PolicyConfig{Mode: types.PolicyModeFile, Path: dir + "/policy.hujson"}
+		require.NoError(t, os.WriteFile(cfg.Policy.Path, startup.Document(t), 0o600))
+	}
+
+	s, err := state.NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+	s.DB().DB.NowFunc = func() time.Time { return propertyEpoch }
+	hub := NewHub()
+	hub.now = func() time.Time { return propertyEpoch }
+	t.Cleanup(hub.Close)
+
+	p := &streamPropertySystem{
+		cfg: cfg, state: s, hub: hub, sessions: make(map[types.NodeID]*streamPropertySession),
+		world:   propcheck.World{Nodes: map[types.NodeID]*types.Node{}},
+		history: newPeerHistoryModel(maxConcurrentMapSessionsPerNode, peerHistoryTTL),
+		probes:  propcheck.WorldProbes{UserIDs: []types.UserID{0, 1, 2, 3}},
+	}
+	if cfg.Policy.Mode == types.PolicyModeFile {
+		p.policy, p.policyDoc, p.packetIntent = -1, startup.Document(t), startup
+		p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: -1, intent: startup}}
+		p.stagedPolicy = streamOperation{doc: slices.Clone(p.policyDoc), policy: -1, intent: startup}
+	}
+
+	for i := range 3 {
+		u := types.User{ID: uint(i + 1), Name: fmt.Sprintf("u%d", i+1), CreatedAt: propertyEpoch, UpdatedAt: propertyEpoch}
+		got, err := s.CreateUser(u)
+		require.NoError(t, err)
+		require.Equal(t, u, *got)
+		p.world.Users = append(p.world.Users, u)
+	}
+
+	p.derpMap = &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: {
+		RegionID: 1, Nodes: []*tailcfg.DERPNode{{Name: "1a", RegionID: 1, HostName: "derp.example.com"}},
+	}}}
+	p.derpMaps = []*tailcfg.DERPMap{p.derpMap.Clone()}
+	s.SetDERPMap(p.derpMap.Clone())
+
+	count := rapid.IntRange(3, 8).Draw(t, "nodes")
+	for i := range count {
+		p.insert(t, types.NodeID(i+1))
+	}
+
+	if cfg.Policy.Mode != types.PolicyModeFile {
+		p.setPolicy(t, rapid.IntRange(0, len(streamPropertyPolicies)-1).Draw(t, "initial-policy"))
+	}
+
+	for _, node := range s.ListNodes().All() {
+		p.open(t, node.ID(), s.Snapshot(), false)
+	}
+
+	return p
+}
+
+var propertyEpoch = time.Unix(1_700_000_000, 0).UTC()
+
+func (p *streamPropertySystem) drawNode(t *rapid.T, id types.NodeID) *types.Node {
+	user := p.world.Users[(id-1)%3].Clone()
+
+	name := fmt.Sprintf("node-%d", id)
+
+	var raw [32]byte
+
+	raw[0], raw[31] = byte(id), rapid.Byte().Draw(t, "key-byte") //nolint:gosec // IDs are in [1, 255].
+	n := types.Node{
+		ID: id, UserID: &user.ID, User: user, GivenName: name, Hostname: name,
+		MachineKey: key.MachinePublicFromRaw32(mem.B(raw[:])),
+		NodeKey:    key.NodePublicFromRaw32(mem.B(raw[:])), DiscoKey: key.DiscoPublicFromRaw32(mem.B(raw[:])),
+		IPv4:      new(netip.AddrFrom4([4]byte{100, 64, 0, byte(id)})), //nolint:gosec // IDs are in [1, 255].
+		IPv6:      new(netip.MustParseAddr(fmt.Sprintf("fd7a:115c:a1e0::%x", id.Uint64()))),
+		Hostinfo:  &tailcfg.Hostinfo{Hostname: name, OS: "linux"},
+		CreatedAt: propertyEpoch, UpdatedAt: propertyEpoch, IsOnline: new(false),
+	}
+	// Start with both user-owned classes and a router whose creator is set.
+	if id == 3 {
+		n.Tags = []string{"tag:a", "tag:srv", "tag:router"}
+		n.Hostinfo.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}
+		n.ApprovedRoutes = slices.Clone(n.Hostinfo.RoutableIPs)
+		n.ActiveSessions, n.IsOnline = 1, new(true)
+		n.SessionStart = time.Unix(1_700_000_000, 0).UTC()
+	}
+
+	return &n
+}
+
+func (p *streamPropertySystem) insert(t *rapid.T, id types.NodeID) {
+	n := p.drawNode(t, id)
+	p.create(t, n)
+}
+
+func (p *streamPropertySystem) create(t *rapid.T, n *types.Node) {
+	// Persistent node IDs are never reused, including after deletion.
+	require.Greater(t, n.ID, p.lastNodeID)
+	require.LessOrEqual(t, n.ID, maxStreamPropertyNodeID)
+	require.NoError(t, p.state.DB().DB.Save(n.Clone()).Error)
+	p.lastNodeID = n.ID
+	p.probes.IDs = append(p.probes.IDs, n.ID)
+	// Retain the first eight lifetimes without evicting revocation witnesses.
+	if n.ID <= 8 {
+		for _, ip := range []*netip.Addr{n.IPv4, n.IPv6} {
+			if ip != nil {
+				p.sourceProbes = append(p.sourceProbes, *ip)
+			}
+		}
+	}
+
+	p.put(t, n)
+}
+
+func (p *streamPropertySystem) put(t *rapid.T, n *types.Node) {
+	p.world.Put(n)
+	p.state.PutNodeInStoreForTest(*n.Clone())
+	p.checkWorld(t)
+}
+
+func (p *streamPropertySystem) setPolicy(t *rapid.T, index int) {
+	p.apply(t, streamOperation{kind: "policy", policy: index, doc: []byte(streamPropertyPolicies[index])})
+}
+
+// Staging owns its input independently of the active policy and graph. Rename
+// models successive complete files at the one configured production path.
+func (p *streamPropertySystem) stagePolicy(t *rapid.T, op streamOperation) {
+	require.Equal(t, types.PolicyModeFile, p.cfg.Policy.Mode)
+
+	if op.kind == "file-missing" {
+		err := os.Remove(p.cfg.Policy.Path)
+		require.True(t, err == nil || errors.Is(err, os.ErrNotExist), "remove policy: %v", err)
+	} else {
+		require.NoError(t, os.WriteFile(p.cfg.Policy.Path+".next", op.doc, 0o600))
+		require.NoError(t, os.Rename(p.cfg.Policy.Path+".next", p.cfg.Policy.Path))
+	}
+
+	p.stagedPolicy = streamOperation{doc: slices.Clone(op.doc), policy: op.policy, intent: op.intent, appIntent: op.appIntent, sshIntent: op.sshIntent, attrIntent: op.attrIntent, reject: op.reject}
+}
+
+// Active expectations advance only after acceptance. Refused files remain on
+// disk, so a later reload must refuse again until another file replaces them.
+func (p *streamPropertySystem) inputPolicy(t *rapid.T, op streamOperation) {
+	before := p.state.Snapshot().Rev()
+
+	var err error
+
+	if p.cfg.Policy.Mode == types.PolicyModeFile {
+		if op.kind != "file-reload" {
+			p.stagePolicy(t, op)
+		}
+
+		if op.kind == "file-stage" {
+			require.Equal(t, before, p.state.Snapshot().Rev(), "staging published")
+			return
+		}
+
+		err = p.state.ReloadPolicy()
+	} else {
+		var changed bool
+
+		changed, err = p.state.SetPolicy(op.doc)
+		if err == nil {
+			require.Equal(t, !bytes.Equal(p.policyDoc, op.doc), changed, "SetPolicy change result")
+		}
+	}
+
+	if op.reject {
+		require.Error(t, err, "refused policy: %s", op.doc)
+
+		if op.kind == "file-test-failure" {
+			require.ErrorContains(t, err, "test(s) failed", "embedded test must fail evaluation")
+		}
+
+		require.Equal(t, before, p.state.Snapshot().Rev(), "refused policy published")
+
+		return
+	}
+
+	require.NoError(t, err, "accepted policy: %s", op.doc)
+
+	wantRev := before
+	if !bytes.Equal(p.policyDoc, op.doc) {
+		wantRev++
+	}
+
+	require.Equal(t, wantRev, p.state.Snapshot().Rev(), "policy publication")
+	p.policy, p.policyDoc, p.packetIntent, p.appIntent = op.policy, slices.Clone(op.doc), op.intent, op.appIntent
+	p.sshIntent = op.sshIntent
+	p.attrIntent = op.attrIntent
+	p.policies = append(p.policies, streamPropertyPolicy{doc: slices.Clone(op.doc), kind: op.policy, intent: op.intent, appIntent: op.appIntent, sshIntent: op.sshIntent, attrIntent: op.attrIntent})
+}
+
+// applyStreamPropertyWire crosses the real encoder boundary. Removal frames
+// must stand alone, so even old delta-only consumers receive revocations.
+func applyStreamPropertyWire(t require.TestingT, hub *Hub, client *propertyClient, responses []*tailcfg.MapResponse) {
+	for _, response := range responses {
+		// Exercise both Hub.Encode slots without changing generated operation draws.
+		wireRoundTrip(t, hub, response, false)
+		wire := *wireRoundTrip(t, hub, response, true)
+		propcheck.CheckNodeAttrWire(t, wire.Node, true)
+
+		for _, peer := range wire.Peers {
+			propcheck.CheckNodeAttrWire(t, peer, false)
+		}
+
+		for _, peer := range wire.PeersChanged {
+			propcheck.CheckNodeAttrWire(t, peer, false)
+		}
+
+		for _, peer := range wire.PeersChangedPatch {
+			propcheck.CheckNodeAttrWire(t, &tailcfg.Node{ID: peer.NodeID, CapMap: peer.CapMap}, false)
+		}
+
+		if len(wire.PeersRemoved) != 0 {
+			without := wire
+			without.PeersRemoved, without.ControlTime = nil, nil
+			require.Equal(t, tailcfg.MapResponse{}, without, "removals must be delta-only")
+			require.True(t, slices.IsSorted(wire.PeersRemoved))
+		}
+
+		for _, peers := range [][]*tailcfg.Node{wire.Peers, wire.PeersChanged} {
+			for i, peer := range peers {
+				if client.self != nil {
+					require.NotEqual(t, client.self.ID, peer.ID, "self leaked into peers")
+				}
+
+				if i > 0 {
+					require.Less(t, peers[i-1].ID, peer.ID, "peers must be sorted and unique")
+				}
+			}
+		}
+
+		client.apply(&wire)
+		client.derp = streamDERPSemantic(client.derp)
+
+		if client.self != nil {
+			require.NotContains(t, client.peers, client.self.ID, "self leaked into the initial peer list")
+
+			for _, patch := range wire.PeersChangedPatch {
+				require.NotEqual(t, client.self.ID, patch.NodeID, "self leaked into peer patches")
+			}
+		}
+
+		require.Zero(t, client.unseenProfile(), "profile of an owner never visible to the client")
+	}
+}
+
+func (p *streamPropertySystem) open(t *rapid.T, id types.NodeID, snap *state.Snapshot, partial bool) {
+	previous := p.sessions[id]
+	cv := rapid.SampledFrom(streamPropertyVersions).Draw(t, "cap-version")
+
+	client := newPropertyClient(&tailcfg.MapResponse{})
+	if previous != nil {
+		client = previous.client
+		if !previous.down {
+			p.hub.Leave(previous.stream.sess)
+			p.history.Leave(previous.token, propertyEpoch)
+		}
+	}
+
+	p.token++
+	token := p.token
+	require.Empty(t, p.history.Join(token, id, propertyEpoch))
+	session := p.hub.Join(id, func() {})
+	require.NotNil(t, session)
+
+	st := NewStream(p.cfg, p.hub, id, cv)
+	st.Attach(session)
+	responses, err := st.Initial(snap)
+	require.NoError(t, err)
+
+	ids := p.expectedPeers(t, id, snap, cv)
+	p.history.Attempt(token, snap.Rev(), ids)
+
+	if partial {
+		applyStreamPropertyWire(t, p.hub, client, responses[:rapid.IntRange(0, len(responses)).Draw(t, "initial-prefix")])
+		p.hub.Leave(session)
+		p.history.Leave(token, propertyEpoch)
+	} else {
+		applyStreamPropertyWire(t, p.hub, client, responses)
+		st.Delivered()
+		p.history.Delivered(token, snap.Rev(), ids)
+	}
+
+	p.sessions[id] = &streamPropertySession{stream: st, client: client, capVer: cv, down: partial, token: token, ids: ids}
+	p.checkHistory(t)
+
+	if !partial {
+		p.checkSession(t, id, snap, p.sessions[id])
+	}
+}
+
+func (p *streamPropertySystem) update(t *rapid.T, id types.NodeID, snap *state.Snapshot, mode int) {
+	session := p.sessions[id]
+	responses, err := session.stream.Update(snap)
+	require.NoError(t, err)
+
+	ids := p.expectedPeers(t, id, snap, session.capVer)
+	if len(responses) > 0 && !slices.Equal(session.ids, ids) {
+		session.pending, session.pendingRev = true, snap.Rev()
+		p.history.Attempt(session.token, snap.Rev(), ids)
+	}
+
+	session.ids = ids
+
+	switch mode {
+	case 1: // An unconfirmed prefix may have reached the client.
+		applyStreamPropertyWire(t, p.hub, session.client, responses[:rapid.IntRange(0, len(responses)).Draw(t, "update-prefix")])
+		p.hub.Leave(session.stream.sess)
+		p.history.Leave(session.token, propertyEpoch)
+		session.down = true
+	case 2: // An obsolete write confirmation must not replace new history.
+		stale := session.stream
+
+		p.open(t, id, snap, false)
+		stale.Delivered()
+
+		if session.pending {
+			p.history.Delivered(session.token, session.pendingRev, session.ids)
+		}
+	default:
+		applyStreamPropertyWire(t, p.hub, session.client, responses)
+		session.stream.Delivered()
+
+		if session.pending {
+			p.history.Delivered(session.token, session.pendingRev, session.ids)
+			session.pending = false
+		}
+
+		quiet, err := session.stream.Update(snap)
+		require.NoError(t, err)
+		require.Empty(t, quiet, "same snapshot must be quiet")
+	}
+
+	p.checkHistory(t)
+
+	if mode != 2 && !session.down {
+		p.checkSession(t, id, snap, session)
+	}
+}
+
+func (p *streamPropertySystem) check(t *rapid.T, snap *state.Snapshot) {
+	for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+		if session := p.sessions[id]; !session.down {
+			p.checkSession(t, id, snap, session)
+		}
+	}
+}
+
+// A later coalesced write must not hide an incorrect intermediate delivery.
+// Only this viewer is current; other sessions may legitimately still lag.
+func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *state.Snapshot, session *streamPropertySession) {
+	t.Helper()
+	checkStreamConfigInputs(t, p.cfg.ServerURL, session.client)
+	checkStreamPacketIntent(t, p.world, streamPacketIntent(p.world, p.policy, p.packetIntent), id, session.client, p.sourceProbes...)
+	checkStreamAppIntent(t, p.world, streamAppIntent(t, p.policyDoc, p.appIntent), id, session.client, p.sourceProbes...)
+
+	if intent := streamSSHIntent(t, p.policyDoc, p.sshIntent); intent != nil {
+		propcheck.CheckSSHIntent(t, p.world, intent, id, session.client.ssh, p.cfg.ServerURL)
+	}
+
+	checkStreamNodeInputs(t, p.world, id, session.client, p.cfg.DNSConfig.BaseDomain, p.packetIntent != nil || (p.policy >= 0 && p.policy <= 2), streamNodeAttrIntent(t, p.policyDoc, p.attrIntent))
+	checkStreamConnectivityInputs(t, p.world, id, session.client)
+
+	freshHub := NewHub()
+	responses, err := NewStream(p.cfg, freshHub, id, session.capVer).Initial(snap)
+	require.NoError(t, err)
+
+	fresh := newPropertyClient(&tailcfg.MapResponse{})
+	applyStreamPropertyWire(t, freshHub, fresh, responses)
+	freshHub.Close()
+	session.client.check(t, fresh)
+	require.Equal(t, wireJSON(t, streamDERPSemantic(p.effectiveDERP(t))), wireJSON(t, session.client.derp), "DERP input to client")
+	require.Len(t, session.client.deltaPeers, len(fresh.peers), "delta-only observer retained a removed peer")
+
+	for peer := range fresh.peers {
+		require.True(t, session.client.deltaPeers[peer], "delta-only observer missed peer %d", peer)
+	}
+
+	self := p.world.Nodes[id]
+	require.NotNil(t, self)
+
+	for _, peerID := range slices.Sorted(maps.Keys(p.world.Nodes)) {
+		peer := p.world.Nodes[peerID]
+		if peer.ID == id {
+			continue
+		}
+
+		wire, visible := session.client.peers[peer.ID.NodeID()]
+		// Same-user visibility is unconditional; tags never confer a
+		// creator's ownership, including when UserID remains populated.
+		if p.policy >= 0 && p.policy <= 2 {
+			want := p.policy == 0 || (len(self.Tags) == 0 && len(peer.Tags) == 0 && self.UserID != nil && peer.UserID != nil && *self.UserID == *peer.UserID)
+			require.Equal(t, want, visible, "policy %d: viewer %d peer %d", p.policy, id, peer.ID)
+		}
+
+		if visible {
+			if p.policy == 0 {
+				var primaries []netip.Prefix
+
+				for prefix, winner := range p.routes.Global {
+					if winner == uint64(peer.ID) {
+						primaries = append(primaries, prefix)
+					}
+				}
+
+				require.ElementsMatch(t, primaries, wire.PrimaryRoutes, "independent primary routes")
+
+				allowed := []netip.Prefix{netip.PrefixFrom(*peer.IPv6, 128)}
+				_, ownDisabled := p.attrIntent.Capabilities(p.world, peer.ID)["disable-ipv4"]
+
+				_, viewerDisabled := p.attrIntent.Capabilities(p.world, id)["disable-ipv4"]
+				if !ownDisabled && !viewerDisabled {
+					allowed = append(allowed, netip.PrefixFrom(*peer.IPv4, 32))
+				}
+
+				allowed = append(allowed, primaries...)
+
+				for _, prefix := range propertyApproved(peer) {
+					if prefix.Bits() == 0 {
+						allowed = append(allowed, prefix)
+					}
+				}
+
+				require.ElementsMatch(t, allowed, wire.AllowedIPs, "independent allowed routes")
+			}
+		}
+	}
+}
+
+// The fixture keeps its valid server URL fixed throughout each history.
+func checkStreamConfigInputs(t require.TestingT, serverURL string, client *propertyClient) {
+	server, err := url.Parse(serverURL)
+	require.NoError(t, err)
+	require.NotEmpty(t, server.Hostname())
+	require.Equal(t, server.Hostname(), client.domain, "configured map domain")
+	require.False(t, client.collectServices, "service collection must remain disabled")
+}
+
+func TestStreamConfigInputContracts(t *testing.T) {
+	const serverURL = "https://control.example.test:8443/control"
+
+	valid := propertyClient{domain: "control.example.test"}
+	checkStreamConfigInputs(t, serverURL, &valid)
+
+	for _, tc := range []struct {
+		name, message string
+		corrupt       func(*propertyClient)
+	}{
+		{"missing-domain", "configured map domain", func(c *propertyClient) { c.domain = "" }},
+		{"wrong-domain", "configured map domain", func(c *propertyClient) { c.domain = "tailnet.example.test" }},
+		{"collect-services", "service collection", func(c *propertyClient) { c.collectServices = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := valid
+			tc.corrupt(&client)
+
+			failure := &streamConnectivityFailure{}
+			require.PanicsWithValue(t, failure, func() { checkStreamConfigInputs(failure, serverURL, &client) })
+			require.Contains(t, failure.message, tc.message)
+		})
+	}
+}
+
+// Missing scores and explicit 1.0 both select the default latency weight.
+// Preserve every non-default score, including stale scores after a clear.
+func streamDERPSemantic(dm *tailcfg.DERPMap) *tailcfg.DERPMap {
+	dm = dm.Clone()
+	if dm != nil && dm.HomeParams != nil {
+		maps.DeleteFunc(dm.HomeParams.RegionScore, func(_ tailcfg.DERPRegionID, score float64) bool { return score == 1 })
+
+		if len(dm.HomeParams.RegionScore) == 0 {
+			dm.HomeParams = nil
+		}
+	}
+
+	return dm
+}
+
+// Decode only DERP from generated input; this is not a policy interpreter.
+func (p *streamPropertySystem) effectiveDERP(t require.TestingT) *tailcfg.DERPMap {
+	var policy struct {
+		DERPMap *tailcfg.DERPMap `json:"derpMap"`
+	}
+
+	if len(p.policyDoc) > 0 {
+		doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
+		require.NoError(t, err)
+		require.NoError(t, jsonv2.Unmarshal(doc, &policy, jsonv2.MatchCaseInsensitiveNames(true)))
+	}
+
+	return propcheck.EffectiveDERP(p.derpMap, policy.DERPMap)
+}
+
+// checkWorld reuses the exact scan assertions used by the focused state property.
+// Probes retain old keys as well as current ones to catch stale index entries.
+func (p *streamPropertySystem) checkWorld(t *rapid.T) {
+	for _, id := range slices.Sorted(maps.Keys(p.world.Nodes)) {
+		n := p.world.Nodes[id]
+		if !slices.Contains(p.probes.NodeKeys, n.NodeKey) {
+			p.probes.NodeKeys = append(p.probes.NodeKeys, n.NodeKey)
+		}
+
+		if !slices.Contains(p.probes.MachineKeys, n.MachineKey) {
+			p.probes.MachineKeys = append(p.probes.MachineKeys, n.MachineKey)
+		}
+	}
+
+	if p.control != nil {
+		for id, n := range p.world.Nodes {
+			require.Len(t, p.control[id], n.ActiveSessions, "owned control count for node %d", id)
+		}
+	}
+
+	snap := p.state.Snapshot()
+	propcheck.CheckWorld(t, p.world, snap, p.probes)
+	require.Equal(t, p.effectiveDERP(t), snap.DERPMap(), "DERP reference")
+	require.True(t, slices.Equal(p.dnsRecords, snap.DNS().ExtraRecords().AsSlice()), "DNS reference")
+	require.Equal(t, string(p.policyDoc), string(snap.PolicySource()), "published policy input")
+
+	nodes := make([]propcheck.RouteNode, 0, len(p.world.Nodes))
+	for _, n := range p.world.Nodes {
+		nodes = append(nodes, propcheck.RouteNode{
+			ID: uint64(n.ID), Online: n.ActiveSessions > 0,
+			Expired: propertyExpired(n), Unhealthy: n.Unhealthy, SessionStart: n.SessionStart,
+			Announced: n.Hostinfo.RoutableIPs, Approved: n.ApprovedRoutes, Tags: n.Tags,
+		})
+	}
+
+	var scopes []propcheck.ViaScope
+
+	if p.policy == 4 || p.viaOnly {
+		var candidates []uint64
+
+		for _, n := range p.world.Nodes {
+			if slices.Contains(n.Tags, "tag:a") {
+				candidates = append(candidates, uint64(n.ID))
+			}
+		}
+
+		scopes = []propcheck.ViaScope{{Key: "tag:a", Prefix: netip.MustParsePrefix("10.0.0.0/24"), Candidates: candidates}}
+	}
+
+	p.routes = propcheck.ElectRoutes(nodes, p.routes.Global, scopes)
+
+	want := map[netip.Prefix]types.NodeID{}
+	for prefix, id := range p.routes.Global {
+		want[prefix] = types.NodeID(id)
+	}
+
+	require.Equal(t, want, snap.PrimaryRoutes(), "independent election after each write")
+}
+
+// Generated expiry dates are deliberately outside the campaign's time range.
+func propertyExpired(n *types.Node) bool {
+	return n.Expiry != nil && !n.Expiry.IsZero() && n.Expiry.Year() < 2020
+}
+
+func propertyPeerIDs(peers []*tailcfg.Node) []types.NodeID {
+	ids := make([]types.NodeID, 0, len(peers))
+	for _, peer := range peers {
+		ids = append(ids, types.NodeID(peer.ID)) //nolint:gosec // Fixture node IDs are 1..255.
+	}
+
+	slices.Sort(ids)
+
+	return ids
+}
+
+func (p *streamPropertySystem) checkHistory(t *rapid.T) {
+	for _, id := range p.probes.IDs {
+		want := p.history.Possible(id)
+		p.hub.mu.Lock()
+		actual, exists := p.hub.sentPeers[id]
+
+		got := slices.Clone(actual.ids)
+		for _, attempted := range actual.attempts {
+			got = append(got, attempted...)
+		}
+		p.hub.mu.Unlock()
+		slices.Sort(got)
+		got = slices.Compact(got)
+		// Shared class views may contain self; it is never a possible wire peer.
+		got = slices.DeleteFunc(got, func(peer types.NodeID) bool { return peer == id })
+
+		require.Equal(t, p.history.HasHistory(id), exists, "history existence for %d", id)
+		require.True(t, slices.Equal(want, got), "history for %d: want %v got %v", id, want, got)
+	}
+
+	for _, session := range p.sessions {
+		require.Equal(t, !session.down, p.history.Live(session.token))
+	}
+}
+
+// expectedPeers uses input intent for the three simple policies. Rich policies
+// use a separate fresh renderer as a secondary oracle, never the live stream's
+// sent state. The ledger itself only sees intended write events and peer sets.
+func (p *streamPropertySystem) expectedPeers(t *rapid.T, viewer types.NodeID, snap *state.Snapshot, version tailcfg.CapabilityVersion) []types.NodeID {
+	if p.policy >= 0 && p.policy <= 2 {
+		var peers []types.NodeID
+
+		self := p.world.Nodes[viewer]
+		for _, id := range slices.Sorted(maps.Keys(p.world.Nodes)) {
+			peer := p.world.Nodes[id]
+			if id != viewer && (p.policy == 0 || len(self.Tags) == 0 && len(peer.Tags) == 0 && self.UserID != nil && peer.UserID != nil && *self.UserID == *peer.UserID) {
+				peers = append(peers, id)
+			}
+		}
+
+		return peers
+	}
+
+	hub := NewHub()
+	responses, err := NewStream(p.cfg, hub, viewer, version).Initial(snap)
+	hub.Close()
+	require.NoError(t, err)
+
+	return propertyPeerIDs(responses[0].Peers)
+}
+
+// streamOperation contains all generated parameters before either model or
+// production state changes. Drawing reads only the independent reference.
+type streamOperation struct {
+	kind         string
+	node, before *types.Node
+	policy       int
+	doc          []byte
+	intent       *propcheck.PacketIntent
+	appIntent    *propcheck.AppIntent
+	sshIntent    *propcheck.SSHIntent
+	attrIntent   *propcheck.NodeAttrIntent
+	reject       bool
+	user         types.User
+	records      []tailcfg.DNSRecord
+	derp         *tailcfg.DERPMap
+	request      tailcfg.MapRequest
+	epoch        uint64
+}
+
+//nolint:gocyclo // One switch arm per generated operation keeps the input contract visible.
+func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) streamOperation {
+	ids := slices.Sorted(maps.Keys(p.world.Nodes))
+	id := rapid.SampledFrom(ids).Draw(t, "node")
+	n := p.world.Nodes[id].Clone()
+
+	operations := kinds
+	if len(operations) == 0 {
+		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "group-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "ssh-policy", "ssh-deny", "ssh-mixed", "attrs-policy", "attrs-clear", "attrs-mixed", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "request-hostinfo", "request-collision", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request", "invalid-policy"}
+		if len(ids) > 3 {
+			operations = append(operations, "delete")
+		}
+
+		if len(ids) < 8 && p.lastNodeID < maxStreamPropertyNodeID {
+			operations = append(operations, "add")
+		}
+	}
+
+	op := rapid.SampledFrom(operations).Draw(t, "operation")
+
+	result := streamOperation{kind: op, node: n, before: n.Clone()}
+	switch op {
+	case "endpoints", "revert":
+		n.Endpoints = nil
+		for range rapid.IntRange(0, 3).Draw(t, "endpoint-count") {
+			n.Endpoints = append(n.Endpoints, netip.AddrPortFrom(
+				netip.AddrFrom4([4]byte{192, 0, 2, rapid.ByteRange(1, 254).Draw(t, "endpoint-ip")}),
+				rapid.Uint16().Draw(t, "endpoint-port")))
+		}
+
+	case "hostinfo":
+		n.Hostinfo.OS = rapid.SampledFrom([]string{"linux", "windows", "android", ""}).Draw(t, "os")
+		n.Hostinfo.Hostname = fmt.Sprintf("reported-%d", rapid.IntRange(0, 10).Draw(t, "hostname"))
+		n.Hostinfo.NetInfo = &tailcfg.NetInfo{PreferredDERP: tailcfg.DERPRegionID(rapid.IntRange(0, 3).Draw(t, "home-derp"))}
+
+		n.Hostinfo.Services = nil
+		if rapid.Bool().Draw(t, "service") {
+			n.Hostinfo.Services = []tailcfg.Service{{Proto: "tcp", Port: rapid.Uint16().Draw(t, "service-port")}}
+		}
+
+	case "keys":
+		var raw [32]byte
+		copy(raw[:], rapid.SliceOfN(rapid.Byte(), 32, 32).Draw(t, "node-key"))
+		raw[0] |= 1 // Registered nodes cannot have a zero node key.
+		n.NodeKey = key.NodePublicFromRaw32(mem.B(raw[:]))
+
+		var disco [32]byte
+		if !rapid.Bool().Draw(t, "zero-disco") {
+			copy(disco[:], rapid.SliceOfN(rapid.Byte(), 32, 32).Draw(t, "disco-key"))
+		}
+
+		n.DiscoKey = key.DiscoPublicFromRaw32(mem.B(disco[:]))
+	case "expiry", "public-expiry":
+		// Fixed distant dates make shrinking independent of wall time.
+		n.Expiry = rapid.SampledFrom([]*time.Time{nil, new(time.Time{}), new(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)), new(time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC))}).Draw(t, "expiry")
+		n.IsOnline = new(n.ActiveSessions > 0 && !propertyExpired(n))
+	case "connect", "connect-request":
+		result.request.NodeKey = n.NodeKey
+	case "stale-connect":
+		var raw [32]byte
+
+		raw[0] = 254
+		result.request.NodeKey = key.NodePublicFromRaw32(mem.B(raw[:]))
+		require.NotEqual(t, n.NodeKey, result.request.NodeKey)
+	case "zero-connect":
+	case "missing-connect", "missing-expiry":
+		result.request.NodeKey = n.NodeKey
+		n.ID = maxStreamPropertyNodeID + 1
+	case "disconnect":
+		require.NotNil(t, p.control, "public sessions require an owned ledger")
+
+		var live []types.NodeID
+
+		for _, candidate := range ids {
+			if len(p.control[candidate]) > 0 {
+				live = append(live, candidate)
+			}
+		}
+
+		if len(live) == 0 {
+			result.kind = "connect"
+		} else {
+			id = rapid.SampledFrom(live).Draw(t, "release-node")
+			result.node, result.before = p.world.Nodes[id].Clone(), p.world.Nodes[id].Clone()
+			result.epoch = rapid.SampledFrom(p.control[id]).Draw(t, "release-epoch")
+		}
+	case "invalid-expiry":
+		n.Expiry = new(time.Date(rapid.SampledFrom([]int{-1, 10000}).Draw(t, "invalid-year"), 1, 1, 0, 0, 0, 0, time.UTC))
+	case "utc-expiry":
+		n.Expiry = new(time.Date(9999, 1, 1, 0, 0, 0, 0, time.FixedZone("input", 3600)))
+	case "online":
+		n.ActiveSessions = 1 - n.ActiveSessions
+		n.IsOnline = new(n.ActiveSessions > 0 && !propertyExpired(n))
+		n.LastSeen = new(time.Unix(1_700_000_000+rapid.Int64Range(0, 1000).Draw(t, "last-seen"), 0).UTC())
+		n.SessionStart = time.Unix(1_700_000_000+int64(n.ID), 0).UTC() //nolint:gosec // IDs are in [1, 255].
+	case "identity":
+		user := p.world.Users[rapid.IntRange(0, 2).Draw(t, "owner")].Clone()
+
+		n.UserID, n.User = &user.ID, user
+
+		n.Tags = rapid.SampledFrom([]types.Strings{nil, {"tag:a"}, {"tag:b"}, {"tag:a", "tag:b"}, {"tag:srv"}, {"tag:router"}}).Draw(t, "tags")
+		if len(n.Tags) > 0 && rapid.Bool().Draw(t, "clear-creator") {
+			n.UserID, n.User = nil, nil
+		}
+
+	case "routes":
+		routes := rapid.SampledFrom([][]netip.Prefix{
+			nil,
+			{netip.MustParsePrefix("10.0.0.0/24")},
+			{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
+			{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("10.1.0.0/24")},
+		}).Draw(t, "routes")
+		n.Hostinfo.RoutableIPs = slices.Clone(routes)
+
+		n.ApprovedRoutes = nil
+		if rapid.Bool().Draw(t, "approve") {
+			n.ApprovedRoutes = slices.Clone(routes)
+		}
+
+	case "health":
+		n.Unhealthy = !n.Unhealthy
+	case "policy":
+		result.policy = rapid.IntRange(0, len(streamPropertyPolicies)-1).Draw(t, "policy")
+		result.doc = []byte(streamPropertyPolicies[result.policy])
+	case "generated-policy":
+		result.policy, result.doc = -1, propcheck.DrawPolicy(t)
+	case "group-policy":
+		result.policy = -1
+		result.doc, result.intent, result.appIntent = propcheck.DrawGroupPolicy(t, p.world)
+	case "packet-policy":
+		result.intent = propcheck.DrawPacketIntent(t, p.world)
+		result.policy, result.doc = -1, result.intent.Document(t)
+	case "packet-deny":
+		result.intent = &propcheck.PacketIntent{}
+		result.policy, result.doc = -1, result.intent.Document(t)
+	case "app-policy", "mixed-policy", "app-deny":
+		result.intent = &propcheck.PacketIntent{}
+
+		result.appIntent = &propcheck.AppIntent{}
+		if op != "app-deny" {
+			result.appIntent = propcheck.DrawAppIntent(t, p.world)
+		}
+
+		if op == "mixed-policy" {
+			result.intent = propcheck.DrawPacketIntent(t, p.world)
+		}
+
+		result.policy, result.doc = -1, result.appIntent.Document(t, result.intent)
+	case "ssh-policy", "ssh-deny", "ssh-mixed":
+		result.intent, result.appIntent = &propcheck.PacketIntent{}, &propcheck.AppIntent{}
+
+		result.sshIntent = &propcheck.SSHIntent{}
+		if op != "ssh-deny" {
+			result.sshIntent = propcheck.DrawSSHIntent(t, p.world)
+		}
+
+		if op == "ssh-mixed" {
+			result.intent = propcheck.DrawPacketIntent(t, p.world)
+			result.appIntent = propcheck.DrawAppIntent(t, p.world)
+		}
+
+		result.policy = -1
+		result.doc = result.sshIntent.AppendDocument(t, result.appIntent.Document(t, result.intent))
+	case "attrs-policy", "attrs-clear", "attrs-mixed":
+		result.intent = &propcheck.PacketIntent{}
+
+		result.attrIntent = &propcheck.NodeAttrIntent{}
+		if op != "attrs-clear" {
+			result.attrIntent = propcheck.DrawNodeAttrIntent(t, p.world)
+		}
+
+		result.policy, result.doc = -1, result.intent.Document(t)
+		if op == "attrs-mixed" {
+			result.intent = propcheck.DrawPacketIntent(t, p.world)
+			result.appIntent = propcheck.DrawAppIntent(t, p.world)
+			result.sshIntent = propcheck.DrawSSHIntent(t, p.world)
+			result.doc = result.sshIntent.AppendDocument(t, result.appIntent.Document(t, result.intent))
+		}
+
+		result.doc = result.attrIntent.AppendDocument(t, result.doc)
+	case "policy-order", "policy-duplicate":
+		doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
+		require.NoError(t, err)
+
+		result.intent = p.packetIntent
+
+		result.policy = p.policy
+		if p.appIntent == nil {
+			result.doc = propcheck.ReorderPolicy(t, doc, op == "policy-duplicate")
+		} else {
+			result.appIntent = p.appIntent.Reordered(op == "policy-duplicate")
+			// Serialize the transformed input; retain unrelated document fields,
+			// including any DERP overlay added since this intent was generated.
+			var previous, composed map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(doc, &previous))
+			require.NoError(t, json.Unmarshal(result.appIntent.Document(t, result.intent), &composed))
+			previous["grants"], previous["tagOwners"] = composed["grants"], composed["tagOwners"]
+			result.doc, err = json.Marshal(previous)
+			require.NoError(t, err)
+		}
+
+		if p.sshIntent != nil {
+			result.sshIntent = p.sshIntent.Reordered(op == "policy-duplicate")
+			result.doc = result.sshIntent.AppendDocument(t, result.doc)
+		}
+
+		if p.attrIntent != nil {
+			result.attrIntent = p.attrIntent.Reordered(op == "policy-duplicate")
+			result.doc = result.attrIntent.AppendDocument(t, result.doc)
+		}
+	case "policy-restore":
+		saved := p.policies[rapid.IntRange(0, len(p.policies)-1).Draw(t, "policy-ancestor")]
+		result.policy, result.doc, result.intent, result.appIntent = saved.kind, slices.Clone(saved.doc), saved.intent, saved.appIntent
+		result.sshIntent = saved.sshIntent
+		result.attrIntent = saved.attrIntent
+	case "user":
+		u := p.world.Users[rapid.IntRange(0, 2).Draw(t, "user")]
+
+		u.DisplayName = rapid.SampledFrom([]string{"", "Renamed", "Display ☃"}).Draw(t, "display-name")
+		u.ProfilePicURL = rapid.SampledFrom([]string{"", "https://example.test/avatar.png", "https://example.test/other.png"}).Draw(t, "profile-picture")
+
+		if u.Name == fmt.Sprintf("u%d", u.ID) {
+			u.Name += "-renamed"
+		} else {
+			u.Name = fmt.Sprintf("u%d", u.ID)
+		}
+
+		result.user = u
+	case "dns":
+		result.records = propcheck.DrawDNSRecords(t)
+	case "derp":
+		result.derp = propcheck.DrawDERPMap(t, false)
+	case "derp-noop":
+		result.derp = p.derpMap.Clone()
+	case "derp-restore":
+		result.derp = p.derpMaps[rapid.IntRange(0, len(p.derpMaps)-1).Draw(t, "DERP ancestor")].Clone()
+	case "derp-policy":
+		var policy map[string]json.RawMessage
+
+		doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(doc, &policy))
+		dm, err := json.Marshal(propcheck.DrawDERPMap(t, true))
+		require.NoError(t, err)
+
+		policy["derpMap"] = dm
+		result.doc, err = json.Marshal(policy)
+		require.NoError(t, err)
+
+		result.policy, result.intent, result.appIntent = p.policy, p.packetIntent, p.appIntent
+		result.sshIntent = p.sshIntent
+		result.attrIntent = p.attrIntent
+	case "add":
+		result.node = p.drawNode(t, p.lastNodeID+1)
+	case "request", "stale-request":
+		result.request = tailcfg.MapRequest{
+			NodeKey: n.NodeKey, DiscoKey: n.DiscoKey,
+			Endpoints: []netip.AddrPort{netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, rapid.ByteRange(1, 254).Draw(t, "request-ip")}), 41641)},
+		}
+		if rapid.Bool().Draw(t, "request-disco-clear") {
+			result.request.DiscoKey = key.DiscoPublic{}
+		}
+
+		if op == "stale-request" {
+			result.request.NodeKey = key.NodePublic{}
+		}
+	case "request-hostinfo", "request-collision", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "request-routes", "missing-request":
+		result.request = tailcfg.MapRequest{
+			NodeKey: n.NodeKey, DiscoKey: n.DiscoKey,
+			Endpoints: slices.Clone(n.Endpoints), Hostinfo: n.Hostinfo.Clone(),
+		}
+		hi := result.request.Hostinfo
+		// Direct graph inputs can leave Hostinfo.Hostname unlike Node.Hostname.
+		// Reports retain the node label unless this operation changes it.
+		hi.Hostname = n.Hostname
+
+		switch op {
+		case "request-hostinfo":
+			// Exercise per-ID labels alongside the explicit shared-name operation.
+			hi.Hostname = fmt.Sprintf("request-%d-%d", id, rapid.IntRange(0, 3).Draw(t, "request-name"))
+			hi.OS = rapid.SampledFrom([]string{"linux", "windows", "android", ""}).Draw(t, "request-os")
+
+			hi.Services = nil
+			if rapid.Bool().Draw(t, "request-service") {
+				hi.Services = []tailcfg.Service{{Proto: "tcp", Port: rapid.Uint16().Draw(t, "request-port")}}
+			}
+
+			hi.RequestTags = slices.Clone(rapid.SampledFrom([][]string{nil, {"tag:srv"}, {"tag:router", "tag:srv"}}).Draw(t, "requested-tags"))
+		case "request-collision":
+			holder := p.world.Nodes[rapid.SampledFrom(ids).Draw(t, "name-holder")]
+
+			names := []string{holder.GivenName, holder.Hostname, "laptop", "desktop", ""}
+			names = slices.DeleteFunc(names, func(name string) bool { return len(name) > 32 })
+
+			hi.Hostname = rapid.SampledFrom(names).Draw(t, "collision-name")
+			if rapid.Bool().Draw(t, "name-case") {
+				hi.Hostname = strings.ToUpper(hi.Hostname)
+			}
+		case "request-netinfo":
+			hi.NetInfo = &tailcfg.NetInfo{PreferredDERP: tailcfg.DERPRegionID(rapid.IntRange(0, 2).Draw(t, "request-derp"))}
+		case "request-omit-netinfo":
+			hi.NetInfo = nil
+		case "request-nil":
+			result.request.Hostinfo = nil
+		case "request-routes":
+			// This operation is selected only by histories without auto-approvers.
+			hi.RoutableIPs = slices.Clone(rapid.SampledFrom([][]netip.Prefix{
+				nil,
+				{netip.MustParsePrefix("10.0.0.0/24")},
+				{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("10.1.0.0/24")},
+			}).Draw(t, "request-routes"))
+		case "missing-request":
+			result.node.ID = maxStreamPropertyNodeID + 1
+		}
+	case "file-stage":
+		result.intent = propcheck.DrawPacketIntent(t, p.world)
+
+		result.policy, result.doc = -1, result.intent.Document(t)
+		if p.appIntent != nil {
+			result.appIntent = propcheck.DrawAppIntent(t, p.world)
+			result.doc = result.appIntent.Document(t, result.intent)
+		}
+
+		if p.sshIntent != nil {
+			result.sshIntent = propcheck.DrawSSHIntent(t, p.world)
+			result.doc = result.sshIntent.AppendDocument(t, result.doc)
+		}
+
+		if p.attrIntent != nil {
+			result.attrIntent = propcheck.DrawNodeAttrIntent(t, p.world)
+			result.doc = result.attrIntent.AppendDocument(t, result.doc)
+		}
+	case "file-reload":
+		result.policy, result.doc, result.intent, result.appIntent, result.reject = p.stagedPolicy.policy, slices.Clone(p.stagedPolicy.doc), p.stagedPolicy.intent, p.stagedPolicy.appIntent, p.stagedPolicy.reject
+		result.sshIntent = p.stagedPolicy.sshIntent
+		result.attrIntent = p.stagedPolicy.attrIntent
+	case "file-same", "file-comment":
+		result.policy, result.doc, result.intent, result.appIntent = p.policy, slices.Clone(p.policyDoc), p.packetIntent, p.appIntent
+
+		result.sshIntent = p.sshIntent
+
+		result.attrIntent = p.attrIntent
+		if op == "file-comment" {
+			doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
+			require.NoError(t, err)
+
+			result.doc = append([]byte("// equivalent policy document\n"), bytes.TrimSpace(doc)...)
+		}
+	case "file-empty", "file-missing":
+		result.reject = true
+	case "file-test-failure":
+		// A literal live witness cannot become vacuous after user renames.
+		result.doc = []byte(fmt.Sprintf(`{"grants":[],"tests":[{"src":%q,"proto":"tcp","accept":[%q]}]}`, p.world.Nodes[ids[0]].IPv4.String(), p.world.Nodes[ids[1]].IPv4.String()+":22"))
+		result.reject = true
+	case "delete", "noop", "invalid-policy":
+	}
+
+	return result
+}
+
+// apply is the production adapter. Each model transition uses the generated
+// values; only validated server timestamps are adopted from a response.
+func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
+	if p.control != nil {
+		require.NotContains(t, []string{"online", "keys", "identity", "delete", "add", "expiry"}, op.kind, "direct lifecycle edits cannot share the public-session ledger")
+	}
+
+	audits := state.PolicyAuditFailures()
+	before := p.state.Snapshot()
+	beforeDERP := p.effectiveDERP(t)
+
+	switch op.kind {
+	case "connect", "connect-request", "stale-connect", "zero-connect", "missing-connect", "disconnect":
+		p.inputControl(t, op)
+	case "public-expiry", "utc-expiry", "invalid-expiry", "missing-expiry":
+		p.inputExpiry(t, op)
+	case "policy", "generated-policy", "group-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "ssh-policy", "ssh-deny", "ssh-mixed", "attrs-policy", "attrs-clear", "attrs-mixed", "policy-order", "policy-duplicate", "policy-restore", "derp-policy", "file-stage", "file-reload", "file-same", "file-comment", "file-empty", "file-missing", "file-test-failure":
+		p.inputPolicy(t, op)
+	case "invalid-policy":
+		op.doc, op.reject = []byte(`{"grants":`), true
+		p.inputPolicy(t, op)
+	case "user":
+		users := slices.Clone(p.world.Users)
+		users[op.user.ID-1] = op.user
+		p.world.SetUsers(users)
+		_, err := p.state.UpdateUser(types.UserID(op.user.ID), func(u *types.User) error { *u = op.user; return nil })
+		require.NoError(t, err)
+	case "dns":
+		p.state.SetExtraRecords(op.records)
+		p.dnsRecords = propcheck.CanonicalDNSRecords(op.records)
+
+		wantRev := before.Rev()
+		if !slices.Equal(before.DNS().ExtraRecords().AsSlice(), p.dnsRecords) {
+			wantRev++
+		}
+
+		require.Equal(t, wantRev, p.state.Snapshot().Rev(), "DNS publication equivalence")
+	case "derp", "derp-noop", "derp-restore":
+		wantRev := before.Rev()
+		if !reflect.DeepEqual(p.derpMap, op.derp) {
+			wantRev++
+		}
+
+		p.state.SetDERPMap(op.derp)
+		p.derpMap = op.derp.Clone()
+		p.derpMaps = append(p.derpMaps, op.derp.Clone())
+		require.Equal(t, wantRev, p.state.Snapshot().Rev(), "configured DERP publication")
+	case "delete":
+		p.world.Delete(op.node.ID)
+		p.state.DeleteNodeFromStoreForTest(op.node.ID)
+		p.hub.forget(op.node.ID)
+		p.history.Forget(op.node.ID)
+
+		if session := p.sessions[op.node.ID]; session != nil {
+			_, err := session.stream.Update(p.state.Snapshot())
+			require.ErrorIs(t, err, ErrNodeGone)
+		}
+
+		delete(p.sessions, op.node.ID)
+	case "add":
+		p.create(t, op.node)
+		p.open(t, op.node.ID, p.state.Snapshot(), false)
+	case "stale-request":
+		require.ErrorIs(t, p.state.UpdateNodeFromMapRequest(op.node.ID, op.request), state.ErrNodeKeyChanged)
+		require.Equal(t, before.Rev(), p.state.Snapshot().Rev(), "refused key published")
+	case "missing-request":
+		require.ErrorIs(t, p.state.UpdateNodeFromMapRequest(op.node.ID, op.request), state.ErrNodeNotInNodeStore)
+		require.Equal(t, before.Rev(), p.state.Snapshot().Rev(), "missing node published")
+	case "request", "request-hostinfo", "request-collision", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "request-routes":
+		p.inputRequest(t, op)
+	default:
+		p.put(t, op.node)
+
+		if op.kind == "revert" {
+			p.put(t, op.before)
+		}
+
+		writes := uint64(1)
+		if op.kind == "revert" {
+			writes++
+		}
+
+		require.Equal(t, before.Rev()+writes, p.state.Snapshot().Rev(), "graph input publication")
+	}
+
+	p.checkWorld(t)
+	p.checkHistory(t)
+	require.Equal(t, audits, state.PolicyAuditFailures(), "policy audit after %s", op.kind)
+
+	after := p.state.Snapshot()
+	if strings.HasPrefix(op.kind, "derp") {
+		changed := !reflect.DeepEqual(beforeDERP, p.effectiveDERP(t))
+		// Per-node policies can wake all clients on any document edit.
+		if op.kind != "derp-policy" || changed {
+			require.Equal(t, changed, after.Since(before).Global, "effective DERP global wake")
+		}
+	}
+
+	p.checkCausal(t, before, after, op)
+}
+
+// streamRequestGivenName models short ASCII labels; all occupied names come from inputs.
+func streamRequestGivenName(world propcheck.World, node *types.Node, hostname string) string {
+	if hostname == "" || hostname == node.Hostname {
+		return node.GivenName
+	}
+
+	base := strings.ToLower(node.Hostname)
+	automatic := node.GivenName == base
+	// At most 255 node lifetimes can occupy a collision chain in this domain.
+	for suffix := 1; !automatic && suffix <= int(maxStreamPropertyNodeID); suffix++ {
+		automatic = node.GivenName == fmt.Sprintf("%s-%d", base, suffix)
+	}
+
+	if !automatic || strings.ToLower(hostname) == node.GivenName {
+		return node.GivenName
+	}
+
+	return world.Name(node.ID, strings.ToLower(hostname))
+}
+
+func TestStreamRequestGivenName(t *testing.T) {
+	world := propcheck.World{Nodes: map[types.NodeID]*types.Node{
+		1: {ID: 1, Hostname: "old", GivenName: "old-2"},
+		2: {ID: 2, GivenName: "Laptop", IsOnline: new(false)},
+		3: {ID: 3, GivenName: "LAPTOP-1", Tags: []string{"tag:srv"}, Expiry: new(propertyEpoch)},
+	}}
+
+	for _, tc := range []struct {
+		name, oldHost, given, reported, want string
+	}{
+		{"case-folded chain", "old", "old", "LAPTOP", "laptop-2"},
+		{"automatic suffix follows", "old", "old-2", "laptop", "laptop-2"},
+		{"self does not occupy", "old", "old-2", "old-2", "old-2"},
+		{"repeat keeps suffix", "old", "old-2", "old", "old-2"},
+		{"empty keeps suffix", "old", "old-2", "", "old-2"},
+		{"custom preserved", "old", "custom", "laptop", "custom"},
+		{"padded suffix custom", "old", "old-02", "laptop", "old-02"},
+		{"repeated hyphen custom", "old", "old--2", "laptop", "old--2"},
+		{"upper hostname automatic", "OLD", "old-2", "desktop", "desktop"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := world.Nodes[1].Clone()
+			node.Hostname, node.GivenName = tc.oldHost, tc.given
+			before := world.Clone()
+			require.Equal(t, tc.want, streamRequestGivenName(world, node, tc.reported))
+			require.Equal(t, before, world, "name reference owns no mutable output")
+		})
+	}
+}
+
+// expectRequest derives report semantics only from owned inputs.
+// Latency jitter, general hostname sanitation and policy auto-approval are outside it.
+func (p *streamPropertySystem) expectRequest(t *rapid.T, op streamOperation) (*types.Node, bool) {
+	n := op.before.Clone()
+	req := op.request
+
+	oldEndpoints := slices.SortedFunc(slices.Values(n.Endpoints), netip.AddrPort.Compare)
+	newEndpoints := slices.SortedFunc(slices.Values(req.Endpoints), netip.AddrPort.Compare)
+
+	changed := n.DiscoKey != req.DiscoKey
+	if req.Endpoints != nil && !slices.Equal(oldEndpoints, newEndpoints) {
+		n.Endpoints = slices.Clone(req.Endpoints)
+		changed = true
+	}
+
+	n.DiscoKey = req.DiscoKey
+
+	if req.Hostinfo != nil {
+		hi := req.Hostinfo.Clone()
+		if hi.NetInfo == nil {
+			hi.NetInfo = n.Hostinfo.NetInfo.Clone()
+		}
+
+		changed = changed || !reflect.DeepEqual(n.Hostinfo, hi)
+
+		n.GivenName = streamRequestGivenName(p.world, n, hi.Hostname)
+		if hi.Hostname != "" {
+			n.Hostname = hi.Hostname
+		}
+
+		if !slices.Equal(n.Hostinfo.RoutableIPs, hi.RoutableIPs) {
+			var policy map[string]json.RawMessage
+
+			doc, err := hujson.Standardize(slices.Clone(p.policyDoc))
+			require.NoError(t, err)
+			require.NoError(t, json.Unmarshal(doc, &policy))
+			require.NotContains(t, policy, "autoApprovers", "route request requires independently modeled approvals")
+
+			// Manual approval survives withdrawal; automatic approval requires advertisement.
+			n.ApprovedRoutes = n.ApprovedRoutes[:0]
+
+			n.AutoApprovedRoutes = n.AutoApprovedRoutes[:0]
+			for _, route := range op.before.ApprovedRoutes {
+				auto := slices.Contains(op.before.AutoApprovedRoutes, route)
+				if !auto || slices.Contains(hi.RoutableIPs, route) {
+					n.ApprovedRoutes = append(n.ApprovedRoutes, route)
+					if auto {
+						n.AutoApprovedRoutes = append(n.AutoApprovedRoutes, route)
+					}
+				}
+			}
+		}
+
+		n.Hostinfo = hi
+	}
+
+	if n.Unhealthy && len(propertyApproved(n)) == 0 {
+		n.Unhealthy = false
+	}
+
+	return n, changed
+}
+
+// inputRequest predicts the supported report domain before calling State.
+// Latency jitter, general hostname sanitation and policy auto-approval are outside it.
+func (p *streamPropertySystem) inputRequest(t *rapid.T, op streamOperation) {
+	before, oldWorld := p.state.Snapshot(), p.world.Clone()
+	n, changed := p.expectRequest(t, op)
+	req := op.request
+	req.Hostinfo, req.Endpoints = req.Hostinfo.Clone(), slices.Clone(req.Endpoints)
+
+	if changed {
+		p.reportSeq++
+		n.ReportGen = p.reportSeq
+	}
+
+	start := time.Now()
+
+	require.NoError(t, p.state.UpdateNodeFromMapRequest(n.ID, req))
+
+	end := time.Now()
+
+	require.Equal(t, op.request, req, "State mutated the submitted request")
+
+	got, ok := p.state.Snapshot().GetNode(n.ID)
+	require.True(t, ok)
+
+	seen := got.LastSeen().Clone()
+	require.NotNil(t, seen)
+	require.False(t, seen.Before(start), "LastSeen precedes request")
+	require.False(t, seen.After(end), "LastSeen follows request completion")
+	n.LastSeen = new(*seen)
+	p.world.Put(n)
+	require.Equal(t, before.Rev()+1, p.state.Snapshot().Rev(), "MapRequest always publishes LastSeen")
+
+	// Reusing caller-owned buffers must not change current or retained snapshots.
+	if req.Hostinfo != nil {
+		req.Hostinfo.Hostname = "mutated-after-request"
+		if req.Hostinfo.NetInfo != nil {
+			req.Hostinfo.NetInfo.PreferredDERP = 99
+		}
+
+		if len(req.Hostinfo.Services) > 0 {
+			req.Hostinfo.Services[0].Port++
+		}
+
+		if len(req.Hostinfo.RequestTags) > 0 {
+			req.Hostinfo.RequestTags[0] = "tag:mutated"
+		}
+
+		if len(req.Hostinfo.RoutableIPs) > 0 {
+			req.Hostinfo.RoutableIPs[0] = netip.MustParsePrefix("192.0.2.0/24")
+		}
+	}
+
+	if len(req.Endpoints) > 0 {
+		req.Endpoints[0] = netip.MustParseAddrPort("192.0.2.99:1")
+	}
+
+	propcheck.CheckWorld(t, oldWorld, before, p.probes)
+}
+
+func propertyApproved(n *types.Node) []netip.Prefix {
+	var routes []netip.Prefix
+
+	for _, prefix := range n.Hostinfo.RoutableIPs {
+		if slices.Contains(n.ApprovedRoutes, prefix) {
+			routes = append(routes, prefix)
+		}
+	}
+
+	return routes
+}
+
+// checkCausal checks one input's effect through render, diff, JSON and the
+// pinned client. It runs in focused histories and after each composed write,
+// independently of the aggregate's coalesced/partial delivery schedule.
+func (p *streamPropertySystem) checkCausal(t require.TestingT, before, after *state.Snapshot, op streamOperation) {
+	// Router removal can move another router's overlay; wider policies can
+	// change other peers' visibility. Those use the composed intent checks.
+	if op.kind == "delete" && (p.policy != 0 || len(propertyApproved(op.node)) != 0) {
+		return
+	}
+
+	switch op.kind {
+	case "endpoints", "hostinfo", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "stale-request", "missing-request", "invalid-policy", "delete":
+	default:
+		if !strings.HasPrefix(op.kind, "file-") || before.Rev() != after.Rev() && op.kind != "file-comment" {
+			return
+		}
+	}
+
+	for _, viewer := range before.ListNodes().All() {
+		if _, live := after.GetNode(viewer.ID()); !live {
+			continue
+		}
+
+		hub := NewHub()
+		stream := NewStream(p.cfg, hub, viewer.ID(), capVer)
+		initial, err := stream.Initial(before)
+		require.NoError(t, err)
+
+		expected, actual := newPropertyClient(&tailcfg.MapResponse{}), newPropertyClient(&tailcfg.MapResponse{})
+		applyStreamPropertyWire(t, hub, expected, initial)
+		applyStreamPropertyWire(t, hub, actual, initial)
+		stream.Delivered()
+		responses, err := stream.Update(after)
+		require.NoError(t, err)
+
+		if strings.HasPrefix(op.kind, "file-") || op.kind == "invalid-policy" {
+			require.Empty(t, responses, "staged, unchanged or refused file emitted a delta")
+		}
+
+		applyStreamPropertyWire(t, hub, actual, responses)
+
+		freshHub := NewHub()
+		full, err := NewStream(p.cfg, freshHub, viewer.ID(), capVer).Initial(after)
+		require.NoError(t, err)
+
+		fresh := newPropertyClient(&tailcfg.MapResponse{})
+		applyStreamPropertyWire(t, freshHub, fresh, full)
+		freshHub.Close()
+		actual.check(t, fresh)
+
+		switch op.kind {
+		case "endpoints":
+			if peer := expected.peers[op.node.ID.NodeID()]; peer != nil {
+				peer.Endpoints = slices.Clone(op.node.Endpoints)
+				if propertyExpired(op.node) {
+					peer.Endpoints = nil
+				}
+			}
+
+			if expected.self.ID == op.node.ID.NodeID() {
+				expected.self.Endpoints = slices.Clone(op.node.Endpoints)
+			}
+		case "hostinfo":
+			subject := actual.peers[op.node.ID.NodeID()]
+
+			self := actual.self.ID == op.node.ID.NodeID()
+			if self {
+				subject = actual.self
+			}
+
+			if subject != nil {
+				require.Equal(t, op.node.Hostinfo.Hostname, subject.Hostinfo.Hostname(), "reported hostname")
+				require.Equal(t, wireJSON(t, op.node.Hostinfo.Services), wireJSON(t, subject.Hostinfo.Services().AsSlice()), "reported TCP services")
+
+				if !self {
+					require.Equal(t, op.node.Hostinfo.OS, subject.Hostinfo.OS(), "reported peer OS")
+				}
+
+				home := op.node.Hostinfo.NetInfo.PreferredDERP
+				if !self && propertyExpired(op.node) {
+					home = 0
+				}
+
+				require.Equal(t, home, subject.HomeDERP, "reported home DERP")
+			}
+			// Hostinfo can change platform-dependent capabilities on self; peers
+			// and globals unrelated to this node must still remain unchanged.
+			if expected.self.ID == op.node.ID.NodeID() {
+				expected.self = actual.self
+			}
+
+			if expected.peers[op.node.ID.NodeID()] != nil {
+				expected.peers[op.node.ID.NodeID()] = actual.peers[op.node.ID.NodeID()]
+			}
+		case "dns":
+			require.True(t, slices.Equal(propcheck.CanonicalDNSRecords(op.records), actual.dns.ExtraRecords), "DNS input to canonical wire records")
+			expected.dns = expected.dns.Clone()
+			expected.dns.ExtraRecords = propcheck.CanonicalDNSRecords(op.records)
+		case "derp", "derp-policy", "derp-noop", "derp-restore":
+			expected.derp = streamDERPSemantic(p.effectiveDERP(t))
+			require.Equal(t, wireJSON(t, expected.derp), wireJSON(t, actual.derp), "effective DERP on wire")
+
+			if reflect.DeepEqual(before.DERPMap(), after.DERPMap()) {
+				for _, response := range responses {
+					require.Nil(t, response.DERPMap, "equal effective DERP emitted a delta")
+				}
+			}
+		case "delete":
+			delete(expected.peers, op.node.ID.NodeID())
+			delete(expected.deltaPeers, op.node.ID.NodeID())
+			// Policy-derived filters/profiles/DNS can legitimately change on removal.
+			expected.filter, expected.ssh, expected.dns = actual.filter, actual.ssh, actual.dns
+			expected.self, expected.profiles = actual.self, actual.profiles
+		}
+
+		actual.check(t, expected)
+
+		quiet, err := stream.Update(after)
+		require.NoError(t, err)
+		require.Empty(t, quiet, "same snapshot quiet after %s", op.kind)
+		hub.Close()
+	}
+}
+
+// TestRapidStreamSystem checks the entire world/policy/Route/render/diff/wire
+// path. Only Route's viewers receive updates; every other active viewer must
+// already equal an independent fresh stream. Rapid's default case and step
+// budgets bound CI work; -rapid.checks, -rapid.steps and -rapid.seed drive campaigns.
+func TestRapidStreamSystem(t *testing.T) {
+	runRapidStreamSystem(t, types.PolicyModeDB)
+}
+
+func TestRapidStreamPacketIntent(t *testing.T) {
+	runRapidStreamSystem(t, types.PolicyModeDB, "packet-policy", "packet-deny", "policy-order", "policy-duplicate", "policy-restore", "identity", "user", "noop")
+}
+
+func TestRapidStreamPolicyFiles(t *testing.T) {
+	runRapidStreamSystem(t, types.PolicyModeFile, "packet-policy", "packet-deny", "policy-order", "policy-duplicate", "policy-restore", "file-stage", "file-reload", "file-same", "file-comment", "invalid-policy", "file-empty", "file-missing", "file-test-failure", "identity", "user", "endpoints", "noop")
+}
+
+func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) {
+	t.Helper()
+
+	initial := "packet-policy"
+	mandatory := []string{"policy-order", "policy-duplicate", "packet-deny", "policy-restore", "packet-policy", "identity"}
+
+	for _, family := range []struct {
+		kind       string
+		operations []string
+	}{
+		{"app-policy", []string{"app-deny", "policy-restore", "mixed-policy", "app-policy", "identity", "policy-order", "policy-duplicate"}},
+		{"ssh-policy", []string{"ssh-deny", "policy-restore", "ssh-policy", "identity", "policy-order", "policy-duplicate", "ssh-mixed"}},
+		{"attrs-policy", []string{"attrs-clear", "policy-restore", "attrs-policy", "identity", "policy-order", "policy-duplicate", "attrs-mixed"}},
+		{"connect", []string{"connect", "connect-request", "public-expiry", "disconnect", "stale-connect", "zero-connect", "missing-connect", "invalid-expiry", "utc-expiry", "missing-expiry"}},
+	} {
+		if slices.Contains(kinds, family.kind) {
+			initial, mandatory = family.kind, family.operations
+		}
+	}
+
+	control := slices.Contains(kinds, "connect")
+
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+	rapid.Check(t, func(t *rapid.T) {
+		operations := kinds
+		audits := state.PolicyAuditFailures()
+
+		p := newStreamPropertySystem(t, mode)
+
+		if control {
+			p.enableControl(t)
+		}
+
+		if len(kinds) > 0 {
+			if control {
+				p.setPolicy(t, 0)
+			} else {
+				p.apply(t, p.drawOperation(t, initial))
+			}
+
+			if mode != types.PolicyModeFile {
+				p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: p.policy, intent: p.packetIntent, appIntent: p.appIntent, sshIntent: p.sshIntent, attrIntent: p.attrIntent}}
+			}
+
+			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+				p.update(t, id, p.state.Snapshot(), 0)
+			}
+		}
+
+		last := p.state.Snapshot()
+		p.check(t, last)
+		commit := func(t *rapid.T, required *streamOperation) {
+			last = p.commit(t, last, operations, required)
+		}
+
+		if len(kinds) > 0 {
+			if mode == types.PolicyModeFile {
+				for _, operation := range []string{"file-stage", "file-reload", "file-same", "file-comment", "invalid-policy", "file-empty", "file-missing", "file-reload", "policy-restore", "file-test-failure", "policy-restore"} {
+					operations = []string{operation}
+
+					commit(t, nil)
+				}
+			}
+
+			for _, operation := range mandatory {
+				operations = []string{operation}
+
+				commit(t, nil)
+			}
+
+			if control && slices.Contains(kinds, "attrs-clear") {
+				p.mixedControlHistory(t, commit, slices.Contains(kinds, "attrs-mixed"))
+			}
+
+			operations = kinds
+
+			for range rapid.IntRange(1, 8).Draw(t, "packet commits") {
+				commit(t, nil)
+			}
+		} else {
+			t.Repeat(map[string]func(*rapid.T){"commit": func(t *rapid.T) { commit(t, nil) }})
+		}
+
+		p.releaseControls(t, last)
+
+		for id, leases := range p.control {
+			require.Empty(t, leases, "unreleased control leases for node %d", id)
+			require.Zero(t, p.world.Nodes[id].ActiveSessions)
+		}
+
+		for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+			if p.sessions[id].down {
+				p.open(t, id, p.state.Snapshot(), false)
+			}
+		}
+
+		p.check(t, p.state.Snapshot())
+		require.Equal(t, audits, state.PolicyAuditFailures(), "incremental policy disagreed with full compile")
+	})
+}
+
+// Guard the reusable replay model's two less common patch fields without
+// claiming the system generator can create a node's KeySignature in State.
+func TestRapidStreamModelPatchFields(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		capability := tailcfg.CapabilityVersion(rapid.IntRange(1, 200).Draw(t, "cap"))
+		signature := rapid.SliceOfN(rapid.Byte(), 1, 64).Draw(t, "signature")
+		client := newPropertyClient(&tailcfg.MapResponse{Peers: []*tailcfg.Node{{ID: 2}}})
+		applyStreamPropertyWire(t, nil, client, []*tailcfg.MapResponse{{PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 2, Cap: capability, KeySignature: signature}}}})
+		require.Equal(t, capability, client.peers[2].Cap)
+		require.True(t, slices.Equal(signature, client.peers[2].KeySignature))
+	})
+}
+
+// The route oracle needs no policy compiler: with two approved routers and
+// exactly one healthy online router, that router must carry the subnet. Run
+// both ordinary grants and via grants, then withdraw and restore approvals.
+func TestRapidStreamRouteFailover(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t)
+		last := p.state.Snapshot()
+		route := netip.MustParsePrefix("10.0.0.0/24")
+
+		via := ""
+		if rapid.Bool().Draw(t, "via") {
+			via = `,"via":["tag:a"]`
+		}
+
+		_, err := p.state.SetPolicy([]byte(`{"tagOwners":{"tag:a":["u1@"]},"grants":[{"src":["u1@"],"dst":["10.0.0.0/24"],"ip":["*"]` + via + `}]}`))
+		require.NoError(t, err)
+
+		p.policy = 3 // This property's route oracle replaces the simple-policy oracle.
+		p.policyDoc = []byte(`{"tagOwners":{"tag:a":["u1@"]},"grants":[{"src":["u1@"],"dst":["10.0.0.0/24"],"ip":["*"]` + via + `}]}`)
+		p.viaOnly = via != ""
+		winner := rapid.SampledFrom([]types.NodeID{2, 3}).Draw(t, "healthy-router")
+
+		for _, id := range []types.NodeID{2, 3} {
+			router := p.world.Nodes[id].Clone()
+			router.Tags = []string{"tag:a"}
+			router.Hostinfo.RoutableIPs = []netip.Prefix{route}
+			router.ApprovedRoutes = []netip.Prefix{route}
+			router.ActiveSessions, router.IsOnline = 1, new(true)
+			router.Unhealthy = id != winner
+			router.SessionStart = time.Unix(1_700_000_000+int64(id), 0).UTC() //nolint:gosec // Router IDs are 2 and 3.
+			p.put(t, router)
+		}
+
+		for phase := range 4 {
+			if phase == 1 {
+				winner = 5 - winner
+			}
+
+			if phase > 0 {
+				for _, id := range []types.NodeID{2, 3} {
+					router := p.world.Nodes[id].Clone()
+					router.Unhealthy = id != winner
+
+					router.ApprovedRoutes = []netip.Prefix{route}
+					if phase == 2 {
+						router.ApprovedRoutes = nil
+					}
+
+					p.put(t, router)
+				}
+			}
+
+			snap := p.state.Snapshot()
+			all, wake := Route(last, snap, snap.Since(last))
+			p.hub.advance(snap)
+
+			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+				if _, named := wake[id]; all || named {
+					p.update(t, id, snap, 0)
+				}
+			}
+
+			p.check(t, snap)
+
+			for _, id := range []types.NodeID{2, 3} {
+				peer := p.sessions[1].client.peers[id.NodeID()]
+
+				winners := p.routes.Global
+				if p.viaOnly {
+					winners = p.routes.Via["tag:a"]
+				}
+
+				want := winners[route] == uint64(id)
+				require.Equal(t, want, phase != 2 && id == winner, "election oracle and directed scenario agree")
+
+				if want {
+					require.NotNil(t, peer, "healthy router must be visible")
+				}
+
+				if peer != nil {
+					require.Equal(t, want, slices.Contains(peer.AllowedIPs, route), "phase %d router %d", phase, id)
+					require.Equal(t, want, slices.Contains(peer.PrimaryRoutes, route), "phase %d router %d", phase, id)
+				}
+			}
+
+			last = snap
+		}
+	})
+}
+
+// Visibility changes must revoke peers through deltas as well as full maps;
+// reconnecting clients retain profiles, but never learn a hidden owner.
+func TestRapidStreamVisibilityTransitions(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t)
+
+		last := p.state.Snapshot()
+		for _, policy := range []int{0, 1, 0, 2} {
+			p.setPolicy(t, policy)
+			snap := p.state.Snapshot()
+			all, wake := Route(last, snap, snap.Since(last))
+			p.hub.advance(snap)
+
+			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+				if _, named := wake[id]; all || named {
+					p.update(t, id, snap, 0)
+				}
+			}
+
+			p.check(t, snap)
+			id := rapid.SampledFrom(slices.Sorted(maps.Keys(p.sessions))).Draw(t, "reconnecting-viewer")
+			p.open(t, id, snap, false)
+			p.check(t, snap)
+			last = snap
+		}
+	})
+}
+
+// Focused callers draw subsets of the same operations and invoke the same
+// world, election, causal-delta and replay assertions as the composed driver.
+func TestRapidStreamOperationContracts(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+
+	for _, kinds := range [][]string{
+		{"endpoints", "hostinfo", "dns", "derp", "noop", "revert"},
+		{"derp", "derp-policy", "derp-noop", "derp-restore", "policy-restore"},
+		{"request", "stale-request", "invalid-policy"},
+		{"request-hostinfo", "request-collision", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request"},
+		{"generated-policy", "policy-order", "policy-duplicate", "policy-restore"},
+	} {
+		t.Run(kinds[0], func(t *testing.T) {
+			rapid.Check(t, func(t *rapid.T) {
+				audits := state.PolicyAuditFailures()
+				p := newStreamPropertySystem(t)
+
+				last := p.state.Snapshot()
+				for range rapid.IntRange(1, 12).Draw(t, "operations") {
+					p.apply(t, p.drawOperation(t, kinds...))
+					snap := p.state.Snapshot()
+					all, wake := Route(last, snap, snap.Since(last))
+					p.hub.advance(snap)
+
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if _, named := wake[id]; all || named {
+							p.update(t, id, snap, 0)
+						}
+					}
+
+					p.check(t, snap)
+					last = snap
+				}
+
+				require.Equal(t, audits, state.PolicyAuditFailures(), "incremental policy audit")
+			})
+		})
+	}
+}
+
+func TestRapidStreamSimplePolicyEdits(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t)
+		kind := rapid.IntRange(0, 2).Draw(t, "simple-policy")
+		p.setPolicy(t, kind)
+
+		p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: kind}}
+		for _, operation := range []string{"policy-order", "policy-duplicate", "policy-restore"} {
+			op := p.drawOperation(t, operation)
+			require.Equal(t, kind, op.policy, "simple intent survives %s", operation)
+			p.apply(t, op)
+			require.Equal(t, kind, p.policy)
+
+			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+				p.update(t, id, p.state.Snapshot(), 0)
+			}
+		}
+	})
+}
+
+// Persistent IDs identify one lifetime. Deletion never makes an ID available
+// for another node, and the byte-based fixture stops allocating at 255.
+func TestRapidStreamFreshNodeIDs(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t)
+		if len(p.world.Nodes) == 3 {
+			p.apply(t, p.drawOperation(t, "add"))
+		}
+
+		for range rapid.IntRange(1, 8).Draw(t, "lifetimes") {
+			removed := p.drawOperation(t, "delete")
+			previousID := p.lastNodeID
+			p.apply(t, removed)
+			added := p.drawOperation(t, "add")
+			require.Equal(t, previousID+1, added.node.ID)
+			require.NotEqual(t, removed.node.ID, added.node.ID)
+			p.apply(t, added)
+			require.Contains(t, p.probes.IDs, removed.node.ID, "deleted IDs remain world/history probes")
+			require.Contains(t, p.probes.IDs, added.node.ID)
+			require.GreaterOrEqual(t, len(p.world.Nodes), 3)
+			require.LessOrEqual(t, len(p.world.Nodes), 8)
+		}
+
+		if len(p.world.Nodes) == 8 {
+			p.apply(t, p.drawOperation(t, "delete"))
+		}
+
+		p.lastNodeID = maxStreamPropertyNodeID - 1
+		last := p.drawOperation(t, "add")
+		require.Equal(t, maxStreamPropertyNodeID, last.node.ID)
+		require.Equal(t, netip.MustParseAddr("100.64.0.255"), *last.node.IPv4)
+		p.apply(t, last)
+		// Keep room in the live fleet so the exhausted-ID guard is exercised.
+		p.apply(t, p.drawOperation(t, "delete"))
+
+		for range 20 {
+			require.NotEqual(t, "add", p.drawOperation(t).kind)
+		}
+	})
+}
+
+// TestStreamRouteOverlaySurvivesStaleCacheAndMembership is an intentionally
+// failing diagnostic: rendering a retained snapshot must not make a later
+// membership change discard an unrelated router's routes.
+func TestStreamRouteOverlaySurvivesStaleCacheAndMembership(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	viewer, removed, routerID := ids[0], ids[1], ids[2]
+	route := netip.MustParsePrefix("10.0.0.0/24")
+	router := mustNode(t, s, routerID).AsStruct()
+	router.Tags = []string{"tag:a"}
+	router.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+	router.ApprovedRoutes = []netip.Prefix{route}
+	s.PutNodeInStoreForTest(*router)
+	s.Connect(routerID)
+
+	hub := NewHub()
+	t.Cleanup(hub.Close)
+	stream := NewStream(cfg, hub, viewer, capVer)
+	old := s.Snapshot()
+	_, err := stream.Initial(old)
+	require.NoError(t, err)
+	stream.Delivered()
+
+	checkRoute := func() {
+		t.Helper()
+
+		peer, ok := stream.sent.peer(routerID.NodeID())
+		require.True(t, ok)
+		require.Contains(t, peer.AllowedIPs, route)
+		require.Contains(t, peer.PrimaryRoutes, route)
+	}
+	checkRoute()
+
+	updateViewer := func(port uint16) {
+		n := mustNode(t, s, viewer).AsStruct()
+		n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), port)}
+		s.PutNodeInStoreForTest(*n)
+		_, err := stream.Update(s.Snapshot())
+		require.NoError(t, err)
+		stream.Delivered()
+	}
+	updateViewer(1)
+	checkRoute()
+
+	// A delayed renderer can still render a snapshot captured before the
+	// endpoint update, sharing the current session's peer-render cache.
+	_, err = NewStream(cfg, hub, viewer, capVer).r.render(old)
+	require.NoError(t, err)
+
+	s.DeleteNodeFromStoreForTest(removed)
+	_, err = stream.Update(s.Snapshot())
+	require.NoError(t, err)
+	stream.Delivered()
+	checkRoute()
+
+	updateViewer(2)
+
+	freshHub := NewHub()
+	t.Cleanup(freshHub.Close)
+	fresh, err := NewStream(cfg, freshHub, viewer, capVer).Initial(s.Snapshot())
+	require.NoError(t, err)
+	require.Contains(t, peerSet(fresh[0]), routerID.NodeID())
+
+	for _, peer := range fresh[0].Peers {
+		if peer.ID == routerID.NodeID() {
+			require.Contains(t, peer.AllowedIPs, route, "fresh renderer still serves the route")
+		}
+	}
+
+	checkRoute()
+}
+
+// Complete configured maps can clear scores on reload. JSON omitempty must not
+// turn that clear into the pinned client's "keep the previous scores" update.
+func TestStreamDERPScoreClearConverges(t *testing.T) {
+	for _, reset := range []struct {
+		name string
+		home *tailcfg.DERPHomeParams
+	}{
+		{"home-parameters", nil},
+		{"empty-scores", &tailcfg.DERPHomeParams{RegionScore: map[tailcfg.DERPRegionID]float64{}}},
+	} {
+		t.Run(reset.name, func(t *testing.T) {
+			cfg, s, ids := streamTestState(t, "")
+			base := &tailcfg.DERPMap{
+				Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: {
+					RegionID: 1, Nodes: []*tailcfg.DERPNode{{Name: "1a", RegionID: 1, HostName: "derp.example.com"}},
+				}},
+				HomeParams: &tailcfg.DERPHomeParams{RegionScore: map[tailcfg.DERPRegionID]float64{1: 2}},
+			}
+			s.SetDERPMap(base)
+
+			hub := NewHub()
+			defer hub.Close()
+
+			stream := NewStream(cfg, hub, ids[0], capVer)
+			initial, err := stream.Initial(s.Snapshot())
+			require.NoError(t, err)
+
+			client := newPropertyClient(&tailcfg.MapResponse{})
+			for _, response := range initial {
+				client.apply(wireRoundTrip(t, hub, response, false))
+			}
+
+			stream.Delivered()
+
+			before := s.Snapshot()
+			next := base.Clone()
+			next.HomeParams = reset.home
+			s.SetDERPMap(next)
+			after := s.Snapshot()
+			require.Equal(t, propcheck.EffectiveDERP(next, nil), after.DERPMap())
+			all, _ := Route(before, after, after.Since(before))
+			require.True(t, all, "configured score clear must wake clients")
+
+			responses, err := stream.Update(after)
+			require.NoError(t, err)
+			require.NotEmpty(t, responses)
+
+			for _, response := range responses {
+				wireRoundTrip(t, hub, response, false)
+				client.apply(wireRoundTrip(t, hub, response, true))
+			}
+
+			require.Equal(t, wireJSON(t, streamDERPSemantic(propcheck.EffectiveDERP(next, nil))), wireJSON(t, streamDERPSemantic(client.derp)), "client retained cleared DERP scores")
+		})
+	}
+}
+
+func TestRapidStreamDERPMaskedPublication(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t)
+		p.setPolicy(t, 2)
+		unchanged := p.effectiveDERP(t)
+		p.apply(t, streamOperation{
+			kind: "derp-policy", policy: 2,
+			doc: []byte(`{"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}],"derpMap":null}`),
+		})
+		require.Equal(t, unchanged, p.effectiveDERP(t))
+		p.setPolicy(t, 0)
+		base := p.derpMap.Clone()
+		custom := base.Regions[1].Clone()
+		custom.RegionID, custom.Nodes[0].RegionID = 900, 900
+		policy := &tailcfg.DERPMap{
+			OmitDefaultRegions: true,
+			Regions:            map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{900: custom},
+			HomeParams:         &tailcfg.DERPHomeParams{RegionScore: map[tailcfg.DERPRegionID]float64{900: 2}},
+		}
+		doc, err := json.Marshal(map[string]any{"derpMap": policy})
+		require.NoError(t, err)
+		p.apply(t, streamOperation{kind: "derp-policy", doc: doc, policy: 0})
+		old, want := p.state.Snapshot(), p.effectiveDERP(t)
+		base.Regions[1].RegionName = "masked configured change"
+		p.apply(t, streamOperation{kind: "derp", derp: base})
+		require.Greater(t, p.state.Snapshot().Rev(), old.Rev())
+		require.False(t, p.state.Snapshot().Since(old).Global)
+		p.apply(t, streamOperation{kind: "derp-noop", derp: base.Clone()})
+		p.apply(t, streamOperation{kind: "derp-policy", doc: []byte(`{"derpMap":{"Regions":{"1":null}}}`), policy: 0})
+		p.apply(t, streamOperation{kind: "derp-policy", doc: []byte(`{}`), policy: 0})
+		p.apply(t, streamOperation{kind: "derp-restore", derp: p.derpMaps[0].Clone()})
+		require.Equal(t, want, old.DERPMap(), "old effective snapshot survives base and policy changes")
+	})
+}
+
+// Expiry suppresses a peer's connectivity fields, but not the node's own view.
+func TestStreamCausalExpiredConnectivity(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		t.Run(fmt.Sprintf("expired=%t", expired), func(t *testing.T) {
+			cfg, s, ids := streamTestState(t, "")
+			p := &streamPropertySystem{cfg: cfg}
+			view, ok := s.Snapshot().GetNode(ids[0])
+			require.True(t, ok)
+
+			node := view.AsStruct()
+			node.Hostinfo = &tailcfg.Hostinfo{Hostname: "connectivity", OS: "linux", NetInfo: &tailcfg.NetInfo{PreferredDERP: 1}}
+
+			node.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")}
+			if expired {
+				node.Expiry = new(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
+			}
+
+			s.PutNodeInStoreForTest(*node.Clone())
+
+			for _, kind := range []string{"endpoints", "hostinfo"} {
+				before := s.Snapshot()
+
+				op := streamOperation{kind: kind, before: node.Clone()}
+				if kind == "endpoints" {
+					node.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.2:41642")}
+				} else {
+					node.Hostinfo.NetInfo.PreferredDERP = 2
+					node.Hostinfo.Hostname = "changed-connectivity"
+				}
+
+				op.node = node.Clone()
+				s.PutNodeInStoreForTest(*node.Clone())
+				// checkCausal visits every viewer, including this node itself.
+				p.checkCausal(t, before, s.Snapshot(), op)
+			}
+		})
+	}
+}
+
+// An app grant to a public prefix makes an exit see its source without
+// granting the source exit traffic, so routing cannot assume symmetric peers.
+func TestRouteWakesExitForCapabilitySource(t *testing.T) {
+	cfg, s, ids := streamTestState(t, `{"grants":[{"src":["u1@"],"dst":["8.8.8.0/24"],"app":{"example.com/cap":[]}}]}`)
+	source, exit := ids[0], ids[2]
+	s.DeleteNodeFromStoreForTest(ids[1])
+
+	router := mustNode(t, s, exit).AsStruct()
+	router.ApprovedRoutes = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")}
+	router.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: slices.Clone(router.ApprovedRoutes)}
+	s.PutNodeInStoreForTest(*router)
+
+	before := s.Snapshot()
+	require.Equal(t, []types.NodeID{source}, before.ListPeerIDs(exit))
+	require.NotContains(t, before.ListPeerIDs(source), exit, "capabilities alone do not grant exit traffic")
+
+	hub := NewHub()
+	t.Cleanup(hub.Close)
+	stream := NewStream(cfg, hub, exit, capVer)
+	initial, err := stream.Initial(before)
+	require.NoError(t, err)
+
+	client := newPropertyClient(&tailcfg.MapResponse{})
+	applyStreamPropertyWire(t, hub, client, initial)
+	stream.Delivered()
+
+	endpoints := []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")}
+	require.NoError(t, s.UpdateNodeFromMapRequest(source, tailcfg.MapRequest{
+		NodeKey: mustNode(t, s, source).NodeKey(), Endpoints: endpoints,
+	}))
+	after := s.Snapshot()
+	all, wake := Route(before, after, after.Since(before))
+	_, named := wake[exit]
+	assert.True(t, all || named, "the exit must learn its capability source changed")
+
+	if all || named {
+		responses, err := stream.Update(after)
+		require.NoError(t, err)
+		applyStreamPropertyWire(t, hub, client, responses)
+	}
+
+	require.Equal(t, endpoints, client.peers[source.NodeID()].Endpoints, "exit retained stale source endpoints")
+}
+
+// Check input contracts even when fresh and incremental renders agree on the
+// same wrong output. The fixture's base domain is fixed at construction.
+// identityAddresses is true for simple policies and documents with owned intent.
+func checkStreamNodeInputs(t require.TestingT, world propcheck.World, viewer types.NodeID, client *propertyClient, baseDomain string, identityAddresses bool, attrs *propcheck.NodeAttrIntent) {
+	require.NotNil(t, client.self, "viewer %d self", viewer)
+	require.Equal(t, viewer.NodeID(), client.self.ID, "self identity")
+	checkStreamRequestHostinfo(t, world, client)
+
+	if identityAddresses && attrs == nil {
+		// These callers own a simple or packet document with no node attributes.
+		attrs = &propcheck.NodeAttrIntent{}
+	}
+
+	// Clients retain historical profiles; only current owners require current values.
+	checkProfile := func(want tailcfg.UserProfile) {
+		got, ok := client.profiles[want.ID]
+		require.True(t, ok, "viewer %d requires profile %d", viewer, want.ID)
+		require.Equal(t, want.ID, got.ID, "profile ID from owned input")
+		require.Equal(t, want.LoginName, got.LoginName, "profile %d LoginName from owned input", want.ID)
+		require.Equal(t, want.DisplayName, got.DisplayName, "profile %d DisplayName from owned input", want.ID)
+		require.Equal(t, want.ProfilePicURL, got.ProfilePicURL, "profile %d ProfilePicURL from owned input", want.ID)
+		require.Empty(t, got.Groups, "profile %d has no input groups", want.ID)
+	}
+
+	nodes := make([]*tailcfg.Node, 1, 1+len(client.peers))
+	nodes[0] = client.self
+
+	for _, id := range slices.Sorted(maps.Keys(client.peers)) {
+		peer := client.peers[id]
+		require.NotNil(t, peer, "peer %d", id)
+		require.Equal(t, id, peer.ID, "peer map identity")
+		require.NotEqual(t, viewer.NodeID(), id, "self must not appear as a peer")
+
+		nodes = append(nodes, peer)
+	}
+
+	for _, wire := range nodes {
+		input := world.Nodes[types.NodeID(wire.ID)] //nolint:gosec // Fixture node IDs are 1..255.
+		require.NotNil(t, input, "viewer %d: unexpected node %d", viewer, wire.ID)
+		require.Equal(t, input.ID.NodeID(), wire.ID, "node ID")
+		require.Equal(t, tailcfg.StableNodeID(strconv.FormatUint(uint64(input.ID), 10)), wire.StableID, "node %d stable ID", input.ID)
+
+		name := input.GivenName
+		if baseDomain != "" {
+			name += "." + baseDomain + "."
+		}
+
+		require.Equal(t, name, wire.Name, "node %d name from owned input", input.ID)
+		require.Equal(t, input.NodeKey, wire.Key, "node %d key", input.ID)
+		require.Equal(t, input.DiscoKey, wire.DiscoKey, "node %d discovery key", input.ID)
+		require.True(t, slices.Equal([]string(input.Tags), wire.Tags), "node %d tags", input.ID)
+		require.True(t, input.CreatedAt.Equal(wire.Created), "node %d Created: want %s, got %s", input.ID, input.CreatedAt, wire.Created)
+
+		var owner tailcfg.UserID
+		if len(input.Tags) > 0 {
+			owner = tailcfg.UserID(types.TaggedDevicesUserID)
+			if input.ID == viewer {
+				owner += 1 + tailcfg.UserID(input.ID) //nolint:gosec // Fixture node IDs are 1..255.
+			}
+		} else if input.UserID != nil {
+			owner = tailcfg.UserID(*input.UserID) //nolint:gosec // Fixture user IDs fit int64.
+		}
+
+		require.Equal(t, owner, wire.User, "node %d ownership", input.ID)
+
+		if len(input.Tags) > 0 {
+			checkProfile(tailcfg.UserProfile{ID: 2147455555, LoginName: "tagged-devices", DisplayName: "Tagged Devices"})
+
+			if input.ID == viewer {
+				checkProfile(tailcfg.UserProfile{ID: owner, LoginName: strings.TrimSuffix(name, "."), DisplayName: input.GivenName})
+			}
+		} else if owner != 0 {
+			index := slices.IndexFunc(world.Users, func(user types.User) bool {
+				return uint64(user.ID) == uint64(owner) //nolint:gosec // Fixture user IDs fit int64.
+			})
+			require.NotEqual(t, -1, index, "node %d owner %d must exist in owned users", input.ID, owner)
+
+			user := world.Users[index]
+			login := cmp.Or(user.Email, user.Name, user.ProviderIdentifier.String, strconv.FormatUint(uint64(user.ID), 10))
+			checkProfile(tailcfg.UserProfile{ID: owner, LoginName: login, DisplayName: cmp.Or(user.DisplayName, login), ProfilePicURL: user.ProfilePicURL})
+		}
+
+		if input.ID == viewer {
+			require.True(t, wire.MachineAuthorized, "self authorized")
+			require.False(t, wire.Expired, "self expiry override")
+			require.Zero(t, wire.Cap, "self capability version override")
+			require.Nil(t, wire.Online, "self online override")
+			require.Nil(t, wire.LastSeen, "self last-seen override")
+		}
+
+		propcheck.CheckNodeAttrIntent(t, world, attrs, input.ID, wire.CapMap, input.ID == viewer)
+
+		if identityAddresses {
+			ownCaps, viewerCaps := attrs.Capabilities(world, input.ID), attrs.Capabilities(world, viewer)
+			_, ownDisabled := ownCaps["disable-ipv4"]
+			_, viewerDisabled := viewerCaps["disable-ipv4"]
+			disabled := ownDisabled || (input.ID != viewer && viewerDisabled)
+
+			var addresses []netip.Prefix
+
+			for _, ip := range []*netip.Addr{input.IPv4, input.IPv6} {
+				if ip != nil && (!disabled || !ip.Is4()) {
+					addresses = append(addresses, netip.PrefixFrom(*ip, ip.BitLen()))
+				}
+			}
+
+			require.ElementsMatch(t, addresses, wire.Addresses, "node %d own addresses", input.ID)
+
+			if disabled && input.IPv4 != nil {
+				require.NotContains(t, wire.AllowedIPs, netip.PrefixFrom(*input.IPv4, 32), "node %d disabled IPv4 identity", input.ID)
+			}
+
+			for _, prefix := range addresses {
+				require.Contains(t, wire.AllowedIPs, prefix, "node %d own identity in AllowedIPs", input.ID)
+			}
+		}
+	}
+}
+
+// Literal wire examples keep the shared checker independent of TailNode,
+// GetFQDN, ownership helpers and the fresh-render comparison.
+func TestStreamNodeInputContracts(t *testing.T) {
+	userKey := key.NodePublicFromRaw32(mem.B([]byte("01234567890123456789012345678901")))
+	tagKey := key.NodePublicFromRaw32(mem.B([]byte("12345678901234567890123456789012")))
+	userDisco := key.DiscoPublicFromRaw32(mem.B([]byte("23456789012345678901234567890123")))
+	tagDisco := key.DiscoPublicFromRaw32(mem.B([]byte("34567890123456789012345678901234")))
+	created := time.Date(2026, time.November, 15, 12, 30, 0, 0, time.FixedZone("fixture", 3600))
+	world := propcheck.World{Nodes: map[types.NodeID]*types.Node{
+		7: {
+			ID: 7, GivenName: "laptop", Hostname: "not-the-given-name", UserID: new(uint(41)),
+			NodeKey: userKey, DiscoKey: userDisco, CreatedAt: created,
+			IPv4:     new(netip.MustParseAddr("100.64.0.7")),
+			IsOnline: new(true), LastSeen: new(created), Expiry: new(time.Unix(1, 0)),
+		},
+		9: {
+			ID: 9, GivenName: "router", Hostname: "also-not-the-given-name", UserID: new(uint(41)),
+			Tags: []string{"tag:srv"}, NodeKey: tagKey, DiscoKey: tagDisco, CreatedAt: created,
+			IPv6:     new(netip.MustParseAddr("fd7a:115c:a1e0::9")),
+			IsOnline: new(false), LastSeen: new(created), Expiry: new(time.Unix(1, 0)),
+		},
+	}}
+
+	for _, tt := range []struct {
+		name, domain, userName, tagName, tagLogin string
+	}{
+		{"fqdn", "example.test", "laptop.example.test.", "router.example.test.", "router.example.test"},
+		{"without-base-domain", "", "laptop", "router", "router"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			user := &tailcfg.Node{
+				ID: 7, StableID: "7", Name: tt.userName, User: 41,
+				Key: userKey, DiscoKey: userDisco, Created: time.Date(2026, time.November, 15, 11, 30, 0, 0, time.UTC),
+				Addresses:  []netip.Prefix{netip.MustParsePrefix("100.64.0.7/32")},
+				AllowedIPs: []netip.Prefix{netip.MustParsePrefix("100.64.0.7/32")},
+			}
+			tagged := &tailcfg.Node{
+				ID: 9, StableID: "9", Name: tt.tagName, User: 2147455555, Tags: []string{"tag:srv"},
+				Key: tagKey, DiscoKey: tagDisco, Created: time.Date(2026, time.November, 15, 11, 30, 0, 0, time.UTC),
+				Addresses:  []netip.Prefix{netip.MustParsePrefix("fd7a:115c:a1e0::9/128")},
+				AllowedIPs: []netip.Prefix{netip.MustParsePrefix("fd7a:115c:a1e0::9/128"), netip.MustParsePrefix("10.0.0.0/24")},
+			}
+			userSelf, taggedSelf := user.Clone(), tagged.Clone()
+			userSelf.MachineAuthorized, taggedSelf.MachineAuthorized = true, true
+			taggedSelf.User = 2147455565
+
+			for _, profile := range []struct {
+				name  string
+				input types.User
+				want  tailcfg.UserProfile
+			}{
+				{"explicit", types.User{ID: 41, Email: "mail@example.test", Name: "ignored", DisplayName: "Display ☃", ProfilePicURL: "https://example.test/avatar.png"}, tailcfg.UserProfile{ID: 41, LoginName: "mail@example.test", DisplayName: "Display ☃", ProfilePicURL: "https://example.test/avatar.png"}},
+				{"email", types.User{ID: 41, Email: "mail@example.test", Name: "ignored"}, tailcfg.UserProfile{ID: 41, LoginName: "mail@example.test", DisplayName: "mail@example.test"}},
+				{"name", types.User{ID: 41, Name: "alice", ProviderIdentifier: sql.NullString{String: "ignored", Valid: true}}, tailcfg.UserProfile{ID: 41, LoginName: "alice", DisplayName: "alice"}},
+				{"provider", types.User{ID: 41, ProviderIdentifier: sql.NullString{String: "issuer/subject", Valid: true}}, tailcfg.UserProfile{ID: 41, LoginName: "issuer/subject", DisplayName: "issuer/subject"}},
+				{"provider-string", types.User{ID: 41, ProviderIdentifier: sql.NullString{String: "issuer/subject"}}, tailcfg.UserProfile{ID: 41, LoginName: "issuer/subject", DisplayName: "issuer/subject"}},
+				{"decimal-id", types.User{ID: 41}, tailcfg.UserProfile{ID: 41, LoginName: "41", DisplayName: "41"}},
+			} {
+				t.Run(profile.name, func(t *testing.T) {
+					world.Users = []types.User{profile.input}
+					profiles := []tailcfg.UserProfile{profile.want, {ID: 2147455555, LoginName: "tagged-devices", DisplayName: "Tagged Devices"}, {ID: 2147455565, LoginName: tt.tagLogin, DisplayName: "router"}}
+					checkStreamNodeInputs(t, world, 7, newPropertyClient(&tailcfg.MapResponse{Node: userSelf, Peers: []*tailcfg.Node{tagged}, UserProfiles: profiles[:2]}), tt.domain, true, nil)
+					checkStreamNodeInputs(t, world, 9, newPropertyClient(&tailcfg.MapResponse{Node: taggedSelf, Peers: []*tailcfg.Node{user}, UserProfiles: profiles}), tt.domain, true, nil)
+					checkStreamNodeInputs(t, world, 9, newPropertyClient(&tailcfg.MapResponse{Node: taggedSelf, UserProfiles: profiles[1:]}), tt.domain, true, nil)
+
+					for _, viewer := range []types.NodeID{7, 9} {
+						selector := propcheck.PacketSelector{}
+						self, peer := userSelf.Clone(), tagged.Clone()
+
+						if viewer == 9 {
+							selector = propcheck.PacketSelector{Tag: "tag:srv"}
+							self, peer = taggedSelf.Clone(), user.Clone()
+						}
+
+						attrs := &propcheck.NodeAttrIntent{Grants: []propcheck.NodeAttrGrant{{Target: selector, Attrs: []nodecap.Cap{"disable-ipv4"}}}}
+
+						self.CapMap = tailcfg.NodeCapMap{"disable-ipv4": nil}
+						if viewer == 7 {
+							self.Addresses, self.AllowedIPs = nil, nil
+						} else {
+							peer.Addresses, peer.AllowedIPs = nil, nil
+						}
+
+						valid := newPropertyClient(&tailcfg.MapResponse{Node: self, Peers: []*tailcfg.Node{peer}, UserProfiles: profiles})
+						checkStreamNodeInputs(t, world, viewer, valid, tt.domain, true, attrs)
+
+						for _, mutation := range []string{"missing-marker", "stale-marker", "peer-marker", "ipv4-address", "ipv4-allowed", "ipv6-loss"} {
+							client := *valid
+							client.self, client.peers = valid.self.Clone(), maps.Clone(valid.peers)
+							client.peers[peer.ID] = valid.peers[peer.ID].Clone()
+							want, message := attrs, "attribute"
+
+							ipv4, ipv6 := client.self, client.peers[peer.ID]
+							if viewer == 9 {
+								ipv4, ipv6 = client.peers[peer.ID], client.self
+							}
+
+							switch mutation {
+							case "missing-marker":
+								delete(client.self.CapMap, "disable-ipv4")
+							case "stale-marker":
+								want = &propcheck.NodeAttrIntent{}
+							case "peer-marker":
+								client.peers[peer.ID].CapMap = tailcfg.NodeCapMap{"disable-ipv4": nil}
+							case "ipv4-address":
+								ipv4.Addresses = []netip.Prefix{netip.MustParsePrefix("100.64.0.7/32")}
+								message = "own addresses"
+							case "ipv4-allowed":
+								ipv4.AllowedIPs = []netip.Prefix{netip.MustParsePrefix("100.64.0.7/32")}
+								message = "disabled IPv4 identity"
+							case "ipv6-loss":
+								ipv6.Addresses = nil
+								message = "own addresses"
+							}
+
+							failure := &streamNodeInputFailure{}
+							require.PanicsWithValue(t, failure, func() { checkStreamNodeInputs(failure, world, viewer, &client, tt.domain, true, want) })
+							require.Contains(t, failure.message, message, "viewer %d mutation %s", viewer, mutation)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+// Presentation changes must reach consumers even when policy inputs stay fixed.
+func TestStreamProfileInputHistory(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			rapid.Check(t, func(t *rapid.T) {
+				p := newStreamPropertySystem(t, mode)
+				last := p.state.Snapshot()
+				flush := func() {
+					snap := p.state.Snapshot()
+					all, wake := Route(last, snap, snap.Since(last))
+					p.hub.advance(snap)
+
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if _, named := wake[id]; all || named {
+							p.update(t, id, snap, 0)
+						}
+					}
+
+					p.check(t, snap)
+					last = snap
+				}
+
+				p.setPolicy(t, 0)
+				flush()
+
+				old, oldWorld := p.state.Snapshot(), p.world.Clone()
+
+				oldHub := NewHub()
+				defer oldHub.Close()
+
+				responses, err := NewStream(p.cfg, oldHub, 1, capVer).Initial(old)
+				require.NoError(t, err)
+
+				oldClient := newPropertyClient(&tailcfg.MapResponse{})
+				applyStreamPropertyWire(t, oldHub, oldClient, responses)
+				checkStreamNodeInputs(t, oldWorld, 1, oldClient, p.cfg.DNSConfig.BaseDomain, true, nil)
+
+				for _, phase := range []string{"rename", "display", "picture", "clear-picture", "clear-display", "tag", "deny", "hidden-user", "allow", "untag", "restore"} {
+					t.Logf("profile phase %s", phase)
+
+					switch phase {
+					case "tag", "untag":
+						before := p.world.Nodes[1].Clone()
+						node := before.Clone()
+						node.Tags = nil
+
+						if phase == "tag" {
+							node.Tags = []string{"tag:srv"}
+						}
+
+						p.apply(t, streamOperation{kind: "identity", before: before, node: node})
+					case "deny":
+						p.setPolicy(t, 1)
+					case "allow":
+						p.setPolicy(t, 0)
+					default:
+						user := p.world.Users[0]
+
+						switch phase {
+						case "rename":
+							user.Name = "renamed-user"
+						case "display":
+							user.DisplayName = "Display ☃"
+						case "picture":
+							user.ProfilePicURL = "https://example.test/avatar.png"
+						case "clear-picture":
+							user.ProfilePicURL = ""
+						case "clear-display":
+							user.DisplayName = ""
+						case "hidden-user":
+							user.DisplayName, user.ProfilePicURL = "Hidden change", "https://example.test/other.png"
+						case "restore":
+							user = oldWorld.Users[0]
+						}
+
+						p.apply(t, streamOperation{kind: "user", user: user})
+					}
+
+					flush()
+
+					late, err := NewStream(p.cfg, p.hub, 1, capVer).r.render(old)
+					require.NoError(t, err)
+
+					lateClient := newPropertyClient(&tailcfg.MapResponse{})
+					applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
+					checkStreamNodeInputs(t, oldWorld, 1, lateClient, p.cfg.DNSConfig.BaseDomain, true, nil)
+					lateClient.check(t, oldClient)
+					propcheck.CheckWorld(t, oldWorld, old, p.probes)
+				}
+
+				for range rapid.IntRange(0, 3).Draw(t, "profile-edits") {
+					p.apply(t, p.drawOperation(t, "user"))
+					flush()
+				}
+			})
+		})
+	}
+}
+
+// Same-user permissions survive a rename, but tags revoke creator ownership.
+// Retained maps keep their old users and policy through both changes.
+func TestStreamSimplePolicyIdentityHistory(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t)
+		if len(p.world.Nodes) == 3 {
+			p.insert(t, 4)
+			p.open(t, 4, p.state.Snapshot(), false)
+		}
+
+		p.setPolicy(t, 2)
+		old, oldWorld := p.state.Snapshot(), p.world.Clone()
+		oldIntent := streamPacketIntent(oldWorld, p.policy, p.packetIntent)
+
+		oldHub := NewHub()
+		defer oldHub.Close()
+
+		responses, err := NewStream(p.cfg, oldHub, 4, capVer).Initial(old)
+		require.NoError(t, err)
+
+		oldClient := newPropertyClient(&tailcfg.MapResponse{})
+		applyStreamPropertyWire(t, oldHub, oldClient, responses)
+		checkStreamPacketIntent(t, oldWorld, oldIntent, 4, oldClient, p.sourceProbes...)
+
+		for _, phase := range []string{"same-user", "rename", "tag", "restore", "deny"} {
+			switch phase {
+			case "rename":
+				user := p.world.Users[0]
+				user.Name = "renamed-user"
+				p.apply(t, streamOperation{kind: "user", user: user})
+			case "tag", "restore":
+				n := p.world.Nodes[1].Clone()
+
+				n.Tags = nil
+				if phase == "tag" {
+					n.Tags = []string{"tag:srv"}
+				}
+
+				p.put(t, n)
+			case "deny":
+				p.setPolicy(t, 1)
+			}
+
+			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+				p.update(t, id, p.state.Snapshot(), 0)
+			}
+
+			require.Nil(t, p.packetIntent, "derived intent must not become policy metadata")
+			late, err := NewStream(p.cfg, p.hub, 4, capVer).r.render(old)
+			require.NoError(t, err)
+
+			lateClient := newPropertyClient(&tailcfg.MapResponse{})
+			applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
+			checkStreamPacketIntent(t, oldWorld, oldIntent, 4, lateClient, p.sourceProbes...)
+			lateClient.check(t, oldClient)
+			propcheck.CheckWorld(t, oldWorld, old, p.probes)
+		}
+	})
+}
+
+// Interpret only the three literal simple policies, using current owned users
+// so renames cannot leave stale selectors in policy history metadata.
+func streamPacketIntent(world propcheck.World, kind int, explicit *propcheck.PacketIntent) *propcheck.PacketIntent {
+	if explicit != nil || kind < 0 || kind > 2 {
+		return explicit
+	}
+
+	intent := &propcheck.PacketIntent{}
+	selectors := []propcheck.PacketSelector{}
+
+	switch kind {
+	case 0:
+		selectors = append(selectors, propcheck.PacketSelector{})
+	case 2:
+		for _, user := range world.Users {
+			selectors = append(selectors, propcheck.PacketSelector{User: user.Name})
+		}
+	}
+
+	for _, selector := range selectors {
+		for _, protocol := range []ipproto.Proto{ipproto.TCP, ipproto.UDP} {
+			intent.Grants = append(intent.Grants, propcheck.PacketGrant{Src: selector, Dst: selector, Protocol: protocol, Last: 65535})
+		}
+	}
+
+	return intent
+}
+
+// Known absence also checks unrelated rich documents; unknown attribute rules stay unmodeled.
+func streamNodeAttrIntent(t require.TestingT, doc []byte, explicit *propcheck.NodeAttrIntent) *propcheck.NodeAttrIntent {
+	if explicit != nil {
+		return explicit
+	}
+
+	if len(doc) > 0 {
+		standard, err := hujson.Standardize(slices.Clone(doc))
+		require.NoError(t, err)
+
+		var fields struct {
+			NodeAttrs           []json.RawMessage `json:"nodeAttrs"`
+			RandomizeClientPort bool              `json:"randomizeClientPort"`
+		}
+
+		require.NoError(t, jsonv2.Unmarshal(standard, &fields, jsonv2.MatchCaseInsensitiveNames(true)))
+
+		if len(fields.NodeAttrs) > 0 || fields.RandomizeClientPort {
+			return nil
+		}
+	}
+
+	return &propcheck.NodeAttrIntent{}
+}
+
+func TestStreamNodeAttrIntentInputs(t *testing.T) {
+	for _, doc := range []string{"", `{}`, `{"nodeAttrs":null}`, `{"nodeAttrs":[]}`, `{"node-attrs":[],"randomize_client-port":false}`, "{ // owned comment\n \"nodeAttrs\": [], }", streamPropertyPolicies[3], streamPropertyPolicies[4], streamPropertyPolicies[6]} {
+		input := []byte(doc)
+		before := slices.Clone(input)
+		intent := streamNodeAttrIntent(t, input, nil)
+		require.NotNil(t, intent)
+		require.Empty(t, intent.Grants)
+		require.Equal(t, before, input, "owned attribute policy bytes")
+
+		// The same checker rejects stale markers even without a packet/simple-policy domain.
+		failure := &streamNodeInputFailure{}
+		require.PanicsWithValue(t, failure, func() {
+			propcheck.CheckNodeAttrIntent(failure, propcheck.World{}, intent, 1, tailcfg.NodeCapMap{"custom:probe": nil}, true)
+		})
+		require.Contains(t, failure.message, "attribute")
+	}
+
+	for _, doc := range []string{streamPropertyPolicies[5], `{"node-attrs":[{"target":["*"],"attr":["custom:probe"]}]}`, `{"randomizeClientPort":true}`, `{"randomize_client-port":true}`} {
+		parsed, err := policyv2.ParsePolicy([]byte(doc))
+		require.NoError(t, err)
+		require.NotNil(t, parsed)
+		require.Nil(t, streamNodeAttrIntent(t, []byte(doc), nil), "unknown attribute input stays unmodeled")
+	}
+
+	explicit := &propcheck.NodeAttrIntent{}
+	require.Same(t, explicit, streamNodeAttrIntent(t, []byte(streamPropertyPolicies[5]), explicit))
+}
+
+// A known SSH-free document means denial even when no generated intent exists.
+// Keep this derived expectation out of metadata so edits preserve original bytes.
+func streamSSHIntent(t require.TestingT, doc []byte, explicit *propcheck.SSHIntent) *propcheck.SSHIntent {
+	if explicit != nil {
+		return explicit
+	}
+
+	if len(doc) > 0 {
+		standard, err := hujson.Standardize(slices.Clone(doc))
+		require.NoError(t, err)
+
+		var fields struct {
+			SSH []json.RawMessage `json:"ssh"`
+		}
+
+		require.NoError(t, jsonv2.Unmarshal(standard, &fields, jsonv2.MatchCaseInsensitiveNames(true)))
+
+		if len(fields.SSH) > 0 {
+			return nil
+		}
+	}
+
+	return &propcheck.SSHIntent{}
+}
+
+func TestStreamSSHIntentInputs(t *testing.T) {
+	for _, doc := range []string{"", `{}`, `{"ssh":null}`, `{"ssh":[]}`, "{ // retained comment\n \"ssh\": [], }"} {
+		input := []byte(doc)
+		before := slices.Clone(input)
+		intent := streamSSHIntent(t, input, nil)
+		require.NotNil(t, intent, "known empty SSH authorization")
+		require.Empty(t, intent.Grants)
+		require.Equal(t, before, input, "owned policy bytes survive standardization")
+	}
+
+	rich := []byte(streamPropertyPolicies[3])
+	for _, field := range []string{"ssh", "SSH", "s-s_h"} {
+		doc := bytes.Replace(rich, []byte(`"ssh"`), []byte(strconv.Quote(field)), 1)
+		parsed, err := policyv2.ParsePolicy(doc)
+		require.NoError(t, err)
+		require.NotEmpty(t, parsed.SSHs, "accepted SSH field %s", field)
+		require.Nil(t, streamSSHIntent(t, doc, nil), "unmodeled SSH field %s remains unmodeled", field)
+	}
+
+	explicit := &propcheck.SSHIntent{Grants: []propcheck.SSHGrant{{Src: propcheck.PacketSelector{User: "u1"}, Self: true, Users: []string{"root"}}}}
+	require.Same(t, explicit, streamSSHIntent(t, rich, explicit))
+}
+
+// Only fully delivered sessions must reflect current intent; partial prefixes
+// are checked after reconnect by the same cumulative client replay.
+func checkStreamPacketIntent(t require.TestingT, world propcheck.World, intent *propcheck.PacketIntent, id types.NodeID, client *propertyClient, extraSources ...netip.Addr) {
+	if intent == nil {
+		return
+	}
+
+	propcheck.CheckSubnetPacketIntent(t, world, intent, id, client.filter, extraSources...)
+
+	for _, peer := range propcheck.CheckPacketIntent(t, world, intent, id, client.filter, extraSources...) {
+		require.Contains(t, client.peers, peer.NodeID(), "required incoming/outgoing packet peer")
+	}
+}
+
+// A fixed history keeps downstream revocation and identity checks reachable
+// even when broader generated documents stop at enabled compiler diagnostics.
+func TestStreamPacketIntentHistory(t *testing.T) {
+	runStreamPacketIntentHistory(t, types.PolicyModeDB, false, true)
+}
+
+func TestStreamPolicyFileHistory(t *testing.T) {
+	runStreamPacketIntentHistory(t, types.PolicyModeFile, false, true)
+}
+
+func TestStreamSubnetIntentHistory(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) { runStreamPacketIntentHistory(t, mode, true, false) })
+	}
+}
+
+// The enabled order audit stays separate so known representation differences
+// cannot prevent repeated authorization histories from reaching revocation.
+func TestStreamSubnetIntentOrder(t *testing.T) {
+	runStreamPacketIntentHistory(t, types.PolicyModeDB, true, true)
+}
+
+func runStreamPacketIntentHistory(t *testing.T, mode types.PolicyMode, subnet, reorder bool) {
+	t.Helper()
+
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+	rapid.Check(t, func(t *rapid.T) {
+		p := newStreamPropertySystem(t, mode)
+		first := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{{
+			Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"},
+			Protocol: ipproto.TCP, First: 22, Last: 23,
+		}}}
+		second := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{{
+			Src: propcheck.PacketSelector{Tag: "tag:srv"}, Dst: propcheck.PacketSelector{User: "u2"},
+			Protocol: ipproto.UDP, First: 65535, Last: 65535,
+		}}}
+
+		if subnet {
+			routes := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("10.1.0.0/24")}
+			first = propcheck.DrawSubnetPacketIntent(t, p.world, 1, routes)
+			tagged := p.world.Clone()
+			tagged.Nodes[1].Tags = []string{"tag:srv"}
+			second = propcheck.DrawSubnetPacketIntent(t, tagged, 1, routes)
+		}
+		// Scope belongs to the history, not to the currently allowed grants.
+		deny := &propcheck.PacketIntent{Subnets: slices.Clone(first.Subnets)}
+		last := p.state.Snapshot()
+		flush := func() {
+			snap := p.state.Snapshot()
+			all, wake := Route(last, snap, snap.Since(last))
+			p.hub.advance(snap)
+
+			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+				if p.sessions[id].down {
+					p.open(t, id, snap, false)
+				} else if _, named := wake[id]; all || named {
+					p.update(t, id, snap, rapid.IntRange(0, 2).Draw(t, "packet delivery"))
+				} else {
+					p.checkSession(t, id, snap, p.sessions[id])
+				}
+			}
+
+			if subnet {
+				// Every router denial completes before a following restoration.
+				require.NotNil(t, p.packetIntent)
+				require.Equal(t, first.Subnets, p.packetIntent.Subnets, "current routed scope survives replacement and restore")
+
+				if p.sessions[3].down {
+					p.open(t, 3, snap, false)
+				} else {
+					p.update(t, 3, snap, 0)
+				}
+
+				require.False(t, p.sessions[3].down)
+			}
+
+			p.check(t, snap)
+			last = snap
+		}
+
+		var (
+			oldWorld    propcheck.World
+			oldSnapshot *state.Snapshot
+			oldClient   *propertyClient
+		)
+
+		if subnet {
+			router := p.world.Nodes[3].Clone()
+			router.Hostinfo.RoutableIPs = slices.Clone(first.Subnets)
+			router.ApprovedRoutes = slices.Clone(first.Subnets)
+			p.apply(t, streamOperation{kind: "routes", node: router})
+			p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: first.Document(t), intent: first})
+			flush()
+
+			oldWorld, oldSnapshot = p.world.Clone(), p.state.Snapshot()
+			oldHub := NewHub()
+			responses, err := NewStream(p.cfg, oldHub, 3, capVer).Initial(p.state.Snapshot())
+			require.NoError(t, err)
+
+			oldClient = newPropertyClient(&tailcfg.MapResponse{})
+			applyStreamPropertyWire(t, oldHub, oldClient, responses)
+			oldHub.Close()
+			checkStreamPacketIntent(t, oldWorld, first, 3, oldClient, p.sourceProbes...)
+
+			for _, phase := range []string{"unapprove", "restore", "withdraw", "restore", "offline", "restore"} {
+				n := router.Clone()
+
+				switch phase {
+				case "unapprove":
+					n.ApprovedRoutes = nil
+				case "withdraw":
+					n.Hostinfo.RoutableIPs = nil
+				case "offline":
+					n.IsOnline, n.ActiveSessions = new(false), 0
+				}
+
+				p.apply(t, streamOperation{kind: "routes", node: n})
+				flush()
+				checkStreamPacketIntent(t, oldWorld, first, 3, oldClient, p.sourceProbes...)
+			}
+		}
+
+		if subnet {
+			source := p.world.Nodes[1].Clone()
+			tagged := source.Clone()
+			tagged.Tags = []string{"tag:srv"}
+			p.apply(t, streamOperation{kind: "identity", node: tagged, before: source})
+			p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: second.Document(t), intent: second})
+			flush()
+			p.apply(t, streamOperation{kind: "identity", node: source, before: tagged})
+			flush()
+		}
+
+		transform := func(intent *propcheck.PacketIntent) {
+			p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: -1, intent: intent}}
+			for _, kind := range []string{"policy-order", "policy-duplicate", "policy-restore"} {
+				op := p.drawOperation(t, kind)
+				require.Same(t, intent, op.intent, "intent survives %s", kind)
+				p.apply(t, op)
+				flush()
+			}
+		}
+
+		for _, intent := range []*propcheck.PacketIntent{first, second, deny, first} {
+			require.Equal(t, first.Subnets, intent.Subnets, "replacement retains the entire subnet probe scope")
+			p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: intent.Document(t), intent: intent})
+			flush()
+
+			p.policies = []streamPropertyPolicy{{doc: slices.Clone(p.policyDoc), kind: -1, intent: intent}}
+			if !subnet {
+				transform(intent)
+			}
+		}
+
+		if mode == types.PolicyModeFile {
+			// Staging a distinct complete document must not change any client;
+			// only its later reload changes the active input and intent.
+			p.apply(t, streamOperation{kind: "file-stage", policy: -1, doc: second.Document(t), intent: second})
+			flush()
+			p.apply(t, p.drawOperation(t, "file-reload"))
+			flush()
+
+			for _, kind := range []string{"file-same", "file-comment", "invalid-policy", "file-reload", "file-empty", "file-reload", "file-missing", "file-reload", "file-test-failure", "file-reload", "policy-restore"} {
+				p.apply(t, p.drawOperation(t, kind))
+				flush()
+			}
+
+			p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: first.Document(t), intent: first})
+			flush()
+		}
+		// Preserve the creator while removing source and then destination user
+		// rights; both must be revoked through the consumer's cumulative filter.
+		for _, id := range []types.NodeID{1, 2} {
+			n := p.world.Nodes[id].Clone()
+			before := n.Clone()
+			n.Tags = []string{"tag:srv"}
+			p.apply(t, streamOperation{kind: "identity", node: n, before: before})
+			flush()
+
+			// Check revocation at its destination before restoration can hide
+			// a partial write; other sessions keep their generated schedule.
+			revoked := p.state.Snapshot()
+			if p.sessions[2].down {
+				p.open(t, 2, revoked, false)
+			} else {
+				p.update(t, 2, revoked, 0)
+			}
+
+			require.False(t, p.sessions[2].down, "destination 2 must complete the revoked snapshot before restoring node %d", id)
+			p.apply(t, streamOperation{kind: "identity", node: before, before: n})
+			flush()
+		}
+
+		// Deliver a policy replacement and restoration to one viewer before
+		// the batch flush; both intermediate maps must satisfy the full check.
+		if p.sessions[2].down {
+			p.open(t, 2, p.state.Snapshot(), false)
+		}
+
+		for _, intent := range []*propcheck.PacketIntent{second, first} {
+			p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: intent.Document(t), intent: intent})
+			p.update(t, 2, p.state.Snapshot(), 0)
+		}
+
+		flush()
+
+		if len(p.world.Nodes) < 8 {
+			added := p.drawOperation(t, "add")
+			p.apply(t, added)
+			flush()
+			p.apply(t, streamOperation{kind: "delete", node: added.node})
+			flush()
+		}
+
+		for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+			if p.sessions[id].down {
+				p.open(t, id, p.state.Snapshot(), false)
+			}
+		}
+
+		if subnet && reorder {
+			// Keep exact audit/reorder inputs enabled after mandatory revocations.
+			for _, intent := range []*propcheck.PacketIntent{first, second, deny, first} {
+				p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: intent.Document(t), intent: intent})
+				flush()
+				transform(intent)
+			}
+		}
+
+		if subnet {
+			// Retired source addresses still probe user/tag revocation and literal retention.
+			p.apply(t, streamOperation{kind: "delete", node: p.world.Nodes[1]})
+			flush()
+			checkStreamPacketIntent(t, oldWorld, first, 3, oldClient, p.sourceProbes...)
+
+			lateHub := NewHub()
+			responses, err := NewStream(p.cfg, lateHub, 3, capVer).Initial(oldSnapshot)
+			require.NoError(t, err)
+
+			lateClient := newPropertyClient(&tailcfg.MapResponse{})
+			applyStreamPropertyWire(t, lateHub, lateClient, responses)
+			lateHub.Close()
+			checkStreamPacketIntent(t, oldWorld, first, 3, lateClient, p.sourceProbes...)
+			lateClient.check(t, oldClient)
+		}
+
+		p.check(t, p.state.Snapshot())
+	})
+}
+
+// A mandatory report history reaches omission, explicit clears and withdrawal
+// before generated operations can encounter unrelated broad-domain diagnostics.
+func TestStreamMapRequestHistory(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+			rapid.Check(t, func(t *rapid.T) {
+				p := newStreamPropertySystem(t, mode)
+				last := p.state.Snapshot()
+				flush := func(complete bool) {
+					snap := p.state.Snapshot()
+					all, wake := Route(last, snap, snap.Since(last))
+					p.hub.advance(snap)
+
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if p.sessions[id].down {
+							if complete || rapid.Bool().Draw(t, "request-reconnect") {
+								p.open(t, id, snap, false)
+							}
+						} else if _, named := wake[id]; all || named {
+							delivery := 0
+							if !complete {
+								delivery = rapid.IntRange(0, 2).Draw(t, "request-delivery")
+							}
+
+							p.update(t, id, snap, delivery)
+						}
+
+						if complete {
+							require.False(t, p.sessions[id].down, "clear phase must complete for viewer %d", id)
+						}
+					}
+
+					p.check(t, snap)
+					last = snap
+				}
+
+				p.setPolicy(t, 0)
+				// Every phase completes so a later rename cannot conceal a stale name.
+				for _, phase := range []struct {
+					id              types.NodeID
+					hostname, given string
+				}{
+					{1, "laptop", "laptop"},
+					{2, "LAPTOP", "laptop-1"},
+					{3, "laptop", "laptop-2"},
+					{1, "desktop", "desktop"},
+					{2, "LAPTOP", "laptop-1"},
+					{2, "", "laptop-1"},
+					{2, "other", "other"},
+					{2, "laptop", "laptop"},
+					{3, "other", "other"},
+					{3, "laptop", "laptop-1"},
+					{1, "LAPTOP", "laptop-2"},
+					{1, "desktop", "desktop"},
+				} {
+					n := p.world.Nodes[phase.id].Clone()
+					hi := n.Hostinfo.Clone()
+					hi.Hostname = phase.hostname
+					t.Logf("name node %d hostname %q want %q", phase.id, phase.hostname, phase.given)
+					p.apply(t, streamOperation{kind: "request-collision", node: n, before: n.Clone(), request: tailcfg.MapRequest{
+						NodeKey: n.NodeKey, DiscoKey: n.DiscoKey, Endpoints: slices.Clone(n.Endpoints), Hostinfo: hi,
+					}})
+					require.Equal(t, phase.given, p.world.Nodes[phase.id].GivenName, "literal name transition")
+					flush(true)
+				}
+
+				// Seed existing approval provenance; the public reports below must
+				// preserve manual approval and revoke withdrawn automatic approval.
+				router := p.world.Nodes[3].Clone()
+				router.GivenName = "Custom-Router"
+				router.Hostinfo.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("10.1.0.0/24")}
+				router.ApprovedRoutes = slices.Clone(router.Hostinfo.RoutableIPs)
+				router.AutoApprovedRoutes = slices.Clone(router.Hostinfo.RoutableIPs[1:])
+				router.Unhealthy = true
+				p.put(t, router)
+				flush(true)
+
+				if mode == types.PolicyModeFile {
+					p.apply(t, p.drawOperation(t, "file-comment"))
+					flush(true)
+
+					before := p.state.Snapshot()
+					rawPolicy := slices.Clone(p.policyDoc)
+					n := p.world.Nodes[1].Clone()
+					hi := n.Hostinfo.Clone()
+					hi.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}
+					p.apply(t, streamOperation{kind: "request-routes", node: n, before: n.Clone(), request: tailcfg.MapRequest{
+						NodeKey: n.NodeKey, DiscoKey: n.DiscoKey, Endpoints: slices.Clone(n.Endpoints), Hostinfo: hi,
+					}})
+					require.Equal(t, rawPolicy, p.policyDoc, "route request preserves raw policy model")
+					require.Equal(t, rawPolicy, p.state.Snapshot().PolicySource(), "route request preserves raw active policy")
+					require.Equal(t, rawPolicy, before.PolicySource(), "route request preserves retained raw policy")
+					require.Equal(t, before.Rev()+1, p.state.Snapshot().Rev(), "only the node report publishes")
+					flush(true)
+				}
+
+				for _, id := range []types.NodeID{1, 3} {
+					for _, phase := range []string{"collision", "report", "same", "nil", "omit-netinfo", "derp-two", "derp-clear", "empty-name", "withdraw", "reannounce", "withdraw-again"} {
+						n := p.world.Nodes[id].Clone()
+						hi := n.Hostinfo.Clone()
+
+						switch phase {
+						case "collision":
+							hi.Hostname = "CUSTOM-ROUTER"
+						case "report":
+							hi.Hostname = fmt.Sprintf("request-%d-0", id)
+							hi.OS = "windows"
+							hi.Services = []tailcfg.Service{{Proto: "tcp", Port: 443}}
+							hi.RequestTags = []string{"tag:srv", "tag:router"}
+							hi.NetInfo = &tailcfg.NetInfo{PreferredDERP: 1}
+						case "nil":
+							hi = nil
+						case "omit-netinfo":
+							hi.NetInfo = nil
+						case "derp-two":
+							hi.NetInfo.PreferredDERP = 2
+						case "derp-clear":
+							hi.NetInfo.PreferredDERP = 0
+						case "empty-name":
+							hi.Hostname = ""
+						case "withdraw", "withdraw-again":
+							hi.RoutableIPs = nil
+						case "reannounce":
+							hi.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("10.1.0.0/24")}
+						}
+
+						t.Logf("request node %d phase %s", id, phase)
+						p.apply(t, streamOperation{kind: "request-hostinfo", node: n, before: n.Clone(), request: tailcfg.MapRequest{
+							NodeKey: n.NodeKey, DiscoKey: n.DiscoKey, Endpoints: slices.Clone(n.Endpoints), Hostinfo: hi,
+						}})
+						flush(slices.Contains([]string{"collision", "report", "derp-clear", "withdraw", "reannounce", "withdraw-again"}, phase))
+					}
+				}
+
+				require.Equal(t, "request-1-0", p.world.Nodes[1].GivenName)
+				require.Empty(t, p.world.Nodes[1].Tags, "requested tags do not grant ownership")
+				require.Equal(t, "Custom-Router", p.world.Nodes[3].GivenName)
+				require.Equal(t, types.Strings{"tag:a", "tag:srv", "tag:router"}, p.world.Nodes[3].Tags)
+				require.Equal(t, types.Prefixes{netip.MustParsePrefix("10.0.0.0/24")}, p.world.Nodes[3].ApprovedRoutes)
+				require.Empty(t, p.world.Nodes[3].AutoApprovedRoutes)
+				require.False(t, p.world.Nodes[3].Unhealthy)
+
+				for _, policy := range []int{1, 0} {
+					p.setPolicy(t, policy)
+					flush(true)
+				}
+
+				for range rapid.IntRange(1, 8).Draw(t, "request batches") {
+					p.setPolicy(t, rapid.IntRange(0, 1).Draw(t, "request policy"))
+
+					for range rapid.IntRange(1, 3).Draw(t, "request coalesced writes") {
+						p.apply(t, p.drawOperation(t, "request-hostinfo", "request-collision", "request-netinfo", "request-omit-netinfo", "request-nil", "request-same", "request-routes", "stale-request", "missing-request"))
+					}
+
+					flush(false)
+				}
+
+				flush(true)
+			})
+		})
+	}
+}
+
+// Derive known app absence from owned documents without changing their metadata.
+func streamAppIntent(t require.TestingT, doc []byte, explicit *propcheck.AppIntent) *propcheck.AppIntent {
+	if explicit != nil {
+		return explicit
+	}
+
+	if len(doc) > 0 {
+		standard, err := hujson.Standardize(slices.Clone(doc))
+		require.NoError(t, err)
+
+		var fields struct {
+			Grants []struct {
+				App tailcfg.PeerCapMap `json:"app"`
+			} `json:"grants"`
+		}
+
+		// Match the policy schema's case and delimiter folding, not its compiler.
+		require.NoError(t, jsonv2.Unmarshal(standard, &fields, jsonv2.MatchCaseInsensitiveNames(true)))
+
+		for _, grant := range fields.Grants {
+			if len(grant.App) > 0 {
+				return nil
+			}
+		}
+	}
+
+	return &propcheck.AppIntent{}
+}
+
+func TestStreamAppIntentInputs(t *testing.T) {
+	for _, doc := range append([]string{
+		"", `{}`, `{"grants":null}`, `{"grants":[]}`,
+		`{"grants":[{"src":["*"],"dst":["*"],"ip":["*"],"app":null}]}`,
+		`{"grants":[{"src":["*"],"dst":["*"],"ip":["*"],"app":{}}]}`,
+		"{ // owned comment\n \"grants\": [], }",
+	}, streamPropertyPolicies...) {
+		input := []byte(doc)
+		before := slices.Clone(input)
+		intent := streamAppIntent(t, input, nil)
+		require.NotNil(t, intent, "known empty app authorization: %s", doc)
+		require.Empty(t, intent.Grants)
+		require.Equal(t, before, input, "owned policy bytes survive standardization")
+	}
+
+	explicit := &propcheck.AppIntent{}
+
+	for _, doc := range []string{
+		`{"grants":[{"src":["*"],"dst":["*"],"app":{"example.com/cap/read":null}}]}`,
+		`{"grants":[{"src":["*"],"dst":["*"],"app":{"example.com/cap/read":[]}}]}`,
+		`{"GRANTS":[{"SRC":["*"],"DST":["*"],"APP":{"example.com/cap/read":[]}}]}`,
+		`{"g-r_a_n_t_s":[{"src":["*"],"dst":["*"],"a-p_p":{"example.com/cap/read":[]}}]}`,
+	} {
+		require.Nil(t, streamAppIntent(t, []byte(doc), nil), "unmodeled app grants remain unknown")
+		require.Same(t, explicit, streamAppIntent(t, []byte(doc), explicit))
+	}
+}
+
+func checkStreamAppIntent(t require.TestingT, world propcheck.World, intent *propcheck.AppIntent, id types.NodeID, client *propertyClient, extraSources ...netip.Addr) {
+	if intent == nil {
+		return
+	}
+
+	for _, peer := range propcheck.CheckAppIntent(t, world, intent, id, client.filter, extraSources...) {
+		require.Contains(t, client.peers, peer.NodeID(), "required app source")
+	}
+}
+
+func TestRapidStreamAppIntent(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			runRapidStreamSystem(t, mode, "app-policy", "group-policy", "mixed-policy", "app-deny", "policy-order", "policy-duplicate", "policy-restore", "identity", "user", "request-hostinfo", "derp-policy", "noop")
+		})
+	}
+}
+
+// Fixed value changes, revocations and restores reach the consumer independently
+// of the enabled order/duplicate diagnostics in generated histories.
+func TestStreamAppIntentHistory(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+			rapid.Check(t, func(t *rapid.T) {
+				p := newStreamPropertySystem(t, mode)
+				packet := &propcheck.PacketIntent{}
+				mixed := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{{
+					Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"},
+					Protocol: ipproto.TCP, First: 22, Last: 23,
+				}}}
+				first := &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+					Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"},
+					Caps: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`, `{"role":"read"}`}, "example.com/cap/empty": nil},
+				}}}
+				second := &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+					Src: first.Grants[0].Src, Dst: first.Grants[0].Dst,
+					Caps: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"audit"}`}, "example.com/cap/empty": {}},
+				}}}
+				last := p.state.Snapshot()
+				flush := func() {
+					snap := p.state.Snapshot()
+					all, wake := Route(last, snap, snap.Since(last))
+					p.hub.advance(snap)
+
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if p.sessions[id].down {
+							p.open(t, id, snap, false)
+						} else if _, named := wake[id]; all || named {
+							p.update(t, id, snap, rapid.IntRange(0, 2).Draw(t, "app delivery"))
+						}
+					}
+					// Check unwoken live clients before any reconnect can hide a
+					// missing Route wake.
+					p.check(t, snap)
+					// Complete the destination while this state still exists; a
+					// partial prefix cannot erase a revocation before restoration.
+					if p.sessions[2].down {
+						p.open(t, 2, snap, false)
+					}
+
+					require.False(t, p.sessions[2].down)
+
+					last = snap
+				}
+				set := func(app *propcheck.AppIntent, ports *propcheck.PacketIntent) {
+					p.apply(t, streamOperation{kind: "app-policy", policy: -1, doc: app.Document(t, ports), intent: ports, appIntent: app})
+					flush()
+				}
+				set(first, packet)
+
+				old, oldWorld := p.state.Snapshot(), p.world.Clone()
+
+				for _, app := range []*propcheck.AppIntent{second, {}, first} {
+					set(app, packet)
+				}
+
+				for _, kind := range []int{0, 1, 2} {
+					p.setPolicy(t, kind)
+					flush()
+					require.Nil(t, p.appIntent, "simple replacement clears app metadata")
+					set(first, packet)
+				}
+
+				p.apply(t, streamOperation{kind: "packet-policy", policy: -1, doc: packet.Document(t), intent: packet})
+				flush()
+				require.Nil(t, p.appIntent, "packet replacement clears app metadata")
+				set(first, packet)
+
+				set(first, mixed)
+				set(first, packet)
+
+				if mode == types.PolicyModeFile {
+					p.apply(t, streamOperation{kind: "file-stage", policy: -1, doc: second.Document(t, packet), intent: packet, appIntent: second})
+					flush()
+					require.Same(t, first, p.appIntent)
+					p.apply(t, p.drawOperation(t, "file-reload"))
+					flush()
+					require.Same(t, second, p.appIntent)
+
+					for _, kind := range []string{"file-same", "file-comment", "invalid-policy", "file-reload", "file-empty", "file-reload", "file-missing", "file-reload", "file-test-failure", "file-reload"} {
+						p.apply(t, p.drawOperation(t, kind))
+						flush()
+						require.Same(t, second, p.appIntent)
+					}
+
+					set(first, packet)
+				}
+
+				saved := p.policies[len(p.policies)-1]
+
+				set(second, packet)
+
+				p.policies = []streamPropertyPolicy{saved}
+				p.apply(t, p.drawOperation(t, "policy-restore"))
+				flush()
+				require.Same(t, first, p.appIntent)
+
+				for _, id := range []types.NodeID{1, 2} {
+					before := p.world.Nodes[id].Clone()
+					tagged := before.Clone()
+					tagged.Tags = []string{"tag:srv"}
+					p.apply(t, streamOperation{kind: "identity", before: before, node: tagged})
+					flush()
+					p.apply(t, streamOperation{kind: "identity", before: tagged, node: before})
+					flush()
+				}
+
+				p.apply(t, p.drawOperation(t, "derp-policy"))
+				flush()
+				require.Same(t, first, p.appIntent)
+
+				groupDoc, groupPacket, groupApp := propcheck.GroupPolicy(t, []string{"u1"}, []string{"u2"}, mixed.Grants[0], first.Grants[0].Caps)
+				setGroup := func(doc []byte, ports *propcheck.PacketIntent, app *propcheck.AppIntent) {
+					p.apply(t, streamOperation{kind: "group-policy", policy: -1, doc: doc, intent: ports, appIntent: app})
+					flush()
+				}
+				setGroup(groupDoc, groupPacket, groupApp)
+
+				groupOld, groupWorld := p.state.Snapshot(), p.world.Clone()
+				groupSaved := p.policies[len(p.policies)-1]
+
+				for _, members := range [][2][]string{
+					{{"u1", "u3"}, {"u2", "u3"}},
+					{{"u3", "u1", "u3"}, {"u3", "u2", "u2"}},
+					{{"u3"}, {"u2"}},
+					{nil, {"u2"}},
+					{{"u1"}, {"u2"}},
+					{{"u1"}, {"u3"}},
+					{{"u1"}, nil},
+					{{"u1"}, {"u2"}},
+				} {
+					doc, ports, app := propcheck.GroupPolicy(t, members[0], members[1], mixed.Grants[0], first.Grants[0].Caps)
+					setGroup(doc, ports, app)
+				}
+
+				for _, id := range []types.NodeID{1, 2} {
+					before := p.world.Nodes[id].Clone()
+					tagged := before.Clone()
+					tagged.Tags = []string{"tag:srv"}
+					p.apply(t, streamOperation{kind: "identity", before: before, node: tagged})
+					flush()
+					p.apply(t, streamOperation{kind: "identity", before: tagged, node: before})
+					flush()
+				}
+
+				for range rapid.IntRange(1, 4).Draw(t, "group replacements") {
+					p.apply(t, p.drawOperation(t, "group-policy"))
+					flush()
+				}
+
+				setGroup(groupDoc, groupPacket, groupApp)
+
+				clearDoc, clearPacket, clearApp := propcheck.GroupPolicy(t, nil, []string{"u2"}, mixed.Grants[0], first.Grants[0].Caps)
+				if mode == types.PolicyModeFile {
+					p.apply(t, streamOperation{kind: "file-stage", policy: -1, doc: clearDoc, intent: clearPacket, appIntent: clearApp})
+					flush()
+					require.Equal(t, groupDoc, p.policyDoc, "staging keeps active membership")
+					p.apply(t, p.drawOperation(t, "file-reload"))
+					flush()
+				} else {
+					setGroup(clearDoc, clearPacket, clearApp)
+				}
+
+				p.policies = []streamPropertyPolicy{groupSaved}
+				p.apply(t, p.drawOperation(t, "policy-restore"))
+				flush()
+				require.Equal(t, groupDoc, p.policyDoc, "restore keeps raw groups")
+				require.Same(t, groupApp, p.appIntent)
+
+				// Delete a live group member without replacing the group document.
+				member := p.drawNode(t, p.lastNodeID+1)
+				member.User, member.UserID = p.world.Users[0].Clone(), new(p.world.Users[0].ID)
+				p.apply(t, streamOperation{kind: "add", node: member})
+				flush()
+				require.True(t, groupPacket.Allows(p.world, member.ID, 2, *member.IPv4, *p.world.Nodes[2].IPv4, 22, ipproto.TCP))
+				require.NotEmpty(t, groupApp.Capabilities(p.world, member.ID, 2, *member.IPv4, *p.world.Nodes[2].IPv4))
+				p.apply(t, streamOperation{kind: "delete", node: member})
+				flush()
+				require.Equal(t, groupDoc, p.policyDoc, "deletion keeps the active group document")
+				// This fixed witness can be lifetime 9, beyond the generated first-eight pool.
+				checkStreamPacketIntent(t, p.world, groupPacket, 2, p.sessions[2].client, *member.IPv4, *member.IPv6)
+				checkStreamAppIntent(t, p.world, groupApp, 2, p.sessions[2].client, *member.IPv4, *member.IPv6)
+
+				// Every selected source belongs to the retained first-eight pool.
+				// Complete user/tag revocation before changing to raw-address controls.
+				for _, id := range []types.NodeID{1, 3} {
+					source := p.world.Nodes[id]
+
+					selector := propcheck.PacketSelector{User: "u1"}
+					if id == 3 {
+						selector = propcheck.PacketSelector{Tag: "tag:srv"}
+					}
+
+					ports := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{{
+						Src: selector, Dst: first.Grants[0].Dst, Protocol: ipproto.TCP, First: 22, Last: 23,
+					}}}
+					app := &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+						Src: selector, Dst: first.Grants[0].Dst, Caps: first.Grants[0].Caps,
+					}}}
+					set(app, ports)
+					p.apply(t, streamOperation{kind: "delete", node: source})
+					flush()
+
+					for _, address := range []propcheck.PacketSelector{{IP: *source.IPv4}, {IP: *source.IPv6}, {}} {
+						ports = &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{{
+							Src: address, Dst: first.Grants[0].Dst, Protocol: ipproto.TCP, First: 22, Last: 23,
+						}}}
+						app = &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+							Src: address, Dst: first.Grants[0].Dst, Caps: first.Grants[0].Caps,
+						}}}
+						set(app, ports)
+					}
+
+					set(&propcheck.AppIntent{}, packet)
+				}
+
+				// Resolve the retained group against its old World after live sources are deleted.
+				groupLate, err := NewStream(p.cfg, p.hub, 2, capVer).r.render(groupOld)
+				require.NoError(t, err)
+
+				groupClient := newPropertyClient(&tailcfg.MapResponse{})
+				applyStreamPropertyWire(t, p.hub, groupClient, []*tailcfg.MapResponse{fullResponse(p.cfg, groupLate)})
+				checkStreamAppIntent(t, groupWorld, groupApp, 2, groupClient, p.sourceProbes...)
+				checkStreamPacketIntent(t, groupWorld, groupPacket, 2, groupClient, p.sourceProbes...)
+
+				late, err := NewStream(p.cfg, p.hub, 2, capVer).r.render(old)
+				require.NoError(t, err)
+
+				client := newPropertyClient(&tailcfg.MapResponse{})
+				applyStreamPropertyWire(t, p.hub, client, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
+				checkStreamAppIntent(t, oldWorld, first, 2, client, p.sourceProbes...)
+				checkStreamPacketIntent(t, oldWorld, packet, 2, client, p.sourceProbes...)
+			})
+		})
+	}
+}
+
+// streamSubscriptionInput owns the observable inputs last completed by one
+// viewer. It is a necessary-wake oracle, not a model of Route's invalidations.
+type streamSubscriptionInput struct {
+	endpoints map[types.NodeID][]netip.AddrPort
+	allowed   map[types.NodeID]bool
+}
+
+func (p *streamPropertySystem) subscriptionInput(t *rapid.T, viewer types.NodeID) streamSubscriptionInput {
+	require.Contains(t, []int{0, 1, 2}, p.policy)
+
+	input := streamSubscriptionInput{
+		endpoints: map[types.NodeID][]netip.AddrPort{},
+		allowed:   map[types.NodeID]bool{},
+	}
+	// expectedPeers takes only the owned World/simple-policy branch here.
+	peers := p.expectedPeers(t, viewer, nil, 0)
+	for _, id := range append(peers, viewer) {
+		input.endpoints[id] = append([]netip.AddrPort(nil), p.world.Nodes[id].Endpoints...)
+	}
+
+	self := p.world.Nodes[viewer]
+	for _, id := range peers {
+		peer := p.world.Nodes[id]
+		sameUser := len(self.Tags) == 0 && len(peer.Tags) == 0 && self.UserID != nil && peer.UserID != nil && *self.UserID == *peer.UserID
+		// Every simple-policy rule permits all ports/protocols; a directed
+		// live-node permission therefore needs only one input-owned bit.
+		input.allowed[id] = p.policy == 0 || p.policy == 2 && sameUser
+	}
+
+	return input
+}
+
+func TestRapidStreamSubscription(t *testing.T) {
+	for _, domain := range []string{"endpoint-revert", "policy-revert", "mixed"} {
+		t.Run(domain, func(t *testing.T) {
+			rapid.Check(t, func(t *rapid.T) {
+				rapid.SyncTest(t, func(t *rapid.T) {
+					checkStreamSubscription(t, domain)
+				})
+			})
+		})
+	}
+}
+
+func checkStreamSubscription(t *rapid.T, domain string) {
+	p := newStreamPropertySystem(t)
+	// Nodes 1 and 4 are same-user witnesses even under deny/self policy.
+	if len(p.world.Nodes) == 3 {
+		p.insert(t, 4)
+		p.open(t, 4, p.state.Snapshot(), false)
+	}
+
+	initialPolicy := rapid.IntRange(0, 2).Draw(t, "subscription-policy")
+	p.setPolicy(t, initialPolicy)
+	ids := slices.Sorted(maps.Keys(p.sessions))
+	delivered := map[types.NodeID]streamSubscriptionInput{}
+
+	complete := func(id types.NodeID) {
+		p.update(t, id, p.state.Snapshot(), 0)
+		delivered[id] = p.subscriptionInput(t, id)
+	}
+	for _, id := range ids {
+		complete(id)
+	}
+
+	sub := p.state.Subscribe()
+	defer sub.Close()
+
+	before, ownedBefore := p.state.Snapshot(), p.world.Clone()
+
+	for range rapid.IntRange(0, 4).Draw(t, "coalesced-prefix") {
+		if domain == "policy-revert" || domain == "mixed" && rapid.Bool().Draw(t, "policy-write") {
+			p.setPolicy(t, rapid.IntRange(0, 2).Draw(t, "simple-policy"))
+		} else {
+			p.apply(t, p.drawOperation(t, "endpoints", "noop", "revert"))
+		}
+
+		if rapid.Bool().Draw(t, "intermediate-completion") {
+			complete(rapid.SampledFrom(ids).Draw(t, "intermediate-viewer"))
+		}
+	}
+
+	if domain == "policy-revert" {
+		p.setPolicy(t, (initialPolicy+rapid.IntRange(1, 2).Draw(t, "policy-offset"))%3)
+		complete(1)
+		p.setPolicy(t, initialPolicy)
+	} else {
+		// Reserve an address outside the prefix generator's 192.0.2.0/24
+		// range so the intermediate witness always differs from its restore.
+		n := p.world.Nodes[1].Clone()
+		n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("198.51.100.1"), rapid.Uint16().Draw(t, "witness-port"))}
+		p.apply(t, streamOperation{kind: "endpoints", node: n, before: p.world.Nodes[1].Clone()})
+		complete(4)
+
+		if domain == "endpoint-revert" {
+			for _, id := range ids {
+				p.apply(t, streamOperation{kind: "endpoints", node: ownedBefore.Nodes[id].Clone(), before: p.world.Nodes[id].Clone()})
+			}
+		} else {
+			n = n.Clone()
+			n.Endpoints = nil
+			p.apply(t, streamOperation{kind: "endpoints", node: n, before: p.world.Nodes[1].Clone()})
+		}
+	}
+
+	final := p.state.Snapshot()
+	required := map[types.NodeID]bool{}
+
+	for _, id := range ids {
+		if !reflect.DeepEqual(delivered[id], p.subscriptionInput(t, id)) {
+			required[id] = true
+		}
+
+		select {
+		case <-p.sessions[id].stream.sess.Wakes():
+			t.Fatalf("viewer %d had a wake before the gated watcher started", id)
+		default:
+		}
+	}
+
+	require.NotEmpty(t, required, "each history must leave an input-owned required wake")
+	propcheck.CheckWorld(t, ownedBefore, before, p.probes)
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+
+		p.hub.watch(p.state, sub, before)
+	}()
+
+	t.Cleanup(func() { p.hub.Close(); <-finished })
+	// All channels belong to this bubble. Quiescence follows wake enqueue,
+	// unlike observing hub.latest, and makes missed wakes fail immediately.
+	synctest.Wait()
+
+	for _, id := range ids {
+		select {
+		case <-p.sessions[id].stream.sess.Wakes():
+			complete(id)
+		default:
+			require.False(t, required[id], "required subscription wake missing for viewer %d in %s", id, domain)
+		}
+	}
+
+	p.check(t, final)
+	p.checkWorld(t)
+	p.checkHistory(t)
+}
+
+func TestRapidStreamSSHIntent(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			runRapidStreamSystem(t, mode, "ssh-policy", "ssh-deny", "ssh-mixed", "policy-order", "policy-duplicate", "policy-restore", "identity", "user", "derp-policy", "noop")
+		})
+	}
+}
+
+// Keep revocation and restoration reachable even when broader generated policy
+// histories stop first at an existing representation/audit diagnostic.
+func TestStreamSSHIntentHistory(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+			rapid.Check(t, func(t *rapid.T) {
+				p := newStreamPropertySystem(t, mode)
+				packet, app := &propcheck.PacketIntent{}, &propcheck.AppIntent{}
+				first := &propcheck.SSHIntent{Grants: []propcheck.SSHGrant{
+					{Src: propcheck.PacketSelector{User: "u1"}, DstTag: "tag:srv", Users: []string{"alice", "bob"}},
+					{Src: propcheck.PacketSelector{User: "u1"}, DstTag: "tag:srv", Check: true, Users: []string{"alice"}},
+					{Src: propcheck.PacketSelector{User: "u1"}, Self: true, Users: []string{"root"}},
+					{Src: propcheck.PacketSelector{Tag: "tag:router"}, DstTag: "tag:srv", Users: []string{"bob"}},
+				}}
+				second := &propcheck.SSHIntent{Grants: []propcheck.SSHGrant{
+					{Src: propcheck.PacketSelector{User: "u2"}, DstTag: "tag:srv", Users: []string{"root"}},
+				}}
+				last := p.state.Snapshot()
+				flush := func() {
+					snap := p.state.Snapshot()
+					all, wake := Route(last, snap, snap.Since(last))
+					p.hub.advance(snap)
+
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if p.sessions[id].down {
+							p.open(t, id, snap, false)
+						} else if _, named := wake[id]; all || named {
+							p.update(t, id, snap, rapid.IntRange(0, 2).Draw(t, "ssh delivery"))
+						}
+					}
+					// Unwoken clients must already be correct before reconnects.
+					p.check(t, snap)
+					// Finish all destinations while revoked policy still exists.
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if p.sessions[id].down {
+							p.open(t, id, snap, false)
+						}
+					}
+
+					last = snap
+				}
+				set := func(ssh *propcheck.SSHIntent) {
+					p.apply(t, streamOperation{kind: "ssh-policy", policy: -1, doc: ssh.AppendDocument(t, app.Document(t, packet)), intent: packet, appIntent: app, sshIntent: ssh})
+					flush()
+				}
+				set(first)
+				require.Equal(t, "check", first.Decision(p.world, 1, 3, "alice"))
+				require.Empty(t, p.sessions[3].client.peers, "SSH alone must not imply peer permission")
+				old, oldWorld := p.state.Snapshot(), p.world.Clone()
+				oldPacket, oldApp := packet, app
+
+				for _, ssh := range []*propcheck.SSHIntent{second, {}, first} {
+					set(ssh)
+				}
+
+				packet = &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{{
+					Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{Tag: "tag:srv"}, Protocol: ipproto.TCP, First: 22, Last: 22,
+				}}}
+				app = &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+					Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{Tag: "tag:srv"}, Caps: tailcfg.PeerCapMap{"example.com/cap/read": {`{"role":"read"}`}},
+				}}}
+
+				set(first)
+
+				packet, app = oldPacket, oldApp
+
+				set(first)
+
+				if mode == types.PolicyModeFile {
+					p.apply(t, streamOperation{kind: "file-stage", policy: -1, doc: second.AppendDocument(t, app.Document(t, packet)), intent: packet, appIntent: app, sshIntent: second})
+					flush()
+					require.Same(t, first, p.sshIntent)
+					p.apply(t, p.drawOperation(t, "file-reload"))
+					flush()
+					require.Same(t, second, p.sshIntent)
+
+					for _, kind := range []string{"file-same", "file-comment", "invalid-policy", "file-reload", "file-empty", "file-reload", "file-missing", "file-reload", "file-test-failure", "file-reload"} {
+						p.apply(t, p.drawOperation(t, kind))
+						flush()
+						require.Same(t, second, p.sshIntent)
+					}
+
+					set(first)
+				}
+
+				saved := p.policies[len(p.policies)-1]
+
+				set(second)
+
+				p.policies = []streamPropertyPolicy{saved}
+				p.apply(t, p.drawOperation(t, "policy-restore"))
+				flush()
+				require.Same(t, first, p.sshIntent)
+
+				for _, id := range []types.NodeID{1, 3} {
+					before := p.world.Nodes[id].Clone()
+					changed := before.Clone()
+
+					changed.Tags = []string{"tag:other"}
+					if id == 3 {
+						changed.Tags = nil
+					}
+
+					p.apply(t, streamOperation{kind: "identity", before: before, node: changed})
+					flush()
+					p.apply(t, streamOperation{kind: "identity", before: changed, node: before})
+					flush()
+				}
+
+				for _, kind := range []string{"derp-policy", "policy-order", "policy-duplicate"} {
+					p.apply(t, p.drawOperation(t, kind))
+					flush()
+				}
+
+				p.apply(t, streamOperation{kind: "delete", node: p.world.Nodes[1].Clone()})
+				flush()
+
+				late, err := NewStream(p.cfg, p.hub, 3, capVer).r.render(old)
+				require.NoError(t, err)
+
+				client := newPropertyClient(&tailcfg.MapResponse{})
+				applyStreamPropertyWire(t, p.hub, client, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
+				propcheck.CheckSSHIntent(t, oldWorld, first, 3, client.ssh, p.cfg.ServerURL)
+				checkStreamPacketIntent(t, oldWorld, oldPacket, 3, client, p.sourceProbes...)
+				checkStreamAppIntent(t, oldWorld, oldApp, 3, client, p.sourceProbes...)
+				p.setPolicy(t, 1)
+				flush()
+				require.Nil(t, p.sshIntent, "unrelated policy must clear SSH metadata")
+			})
+		})
+	}
+}
+
+func TestRapidStreamNodeAttrIntent(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			runRapidStreamSystem(t, mode, "attrs-policy", "attrs-clear", "attrs-mixed", "policy-order", "policy-duplicate", "policy-restore", "identity", "user", "derp-policy", "noop")
+		})
+	}
+}
+
+func TestStreamNodeAttrIntentHistory(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+			rapid.Check(t, func(t *rapid.T) {
+				p := newStreamPropertySystem(t, mode)
+				first := &propcheck.NodeAttrIntent{Grants: []propcheck.NodeAttrGrant{
+					{Target: propcheck.PacketSelector{User: "u1"}, Attrs: []nodecap.Cap{"custom:probe", "disable-ipv4"}},
+					{Target: propcheck.PacketSelector{Tag: "tag:srv"}, Attrs: []nodecap.Cap{"custom:other", "disable-ipv4"}},
+					{Attrs: []nodecap.Cap{nodecap.RandomizeClientPort}},
+				}}
+				second := &propcheck.NodeAttrIntent{Grants: []propcheck.NodeAttrGrant{
+					{Target: propcheck.PacketSelector{User: "u2"}, Attrs: []nodecap.Cap{"custom:other", "disable-ipv4"}},
+				}}
+				// Keep the existing independently elected subnet and both exit families.
+				router := p.world.Nodes[3].Clone()
+				router.Hostinfo.RoutableIPs = append(router.Hostinfo.RoutableIPs, netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"))
+				router.ApprovedRoutes = slices.Clone(router.Hostinfo.RoutableIPs)
+				p.put(t, router)
+				last := p.state.Snapshot()
+				flush := func() {
+					snap := p.state.Snapshot()
+					all, wake := Route(last, snap, snap.Since(last))
+					p.hub.advance(snap)
+
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if p.sessions[id].down {
+							p.open(t, id, snap, false)
+						} else if _, named := wake[id]; all || named {
+							p.update(t, id, snap, rapid.IntRange(0, 2).Draw(t, "attribute delivery"))
+						}
+					}
+
+					p.check(t, snap)
+
+					for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+						if p.sessions[id].down {
+							p.open(t, id, snap, false)
+						}
+					}
+
+					last = snap
+				}
+				set := func(attrs *propcheck.NodeAttrIntent) {
+					p.apply(t, streamOperation{kind: "attrs-policy", policy: 0, doc: attrs.AppendDocument(t, []byte(streamPropertyPolicies[0])), attrIntent: attrs})
+					flush()
+				}
+				set(first)
+				// Both viewers share one Hub peer cache, but only viewer 1 disables IPv4.
+				require.NotContains(t, p.sessions[1].client.peers[2].Addresses, netip.PrefixFrom(*p.world.Nodes[2].IPv4, 32))
+				require.Contains(t, p.sessions[2].client.self.Addresses, netip.PrefixFrom(*p.world.Nodes[2].IPv4, 32))
+
+				for _, viewer := range []types.NodeID{1, 2} {
+					require.Contains(t, p.sessions[viewer].client.peers[3].AllowedIPs, netip.MustParsePrefix("10.0.0.0/24"))
+					require.Contains(t, p.sessions[viewer].client.peers[3].AllowedIPs, netip.MustParsePrefix("0.0.0.0/0"))
+				}
+
+				old, oldWorld := p.state.Snapshot(), p.world.Clone()
+
+				p.setPolicy(t, 3)
+				flush()
+				require.Nil(t, p.attrIntent, "unrelated rich policy clears attribute metadata")
+				set(first)
+
+				for _, attrs := range []*propcheck.NodeAttrIntent{second, {}, first} {
+					set(attrs)
+
+					if attrs == second {
+						prefix := netip.PrefixFrom(*p.world.Nodes[3].IPv4, 32)
+						require.Contains(t, p.sessions[1].client.peers[3].Addresses, prefix, "enabled viewer retains enabled peer IPv4")
+						require.NotContains(t, p.sessions[2].client.peers[3].Addresses, prefix, "disabled viewer strips same cached peer IPv4")
+					}
+				}
+
+				if mode == types.PolicyModeFile {
+					p.apply(t, streamOperation{kind: "file-stage", policy: 0, doc: second.AppendDocument(t, []byte(streamPropertyPolicies[0])), attrIntent: second})
+					flush()
+					require.Same(t, first, p.attrIntent)
+					p.apply(t, p.drawOperation(t, "file-reload"))
+					flush()
+					require.Same(t, second, p.attrIntent)
+
+					for _, kind := range []string{"file-same", "file-comment", "invalid-policy", "file-reload", "file-empty", "file-reload", "file-missing", "file-reload", "file-test-failure", "file-reload"} {
+						p.apply(t, p.drawOperation(t, kind))
+						flush()
+						require.Same(t, second, p.attrIntent)
+					}
+
+					set(first)
+				}
+
+				saved := p.policies[len(p.policies)-1]
+
+				set(second)
+
+				p.policies = []streamPropertyPolicy{saved}
+				p.apply(t, p.drawOperation(t, "policy-restore"))
+				flush()
+				require.Same(t, first, p.attrIntent)
+
+				for _, id := range []types.NodeID{1, 3} {
+					before := p.world.Nodes[id].Clone()
+					changed := before.Clone()
+
+					changed.Tags = []string{"tag:other"}
+					if id == 3 {
+						changed.Tags = nil
+					}
+
+					p.apply(t, streamOperation{kind: "identity", before: before, node: changed})
+					flush()
+					p.apply(t, streamOperation{kind: "identity", before: changed, node: before})
+					flush()
+				}
+
+				for _, kind := range []string{"derp-policy", "policy-order", "policy-duplicate"} {
+					p.apply(t, p.drawOperation(t, kind))
+					flush()
+				}
+
+				for _, viewer := range []types.NodeID{1, 2} {
+					late, err := NewStream(p.cfg, p.hub, viewer, capVer).r.render(old)
+					require.NoError(t, err)
+
+					client := newPropertyClient(&tailcfg.MapResponse{})
+					applyStreamPropertyWire(t, p.hub, client, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
+					checkStreamNodeInputs(t, oldWorld, viewer, client, p.cfg.DNSConfig.BaseDomain, true, first)
+				}
+
+				p.setPolicy(t, 0)
+				flush()
+				require.Nil(t, p.attrIntent, "unrelated policy must clear attribute metadata")
+			})
+		})
+	}
+}
+
+type streamNodeInputFailure struct{ message string }
+
+func (f *streamNodeInputFailure) Errorf(format string, args ...any) {
+	f.message = fmt.Sprintf(format, args...)
+}
+
+func (f *streamNodeInputFailure) FailNow() { panic(f) }
+
+// enableControl removes the fixture's synthetic router session before any
+// public acquisition; map-delivery sessions and control leases are independent.
+func (p *streamPropertySystem) enableControl(t *rapid.T) {
+	require.Nil(t, p.control)
+
+	for _, id := range slices.Sorted(maps.Keys(p.world.Nodes)) {
+		n := p.world.Nodes[id].Clone()
+		n.ActiveSessions, n.IsOnline, n.SessionStart = 0, new(false), time.Time{}
+		p.put(t, n)
+	}
+
+	p.control = make(map[types.NodeID][]uint64)
+}
+
+func (p *streamPropertySystem) inputControl(t *rapid.T, op streamOperation) {
+	require.NotNil(t, p.control, "public sessions require an owned ledger")
+	before, oldWorld := p.state.Snapshot(), p.world.Clone()
+
+	id := op.node.ID
+	if op.kind == "stale-connect" || op.kind == "zero-connect" || op.kind == "missing-connect" {
+		require.Zero(t, p.state.ConnectForMapRequest(id, op.request.NodeKey))
+
+		if op.kind == "missing-connect" {
+			require.Zero(t, p.state.Connect(id))
+		}
+
+		require.Equal(t, before.Rev(), p.state.Snapshot().Rev(), "refused admission published")
+
+		return
+	}
+
+	n := op.before.Clone()
+	require.Len(t, p.control[id], n.ActiveSessions, "owned session count")
+
+	start := time.Now()
+
+	if op.kind == "disconnect" {
+		index := slices.Index(p.control[id], op.epoch)
+		require.NotEqual(t, -1, index, "each acquired lease releases exactly once")
+
+		n.ActiveSessions--
+		if n.ActiveSessions == 0 {
+			n.IsOnline, n.Unhealthy = new(false), false
+		}
+
+		require.NoError(t, p.state.Disconnect(id, op.epoch))
+		p.control[id] = slices.Delete(p.control[id], index, index+1)
+	} else {
+		n.SessionEpoch++
+		n.ActiveSessions++
+		n.IsOnline, n.Unhealthy = new(!propertyExpired(n)), false
+
+		var epoch uint64
+		if op.kind == "connect-request" {
+			epoch = p.state.ConnectForMapRequest(id, op.request.NodeKey)
+		} else {
+			epoch = p.state.Connect(id)
+		}
+
+		require.Equal(t, n.SessionEpoch, epoch, "independent acquisition epoch")
+		p.control[id] = append(p.control[id], epoch)
+	}
+
+	end := time.Now()
+
+	got, ok := p.state.Snapshot().GetNode(id)
+	require.True(t, ok)
+
+	if op.kind == "disconnect" && n.ActiveSessions == 0 {
+		seen := got.LastSeen().Clone()
+		require.NotNil(t, seen)
+		require.False(t, seen.Before(start), "LastSeen precedes release")
+		require.False(t, seen.After(end), "LastSeen follows release")
+		n.LastSeen = new(*seen)
+	} else if op.kind != "disconnect" && op.before.ActiveSessions == 0 {
+		started := got.SessionStart()
+		require.False(t, started.Before(start), "SessionStart precedes admission")
+		require.False(t, started.After(end), "SessionStart follows admission")
+		n.SessionStart = started
+	}
+
+	p.world.Put(n)
+	require.Equal(t, before.Rev()+1, p.state.Snapshot().Rev(), "control publication")
+	propcheck.CheckWorld(t, oldWorld, before, p.probes)
+}
+
+func (p *streamPropertySystem) inputExpiry(t *rapid.T, op streamOperation) {
+	before, oldWorld := p.state.Snapshot(), p.world.Clone()
+
+	var expiry *time.Time
+	if op.node.Expiry != nil {
+		expiry = new(*op.node.Expiry)
+	}
+
+	_, err := p.state.SetNodeExpiry(op.node.ID, expiry)
+	if op.kind == "invalid-expiry" || op.kind == "missing-expiry" {
+		if op.kind == "invalid-expiry" {
+			require.ErrorIs(t, err, types.ErrExpiryOutOfRange)
+		} else {
+			require.ErrorIs(t, err, state.ErrNodeNotInNodeStore)
+		}
+
+		require.Equal(t, before.Rev(), p.state.Snapshot().Rev(), "refused expiry published")
+
+		return
+	}
+
+	require.NoError(t, err)
+
+	n := op.before.Clone()
+
+	n.Expiry = nil
+	if expiry != nil {
+		require.Equal(t, *op.node.Expiry, *expiry, "expiry input mutated")
+		n.Expiry = new(expiry.UTC())
+		*expiry = time.Date(1999, 1, 1, 0, 0, 0, 0, time.UTC)
+	}
+
+	n.IsOnline = new(n.ActiveSessions > 0 && !propertyExpired(n))
+	p.world.Put(n)
+	require.Equal(t, before.Rev()+1, p.state.Snapshot().Rev(), "expiry publication")
+	propcheck.CheckWorld(t, oldWorld, before, p.probes)
+}
+
+// Expected connectivity comes only from owned inputs. The replay contract keeps
+// LastSeen sticky while online, but offline timestamps must remain observable.
+func checkStreamConnectivityInputs(t require.TestingT, world propcheck.World, viewer types.NodeID, client *propertyClient) {
+	wires := make([]*tailcfg.Node, 0, 1+len(client.peers))
+
+	wires = append(wires, client.self)
+	for _, id := range slices.Sorted(maps.Keys(client.peers)) {
+		wires = append(wires, client.peers[id])
+	}
+
+	for _, wire := range wires {
+		require.NotNil(t, wire)
+		n := world.Nodes[types.NodeID(wire.ID)] //nolint:gosec // Fixture IDs are 1..255.
+		require.NotNil(t, n)
+		self := n.ID == viewer
+		expired := propertyExpired(n)
+
+		var expiry time.Time
+		if n.Expiry != nil {
+			expiry = n.Expiry.UTC()
+		}
+
+		require.True(t, expiry.Equal(wire.KeyExpiry), "node %d KeyExpiry", n.ID)
+		require.Equal(t, !self && expired, wire.Expired, "node %d Expired", n.ID)
+		endpoints := n.Endpoints
+
+		var derp tailcfg.DERPRegionID
+		if n.Hostinfo != nil && n.Hostinfo.NetInfo != nil {
+			derp = n.Hostinfo.NetInfo.PreferredDERP
+		}
+
+		if !self && expired {
+			endpoints, derp = nil, 0
+		}
+
+		require.True(t, slices.Equal(endpoints, wire.Endpoints), "node %d Endpoints: want %v got %v", n.ID, endpoints, wire.Endpoints)
+		require.Equal(t, derp, wire.HomeDERP, "node %d HomeDERP", n.ID)
+
+		if self {
+			require.Nil(t, wire.Online, "self Online")
+			require.Nil(t, wire.LastSeen, "self LastSeen")
+
+			continue
+		}
+
+		online := n.IsOnline
+		if expired && n.ActiveSessions > 0 {
+			online = new(true)
+		}
+
+		require.Equal(t, online, wire.Online, "node %d Online", n.ID)
+
+		if online != nil && *online {
+			continue
+		}
+
+		var seen *time.Time
+		if online != nil && n.LastSeen != nil {
+			seen = new(n.LastSeen.UTC())
+		}
+
+		require.Equal(t, seen, wire.LastSeen, "node %d offline LastSeen", n.ID)
+	}
+}
+
+func TestStreamConnectivityInputContracts(t *testing.T) {
+	endpoint := netip.MustParseAddrPort("192.0.2.1:41641")
+	seen := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+	past := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	future := time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name   string
+		expiry *time.Time
+		online *bool
+		count  int
+		peer   *tailcfg.Node
+	}{
+		{"offline", nil, new(false), 0, &tailcfg.Node{ID: 2, Online: new(false), LastSeen: &seen, Endpoints: []netip.AddrPort{endpoint}, HomeDERP: 2}},
+		{"unknown", new(time.Time{}), nil, 0, &tailcfg.Node{ID: 2, Endpoints: []netip.AddrPort{endpoint}, HomeDERP: 2}},
+		{"online-sticky-seen", &future, new(true), 1, &tailcfg.Node{ID: 2, KeyExpiry: future, Online: new(true), LastSeen: &past, Endpoints: []netip.AddrPort{endpoint}, HomeDERP: 2}},
+		{"expired-offline", &past, new(false), 0, &tailcfg.Node{ID: 2, KeyExpiry: past, Expired: true, Online: new(false), LastSeen: &seen}},
+		{"expired-connected", &past, new(false), 2, &tailcfg.Node{ID: 2, KeyExpiry: past, Expired: true, Online: new(true)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := &types.Node{ID: 2, Expiry: tc.expiry, IsOnline: tc.online, ActiveSessions: tc.count, LastSeen: &seen, Endpoints: []netip.AddrPort{endpoint}, Hostinfo: &tailcfg.Hostinfo{NetInfo: &tailcfg.NetInfo{PreferredDERP: 2}}}
+			world := propcheck.World{Nodes: map[types.NodeID]*types.Node{1: {ID: 1}, 2: n}}
+			checkStreamConnectivityInputs(t, world, 1, newPropertyClient(&tailcfg.MapResponse{Node: &tailcfg.Node{ID: 1}, Peers: []*tailcfg.Node{tc.peer}}))
+			self := &tailcfg.Node{ID: 2, KeyExpiry: tc.peer.KeyExpiry, Endpoints: []netip.AddrPort{endpoint}, HomeDERP: 2}
+			checkStreamConnectivityInputs(t, world, 2, newPropertyClient(&tailcfg.MapResponse{Node: self}))
+		})
+	}
+}
+
+func TestRapidStreamControlSessions(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			runRapidStreamSystem(t, mode, "connect", "connect-request", "disconnect", "stale-connect", "zero-connect", "missing-connect", "public-expiry", "utc-expiry", "invalid-expiry", "missing-expiry", "health", "endpoints", "request-hostinfo", "policy", "dns", "derp", "noop")
+		})
+	}
+}
+
+func TestStreamControlSessionHistory(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			rapid.Check(t, func(t *rapid.T) {
+				p := newStreamPropertySystem(t, mode)
+				p.setPolicy(t, 0)
+
+				route := netip.MustParsePrefix("10.0.0.0/24")
+
+				for _, id := range []types.NodeID{2, 3} {
+					n := p.world.Nodes[id].Clone()
+					n.Hostinfo.RoutableIPs, n.ApprovedRoutes = []netip.Prefix{route}, []netip.Prefix{route}
+					n.Hostinfo.NetInfo = &tailcfg.NetInfo{PreferredDERP: 2}
+					n.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.2:41641")}
+					n.Unhealthy = true
+					p.put(t, n)
+				}
+
+				p.enableControl(t)
+
+				for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+					p.update(t, id, p.state.Snapshot(), 0)
+				}
+
+				phase := func(kind string, id types.NodeID, epoch uint64, expiry *time.Time, winner uint64) {
+					t.Logf("control phase %s node=%d epoch=%d", kind, id, epoch)
+
+					old, oldWorld := p.state.Snapshot(), p.world.Clone()
+					oldMap, err := NewStream(p.cfg, p.hub, 1, capVer).r.render(old)
+					require.NoError(t, err)
+
+					oldClient := newPropertyClient(&tailcfg.MapResponse{})
+					applyStreamPropertyWire(t, p.hub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, oldMap)})
+					checkStreamConnectivityInputs(t, oldWorld, 1, oldClient)
+
+					n := p.world.Nodes[id].Clone()
+
+					op := streamOperation{kind: kind, node: n, before: n.Clone(), epoch: epoch, request: tailcfg.MapRequest{NodeKey: n.NodeKey}}
+					if strings.Contains(kind, "expiry") {
+						op.node.Expiry = expiry
+					}
+
+					if kind == "health" {
+						op.node.Unhealthy = true
+					}
+
+					if kind == "zero-connect" {
+						op.request.NodeKey = key.NodePublic{}
+					}
+
+					if kind == "stale-connect" {
+						op.request.NodeKey = p.world.Nodes[1].NodeKey
+					}
+
+					if strings.HasPrefix(kind, "missing-") {
+						op.node.ID = maxStreamPropertyNodeID + 1
+					}
+
+					p.apply(t, op)
+					snap := p.state.Snapshot()
+					all, wake := Route(old, snap, snap.Since(old))
+					p.hub.advance(snap)
+
+					for _, viewer := range slices.Sorted(maps.Keys(p.sessions)) {
+						if _, named := wake[viewer]; all || named {
+							p.update(t, viewer, snap, 0)
+						}
+					}
+
+					p.check(t, snap)
+					require.Equal(t, winner, p.routes.Global[route], "mandatory route election")
+					propcheck.CheckWorld(t, oldWorld, old, p.probes)
+					lateMap, err := NewStream(p.cfg, p.hub, 1, capVer).r.render(old)
+					require.NoError(t, err)
+
+					lateClient := newPropertyClient(&tailcfg.MapResponse{})
+					applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, lateMap)})
+					checkStreamConnectivityInputs(t, oldWorld, 1, lateClient)
+					lateClient.check(t, oldClient)
+				}
+
+				phase("connect", 2, 0, nil, 2)
+
+				first := p.control[2][0]
+
+				phase("connect-request", 2, 0, nil, 2)
+
+				second := p.control[2][1]
+
+				phase("connect-request", 3, 0, nil, 2)
+
+				third := p.control[3][0]
+
+				phase("disconnect", 2, second, nil, 2)
+				phase("disconnect", 2, first, nil, 3)
+
+				past := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+				phase("public-expiry", 3, 0, &past, 3)
+				phase("public-expiry", 3, 0, nil, 3)
+				phase("public-expiry", 3, 0, &past, 3)
+				phase("public-expiry", 3, 0, new(time.Time{}), 3)
+				phase("public-expiry", 2, 0, &past, 3)
+				phase("connect-request", 2, 0, nil, 3)
+
+				fourth := p.control[2][0]
+
+				phase("utc-expiry", 2, 0, new(time.Date(9999, 1, 1, 0, 0, 0, 0, time.FixedZone("input", 3600))), 3)
+
+				for _, kind := range []string{"stale-connect", "zero-connect", "missing-connect", "missing-expiry"} {
+					phase(kind, 2, 0, nil, 3)
+				}
+
+				for _, year := range []int{-1, 10000} {
+					phase("invalid-expiry", 2, 0, new(time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)), 3)
+				}
+
+				phase("disconnect", 3, third, nil, 2)
+				phase("health", 2, 0, nil, 2)
+				phase("disconnect", 2, fourth, nil, 2)
+
+				for _, id := range []types.NodeID{2, 3} {
+					require.Empty(t, p.control[id])
+					require.Zero(t, p.world.Nodes[id].ActiveSessions)
+					require.Equal(t, new(false), p.world.Nodes[id].IsOnline)
+				}
+				// Every unwoken client was checked before a reconnect can repair it.
+				p.open(t, 1, p.state.Snapshot(), false)
+				p.check(t, p.state.Snapshot())
+			})
+		})
+	}
+}
+
+// releaseControls balances every acquired lease before the shared driver finishes.
+func (p *streamPropertySystem) releaseControls(t *rapid.T, last *state.Snapshot) {
+	if p.control == nil {
+		return
+	}
+
+	for _, id := range slices.Sorted(maps.Keys(p.control)) {
+		for _, epoch := range slices.Clone(p.control[id]) {
+			n := p.world.Nodes[id].Clone()
+			p.apply(t, streamOperation{kind: "disconnect", node: n, before: n.Clone(), epoch: epoch})
+		}
+	}
+
+	snap := p.state.Snapshot()
+	all, wake := Route(last, snap, snap.Since(last))
+	p.hub.advance(snap)
+
+	for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+		if _, named := wake[id]; !p.sessions[id].down && (all || named) {
+			p.update(t, id, snap, 0)
+		}
+	}
+
+	p.check(t, snap)
+}
+
+// Only require assertion panics count as corruption detection.
+type streamConnectivityFailure struct{ message string }
+
+func (f *streamConnectivityFailure) Errorf(format string, args ...any) {
+	f.message = fmt.Sprintf(format, args...)
+}
+
+func (f *streamConnectivityFailure) FailNow() { panic(f) }
+
+func TestStreamConnectivityRejectsCorruptions(t *testing.T) {
+	past := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	seen := propertyEpoch
+	endpoint := netip.MustParseAddrPort("192.0.2.1:41641")
+	world := propcheck.World{Nodes: map[types.NodeID]*types.Node{
+		1: {ID: 1, Expiry: &past, Endpoints: []netip.AddrPort{endpoint}, Hostinfo: &tailcfg.Hostinfo{NetInfo: &tailcfg.NetInfo{PreferredDERP: 2}}},
+		2: {ID: 2, Expiry: &past, ActiveSessions: 1, IsOnline: new(false)},
+		3: {ID: 3, IsOnline: new(false), LastSeen: &seen},
+	}}
+	initial := &tailcfg.MapResponse{
+		Node: &tailcfg.Node{ID: 1, KeyExpiry: past, Endpoints: []netip.AddrPort{endpoint}, HomeDERP: 2},
+		Peers: []*tailcfg.Node{
+			{ID: 2, KeyExpiry: past, Expired: true, Online: new(true)},
+			{ID: 3, Online: new(false), LastSeen: &seen},
+		},
+	}
+	checkStreamConnectivityInputs(t, world, 1, newPropertyClient(initial))
+
+	for _, tc := range []struct {
+		name, message string
+		corrupt       func(*propertyClient)
+	}{
+		{"expiry-clear", "KeyExpiry", func(c *propertyClient) { c.peers[2].KeyExpiry = time.Time{} }},
+		{"expired-clear", "Expired", func(c *propertyClient) { c.peers[2].Expired = false }},
+		{"expired-online", "Online", func(c *propertyClient) { c.peers[2].Online = new(false) }},
+		{"expired-endpoints", "Endpoints", func(c *propertyClient) { c.peers[2].Endpoints = []netip.AddrPort{endpoint} }},
+		{"expired-derp", "HomeDERP", func(c *propertyClient) { c.peers[2].HomeDERP = 2 }},
+		{"offline-seen", "LastSeen", func(c *propertyClient) { c.peers[3].LastSeen = nil }},
+		{"offline-stale-seen", "LastSeen", func(c *propertyClient) { c.peers[3].LastSeen = &past }},
+		{"offline-online", "Online", func(c *propertyClient) { c.peers[3].Online = new(true) }},
+		{"self-expired", "Expired", func(c *propertyClient) { c.self.Expired = true }},
+		{"self-endpoints", "Endpoints", func(c *propertyClient) { c.self.Endpoints = nil }},
+		{"self-derp", "HomeDERP", func(c *propertyClient) { c.self.HomeDERP = 0 }},
+		{"self-online", "self Online", func(c *propertyClient) { c.self.Online = new(true) }},
+		{"self-seen", "self LastSeen", func(c *propertyClient) { c.self.LastSeen = &seen }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newPropertyClient(initial)
+			tc.corrupt(client)
+
+			failure := &streamConnectivityFailure{}
+			require.PanicsWithValue(t, failure, func() { checkStreamConnectivityInputs(failure, world, 1, client) })
+			require.Contains(t, failure.message, tc.message)
+		})
+	}
+}
+
+// The mandatory prefix exercises change, repeat, omission, clear and restore on both nodes.
+func (p *streamPropertySystem) drawConcurrentRequests(t *rapid.T) [][2]tailcfg.MapRequest {
+	var positive, omitted, cleared, lite [2]tailcfg.MapRequest
+	for i := range positive {
+		n := p.world.Nodes[types.NodeID(i+1)]
+		positive[i] = tailcfg.MapRequest{
+			NodeKey: n.NodeKey, DiscoKey: n.DiscoKey,
+			Endpoints: []netip.AddrPort{netip.AddrPortFrom(*n.IPv4, rapid.Uint16Range(1, 65535).Draw(t, "request port"))},
+			Hostinfo: &tailcfg.Hostinfo{
+				Hostname: n.Hostname, OS: rapid.SampledFrom([]string{"linux", "windows", "darwin"}).Draw(t, "request OS"),
+				Services: []tailcfg.Service{{Proto: "tcp", Port: rapid.Uint16Range(1, 65535).Draw(t, "service port")}},
+				NetInfo:  &tailcfg.NetInfo{PreferredDERP: rapid.SampledFrom([]tailcfg.DERPRegionID{1, 2, 3}).Draw(t, "request DERP")},
+			},
+		}
+		omitted[i] = positive[i]
+		omitted[i].Hostinfo = positive[i].Hostinfo.Clone()
+		omitted[i].Hostinfo.NetInfo = nil
+		cleared[i] = positive[i]
+		cleared[i].Endpoints = []netip.AddrPort{}
+		cleared[i].Hostinfo = &tailcfg.Hostinfo{Hostname: n.Hostname, OS: "linux", NetInfo: &tailcfg.NetInfo{}}
+		lite[i] = tailcfg.MapRequest{NodeKey: n.NodeKey, DiscoKey: n.DiscoKey}
+	}
+
+	return [][2]tailcfg.MapRequest{positive, positive, omitted, lite, cleared, cleared, positive, {cleared[0], positive[1]}, positive}
+}
+
+// Distinct nodes commute in this bounded domain; only the counter assignment is unordered.
+func (p *streamPropertySystem) concurrentRequests(t *rapid.T, requests [2]tailcfg.MapRequest) {
+	before, audits := p.state.Snapshot(), state.PolicyAuditFailures()
+
+	var (
+		expected                  [2]*types.Node
+		changed                   [2]bool
+		submitted                 [2]tailcfg.MapRequest
+		started, ended            [2]time.Time
+		errs                      [2]error
+		wantCounters, gotCounters []uint64
+	)
+
+	for i, req := range requests {
+		n := p.world.Nodes[types.NodeID(i+1)]
+		expected[i], changed[i] = p.expectRequest(t, streamOperation{before: n, request: req})
+		submitted[i] = req
+
+		submitted[i].Hostinfo, submitted[i].Endpoints = req.Hostinfo.Clone(), slices.Clone(req.Endpoints)
+		if changed[i] {
+			wantCounters = append(wantCounters, p.reportSeq+uint64(len(wantCounters))+1)
+		}
+	}
+
+	start := make(chan struct{})
+
+	var workers sync.WaitGroup
+	for i := range requests {
+		workers.Go(func() {
+			<-start
+
+			started[i] = time.Now()
+			errs[i] = p.state.UpdateNodeFromMapRequest(expected[i].ID, submitted[i])
+			ended[i] = time.Now()
+		})
+	}
+
+	close(start)
+	workers.Wait()
+
+	final := p.state.Snapshot()
+	require.GreaterOrEqual(t, final.Rev(), before.Rev()+1, "every request stamps LastSeen")
+	require.LessOrEqual(t, final.Rev(), before.Rev()+2, "two writes may share one commit")
+	require.Equal(t, audits, state.PolicyAuditFailures(), "concurrent request policy audit")
+
+	for i, n := range expected {
+		require.NoError(t, errs[i])
+		require.Equal(t, requests[i], submitted[i], "State mutated the submitted request")
+
+		got, ok := final.GetNode(n.ID)
+		require.True(t, ok)
+
+		seen := got.LastSeen().Clone()
+		require.NotNil(t, seen)
+		require.False(t, seen.Before(started[i]), "LastSeen precedes request")
+		require.False(t, seen.After(ended[i]), "LastSeen follows request completion")
+		n.LastSeen = new(*seen)
+
+		if changed[i] {
+			require.Greater(t, got.ReportGen(), p.reportSeq, "changed report exceeds old global bound")
+			gotCounters = append(gotCounters, got.ReportGen())
+		} else {
+			require.Equal(t, n.ReportGen, got.ReportGen(), "content repeat retains ReportGen")
+		}
+	}
+	// world.update retries only panicked batches; this domain has no panic-producing inputs.
+	require.ElementsMatch(t, wantCounters, gotCounters, "exact substantive report counter permutation")
+	p.reportSeq += uint64(len(wantCounters))
+
+	for i, n := range expected {
+		got, _ := final.GetNode(n.ID)
+		n.ReportGen = got.ReportGen()
+		p.world.Put(n)
+
+		if submitted[i].Hostinfo != nil {
+			submitted[i].Hostinfo.Hostname = "mutated-after-request"
+			if submitted[i].Hostinfo.NetInfo != nil {
+				submitted[i].Hostinfo.NetInfo.PreferredDERP = 99
+			}
+
+			if len(submitted[i].Hostinfo.Services) > 0 {
+				submitted[i].Hostinfo.Services[0].Port++
+			}
+		}
+
+		if len(submitted[i].Endpoints) > 0 {
+			submitted[i].Endpoints[0] = netip.MustParseAddrPort("192.0.2.99:1")
+		}
+	}
+}
+
+// Both orders are input-owned; omissions may legally retain the other writer's fields.
+type streamRequestOutcome struct {
+	node      *types.Node
+	reportSeq uint64
+}
+
+type streamRequestCall struct {
+	started, ended    time.Time
+	invoked, returned uint64
+}
+
+func (p *streamPropertySystem) sameNodeRequestOutcomes(t *rapid.T, requests [2]tailcfg.MapRequest) [2]streamRequestOutcome {
+	var outcomes [2]streamRequestOutcome
+	for last := range outcomes {
+		n, seq := p.world.Nodes[1].Clone(), p.reportSeq
+
+		for _, i := range [2]int{1 - last, last} {
+			var changed bool
+
+			n, changed = p.expectRequest(t, streamOperation{before: n, request: requests[i]})
+			if changed {
+				seq++
+				n.ReportGen = seq
+			}
+		}
+
+		outcomes[last] = streamRequestOutcome{node: n, reportSeq: seq}
+	}
+
+	return outcomes
+}
+
+func checkStreamSameNodeOutcome(t require.TestingT, outcomes [2]streamRequestOutcome, got *types.Node, calls [2]streamRequestCall) streamRequestOutcome {
+	require.NotNil(t, got.LastSeen, "same-node LastSeen")
+
+	for last, outcome := range outcomes {
+		call := calls[last]
+		if call.returned < calls[1-last].invoked || got.LastSeen.Before(call.started) || got.LastSeen.After(call.ended) {
+			continue
+		}
+
+		want := outcome.node.Clone()
+
+		want.LastSeen = new(*got.LastSeen)
+		if reflect.DeepEqual(want, got) {
+			return streamRequestOutcome{node: want, reportSeq: outcome.reportSeq}
+		}
+	}
+
+	require.FailNow(t, "same-node outcome outside both input-owned orders", "got: %+v; candidates: %+v / %+v", got, outcomes[0].node, outcomes[1].node)
+
+	return streamRequestOutcome{}
+}
+
+func (p *streamPropertySystem) drawSameNodeRequests(t *rapid.T) [][2]tailcfg.MapRequest {
+	positive := p.drawConcurrentRequests(t)[0]
+	a, b := positive[0], positive[1]
+	b.NodeKey, b.DiscoKey, b.Hostinfo.Hostname = a.NodeKey, a.DiscoKey, a.Hostinfo.Hostname
+	// Endpoint addresses already differ; these fields must conflict even after shrinking.
+	b.Hostinfo.OS = "linux"
+	if a.Hostinfo.OS == b.Hostinfo.OS {
+		b.Hostinfo.OS = "windows"
+	}
+
+	b.Hostinfo.Services[0].Port = a.Hostinfo.Services[0].Port%65535 + 1
+	b.Hostinfo.NetInfo.PreferredDERP = a.Hostinfo.NetInfo.PreferredDERP%3 + 1
+	omittedA, omittedB := a, b
+	omittedA.Hostinfo, omittedB.Hostinfo = a.Hostinfo.Clone(), b.Hostinfo.Clone()
+	omittedA.Hostinfo.NetInfo, omittedB.Hostinfo.NetInfo = nil, nil
+	lite := tailcfg.MapRequest{NodeKey: a.NodeKey, DiscoKey: a.DiscoKey}
+	cleared := lite
+	cleared.Endpoints = []netip.AddrPort{}
+	cleared.Hostinfo = &tailcfg.Hostinfo{Hostname: a.Hostinfo.Hostname, OS: "linux", NetInfo: &tailcfg.NetInfo{}}
+
+	return [][2]tailcfg.MapRequest{{a, b}, {a, a}, {a, a}, {a, omittedB}, {a, lite}, {b, omittedA}, {cleared, cleared}, {cleared, cleared}, {a, a}}
+}
+
+func (p *streamPropertySystem) concurrentSameNodeRequests(t *rapid.T, requests [2]tailcfg.MapRequest) {
+	before, audits := p.state.Snapshot(), state.PolicyAuditFailures()
+	outcomes := p.sameNodeRequestOutcomes(t, requests)
+
+	var submitted [2]tailcfg.MapRequest
+	for i, req := range requests {
+		submitted[i] = req
+		submitted[i].Hostinfo, submitted[i].Endpoints = req.Hostinfo.Clone(), slices.Clone(req.Endpoints)
+	}
+
+	var (
+		calls   [2]streamRequestCall
+		errs    [2]error
+		events  atomic.Uint64
+		workers sync.WaitGroup
+	)
+
+	start := make(chan struct{})
+
+	for i := range submitted {
+		workers.Go(func() {
+			<-start
+
+			calls[i].invoked = events.Add(1)
+			calls[i].started = time.Now()
+			errs[i] = p.state.UpdateNodeFromMapRequest(1, submitted[i])
+			calls[i].ended = time.Now()
+			calls[i].returned = events.Add(1)
+		})
+	}
+
+	close(start)
+	workers.Wait()
+
+	final := p.state.Snapshot()
+	require.GreaterOrEqual(t, final.Rev(), before.Rev()+1, "every request stamps LastSeen")
+	require.LessOrEqual(t, final.Rev(), before.Rev()+2, "two writes may share one commit")
+	require.Equal(t, audits, state.PolicyAuditFailures(), "same-node policy audit")
+
+	for i := range requests {
+		require.NoError(t, errs[i])
+		require.Equal(t, requests[i], submitted[i], "State mutated the submitted request")
+	}
+
+	got, ok := final.GetNode(1)
+	require.True(t, ok)
+	outcome := checkStreamSameNodeOutcome(t, outcomes, got.AsStruct(), calls)
+	p.world.Put(outcome.node)
+	p.reportSeq = outcome.reportSeq
+
+	for _, req := range submitted {
+		if req.Hostinfo != nil {
+			req.Hostinfo.Hostname = "mutated-after-request"
+			if req.Hostinfo.NetInfo != nil {
+				req.Hostinfo.NetInfo.PreferredDERP = 99
+			}
+
+			if len(req.Hostinfo.Services) > 0 {
+				req.Hostinfo.Services[0].Port++
+			}
+		}
+
+		if len(req.Endpoints) > 0 {
+			req.Endpoints[0] = netip.MustParseAddrPort("192.0.2.99:1")
+		}
+	}
+}
+
+func TestRapidStreamSameNodeRequests(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+	rapid.Check(t, func(t *rapid.T) {
+		rapid.SyncTest(t, func(t *rapid.T) { checkStreamConcurrentInputs(t, "same-node") })
+	})
+}
+
+func TestStreamSameNodeRequestContracts(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		n := &types.Node{ID: 1, Hostname: "node-1", GivenName: "node-1", ReportGen: 17, Hostinfo: &tailcfg.Hostinfo{Hostname: "node-1", OS: "linux"}}
+		p := &streamPropertySystem{world: propcheck.World{Nodes: map[types.NodeID]*types.Node{1: n}}, reportSeq: 17}
+		a := tailcfg.MapRequest{Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1")}, Hostinfo: &tailcfg.Hostinfo{Hostname: n.Hostname, OS: "windows", NetInfo: &tailcfg.NetInfo{PreferredDERP: 1}}}
+		b := tailcfg.MapRequest{Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.2:2")}, Hostinfo: &tailcfg.Hostinfo{Hostname: n.Hostname, OS: "darwin", NetInfo: &tailcfg.NetInfo{PreferredDERP: 2}}}
+		outcomes := p.sameNodeRequestOutcomes(t, [2]tailcfg.MapRequest{a, b})
+		calls := [2]streamRequestCall{{propertyEpoch, propertyEpoch, 1, 3}, {propertyEpoch, propertyEpoch, 2, 4}}
+
+		for _, outcome := range outcomes {
+			got := outcome.node.Clone()
+			got.LastSeen = new(propertyEpoch)
+			require.Equal(t, uint64(19), checkStreamSameNodeOutcome(t, outcomes, got, calls).reportSeq)
+		}
+
+		for _, corruption := range []string{"missing-last-write", "hybrid", "counter", "timestamp", "real-time"} {
+			got, intervals := outcomes[0].node.Clone(), calls
+			got.LastSeen = new(propertyEpoch)
+
+			switch corruption {
+			case "missing-last-write":
+				got, _ = p.expectRequest(t, streamOperation{before: n, request: a})
+				got.ReportGen, got.LastSeen = 18, new(propertyEpoch)
+			case "hybrid":
+				got.Hostinfo = outcomes[1].node.Hostinfo.Clone()
+			case "counter":
+				got.ReportGen++
+			case "timestamp":
+				intervals[0].started, intervals[0].ended = propertyEpoch.Add(time.Second), propertyEpoch.Add(time.Second)
+			case "real-time":
+				intervals[0].returned, intervals[1].invoked = 2, 3
+			}
+
+			failure := &streamConnectivityFailure{}
+			require.PanicsWithValue(t, failure, func() { checkStreamSameNodeOutcome(failure, outcomes, got, intervals) }, corruption)
+			require.Contains(t, failure.message, "same-node outcome", corruption)
+		}
+		// Omitted NetInfo legally mixes B's endpoint/OS with A's DERP.
+		b.Hostinfo.NetInfo = nil
+		outcomes = p.sameNodeRequestOutcomes(t, [2]tailcfg.MapRequest{a, b})
+		mixed := outcomes[1].node.Clone()
+		require.True(t, slices.Equal(b.Endpoints, mixed.Endpoints))
+		require.Equal(t, b.Hostinfo.OS, mixed.Hostinfo.OS)
+		require.Equal(t, a.Hostinfo.NetInfo.PreferredDERP, mixed.Hostinfo.NetInfo.PreferredDERP)
+		mixed.LastSeen = new(propertyEpoch)
+		checkStreamSameNodeOutcome(t, outcomes, mixed, calls)
+	})
+}
+
+func TestRapidStreamConcurrentInputs(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+	rapid.Check(t, func(t *rapid.T) {
+		rapid.SyncTest(t, func(t *rapid.T) { checkStreamConcurrentInputs(t, "policy-dns") })
+	})
+}
+
+func TestRapidStreamConcurrentRequests(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+	rapid.Check(t, func(t *rapid.T) {
+		rapid.SyncTest(t, func(t *rapid.T) { checkStreamConcurrentInputs(t, "requests") })
+	})
+}
+
+func checkStreamConcurrentInputs(t *rapid.T, mode string) {
+	p := newStreamPropertySystem(t)
+	if mode != "policy-dns" {
+		p.setPolicy(t, 0)
+	} else {
+		p.setPolicy(t, 1)
+	}
+
+	ids := slices.Sorted(maps.Keys(p.sessions))
+	frozenDNS := make(map[types.NodeID]*tailcfg.DNSConfig, len(ids))
+
+	for _, id := range ids {
+		p.update(t, id, p.state.Snapshot(), 0)
+		frozenDNS[id] = p.sessions[id].client.dns.Clone()
+	}
+
+	var (
+		phases []streamOperation
+		pairs  [][2]tailcfg.MapRequest
+	)
+
+	switch mode {
+	case "same-node":
+		pairs = p.drawSameNodeRequests(t)
+	case "requests":
+		pairs = p.drawConcurrentRequests(t)
+	default:
+		// Draw the complete history before starting any concurrent input workers.
+		records := []tailcfg.DNSRecord{{Name: "service.example.com", Type: "A", Value: fmt.Sprintf("100.64.0.%d", rapid.ByteRange(1, 254).Draw(t, "DNS witness"))}}
+		equivalent := slices.Clone(records)
+		equivalent[0].Name = strings.ToUpper(equivalent[0].Name)
+
+		phases = append(phases, []streamOperation{
+			{kind: "allow-and-DNS", policy: 0, records: records},
+			{kind: "canonical-noop", policy: 0, records: equivalent},
+			{kind: "deny-and-clear", policy: 1},
+			{kind: "empty-noop", policy: 1, records: []tailcfg.DNSRecord{}},
+			{kind: "restore", policy: 0, records: records},
+			{kind: "policy-only", policy: 2, records: records},
+			{kind: "DNS-only", policy: 2},
+		}...)
+		for range rapid.IntRange(0, 4).Draw(t, "concurrent suffix") {
+			phases = append(phases, streamOperation{kind: "generated", policy: rapid.IntRange(0, 2).Draw(t, "concurrent policy"), records: propcheck.DrawDNSRecords(t)})
+		}
+	}
+
+	sub := p.state.Subscribe()
+	before := p.state.Snapshot()
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+
+		p.hub.watch(p.state, sub, before)
+	}()
+
+	t.Cleanup(func() { p.hub.Close(); <-finished })
+	synctest.Wait()
+
+	for _, pair := range pairs {
+		p.concurrentInputDelivery(t, frozenDNS, func() {
+			if mode == "same-node" {
+				p.concurrentSameNodeRequests(t, pair)
+			} else {
+				p.concurrentRequests(t, pair)
+			}
+		})
+	}
+
+	for _, op := range phases {
+		t.Logf("concurrent phase %s", op.kind)
+		p.concurrentPolicyDNS(t, op, frozenDNS)
+	}
+}
+
+// These public writes own different graph inputs; nodes/users stay fixed and
+// simple policies neither read DNS nor approve routes. Only final delivery is modeled.
+func (p *streamPropertySystem) concurrentPolicyDNS(t *rapid.T, op streamOperation, frozenDNS map[types.NodeID]*tailcfg.DNSConfig) {
+	p.concurrentInputDelivery(t, frozenDNS, func() {
+		before := p.state.Snapshot()
+		doc := []byte(streamPropertyPolicies[op.policy])
+		submittedDoc, submittedRecords := slices.Clone(doc), slices.Clone(op.records)
+		wantRecords := propcheck.CanonicalDNSRecords(op.records)
+		policyChanged := !bytes.Equal(p.policyDoc, doc)
+
+		wantRev := before.Rev()
+		if policyChanged {
+			wantRev++
+		}
+
+		if !slices.Equal(p.dnsRecords, wantRecords) {
+			wantRev++
+		}
+
+		audits := state.PolicyAuditFailures()
+		start := make(chan struct{})
+
+		var changed bool
+
+		var policyErr error
+
+		var workers sync.WaitGroup
+
+		workers.Go(func() {
+			<-start
+
+			changed, policyErr = p.state.SetPolicy(submittedDoc)
+		})
+		workers.Go(func() {
+			<-start
+			p.state.SetExtraRecords(submittedRecords)
+		})
+		close(start)
+		workers.Wait()
+
+		// No Rapid calls or owned-model writes run in the input goroutines.
+		require.NoError(t, policyErr)
+		require.Equal(t, policyChanged, changed, "concurrent policy acceptance")
+		require.Equal(t, doc, submittedDoc, "policy input mutated")
+		require.Equal(t, op.records, submittedRecords, "DNS input mutated")
+		p.policy, p.policyDoc, p.dnsRecords = op.policy, doc, wantRecords
+		require.Equal(t, wantRev, p.state.Snapshot().Rev(), "independent input publications")
+		require.Equal(t, audits, state.PolicyAuditFailures(), "concurrent policy audit")
+
+		// Reusing caller buffers must not alter current or retained input snapshots.
+		submittedDoc[0] = '!'
+
+		if len(submittedRecords) > 0 {
+			submittedRecords[0].Value = "192.0.2.99"
+		}
+
+		synctest.Wait()
+
+		for _, session := range p.sessions {
+			if len(session.stream.sess.Wakes()) > 0 {
+				require.NotEqual(t, wantRev, before.Rev(), "equivalent inputs must not wake clients")
+			}
+		}
+	})
+}
+
+// Keep the same retained-input and actual subscription checks for both public write pairs.
+func (p *streamPropertySystem) concurrentInputDelivery(t *rapid.T, frozenDNS map[types.NodeID]*tailcfg.DNSConfig, write func()) {
+	before := p.state.Snapshot()
+	old := *p
+	old.world, old.policyDoc, old.dnsRecords = p.world.Clone(), slices.Clone(p.policyDoc), slices.Clone(p.dnsRecords)
+	viewer := types.NodeID(1)
+	version := p.sessions[viewer].capVer
+	retained, err := NewStream(p.cfg, p.hub, viewer, version).r.render(before)
+	require.NoError(t, err)
+
+	oldClient := newPropertyClient(&tailcfg.MapResponse{})
+	applyStreamPropertyWire(t, p.hub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, retained)})
+	old.checkSession(t, viewer, before, &streamPropertySession{client: oldClient, capVer: version})
+	checkStreamDNSInputs(t, frozenDNS[viewer], old.dnsRecords, oldClient)
+
+	write()
+
+	synctest.Wait()
+
+	final := p.state.Snapshot()
+	p.checkWorld(t)
+
+	for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+		select {
+		case <-p.sessions[id].stream.sess.Wakes():
+			p.update(t, id, final, 0)
+		default:
+		}
+
+		// Unwoken clients must already contain both final accepted inputs.
+		p.checkSession(t, id, final, p.sessions[id])
+		checkStreamDNSInputs(t, frozenDNS[id], p.dnsRecords, p.sessions[id].client)
+	}
+
+	p.checkHistory(t)
+	propcheck.CheckWorld(t, old.world, before, p.probes)
+	require.Equal(t, string(old.policyDoc), string(before.PolicySource()), "retained policy input")
+	require.True(t, slices.Equal(old.dnsRecords, before.DNS().ExtraRecords().AsSlice()), "retained DNS input")
+
+	late, err := NewStream(p.cfg, p.hub, viewer, version).r.render(before)
+	require.NoError(t, err)
+
+	lateClient := newPropertyClient(&tailcfg.MapResponse{})
+	applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, late)})
+
+	for _, client := range []*propertyClient{oldClient, lateClient} {
+		old.checkSession(t, viewer, before, &streamPropertySession{client: client, capVer: version})
+		checkStreamDNSInputs(t, frozenDNS[viewer], old.dnsRecords, client)
+	}
+
+	lateClient.check(t, oldClient)
+}
+
+func checkStreamRequestHostinfo(t require.TestingT, world propcheck.World, client *propertyClient) {
+	for _, id := range slices.Sorted(maps.Keys(world.Nodes)) {
+		input, wire := world.Nodes[id], client.peers[id.NodeID()]
+		if id.NodeID() == client.self.ID {
+			wire = client.self
+		}
+
+		if wire == nil {
+			continue
+		}
+
+		if input.Hostinfo == nil {
+			require.False(t, wire.Hostinfo.Valid(), "Hostinfo absent from owned inputs")
+			continue
+		}
+
+		require.True(t, wire.Hostinfo.Valid(), "Hostinfo present in owned inputs")
+		require.Equal(t, input.Hostinfo.Hostname, wire.Hostinfo.Hostname(), "request Hostname")
+
+		services := slices.Clone(input.Hostinfo.Services)
+		if wire.ID != client.self.ID {
+			services = slices.DeleteFunc(services, func(service tailcfg.Service) bool { return service.Proto == tailcfg.PeerAPIDNS })
+
+			require.Equal(t, input.Hostinfo.OS, wire.Hostinfo.OS(), "request peer OS")
+		}
+
+		require.True(t, slices.EqualFunc(services, wire.Hostinfo.Services().AsSlice(), func(a, b tailcfg.Service) bool { return reflect.DeepEqual(a, b) }), "request Services")
+	}
+}
+
+func TestStreamConcurrentRequestContracts(t *testing.T) {
+	hi := &tailcfg.Hostinfo{Hostname: "reported", OS: "linux", Services: []tailcfg.Service{{Proto: "tcp", Port: 443}, {Proto: tailcfg.PeerAPIDNS, Port: 1}}}
+	peerInfo := hi.Clone()
+	peerInfo.Services = peerInfo.Services[:1]
+	world := propcheck.World{Nodes: map[types.NodeID]*types.Node{1: {Hostinfo: hi.Clone()}, 2: {Hostinfo: hi.Clone()}}}
+	client := newPropertyClient(&tailcfg.MapResponse{
+		Node: &tailcfg.Node{ID: 1, Hostinfo: hi.Clone().View()}, Peers: []*tailcfg.Node{{ID: 2, Hostinfo: peerInfo.View()}},
+	})
+	checkStreamRequestHostinfo(t, world, client)
+
+	for _, present := range []bool{false, true} {
+		want, wire := world.Clone(), *client
+		wire.self = client.self.Clone()
+
+		if present {
+			wire.self.Hostinfo = tailcfg.HostinfoView{}
+		} else {
+			want.Nodes[1].Hostinfo = nil
+		}
+
+		failure := &streamConnectivityFailure{}
+		require.PanicsWithValue(t, failure, func() { checkStreamRequestHostinfo(failure, want, &wire) })
+		require.Contains(t, failure.message, "Hostinfo")
+	}
+
+	for _, services := range [][]tailcfg.Service{nil, {}, {{Proto: tailcfg.PeerAPIDNS, Port: 1}}} {
+		inputs, wire := world.Clone(), *client
+		inputs.Nodes[2].Hostinfo.Services = services
+		wire.peers = maps.Clone(client.peers)
+		wire.peers[2] = client.peers[2].Clone()
+		info := peerInfo.Clone()
+		info.Services = nil
+		wire.peers[2].Hostinfo = info.View()
+		checkStreamRequestHostinfo(t, inputs, &wire)
+	}
+
+	for _, field := range []string{"Hostname", "OS", "Services"} {
+		t.Run(field, func(t *testing.T) {
+			corrupt := peerInfo.Clone()
+
+			switch field {
+			case "Hostname":
+				corrupt.Hostname = "stale"
+			case "OS":
+				corrupt.OS = "windows"
+			case "Services":
+				corrupt.Services = nil
+			}
+
+			client.peers[2].Hostinfo = corrupt.View()
+			failure := &streamConnectivityFailure{}
+			require.PanicsWithValue(t, failure, func() { checkStreamRequestHostinfo(failure, world, client) })
+			require.Contains(t, failure.message, field)
+		})
+	}
+}
+
+// ExtraRecords come from owned inputs; other DNS fields retain the completed
+// baseline settings. This checks preservation, not independent startup rendering.
+func checkStreamDNSInputs(t require.TestingT, frozen *tailcfg.DNSConfig, records []tailcfg.DNSRecord, client *propertyClient) {
+	require.NotNil(t, client.dns, "DNS config missing")
+
+	want := frozen.Clone()
+	want.ExtraRecords = propcheck.CanonicalDNSRecords(records)
+	require.Equal(t, wireJSON(t, want), wireJSON(t, client.dns), "DNS inputs and frozen settings")
+}
+
+func TestStreamConcurrentInputContracts(t *testing.T) {
+	world := propcheck.World{Nodes: map[types.NodeID]*types.Node{
+		1: {ID: 1, IPv4: new(netip.MustParseAddr("100.64.0.1"))},
+		2: {ID: 2, IPv4: new(netip.MustParseAddr("100.64.0.2"))},
+	}}
+	allow, deny := streamPacketIntent(world, 0, nil), streamPacketIntent(world, 1, nil)
+	frozen := &tailcfg.DNSConfig{Proxied: true, Domains: []string{"headscale.test"}, Routes: map[string][]*dnstype.Resolver{"headscale.test": {}}}
+	records := []tailcfg.DNSRecord{{Name: "Service.Example.com", Type: "A", Value: "100.64.0.9"}}
+	positive := &tailcfg.MapResponse{
+		Node:         &tailcfg.Node{ID: 1},
+		Peers:        []*tailcfg.Node{{ID: 2}},
+		PacketFilter: []tailcfg.FilterRule{{SrcIPs: []string{"*"}, DstPorts: []tailcfg.NetPortRange{{IP: "*", Ports: tailcfg.PortRange{First: 0, Last: 65535}}}}},
+		DNSConfig:    frozen.Clone(),
+	}
+	positive.DNSConfig.ExtraRecords = []tailcfg.DNSRecord{{Name: "service.example.com", Type: "A", Value: "100.64.0.9"}}
+	client := newPropertyClient(positive)
+	checkStreamPacketIntent(t, world, allow, 1, client)
+	checkStreamDNSInputs(t, frozen, records, client)
+	cleared := newPropertyClient(&tailcfg.MapResponse{Node: &tailcfg.Node{ID: 1}, DNSConfig: frozen.Clone()})
+	checkStreamPacketIntent(t, world, deny, 1, cleared)
+	checkStreamDNSInputs(t, frozen, nil, cleared)
+
+	for _, mutation := range []string{"lost-policy", "lost-DNS", "stale-policy", "stale-DNS", "lost-settings"} {
+		t.Run(mutation, func(t *testing.T) {
+			client := newPropertyClient(positive)
+			client.dns = positive.DNSConfig.Clone()
+			wantIntent, wantRecords := allow, records
+			message := "DNS inputs and frozen settings"
+
+			switch mutation {
+			case "lost-policy":
+				client.filter = nil
+				message = "packet"
+			case "lost-DNS":
+				client.dns.ExtraRecords = nil
+			case "stale-policy":
+				wantIntent = deny
+				message = "packet"
+			case "stale-DNS":
+				wantRecords = nil
+			case "lost-settings":
+				client.dns.Routes = nil
+			}
+
+			failure := &streamConnectivityFailure{}
+			require.PanicsWithValue(t, failure, func() {
+				checkStreamPacketIntent(failure, world, wantIntent, 1, client)
+				checkStreamDNSInputs(failure, frozen, wantRecords, client)
+			})
+			require.Contains(t, failure.message, message)
+		})
+	}
+}
+
+// App-free inputs must reject stale capabilities even when packet rules agree.
+func TestStreamAppAbsenceRejectsStaleCapabilities(t *testing.T) {
+	src4, src6 := netip.MustParseAddr("100.64.0.1"), netip.MustParseAddr("fd7a:115c:a1e0::1")
+	dst4, dst6 := netip.MustParseAddr("100.64.0.2"), netip.MustParseAddr("fd7a:115c:a1e0::2")
+
+	for _, retired := range []bool{false, true} {
+		for family, source := range []netip.Addr{src4, src6} {
+			t.Run(fmt.Sprintf("retired=%t/family=%d", retired, family), func(t *testing.T) {
+				destination := []netip.Addr{dst4, dst6}[family]
+
+				world := propcheck.World{Nodes: map[types.NodeID]*types.Node{
+					2: {ID: 2, IPv4: &dst4, IPv6: &dst6},
+				}}
+				if !retired {
+					world.Nodes[1] = &types.Node{ID: 1, IPv4: &src4, IPv6: &src6}
+				}
+
+				caps := tailcfg.PeerCapMap{"example.com/cap/stale": {`{"role":"read"}`}, "example.com/cap/empty": nil}
+				rules := []tailcfg.FilterRule{{
+					SrcIPs: []string{source.String()},
+					CapGrant: []tailcfg.CapGrant{{
+						Dsts: []netip.Prefix{netip.PrefixFrom(destination, destination.BitLen())}, CapMap: caps,
+					}},
+				}}
+				full := &tailcfg.MapResponse{Node: &tailcfg.Node{ID: 2}, PacketFilter: rules}
+				client, same := newPropertyClient(full), newPropertyClient(full)
+				probes := []netip.Addr{src4, src6}
+				positive := &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+					Src: propcheck.PacketSelector{IP: source}, Dst: propcheck.PacketSelector{IP: destination}, Caps: caps,
+				}}}
+				propcheck.CheckAppIntent(t, world, positive, 2, client.filter, probes...)
+
+				// The packet oracle and equality check accept identical app-only corruption.
+				checkStreamPacketIntent(t, world, &propcheck.PacketIntent{}, 2, client, probes...)
+				client.check(t, same)
+
+				for _, doc := range append([]string{`{"grants":[]}`}, streamPropertyPolicies[:3]...) {
+					intent := streamAppIntent(t, []byte(doc), nil)
+					require.NotNil(t, intent)
+
+					failure := &streamNodeInputFailure{}
+					require.PanicsWithValue(t, failure, func() {
+						checkStreamAppIntent(failure, world, intent, 2, client, probes...)
+					})
+					require.Contains(t, failure.message, "app keys")
+				}
+			})
+		}
+	}
+}
+
+func TestRapidStreamMixedControl(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			t.Run("literal", func(t *testing.T) {
+				runRapidStreamSystem(t, mode, "connect", "attrs-clear", "noop")
+			})
+			t.Run("generated", func(t *testing.T) {
+				runRapidStreamSystem(t, mode,
+					"connect", "connect-request", "disconnect", "stale-connect", "zero-connect", "missing-connect",
+					"public-expiry", "utc-expiry", "invalid-expiry", "missing-expiry", "health", "endpoints", "request-hostinfo",
+					"attrs-mixed", "attrs-clear", "group-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "ssh-policy", "ssh-deny",
+					"policy-order", "policy-duplicate", "policy-restore", "invalid-policy", "dns", "derp", "derp-policy", "noop")
+			})
+		})
+	}
+}
+
+// commit retains the previous input and wire views across one delivered transaction.
+func (p *streamPropertySystem) commit(t *rapid.T, last *state.Snapshot, operations []string, required *streamOperation) *state.Snapshot {
+	// Keep an old snapshot and its wire model across writes and
+	// cache advancement; a late renderer must still read it correctly.
+	old := p.state.Snapshot()
+	oldWorld := p.world.Clone()
+	oldIntent := streamPacketIntent(oldWorld, p.policy, p.packetIntent)
+	oldAppIntent := streamAppIntent(t, p.policyDoc, p.appIntent)
+	oldSSHIntent := streamSSHIntent(t, p.policyDoc, p.sshIntent)
+	oldAttrIntent := streamNodeAttrIntent(t, p.policyDoc, p.attrIntent)
+	oldIdentityAddresses := oldIntent != nil || (p.policy >= 0 && p.policy <= 2)
+	oldDERP := p.effectiveDERP(t)
+	oldNode := old.ListNodes().At(0).ID()
+	oldHub := NewHub()
+	oldMap, err := NewStream(p.cfg, oldHub, oldNode, capVer).r.render(old)
+	require.NoError(t, err)
+
+	oldClient := newPropertyClient(&tailcfg.MapResponse{})
+	applyStreamPropertyWire(t, oldHub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, oldMap)})
+	checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, oldClient, p.sourceProbes...)
+	checkStreamAppIntent(t, oldWorld, oldAppIntent, oldNode, oldClient, p.sourceProbes...)
+
+	if oldSSHIntent != nil {
+		propcheck.CheckSSHIntent(t, oldWorld, oldSSHIntent, oldNode, oldClient.ssh, p.cfg.ServerURL)
+	}
+
+	checkStreamConfigInputs(t, p.cfg.ServerURL, oldClient)
+	checkStreamNodeInputs(t, oldWorld, oldNode, oldClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses, oldAttrIntent)
+	checkStreamConnectivityInputs(t, oldWorld, oldNode, oldClient)
+	oldHub.Close()
+
+	writes := 1
+	if required == nil {
+		writes = rapid.IntRange(1, 3).Draw(t, "coalesced-writes")
+	}
+
+	for range writes {
+		op := required
+		if op == nil {
+			op = new(p.drawOperation(t, operations...))
+		}
+
+		p.apply(t, *op)
+
+		if rapid.Bool().Draw(t, "intermediate-render") {
+			id := rapid.SampledFrom(slices.Sorted(maps.Keys(p.sessions))).Draw(t, "intermediate-viewer")
+
+			session := p.sessions[id]
+			if session.down {
+				p.open(t, id, p.state.Snapshot(), rapid.Bool().Draw(t, "partial-reconnect"))
+			} else {
+				p.update(t, id, p.state.Snapshot(), 0)
+			}
+		}
+	}
+
+	snap := p.state.Snapshot()
+	all, wake := Route(last, snap, snap.Since(last))
+	p.hub.advance(snap)
+
+	for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+		session := p.sessions[id]
+		if session.down {
+			if rapid.Bool().Draw(t, "reconnect") {
+				p.open(t, id, snap, rapid.Bool().Draw(t, "partial-reconnect"))
+			}
+		} else if _, named := wake[id]; all || named {
+			p.update(t, id, snap, rapid.IntRange(0, 5).Draw(t, "delivery"))
+		}
+	}
+
+	p.check(t, snap)
+	// Required states must complete before replacement, after unwoken
+	// clients have been checked so reconnect cannot conceal a missed wake.
+	if required != nil {
+		for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+			if p.sessions[id].down {
+				p.open(t, id, snap, false)
+			}
+		}
+
+		p.check(t, snap)
+	}
+
+	propcheck.CheckWorld(t, oldWorld, old, p.probes)
+	require.Equal(t, oldDERP, old.DERPMap(), "retained DERP snapshot")
+	lateMap, err := NewStream(p.cfg, p.hub, oldNode, capVer).r.render(old)
+	require.NoError(t, err)
+
+	lateClient := newPropertyClient(&tailcfg.MapResponse{})
+	applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, lateMap)})
+	lateClient.check(t, oldClient)
+
+	checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, lateClient, p.sourceProbes...)
+	checkStreamAppIntent(t, oldWorld, oldAppIntent, oldNode, lateClient, p.sourceProbes...)
+
+	if oldSSHIntent != nil {
+		propcheck.CheckSSHIntent(t, oldWorld, oldSSHIntent, oldNode, lateClient.ssh, p.cfg.ServerURL)
+	}
+
+	checkStreamConfigInputs(t, p.cfg.ServerURL, lateClient)
+	checkStreamNodeInputs(t, oldWorld, oldNode, lateClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses, oldAttrIntent)
+	checkStreamConnectivityInputs(t, oldWorld, oldNode, lateClient)
+
+	return snap
+}
+
+// mixedControlHistory composes required inputs; the shared commit owns delivery and checks.
+func (p *streamPropertySystem) mixedControlHistory(t *rapid.T, commit func(*rapid.T, *streamOperation), generated bool) {
+	// Coalesced releases can drain the earlier admissions entirely.
+	commit(t, new(p.drawOperation(t, "connect")))
+
+	owned := 0
+	for _, leases := range p.control {
+		owned += len(leases)
+	}
+
+	require.Positive(t, owned, "mixed policy requires an acquired control lease")
+
+	packet := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{{
+		Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"}, Protocol: ipproto.TCP, First: 22, Last: 22,
+	}}}
+	app := &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+		Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"},
+		Caps: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`}},
+	}}}
+	ssh := &propcheck.SSHIntent{Grants: []propcheck.SSHGrant{{
+		Src: propcheck.PacketSelector{User: "u1"}, DstTag: "tag:srv", Check: true, Users: []string{"alice"},
+	}}}
+	attrs := &propcheck.NodeAttrIntent{Grants: []propcheck.NodeAttrGrant{{
+		Target: propcheck.PacketSelector{User: "u1"}, Attrs: []nodecap.Cap{"custom:probe", nodecap.RandomizeClientPort},
+	}}}
+	mixed := streamOperation{
+		kind: "attrs-mixed", policy: -1, intent: packet, appIntent: app, sshIntent: ssh, attrIntent: attrs,
+		doc: attrs.AppendDocument(t, ssh.AppendDocument(t, app.Document(t, packet))),
+	}
+	require.True(t, packet.Allows(p.world, 1, 2, *p.world.Nodes[1].IPv4, *p.world.Nodes[2].IPv4, 22, ipproto.TCP))
+	require.NotEmpty(t, app.Capabilities(p.world, 1, 2, *p.world.Nodes[1].IPv4, *p.world.Nodes[2].IPv4))
+	require.Equal(t, "check", ssh.Decision(p.world, 1, 3, "alice"))
+	require.Contains(t, attrs.Capabilities(p.world, 1), nodecap.Cap("custom:probe"))
+	commit(t, &mixed)
+
+	doc, groupPacket, groupApp := propcheck.GroupPolicy(t, []string{"u1"}, []string{"u2"}, packet.Grants[0], app.Grants[0].Caps)
+	group := streamOperation{kind: "group-policy", policy: -1, doc: doc, intent: groupPacket, appIntent: groupApp}
+	commit(t, &group)
+	group.doc, group.intent, group.appIntent = propcheck.GroupPolicy(t, nil, []string{"u2"}, packet.Grants[0], app.Grants[0].Caps)
+	commit(t, &group)
+	commit(t, &mixed)
+
+	for _, kind := range []string{"health", "request-hostinfo", "public-expiry", "utc-expiry", "stale-connect", "zero-connect", "missing-connect", "invalid-expiry", "missing-expiry", "invalid-policy"} {
+		commit(t, new(p.drawOperation(t, kind)))
+	}
+
+	if p.cfg.Policy.Mode == types.PolicyModeFile {
+		for _, kind := range []string{"file-same", "file-comment", "file-empty", "file-reload", "file-missing", "file-reload", "file-test-failure", "file-reload"} {
+			commit(t, new(p.drawOperation(t, kind)))
+		}
+	}
+
+	cleared := p.drawOperation(t, "attrs-clear")
+	// Explicit empty metadata keeps all four denial checks active.
+	cleared.appIntent, cleared.sshIntent = &propcheck.AppIntent{}, &propcheck.SSHIntent{}
+	if p.cfg.Policy.Mode == types.PolicyModeFile {
+		staged := cleared
+		staged.kind = "file-stage"
+		commit(t, &staged)
+		require.Same(t, app, p.appIntent, "staging must retain active mixed intent")
+		cleared = p.drawOperation(t, "file-reload")
+	}
+
+	commit(t, &cleared)
+
+	mixed.kind = "policy-restore"
+	commit(t, &mixed)
+	t.Log("completed mixed/clear/restore with an owned control lease")
+
+	if generated {
+		commit(t, new(p.drawOperation(t, "attrs-mixed")))
+	}
+}
+
+func TestStreamDERPIntentFieldNames(t *testing.T) {
+	for _, doc := range []string{
+		`{"derpMap":{"Regions":{"1":null}}}`,
+		`{"DERPMAP":{"REGIONS":{"1":null}}}`,
+		`{"d-e_r_p_m_a_p":{"Regions":{"1":null}}}`,
+		`{"derpMap":{"r-e_g_i_o_n_s":{"1":null}}}`,
+		"{ // retained input comment\n \"derp_map\": {\"Regions\": {\"1\": null}}, }",
+	} {
+		t.Run(doc, func(t *testing.T) {
+			parsed, err := policyv2.ParsePolicy([]byte(doc))
+			require.NoError(t, err)
+			require.NotNil(t, parsed.DERPMap)
+			require.Contains(t, parsed.DERPMap.Regions, tailcfg.DERPRegionID(1))
+			require.Nil(t, parsed.DERPMap.Regions[1])
+
+			p := &streamPropertySystem{
+				policyDoc: []byte(doc),
+				derpMap:   &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: {RegionID: 1}}},
+			}
+			before := slices.Clone(p.policyDoc)
+			require.Equal(t, &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{}}, p.effectiveDERP(t))
+			require.Equal(t, before, p.policyDoc, "owned policy bytes")
+		})
+	}
 }

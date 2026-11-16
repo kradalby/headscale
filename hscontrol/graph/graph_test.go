@@ -8,8 +8,12 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"pgregory.net/rapid"
 )
 
 func TestDerivedRecomputesOnlyOnChange(t *testing.T) {
@@ -917,4 +921,1368 @@ func BenchmarkMapChanges(b *testing.B) {
 			})
 		}
 	}
+}
+
+// These helpers belong to the concurrency properties only. The oracle uses
+// integer tuples and enumerates at most 5! serial histories, not graph internals.
+type concurrencyValues struct {
+	a, b int
+	useB bool
+}
+
+type concurrencyView struct {
+	concurrencyValues
+
+	rev       uint64
+	sum, pick int
+}
+
+type concurrencyCells struct {
+	a, b      Input[int]
+	useB      Input[bool]
+	sum, pick Derived[int]
+}
+
+func newConcurrencyGraph(initial concurrencyValues) (*Graph, concurrencyCells) {
+	g := New()
+	c := concurrencyCells{
+		a:    g.NewInput("a", initial.a, Same[int]),
+		b:    g.NewInput("b", initial.b, Same[int]),
+		useB: g.NewInput("useB", initial.useB, Same[bool]),
+	}
+	c.sum = NewDerived(g, "sum", Same[int], func(s *Snapshot, _ int) int {
+		return s.Get(c.a) + s.Get(c.b)
+	})
+	c.pick = NewDerived(g, "pick", Same[int], func(s *Snapshot, _ int) int {
+		if s.Get(c.useB) {
+			return s.Get(c.b)
+		}
+
+		return s.Get(c.a)
+	})
+
+	return g, c
+}
+
+func (c concurrencyCells) read(s *Snapshot) concurrencyView {
+	if s == nil {
+		return concurrencyView{}
+	}
+
+	return concurrencyView{
+		rev:               s.Rev(),
+		concurrencyValues: concurrencyValues{s.Get(c.a), s.Get(c.b), s.Get(c.useB)},
+		sum:               s.Get(c.sum),
+		pick:              s.Get(c.pick),
+	}
+}
+
+func concurrencyExpected(v concurrencyValues, rev uint64) concurrencyView {
+	pick := v.a
+	if v.useB {
+		pick = v.b
+	}
+
+	return concurrencyView{v, rev, v.a + v.b, pick}
+}
+
+type concurrencyOp struct {
+	kind, decision string
+	a, b, limit    int
+	useB           bool
+	phase          int
+}
+
+func drawConcurrencyOp(t *rapid.T) concurrencyOp {
+	return concurrencyOp{
+		kind:     rapid.SampledFrom([]string{"add", "set", "switch", "equal", "revert", "empty"}).Draw(t, "operation"),
+		decision: rapid.SampledFrom([]string{"accept", "abort", "check"}).Draw(t, "decision"),
+		a:        rapid.IntRange(-3, 3).Draw(t, "a"),
+		b:        rapid.IntRange(-3, 3).Draw(t, "b"),
+		limit:    rapid.IntRange(-4, 4).Draw(t, "limit"),
+		useB:     rapid.Bool().Draw(t, "useB"),
+		phase:    rapid.IntRange(0, 2).Draw(t, "phase"),
+	}
+}
+
+var (
+	errConcurrencyAbort  = errors.New("concurrency transaction aborted")
+	errConcurrencyRefuse = errors.New("concurrency candidate refused")
+)
+
+type concurrencyResult struct {
+	op         concurrencyOp
+	start, end uint64
+	snap       *Snapshot
+	view       concurrencyView
+	checked    bool
+	candidate  concurrencyView
+	err        error
+}
+
+func (c concurrencyCells) run(g *Graph, op concurrencyOp) concurrencyResult {
+	r := concurrencyResult{op: op}
+	if op.kind == "read" {
+		r.snap = g.Snapshot()
+		r.view = c.read(r.snap)
+
+		return r
+	}
+
+	var check func(*Snapshot) error
+	if op.decision == "check" {
+		check = func(s *Snapshot) error {
+			r.checked, r.candidate = true, c.read(s)
+			if s.Get(c.sum) > op.limit {
+				return errConcurrencyRefuse
+			}
+
+			return nil
+		}
+	}
+
+	r.snap, r.err = g.UpdateChecked(func(tx *Tx) error {
+		// Stage the fixture's initial values before Peek; an unpublished
+		// graph has no latest snapshot from which an unstaged read can read.
+		if g.Snapshot() == nil {
+			Set(tx, c.a, 0)
+			Set(tx, c.b, 0)
+			Set(tx, c.useB, false)
+		}
+
+		switch op.kind {
+		case "add":
+			Set(tx, c.a, Peek(tx, c.a)+op.a)
+			Set(tx, c.b, Peek(tx, c.b)+op.b)
+		case "set":
+			Set(tx, c.a, op.a)
+			Set(tx, c.a, op.a) // Duplicate writes have one final value.
+			Set(tx, c.b, op.b)
+			Set(tx, c.useB, op.useB)
+		case "switch":
+			Set(tx, c.useB, !Peek(tx, c.useB))
+		case "equal":
+			Set(tx, c.a, Peek(tx, c.a))
+			Set(tx, c.b, Peek(tx, c.b))
+		case "revert":
+			a := Peek(tx, c.a)
+			Set(tx, c.a, op.a)
+			Set(tx, c.a, a)
+		case "empty":
+		}
+
+		if op.decision == "abort" {
+			return errConcurrencyAbort
+		}
+
+		return nil
+	}, check)
+	r.view = c.read(r.snap)
+
+	return r
+}
+
+// concurrencyStep specifies the externally visible transaction, including
+// check being skipped on a no-op. It never reads a graph or a transaction.
+func concurrencyStep(before concurrencyView, op concurrencyOp) (concurrencyView, concurrencyView, bool, error) {
+	if op.kind == "read" {
+		return before, concurrencyView{}, false, nil
+	}
+
+	if op.decision == "abort" {
+		return before, concurrencyView{}, false, errConcurrencyAbort
+	}
+
+	v := before.concurrencyValues
+
+	switch op.kind {
+	case "add":
+		v.a += op.a
+		v.b += op.b
+	case "set":
+		v = concurrencyValues{op.a, op.b, op.useB}
+	case "switch":
+		v.useB = !v.useB
+	}
+
+	if before.rev != 0 && v == before.concurrencyValues {
+		return before, concurrencyView{}, false, nil
+	}
+
+	next := concurrencyExpected(v, before.rev+1)
+	if op.decision == "check" {
+		if next.sum > op.limit {
+			return before, next, true, errConcurrencyRefuse
+		}
+
+		return next, next, true, nil
+	}
+
+	return next, concurrencyView{}, false, nil
+}
+
+func concurrencySerial(history []concurrencyResult, used uint, state, final concurrencyView) bool {
+	if used == (1<<len(history))-1 {
+		return state == final
+	}
+
+	for i, r := range history {
+		if used&(1<<i) != 0 {
+			continue
+		}
+
+		eligible := true
+
+		for j, other := range history {
+			// A completed call must precede a subsequently invoked call.
+			if used&(1<<j) == 0 && other.end < r.start {
+				eligible = false
+			}
+		}
+
+		if !eligible {
+			continue
+		}
+
+		next, candidate, checked, err := concurrencyStep(state, r.op)
+		if r.view == next && r.checked == checked && r.candidate == candidate && errors.Is(r.err, err) &&
+			concurrencySerial(history, used|(1<<i), next, final) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func TestRapidConcurrentHistory(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		g, cells := newConcurrencyGraph(concurrencyValues{})
+
+		var retained []concurrencyResult
+
+		t.Repeat(map[string]func(*rapid.T){
+			"batch": func(t *rapid.T) {
+				// Draw every call and release phase before starting any goroutine.
+				writers := rapid.IntRange(1, 3).Draw(t, "writers")
+
+				history := make([]concurrencyResult, writers, writers+2)
+				for i := range history {
+					history[i].op = drawConcurrencyOp(t)
+				}
+
+				for range 2 {
+					history = append(history, concurrencyResult{op: concurrencyOp{
+						kind: "read", phase: rapid.IntRange(0, 2).Draw(t, "reader phase"),
+					}})
+				}
+
+				before := cells.read(g.Snapshot())
+
+				var clock atomic.Uint64
+
+				for phase := range 3 {
+					start := make(chan struct{})
+
+					var wg sync.WaitGroup
+
+					for i := range history {
+						if history[i].op.phase != phase {
+							continue
+						}
+
+						wg.Go(func() {
+							<-start
+
+							begin := clock.Add(1)
+							r := cells.run(g, history[i].op)
+							r.start, r.end = begin, clock.Add(1)
+							history[i] = r
+						})
+					}
+
+					close(start)
+					wg.Wait()
+				}
+
+				final := cells.read(g.Snapshot())
+				if !concurrencySerial(history, 0, before, final) {
+					t.Fatalf("no atomic serial history: before=%+v calls=%+v final=%+v", before, history, final)
+				}
+
+				retained = append(retained, history...)
+				for _, old := range retained {
+					if got := cells.read(old.snap); got != old.view {
+						t.Fatalf("retained snapshot changed: got=%+v want=%+v", got, old.view)
+					}
+				}
+			},
+		})
+	})
+}
+
+func TestRapidConcurrentRollback(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		err      error
+		panicked any
+	}{
+		{name: "abort", err: errConcurrencyAbort},
+		{name: "refuse", err: errConcurrencyRefuse},
+		{name: "callback panic", panicked: "callback panic"},
+		{name: "compute panic", panicked: "compute panic"},
+		{name: "check panic", panicked: "check panic"},
+		{name: "accept"},
+	} {
+		failure := testCase.name
+		t.Run(failure, func(t *testing.T) {
+			rapid.Check(t, func(t *rapid.T) {
+				initial := concurrencyValues{
+					a: rapid.IntRange(-5, 5).Draw(t, "initial a"), b: rapid.IntRange(-5, 5).Draw(t, "initial b"),
+					useB: rapid.Bool().Draw(t, "initial selector"),
+				}
+				first := rapid.Bool().Draw(t, "first publication")
+				delta := rapid.IntRange(1, 5).Draw(t, "delta")
+				g, cells := newConcurrencyGraph(initial)
+				entered, release := make(chan struct{}), make(chan struct{})
+
+				var armed atomic.Bool
+
+				_ = NewDerived(g, "panic barrier", Same[int], func(s *Snapshot, _ int) int {
+					v := s.Get(cells.sum)
+
+					if armed.Swap(false) {
+						close(entered)
+						<-release
+						panic(failure)
+					}
+
+					return v
+				})
+				if !first {
+					_, err := g.Update(func(*Tx) error { return nil })
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				before := g.Snapshot()
+				beforeView := cells.read(before)
+
+				sub := g.Subscribe()
+				defer sub.Close()
+
+				candidate := concurrencyValues{initial.a + delta, initial.b + delta, !initial.useB}
+
+				type outcome struct {
+					snap     *Snapshot
+					err      error
+					panicked any
+				}
+
+				finished := make(chan outcome, 1)
+
+				go func() {
+					var out outcome
+					defer func() {
+						out.panicked = recover()
+						finished <- out
+					}()
+
+					armed.Store(failure == "compute panic")
+
+					out.snap, out.err = g.UpdateChecked(func(tx *Tx) error {
+						Set(tx, cells.a, candidate.a)
+						Set(tx, cells.b, candidate.b)
+						Set(tx, cells.useB, candidate.useB)
+
+						switch failure {
+						case "abort", "callback panic":
+							close(entered)
+							<-release
+
+							if failure == "callback panic" {
+								panic(failure)
+							}
+
+							return errConcurrencyAbort
+						}
+
+						return nil
+					}, func(*Snapshot) error {
+						close(entered)
+						<-release
+
+						switch failure {
+						case "refuse":
+							return errConcurrencyRefuse
+						case "check panic":
+							panic(failure)
+						default:
+							return nil
+						}
+					})
+				}()
+
+				<-entered
+
+				// A second Update is invoked while the first is held in fn,
+				// compute, or check. Hold its callback too, to inspect rollback
+				// before its own commit can hide an incorrectly published value.
+				waiting, nextEntered, nextRelease := make(chan struct{}), make(chan struct{}), make(chan struct{})
+				nextDone := make(chan outcome, 1)
+
+				go func() {
+					close(waiting)
+
+					snap, err := g.Update(func(tx *Tx) error {
+						input, initialValue := cells.a, initial.a
+						if initial.useB {
+							input, initialValue = cells.b, initial.b
+						}
+
+						if g.Snapshot() == nil {
+							Set(tx, input, initialValue)
+						}
+
+						Set(tx, input, Peek(tx, input)+delta)
+						close(nextEntered)
+						<-nextRelease
+
+						return nil
+					})
+					nextDone <- outcome{snap: snap, err: err}
+				}()
+
+				<-waiting
+
+				// Collect observations now, assert only after both workers exit.
+				during := g.Snapshot()
+				duringView := cells.read(during)
+				prematureWake := false
+
+				select {
+				case <-sub.C:
+					prematureWake = true
+				default:
+				}
+
+				close(release)
+
+				out := <-finished
+
+				<-nextEntered
+
+				after := g.Snapshot()
+				afterView := cells.read(after)
+				woke := false
+
+				select {
+				case <-sub.C:
+					woke = true
+				default:
+				}
+
+				close(nextRelease)
+
+				next := <-nextDone
+
+				if during != before || duringView != beforeView || prematureWake {
+					t.Fatalf("in-flight transaction published: before=%+v during=%+v wake=%t", beforeView, duringView, prematureWake)
+				}
+
+				want := beforeView
+				if failure == "accept" {
+					want = concurrencyExpected(candidate, beforeView.rev+1)
+				}
+
+				if afterView != want || woke != (failure == "accept") {
+					t.Fatalf("publication after %s: got=%+v want=%+v wake=%t", failure, afterView, want, woke)
+				}
+
+				if !errors.Is(out.err, testCase.err) || out.panicked != testCase.panicked {
+					t.Fatalf("%s result: %+v, want err=%v panic=%v", failure, out, testCase.err, testCase.panicked)
+				}
+
+				if testCase.panicked == nil && out.snap != after {
+					t.Fatalf("%s returned snapshot %p, want published %p", failure, out.snap, after)
+				}
+
+				v := want.concurrencyValues
+
+				if want.rev == 0 {
+					v = initial
+				}
+
+				if initial.useB {
+					v.b += delta
+				} else {
+					v.a += delta
+				}
+
+				wantNext := concurrencyExpected(v, want.rev+1)
+				if next.err != nil || cells.read(next.snap) != wantNext || cells.read(g.Snapshot()) != wantNext {
+					t.Fatalf("waiting update: err=%v got=%+v want=%+v", next.err, cells.read(next.snap), wantNext)
+				}
+
+				if cells.read(before) != beforeView || cells.read(after) != afterView {
+					t.Fatal("waiting writer changed a retained snapshot")
+				}
+			})
+		})
+	}
+}
+
+// concurrencyWakes drains enough to distinguish no wake, one coalesced wake,
+// and a broken queue (including a channel closed by Subscription.Close).
+func concurrencyWakes(sub *Subscription) int {
+	wakes := 0
+
+	for range 2 {
+		select {
+		case <-sub.C:
+			wakes++
+		default:
+		}
+	}
+
+	return wakes
+}
+
+func TestRapidConcurrentSubscriptions(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		deltas := rapid.SliceOfN(rapid.IntRange(1, 3), 2, 40).Draw(t, "deltas")
+		closeAt := rapid.IntRange(0, len(deltas)).Draw(t, "close at")
+		rapid.SyncTest(t, func(t *rapid.T) {
+			g, cells := newConcurrencyGraph(concurrencyValues{})
+
+			slow, closing, closed := g.Subscribe(), g.Subscribe(), g.Subscribe()
+			defer slow.Close()
+			defer closing.Close()
+
+			closed.Close()
+			closed.Close()
+
+			done := make(chan struct{})
+			results := make([]concurrencyResult, len(deltas))
+
+			go func() {
+				defer close(done)
+
+				for i, delta := range deltas {
+					if i == closeAt {
+						closing.Close()
+					}
+
+					results[i] = cells.run(g, concurrencyOp{kind: "add", a: delta, b: -delta})
+				}
+			}()
+			// No receiver drains a subscription until the writer has finished.
+			// A blocked send is detected by quiescence, never by elapsed time.
+			synctest.Wait()
+
+			select {
+			case <-done:
+			default:
+				// Release the writer before failing so a broken blocking send
+				// cannot also block subscription cleanup and Rapid shrinking.
+			unblock:
+				for {
+					select {
+					case <-done:
+						break unblock
+					case <-slow.C:
+					case <-closing.C:
+					case <-closed.C:
+					}
+				}
+
+				t.Fatal("writer blocked behind a slow or closed subscriber")
+			}
+
+			total := 0
+			for i, r := range results {
+				total += deltas[i]
+
+				want := concurrencyExpected(concurrencyValues{a: total, b: -total}, uint64(i+1))
+				if r.err != nil || r.view != want || cells.read(r.snap) != want {
+					t.Fatalf("write %d: got=%+v err=%v want=%+v", i, r.view, r.err, want)
+				}
+			}
+
+			for _, sub := range []*Subscription{slow, closing, closed} {
+				wantWake := sub == slow || sub == closing && closeAt != 0
+				wakes := concurrencyWakes(sub)
+
+				if (wakes == 1) != wantWake || wakes > 1 {
+					t.Fatalf("coalesced wakes=%d, want pending=%t", wakes, wantWake)
+				}
+			}
+
+			// Race subscription registration and removal against publication.
+			// The racing wake is optional; the following commit must reach the
+			// new subscriber and must not reach either closed subscriber.
+			start := make(chan struct{})
+			joined := make(chan *Subscription, 1)
+			written := make(chan concurrencyResult, 1)
+
+			go func() {
+				<-start
+				closing.Close()
+
+				joined <- g.Subscribe()
+			}()
+			go func() {
+				<-start
+
+				written <- cells.run(g, concurrencyOp{kind: "add", a: 1, b: -1})
+			}()
+
+			close(start)
+			synctest.Wait()
+
+			fresh := <-joined
+			defer fresh.Close()
+
+			r := <-written
+			total++
+
+			want := concurrencyExpected(concurrencyValues{a: total, b: -total}, uint64(len(deltas)+1))
+			if r.err != nil || r.view != want {
+				t.Fatalf("publication racing subscriptions: got=%+v err=%v want=%+v", r.view, r.err, want)
+			}
+
+			for _, sub := range []*Subscription{slow, closing, fresh} {
+				concurrencyWakes(sub)
+			}
+
+			r = cells.run(g, concurrencyOp{kind: "add", a: 1, b: -1})
+			total++
+
+			want = concurrencyExpected(concurrencyValues{a: total, b: -total}, uint64(len(deltas)+2))
+			if r.err != nil || r.view != want || cells.read(g.Snapshot()) != want {
+				t.Fatalf("post-close publication: got=%+v err=%v want=%+v", r.view, r.err, want)
+			}
+
+			for _, sub := range []*Subscription{slow, closing, closed, fresh} {
+				wakes := concurrencyWakes(sub)
+				if (wakes == 1) != (sub == slow || sub == fresh) || wakes > 1 {
+					t.Fatalf("wake after close/subscribe: got=%d want pending=%t", wakes, sub == slow || sub == fresh)
+				}
+			}
+		})
+	})
+}
+
+type graphExpression struct {
+	kind    string
+	a, b, c int
+}
+
+// evaluate rebuilds pure expressions without consulting graph dependencies,
+// change revisions, or cached values. Stateful derived cells are tested separately.
+func (e graphExpression) evaluate(values []int) int {
+	switch e.kind {
+	case "sum":
+		return (values[e.a] + values[e.b]) % 17
+	case "parity":
+		return values[e.a] % 2
+	case "pick":
+		if values[e.a]%2 == 0 {
+			return values[e.b]
+		}
+
+		return values[e.c]
+	default:
+		return e.a
+	}
+}
+
+func (e graphExpression) dependencies(values []int) []int {
+	switch e.kind {
+	case "sum":
+		return []int{e.a, e.b}
+	case "parity":
+		return []int{e.a}
+	case "pick":
+		if values[e.a]%2 == 0 {
+			return []int{e.a, e.b}
+		}
+
+		return []int{e.a, e.c}
+	default:
+		return nil
+	}
+}
+
+type graphReference struct {
+	rev     uint64
+	values  []int
+	changed []uint64
+}
+
+func (m graphReference) check(t *rapid.T, s *Snapshot, nodes []Node[int]) {
+	t.Helper()
+
+	if m.rev == 0 {
+		if s != nil {
+			t.Fatal("uncommitted graph published a snapshot")
+		}
+
+		return
+	}
+
+	if s == nil || s.Rev() != m.rev {
+		t.Fatalf("snapshot %v, want revision %d", s, m.rev)
+	}
+
+	for i, n := range nodes {
+		if got := s.Get(n); got != m.values[i] {
+			t.Fatalf("rev %d cell %d: value %d, want %d", m.rev, i, got, m.values[i])
+		}
+
+		if got := ChangedAt(s, n); got != m.changed[i] {
+			t.Fatalf("rev %d cell %d: ChangedAt %d, want %d", m.rev, i, got, m.changed[i])
+		}
+	}
+}
+
+type graphPropertySubscription struct {
+	sub             *Subscription
+	pending, closed bool
+}
+
+func (s *graphPropertySubscription) drain(t *rapid.T) {
+	t.Helper()
+
+	got := false
+
+	select {
+	case <-s.sub.C:
+		got = true
+	default:
+	}
+
+	if got != s.pending {
+		t.Fatalf("notification = %t, want %t (closed=%t)", got, s.pending, s.closed)
+	}
+
+	select {
+	case <-s.sub.C:
+		t.Fatal("notifications did not coalesce")
+	default:
+	}
+
+	s.pending = false
+}
+
+// Keeping the actions together makes their shared reference state explicit.
+func TestGraphPropertyTransactions(t *testing.T) { //nolint:gocyclo
+	rapid.Check(t, func(t *rapid.T) {
+		g := New()
+		initial := rapid.SliceOfN(rapid.IntRange(-8, 8), 0, 5).Draw(t, "initial")
+		expressions := make([]graphExpression, rapid.IntRange(0, 10).Draw(t, "derived-count"))
+		inputs := make([]Input[int], len(initial))
+		nodes := make([]Node[int], len(initial), len(initial)+len(expressions))
+
+		for i, value := range initial {
+			inputs[i] = g.NewInput(fmt.Sprintf("input-%d", i), value, Same[int])
+			nodes[i] = inputs[i]
+		}
+
+		calls := make([]int, len(expressions))
+
+		for i := range expressions {
+			e := graphExpression{kind: "constant", a: rapid.IntRange(-8, 8).Draw(t, "constant")}
+			if len(nodes) > 0 {
+				e.kind = rapid.SampledFrom([]string{"constant", "sum", "parity", "pick"}).Draw(t, "operator")
+				if e.kind != "constant" {
+					e.a = rapid.IntRange(0, len(nodes)-1).Draw(t, "a")
+					e.b = rapid.IntRange(0, len(nodes)-1).Draw(t, "b")
+					e.c = rapid.IntRange(0, len(nodes)-1).Draw(t, "c")
+				}
+			}
+
+			expressions[i] = e
+			n := NewDerived(g, fmt.Sprintf("derived-%d", i), Same[int], func(s *Snapshot, _ int) int {
+				calls[i]++
+
+				switch e.kind {
+				case "sum":
+					return (s.Get(nodes[e.a]) + s.Get(nodes[e.b])) % 17
+				case "parity":
+					return s.Get(nodes[e.a]) % 2
+				case "pick":
+					if s.Get(nodes[e.a])%2 == 0 {
+						return s.Get(nodes[e.b])
+					}
+
+					return s.Get(nodes[e.c])
+				default:
+					return e.a
+				}
+			})
+			nodes = append(nodes, n)
+		}
+
+		type retained struct {
+			snapshot *Snapshot
+			model    graphReference
+			at       time.Time
+		}
+
+		var (
+			model   graphReference
+			history []retained
+			subs    []*graphPropertySubscription
+		)
+
+		defer func() {
+			for _, sub := range subs {
+				sub.sub.Close()
+			}
+		}()
+
+		type write struct{ index, value int }
+
+		update := func(t *rapid.T, writes []write, outcome string) {
+			t.Helper()
+
+			before := g.Snapshot()
+
+			values := slices.Clone(initial)
+			if model.rev != 0 {
+				values = slices.Clone(model.values[:len(inputs)])
+			}
+
+			for _, w := range writes {
+				values[w.index] = w.value
+			}
+
+			build := model.rev == 0 || !slices.Equal(values, model.values[:len(inputs)])
+			next := graphReference{rev: model.rev + 1, changed: make([]uint64, len(nodes))}
+
+			for _, e := range expressions {
+				values = append(values, e.evaluate(values))
+			}
+
+			next.values = values
+			for i, value := range values {
+				next.changed[i] = next.rev
+				if model.rev != 0 && value == model.values[i] {
+					next.changed[i] = model.changed[i]
+				}
+			}
+
+			wantCalls := slices.Clone(calls)
+
+			if build && outcome != "abort" {
+				for i, e := range expressions {
+					run := model.rev == 0
+					if !run {
+						for _, dependency := range e.dependencies(model.values) {
+							run = run || values[dependency] != model.values[dependency]
+						}
+					}
+
+					if run {
+						wantCalls[i]++
+					}
+				}
+			}
+
+			checked := false
+			got, err := g.UpdateChecked(func(tx *Tx) error {
+				staged := make(map[int]int)
+				peek := func() {
+					for i, n := range nodes {
+						want, set := staged[i]
+						if !set {
+							// No published snapshot means no documented unstaged value.
+							if model.rev == 0 {
+								continue
+							}
+
+							want = model.values[i]
+						}
+
+						if value := Peek(tx, n); value != want {
+							t.Fatalf("Peek cell %d = %d, want %d", i, value, want)
+						}
+					}
+				}
+
+				peek()
+
+				for _, w := range writes {
+					Set(tx, inputs[w.index], w.value)
+					staged[w.index] = w.value
+
+					peek()
+				}
+
+				if outcome == "abort" {
+					return errBoom
+				}
+
+				return nil
+			}, func(s *Snapshot) error {
+				checked = true
+
+				next.check(t, s, nodes)
+
+				if g.Snapshot() != before {
+					t.Fatal("candidate published before check accepted it")
+				}
+
+				if outcome == "refuse" {
+					return errBoom
+				}
+
+				return nil
+			})
+
+			wantError := outcome == "abort" || build && outcome == "refuse"
+			if wantError && !errors.Is(err, errBoom) || !wantError && err != nil {
+				t.Fatalf("outcome %s: error %v, want error=%t", outcome, err, wantError)
+			}
+
+			if checked != (build && outcome != "abort") || !slices.Equal(calls, wantCalls) {
+				t.Fatalf("outcome %s build=%t: checked=%t calls=%v, want %v", outcome, build, checked, calls, wantCalls)
+			}
+
+			if build && outcome == "commit" {
+				model = next
+				history = append(history, retained{got, model, got.Time()})
+
+				for _, sub := range subs {
+					if !sub.closed {
+						sub.pending = true
+					}
+				}
+			} else if got != before {
+				t.Fatal("aborted, refused, or no-op update replaced the snapshot")
+			}
+
+			if got != g.Snapshot() {
+				t.Fatal("update did not return the published snapshot")
+			}
+
+			model.check(t, got, nodes)
+		}
+
+		drawWrites := func(t *rapid.T) []write {
+			var writes []write
+
+			if len(inputs) != 0 {
+				for range rapid.IntRange(0, 6).Draw(t, "writes") {
+					writes = append(writes, write{
+						rapid.IntRange(0, len(inputs)-1).Draw(t, "input"),
+						rapid.IntRange(-8, 8).Draw(t, "value"),
+					})
+				}
+			}
+
+			return writes
+		}
+
+		subs = append(subs, &graphPropertySubscription{sub: g.Subscribe()})
+
+		t.Repeat(map[string]func(*rapid.T){
+			"commit": func(t *rapid.T) { update(t, drawWrites(t), "commit") },
+			"abort":  func(t *rapid.T) { update(t, drawWrites(t), "abort") },
+			"refuse": func(t *rapid.T) { update(t, drawWrites(t), "refuse") },
+			"empty":  func(t *rapid.T) { update(t, nil, "commit") },
+			"revert": func(t *rapid.T) {
+				if model.rev == 0 || len(inputs) == 0 {
+					t.Skip("reversion needs a published input")
+				}
+
+				i := rapid.IntRange(0, len(inputs)-1).Draw(t, "input")
+				update(t, []write{{i, model.values[i] + 1}, {i, model.values[i]}}, "commit")
+			},
+			"subscribe": func(t *rapid.T) {
+				if len(subs) >= 8 {
+					t.Skip("enough subscriptions")
+				}
+
+				sub := &graphPropertySubscription{sub: g.Subscribe()}
+				subs = append(subs, sub)
+				sub.drain(t)
+			},
+			"drain": func(t *rapid.T) {
+				subs[rapid.IntRange(0, len(subs)-1).Draw(t, "subscriber")].drain(t)
+			},
+			"close": func(t *rapid.T) {
+				sub := subs[rapid.IntRange(0, len(subs)-1).Draw(t, "subscriber")]
+				// Drain before Close; the contract does not promise to discard pending wakes.
+				sub.drain(t)
+				sub.sub.Close()
+				sub.closed = true
+			},
+			"": func(t *rapid.T) {
+				model.check(t, g.Snapshot(), nodes)
+
+				for _, old := range history {
+					old.model.check(t, old.snapshot, nodes)
+
+					if old.snapshot.Time() != old.at {
+						t.Fatal("retained snapshot commit time changed")
+					}
+				}
+			},
+		})
+
+		for _, sub := range subs {
+			sub.drain(t)
+		}
+	})
+}
+
+func TestGraphPropertyEqualOutputRetainsPreviousState(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		type state struct{ visible, generation int }
+
+		g := New()
+		in := g.NewInput("in", 0, Same[int])
+		modulus := rapid.IntRange(1, 5).Draw(t, "modulus")
+		cell := NewDerived(g, "state", func(a, b state) bool { return a.visible == b.visible },
+			func(s *Snapshot, prev state) state {
+				return state{s.Get(in) % modulus, prev.generation + 1}
+			})
+		runs := 0
+		sink := NewDerived(g, "sink", Same[int], func(s *Snapshot, _ int) int {
+			runs++
+
+			return s.Get(cell).visible
+		})
+
+		snapshot, err := g.Update(func(*Tx) error { return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		want := state{generation: 1}
+		lastChange, wantRuns := uint64(1), 1
+
+		for step := range rapid.IntRange(1, 40).Draw(t, "steps") {
+			before, previous := snapshot, want
+
+			value := (step + 1) * rapid.IntRange(1, 5).Draw(t, "multiple") * modulus
+			if rapid.Bool().Draw(t, "change-visible") {
+				value++
+			}
+
+			refuse := rapid.Bool().Draw(t, "refuse")
+			changed := value != before.Get(in)
+			next := state{value % modulus, want.generation + 1}
+
+			wantError := refuse && changed
+			if changed && next.visible != want.visible {
+				wantRuns++
+			}
+
+			snapshot, err = g.UpdateChecked(func(tx *Tx) error {
+				Set(tx, in, value)
+
+				return nil
+			}, func(s *Snapshot) error {
+				if got := s.Get(cell); got != next {
+					t.Fatalf("candidate state %v, want %v", got, next)
+				}
+
+				if refuse {
+					return errBoom
+				}
+
+				return nil
+			})
+			if wantError && !errors.Is(err, errBoom) || !wantError && err != nil {
+				t.Fatalf("error=%v, want refusal=%t", err, wantError)
+			}
+
+			if changed && !refuse {
+				if next.visible != want.visible {
+					lastChange = before.Rev() + 1
+				}
+
+				want = next
+			} else if snapshot != before {
+				t.Fatal("no-op or refused state published")
+			}
+
+			if got := snapshot.Get(cell); got != want || ChangedAt(snapshot, cell) != lastChange {
+				t.Fatalf("state=%v ChangedAt=%d, want %v at %d", got, ChangedAt(snapshot, cell), want, lastChange)
+			}
+
+			if snapshot.Get(sink) != want.visible || runs != wantRuns {
+				t.Fatalf("sink=%d runs=%d, want %d runs=%d", snapshot.Get(sink), runs, want.visible, wantRuns)
+			}
+
+			if before.Get(cell) != previous {
+				t.Fatal("equal output mutated a retained snapshot")
+			}
+		}
+	})
+}
+
+func TestGraphPropertyEqualSwitchReplacesDependencies(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		g := New()
+		value := rapid.IntRange(-100, 100).Draw(t, "initial")
+		selector := g.NewInput("selector", false, Same[bool])
+		left := g.NewInput("left", value, Same[int])
+		right := g.NewInput("right", value, Same[int])
+		runs, downstream := 0, 0
+		pick := NewDerived(g, "pick", Same[int], func(s *Snapshot, _ int) int {
+			runs++
+
+			if s.Get(selector) {
+				return s.Get(right)
+			}
+
+			return s.Get(left)
+		})
+		_ = NewDerived(g, "downstream", Same[int], func(s *Snapshot, _ int) int {
+			downstream++
+
+			return s.Get(pick)
+		})
+
+		before, err := g.Update(func(*Tx) error { return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Both branches have the same value: switching must still replace the reads.
+		switched, err := g.Update(func(tx *Tx) error { Set(tx, selector, true); return nil })
+		if err != nil || runs != 2 || downstream != 1 || ChangedAt(switched, pick) != ChangedAt(before, pick) {
+			t.Fatalf("equal switch: error=%v runs=%d downstream=%d", err, runs, downstream)
+		}
+
+		for range rapid.IntRange(1, 12).Draw(t, "unread-writes") {
+			value += rapid.IntRange(1, 10).Draw(t, "delta")
+
+			_, err = g.Update(func(tx *Tx) error { Set(tx, left, value); return nil })
+			if err != nil || runs != 2 || downstream != 1 {
+				t.Fatalf("unread branch: error=%v runs=%d downstream=%d", err, runs, downstream)
+			}
+		}
+
+		next, err := g.Update(func(tx *Tx) error { Set(tx, right, value); return nil })
+		if err != nil || runs != 3 || downstream != 2 || next.Get(pick) != value || ChangedAt(next, pick) != next.Rev() {
+			t.Fatalf("selected branch: error=%v runs=%d downstream=%d", err, runs, downstream)
+		}
+	})
+}
+
+func TestGraphPropertyFailedUpdateCanRetry(t *testing.T) {
+	for _, failure := range []string{"abort", "refuse", "transaction-panic", "compute-panic", "check-panic"} {
+		t.Run(failure, func(t *testing.T) {
+			rapid.Check(t, func(t *rapid.T) {
+				g := New()
+				initial := rapid.IntRange(1, 100).Draw(t, "initial")
+				in := g.NewInput("in", initial, Same[int])
+				failCompute := false
+				cell := NewDerived(g, "accumulate", Same[int], func(s *Snapshot, prev int) int {
+					if failCompute {
+						panic(errBoom)
+					}
+
+					return prev + s.Get(in)
+				})
+
+				var before *Snapshot
+
+				if rapid.Bool().Draw(t, "already-published") {
+					var err error
+
+					before, err = g.Update(func(*Tx) error { return nil })
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				sub := &graphPropertySubscription{sub: g.Subscribe()}
+				defer sub.sub.Close()
+
+				failCompute = failure == "compute-panic"
+
+				var recovered any
+
+				func() {
+					defer func() { recovered = recover() }()
+
+					got, err := g.UpdateChecked(func(tx *Tx) error {
+						Set(tx, in, initial+1)
+
+						if failure == "transaction-panic" {
+							panic(errBoom)
+						}
+
+						if failure == "abort" {
+							return errBoom
+						}
+
+						return nil
+					}, func(*Snapshot) error {
+						if failure == "check-panic" {
+							panic(errBoom)
+						}
+
+						return errBoom
+					})
+					if got != before || !errors.Is(err, errBoom) {
+						t.Fatalf("failure returned snapshot=%v error=%v", got, err)
+					}
+				}()
+
+				wantPanic := failure != "abort" && failure != "refuse"
+
+				panicError, _ := recovered.(error)
+				if wantPanic && !errors.Is(panicError, errBoom) || !wantPanic && recovered != nil {
+					t.Fatalf("recovered=%v, want panic=%t", recovered, wantPanic)
+				}
+
+				if g.Snapshot() != before {
+					t.Fatal("failed update published a snapshot")
+				}
+
+				sub.drain(t)
+
+				failCompute = false
+				want, revision := initial, uint64(1)
+
+				next, err := g.Update(func(tx *Tx) error {
+					if before != nil {
+						Set(tx, in, initial+2)
+						want += initial + 2
+						revision++
+					}
+
+					return nil
+				})
+				if err != nil || next.Rev() != revision || next.Get(cell) != want {
+					t.Fatalf("retry: snapshot=%v error=%v, want value %d revision %d", next, err, want, revision)
+				}
+
+				sub.pending = true
+				sub.drain(t)
+			})
+		})
+	}
+}
+
+func TestGraphPropertyNeverForcesChange(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		g := New()
+		value := rapid.IntRange(-100, 100).Draw(t, "initial")
+		in := g.NewInput("in", value, Never[int])
+		forcedRuns, sinkRuns := 0, 0
+		forced := NewDerived(g, "forced", Never[int], func(s *Snapshot, _ int) int {
+			forcedRuns++
+
+			return s.Get(in)
+		})
+		sink := NewDerived(g, "sink", Same[int], func(s *Snapshot, _ int) int {
+			sinkRuns++
+
+			return s.Get(forced)
+		})
+
+		snapshot, err := g.Update(func(*Tx) error { return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for step := range rapid.IntRange(1, 30).Draw(t, "steps") {
+			before := snapshot
+
+			snapshot, err = g.Update(func(tx *Tx) error {
+				Set(tx, in, rapid.IntRange(-100, 100).Draw(t, "temporary"))
+				Set(tx, in, value)
+
+				return nil
+			})
+			if err != nil || snapshot.Rev() != uint64(step+2) || forcedRuns != step+2 || sinkRuns != step+2 {
+				t.Fatalf("Never: error=%v snapshot=%v forced=%d sink=%d", err, snapshot, forcedRuns, sinkRuns)
+			}
+
+			if snapshot.Get(sink) != value || ChangedAt(snapshot, sink) != 1 || ChangedAt(snapshot, in) != snapshot.Rev() || ChangedAt(snapshot, forced) != snapshot.Rev() {
+				t.Fatal("Never must propagate equal writes; Same must cut off the equal sink value")
+			}
+
+			if before.Get(in) != value || before.Rev() != uint64(step+1) {
+				t.Fatal("forced change altered a retained snapshot")
+			}
+
+			unchanged, err := g.Update(func(*Tx) error { return nil })
+			if err != nil || unchanged != snapshot || forcedRuns != step+2 || sinkRuns != step+2 {
+				t.Fatal("Never must not cause an empty transaction to commit or compute")
+			}
+		}
+	})
+}
+
+func TestGraphPropertyRegistrationGuards(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		g := New()
+		initial := rapid.IntRange(-100, 100).Draw(t, "initial")
+		in := g.NewInput("in", initial, Same[int])
+
+		var later Node[int]
+
+		illegal := true
+		cell := NewDerived(g, "reader", Same[int], func(s *Snapshot, _ int) int {
+			if illegal {
+				return s.Get(later)
+			}
+
+			return s.Get(in)
+		})
+
+		later = cell
+		if rapid.Bool().Draw(t, "forward-read") {
+			later = g.NewInput("later", initial, Same[int])
+		}
+
+		var recovered any
+
+		func() {
+			defer func() { recovered = recover() }()
+
+			_, _ = g.Update(func(*Tx) error { return nil })
+		}()
+
+		if recovered == nil || g.Snapshot() != nil {
+			t.Fatal("self/forward read must panic without publishing")
+		}
+
+		// A failed first update must not freeze registration or lose initial values.
+		extra := g.NewInput("after-failure", initial+1, Same[int])
+		illegal = false
+
+		before, err := g.Update(func(*Tx) error { return nil })
+		if err != nil || before.Get(cell) != initial || before.Get(extra) != initial+1 {
+			t.Fatalf("retry lost initial values: snapshot=%v error=%v", before, err)
+		}
+
+		func() {
+			defer func() { recovered = recover() }()
+
+			if rapid.Bool().Draw(t, "late-derived") {
+				_ = NewDerived(g, "too-late", Same[int], func(*Snapshot, int) int { return initial })
+			} else {
+				_ = g.NewInput("too-late", initial, Same[int])
+			}
+		}()
+
+		if recovered == nil || g.Snapshot() != before {
+			t.Fatal("registration after publication must panic without changing the snapshot")
+		}
+
+		next, err := g.Update(func(tx *Tx) error { Set(tx, in, initial+2); return nil })
+		if err != nil || next.Get(cell) != initial+2 || next.Rev() != 2 {
+			t.Fatalf("registration panic left graph unusable: snapshot=%v error=%v", next, err)
+		}
+	})
 }

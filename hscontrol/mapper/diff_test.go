@@ -1,10 +1,15 @@
 package mapper
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
+	"maps"
 	"net/netip"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -12,9 +17,13 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go4.org/mem"
+	"pgregory.net/rapid"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/key"
 	"tailscale.com/types/opt"
+	"tailscale.com/util/zstdframe"
 )
 
 func testPeer(id tailcfg.NodeID) *tailcfg.Node {
@@ -897,4 +906,882 @@ func saasDiscoRotation(t *testing.T) (bool, bool) {
 	t.Fatal("no disco rotation reached bystander")
 
 	return false, false
+}
+
+func wirePeer(id tailcfg.NodeID) *tailcfg.Node {
+	raw := bytes.Repeat([]byte{byte(id)}, 32)                                                         //nolint:gosec // test IDs are 1..5
+	addresses := []netip.Prefix{netip.PrefixFrom(netip.AddrFrom4([4]byte{100, 64, 0, byte(id)}), 32)} //nolint:gosec // test IDs are 1..5
+
+	return &tailcfg.Node{
+		ID: id, StableID: tailcfg.StableNodeID(fmt.Sprint(id)), Name: fmt.Sprintf("peer-%d.example.", id),
+		User: 1, Key: key.NodePublicFromRaw32(mem.B(raw)),
+		DiscoKey:  key.DiscoPublicFromRaw32(mem.B(raw)),
+		Addresses: addresses, AllowedIPs: slices.Clone(addresses),
+		Online: new(true), Cap: tailcfg.CurrentCapabilityVersion,
+		Hostinfo: (&tailcfg.Hostinfo{Hostname: "peer", OS: "linux"}).View(),
+	}
+}
+
+func wireText(t *rapid.T) string {
+	return rapid.SampledFrom([]string{"", "plain", "quote\"slash\\\n\t", "<>&", "é\u96ea😀", "e\u0301\u2028\u2029", "\x00"}).Draw(t, "text")
+}
+
+func wireTime(t *rapid.T) *time.Time {
+	switch rapid.IntRange(0, 3).Draw(t, "time-kind") {
+	case 0:
+		return nil
+	case 1:
+		return new(time.Time)
+	default:
+		return new(time.Unix(rapid.Int64Range(1, 4102444800).Draw(t, "seconds"), 123).UTC())
+	}
+}
+
+func wireCaps(t *rapid.T) tailcfg.NodeCapMap {
+	switch rapid.IntRange(0, 4).Draw(t, "caps-kind") {
+	case 0:
+		return nil
+	case 1:
+		return tailcfg.NodeCapMap{}
+	case 2:
+		return tailcfg.NodeCapMap{nodecap.FileSharing: nil}
+	case 3:
+		return tailcfg.NodeCapMap{nodecap.FileSharing: {}}
+	default:
+		payload, err := json.Marshal(wireText(t))
+		require.NoError(t, err)
+
+		return tailcfg.NodeCapMap{nodecap.FileSharing: {tailcfg.RawMessage(payload)}}
+	}
+}
+
+func wireEdit(t *rapid.T, n *tailcfg.Node) {
+	switch rapid.IntRange(0, 8).Draw(t, "field") {
+	case 0:
+		n.HomeDERP = tailcfg.DERPRegionID(rapid.IntRange(0, 3).Draw(t, "derp"))
+	case 1:
+		n.Endpoints = rapid.SampledFrom([][]netip.AddrPort{
+			nil, {}, {netip.MustParseAddrPort("192.0.2.1:41641")}, {netip.MustParseAddrPort("[2001:db8::1]:1")},
+		}).Draw(t, "endpoints")
+	case 2:
+		// Registered nodes have a nonzero public key; zero-key clears are
+		// a separate generic PeerChange contract, not a valid registration.
+		raw := bytes.Repeat([]byte{rapid.ByteRange(1, 255).Draw(t, "key-byte")}, 32)
+		n.Key = key.NodePublicFromRaw32(mem.B(raw))
+
+		n.DiscoKey = key.DiscoPublic{}
+		if !rapid.Bool().Draw(t, "clear-disco") {
+			n.DiscoKey = key.DiscoPublicFromRaw32(mem.B(raw))
+		}
+	case 3:
+		n.KeyExpiry = time.Time{}
+		if rapid.Bool().Draw(t, "expires") {
+			n.KeyExpiry = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+		}
+	case 4:
+		n.Online = new(rapid.Bool().Draw(t, "online"))
+
+		n.LastSeen = nil
+		if !*n.Online {
+			n.LastSeen = new(time.Unix(rapid.Int64Range(1, 10000).Draw(t, "seen"), 0).UTC())
+		}
+	case 5:
+		// A viewer can see an exit node's suggestion without receiving its
+		// exit routes when policy grants only access to the node itself.
+		n.CapMap = rapid.SampledFrom([]tailcfg.NodeCapMap{nil, {}, {nodecap.SuggestExitNode: nil}}).Draw(t, "peer-caps")
+	case 6:
+		n.Name = rapid.SampledFrom([]string{"peer.example.", "renamed.example."}).Draw(t, "name")
+		n.Hostinfo = (&tailcfg.Hostinfo{Hostname: n.Name, OS: "linux"}).View()
+	case 7:
+		n.AllowedIPs = slices.Clone(n.Addresses)
+
+		n.PrimaryRoutes = nil
+		if rapid.Bool().Draw(t, "route") {
+			n.PrimaryRoutes = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
+			n.AllowedIPs = append(n.AllowedIPs, n.PrimaryRoutes...)
+		}
+	case 8:
+		// A re-render with identical fields is a no-op even with new pointers.
+	}
+}
+
+// TestRapidWireDiffReplay checks that serialized diffs converge on a fresh map.
+// These are renderable peer fields: node keys stay nonzero, disco keys can clear,
+// and peer capabilities use SuggestExitNode. The client may see that capability
+// without exit routes when policy grants only access to the peer itself.
+// This diagnostic property intentionally exposes current zero-disco and mixed
+// offline/clear bugs; TestWireReachableFailures pins their State-to-wire paths.
+func TestRapidWireDiffReplay(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		sent := &netMap{self: wirePeer(1), peers: peerMapOf(), profiles: newProfileMap()}
+		client := wirePeers{}
+		hub := NewHub()
+		steps := rapid.IntRange(1, 30).Draw(t, "steps")
+		history := make([]*netMap, 1, steps+1)
+		history[0] = sent
+		retained := make([]any, 1, steps+1)
+
+		retained[0] = wireJSON(t, sortedPeers(sent))
+		for step := range steps {
+			next := *sent
+			next.at = time.Unix(int64(step+1), 0).UTC()
+			e := sent.peers.Edit()
+
+			for range rapid.IntRange(1, 3).Draw(t, "operations") {
+				id := tailcfg.NodeID(rapid.IntRange(2, 5).Draw(t, "id"))
+				switch rapid.IntRange(0, 3).Draw(t, "operation") {
+				case 0:
+					e.Delete(id)
+				case 1:
+					old := history[rapid.IntRange(0, len(history)-1).Draw(t, "restore")]
+					if p, ok := old.peer(id); ok {
+						e.Set(id, p)
+					}
+				default:
+					p, ok := e.Get(id)
+					if !ok {
+						p = wirePeer(id)
+					}
+
+					p = p.Clone()
+					for range rapid.IntRange(1, 3).Draw(t, "edits") {
+						wireEdit(t, p)
+					}
+
+					e.Set(id, p)
+				}
+			}
+
+			next.peers = e.Done()
+
+			uncached := diff(sent, &next, nil)
+			for repeat := range 2 {
+				cached := diff(sent, &next, &hub.frames)
+				require.Equal(t, wireJSON(t, uncached), wireJSON(t, cached), "cached diff, repeat %d", repeat)
+
+				for _, resp := range cached {
+					shared := hub.frames.share(resp)
+					wireRoundTrip(t, hub, shared, false)
+					decoded := wireRoundTrip(t, hub, shared, true)
+
+					if repeat == 0 {
+						client.apply(decoded)
+					}
+				}
+			}
+
+			fresh := wirePeers{}
+			fresh.apply(wireDecode(t, &tailcfg.MapResponse{Peers: sortedPeers(&next)}))
+			require.Equal(t, wireSemantic(t, fresh), wireSemantic(t, client), "step %d", step)
+
+			sent = &next
+			history = append(history, sent)
+			retained = append(retained, wireJSON(t, sortedPeers(sent)))
+		}
+
+		for i, old := range history {
+			require.Equal(t, retained[i], wireJSON(t, sortedPeers(old)), "retained render %d", i)
+		}
+	})
+}
+
+// Marshal's contract is encoding/json.Marshal, including omission and escaping.
+// Reuse immutable node pointers across different responses to exercise nodeJSON.
+func TestRapidWireMarshal(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		n := wirePeer(2)
+		n.Name = wireText(t)
+		n.Hostinfo = (&tailcfg.Hostinfo{Hostname: wireText(t), OS: wireText(t)}).View()
+
+		n.LastSeen = wireTime(t)
+		if expiry := wireTime(t); expiry != nil {
+			n.KeyExpiry = *expiry
+		}
+
+		n.CapMap = wireCaps(t)
+		n.KeySignature = rapid.SampledFrom([][]byte{nil, {}, {0}, {0, 255, 1}}).Draw(t, "signature")
+
+		p := &tailcfg.PeerChange{NodeID: n.ID, CapMap: wireCaps(t), LastSeen: wireTime(t), KeyExpiry: wireTime(t), KeySignature: n.KeySignature}
+		for repeat := range 3 {
+			resp := &tailcfg.MapResponse{
+				Node: n, Peers: []*tailcfg.Node{n}, PeersChanged: []*tailcfg.Node{n}, PeersChangedPatch: []*tailcfg.PeerChange{p},
+				Domain: wireText(t), ControlTime: wireTime(t),
+				DNSConfig:     &tailcfg.DNSConfig{Domains: []string{wireText(t)}},
+				PacketFilters: rapid.SampledFrom([]map[string][]tailcfg.FilterRule{nil, {}, {"base": nil}, {"base": {}}, {"base": {{SrcIPs: []string{"*"}}}}}).Draw(t, "filters"),
+				UserProfiles:  []tailcfg.UserProfile{{ID: 1, LoginName: wireText(t), DisplayName: wireText(t)}},
+			}
+			want := wireJSON(t, resp)
+			data, err := Marshal(resp)
+			require.NoError(t, err)
+
+			var got any
+			require.NoError(t, json.Unmarshal(data, &got))
+			require.Equal(t, want, got, "Marshal repeat %d", repeat)
+
+			var buf bytes.Buffer
+			require.NoError(t, MarshalTo(&buf, resp))
+			require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+			require.Equal(t, want, got, "MarshalTo repeat %d", repeat)
+			// Warming the cache must not change the source response.
+			require.Equal(t, want, wireJSON(t, resp))
+		}
+	})
+}
+
+type wireFailWriter struct {
+	remaining int
+	err       error
+}
+
+func (w *wireFailWriter) Write(p []byte) (int, error) {
+	if len(p) > w.remaining {
+		n := w.remaining
+		w.remaining = 0
+
+		return n, w.err
+	}
+
+	w.remaining -= len(p)
+
+	return len(p), nil
+}
+
+func TestRapidWireMarshalWriterError(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		n := wirePeer(2)
+		n.Name = wireText(t)
+		resp := &tailcfg.MapResponse{Peers: []*tailcfg.Node{n, n}}
+		data, err := Marshal(resp)
+		require.NoError(t, err)
+
+		failure := io.ErrClosedPipe
+		w := &wireFailWriter{remaining: rapid.IntRange(0, len(data)-1).Draw(t, "fail-after"), err: failure}
+		require.ErrorIs(t, MarshalTo(w, resp), failure)
+		// A failed write must not poison the shared node encoding.
+		var buf bytes.Buffer
+		require.NoError(t, MarshalTo(&buf, resp))
+		require.JSONEq(t, string(data), buf.String())
+	})
+}
+
+func TestRapidWireConnectivityReplay(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		before := wirePeer(2)
+		client := wirePeers{}
+		client.apply(wireDecode(t, &tailcfg.MapResponse{Peers: []*tailcfg.Node{before}}))
+
+		for range rapid.IntRange(1, 30).Draw(t, "steps") {
+			after := before.Clone()
+			after.Online = new(rapid.Bool().Draw(t, "online"))
+
+			after.LastSeen = nil
+			if !*after.Online {
+				after.LastSeen = new(time.Unix(rapid.Int64Range(1, 10000).Draw(t, "seen"), 0).UTC())
+			}
+
+			sent := &netMap{peers: peerMapOf(before), profiles: newProfileMap()}
+
+			next := withPeers(sent, after)
+			for _, resp := range diff(sent, next, nil) {
+				client.apply(wireDecode(t, resp))
+			}
+
+			fresh := wirePeers{}
+			fresh.apply(wireDecode(t, &tailcfg.MapResponse{Peers: []*tailcfg.Node{after}}))
+			require.Equal(t, wireSemantic(t, fresh), wireSemantic(t, client))
+
+			before = after
+		}
+	})
+}
+
+// These include documented generic peerPatch fields that Headscale does not
+// currently render (Cap=0, Online=nil and nonempty KeySignature). A clear that
+// requires a full list must still deliver concurrent removals and other edits.
+func TestRapidWireClearWithRemoval(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		before := wirePeer(2)
+		before.HomeDERP = 1
+		before.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")}
+		after := before.Clone()
+
+		switch rapid.IntRange(0, 3).Draw(t, "clear") {
+		case 0:
+			after.HomeDERP = 0
+		case 1:
+			after.Endpoints = rapid.SampledFrom([][]netip.AddrPort{nil, {}}).Draw(t, "empty-endpoints")
+		case 2:
+			after.Cap = 0
+		case 3:
+			after.Online = nil
+		}
+
+		other := wirePeer(3)
+		changed := other.Clone()
+		changed.HomeDERP = tailcfg.DERPRegionID(rapid.IntRange(1, 10).Draw(t, "other-derp"))
+		changed.KeySignature = rapid.SliceOfN(rapid.Byte(), 1, 20).Draw(t, "signature")
+		sent := &netMap{peers: peerMapOf(before, other, wirePeer(4)), profiles: newProfileMap()}
+		next := withPeers(sent, after, changed)
+		client := wirePeers{}
+		client.apply(wireDecode(t, &tailcfg.MapResponse{Peers: sortedPeers(sent)}))
+		responses := diff(sent, next, nil)
+		require.NotEmpty(t, responses)
+		// Old clients require removals before a response forcing a rebuild.
+		require.Equal(t, []tailcfg.NodeID{4}, responses[0].PeersRemoved)
+		require.Empty(t, responses[0].Peers)
+
+		for _, resp := range responses {
+			client.apply(wireDecode(t, resp))
+		}
+
+		fresh := wirePeers{}
+		fresh.apply(wireDecode(t, &tailcfg.MapResponse{Peers: sortedPeers(next)}))
+		require.Equal(t, wireSemantic(t, fresh), wireSemantic(t, client))
+	})
+}
+
+func TestRapidWirePeerPatch(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		before := wirePeer(2)
+		before.KeySignature = []byte{1}
+		after := before.Clone()
+		after.Cap = tailcfg.CapabilityVersion(rapid.IntRange(1, 200).Draw(t, "cap"))
+		after.KeySignature = rapid.SliceOfN(rapid.Byte(), 1, 20).Draw(t, "signature")
+		after.CapMap = tailcfg.NodeCapMap{nodecap.FileSharing: nil}
+		after.HomeDERP = tailcfg.DERPRegionID(rapid.IntRange(1, 10).Draw(t, "derp"))
+
+		after.Online = new(rapid.Bool().Draw(t, "online"))
+		if !*after.Online {
+			after.LastSeen = new(time.Unix(1, 0).UTC())
+		}
+
+		patch, ok := peerPatch(before, after)
+		require.True(t, ok)
+
+		client := wirePeers{}
+		client.apply(wireDecode(t, &tailcfg.MapResponse{Peers: []*tailcfg.Node{before}}))
+		client.apply(wireDecode(t, &tailcfg.MapResponse{PeersChangedPatch: []*tailcfg.PeerChange{patch}}))
+
+		fresh := wirePeers{}
+		fresh.apply(wireDecode(t, &tailcfg.MapResponse{Peers: []*tailcfg.Node{after}}))
+		require.Equal(t, wireSemantic(t, fresh), wireSemantic(t, client))
+	})
+}
+
+// These tests use State, real renderers and streams. They intentionally assert
+// the desired convergence and fail until the wire bugs are fixed.
+func TestWireReachableFailures(t *testing.T) {
+	for _, scenario := range []string{"disco-key-zero", "expiry-clear-offline", "capmap-clear-offline"} {
+		t.Run(scenario, func(t *testing.T) {
+			policy := `{"grants":[{"src":["u1@"],"dst":["u2@"],"ip":["*"]}]}`
+			cfg, s, ids := streamTestState(t, policy)
+			target := ids[2]
+			before, ok := s.GetNodeByID(target)
+			require.True(t, ok)
+
+			var disco key.DiscoPublic
+			require.NoError(t, disco.UnmarshalText([]byte("discokey:0101010101010101010101010101010101010101010101010101010101010101")))
+
+			req := tailcfg.MapRequest{NodeKey: before.NodeKey(), DiscoKey: disco}
+			if scenario == "capmap-clear-offline" {
+				req.Hostinfo = &tailcfg.Hostinfo{Hostname: before.Hostname()}
+				req.Hostinfo.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")}
+			}
+
+			require.NoError(t, s.UpdateNodeFromMapRequest(target, req))
+
+			if scenario == "capmap-clear-offline" {
+				_, err := s.SetApprovedRoutes(target, req.Hostinfo.RoutableIPs)
+				require.NoError(t, err)
+			}
+
+			if scenario == "expiry-clear-offline" {
+				_, err := s.SetNodeExpiry(target, new(time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)))
+				require.NoError(t, err)
+			}
+
+			epoch := s.Connect(target)
+			stream := NewStream(cfg, NewHub(), ids[0], capVer)
+			initial, err := stream.Initial(s.Snapshot())
+			require.NoError(t, err)
+
+			client := wirePeers{}
+			for _, resp := range initial {
+				client.apply(wireDecode(t, resp))
+			}
+
+			require.Contains(t, client, target.NodeID())
+			require.True(t, *client[target.NodeID()].Online)
+
+			if scenario == "capmap-clear-offline" {
+				require.Contains(t, client[target.NodeID()].CapMap, nodecap.SuggestExitNode)
+				require.Equal(t, client[target.NodeID()].Addresses, client[target.NodeID()].AllowedIPs, "viewer has no Internet access")
+			}
+
+			switch scenario {
+			case "disco-key-zero":
+				req.DiscoKey = key.DiscoPublic{}
+				require.NoError(t, s.UpdateNodeFromMapRequest(target, req))
+				stored, ok := s.GetNodeByID(target)
+				require.True(t, ok)
+				require.True(t, stored.DiscoKey().IsZero(), "zero disco key reaches State")
+				tn, err := stored.TailNode(capVer, s.GetNodePrimaryRoutes, cfg, s.Snapshot().DNS(), nil)
+				require.NoError(t, err)
+				require.True(t, tn.DiscoKey.IsZero(), "zero disco key reaches TailNode")
+			case "expiry-clear-offline":
+				_, err := s.SetNodeExpiry(target, nil)
+				require.NoError(t, err)
+				require.NoError(t, s.Disconnect(target, epoch))
+			case "capmap-clear-offline":
+				_, err := s.SetApprovedRoutes(target, nil)
+				require.NoError(t, err)
+				require.NoError(t, s.Disconnect(target, epoch))
+			}
+
+			updates, err := stream.Update(s.Snapshot())
+			require.NoError(t, err)
+
+			for _, resp := range updates {
+				data, err := Marshal(resp)
+				require.NoError(t, err)
+				t.Logf("wire: %s", data)
+				client.apply(wireDecode(t, resp))
+			}
+
+			fresh := wirePeers{}
+			freshStream := NewStream(cfg, NewHub(), ids[0], capVer)
+			freshResponses, err := freshStream.Initial(s.Snapshot())
+			require.NoError(t, err)
+
+			for _, resp := range freshResponses {
+				fresh.apply(wireDecode(t, resp))
+			}
+
+			require.Equal(t, wireSemantic(t, fresh), wireSemantic(t, client))
+		})
+	}
+}
+
+// wirePeers models the peer state in Tailscale f7c1b8e52600's
+// control/controlclient/map.go: upgradeNode, peerChangeDiff and
+// updatePeersStateFromResponse. In particular, PeersChanged is NOT always
+// replacement: the client first converts eligible entries to in-memory patches.
+// Keep this independent of peerPatch, needsPeerListRefresh and modelClient.
+type wirePeers map[tailcfg.NodeID]*tailcfg.Node
+
+func (peers wirePeers) apply(resp *tailcfg.MapResponse) {
+	if len(resp.Peers) > 0 {
+		clear(peers)
+
+		for _, n := range resp.Peers {
+			peers[n.ID] = wireUpgrade(n)
+		}
+
+		return
+	}
+
+	// Patchification happens before removal in the client.
+	patches := slices.Clone(resp.PeersChangedPatch)
+
+	var replacements []*tailcfg.Node
+
+	for _, n := range resp.PeersChanged {
+		n = wireUpgrade(n)
+		if before := peers[n.ID]; before != nil && wirePatchable(before, n) {
+			p := &tailcfg.PeerChange{
+				NodeID: n.ID, DERPRegion: n.HomeDERP, Cap: n.Cap,
+				Endpoints: n.Endpoints, Key: &n.Key, DiscoKey: &n.DiscoKey,
+				KeyExpiry: &n.KeyExpiry, KeySignature: n.KeySignature,
+				CapMap: n.CapMap,
+			}
+			// An internal patch can clear a map or a zero expiry: it never
+			// passes through JSON's omitempty/omitzero a second time.
+			if p.CapMap == nil {
+				p.CapMap = tailcfg.NodeCapMap{}
+			}
+
+			if before.Online != nil && n.Online != nil {
+				p.Online = n.Online
+			}
+
+			if before.LastSeen != nil && n.LastSeen != nil {
+				p.LastSeen = n.LastSeen
+			}
+
+			patches = append(patches, p)
+		} else {
+			replacements = append(replacements, n)
+		}
+	}
+
+	for _, id := range resp.PeersRemoved {
+		delete(peers, id)
+	}
+
+	for _, n := range replacements {
+		peers[n.ID] = n
+	}
+
+	for _, p := range patches {
+		n := peers[p.NodeID]
+		if n == nil {
+			continue
+		}
+
+		if p.DERPRegion != 0 {
+			n.HomeDERP = p.DERPRegion
+		}
+
+		if p.Cap != 0 {
+			n.Cap = p.Cap
+		}
+
+		if p.Endpoints != nil {
+			n.Endpoints = p.Endpoints
+		}
+
+		if p.Key != nil {
+			n.Key = *p.Key
+		}
+
+		if p.DiscoKey != nil {
+			n.DiscoKey = *p.DiscoKey
+		}
+
+		if p.Online != nil {
+			n.Online = p.Online
+		}
+
+		if p.LastSeen != nil {
+			n.LastSeen = p.LastSeen
+		}
+
+		if p.KeyExpiry != nil {
+			n.KeyExpiry = *p.KeyExpiry
+		}
+
+		if p.KeySignature != nil {
+			n.KeySignature = p.KeySignature
+		}
+
+		if p.CapMap != nil {
+			n.CapMap = p.CapMap
+		}
+	}
+}
+
+func wireUpgrade(n *tailcfg.Node) *tailcfg.Node {
+	n = n.Clone()
+	if n.AllowedIPs == nil {
+		n.AllowedIPs = slices.Clone(n.Addresses)
+	}
+
+	return n
+}
+
+// All fields outside upstream's patch/ignored sets must compare equal.
+// Reflection makes a future Node field conservative instead of dropping it.
+// Generated nodes use modern HomeDERP and no legacy DERP string.
+func wirePatchable(before, after *tailcfg.Node) bool {
+	a, b := reflect.ValueOf(*before), reflect.ValueOf(*after)
+	for field := range a.Type().Fields() {
+		switch field.Name {
+		case "Key", "DiscoKey", "KeyExpiry", "KeySignature", "HomeDERP", "Endpoints", "Cap", "CapMap", "Online", "LastSeen",
+			"ComputedName", "ComputedNameWithHost", "computedHostIfDifferent", "DataPlaneAuditLogID", "StableTailnetID", "Capabilities":
+			continue
+		case "Hostinfo":
+			if !before.Hostinfo.Equal(after.Hostinfo) {
+				return false
+			}
+		case "Created":
+			if !before.Created.Equal(after.Created) {
+				return false
+			}
+		default:
+			x, y := a.FieldByIndex(field.Index), b.FieldByIndex(field.Index)
+			if x.Kind() == reflect.Slice && x.Len() == 0 && y.Len() == 0 {
+				continue
+			}
+
+			if !reflect.DeepEqual(x.Interface(), y.Interface()) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func wireDecode(t require.TestingT, resp *tailcfg.MapResponse) *tailcfg.MapResponse {
+	return wireRoundTrip(t, nil, resp, false)
+}
+
+// wireRoundTrip shares the real session Hub's encoded-frame cache when supplied.
+// Standalone model inputs use the same encoder without a Hub cache.
+func wireRoundTrip(t require.TestingT, hub *Hub, resp *tailcfg.MapResponse, compress bool) *tailcfg.MapResponse {
+	var (
+		data []byte
+		err  error
+	)
+	if hub == nil {
+		data, err = benchEncode(resp, compress)
+	} else {
+		data, err = hub.Encode(resp, compress, benchEncode)
+	}
+
+	require.NoError(t, err)
+
+	if compress {
+		data, err = zstdframe.AppendDecode(nil, data)
+		require.NoError(t, err)
+	}
+
+	standard, err := json.Marshal(resp)
+	require.NoError(t, err)
+	require.JSONEq(t, string(standard), string(data), "Hub encoding changed response content")
+
+	var decoded tailcfg.MapResponse
+	require.NoError(t, json.Unmarshal(data, &decoded))
+
+	return &decoded
+}
+
+func wireJSON(t require.TestingT, v any) any {
+	data, err := json.Marshal(v)
+	require.NoError(t, err)
+
+	var decoded any
+	require.NoError(t, json.Unmarshal(data, &decoded))
+
+	return decoded
+}
+
+func wireSemantic(t require.TestingT, peers wirePeers) any {
+	cloned := make(wirePeers, len(peers))
+	for id, n := range peers {
+		n = n.Clone()
+		// tailcfg.Node documents LastSeen as stale while Online is true.
+		if n.Online != nil && *n.Online {
+			n.LastSeen = nil
+		}
+
+		cloned[id] = n
+	}
+
+	return wireJSON(t, cloned)
+}
+
+// propertyClient composes pinned peer replay with the sticky global fields and
+// an observer that only learns removals through explicit delta frames.
+type propertyClient struct {
+	domain          string
+	collectServices bool
+	filters         map[string][]tailcfg.FilterRule
+	self            *tailcfg.Node
+	peers           wirePeers
+	filter          []tailcfg.FilterRule
+	ssh             *tailcfg.SSHPolicy
+	dns             *tailcfg.DNSConfig
+	derp            *tailcfg.DERPMap
+	profiles        map[tailcfg.UserID]tailcfg.UserProfile
+	seen            map[tailcfg.UserID]bool
+	deltaPeers      map[tailcfg.NodeID]bool
+}
+
+func newPropertyClient(full *tailcfg.MapResponse) *propertyClient {
+	c := &propertyClient{peers: wirePeers{}, filters: map[string][]tailcfg.FilterRule{}, profiles: map[tailcfg.UserID]tailcfg.UserProfile{}, seen: map[tailcfg.UserID]bool{}, deltaPeers: map[tailcfg.NodeID]bool{}}
+	c.apply(full)
+
+	return c
+}
+
+func (c *propertyClient) apply(r *tailcfg.MapResponse) {
+	if r.Node != nil {
+		c.self = wireUpgrade(r.Node)
+
+		c.seen[c.self.User] = true
+		if len(c.self.Tags) > 0 {
+			c.seen[tailcfg.UserID(types.TaggedDevicesUserID)] = true
+		}
+	}
+
+	if r.SSHPolicy != nil {
+		c.ssh = r.SSHPolicy
+	}
+
+	if r.DNSConfig != nil {
+		c.dns = r.DNSConfig
+	}
+
+	if r.DERPMap != nil {
+		dm := r.DERPMap.Clone()
+		// The pinned client treats omitted DERP fields as unchanged.
+		if previous := c.derp; previous != nil {
+			if dm.Regions == nil {
+				dm.Regions, dm.OmitDefaultRegions = previous.Regions, previous.OmitDefaultRegions
+			}
+
+			if dm.HomeParams == nil {
+				dm.HomeParams = previous.HomeParams
+			} else if previous.HomeParams != nil && dm.HomeParams.RegionScore == nil {
+				dm.HomeParams.RegionScore = previous.HomeParams.RegionScore
+			}
+		}
+
+		c.derp = dm
+	}
+
+	if r.Domain != "" {
+		c.domain = r.Domain
+	}
+
+	if value, ok := r.CollectServices.Get(); ok {
+		c.collectServices = value
+	}
+
+	if r.PacketFilter != nil {
+		c.filters["base"] = r.PacketFilter
+	}
+
+	if value, reset := r.PacketFilters["*"]; reset && value == nil {
+		clear(c.filters)
+	}
+
+	for name, rules := range r.PacketFilters {
+		if name == "*" {
+			continue
+		}
+
+		if rules == nil {
+			delete(c.filters, name)
+		} else {
+			c.filters[name] = rules
+		}
+	}
+
+	c.filter = nil
+	for _, name := range slices.Sorted(maps.Keys(c.filters)) {
+		c.filter = append(c.filter, c.filters[name]...)
+	}
+
+	for _, p := range r.UserProfiles {
+		c.profiles[p.ID] = p
+	}
+
+	for _, p := range slices.Concat(r.Peers, r.PeersChanged) {
+		c.deltaPeers[p.ID] = true
+	}
+
+	for _, id := range r.PeersRemoved {
+		delete(c.deltaPeers, id)
+	}
+
+	c.peers.apply(r)
+
+	for _, p := range c.peers {
+		c.seen[p.User] = true
+	}
+}
+
+func (c *propertyClient) unseenProfile() tailcfg.UserID {
+	for id := range c.profiles {
+		if !c.seen[id] {
+			return id
+		}
+	}
+
+	return 0
+}
+
+func (c *propertyClient) check(t require.TestingT, fresh *propertyClient) {
+	require.Equal(t, fresh.domain, c.domain, "domain")
+	require.Equal(t, fresh.collectServices, c.collectServices, "service collection")
+	require.Equal(t, wireSemantic(t, wirePeers{0: fresh.self}), wireSemantic(t, wirePeers{0: c.self}), "self")
+	require.Equal(t, wireSemantic(t, fresh.peers), wireSemantic(t, c.peers), "peers")
+	require.Equal(t, wireJSON(t, fresh.filter), wireJSON(t, c.filter), "filter")
+	require.Equal(t, wireJSON(t, fresh.ssh), wireJSON(t, c.ssh), "SSH")
+	require.Equal(t, wireJSON(t, fresh.dns), wireJSON(t, c.dns), "DNS")
+	require.Equal(t, wireJSON(t, fresh.derp), wireJSON(t, c.derp), "DERP")
+
+	for id, p := range fresh.profiles {
+		require.Equal(t, p, c.profiles[id], "profile %d", id)
+	}
+
+	require.Zero(t, c.unseenProfile(), "hidden owner profile")
+	require.Len(t, c.deltaPeers, len(fresh.peers), "delta-only observer retained a removed peer")
+
+	for id := range fresh.peers {
+		require.True(t, c.deltaPeers[id], "delta-only observer missed peer %d", id)
+	}
+}
+
+func TestPropertyClientContracts(t *testing.T) {
+	before := wirePeer(2)
+	client := newPropertyClient(wireDecode(t, &tailcfg.MapResponse{Peers: []*tailcfg.Node{before, wirePeer(3)}}))
+	// An empty full-list field is a delta, not a reset, in the pinned client.
+	client.apply(wireDecode(t, &tailcfg.MapResponse{Peers: []*tailcfg.Node{}}))
+	require.Len(t, client.peers, 2)
+	client.apply(wireDecode(t, &tailcfg.MapResponse{Peers: []*tailcfg.Node{before}}))
+	require.Len(t, client.peers, 1)
+	require.True(t, client.deltaPeers[3], "full replacement cannot notify delta-only observer")
+	client.apply(&tailcfg.MapResponse{PeersRemoved: []tailcfg.NodeID{3}})
+	require.NotContains(t, client.deltaPeers, tailcfg.NodeID(3))
+
+	after := before.Clone()
+	after.Online, after.LastSeen = new(false), new(propertyEpoch)
+	client.apply(wireDecode(t, &tailcfg.MapResponse{PeersChanged: []*tailcfg.Node{after}}))
+	require.Nil(t, client.peers[2].LastSeen, "upstream patchification cannot introduce absent LastSeen")
+	require.NotEqual(t, wireSemantic(t, wirePeers{2: after}), wireSemantic(t, client.peers), "offline lost fields must remain observable")
+	after = after.Clone()
+	after.Hostinfo = (&tailcfg.Hostinfo{Hostname: "changed"}).View()
+	client.apply(wireDecode(t, &tailcfg.MapResponse{PeersChanged: []*tailcfg.Node{after}}))
+	require.Equal(t, after.LastSeen, client.peers[2].LastSeen, "nonpatchable replacement keeps LastSeen")
+
+	client.apply(&tailcfg.MapResponse{PacketFilters: map[string][]tailcfg.FilterRule{"a": {{SrcIPs: []string{"a"}}}, "b": {{SrcIPs: []string{"b"}}}}})
+	require.Len(t, client.filter, 2)
+	client.apply(&tailcfg.MapResponse{PacketFilters: map[string][]tailcfg.FilterRule{"a": nil}})
+	require.Equal(t, "b", client.filter[0].SrcIPs[0])
+	client.apply(&tailcfg.MapResponse{PacketFilters: map[string][]tailcfg.FilterRule{"*": nil}})
+	require.Empty(t, client.filter)
+}
+
+func TestPropertyClientDERPStickyFields(t *testing.T) {
+	initial := &tailcfg.DERPMap{
+		Regions:            map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: {RegionID: 1}},
+		OmitDefaultRegions: true,
+		HomeParams:         &tailcfg.DERPHomeParams{RegionScore: map[tailcfg.DERPRegionID]float64{1: 0.5}},
+	}
+	client := newPropertyClient(&tailcfg.MapResponse{DERPMap: initial})
+
+	for _, update := range []*tailcfg.DERPMap{{}, {HomeParams: &tailcfg.DERPHomeParams{}}} {
+		frozen := update.Clone()
+		client.apply(&tailcfg.MapResponse{DERPMap: update})
+		require.Equal(t, initial, client.derp, "nil fields retain previous values")
+		require.Equal(t, frozen, update, "replay owns the received map")
+	}
+
+	client.apply(&tailcfg.MapResponse{DERPMap: &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{}}})
+	require.Empty(t, client.derp.Regions)
+	require.False(t, client.derp.OmitDefaultRegions, "non-nil Regions replaces the associated flag")
+	require.Equal(t, initial.HomeParams, client.derp.HomeParams)
+
+	scores := map[tailcfg.DERPRegionID]float64{2: 2}
+	client.apply(&tailcfg.MapResponse{DERPMap: &tailcfg.DERPMap{HomeParams: &tailcfg.DERPHomeParams{RegionScore: scores}}})
+	require.Equal(t, scores, client.derp.HomeParams.RegionScore)
+	require.Empty(t, client.derp.Regions)
+	require.False(t, client.derp.OmitDefaultRegions)
+}
+
+func TestPropertyWireEncodingSlots(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	response := hub.frames.share(&tailcfg.MapResponse{ControlTime: new(propertyEpoch), DERPMap: &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: {RegionID: 1}}}})
+	require.Contains(t, hub.frames.byResp, response)
+
+	for range 2 {
+		for _, compress := range []bool{false, true} {
+			wireRoundTrip(t, hub, response, compress)
+		}
+	}
 }

@@ -2,6 +2,7 @@ package v2
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/policy/policyutil"
+	"github.com/juanfont/headscale/hscontrol/propcheck"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
@@ -31,6 +33,7 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/types/ipproto"
 	"tailscale.com/types/views"
 	"tailscale.com/util/multierr"
 )
@@ -7261,5 +7264,1946 @@ func TestSideIndexCapacity(t *testing.T) {
 			idx := newSideIndex(sideIndexNodes(1000, family, 0))
 			assert.Equal(t, len(idx.byIP), cap(idx.byIP), "immutable address index must not retain growth slack")
 		})
+	}
+}
+
+var incrementalURLs = []string{"https://a.example.com", "https://b.example.com"}
+
+func incrementalJSON(t *rapid.T, v any) []byte {
+	t.Helper()
+
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+
+	return b
+}
+
+func incrementalNode(t *rapid.T, id types.NodeID, users []types.User) *types.Node {
+	u := users[rapid.IntRange(0, len(users)-1).Draw(t, "owner")]
+	n := node(fmt.Sprintf("n%d", id), fmt.Sprintf("100.64.0.%d", id), fmt.Sprintf("fd7a:115c:a1e0::%x", id), u)
+	n.ID = id
+	incrementalIdentity(t, n, users)
+	incrementalFamily(t, n)
+
+	return n
+}
+
+func incrementalIdentity(t *rapid.T, n *types.Node, users []types.User) {
+	u := users[rapid.IntRange(0, len(users)-1).Draw(t, "owner")]
+	n.User, n.UserID = &u, &u.ID
+
+	n.Tags = rapid.SampledFrom([][]string{nil, {"tag:srv"}, {"tag:router"}, {"tag:srv", "tag:srv"}}).Draw(t, "tags")
+	if n.IsTagged() && rapid.Bool().Draw(t, "clear creator") {
+		n.User, n.UserID = nil, nil
+	}
+}
+
+func incrementalFamily(t *rapid.T, n *types.Node) {
+	n.IPv4 = new(netip.MustParseAddr(fmt.Sprintf("100.64.0.%d", n.ID)))
+	n.IPv6 = new(netip.MustParseAddr(fmt.Sprintf("fd7a:115c:a1e0::%x", n.ID)))
+
+	switch rapid.IntRange(0, 2).Draw(t, "family") {
+	case 1:
+		n.IPv4 = nil
+	case 2:
+		n.IPv6 = nil
+	}
+}
+
+type incrementalInput struct {
+	doc   []byte
+	users []types.User
+	nodes types.Nodes
+}
+
+func (in incrementalInput) edit(t *rapid.T, op string) incrementalInput {
+	in.users, in.nodes = slices.Clone(in.users), slices.Clone(in.nodes)
+
+	switch op {
+	case "policy":
+		in.doc = propcheck.DrawPolicy(t)
+	case "users":
+		i := rapid.IntRange(0, len(in.users)-1).Draw(t, "user index")
+		in.users[i].Name = rapid.SampledFrom([]string{"u1", "u2", "renamed"}).Draw(t, "name")
+		in.users[i].Email = rapid.SampledFrom([]string{"u1@example.com", "u2@example.net", ""}).Draw(t, "email")
+		in.users[i].ProviderIdentifier = sql.NullString{String: "subject", Valid: rapid.Bool().Draw(t, "provider")}
+	case "membership":
+		id := types.NodeID(rapid.IntRange(1, 8).Draw(t, "member id")) //nolint:gosec // bounded positive ID
+
+		i := slices.IndexFunc(in.nodes, func(n *types.Node) bool { return n.ID == id })
+		if i < 0 {
+			in.nodes = append(in.nodes, incrementalNode(t, id, in.users))
+		} else {
+			in.nodes = slices.Delete(in.nodes, i, i+1)
+		}
+	case "order", "duplicate":
+		in.doc = propcheck.ReorderPolicy(t, in.doc, op == "duplicate")
+		slices.Reverse(in.nodes)
+	case "noop":
+	default:
+		if len(in.nodes) == 0 {
+			return in
+		}
+
+		i := rapid.IntRange(0, len(in.nodes)-1).Draw(t, "node index")
+		n := in.nodes[i].Clone()
+		in.nodes[i] = n
+
+		switch op {
+		case "identity":
+			incrementalIdentity(t, n, in.users)
+		case "family":
+			incrementalFamily(t, n)
+		case "endpoints":
+			n.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1234")}
+		case "approved", "advertised":
+			routes := rapid.SliceOfN(rapid.SampledFrom([]netip.Prefix{
+				netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("2001:db8::/64"),
+				netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+			}), 0, 4).Draw(t, "routes")
+			if op == "approved" {
+				n.ApprovedRoutes = routes
+			} else {
+				n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: routes}
+			}
+		}
+	}
+
+	return in
+}
+
+// Keep returned slices/maps as well as serialized values: re-reading a manager
+// alone would miss mutations of output a reader already holds.
+type incrementalOutput struct {
+	Global   []tailcfg.FilterRule
+	Filters  map[types.NodeID][]tailcfg.FilterRule
+	SSH      map[string]map[types.NodeID]*tailcfg.SSHPolicy
+	Caps     map[types.NodeID]tailcfg.NodeCapMap
+	Peers    map[types.NodeID][]types.NodeID
+	Matchers map[types.NodeID][]string
+}
+
+func incrementalObserve(t *rapid.T, pm *PolicyManager, classes *PeerClasses) incrementalOutput {
+	t.Helper()
+
+	out := incrementalOutput{
+		Filters: map[types.NodeID][]tailcfg.FilterRule{}, SSH: map[string]map[types.NodeID]*tailcfg.SSHPolicy{},
+		Caps: pm.NodeCapMaps(), Peers: map[types.NodeID][]types.NodeID{}, Matchers: map[types.NodeID][]string{},
+	}
+
+	out.Global, _ = pm.Filter()
+	for _, url := range incrementalURLs {
+		out.SSH[url] = map[types.NodeID]*tailcfg.SSHPolicy{}
+	}
+
+	for _, n := range pm.nodes.All() {
+		var err error
+
+		out.Filters[n.ID()], err = pm.FilterForNode(n)
+		require.NoError(t, err)
+
+		for _, url := range incrementalURLs {
+			out.SSH[url][n.ID()], err = pm.SSHPolicy(url, n)
+			require.NoError(t, err)
+		}
+
+		out.Peers[n.ID()] = classes.Peers(n.ID())
+		ms, err := pm.MatchersForNode(n)
+		require.NoError(t, err)
+
+		for _, m := range ms {
+			out.Matchers[n.ID()] = append(out.Matchers[n.ID()], fmt.Sprintf("%s internet=%t capInternet=%t", m.DebugString(), m.DestsIsTheInternet(), m.CapDestsIsTheInternet()))
+		}
+	}
+
+	return out
+}
+
+type incrementalSnapshot struct {
+	incrementalInput
+
+	warm, cold          *PolicyManager
+	classes             *PeerClasses
+	held                incrementalOutput
+	frozen, frozenViews []byte
+}
+
+func incrementalCompile(t *rapid.T, in incrementalInput, prev *incrementalSnapshot) *incrementalSnapshot {
+	t.Helper()
+
+	var (
+		warm, cold *PolicyManager
+		classes    *PeerClasses
+	)
+	if prev != nil {
+		warm, cold, classes = prev.warm, prev.cold, prev.classes
+	}
+
+	fresh, err := NewPolicyManager(in.doc, in.users, in.nodes.ViewSlice())
+	require.NoError(t, err, "document: %s", in.doc)
+	warm, err = NewPolicyManagerFrom(warm, in.doc, in.users, in.nodes.ViewSlice())
+	require.NoError(t, err)
+	cold, err = NewPolicyManagerFrom(cold, in.doc, in.users, in.nodes.ViewSlice())
+	require.NoError(t, err)
+
+	classes = warm.BuildPeerClasses(in.nodes.ViewSlice(), classes)
+	if prev != nil {
+		classes.Reuse(prev.classes)
+	}
+
+	wantClasses := fresh.BuildPeerClasses(in.nodes.ViewSlice(), nil)
+	want := incrementalObserve(t, fresh, wantClasses)
+	got := incrementalObserve(t, warm, classes)
+	require.Equal(t, want, got)
+	require.Equal(t, fresh.tagOwnerMap, warm.tagOwnerMap)
+	require.Equal(t, fresh.autoApproveMap, warm.autoApproveMap)
+	require.Equal(t, fresh.exitSet, warm.exitSet)
+
+	pairScan := fresh.BuildPeerMap(in.nodes.ViewSlice())
+	for _, n := range in.nodes {
+		require.ElementsMatch(t, pairScan[n.ID], got.Peers[n.ID])
+	}
+
+	if prev != nil {
+		incrementalNotifications(t, prev, prev.warm, warm, want, classes)
+		incrementalNotifications(t, prev, prev.cold, cold, want, classes)
+	}
+
+	return &incrementalSnapshot{
+		incrementalInput: in, warm: warm, cold: cold, classes: classes,
+		held: got, frozen: incrementalJSON(t, want), frozenViews: incrementalJSON(t, classes.Views()),
+	}
+}
+
+func incrementalNotifications(t *rapid.T, old *incrementalSnapshot, previous, next *PolicyManager, want incrementalOutput, classes *PeerClasses) {
+	t.Helper()
+
+	changed, all := next.FilterChangedNodes(previous)
+
+	peerChanged := classes.Changed(old.classes)
+	for _, n := range next.nodes.All() {
+		before, exists := old.warm.nodesByID[n.ID()]
+		if !exists || !slices.Equal(old.held.Peers[n.ID()], want.Peers[n.ID()]) {
+			require.Contains(t, peerChanged, n.ID(), "peer notification")
+		}
+		// The world wakes a changed node itself. This delta must also wake
+		// untouched destinations, even if they are not peers of the changed node.
+		if !exists || before != n || all || slices.Contains(changed, n.ID()) {
+			continue
+		}
+
+		require.Equal(t, old.held.Filters[n.ID()], want.Filters[n.ID()], "missed filter notification for %d", n.ID())
+
+		for _, url := range incrementalURLs {
+			require.Equal(t, old.held.SSH[url][n.ID()], want.SSH[url][n.ID()], "missed SSH notification for %d", n.ID())
+		}
+	}
+
+	for id := range old.warm.nodesByID {
+		if _, exists := next.nodesByID[id]; !exists {
+			require.Contains(t, peerChanged, id, "removed node notification")
+		}
+	}
+}
+
+func (s *incrementalSnapshot) check(t *rapid.T) {
+	t.Helper()
+	require.Equal(t, s.frozen, incrementalJSON(t, s.held), "retained output mutated")
+	require.Equal(t, s.frozenViews, incrementalJSON(t, s.classes.Views()), "retained peer views mutated")
+	require.Equal(t, s.frozen, incrementalJSON(t, incrementalObserve(t, s.warm, s.classes)), "old warm snapshot changed")
+	classes := s.cold.BuildPeerClasses(s.nodes.ViewSlice(), nil)
+	require.Equal(t, s.frozen, incrementalJSON(t, incrementalObserve(t, s.cold, classes)), "old cold snapshot changed")
+}
+
+func TestIncrementalPolicyRapidHistory(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		in := incrementalInput{doc: propcheck.DrawPolicy(t), users: []types.User{
+			{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}, {ID: 3, Name: "u3"},
+		}}
+		for i := range rapid.IntRange(0, 6).Draw(t, "nodes") {
+			in.nodes = append(in.nodes, incrementalNode(t, types.NodeID(i+1), in.users)) //nolint:gosec
+		}
+
+		history := []*incrementalSnapshot{incrementalCompile(t, in, nil)}
+
+		ops := []string{"policy", "users", "identity", "family", "approved", "advertised", "endpoints", "membership", "order", "duplicate", "noop"}
+		for _, op := range rapid.SliceOfN(rapid.SampledFrom(append(slices.Clone(ops), "restore", "temporary", "batch")), 1, 12).Draw(t, "operations") {
+			base := history[len(history)-1]
+			if rapid.Bool().Draw(t, "sibling") {
+				base = history[rapid.IntRange(0, len(history)-1).Draw(t, "ancestor")]
+			}
+
+			in = base.incrementalInput
+
+			switch op {
+			case "restore":
+				in = history[rapid.IntRange(0, len(history)-1).Draw(t, "restore snapshot")].incrementalInput
+			case "temporary":
+				// Remove all grants, then restore from a descendant, not from the saved manager.
+				in.doc = []byte(`{"grants":[]}`)
+				removed := incrementalCompile(t, in, base)
+				history = append(history, removed)
+				in, base = base.incrementalInput, removed
+			case "batch":
+				for range rapid.IntRange(2, 4).Draw(t, "batch size") {
+					in = in.edit(t, rapid.SampledFrom(ops).Draw(t, "batch operation"))
+				}
+			default:
+				in = in.edit(t, op)
+			}
+
+			next := incrementalCompile(t, in, base)
+			if op == "order" || op == "duplicate" || op == "endpoints" || op == "noop" {
+				require.Equal(t, base.held.Peers, next.held.Peers, "semantics-preserving operation %s", op)
+			}
+
+			history = append(history, next)
+			// The newest manager stays cold until a child has compiled from it.
+			for _, old := range history[:len(history)-1] {
+				old.check(t)
+			}
+		}
+
+		history[len(history)-1].check(t)
+	})
+}
+
+// This oracle knows only literal IPs and directed edges. It never calls a
+// production alias resolver, matcher, reducer or CanAccess implementation.
+func TestIncrementalPolicyRapidDirectIPs(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		n := rapid.IntRange(2, 8).Draw(t, "nodes")
+
+		nodes := make(types.Nodes, n)
+		for i := range nodes {
+			nodes[i] = node(fmt.Sprint("n", i), fmt.Sprintf("100.64.0.%d", i+1), fmt.Sprintf("fd7a:115c:a1e0::%x", i+1), types.User{ID: uint(i + 1), Name: fmt.Sprint("u", i)}) //nolint:gosec
+			nodes[i].ID = types.NodeID(i + 1)                                                                                                                                   //nolint:gosec
+		}
+
+		type edge struct{ from, to int }
+
+		edges := rapid.SliceOfN(rapid.Custom(func(t *rapid.T) edge {
+			return edge{rapid.IntRange(0, n-1).Draw(t, "from"), rapid.IntRange(0, n-1).Draw(t, "to")}
+		}), 0, 16).Draw(t, "edges")
+		v6 := rapid.Bool().Draw(t, "ipv6")
+		ip := func(i int) string {
+			if v6 {
+				return nodes[i].IPv6.String()
+			}
+
+			return nodes[i].IPv4.String()
+		}
+
+		var prev *incrementalSnapshot
+		// Duplicate, reorder, remove and restore rules without changing their model.
+		for _, es := range [][]edge{edges, slices.Concat(edges, edges), {}, edges} {
+			grants := []any{}
+			for _, e := range es {
+				grants = append(grants, map[string]any{"src": []string{ip(e.from)}, "dst": []string{ip(e.to)}, "ip": []string{"tcp:443"}})
+			}
+
+			slices.Reverse(grants)
+
+			next := incrementalCompile(t, incrementalInput{doc: incrementalJSON(t, map[string]any{"grants": grants}), nodes: nodes}, prev)
+			for i, a := range nodes {
+				var peers []types.NodeID
+
+				for j, b := range nodes {
+					forward := slices.Contains(es, edge{i, j})
+					if i != j && (forward || slices.Contains(es, edge{j, i})) {
+						peers = append(peers, b.ID)
+					}
+					// All generated rules have one literal source and TCP port 443.
+					allowed := false
+
+					for _, rule := range next.held.Filters[b.ID] {
+						if !slices.Contains(rule.SrcIPs, ip(i)) {
+							continue
+						}
+
+						for _, dst := range rule.DstPorts {
+							if dst.IP == ip(j) && dst.Ports.First <= 443 && dst.Ports.Last >= 443 && slices.Contains(rule.IPProto, 6) {
+								allowed = true
+							}
+						}
+					}
+
+					require.Equal(t, forward, allowed, "directed packet access %d -> %d", i, j)
+				}
+
+				require.ElementsMatch(t, peers, next.held.Peers[a.ID])
+			}
+
+			if prev != nil {
+				prev.check(t)
+			}
+
+			prev = next
+		}
+
+		prev.check(t)
+	})
+}
+
+func TestIncrementalPolicyRapidMatcherWords(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		count := rapid.SampledFrom([]int{0, 1, 63, 64, 65, 127, 128, 129}).Draw(t, "matcher count")
+		nodes := scanManyRulesNodes(6).ViewSlice()
+
+		rules := make([]tailcfg.FilterRule, count)
+		for i := range rules {
+			src := rapid.IntRange(0, nodes.Len()-1).Draw(t, "source")
+			dst := rapid.IntRange(0, nodes.Len()-1).Draw(t, "destination")
+			rules[i] = tailcfg.FilterRule{
+				SrcIPs:   []string{nodes.At(src).IPv4().String()},
+				DstPorts: []tailcfg.NetPortRange{{IP: nodes.At(dst).IPv4().String(), Ports: tailcfg.PortRangeAny}},
+			}
+		}
+
+		ms := matcher.MatchesFromFilterRules(rules)
+		_, _, old := cachedMatcherSides(ms, nodes, nil)
+
+		type masks struct{ Src, Dst []uint64 }
+
+		frozen := map[types.NodeID]masks{}
+		for id, s := range old.nodes {
+			frozen[id] = masks{slices.Clone(s.src), slices.Clone(s.dst)}
+		}
+
+		reordered := slices.Clone(ms)
+		slices.Reverse(reordered)
+
+		removed := reordered[:rapid.IntRange(0, len(reordered)).Draw(t, "retain")]
+		for _, next := range [][]matcher.Match{reordered, slices.Concat(ms, ms), removed, nil, ms} {
+			src, dst, _ := cachedMatcherSides(next, nodes, old)
+			// Compare every bit with a scalar membership test, including high words.
+			for i, node := range nodes.All() {
+				for k, m := range next {
+					has := func(words []uint64) bool { return k/64 < len(words) && words[k/64]&(uint64(1)<<uint(k%64)) != 0 } //nolint:gosec
+					require.Equal(t, m.SrcsContainsIPs(node.IPs()...), has(src[i]))
+					require.Equal(t, m.DestsContainsIP(node.IPs()...), has(dst[i]))
+				}
+
+				// Cached masks may keep zero words, but no bit may name a removed rule.
+				for _, words := range [][]uint64{src[i], dst[i]} {
+					for w, word := range words {
+						valid := min(max(len(next)-64*w, 0), 64)
+						unused := ^uint64(0) << valid
+						require.Zero(t, word&unused, "bits beyond %d matchers in word %d", len(next), w)
+					}
+				}
+			}
+
+			for id, s := range old.nodes {
+				require.Equal(t, masks{s.src, s.dst}, frozen[id], "old masks mutated")
+			}
+		}
+	})
+}
+
+func TestIncrementalPolicyRapidSSHAndOwnership(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		users := []types.User{{ID: 1, Name: "u1"}}
+
+		nodes := types.Nodes{
+			node("source", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
+			node("sibling", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
+			node("server", "100.64.0.3", "fd7a:115c:a1e0::3", users[0]),
+		}
+		for i, n := range nodes {
+			n.ID = types.NodeID(i + 1)
+		} //nolint:gosec
+
+		nodes[2].Tags = []string{"tag:srv"} // Retain creator: tags still exclude self access.
+		self := rapid.Bool().Draw(t, "self packet grant")
+
+		pol := map[string]any{"grants": []any{}, "ssh": []any{}, "tagOwners": map[string][]string{"tag:srv": {"u1@"}}}
+		if self {
+			pol["grants"] = []any{map[string]any{"src": []string{"u1@"}, "dst": []string{"autogroup:self"}, "ip": []string{"*"}}}
+		}
+
+		base := incrementalCompile(t, incrementalInput{doc: incrementalJSON(t, pol), users: users, nodes: nodes}, nil)
+		prev := base
+
+		for _, enabled := range []bool{true, false, true} {
+			pol["ssh"] = []any{}
+			if enabled {
+				pol["ssh"] = []any{map[string]any{"action": "accept", "src": []string{"u1@"}, "dst": []string{"tag:srv"}, "users": []string{"root"}}}
+			}
+
+			next := incrementalCompile(t, incrementalInput{doc: incrementalJSON(t, pol), users: users, nodes: nodes}, prev)
+			for _, url := range incrementalURLs {
+				ssh := next.held.SSH[url][3]
+				require.Equal(t, enabled, ssh != nil && len(ssh.Rules) > 0)
+			}
+
+			require.Empty(t, next.held.Peers[3], "SSH alone must not grant packet visibility")
+			require.Empty(t, next.held.Filters[3], "creator ID must not give tagged nodes self access")
+			// Move a source's identity while the destination is untouched and is
+			// not its peer. FilterChangedNodes must still cover the SSH change.
+			moved := slices.Clone(nodes)
+			moved[0] = moved[0].Clone()
+
+			moved[0].Tags = []string{"tag:srv"}
+			if rapid.Bool().Draw(t, "retain creator") {
+				moved[0].User, moved[0].UserID = nil, nil
+			}
+
+			child := incrementalCompile(t, incrementalInput{doc: next.doc, users: users, nodes: moved}, next)
+			require.Empty(t, child.held.Filters[1], "tagged source must lose its self filter")
+			require.Empty(t, child.held.Peers[1])
+
+			if enabled {
+				require.NotEqual(t, next.held.SSH[incrementalURLs[0]][3], child.held.SSH[incrementalURLs[0]][3])
+			}
+
+			next.check(t)
+			prev = incrementalCompile(t, next.incrementalInput, child)
+			child.check(t)
+			base.check(t)
+		}
+
+		prev.check(t)
+	})
+}
+
+func TestIncrementalPolicyRapidRawApprovals(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		route := rapid.SampledFrom([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("2001:db8::/64")}).Draw(t, "route")
+		nodes := scanManyRulesNodes(2)
+		// Wildcard source includes manual approvals even before advertisement.
+		wildcard := []byte(`{"grants":[{"src":["*"],"dst":["*"],"ip":["*"]}]}`)
+		// A subnet source connects a router only while it serves that subnet.
+		subnet := incrementalJSON(t, map[string]any{"grants": []any{map[string]any{
+			"src": []string{route.String()}, "dst": []string{nodes[1].IPv4.String()}, "ip": []string{"*"},
+		}}})
+
+		var prev *incrementalSnapshot
+
+		for _, doc := range [][]byte{wildcard, subnet} {
+			for _, state := range [][2]bool{{false, false}, {true, false}, {true, true}, {false, true}, {false, false}, {true, true}} {
+				nodes = slices.Clone(nodes)
+				nodes[0] = nodes[0].Clone()
+				nodes[0].ApprovedRoutes = nil
+
+				nodes[0].Hostinfo = &tailcfg.Hostinfo{}
+				if state[0] {
+					nodes[0].ApprovedRoutes = []netip.Prefix{route}
+				}
+
+				if state[1] {
+					nodes[0].Hostinfo.RoutableIPs = []netip.Prefix{route}
+				}
+
+				next := incrementalCompile(t, incrementalInput{doc: doc, nodes: nodes}, prev)
+				if string(doc) == string(wildcard) {
+					present := slices.ContainsFunc(next.held.Global, func(r tailcfg.FilterRule) bool { return slices.Contains(r.SrcIPs, route.String()) })
+					require.Equal(t, state[0], present, "wildcard must use raw approval")
+				} else {
+					require.Equal(t, state[0] && state[1], slices.Contains(next.held.Peers[1], types.NodeID(2)), "subnet source needs approval and advertisement")
+				}
+
+				if prev != nil {
+					prev.check(t)
+				}
+
+				prev = next
+			}
+		}
+
+		prev.check(t)
+	})
+}
+
+func TestIncrementalPolicyRapidCapabilityKeys(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		nodes := scanManyRulesNodes(2)
+		suffix := rapid.SampledFrom([]string{"a", "a,b", "a=b", "a|b"}).Draw(t, "capability suffix")
+		key := "example.com/" + suffix
+		caps := []map[string]any{
+			{key: []any{}, "example.com/b": []any{}},
+			{key + "=example.com/b": []any{}},
+			{key: []any{map[string]any{"value": rapid.IntRange(0, 3).Draw(t, "value")}}},
+		}
+
+		var prev *incrementalSnapshot
+
+		for _, capMap := range []map[string]any{caps[0], caps[1], caps[2], caps[0]} {
+			doc := incrementalJSON(t, map[string]any{"grants": []any{map[string]any{
+				"src": []string{nodes[0].IPv4.String()}, "dst": []string{nodes[1].IPv4.String()}, "app": capMap,
+			}}})
+			next := incrementalCompile(t, incrementalInput{doc: doc, nodes: nodes}, prev)
+			rules := next.held.Filters[2]
+			require.Len(t, rules, 1)
+			require.Len(t, rules[0].CapGrant, 1)
+			require.JSONEq(t, string(incrementalJSON(t, capMap)), string(incrementalJSON(t, rules[0].CapGrant[0].CapMap)))
+
+			if prev != nil {
+				prev.check(t)
+			}
+
+			prev = next
+		}
+
+		prev.check(t)
+
+		// Same source/destination sets, different meaning for an exit node.
+		nodes = slices.Clone(nodes)
+		nodes[1] = nodes[1].Clone()
+		nodes[1].ApprovedRoutes = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}
+		nodes[1].Hostinfo = &tailcfg.Hostinfo{RoutableIPs: slices.Clone(nodes[1].ApprovedRoutes)}
+		prev = nil
+
+		for _, app := range []bool{false, true, false, true} {
+			grant := map[string]any{"src": []string{nodes[0].IPv4.String()}, "dst": []string{"8.8.8.0/24"}}
+			if app {
+				grant["app"] = caps[0]
+			} else {
+				grant["ip"] = []string{"*"}
+			}
+
+			next := incrementalCompile(t, incrementalInput{doc: incrementalJSON(t, map[string]any{"grants": []any{grant}}), nodes: nodes}, prev)
+			require.Equal(t, !app, slices.Contains(next.held.Peers[1], types.NodeID(2)), "capabilities alone do not grant exit traffic")
+			require.Equal(t, []types.NodeID{1}, next.held.Peers[2], "exit must know capability source")
+
+			if prev != nil {
+				prev.check(t)
+			}
+
+			prev = next
+		}
+
+		prev.check(t)
+	})
+}
+
+func TestIncrementalDuplicateAppGrantInvalidatesFilter(t *testing.T) {
+	nodes := scanManyRulesNodes(2).ViewSlice()
+	before := []byte(`{"grants":[{"src":["100.64.0.0"],"dst":["100.64.0.1"],"app":{"example.com/cap":[]}}]}`)
+	after := []byte(`{"grants":[{"src":["100.64.0.0"],"dst":["100.64.0.1"],"app":{"example.com/cap":[]}},{"src":["100.64.0.0"],"dst":["100.64.0.1"],"app":{"example.com/cap":[]}}]}`)
+	old, err := NewPolicyManager(before, nil, nodes)
+	require.NoError(t, err)
+	_, err = old.FilterForNode(nodes.At(1))
+	require.NoError(t, err)
+	next, err := NewPolicyManagerFrom(old, after, nil, nodes)
+	require.NoError(t, err)
+	fresh, err := NewPolicyManager(after, nil, nodes)
+	require.NoError(t, err)
+	// Compilation itself agrees; the warmed reduced filter is stale.
+	wantGlobal, _ := fresh.Filter()
+	gotGlobal, _ := next.Filter()
+	require.Equal(t, wantGlobal, gotGlobal)
+
+	cold, err := NewPolicyManager(before, nil, nodes)
+	require.NoError(t, err)
+	coldNext, err := NewPolicyManagerFrom(cold, after, nil, nodes)
+	require.NoError(t, err)
+	coldRules, err := coldNext.FilterForNode(nodes.At(1))
+	require.NoError(t, err)
+	got, err := next.FilterForNode(nodes.At(1))
+	require.NoError(t, err)
+	want, err := fresh.FilterForNode(nodes.At(1))
+	require.NoError(t, err)
+	require.Equal(t, want, coldRules)
+
+	changed, all := next.FilterChangedNodes(old)
+	t.Logf("rules fresh=%d incremental=%d notifications=%v all=%t destination=%d", len(want), len(got), changed, all, types.NodeID(2))
+	require.Equal(t, want, got)
+}
+
+func TestIncrementalAppGrantOrderInvalidatesFilter(t *testing.T) {
+	nodes := scanManyRulesNodes(2).ViewSlice()
+	before := []byte(`{"grants":[{"src":["100.64.0.0"],"dst":["100.64.0.1"],"app":{"example.com/cap":[{"role":"read"}]}},{"src":["100.64.0.0"],"dst":["100.64.0.1"],"app":{"example.com/cap":[{"role":"write"}]}}]}`)
+	after := []byte(`{"grants":[{"src":["100.64.0.0"],"dst":["100.64.0.1"],"app":{"example.com/cap":[{"role":"write"}]}},{"src":["100.64.0.0"],"dst":["100.64.0.1"],"app":{"example.com/cap":[{"role":"read"}]}}]}`)
+	old, err := NewPolicyManager(before, nil, nodes)
+	require.NoError(t, err)
+	_, err = old.FilterForNode(nodes.At(1))
+	require.NoError(t, err)
+	next, err := NewPolicyManagerFrom(old, after, nil, nodes)
+	require.NoError(t, err)
+	fresh, err := NewPolicyManager(after, nil, nodes)
+	require.NoError(t, err)
+	cold, err := NewPolicyManager(before, nil, nodes)
+	require.NoError(t, err)
+	coldNext, err := NewPolicyManagerFrom(cold, after, nil, nodes)
+	require.NoError(t, err)
+	coldRules, err := coldNext.FilterForNode(nodes.At(1))
+	require.NoError(t, err)
+	got, err := next.FilterForNode(nodes.At(1))
+	require.NoError(t, err)
+	want, err := fresh.FilterForNode(nodes.At(1))
+	require.NoError(t, err)
+
+	// Pin input order independently of the incremental/fresh comparison.
+	require.Len(t, want, 2)
+
+	for i, role := range []tailcfg.RawMessage{`{"role":"write"}`, `{"role":"read"}`} {
+		require.Len(t, want[i].CapGrant, 1)
+		require.Equal(t, []tailcfg.RawMessage{role}, want[i].CapGrant[0].CapMap["example.com/cap"])
+	}
+
+	wantGlobal, _ := fresh.Filter()
+	gotGlobal, _ := next.Filter()
+	require.Equal(t, wantGlobal, gotGlobal)
+	require.Equal(t, want, coldRules)
+	require.ElementsMatch(t, want, got, "only order changed, not payloads or multiplicity")
+
+	// Exact filter convergence requires invalidation even for a pure reorder.
+	changed, all := next.FilterChangedNodes(old)
+	if !all {
+		assert.Contains(t, changed, nodes.At(1).ID(), "the destination must receive its reordered filter")
+	}
+
+	require.Equal(t, want, got, "a warmed filter must preserve the new policy's grant order")
+}
+
+// Lost grants, broadened ports and creator-as-owner mistakes must disagree with
+// this input model even when incremental and full compiles agree with each other.
+func TestIncrementalPolicyRapidPacketIntent(t *testing.T) {
+	runIncrementalPolicyIntent(t, false, false, false, true, false)
+}
+
+func TestIncrementalPolicyRapidAppIntent(t *testing.T) {
+	runIncrementalPolicyIntent(t, true, false, false, true, false)
+}
+
+func TestIncrementalPolicyRapidAppReplacements(t *testing.T) {
+	runIncrementalPolicyIntent(t, true, false, false, false, false)
+}
+
+func TestIncrementalPolicyRapidGroupIntent(t *testing.T) {
+	runIncrementalPolicyIntent(t, false, false, false, false, true)
+}
+
+func TestGroupPolicyDocumentAndOwnership(t *testing.T) {
+	sources, destinations := []string{"u2", "u1", "u2"}, []string{"u3", "u2", "u3"}
+	caps := tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`, `{"role":"read"}`}}
+	ports := propcheck.PacketGrant{Src: propcheck.PacketSelector{Tag: "tag:ignored"}, Dst: propcheck.PacketSelector{IP: netip.MustParseAddr("192.0.2.1")}, Protocol: ipproto.TCP, First: 22, Last: 23}
+	doc, packet, app := propcheck.GroupPolicy(t, sources, destinations, ports, caps)
+
+	var actual struct {
+		Groups map[string][]string `json:"groups"`
+		Grants []struct {
+			Src, Dst []string
+		} `json:"grants"`
+	}
+	require.NoError(t, json.Unmarshal(doc, &actual))
+	require.Equal(t, map[string][]string{"group:source": {"u2@", "u1@", "u2@"}, "group:destination": {"u3@", "u2@", "u3@"}}, actual.Groups)
+	require.NotEmpty(t, actual.Grants)
+
+	for _, grant := range actual.Grants {
+		require.Equal(t, []string{"group:source"}, grant.Src)
+		require.Equal(t, []string{"group:destination"}, grant.Dst)
+	}
+
+	require.Len(t, packet.Grants, 4)
+	require.Len(t, app.Grants, 4)
+
+	wantPairs := map[[2]string]bool{{"u1", "u2"}: true, {"u1", "u3"}: true, {"u2", "u2"}: true, {"u2", "u3"}: true}
+
+	for _, grant := range packet.Grants {
+		pair := [2]string{grant.Src.User, grant.Dst.User}
+		require.True(t, wantPairs[pair], "unique concrete member pair %v", pair)
+		delete(wantPairs, pair)
+		require.Empty(t, grant.Src.Tag, "packet selectors are replaced by group members")
+		require.False(t, grant.Dst.IP.IsValid(), "destination selector is replaced too")
+	}
+
+	require.Empty(t, wantPairs)
+
+	require.Equal(t, []string{"u2", "u1", "u2"}, sources, "constructor preserves source input")
+	require.Equal(t, []string{"u3", "u2", "u3"}, destinations, "constructor preserves destination input")
+
+	sources[0], destinations[0] = "changed", "changed"
+	caps["example.com/cap/roles"][0] = `{"role":"changed"}`
+	delete(caps, "example.com/cap/roles")
+
+	for _, grant := range app.Grants {
+		require.Equal(t, []tailcfg.RawMessage{`{"role":"read"}`, `{"role":"write"}`, `{"role":"read"}`}, grant.Caps["example.com/cap/roles"])
+		require.NotEqual(t, "changed", grant.Src.User)
+		require.NotEqual(t, "changed", grant.Dst.User)
+	}
+
+	for _, members := range [][2][]string{{nil, {"u2"}}, {{"u1"}, nil}, {nil, nil}} {
+		emptyDoc, emptyPacket, emptyApp := propcheck.GroupPolicy(t, members[0], members[1], ports, nil)
+		require.NoError(t, json.Unmarshal(emptyDoc, &actual))
+		require.NotNil(t, actual.Groups["group:source"], "empty group must be an array")
+		require.NotNil(t, actual.Groups["group:destination"], "empty group must be an array")
+		require.Empty(t, emptyPacket.Grants)
+		require.Empty(t, emptyApp.Grants)
+
+		_, err := NewPolicyManager(emptyDoc, nil, views.SliceOf([]types.NodeView{}))
+		require.NoError(t, err)
+	}
+}
+
+//nolint:gocyclo // Keep shared component transitions and retained consumer checks in one history.
+func runIncrementalPolicyIntent(t *testing.T, apps, ssh, attrs, reorder, groups bool) {
+	t.Helper()
+	rapid.Check(t, func(t *rapid.T) {
+		in := incrementalInput{users: []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}, {ID: 3, Name: "u3"}}}
+		for i := range rapid.IntRange(4, 6).Draw(t, "nodes") {
+			in.nodes = append(in.nodes, incrementalNode(t, types.NodeID(i+1), in.users)) //nolint:gosec // Bounded positive IDs.
+		}
+
+		if groups {
+			for i := range 3 {
+				user := in.users[i%2]
+				in.nodes[i] = node(fmt.Sprintf("group-%d", i+1), fmt.Sprintf("100.64.0.%d", i+1), fmt.Sprintf("fd7a:115c:a1e0::%d", i+1), user)
+				in.nodes[i].ID = types.NodeID(i + 1) //nolint:gosec // Three fixed node IDs.
+			}
+
+			in.nodes[2].Tags = []string{"tag:srv"}
+		}
+
+		world := func(in incrementalInput) propcheck.World {
+			m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: slices.Clone(in.users)}
+			for _, n := range in.nodes {
+				m.Put(n)
+			}
+
+			return m
+		}
+		intent := propcheck.DrawPacketIntent(t, world(in))
+		in.doc = intent.Document(t)
+
+		var appIntent *propcheck.AppIntent
+		if apps {
+			appIntent = propcheck.DrawAppIntent(t, world(in))
+			in.doc = appIntent.Document(t, intent)
+		}
+
+		var sshIntent *propcheck.SSHIntent
+		if ssh {
+			sshIntent = propcheck.DrawSSHIntent(t, world(in))
+			in.doc = sshIntent.AppendDocument(t, in.doc)
+		}
+
+		var attrIntent *propcheck.NodeAttrIntent
+		if attrs {
+			attrIntent = propcheck.DrawNodeAttrIntent(t, world(in))
+			in.doc = attrIntent.AppendDocument(t, in.doc)
+		}
+
+		groupPorts := propcheck.PacketGrant{Protocol: ipproto.TCP, First: 22, Last: 23}
+		groupCaps := tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`, `{"role":"read"}`}}
+		groupMembers := map[string][2][]string{
+			"group-extend":            {{"u1", "u3"}, {"u2", "u3"}},
+			"group-permute":           {{"u3", "u1", "u3"}, {"u3", "u2", "u2"}},
+			"group-revoke":            {{"u3"}, {"u2"}},
+			"group-clear-source":      {nil, {"u2"}},
+			"group-restore":           {{"u1"}, {"u2"}},
+			"group-destination":       {{"u1"}, {"u3"}},
+			"group-clear-destination": {{"u1"}, nil},
+		}
+
+		if groups {
+			in.doc, intent, appIntent = propcheck.GroupPolicy(t, []string{"u1"}, []string{"u2"}, groupPorts, groupCaps)
+		}
+
+		type savedPolicy struct {
+			doc        []byte
+			intent     *propcheck.PacketIntent
+			appIntent  *propcheck.AppIntent
+			sshIntent  *propcheck.SSHIntent
+			attrIntent *propcheck.NodeAttrIntent
+		}
+
+		// Every history replaces and restores a document; generated steps add
+		// identity/family changes and further historical transformations.
+		ops := []string{"deny", "restore", "policy"}
+		choices := []string{"policy", "identity", "family", "restore"}
+
+		if reorder {
+			ops = append([]string{"order", "duplicate"}, ops...)
+			choices = append(choices, "order", "duplicate")
+		}
+
+		if groups {
+			ops = append([]string{"group-extend", "group-permute", "group-revoke", "group-clear-source", "group-restore", "group-destination", "group-clear-destination", "group-restore", "group-tag", "group-untag", "group-rename", "group-unrename"}, ops...)
+		}
+
+		ops = append(ops, rapid.SliceOfN(rapid.SampledFrom(choices), 1, 8).Draw(t, "intent operations")...)
+		history := make([]savedPolicy, 1, 1+len(ops))
+		history[0] = savedPolicy{in.doc, intent, appIntent, sshIntent, attrIntent}
+
+		type retained struct {
+			world      propcheck.World
+			intent     *propcheck.PacketIntent
+			appIntent  *propcheck.AppIntent
+			sshIntent  *propcheck.SSHIntent
+			attrIntent *propcheck.NodeAttrIntent
+			manager    *PolicyManager
+		}
+
+		var (
+			previous  *PolicyManager
+			snapshots []retained
+		)
+
+		var sourceProbes []netip.Addr
+
+		check := func() {
+			for _, n := range in.nodes {
+				for _, ip := range []*netip.Addr{n.IPv4, n.IPv6} {
+					if ip != nil && !slices.Contains(sourceProbes, *ip) {
+						sourceProbes = append(sourceProbes, *ip)
+					}
+				}
+			}
+
+			next, err := NewPolicyManagerFrom(previous, in.doc, in.users, in.nodes.ViewSlice())
+			require.NoError(t, err)
+			fresh, err := NewPolicyManager(in.doc, in.users, in.nodes.ViewSlice())
+			require.NoError(t, err)
+
+			m := world(in)
+			snapshots = append(snapshots, retained{m, intent, appIntent, sshIntent, attrIntent, next})
+			// Packet order is not authorization. Existing equivalence properties
+			// retain their stronger representation diagnostics separately.
+			for _, saved := range append(slices.Clone(snapshots), retained{m, intent, appIntent, sshIntent, attrIntent, fresh}) {
+				classes := saved.manager.BuildPeerClasses(saved.manager.nodes, nil)
+				for _, id := range slices.Sorted(maps.Keys(saved.world.Nodes)) {
+					n := saved.world.Nodes[id]
+					propcheck.CheckNodeAttrIntent(t, saved.world, saved.attrIntent, id, saved.manager.NodeCapMap(id), true)
+					rules, err := saved.manager.FilterForNode(n.View())
+					require.NoError(t, err)
+
+					for _, peer := range propcheck.CheckPacketIntent(t, saved.world, saved.intent, id, rules, sourceProbes...) {
+						require.Contains(t, classes.Peers(id), peer, "required incoming/outgoing packet peer")
+					}
+
+					if saved.sshIntent != nil {
+						for _, url := range incrementalURLs {
+							policy, err := saved.manager.SSHPolicy(url, n.View())
+							require.NoError(t, err)
+							propcheck.CheckSSHIntent(t, saved.world, saved.sshIntent, id, policy, url)
+						}
+					}
+
+					if saved.appIntent != nil {
+						for _, peer := range propcheck.CheckAppIntent(t, saved.world, saved.appIntent, id, rules, sourceProbes...) {
+							require.Contains(t, classes.Peers(id), peer, "required app source")
+						}
+					}
+				}
+			}
+
+			previous = next
+		}
+		check()
+
+		for _, op := range ops {
+			switch op {
+			case "policy":
+				intent = propcheck.DrawPacketIntent(t, world(in))
+				in.doc = intent.Document(t)
+			case "deny":
+				intent = &propcheck.PacketIntent{}
+				in.doc = intent.Document(t)
+			case "restore":
+				saved := history[rapid.IntRange(0, len(history)-1).Draw(t, "intent ancestor")]
+				in.doc, intent, appIntent, sshIntent, attrIntent = slices.Clone(saved.doc), saved.intent, saved.appIntent, saved.sshIntent, saved.attrIntent
+			case "order", "duplicate":
+				if appIntent != nil {
+					appIntent = appIntent.Reordered(op == "duplicate")
+					in.doc = appIntent.Document(t, intent)
+				} else {
+					in = in.edit(t, op)
+				}
+			case "group-tag", "group-untag":
+				in.nodes = slices.Clone(in.nodes)
+				in.nodes[0] = in.nodes[0].Clone()
+
+				in.nodes[0].Tags = nil
+				if op == "group-tag" {
+					in.nodes[0].Tags = []string{"tag:srv"}
+				}
+			case "group-rename", "group-unrename":
+				in.users = slices.Clone(in.users)
+
+				in.users[0].Name = "u1"
+				if op == "group-rename" {
+					in.users[0].Name = "renamed"
+				}
+			default:
+				if members, ok := groupMembers[op]; groups && ok {
+					in.doc, intent, appIntent = propcheck.GroupPolicy(t, members[0], members[1], groupPorts, groupCaps)
+				} else {
+					in = in.edit(t, op)
+				}
+			}
+
+			if groups {
+				switch op {
+				case "policy":
+					in.doc, intent, appIntent = propcheck.DrawGroupPolicy(t, world(in))
+				case "deny":
+					appIntent = &propcheck.AppIntent{}
+				}
+			}
+
+			if apps && (op == "policy" || op == "deny") {
+				appIntent = &propcheck.AppIntent{}
+				if op == "policy" {
+					appIntent = propcheck.DrawAppIntent(t, world(in))
+				}
+
+				in.doc = appIntent.Document(t, intent)
+			}
+
+			if ssh {
+				switch op {
+				case "policy":
+					sshIntent = propcheck.DrawSSHIntent(t, world(in))
+				case "deny":
+					sshIntent = &propcheck.SSHIntent{}
+				case "order", "duplicate":
+					sshIntent = sshIntent.Reordered(op == "duplicate")
+				}
+
+				in.doc = sshIntent.AppendDocument(t, in.doc)
+			}
+
+			if attrs {
+				switch op {
+				case "policy":
+					attrIntent = propcheck.DrawNodeAttrIntent(t, world(in))
+				case "deny":
+					attrIntent = &propcheck.NodeAttrIntent{}
+				case "order", "duplicate":
+					attrIntent = attrIntent.Reordered(op == "duplicate")
+				}
+
+				in.doc = attrIntent.AppendDocument(t, in.doc)
+			}
+
+			check()
+
+			history = append(history, savedPolicy{slices.Clone(in.doc), intent, appIntent, sshIntent, attrIntent})
+		}
+	})
+}
+
+// Pin the independent model's ownership and boundary semantics with literal
+// expectations, so an always-deny oracle cannot validate missing wire grants.
+func TestPacketIntentOwnershipAndPorts(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: users}
+	for i := range 4 {
+		n := node(fmt.Sprintf("n%d", i+1), fmt.Sprintf("100.64.0.%d", i+1), fmt.Sprintf("fd7a:115c:a1e0::%d", i+1), users[i%2])
+
+		n.ID = types.NodeID(i + 1) //nolint:gosec // Four fixed node IDs.
+		switch i {
+		case 2:
+			n.Tags = []string{"tag:srv"}
+		case 3:
+			n.Tags = []string{"tag:router"}
+		}
+
+		m.Put(n)
+	}
+
+	intent := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{
+		{Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"}, Protocol: ipproto.TCP, First: 22, Last: 25},
+		{Src: propcheck.PacketSelector{Tag: "tag:srv"}, Dst: propcheck.PacketSelector{Tag: "tag:router"}, Protocol: ipproto.UDP, First: 65535, Last: 65535},
+		{Src: propcheck.PacketSelector{IP: *m.Nodes[1].IPv6}, Dst: propcheck.PacketSelector{IP: *m.Nodes[2].IPv6}, Protocol: ipproto.UDP, First: 0, Last: 0},
+	}}
+	for _, tc := range []struct {
+		src, dst types.NodeID
+		v6       bool
+		port     uint16
+		protocol ipproto.Proto
+		want     bool
+	}{
+		{1, 2, false, 21, ipproto.TCP, false},
+		{1, 2, false, 22, ipproto.TCP, true},
+		{1, 2, true, 23, ipproto.TCP, true},
+		{1, 2, true, 24, ipproto.TCP, true},
+		{1, 2, false, 25, ipproto.TCP, true},
+		{1, 2, true, 26, ipproto.TCP, false},
+		{1, 2, false, 22, ipproto.UDP, false},
+		{2, 1, false, 22, ipproto.TCP, false},
+		{3, 2, false, 22, ipproto.TCP, false},
+		{1, 4, false, 22, ipproto.TCP, false},
+		{3, 4, false, 65534, ipproto.UDP, false},
+		{3, 4, true, 65535, ipproto.UDP, true},
+		{3, 4, true, 65535, ipproto.TCP, false},
+		{1, 2, true, 0, ipproto.UDP, true},
+		{1, 2, false, 0, ipproto.UDP, false},
+		{1, 2, true, 1, ipproto.UDP, false},
+	} {
+		src, dst := m.Nodes[tc.src].IPv4, m.Nodes[tc.dst].IPv4
+		if tc.v6 {
+			src, dst = m.Nodes[tc.src].IPv6, m.Nodes[tc.dst].IPv6
+		}
+
+		require.Equal(t, tc.want, intent.Allows(m, tc.src, tc.dst, *src, *dst, tc.port, tc.protocol), "%+v", tc)
+	}
+
+	nodes := make(types.Nodes, 0, len(m.Nodes))
+	for _, id := range slices.Sorted(maps.Keys(m.Nodes)) {
+		nodes = append(nodes, m.Nodes[id])
+	}
+
+	pm, err := NewPolicyManager(intent.Document(t), users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	peers := map[types.NodeID][]types.NodeID{1: {2}, 2: {1}, 3: {4}, 4: {3}}
+
+	for _, n := range nodes {
+		rules, err := pm.FilterForNode(n.View())
+		require.NoError(t, err)
+		require.Equal(t, peers[n.ID], propcheck.CheckPacketIntent(t, m, intent, n.ID, rules), "incoming and outgoing required peers")
+	}
+}
+
+func TestPacketIntentRevocation(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+	nodes := types.Nodes{
+		node("n1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
+		node("n2", "100.64.0.2", "fd7a:115c:a1e0::2", users[1]),
+	}
+	nodes[0].ID, nodes[1].ID = 1, 2
+
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: users}
+	for _, n := range nodes {
+		m.Put(n)
+	}
+
+	initial := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{
+		{Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"}, Protocol: ipproto.TCP, First: 22, Last: 23},
+	}}
+	replacement := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{
+		{Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"}, Protocol: ipproto.UDP, First: 65535, Last: 65535},
+	}}
+
+	var previous *PolicyManager
+
+	for _, step := range []struct {
+		name     string
+		intent   *propcheck.PacketIntent
+		allowTCP bool
+		allowUDP bool
+	}{
+		{"allow", initial, true, false},
+		{"deny", &propcheck.PacketIntent{}, false, false},
+		{"restore", initial, true, false},
+		{"replacement", replacement, false, true},
+	} {
+		doc := step.intent.Document(t)
+		next, err := NewPolicyManagerFrom(previous, doc, users, nodes.ViewSlice())
+		require.NoError(t, err)
+		fresh, err := NewPolicyManager(doc, users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		previous = next
+
+		t.Run(step.name, func(t *testing.T) {
+			for family, src := range []*netip.Addr{nodes[0].IPv4, nodes[0].IPv6} {
+				dst := []*netip.Addr{nodes[1].IPv4, nodes[1].IPv6}[family]
+				for _, port := range []uint16{22, 23} {
+					require.Equal(t, step.allowTCP, step.intent.Allows(m, 1, 2, *src, *dst, port, ipproto.TCP))
+				}
+
+				require.Equal(t, step.allowUDP, step.intent.Allows(m, 1, 2, *src, *dst, 65535, ipproto.UDP))
+			}
+
+			for _, subject := range []struct {
+				name    string
+				manager *PolicyManager
+			}{
+				{"incremental", next},
+				{"fresh", fresh},
+			} {
+				t.Run(subject.name, func(t *testing.T) {
+					for _, n := range nodes {
+						rules, err := subject.manager.FilterForNode(n.View())
+						require.NoError(t, err)
+						propcheck.CheckPacketIntent(t, m, step.intent, n.ID, rules)
+					}
+				})
+			}
+		})
+	}
+}
+
+// Literal expectations pin ownership, nil/empty key presence, order and repeats
+// independently of the policy compiler and the generated reference model.
+func TestAppIntentOwnershipAndValues(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: users}
+
+	nodes := make(types.Nodes, 0, 4)
+
+	for i := range 4 {
+		n := node(fmt.Sprintf("n%d", i+1), fmt.Sprintf("100.64.0.%d", i+1), fmt.Sprintf("fd7a:115c:a1e0::%d", i+1), users[i%2])
+
+		n.ID = types.NodeID(i + 1)
+		if i >= 2 {
+			n.Tags = []string{"tag:srv"}
+		}
+
+		m.Put(n)
+		nodes = append(nodes, n)
+	}
+
+	intent := &propcheck.AppIntent{Grants: []propcheck.AppGrant{
+		{Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"}, Caps: tailcfg.PeerCapMap{
+			"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`, `{"role":"read"}`},
+			"example.com/cap/nil":   nil, "example.com/cap/empty": {},
+		}},
+		{Src: propcheck.PacketSelector{Tag: "tag:srv"}, Dst: propcheck.PacketSelector{User: "u2"}, Caps: tailcfg.PeerCapMap{"example.com/cap/tag": nil}},
+		{Src: propcheck.PacketSelector{IP: *nodes[0].IPv6}, Dst: propcheck.PacketSelector{IP: *nodes[3].IPv6}, Caps: tailcfg.PeerCapMap{"example.com/cap/v6": {`{"family":6}`}}},
+	}}
+	packet := &propcheck.PacketIntent{}
+	pm, err := NewPolicyManager(intent.Document(t, packet), users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	classes := pm.BuildPeerClasses(pm.nodes, nil)
+
+	for _, tc := range []struct {
+		src, dst types.NodeID
+		v6       bool
+		want     tailcfg.PeerCapMap
+	}{
+		{1, 2, false, tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`, `{"role":"read"}`}, "example.com/cap/nil": nil, "example.com/cap/empty": nil}},
+		{1, 2, true, tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`, `{"role":"read"}`}, "example.com/cap/nil": nil, "example.com/cap/empty": nil}},
+		{2, 1, false, tailcfg.PeerCapMap{}},
+		{3, 2, true, tailcfg.PeerCapMap{"example.com/cap/tag": nil}},
+		{1, 4, false, tailcfg.PeerCapMap{}},
+		{1, 4, true, tailcfg.PeerCapMap{"example.com/cap/v6": {`{"family":6}`}}},
+	} {
+		src, dst := m.Nodes[tc.src].IPv4, m.Nodes[tc.dst].IPv4
+		if tc.v6 {
+			src, dst = m.Nodes[tc.src].IPv6, m.Nodes[tc.dst].IPv6
+		}
+
+		require.Equal(t, tc.want, intent.Capabilities(m, tc.src, tc.dst, *src, *dst), "%+v", tc)
+	}
+
+	for _, n := range nodes {
+		rules, err := pm.FilterForNode(n.View())
+		require.NoError(t, err)
+		propcheck.CheckPacketIntent(t, m, packet, n.ID, rules)
+
+		for _, peer := range propcheck.CheckAppIntent(t, m, intent, n.ID, rules) {
+			require.Contains(t, classes.Peers(n.ID), peer)
+		}
+	}
+}
+
+// These enabled regressions expose the known cache invalidation defects through
+// consumer values, without the older representation/audit check stopping first.
+func TestIncrementalAppIntentConsumerInvalidation(t *testing.T) {
+	for _, duplicate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("duplicate=%t", duplicate), func(t *testing.T) {
+			nodes := scanManyRulesNodes(2)
+
+			m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}}
+			for _, n := range nodes {
+				m.Put(n)
+			}
+
+			before := &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+				Src: propcheck.PacketSelector{IP: *nodes[0].IPv4}, Dst: propcheck.PacketSelector{IP: *nodes[1].IPv4},
+				Caps: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`}},
+			}}}
+			if !duplicate {
+				before.Grants = append(before.Grants, propcheck.AppGrant{
+					Src: before.Grants[0].Src, Dst: before.Grants[0].Dst,
+					Caps: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"write"}`}},
+				})
+			}
+
+			packet := &propcheck.PacketIntent{}
+			old, err := NewPolicyManager(before.Document(t, packet), nil, nodes.ViewSlice())
+			require.NoError(t, err)
+			rules, err := old.FilterForNode(nodes[1].View())
+			require.NoError(t, err)
+			propcheck.CheckAppIntent(t, m, before, nodes[1].ID, rules)
+
+			after := before.Reordered(duplicate)
+			next, err := NewPolicyManagerFrom(old, after.Document(t, packet), nil, nodes.ViewSlice())
+			require.NoError(t, err)
+			fresh, err := NewPolicyManager(after.Document(t, packet), nil, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			for _, manager := range []*PolicyManager{fresh, next} {
+				rules, err := manager.FilterForNode(nodes[1].View())
+				require.NoError(t, err)
+				propcheck.CheckAppIntent(t, m, after, nodes[1].ID, rules)
+			}
+		})
+	}
+}
+
+// Capture only assertion failures so negative oracle controls remain ordinary
+// passing tests. A different panic cannot masquerade as rejecting corrupt rules.
+type appIntentFailure struct {
+	message string
+}
+
+func (f *appIntentFailure) Errorf(format string, args ...any) {
+	f.message = fmt.Sprintf(format, args...)
+}
+
+func (f *appIntentFailure) FailNow() { panic(f) }
+
+func TestAppIntentRejectsCorruptedConsumerRules(t *testing.T) {
+	nodes := scanManyRulesNodes(2)
+
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}}
+	for _, n := range nodes {
+		m.Put(n)
+	}
+
+	intent := &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+		Src: propcheck.PacketSelector{IP: *nodes[0].IPv4}, Dst: propcheck.PacketSelector{IP: *nodes[1].IPv4},
+		Caps: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`}, "example.com/cap/empty": nil},
+	}}}
+	actual := []tailcfg.FilterRule{{SrcIPs: []string{nodes[0].IPv4.String()}, CapGrant: []tailcfg.CapGrant{{
+		Dsts:   []netip.Prefix{netip.PrefixFrom(*nodes[1].IPv4, 32)},
+		CapMap: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`}, "example.com/cap/empty": {}},
+	}}}}
+	propcheck.CheckAppIntent(t, m, intent, nodes[1].ID, actual)
+
+	for _, mutation := range []string{"drop", "retain-revoked", "reverse", "duplicate", "replace-empty-key"} {
+		t.Run(mutation, func(t *testing.T) {
+			rules := slices.Clone(actual)
+			rules[0].CapGrant = slices.Clone(actual[0].CapGrant)
+			caps := maps.Clone(actual[0].CapGrant[0].CapMap)
+			caps["example.com/cap/roles"] = slices.Clone(caps["example.com/cap/roles"])
+			rules[0].CapGrant[0].CapMap = caps
+			want := intent
+			message := "app values"
+
+			switch mutation {
+			case "drop":
+				rules, message = nil, "app keys"
+			case "retain-revoked":
+				want, message = &propcheck.AppIntent{}, "app keys"
+			case "reverse":
+				slices.Reverse(caps["example.com/cap/roles"])
+			case "duplicate":
+				caps["example.com/cap/roles"] = append(caps["example.com/cap/roles"], caps["example.com/cap/roles"][0])
+			case "replace-empty-key":
+				delete(caps, "example.com/cap/empty")
+				caps["example.com/cap/unexpected"] = nil
+				message = "missing app key"
+			}
+
+			failure := &appIntentFailure{}
+			// No warm/fresh agreement participates: identical corruption in
+			// both compiler paths must still fail this input-derived check.
+			require.PanicsWithValue(t, failure, func() {
+				propcheck.CheckAppIntent(failure, m, want, nodes[1].ID, rules)
+			})
+			require.Contains(t, failure.message, message)
+		})
+	}
+}
+
+func TestIncrementalPolicyRapidSSHIntent(t *testing.T) {
+	runIncrementalPolicyIntent(t, false, true, false, true, false)
+}
+
+func TestSSHIntentOwnershipAndProtocol(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: users}
+
+	nodes := make(types.Nodes, 0, 5)
+
+	for i, owner := range []int{0, 0, 1, 0, 1} {
+		n := node(fmt.Sprintf("n%d", i), fmt.Sprintf("100.64.0.%d", i+1), fmt.Sprintf("fd7a:115c:a1e0::%d", i+1), users[owner])
+
+		n.ID = types.NodeID(i + 1) //nolint:gosec // Five positive IDs.
+		if i >= 3 {
+			n.Tags = []string{"tag:srv"}
+		}
+
+		m.Put(n)
+		nodes = append(nodes, n)
+	}
+
+	intent := &propcheck.SSHIntent{Grants: []propcheck.SSHGrant{
+		{Src: propcheck.PacketSelector{User: "u1"}, DstTag: "tag:srv", Users: []string{"alice", "bob"}},
+		{Src: propcheck.PacketSelector{User: "u1"}, DstTag: "tag:srv", Check: true, Users: []string{"alice"}},
+		{Src: propcheck.PacketSelector{User: "u1"}, Self: true, Users: []string{"root"}},
+		{Src: propcheck.PacketSelector{Tag: "tag:srv"}, DstTag: "tag:srv", Users: []string{"bob"}},
+	}}
+	for _, tc := range []struct {
+		src, dst        types.NodeID
+		login, decision string
+	}{
+		{1, 4, "alice", "check"},
+		{1, 4, "bob", "accept"},
+		{1, 4, "root", "deny"},
+		{1, 4, "charlie", "deny"},
+		{4, 5, "alice", "deny"},
+		{4, 5, "bob", "accept"},
+		{1, 2, "root", "accept"},
+		{1, 3, "root", "deny"},
+		{4, 2, "root", "deny"},
+	} {
+		require.Equal(t, tc.decision, intent.Decision(m, tc.src, tc.dst, tc.login))
+		require.Equal(t, tc.decision, intent.Reordered(true).Decision(m, tc.src, tc.dst, tc.login))
+	}
+
+	packet := &propcheck.PacketIntent{}
+	for _, in := range []*propcheck.SSHIntent{intent, intent.Reordered(true), {}, intent} {
+		pm, err := NewPolicyManager(in.AppendDocument(t, packet.Document(t)), users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		for id, n := range m.Nodes {
+			policy, err := pm.SSHPolicy("https://control.test", n.View())
+			require.NoError(t, err)
+			propcheck.CheckSSHIntent(t, m, in, id, policy, "https://control.test")
+
+			rules, err := pm.FilterForNode(n.View())
+			require.NoError(t, err)
+			require.Empty(t, propcheck.CheckPacketIntent(t, m, packet, id, rules))
+		}
+	}
+}
+
+// Literal wire rules anchor the protocol interpretation independently of the
+// compiler. Each corruption calls the same checker used by delivered streams.
+func TestSSHIntentRejectsCorruptedRules(t *testing.T) {
+	user := types.User{ID: 1, Name: "u1"}
+	src := node("source", "100.64.0.1", "fd7a:115c:a1e0::1", user)
+	dst := node("server", "100.64.0.2", "fd7a:115c:a1e0::2", user)
+	src.ID, dst.ID, dst.Tags = 1, 2, []string{"tag:srv"}
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{1: src, 2: dst}, Users: []types.User{user}}
+	intent := &propcheck.SSHIntent{Grants: []propcheck.SSHGrant{
+		{Src: propcheck.PacketSelector{User: "u1"}, DstTag: "tag:srv", Users: []string{"alice", "bob"}},
+		{Src: propcheck.PacketSelector{User: "u1"}, DstTag: "tag:srv", Check: true, Users: []string{"alice"}},
+	}}
+
+	const url = "https://control.test"
+
+	literal := `{"rules":[{"principals":[{"nodeIP":"100.64.0.1"},{"nodeIP":"fd7a:115c:a1e0::1"}],"sshUsers":{"alice":"alice","root":"","0":""},"action":{"holdAndDelegate":"https://control.test/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID?local_user=$LOCAL_USER"}},{"principals":[{"nodeIP":"100.64.0.1"},{"nodeIP":"fd7a:115c:a1e0::1"}],"sshUsers":{"alice":"alice","bob":"bob","root":"","0":""},"action":{"accept":true,"allowAgentForwarding":true,"allowLocalPortForwarding":true,"allowRemotePortForwarding":true}}]}`
+
+	var valid tailcfg.SSHPolicy
+	require.NoError(t, json.Unmarshal([]byte(literal), &valid))
+	propcheck.CheckSSHIntent(t, m, intent, 2, &valid, url)
+	propcheck.CheckSSHIntent(t, m, &propcheck.SSHIntent{}, 2, &tailcfg.SSHPolicy{}, url)
+	// Reject bypasses SSHUsers and stops before a later accepting rule.
+	rejected := &tailcfg.SSHPolicy{Rules: append([]*tailcfg.SSHRule{{Principals: valid.Rules[0].Principals, Action: &tailcfg.SSHAction{Reject: true}}}, valid.Rules...)}
+	propcheck.CheckSSHIntent(t, m, &propcheck.SSHIntent{}, 2, rejected, url)
+
+	for _, mutation := range []string{"principal", "login", "root", "foreign", "deleted-source", "revoked", "order", "wildcard", "any", "duration", "url"} {
+		t.Run(mutation, func(t *testing.T) {
+			var policy tailcfg.SSHPolicy
+			require.NoError(t, json.Unmarshal([]byte(literal), &policy))
+
+			want, world, message := intent, m.Clone(), "SSH decision"
+
+			switch mutation {
+			case "principal":
+				policy.Rules[1].Principals = policy.Rules[1].Principals[1:]
+			case "login":
+				delete(policy.Rules[1].SSHUsers, "bob")
+			case "root":
+				policy.Rules[1].SSHUsers["root"] = "root"
+			case "foreign":
+				policy.Rules[1].Principals = append(policy.Rules[1].Principals, &tailcfg.SSHPrincipal{NodeIP: "198.51.100.123"})
+			case "deleted-source":
+				delete(world.Nodes, 1)
+			case "revoked":
+				want = &propcheck.SSHIntent{}
+			case "order":
+				slices.Reverse(policy.Rules)
+			case "wildcard":
+				policy.Rules[1].SSHUsers["*"] = "="
+				message = "unsupported SSH login"
+			case "any":
+				policy.Rules[1].Principals[0].Any = true
+				message = "unsupported SSH principal fields"
+			case "duration":
+				policy.Rules[0].Action.SessionDuration = time.Hour
+				message = "unsupported SSH action fields"
+			case "url":
+				policy.Rules[0].Action.HoldAndDelegate = "https://wrong.test"
+				message = "unsupported SSH action fields"
+			}
+
+			failure := &appIntentFailure{}
+			require.PanicsWithValue(t, failure, func() {
+				propcheck.CheckSSHIntent(failure, world, want, 2, &policy, url)
+			})
+			require.Contains(t, failure.message, message)
+		})
+	}
+}
+
+func TestIncrementalPolicyRapidNodeAttrIntent(t *testing.T) {
+	runIncrementalPolicyIntent(t, false, false, true, true, false)
+}
+
+func TestNodeAttrIntentOwnershipAndMarkers(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: users}
+	nodes := make(types.Nodes, 0, 3)
+
+	for i := range 3 {
+		n := node(fmt.Sprintf("n%d", i+1), fmt.Sprintf("100.64.0.%d", i+1), fmt.Sprintf("fd7a:115c:a1e0::%d", i+1), users[i%2])
+
+		n.ID = types.NodeID(i + 1) //nolint:gosec // Three fixed node IDs.
+		if i == 2 {
+			n.Tags = []string{"tag:srv"}
+		}
+
+		m.Put(n)
+		nodes = append(nodes, n)
+	}
+
+	intent := &propcheck.NodeAttrIntent{Grants: []propcheck.NodeAttrGrant{
+		{Target: propcheck.PacketSelector{User: "u1"}, Attrs: []nodecap.Cap{"custom:probe", "disable-ipv4"}},
+		{Target: propcheck.PacketSelector{Tag: "tag:srv"}, Attrs: []nodecap.Cap{"custom:other"}},
+		{Attrs: []nodecap.Cap{nodecap.RandomizeClientPort}},
+	}}
+	require.Equal(t, tailcfg.NodeCapMap{"custom:probe": nil, "disable-ipv4": nil, nodecap.RandomizeClientPort: nil}, intent.Capabilities(m, 1))
+	require.Equal(t, tailcfg.NodeCapMap{nodecap.RandomizeClientPort: nil}, intent.Capabilities(m, 2))
+	require.Equal(t, tailcfg.NodeCapMap{"custom:other": nil, nodecap.RandomizeClientPort: nil}, intent.Capabilities(m, 3))
+
+	base := []byte(`{"grants":[{"src":["u1@"],"dst":["u2@"],"app":{"example.com/cap/read":[{"role":"read"}]},"ip":["tcp:22"]}],"ssh":[{"action":"accept","src":["u1@"],"dst":["tag:srv"],"users":["root"]}],"derpMap":{"Regions":{}},"tagOwners":{"tag:srv":["u1@"],"tag:unrelated":["u2@"]}}`)
+	original := slices.Clone(base)
+
+	var originalFields, composedFields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(base, &originalFields))
+	require.NoError(t, json.Unmarshal(intent.AppendDocument(t, base), &composedFields))
+
+	for field, value := range originalFields {
+		require.JSONEq(t, string(value), string(composedFields[field]), "attribute append preserves %s", field)
+	}
+
+	require.Equal(t, original, base, "attribute append must not mutate its document")
+
+	before := intent.AppendDocument(t, (&propcheck.PacketIntent{}).Document(t))
+	for _, in := range []*propcheck.NodeAttrIntent{intent, intent.Reordered(true), {}, intent} {
+		pm, err := NewPolicyManager(in.AppendDocument(t, (&propcheck.PacketIntent{}).Document(t)), users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		for _, n := range nodes {
+			propcheck.CheckNodeAttrIntent(t, m, in, n.ID, pm.NodeCapMap(n.ID), true)
+			propcheck.CheckNodeAttrWire(t, &tailcfg.Node{ID: n.ID.NodeID(), CapMap: pm.NodeCapMap(n.ID)}, true)
+		}
+	}
+
+	require.Equal(t, before, intent.AppendDocument(t, (&propcheck.PacketIntent{}).Document(t)), "reorder must retain immutable input")
+}
+
+func TestNodeAttrIntentRejectsCorruptedMarkers(t *testing.T) {
+	m := propcheck.World{Nodes: map[types.NodeID]*types.Node{1: {ID: 1}}}
+	intent := &propcheck.NodeAttrIntent{Grants: []propcheck.NodeAttrGrant{{Attrs: []nodecap.Cap{"custom:probe", "disable-ipv4"}}}}
+	valid := tailcfg.NodeCapMap{"custom:probe": nil, "disable-ipv4": nil, nodecap.SSH: nil}
+	propcheck.CheckNodeAttrIntent(t, m, intent, 1, valid, true)
+	propcheck.CheckNodeAttrIntent(t, m, intent, 1, nil, false)
+
+	for _, mutation := range []string{"missing", "revoked", "peer-leak", "payload", "unexpected"} {
+		t.Run(mutation, func(t *testing.T) {
+			actual, want, self := maps.Clone(valid), intent, true
+			message := "membership"
+
+			switch mutation {
+			case "missing":
+				delete(actual, "disable-ipv4")
+			case "revoked":
+				want = &propcheck.NodeAttrIntent{}
+			case "peer-leak":
+				self = false
+			case "payload":
+				actual["custom:probe"] = []tailcfg.RawMessage{`true`}
+				message = "marker payload"
+			case "unexpected":
+				actual["custom:other"] = nil
+			}
+
+			failure := &appIntentFailure{}
+			require.PanicsWithValue(t, failure, func() { propcheck.CheckNodeAttrIntent(failure, m, want, 1, actual, self) })
+			require.Contains(t, failure.message, message)
+		})
+	}
+}
+
+func TestNodeAttrWireRejectsNonNullMarkers(t *testing.T) {
+	for _, self := range []bool{false, true} {
+		failure := &appIntentFailure{}
+		require.PanicsWithValue(t, failure, func() {
+			propcheck.CheckNodeAttrWire(failure, &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{"custom:probe": {}}}, self)
+		})
+		require.Contains(t, failure.message, "attribute custom:probe")
+	}
+
+	propcheck.CheckNodeAttrWire(t, &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{"custom:probe": nil}}, true)
+}
+
+func TestPacketAppIntentRetiredSources(t *testing.T) {
+	for _, selector := range []string{"user", "tag", "literal", "wildcard"} {
+		t.Run(selector, func(t *testing.T) {
+			users := types.Users{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+			src := node("source", "100.64.0.1", "fd7a:115c:a1e0::1", users[0])
+			dst := node("destination", "100.64.0.2", "fd7a:115c:a1e0::2", users[1])
+			src.ID, dst.ID = 1, 2
+			sources := []netip.Addr{*src.IPv4, *src.IPv6, *src.IPv4, *dst.IPv4}
+			selectors := []propcheck.PacketSelector{{}}
+
+			switch selector {
+			case "user":
+				selectors = []propcheck.PacketSelector{{User: "u1"}}
+			case "tag":
+				src.Tags = []string{"tag:srv"}
+				selectors = []propcheck.PacketSelector{{Tag: "tag:srv"}}
+			case "literal":
+				selectors = []propcheck.PacketSelector{{IP: *src.IPv4}, {IP: *src.IPv6}}
+			}
+
+			packet, app := &propcheck.PacketIntent{}, &propcheck.AppIntent{}
+			for _, source := range selectors {
+				packet.Grants = append(packet.Grants, propcheck.PacketGrant{
+					Src: source, Dst: propcheck.PacketSelector{User: "u2"}, Protocol: ipproto.TCP, First: 22, Last: 23,
+				})
+				app.Grants = append(app.Grants, propcheck.AppGrant{
+					Src: source, Dst: propcheck.PacketSelector{User: "u2"},
+					Caps: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`, `{"role":"read"}`}},
+				})
+			}
+
+			var (
+				previous      *PolicyManager
+				originalRules []tailcfg.FilterRule
+			)
+
+			for _, phase := range []string{"live", "no-v4", "no-v6", "deleted", "reassigned", "restored"} {
+				t.Run(phase, func(t *testing.T) {
+					current := src.Clone()
+					if phase == "reassigned" {
+						current.ID, current.User, current.UserID, current.Tags = 3, &users[1], &users[1].ID, nil
+					}
+
+					if phase == "no-v4" {
+						current.IPv4 = nil
+					}
+
+					if phase == "no-v6" {
+						current.IPv6 = nil
+					}
+
+					nodes := types.Nodes{dst}
+					if phase != "deleted" {
+						nodes = append(nodes, current)
+					}
+
+					world := propcheck.World{Users: users, Nodes: map[types.NodeID]*types.Node{}}
+					for _, n := range nodes {
+						world.Put(n)
+					}
+
+					doc := app.Document(t, packet)
+					next, err := NewPolicyManagerFrom(previous, doc, users, nodes.ViewSlice())
+					require.NoError(t, err)
+					fresh, err := NewPolicyManager(doc, users, nodes.ViewSlice())
+					require.NoError(t, err)
+
+					for _, manager := range []*PolicyManager{next, fresh} {
+						rules, err := manager.FilterForNode(dst.View())
+						require.NoError(t, err)
+						peers := propcheck.CheckPacketIntent(t, world, packet, 2, rules, sources...)
+
+						appPeers := propcheck.CheckAppIntent(t, world, app, 2, rules, sources...)
+						if phase == "deleted" {
+							require.Empty(t, peers)
+							require.Empty(t, appPeers)
+						}
+
+						if phase == "reassigned" {
+							if selector == "literal" || selector == "wildcard" {
+								require.Equal(t, []types.NodeID{3}, peers)
+								require.Equal(t, []types.NodeID{3}, appPeers)
+							} else {
+								require.Empty(t, peers)
+								require.Empty(t, appPeers)
+							}
+						}
+
+						if phase == "live" {
+							originalRules = rules
+						}
+					}
+
+					if phase == "deleted" {
+						addressGrant := selector == "literal" || selector == "wildcard"
+
+						for family, ip := range []*netip.Addr{src.IPv4, src.IPv6} {
+							dstIP := []*netip.Addr{dst.IPv4, dst.IPv6}[family]
+							require.Equal(t, addressGrant, packet.Allows(world, 0, 2, *ip, *dstIP, 22, ipproto.TCP))
+							require.Equal(t, addressGrant, len(app.Capabilities(world, 0, 2, *ip, *dstIP)) > 0)
+						}
+
+						if addressGrant {
+							// A raw address grant remains legitimate after its node disappears.
+							propcheck.CheckPacketIntent(t, world, packet, 2, originalRules, sources...)
+							propcheck.CheckAppIntent(t, world, app, 2, originalRules, sources...)
+						} else {
+							// Corrupt the actual consumer input with the old identity rules.
+							failure := &appIntentFailure{}
+							require.PanicsWithValue(t, failure, func() {
+								propcheck.CheckPacketIntent(failure, world, packet, 2, originalRules, sources...)
+							})
+							require.Contains(t, failure.message, "packet 0")
+							require.PanicsWithValue(t, failure, func() {
+								propcheck.CheckAppIntent(failure, world, app, 2, originalRules, sources...)
+							})
+							require.Contains(t, failure.message, "app keys 0")
+						}
+					}
+
+					previous = next
+				})
+			}
+		})
+	}
+}
+
+func TestGroupIntentRejectsStaleAndDuplicateRules(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}, {ID: 3, Name: "u3"}}
+	world := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: users}
+	nodes := make(types.Nodes, 0, 4)
+
+	for i := range 4 {
+		n := node(fmt.Sprintf("group-%d", i+1), fmt.Sprintf("100.64.0.%d", i+1), fmt.Sprintf("fd7a:115c:a1e0::%d", i+1), users[i%2])
+
+		n.ID = types.NodeID(i + 1) //nolint:gosec // Four fixed node IDs.
+		if i >= 2 {
+			n.Tags = []string{"tag:srv"}
+		}
+
+		nodes = append(nodes, n)
+		world.Put(n)
+	}
+
+	ports := propcheck.PacketGrant{Protocol: ipproto.TCP, First: 22, Last: 23}
+	caps := tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`, `{"role":"write"}`, `{"role":"read"}`}}
+	doc, packet, app := propcheck.GroupPolicy(t, []string{"u1", "u1"}, []string{"u2", "u2"}, ports, caps)
+	manager, err := NewPolicyManager(doc, users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	for _, pair := range [][2]types.NodeID{{1, 2}, {3, 2}, {1, 4}, {2, 1}} {
+		for family := range 2 {
+			src := []*netip.Addr{world.Nodes[pair[0]].IPv4, world.Nodes[pair[0]].IPv6}[family]
+			dst := []*netip.Addr{world.Nodes[pair[1]].IPv4, world.Nodes[pair[1]].IPv6}[family]
+			allowed := pair == [2]types.NodeID{1, 2}
+			require.Equal(t, allowed, packet.Allows(world, pair[0], pair[1], *src, *dst, 22, ipproto.TCP))
+
+			wantCaps := tailcfg.PeerCapMap{}
+			if allowed {
+				wantCaps = caps
+			}
+
+			require.Equal(t, wantCaps, app.Capabilities(world, pair[0], pair[1], *src, *dst))
+		}
+	}
+
+	classes := manager.BuildPeerClasses(manager.nodes, nil)
+	for _, n := range nodes {
+		rules, err := manager.FilterForNode(n.View())
+		require.NoError(t, err)
+
+		for _, peer := range propcheck.CheckPacketIntent(t, world, packet, n.ID, rules) {
+			require.Contains(t, classes.Peers(n.ID), peer)
+		}
+
+		for _, peer := range propcheck.CheckAppIntent(t, world, app, n.ID, rules) {
+			require.Contains(t, classes.Peers(n.ID), peer)
+		}
+	}
+
+	rules, err := manager.FilterForNode(nodes[1].View())
+	require.NoError(t, err)
+
+	for _, members := range [][2][]string{{{"u3"}, {"u2"}}, {nil, {"u2"}}, {{"u1"}, {"u3"}}, {{"u1"}, nil}} {
+		_, revokedPacket, revokedApp := propcheck.GroupPolicy(t, members[0], members[1], ports, caps)
+
+		for _, check := range []func(*appIntentFailure){
+			func(f *appIntentFailure) { propcheck.CheckPacketIntent(f, world, revokedPacket, 2, rules) },
+			func(f *appIntentFailure) { propcheck.CheckAppIntent(f, world, revokedApp, 2, rules) },
+		} {
+			failure := &appIntentFailure{}
+			require.PanicsWithValue(t, failure, func() { check(failure) })
+			require.NotEmpty(t, failure.message)
+		}
+	}
+
+	failure := &appIntentFailure{}
+
+	duplicated := append(slices.Clone(rules), rules...)
+
+	require.PanicsWithValue(t, failure, func() {
+		propcheck.CheckAppIntent(failure, world, app, 2, duplicated)
+	})
+	require.Contains(t, failure.message, "app values")
+	// Controls prove the same checker accepts the original rules after corruption checks.
+	propcheck.CheckPacketIntent(t, world, packet, 2, rules)
+	propcheck.CheckAppIntent(t, world, app, 2, rules)
+}
+
+func TestGroupPolicyGenerationWithoutNodes(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		world := propcheck.World{Users: []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}}
+		doc, packet, app := propcheck.DrawGroupPolicy(t, world)
+		require.NotNil(t, packet)
+		require.NotNil(t, app)
+
+		_, err := NewPolicyManager(doc, world.Users, views.SliceOf([]types.NodeView{}))
+		require.NoError(t, err, "group generation must not require a live app witness")
+	})
+}
+
+func TestSubnetPacketIntentHistory(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		users := []types.User{{ID: 1, Name: "u1"}, {ID: 2, Name: "u2"}}
+		nodes := types.Nodes{
+			node("source", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
+			node("router", "100.64.0.2", "fd7a:115c:a1e0::2", users[1]),
+		}
+		nodes[0].ID, nodes[1].ID = 1, 2
+		subnets := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("10.1.0.0/24")}
+		nodes[1].Hostinfo = &tailcfg.Hostinfo{RoutableIPs: slices.Clone(subnets)}
+		nodes[1].ApprovedRoutes = slices.Clone(subnets)
+
+		world := propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: users}
+		for _, n := range nodes {
+			world.Put(n)
+		}
+
+		first := propcheck.DrawSubnetPacketIntent(t, world, 1, subnets)
+		intent := first
+		source := nodes[0].Clone()
+		router := nodes[1].Clone()
+		probes := []netip.Addr{*source.IPv4, *source.IPv6}
+
+		type retained struct {
+			world   propcheck.World
+			intent  *propcheck.PacketIntent
+			manager *PolicyManager
+		}
+
+		var previous *PolicyManager
+
+		history := make([]retained, 0, 13)
+
+		for _, phase := range []string{"allow", "unapprove", "restore", "withdraw", "restore", "deny", "restore", "tag", "tag-policy", "delete", "restore", "order", "duplicate"} {
+			nodes = types.Nodes{source.Clone(), router.Clone()}
+
+			switch phase {
+			case "unapprove":
+				nodes[1].ApprovedRoutes = nil
+			case "withdraw":
+				nodes[1].Hostinfo.RoutableIPs = nil
+			case "deny":
+				intent = &propcheck.PacketIntent{Subnets: slices.Clone(subnets)}
+			case "restore":
+				intent = first
+			case "tag", "tag-policy":
+				nodes[0].Tags = []string{"tag:srv"}
+			case "delete":
+				nodes = nodes[1:]
+			}
+
+			world = propcheck.World{Nodes: map[types.NodeID]*types.Node{}, Users: users}
+			for _, n := range nodes {
+				world.Put(n)
+			}
+
+			if phase == "tag-policy" {
+				intent = propcheck.DrawSubnetPacketIntent(t, world, 1, subnets)
+			}
+
+			doc := intent.Document(t)
+			if phase == "order" || phase == "duplicate" {
+				doc = propcheck.ReorderPolicy(t, doc, phase == "duplicate")
+			}
+
+			next, err := NewPolicyManagerFrom(previous, doc, users, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			history = append(history, retained{world.Clone(), intent, next})
+			fresh, err := NewPolicyManager(doc, users, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			for _, old := range append(slices.Clone(history), retained{world.Clone(), intent, fresh}) {
+				for id, n := range old.world.Nodes {
+					rules, err := old.manager.FilterForNode(n.View())
+					require.NoError(t, err)
+					propcheck.CheckPacketIntent(t, old.world, old.intent, id, rules, probes...)
+					propcheck.CheckSubnetPacketIntent(t, old.world, old.intent, id, rules, probes...)
+				}
+			}
+
+			previous = next
+		}
+	})
+}
+
+func TestSubnetPacketIntentRejectsCorruptRules(t *testing.T) {
+	subnet := netip.MustParsePrefix("10.0.0.0/24")
+	source := netip.MustParseAddr("100.64.0.1")
+	world := propcheck.World{Nodes: map[types.NodeID]*types.Node{
+		1: {ID: 1, IPv4: &source},
+		2: {ID: 2, IPv4: new(netip.MustParseAddr("100.64.0.2")), Hostinfo: &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{subnet}}, ApprovedRoutes: []netip.Prefix{subnet}},
+	}}
+	intent := &propcheck.PacketIntent{Subnets: []netip.Prefix{subnet}, Grants: []propcheck.PacketGrant{{
+		Src: propcheck.PacketSelector{IP: source}, Dst: propcheck.PacketSelector{Prefix: subnet}, Protocol: ipproto.TCP, First: 22, Last: 23,
+	}}}
+	valid := []tailcfg.FilterRule{{SrcIPs: []string{source.String()}, IPProto: []int{6}, DstPorts: []tailcfg.NetPortRange{{IP: subnet.String(), Ports: tailcfg.PortRange{First: 22, Last: 23}}}}}
+	propcheck.CheckSubnetPacketIntent(t, world, intent, 2, valid)
+
+	for _, mutation := range []string{"lost", "port", "neighbor", "foreign", "deny", "unapprove", "withdraw"} {
+		t.Run(mutation, func(t *testing.T) {
+			rules := []tailcfg.FilterRule{{SrcIPs: slices.Clone(valid[0].SrcIPs), IPProto: []int{6}, DstPorts: slices.Clone(valid[0].DstPorts)}}
+			want, inputs := intent, world.Clone()
+
+			switch mutation {
+			case "lost":
+				rules = nil
+			case "port":
+				rules[0].DstPorts[0].Ports.Last = 24
+			case "neighbor":
+				rules[0].DstPorts[0].IP = "10.0.0.0/23"
+			case "foreign":
+				rules[0].SrcIPs = []string{"*"}
+			case "deny":
+				want = &propcheck.PacketIntent{Subnets: slices.Clone(intent.Subnets)}
+			case "unapprove":
+				inputs.Nodes[2].ApprovedRoutes = nil
+			case "withdraw":
+				inputs.Nodes[2].Hostinfo.RoutableIPs = nil
+			}
+
+			failure := &appIntentFailure{}
+			require.PanicsWithValue(t, failure, func() { propcheck.CheckSubnetPacketIntent(failure, inputs, want, 2, rules) })
+			require.Contains(t, failure.message, "subnet packet")
+		})
+	}
+
+	propcheck.CheckSubnetPacketIntent(t, world, intent, 2, valid)
+}
+
+func TestIntentRejectsSubnetSelectorsOutsidePacketDomain(t *testing.T) {
+	selector := propcheck.PacketSelector{Prefix: netip.MustParsePrefix("10.0.0.0/24")}
+
+	for _, build := range []func(require.TestingT){
+		func(t require.TestingT) {
+			(&propcheck.SSHIntent{Grants: []propcheck.SSHGrant{{Src: selector, DstTag: "tag:srv", Users: []string{"root"}}}}).AppendDocument(t, []byte(`{"grants":[]}`))
+		},
+		func(t require.TestingT) {
+			(&propcheck.NodeAttrIntent{Grants: []propcheck.NodeAttrGrant{{Target: selector, Attrs: []nodecap.Cap{"custom:probe"}}}}).AppendDocument(t, []byte(`{"grants":[]}`))
+		},
+	} {
+		failure := &appIntentFailure{}
+		require.PanicsWithValue(t, failure, func() { build(failure) })
+		require.Contains(t, failure.message, "literal selectors are outside the intent domain")
 	}
 }
