@@ -949,3 +949,63 @@ func BenchmarkMapChanges(b *testing.B) {
 		}
 	}
 }
+
+// TestGroupByListsHoldNoSpareRoom pins group lists at their length: they
+// are copied on every edit and shared once published, and readers keep
+// them (a peer view kept for an offline node), so spare capacity would
+// be pinned with them.
+func TestGroupByListsHoldNoSpareRoom(t *testing.T) {
+	in := NewMap[int, int](func(a, b int) bool { return a == b }, map[int]int{1: 0, 2: 0, 3: 0})
+	byGroup := func(_ int, g int) []int { return []int{g} }
+
+	grouped := GroupBy(Grouped[int, int, int]{}, in, byGroup, nil)
+
+	for k := 4; k < 40; k++ {
+		e := in.Edit()
+		e.Set(k, 0)
+
+		// Some commits move several keys into the group at once.
+		if k%3 == 0 {
+			e.Set(-k, 0)
+		}
+
+		if k%5 == 0 {
+			e.Delete(k - 1)
+		}
+
+		in = e.Done()
+		grouped = GroupBy(grouped, in, byGroup, nil)
+
+		if keys, _ := grouped.Groups.Get(0); cap(keys) != len(keys) {
+			t.Fatalf("after key %d: %d keys in an array of %d", k, len(keys), cap(keys))
+		}
+	}
+}
+
+// BenchmarkGroupByEdit moves one key into a group of n: one copy of the
+// group's list, at its length, is what the edit should cost.
+func BenchmarkGroupByEdit(b *testing.B) {
+	byGroup := func(_ int, g int) []int { return []int{g} }
+
+	for _, n := range []int{6, 101, 1002, 10002} {
+		b.Run(fmt.Sprintf("len=%d", n), func(b *testing.B) {
+			m := make(map[int]int, n)
+			for i := range n {
+				m[2*i] = 0
+			}
+
+			in := NewMap[int, int](func(a, b int) bool { return a == b }, m)
+			grouped := GroupBy(Grouped[int, int, int]{}, in, byGroup, nil)
+
+			e := in.Edit()
+			e.Set(1, 0)
+			next := e.Done()
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				GroupBy(grouped, next, byGroup, nil)
+			}
+		})
+	}
+}
