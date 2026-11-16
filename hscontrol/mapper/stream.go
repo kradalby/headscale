@@ -677,9 +677,13 @@ func Route(old, cur *state.Snapshot, c state.Change) (bool, map[types.NodeID]str
 
 	viewed := [][]types.NodeID{nodes, c.Primaries, c.Caps}
 
-	// Routes a viewer sees follow the filter, which only a compile that
-	// renders peers differently changes; peers render from the same
-	// revision, so any other recompile would wake routers to send nothing.
+	// The routes a viewer is served read side sets, routers' cover counts
+	// and the via plan; they move only with a compile that renders peers
+	// differently, so any other recompile would wake routers to send
+	// nothing.
+	//
+	// TODO(capsrc/routing): the compile's revision stands for those inputs
+	// while it moves with membership. Routing on roles replaces it.
 	if old.PeerPolicyRev() != cur.PeerPolicyRev() {
 		add(old.RoutedNodes())
 		add(cur.RoutedNodes())

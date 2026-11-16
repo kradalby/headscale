@@ -1392,38 +1392,78 @@ func TestStreamsConvergeUnderRandomWrites(t *testing.T) {
 
 	failures := state.PolicyAuditFailures()
 
+	reach := runStreamsConverge(t, oracleAudited)
+
+	require.Equal(t, failures, state.PolicyAuditFailures(), "incremental compiles must match compiles from scratch")
+
+	reach.require(t)
+}
+
+// TestStreamsMatchTheCompileUnderRandomWrites runs the random writes of
+// [TestStreamsConvergeUnderRandomWrites] with the policy audit off, as
+// production runs, and holds what every session holds — its peers, its
+// packet filter and each peer's routes — to what the compile, which
+// serves none of them, gives for the same snapshot. A fresh session shares
+// any mistake of the served path; the compile does not.
+func TestStreamsMatchTheCompileUnderRandomWrites(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "false")
+
+	runStreamsConverge(t, oracleCompile).require(t)
+}
+
+// oracleMode says what the random writes check besides each session
+// against a fresh one.
+type oracleMode int
+
+const (
+	// oracleAudited requires every snapshot audited.
+	oracleAudited oracleMode = iota
+	// oracleCompile holds every session to the compile.
+	oracleCompile
+)
+
+func runStreamsConverge(t *testing.T, mode oracleMode) oracleReach {
+	t.Helper()
+
 	var reach oracleReach
 
 	for seed := range uint64(6) {
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
-			got := testStreamsConverge(t, rand.New(rand.NewPCG(seed, 6))) //nolint:gosec // deterministic test input
+			got := testStreamsConverge(t, rand.New(rand.NewPCG(seed, 6)), mode) //nolint:gosec // deterministic test input
 			reach.via += got.via
 			reach.exit += got.exit
 			reach.autoApproved += got.autoApproved
 			reach.keysRotated += got.keysRotated
 			reach.minCapVer += got.minCapVer
+			reach.addressMoved += got.addressMoved
 		})
 	}
 
-	require.Equal(t, failures, state.PolicyAuditFailures(), "incremental compiles must match compiles from scratch")
+	return reach
+}
 
-	// A shape the seeds never reach tests nothing.
+// require fails unless every shape was reached: a shape the seeds never
+// reach tests nothing.
+func (reach oracleReach) require(t *testing.T) {
+	t.Helper()
+
 	require.NotZero(t, reach.via, "a via route served at some step")
 	require.NotZero(t, reach.exit, "an exit route served to a client at some step")
 	require.NotZero(t, reach.autoApproved, "a route auto-approved at some step")
 	require.NotZero(t, reach.keysRotated, "a node's keys rotated at some step")
 	require.NotZero(t, reach.minCapVer, "a session at the oldest supported capability version")
+	require.NotZero(t, reach.addressMoved, "a node's address changed at some step")
 }
 
 // oracleReach counts how often the oracle reached the shapes its writes
 // and policies are there for.
 type oracleReach struct {
-	via, exit, autoApproved, keysRotated, minCapVer int
+	via, exit, autoApproved, keysRotated, minCapVer, addressMoved int
 }
 
 // testStreamsConverge runs one seed and returns what it reached, so the
 // caller can tell every shape was exercised.
-func testStreamsConverge(t *testing.T, r *rand.Rand) oracleReach {
+func testStreamsConverge(t *testing.T, r *rand.Rand, mode oracleMode) oracleReach {
 	t.Helper()
 
 	cfg, s, _ := streamTestState(t, "")
@@ -1578,15 +1618,21 @@ func testStreamsConverge(t *testing.T, r *rand.Rand) oracleReach {
 
 		snap := s.Snapshot()
 
-		// The snapshot every session renders was audited at the commit that
-		// last changed its membership.
-		require.True(t, snap.MembershipAudited(), "step %d: the last change to membership was audited", step)
-		require.True(t, snap.FilterAudited(), "step %d: every filter was expanded from templates and checked at the last change", step)
-		require.True(t, snap.SidesAudited(), "step %d: peers, routes and via from roles were checked at the last change", step)
-		require.True(t, snap.ViaElectionAudited() || snap.PolicyErr() != nil, "step %d: the via elections were checked against the plan", step)
+		if mode == oracleAudited {
+			// The snapshot every session renders was audited at the commit
+			// that last changed its membership.
+			require.True(t, snap.MembershipAudited(), "step %d: the last change to membership was audited", step)
+			require.True(t, snap.FilterAudited(), "step %d: every filter was expanded from templates and checked at the last change", step)
+			require.True(t, snap.SidesAudited(), "step %d: peers, routes and via from roles were checked at the last change", step)
+			require.True(t, snap.ViaElectionAudited() || snap.PolicyErr() != nil, "step %d: the via elections were checked against the plan", step)
+		}
 
 		advanceOracleSessions(t, r, cfg, hub, snap, wake(snap), sessions)
 		requireOracleConverged(t, step, cfg, snap, sessions)
+
+		if mode == oracleCompile {
+			requireSessionsMatchCompile(t, step, snap, sessions)
+		}
 
 		if servesVia(snap) {
 			reach.via++
@@ -1614,6 +1660,8 @@ type oracleRun struct {
 	open       func(types.NodeID)
 	addNode    func(string) types.NodeID
 	reach      *oracleReach
+	// addrs counts the addresses address changes handed out.
+	addrs int
 }
 
 // write applies one random write to nv, at step, of the kinds a real
@@ -1623,7 +1671,7 @@ func (o *oracleRun) write(step int, nodes views.Slice[types.NodeView], nv types.
 	route, exitRoutes, router, u1, u2 := o.route, o.exitRoutes, o.router, o.u1, o.u2
 	open, addNode := o.open, o.addNode
 
-	switch op := r.IntN(19); op {
+	switch op := r.IntN(20); op {
 	case 0, 1, 2:
 		n := nv.AsStruct()
 		n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(step))} //nolint:gosec // small
@@ -1723,6 +1771,26 @@ func (o *oracleRun) write(step int, nodes views.Slice[types.NodeView], nv types.
 		if mustNode(t, s, id).ApprovedRoutes().Len() > nv.ApprovedRoutes().Len() {
 			o.reach.autoApproved++
 		}
+	case 19:
+		// An address change, a policy fact no other write moves: one
+		// family, the other or both, to addresses no node held before.
+		o.addrs++
+		n := nv.AsStruct()
+		v4 := netip.MustParseAddr(fmt.Sprintf("100.64.%d.%d", 4+o.addrs/250, o.addrs%250))
+		v6 := netip.MustParseAddr(fmt.Sprintf("fd7a:115c:a1e0:4::%x", o.addrs))
+
+		switch r.IntN(3) {
+		case 0:
+			n.IPv4 = &v4
+		case 1:
+			n.IPv6 = &v6
+		default:
+			n.IPv4, n.IPv6 = &v4, &v6
+		}
+
+		s.PutNodeInStoreForTest(*n)
+
+		o.reach.addressMoved++
 	case 16:
 		// A map request stamping LastSeen, online or not.
 		n := nv.AsStruct()
@@ -1739,6 +1807,73 @@ func (o *oracleRun) write(step int, nodes views.Slice[types.NodeView], nv types.
 			open(addNode(fmt.Sprintf("new-%d", step)))
 		}
 	}
+}
+
+// requireSessionsMatchCompile holds every live session's peers, packet
+// filter and peers' routes to the compile's answers for snap: its pair scan
+// for peers, its filter for the node, and its route composition (its
+// matchers and its own via scopes) for each peer's routes.
+func requireSessionsMatchCompile(t *testing.T, step int, snap *state.Snapshot, sessions map[types.NodeID]*oracleSession) {
+	t.Helper()
+
+	pm, ok := snap.Policy().(*policyv2.PolicyManager)
+	require.True(t, ok)
+
+	peerMap := pm.BuildPeerMap(snap.ListNodes())
+
+	for _, id := range slices.Sorted(maps.Keys(sessions)) {
+		sess := sessions[id]
+		if sess.down {
+			continue
+		}
+
+		self, ok := snap.GetNode(id)
+		require.True(t, ok)
+
+		want := slices.Clone(peerMap[id])
+		slices.Sort(want)
+
+		want = slices.DeleteFunc(want, func(p types.NodeID) bool { return p == id })
+
+		got := make([]types.NodeID, 0, len(sess.client.peers))
+		for pid := range sess.client.peers {
+			got = append(got, types.NodeID(pid)) //nolint:gosec // node IDs fit
+		}
+
+		slices.Sort(got)
+
+		if !slices.Equal(want, got) {
+			t.Fatalf("step %d: session %d holds peers %v, the compile's pair scan %v", step, id, got, want)
+		}
+
+		filter, err := pm.FilterForNode(self)
+		require.NoError(t, err)
+
+		if !reflect.DeepEqual(filter, sess.client.filter) && (len(filter) > 0 || len(sess.client.filter) > 0) {
+			t.Fatalf("step %d: session %d holds filter %v, the compile's %v", step, id, sess.client.filter, filter)
+		}
+
+		for pid, tn := range sess.client.peers {
+			peer, ok := snap.GetNode(types.NodeID(pid)) //nolint:gosec // node IDs fit
+			require.True(t, ok)
+
+			routes, err := snap.CompiledRoutesForPeer(self, peer)
+			require.NoError(t, err)
+
+			if got, want := heldRoutes(tn), slices.SortedFunc(slices.Values(routes), netip.Prefix.Compare); !slices.Equal(got, want) {
+				t.Fatalf("step %d: session %d holds routes %v of peer %d, the compile's %v", step, id, got, pid, want)
+			}
+		}
+	}
+}
+
+// heldRoutes returns the routes a peer's AllowedIPs hold beyond its
+// addresses, sorted.
+func heldRoutes(tn *tailcfg.Node) []netip.Prefix {
+	routes := slices.DeleteFunc(slices.Clone(tn.AllowedIPs), func(p netip.Prefix) bool { return slices.Contains(tn.Addresses, p) })
+	slices.SortFunc(routes, netip.Prefix.Compare)
+
+	return routes
 }
 
 // servesExit reports whether any client holds a peer offering an exit
@@ -1993,12 +2128,10 @@ func scalingRouters(tb testing.TB, s *state.State) {
 	// standby.
 	snap := s.Snapshot()
 	viewer, router, standby := s.ListNodes().At(1), s.ListNodes().At(0), s.ListNodes().At(10)
-	matchers, err := snap.Policy().MatchersForNode(viewer)
-	require.NoError(tb, err)
 
 	subnet := netip.MustParsePrefix("10.0.0.0/24")
-	require.Contains(tb, snap.RoutesForPeer(viewer, mustNode(tb, s, router.ID()), matchers), subnet)
-	require.NotContains(tb, snap.RoutesForPeer(viewer, mustNode(tb, s, standby.ID()), matchers), subnet)
+	require.Contains(tb, snap.RoutesForPeer(viewer, mustNode(tb, s, router.ID())), subnet)
+	require.NotContains(tb, snap.RoutesForPeer(viewer, mustNode(tb, s, standby.ID())), subnet)
 
 	// And it is the via grant that serves it, not HA primaries under a
 	// plain grant.
@@ -2306,10 +2439,8 @@ func BenchmarkViaOnlineWrites(b *testing.B) {
 				if kind == "router-failover" {
 					snap := s.Snapshot()
 					viewer := mustNode(b, s, streams[1].nodeID)
-					matchers, err := snap.Policy().MatchersForNode(viewer)
-					require.NoError(b, err)
 					winner := mustNode(b, s, streams[(i%2)*10].nodeID)
-					require.Contains(b, snap.RoutesForPeer(viewer, winner, matchers), netip.MustParsePrefix("10.0.0.0/24"))
+					require.Contains(b, snap.RoutesForPeer(viewer, winner), netip.MustParsePrefix("10.0.0.0/24"))
 					require.Positive(b, sc.updates, "each failover must send route changes")
 				}
 
@@ -2370,10 +2501,8 @@ func BenchmarkViaMixedOnlineWrites(b *testing.B) {
 
 				snap := s.Snapshot()
 				viewer := mustNode(b, s, streams[1].nodeID)
-				matchers, err := snap.Policy().MatchersForNode(viewer)
-				require.NoError(b, err)
 				winner := mustNode(b, s, streams[(i%2)*10].nodeID)
-				require.Contains(b, snap.RoutesForPeer(viewer, winner, matchers), netip.MustParsePrefix("10.0.0.0/24"))
+				require.Contains(b, snap.RoutesForPeer(viewer, winner), netip.MustParsePrefix("10.0.0.0/24"))
 				require.Positive(b, sc.updates)
 				b.ReportMetric(float64(sc.woken)/float64(i), "woken/op")
 				b.ReportMetric(float64(sc.updates)/float64(i), "updates/op")

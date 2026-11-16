@@ -19,16 +19,16 @@ import (
 	"tailscale.com/types/views"
 )
 
-func (s *Snapshot) sides() policyv2.Sides            { return s.s.Get(s.w.sides) }
-func (s *Snapshot) rolePeers() *policyv2.PeerClasses { return s.s.Get(s.w.rolePeers) }
-func (s *Snapshot) viaPlans() policyv2.ViaPlans      { return s.s.Get(s.w.viaPlan) }
+func (s *Snapshot) sides() policyv2.Sides        { return s.s.Get(s.w.sides) }
+func (s *Snapshot) peers() *policyv2.PeerClasses { return s.s.Get(s.w.peers) }
+func (s *Snapshot) viaPlans() policyv2.ViaPlans  { return s.s.Get(s.w.viaPlan) }
 
 type sidesRevs struct{ sides, peers, via uint64 }
 
 func (s *Snapshot) sidesRevs() sidesRevs {
 	return sidesRevs{
 		sides: graph.ChangedAt(s.s, s.w.sides),
-		peers: graph.ChangedAt(s.s, s.w.rolePeers),
+		peers: graph.ChangedAt(s.s, s.w.peers),
 		via:   graph.ChangedAt(s.s, s.w.viaPlan),
 	}
 }
@@ -40,7 +40,7 @@ func sidesAuditOf(s *Snapshot) policyv2.SidesAudit {
 
 	return policyv2.SidesAudit{
 		Templates: s.templates(), Roles: s.roles(), Postings: s.postings(), Approvals: s.approvals(),
-		Nodes: s.nodes(), Sides: s.sides(), Peers: s.rolePeers(), Via: s.viaPlans().Plan,
+		Nodes: s.nodes(), Sides: s.sides(), Peers: s.peers(), Via: s.viaPlans().Plan,
 		List: s.s.Get(s.w.policyNodes).list, Users: s.s.Get(s.w.policyUsers), Policy: pm, Current: cp.err == nil,
 	}
 }
@@ -117,7 +117,7 @@ func TestWorldSidesCostFollowsChange(t *testing.T) {
 		t.Helper()
 
 		for id, peers := range want {
-			if got := s.rolePeers().Peers(id); len(peers) > 0 || len(got) > 0 {
+			if got := s.peers().Peers(id); len(peers) > 0 || len(got) > 0 {
 				assert.Equal(t, peers, got, "peers of %d", id)
 			}
 		}
@@ -222,13 +222,13 @@ func TestWorldSidesCostFollowsChange(t *testing.T) {
 			_, isComputed := after.sides().Computed()
 			assert.Equal(t, step.want.computed, isComputed-wasComputed, "side sets computed")
 
-			wasViews, _ := before.rolePeers().ViewsComputed()
-			isViews, _ := after.rolePeers().ViewsComputed()
+			wasViews, _ := before.peers().ViewsComputed()
+			isViews, _ := after.peers().ViewsComputed()
 			assert.Equal(t, step.want.views, isViews-wasViews, "class views computed")
 			assert.Equal(t, step.want.viaBuilt, after.viaPlans().Builds > before.viaPlans().Builds, "via plan built")
 
 			for _, id := range step.want.kept {
-				v, o := after.rolePeers().View(id), before.rolePeers().View(id)
+				v, o := after.peers().View(id), before.peers().View(id)
 				assert.True(t, len(v) == len(o) && (len(v) == 0 || &v[0] == &o[0]), "node %d keeps its view", id)
 			}
 
@@ -286,7 +286,7 @@ func TestWorldSidesFollowMembershipUnderRefusal(t *testing.T) {
 	// The last good rules: alice reaches bob's nodes and the via routers,
 	// bob's nodes are one clique.
 	for id, want := range map[types.NodeID][]types.NodeID{1: {2, 3, 4, 5}, 2: {1, 3}, 3: {1, 2}, 5: {1}} {
-		assert.Equal(t, want, s.rolePeers().Peers(id), "peers of %d", id)
+		assert.Equal(t, want, s.peers().Peers(id), "peers of %d", id)
 	}
 
 	rep := requireSides(t, s)

@@ -678,12 +678,10 @@ func TestViaElectionRestart(t *testing.T) {
 		t.Helper()
 
 		v, _ := snap.GetNode(viewer.ID)
-		matchers, err := snap.Policy().MatchersForNode(v)
-		require.NoError(t, err)
 
 		for _, id := range []types.NodeID{r1.ID, r2.ID} {
 			peer, _ := snap.GetNode(id)
-			if slices.Contains(snap.RoutesForPeer(v, peer, matchers), route) {
+			if slices.Contains(snap.RoutesForPeer(v, peer), route) {
 				return id
 			}
 		}

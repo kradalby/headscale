@@ -174,9 +174,7 @@ func subnetRouters(tb testing.TB, s *state.State) {
 	require.Contains(tb, snap.PeerView(eng.ID()), router.ID())
 	require.NotContains(tb, snap.PeerView(other.ID()), router.ID())
 
-	matchers, err := snap.Policy().MatchersForNode(eng)
-	require.NoError(tb, err)
-	require.Equal(tb, router.ApprovedRoutes().AsSlice(), snap.RoutesForPeer(eng, mustNode(tb, s, router.ID()), matchers))
+	require.Equal(tb, router.ApprovedRoutes().AsSlice(), snap.RoutesForPeer(eng, mustNode(tb, s, router.ID())))
 }
 
 func userNames(tb testing.TB, s *state.State) map[types.UserID]string {
@@ -638,6 +636,64 @@ func benchChurn(b *testing.B, kind, shape string, n int) {
 	b.ReportMetric(per(cr.selfFilterBytes), "self-filter-bytes/op")
 	b.ReportMetric(per(cr.restBytes), "rest-bytes/op")
 	b.ReportMetric(per(cr.commits), "commits/op")
+}
+
+// BenchmarkEndpointAfterChurn measures an endpoint write right after a
+// join or a tag change and its restore: the served filters are cached per
+// commit that moves a policy fact, so every session the churn did not wake
+// cuts its unchanged filter again at its next render, here the endpoint
+// write's. filter-cuts/op counts those cuts; a cache keyed on what each
+// node's rules read would remove them. HEADSCALE_SCALE_NODES sets the size.
+func BenchmarkEndpointAfterChurn(b *testing.B) {
+	n := 400
+
+	if v, ok := os.LookupEnv("HEADSCALE_SCALE_NODES"); ok {
+		var err error
+
+		n, err = strconv.Atoi(v)
+		require.NoError(b, err)
+	}
+
+	for _, kind := range []string{"join", "tag"} {
+		for _, shape := range []string{"mesh", "users", "selectors", "routers"} {
+			w := churnWrites[kind]
+			if !w.applies(churnShapes[shape]) {
+				continue
+			}
+
+			b.Run(fmt.Sprintf("%s/%s/nodes=%d", kind, shape, n), func(b *testing.B) {
+				s, streams := scalingTailnet(b, n, shape)
+				cr := newChurnRun(b, s, streams, shape)
+
+				var i, cuts, woken int
+
+				for b.Loop() {
+					b.StopTimer()
+					w.write(cr, b, i)
+					cr.deliver(b)
+
+					if w.restore != nil {
+						w.restore(cr, b, i)
+					}
+
+					was, wasWoken := state.FilterCuts(), cr.woken
+
+					b.StartTimer()
+
+					// A node apart from the churn's subjects, picked in turn.
+					scalingEndpoint(b, s, cr.streams[(i*37+11)%len(cr.streams)].nodeID, i)
+					cr.deliver(b)
+
+					cuts += int(state.FilterCuts() - was) //nolint:gosec // small
+					woken += cr.woken - wasWoken
+					i++
+				}
+
+				b.ReportMetric(float64(cuts)/float64(i), "filter-cuts/op")
+				b.ReportMetric(float64(woken)/float64(i), "woken/op")
+			})
+		}
+	}
 }
 
 // TestScalingWriteWorkChurn is [TestScalingWriteWork] for the churn kinds,

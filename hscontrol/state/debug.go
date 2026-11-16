@@ -9,6 +9,7 @@ import (
 	"time"
 
 	hsdb "github.com/juanfont/headscale/hscontrol/db"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
 )
@@ -351,9 +352,23 @@ func (s *State) DebugPolicyManager() string {
 	return s.PolicyDebugString()
 }
 
-// PolicyDebugString returns a debug representation of the current policy.
+// PolicyDebugString returns a debug representation of the current policy:
+// the compile's document, tag owners, auto-approvers and node list, which
+// it still serves, with the served global filter in place of its own.
 func (s *State) PolicyDebugString() string {
-	return s.Snapshot().Policy().DebugString()
+	snap := s.Snapshot()
+
+	pm, ok := snap.Policy().(*policyv2.PolicyManager)
+	if !ok {
+		return snap.Policy().DebugString()
+	}
+
+	rules, _, err := snap.Filter()
+	if err != nil {
+		return fmt.Sprintf("expanding the policy's filter: %v", err)
+	}
+
+	return pm.DebugStringFor(rules)
 }
 
 // DebugOverviewJSON returns a structured overview of the current state for debugging.
@@ -464,6 +479,6 @@ func (s *State) DebugNodeStoreJSON() map[types.NodeID]types.Node {
 // DebugPolicyManagerJSON returns structured debug information about the policy manager.
 func (s *State) DebugPolicyManagerJSON() DebugStringInfo {
 	return DebugStringInfo{
-		Content: s.Snapshot().Policy().DebugString(),
+		Content: s.PolicyDebugString(),
 	}
 }

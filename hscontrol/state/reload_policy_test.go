@@ -242,7 +242,8 @@ func TestSetPolicyUnchangedDocumentIsANoOp(t *testing.T) {
 	node, ok := s.GetNodeByID(nodeID)
 	require.True(t, ok)
 	require.NoError(t, s.DeleteNode(node))
-	require.Error(t, policyRefusal(s.Snapshot().Policy()), "test sanity: the document's tests now fail")
+	snap := s.Snapshot()
+	require.Error(t, policyRefusal(snap, snap.Policy()), "test sanity: the document's tests now fail")
 
 	changed, err := s.SetPolicy(pol)
 	require.NoError(t, err, "an unchanged document is already live")

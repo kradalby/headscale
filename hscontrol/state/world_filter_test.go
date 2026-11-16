@@ -719,6 +719,105 @@ func TestWorldFilterFollowsMembershipUnderRefusedPolicy(t *testing.T) {
 	assert.Zero(t, PolicyAuditFailures()-failures)
 }
 
+// TestWorldServedFilterFollowsMembership reads each node's served filter
+// as a session would, before and after each write, and holds it to what
+// the writes give, worked out by hand: a filter read before a join, a
+// leave or an address change must not be served after it.
+func TestWorldServedFilterFollowsMembership(t *testing.T) {
+	const src = `{"acls": [{"action": "accept", "src": ["alice@"], "dst": ["alice@:22"]}]}`
+
+	users := []types.User{{ID: 1, Name: "alice"}}
+
+	w, err := newWorld(types.Nodes{worldNode(1, &users[0], "100.64.0.1"), worldNode(2, &users[0], "100.64.0.2")}, users, []byte(src), types.DNSView{})
+	require.NoError(t, err)
+
+	sources := func(id types.NodeID) []string {
+		t.Helper()
+
+		snap := w.snapshot()
+
+		rules, err := snap.FilterForNode(id)
+		require.NoError(t, err)
+		require.Len(t, rules, 1)
+
+		// Read twice, as two sessions of one snapshot do: one slice.
+		again, err := snap.FilterForNode(id)
+		require.NoError(t, err)
+		require.Same(t, &rules[0], &again[0])
+
+		return rules[0].SrcIPs
+	}
+
+	assert.Equal(t, []string{"100.64.0.1", "100.64.0.2"}, sources(1))
+
+	w.PutNode(*worldNode(3, &users[0], "100.64.0.3"))
+	assert.Equal(t, []string{"100.64.0.1", "100.64.0.2", "100.64.0.3"}, sources(1), "a join reaches a filter read before it")
+
+	_, ok := w.UpdateNode(2, func(n *types.Node) { n.IPv4 = new(netip.MustParseAddr("100.64.0.9")) })
+	require.True(t, ok)
+	assert.Equal(t, []string{"100.64.0.1", "100.64.0.3", "100.64.0.9"}, sources(1), "an address change too")
+
+	w.DeleteNode(3)
+	assert.Equal(t, []string{"100.64.0.1", "100.64.0.9"}, sources(1), "and a leave")
+
+	_, ok = w.UpdateNode(1, func(n *types.Node) { n.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")} })
+	require.True(t, ok)
+	assert.Equal(t, []string{"100.64.0.1", "100.64.0.9"}, sources(1), "a write no policy reads keeps the filter")
+}
+
+// TestWorldServesMembershipUnderRefusedPolicy pins what the switch to the
+// expanded filters serves while a refused document stands: the served
+// filter follows a join under the last good policy, and since the compile
+// does not, change routing wakes every session at a recompile then and at
+// the first one after; a write no policy reads still wakes nobody new.
+func TestWorldServesMembershipUnderRefusedPolicy(t *testing.T) {
+	const good = `{"acls": [{"action": "accept", "src": ["alice@"], "dst": ["alice@:22"]}]}`
+
+	users := []types.User{{ID: 1, Name: "alice"}}
+
+	w, err := newWorld(types.Nodes{worldNode(1, &users[0], "100.64.0.1")}, users, []byte(good), types.DNSView{})
+	require.NoError(t, err)
+
+	accepted := w.snapshot()
+
+	_, err = w.SetPolicy([]byte(`{"acls": [`), noCheck)
+	require.NoError(t, err)
+
+	refused := w.snapshot()
+	require.Error(t, refused.PolicyErr())
+	assert.True(t, refused.Since(accepted).Global, "a refusal wakes everyone")
+
+	w.PutNode(*worldNode(2, &users[0], "100.64.0.2"))
+
+	joined := w.snapshot()
+	node1, ok := joined.GetNode(1)
+	require.True(t, ok)
+
+	served, err := joined.FilterForNode(1)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"100.64.0.1", "100.64.0.2"}, served[0].SrcIPs, "the served filter follows the join under the last good policy")
+
+	frozen, err := joined.Policy().FilterForNode(node1)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"100.64.0.1"}, frozen[0].SrcIPs, "the compile is frozen, so it cannot route the join")
+
+	assert.True(t, joined.Since(refused).Global, "a recompile under a refused document wakes everyone")
+	assert.NotEqual(t, refused.PeerPolicyRev(), joined.PeerPolicyRev(), "routed peers render again under a refused document")
+
+	_, ok = w.UpdateNode(2, func(n *types.Node) { n.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")} })
+	require.True(t, ok)
+
+	quiet := w.snapshot()
+	assert.False(t, quiet.Since(joined).Global, "a write no policy reads recompiles nothing")
+
+	_, err = w.SetPolicy([]byte(good), noCheck)
+	require.NoError(t, err)
+
+	fixed := w.snapshot()
+	require.NoError(t, fixed.PolicyErr())
+	assert.True(t, fixed.Since(quiet).Global, "the first compile after a refusal wakes everyone")
+}
+
 // shapeNode is a node of the shapes test: owner (nil for tagged), one or
 // both addresses, tags, routes announced and approved, routes approved only.
 func shapeNode(id types.NodeID, user *types.User, v4, v6 string, tags []string, routes, only []string) *types.Node {

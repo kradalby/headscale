@@ -126,9 +126,11 @@ type renderer struct {
 	lastClass   *peerMap
 	lastKey     renderKey
 	lastPeerIDs []types.NodeID // the snapshot's shared view, see [state.Snapshot.PeerView]
-	lastSelf    types.NodeView
-	lastNodes   state.NodesVersion
-	lastCaps    state.CapsVersion
+	// lastPeersRev is the peers revision lastPeerIDs and lastKey.side are of.
+	lastPeersRev uint64
+	lastSelf     types.NodeView
+	lastNodes    state.NodesVersion
+	lastCaps     state.CapsVersion
 	// overlaid holds the peers this viewer has its own copy of, with its
 	// routes or without the IPv4 identity, so losing the last restores the
 	// shared class map. It is kept by ID, not told from the last class
@@ -162,9 +164,16 @@ type renderer struct {
 }
 
 // renderKey is what a peer's rendering reads besides the peer and the
-// viewer: how the policy renders peers, and the primary routes.
+// viewer: how the policy renders peers, the primary routes, and the
+// viewer's side set, which the routes it is served read.
+//
+// TODO(capsrc/routing): policy is the compile's [state.Snapshot.PeerPolicyRev],
+// a proxy for what else the served routes read (the routers' cover counts,
+// the via plan, other nodes' side sets) that holds while the compile moves
+// with membership; routing on roles replaces it.
 type renderKey struct {
 	policy, primaries uint64
+	side              policyv2.RoleSet
 }
 
 type dnsKey struct {
@@ -408,7 +417,7 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 
 	tn := r.self
 
-	filter, err := pm.FilterForNode(self)
+	filter, err := snap.FilterForNode(self.ID())
 	if err != nil {
 		return nil, err
 	}
@@ -462,12 +471,18 @@ func (r *renderer) renderPeers(
 	capMaps map[types.NodeID]tailcfg.NodeCapMap,
 	nm *netMap,
 ) error {
+	// An unmoved peers cell holds the same views and side sets.
+	view, side := r.lastPeerIDs, r.lastKey.side
+	if nm.base == nil || snap.PeersRev() != r.lastPeersRev {
+		view, side = snap.PeerViewAndSideSet(r.nodeID)
+	}
+
 	key := renderKey{
 		policy:    snap.PeerPolicyRev(),
 		primaries: snap.PrimariesRev(),
+		side:      side,
 	}
 
-	view := snap.PeerView(r.nodeID)
 	class, profiles, nodes := r.classes.get(r.cfg, r.renders, snap, view, r.peerCapVer, key.policy, capMaps)
 	nm.peers, nm.profiles = class, profiles
 
@@ -535,13 +550,6 @@ func (r *renderer) renderPeers(
 	}
 
 	if len(routed) > 0 {
-		// RoutesForPeer needs the unreduced matchers: every rule where
-		// the node is source or destination.
-		matchers, err := snap.Policy().MatchersForNode(self)
-		if err != nil {
-			return err
-		}
-
 		if r.routedPrimaries == nil {
 			r.routedPrimaries = make(map[tailcfg.NodeID][]netip.Prefix, len(routed))
 		}
@@ -552,7 +560,7 @@ func (r *renderer) renderPeers(
 
 			r.routedPrimaries[id.NodeID()] = snap.PrimaryRoutesForNode(id)
 
-			tn := withRoutes(base, snap.RoutesForPeer(self, peer, matchers))
+			tn := withRoutes(base, snap.RoutesForPeer(self, peer))
 			if ipv4Disabled {
 				tn = withoutIPv4Identity(tn)
 			}
@@ -593,7 +601,7 @@ func (r *renderer) renderPeers(
 
 	// Only a render that completed moves the cursor; a failed one is
 	// retried from the same place.
-	r.markRendered(snap, key, self, class, nodes)
+	r.markRendered(snap, key, self, class, view, nodes)
 
 	return nil
 }
@@ -675,9 +683,14 @@ func (r *renderer) routedCandidates(snap *state.Snapshot, self types.NodeView, k
 	via := weak.Make(snap.ViaElection())
 
 	switch {
-	case first || key.policy != r.lastKey.policy || !sameRouteFacts(r.lastSelf, self):
+	case first || key.policy != r.lastKey.policy || key.side != r.lastKey.side || !sameRouteFacts(r.lastSelf, self):
 		// A policy or viewer change can steer any router's routes for this
 		// viewer.
+		//
+		// TODO(capsrc/routing): untested until M5. While the compile runs,
+		// PeerPolicyRev moves whenever a viewer's side set does, so dropping
+		// the side comparison fails no test; when M5 replaces PeerPolicyRev
+		// it needs a test that fails without it.
 		r.routedPrimaries = nil
 
 		for _, id := range snap.RoutedNodes() {
@@ -716,9 +729,9 @@ func sameRouteFacts(a, b types.NodeView) bool {
 		slices.Equal(a.AllApprovedRoutes(), b.AllApprovedRoutes())
 }
 
-func (r *renderer) markRendered(snap *state.Snapshot, key renderKey, self types.NodeView, class *peerMap, nodes state.NodesVersion) {
+func (r *renderer) markRendered(snap *state.Snapshot, key renderKey, self types.NodeView, class *peerMap, view []types.NodeID, nodes state.NodesVersion) {
 	r.lastClass, r.lastKey = class, key
-	r.lastPeerIDs, r.lastSelf = snap.PeerView(r.nodeID), self
+	r.lastPeerIDs, r.lastPeersRev, r.lastSelf = view, snap.PeersRev(), self
 	r.lastNodes, r.lastCaps = nodes, snap.CapsVersion()
 
 	via := weak.Make(snap.ViaElection())

@@ -98,6 +98,10 @@ func SidesAuditRuns() uint64 { return sidesAuditRuns.Load() }
 // ViaPlanAuditRuns: see [SidesAuditRuns].
 func ViaPlanAuditRuns() uint64 { return viaPlanAuditRuns.Load() }
 
+// FilterCuts counts the node filters the served filters have cut, so a
+// benchmark can tell how many renders recut an unchanged filter.
+func FilterCuts() uint64 { return policyv2.FilterCuts() }
+
 // FilterAuditRuns counts the filter audits that ran, so a test can prove
 // the audit is wired; their failures count in [PolicyAuditFailures].
 func FilterAuditRuns() uint64 { return filterAuditRuns.Load() }
@@ -205,15 +209,25 @@ func (e *nodeEdit) nameTaken(self types.NodeID, name string) bool {
 // extra DNS records. Everything else is derived and recomputed only when
 // what it read changed:
 //
-//	nodes ──► index ──► policyNodes ─┬─► policy ──► peers
+//	nodes ──► index ──► policyNodes ─┬─► policy
 //	users ───────────────────────────┤
 //	policySrc ───────────────────────┘
-//	index, nodes, policy ──► primaries
 //	policy ──► selectors ──► userSets ◄── users
 //	userSets, nodes ──► roles ──► postings
 //	selectors ──► templates
 //	nodes ──► approvals
-//	templates, roles, postings, approvals, nodes ──► sides ──► rolePeers, viaPlan
+//	templates, postings, approvals, policyNodes ──► filters
+//	templates, roles, postings, approvals, nodes ──► sides ──► peers, viaPlan
+//	index, nodes, viaPlan, sides ──► primaries
+//
+// What clients are sent of the policy — packet filters, peers, the routes
+// a viewer may use, via steering and elections — comes from the cells
+// after policy, which read the document and membership, never the compiled
+// policy's address sets. The compile still serves SSH, node attributes,
+// tag owners, auto-approvers and DERP, says which document is in force,
+// and, until change routing moves onto roles, tells [Snapshot.Since] whose
+// filters a recompile can reach; under the policy audit it is the oracle
+// the served values are held against.
 //
 // The nodes, users and policySrc inputs are written only through the
 // methods below, which serialise on the graph.
@@ -272,39 +286,42 @@ type world struct {
 	peerPolicy graph.Derived[peerPolicy]
 	// nodeCaps is the policy's capability map per node, kept as a Map so
 	// a reader finds whose caps a recompile changed.
-	nodeCaps  graph.Derived[*capsMap]
-	peers     graph.Derived[*policyv2.PeerClasses]
-	primaries graph.Derived[primaryRoutes]
+	nodeCaps graph.Derived[*capsMap]
 
-	// Membership, read only by the policy audit until the compile moves
-	// onto it: the selectors the policy in force names;
-	// the users each user selector names; each node's role set; and each
-	// role's nodes. Each recomputes only for what its inputs changed, so
-	// a user outside every selector, an endpoint or a Hostinfo write
-	// reaches no role, and a join reaches one node's.
+	// Membership: the selectors the policy in force names; the users each
+	// user selector names; each node's role set; and each role's nodes.
+	// Each recomputes only for what its inputs changed, so a user outside
+	// every selector, an endpoint or a Hostinfo write reaches no role, and
+	// a join reaches one node's.
 	selectors graph.Derived[*policyv2.Selectors]
 	userSets  graph.Derived[*policyv2.UserSets]
 	roles     graph.Derived[policyv2.Roles]
 	postings  graph.Derived[policyv2.Postings]
 
-	// The filter's other half, read only by the policy audit until the
-	// filter moves onto it: the policy's rules as templates naming
-	// selectors, which only a document edit reaches; and the approved
-	// subnet routes a * source adds, which only an approval reaches.
+	// The policy's rules as templates naming selectors, which only a
+	// document edit reaches; and the approved subnet routes a * source
+	// adds, which only an approval reaches.
 	templates graph.Derived[*policyv2.Templates]
 	approvals graph.Derived[policyv2.SubnetApprovals]
 
+	// filters serves every node's packet filter, expanded from the
+	// templates and postings when a session first reads it.
+	filters graph.Derived[*policyv2.Filters]
+
 	// Who sees whom, which routes a viewer may use and via steering, from
-	// the templates and roles; read only by the policy audit until the
-	// consumers move onto them: each node's side set, the peer classes
+	// the templates and roles: each node's side set, the peer classes
 	// keyed by it, and the via elections' scopes, kept by identity while
 	// their content stays.
 	sides     graph.Derived[policyv2.Sides]
-	rolePeers graph.Derived[*policyv2.PeerClasses]
+	peers     graph.Derived[*policyv2.PeerClasses]
 	viaPlan   graph.Derived[policyv2.ViaPlans]
+	primaries graph.Derived[primaryRoutes]
 
-	// membershipAudit, filterAudit and sidesAudit are set, with auditing,
-	// only under the policy audit.
+	// compiledPeers are the compile's peer classes, built incrementally
+	// as they were when they served and checked against a fresh build;
+	// nothing reads them. membershipAudit, filterAudit and sidesAudit are
+	// the audits. All are set, with auditing, only under the policy audit.
+	compiledPeers   graph.Derived[*policyv2.PeerClasses]
 	membershipAudit graph.Derived[membershipAudit]
 	filterAudit     graph.Derived[filterAudit]
 	sidesAudit      graph.Derived[sidesAudit]
@@ -357,10 +374,12 @@ type capsMap = graph.Map[types.NodeID, tailcfg.NodeCapMap]
 func sameCaps(a, b tailcfg.NodeCapMap) bool { return reflect.DeepEqual(a, b) }
 
 // peerPolicy is a generation number that moves only when a compiled
-// policy renders peers differently, with the policy it was taken at.
+// policy renders peers differently, with the policy it was taken at and
+// whether that compile was refused.
 type peerPolicy struct {
-	pm  policy.PolicyManager
-	gen uint64
+	pm      policy.PolicyManager
+	gen     uint64
+	refused bool
 }
 
 // compiledPolicy is the policy compiled against the users and nodes of a
@@ -444,17 +463,25 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 			return &compiledPolicy{pm: pm}
 		})
 
+	// TODO(capsrc/routing): renderers key routed peers on this, and Route
+	// wakes routers' viewers on it: a proxy, from the compile, for the side
+	// sets, cover counts and via plan the served routes read. It holds while
+	// the compile moves with membership; routing on roles replaces it.
 	w.peerPolicy = graph.NewDerived(g, "peer-policy", func(a, b peerPolicy) bool { return a.gen == b.gen },
 		func(s *graph.Snapshot, prev peerPolicy) peerPolicy {
 			cur := s.Get(w.policy)
 			next, _ := cur.pm.(*policyv2.PolicyManager)
 			last, _ := prev.pm.(*policyv2.PolicyManager)
 
-			if next != nil && next.SameForPeers(last) {
+			// Under a refused document the served routes follow membership
+			// while the compile stays as it was: every recompile then counts,
+			// and the first one after. Production cannot reach one today
+			// (see Snapshot.Since); only world tests set one directly.
+			if cur.err == nil && !prev.refused && next != nil && next.SameForPeers(last) {
 				return peerPolicy{pm: cur.pm, gen: prev.gen}
 			}
 
-			return peerPolicy{pm: cur.pm, gen: prev.gen + 1}
+			return peerPolicy{pm: cur.pm, gen: prev.gen + 1, refused: cur.err != nil}
 		})
 
 	w.nodeCaps = graph.NewDerived(g, "node-caps", graph.Same[*capsMap], w.deriveNodeCaps)
@@ -468,13 +495,14 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 
 		return derp.ApplyPolicy(configured, pm.DERPMap())
 	})
-	w.peers = graph.NewDerived(g, "peers", (*policyv2.PeerClasses).Same, w.derivePeers)
-	w.primaries = graph.NewDerived(g, "primaries", samePrimaries, w.electPrimaries)
 
 	// From the compile in force, not the document: a compile that fails
 	// keeps serving the last good policy, and membership must describe the
 	// policy served. A recompile of the same document reuses its parse, so
 	// node writes reach no further than here.
+	//
+	// TODO(capsrc/compile): which document is in force is the compile's
+	// verdict; it moves here when the compile's filter and peers go.
 	w.selectors = graph.NewDerived(g, "selectors", graph.Same[*policyv2.Selectors],
 		func(s *graph.Snapshot, prev *policyv2.Selectors) *policyv2.Selectors {
 			pm, _ := s.Get(w.policy).pm.(*policyv2.PolicyManager)
@@ -507,19 +535,27 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 		func(s *graph.Snapshot, prev policyv2.SubnetApprovals) policyv2.SubnetApprovals {
 			return prev.Update(s.Get(w.nodes))
 		})
+	// Over the policy's node list, not the nodes: the addresses of members
+	// are policy facts, and an endpoint write must keep every filter
+	// served. Building is left to the first session that reads one.
+	w.filters = graph.NewDerived(g, "filters", graph.Same[*policyv2.Filters],
+		func(s *graph.Snapshot, _ *policyv2.Filters) *policyv2.Filters {
+			return policyv2.NewFilters(s.Get(w.templates), s.Get(w.postings), s.Get(w.approvals), s.Get(w.policyNodes).list)
+		})
 
 	// From the nodes, as roles: a write that moves no address, route, tag
 	// or user is cut off there and reaches neither classes nor via.
 	w.sides = graph.NewDerived(g, "sides", policyv2.Sides.Same, func(s *graph.Snapshot, prev policyv2.Sides) policyv2.Sides {
 		return policyv2.UpdateSides(prev, s.Get(w.templates), s.Get(w.roles), s.Get(w.postings), s.Get(w.approvals), s.Get(w.nodes))
 	})
-	w.rolePeers = graph.NewDerived(g, "role-peers", (*policyv2.PeerClasses).SameKeyed,
+	w.peers = graph.NewDerived(g, "peers", (*policyv2.PeerClasses).SameKeyed,
 		func(s *graph.Snapshot, prev *policyv2.PeerClasses) *policyv2.PeerClasses {
 			return policyv2.RolePeers(prev, s.Get(w.sides))
 		})
 	w.viaPlan = graph.NewDerived(g, "via-plan", policyv2.ViaPlans.Same, func(s *graph.Snapshot, prev policyv2.ViaPlans) policyv2.ViaPlans {
 		return policyv2.UpdateViaPlans(prev, s.Get(w.sides))
 	})
+	w.primaries = graph.NewDerived(g, "primaries", samePrimaries, w.electPrimaries)
 
 	// Registered only under the audit, so once, here, where the compile
 	// audits read the knob at every compile: a derived cell is recomputed
@@ -529,6 +565,7 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 	// running server therefore starts the compile audits only.
 	if policyAudit() {
 		w.auditing = true
+		w.compiledPeers = graph.NewDerived(g, "compiled-peers", (*policyv2.PeerClasses).Same, w.derivePeers)
 		w.membershipAudit = graph.NewDerived(g, "membership-audit",
 			func(membershipAudit, membershipAudit) bool { return true }, w.auditMembership)
 		w.filterAudit = graph.NewDerived(g, "filter-audit", func(filterAudit, filterAudit) bool { return true }, w.auditFilters)
@@ -649,10 +686,11 @@ type filterAudit struct {
 
 // auditFilters checks, at every commit that changes the compile, its users
 // or node list, the templates, the postings or the approved routes, that
-// every node's filter expanded from templates and postings equals the
-// compile's. It reads the policy's node list, not the nodes: no input of
-// either side changes on an endpoint or health write, so neither does the
-// verdict, and the audit costs nothing there.
+// every node's filter served, and the one an expansion built here gives,
+// equals the compile's, as does the global filter. It reads the policy's
+// node list, not the nodes: no input of either side changes on an endpoint
+// or health write, so neither does the verdict, and the audit costs
+// nothing there.
 func (w *world) auditFilters(s *graph.Snapshot, prev filterAudit) filterAudit {
 	filterAuditRuns.Add(1)
 
@@ -671,6 +709,7 @@ func (w *world) auditFilters(s *graph.Snapshot, prev filterAudit) filterAudit {
 		// A build from scratch costs the policy's size; a node write
 		// leaves the templates it checked as they were.
 		TemplatesAudited: prev.templates == templates,
+		Served:           s.Get(w.filters),
 	})
 	if err != nil {
 		policyAuditFailures.Add(1)
@@ -693,6 +732,7 @@ func (s *Snapshot) FilterAudited() bool {
 	for _, rev := range []uint64{
 		graph.ChangedAt(s.s, s.w.policy), graph.ChangedAt(s.s, s.w.policyUsers), graph.ChangedAt(s.s, s.w.policyNodes),
 		graph.ChangedAt(s.s, s.w.templates), graph.ChangedAt(s.s, s.w.postings), graph.ChangedAt(s.s, s.w.approvals),
+		graph.ChangedAt(s.s, s.w.filters),
 	} {
 		last = max(last, rev)
 	}
@@ -728,7 +768,7 @@ type sidesPairs struct {
 func (w *world) sidesPairsOf(s *graph.Snapshot) sidesPairs {
 	return sidesPairs{
 		policy: s.Get(w.policy), nodesGen: s.Get(w.policyNodes).gen,
-		sides: s.Get(w.sides), peers: s.Get(w.rolePeers), via: s.Get(w.viaPlan).Plan,
+		sides: s.Get(w.sides), peers: s.Get(w.peers), via: s.Get(w.viaPlan).Plan,
 	}
 }
 
@@ -779,7 +819,7 @@ func (w *world) auditSides(s *graph.Snapshot, prev sidesAudit) sidesAudit {
 		}
 
 		if current {
-			err := w.auditRoleRoutes(&Snapshot{s: s, w: w}, pm, pn.list, in.sides, in.via)
+			err := w.auditRoleRoutes(&Snapshot{s: s, w: w}, pm, pn.list)
 			if err != nil {
 				fail("role routes", err)
 			}
@@ -800,6 +840,11 @@ func (w *world) auditSides(s *graph.Snapshot, prev sidesAudit) sidesAudit {
 			fail("via plan", errViaPlanElection)
 		}
 
+		// The oracle: the compile's own scopes elect what is served.
+		if !pm.ElectsVia(prim.via, elect) {
+			fail("via election", errCompiledElection)
+		}
+
 		next.primaries, next.elected, next.electRev = prim.gen, in.via, s.Rev()
 	}
 
@@ -807,15 +852,17 @@ func (w *world) auditSides(s *graph.Snapshot, prev sidesAudit) sidesAudit {
 }
 
 var (
-	errViaPlanElection = errors.New("the election differs from one over the via plan")
-	errRoleRoutes      = errors.New("role-based routes differ")
+	errViaPlanElection  = errors.New("the election differs from one over the via plan")
+	errCompiledElection = errors.New("the election differs from one over the compile's via scopes")
+	errRoleRoutes       = errors.New("served routes differ from the compile's")
 )
 
-// auditRoleRoutes holds the role-based routes every viewer gets for every
-// peer, elected over the via plan, against [Snapshot.RoutesForPeer].
-func (w *world) auditRoleRoutes(snap *Snapshot, pm *policyv2.PolicyManager, list views.Slice[types.NodeView], sides policyv2.Sides, via *policyv2.ViaPlan) error {
+// auditRoleRoutes holds the routes every viewer is served for every peer
+// against the compile's: route access by the viewer's matchers, and via
+// steering by the compile's own scopes, elected afresh.
+func (w *world) auditRoleRoutes(snap *Snapshot, pm *policyv2.PolicyManager, list views.Slice[types.NodeView]) error {
 	nodes := snap.nodes()
-	winners := policyv2.ElectVia(nil, via, nil, func(candidates views.Slice[types.NodeID], incumbent types.NodeID) (types.NodeID, bool) {
+	compiled, _ := pm.ElectViaRoutes(nil, nil, func(candidates views.Slice[types.NodeID], incumbent types.NodeID) (types.NodeID, bool) {
 		return electViaPrimary(nodes, candidates, incumbent)
 	})
 
@@ -828,11 +875,11 @@ func (w *world) auditRoleRoutes(snap *Snapshot, pm *policyv2.PolicyManager, list
 		}
 
 		for _, peer := range list.All() {
-			want := snap.RoutesForPeer(viewer, peer, matchers)
-			got := w.roleRoutesForPeer(prim, sides, via, winners, viewer, peer)
+			want := w.compiledRoutesForPeer(prim, compiled, viewer, peer, matchers)
+			got := snap.RoutesForPeer(viewer, peer)
 
 			if !slices.Equal(want, got) {
-				return fmt.Errorf("%w: node %d through %d: %v, today's %v", errRoleRoutes, viewer.ID(), peer.ID(), got, want)
+				return fmt.Errorf("%w: node %d through %d: %v, the compile's %v", errRoleRoutes, viewer.ID(), peer.ID(), got, want)
 			}
 		}
 	}
@@ -840,20 +887,46 @@ func (w *world) auditRoleRoutes(snap *Snapshot, pm *policyv2.PolicyManager, list
 	return nil
 }
 
-// roleRoutesForPeer is [Snapshot.RoutesForPeer] with route access from the
-// viewer's side set and via steering from the via plan and its winners.
-func (w *world) roleRoutesForPeer(prim primaryRoutes, sides policyv2.Sides, via *policyv2.ViaPlan, winners *policyv2.ViaWinners, viewer, peer types.NodeView) []netip.Prefix {
-	steer := via.Steer(sides, viewer, peer, winners.Primary)
+// CompiledRoutesForPeer is what [Snapshot.RoutesForPeer] gives as the
+// compile decides it: route access by viewer's matchers, via steering by the
+// compile's own scopes elected afresh. It is the oracle the audit and tests
+// hold the served routes against, written apart from them; nothing serves
+// it.
+func (s *Snapshot) CompiledRoutesForPeer(viewer, peer types.NodeView) ([]netip.Prefix, error) {
+	pm, ok := s.Policy().(*policyv2.PolicyManager)
+	if !ok {
+		return nil, errNotV2Policy
+	}
+
+	matchers, err := pm.MatchersForNode(viewer)
+	if err != nil {
+		return nil, err
+	}
+
+	nodes := s.nodes()
+	via, _ := pm.ElectViaRoutes(nil, nil, func(candidates views.Slice[types.NodeID], incumbent types.NodeID) (types.NodeID, bool) {
+		return electViaPrimary(nodes, candidates, incumbent)
+	})
+
+	return s.w.compiledRoutesForPeer(s.s.Get(s.w.primaries), via, viewer, peer, matchers), nil
+}
+
+// compiledRoutesForPeer is [Snapshot.RoutesForPeer] as the compile decides it:
+// route access by viewer's matchers, steering by via, the compile's
+// elections. Written apart from RoutesForPeer, so the audit sees a mistake in
+// either.
+func (w *world) compiledRoutesForPeer(prim primaryRoutes, via *policyv2.ViaRoutes, viewer, peer types.NodeView, matchers []matcher.Match) []netip.Prefix {
+	steer := via.ForPeer(viewer, peer)
 	primaries := slices.Clone(prim.byNode[peer.ID()])
 	candidates := slices.Concat(primaries, peer.ExitRoutes())
 
 	var reduced []netip.Prefix
 
 	if len(steer.Include) == 0 && len(steer.Exclude) == 0 {
-		reduced = sides.RouteAccess(viewer.ID(), candidates)
+		reduced = policy.ReduceRoutes(viewer, candidates, matchers)
 	} else {
 		candidates = slices.DeleteFunc(candidates, func(p netip.Prefix) bool { return slices.Contains(steer.Exclude, p) })
-		reduced = sides.RouteAccess(viewer.ID(), candidates)
+		reduced = policy.ReduceRoutes(viewer, candidates, matchers)
 
 		for _, p := range steer.Include {
 			if !slices.Contains(reduced, p) && (slices.Contains(primaries, p) || !slices.Contains(steer.UsePrimary, p)) {
@@ -1175,7 +1248,9 @@ func sameUserForNodes(a, b types.User) bool {
 // never be mutated in place.
 func (w *world) electPrimaries(s *graph.Snapshot, prev primaryRoutes) primaryRoutes {
 	nodes := s.Get(w.nodes)
-	pm := s.Get(w.policy).pm
+	// Both are read at every election: the via elections are bound to the
+	// sides they steer by, so a commit moving them must rebind.
+	plan, sides := s.Get(w.viaPlan).Plan, s.Get(w.sides)
 
 	var (
 		touched map[netip.Prefix]struct{}
@@ -1188,10 +1263,13 @@ func (w *world) electPrimaries(s *graph.Snapshot, prev primaryRoutes) primaryRou
 		next = newPrimaryRoutes(electPrimaryRoutes(nodes, nil), nodes, prev)
 		next.outages = patchOutages(nil, nodes, groups, next.routes, next.routes)
 	} else {
-		// Only the prefixes a changed router names can elect anew.
+		// Only the prefixes a changed router names can elect anew, and,
+		// for via, the scopes of a plan that moved: it keeps its identity
+		// while its scopes stay.
 		touched = electionPrefixes(prev.from, nodes)
-		if len(touched) == 0 && pm == prev.policy {
+		if len(touched) == 0 && plan == prev.via.Plan() {
 			prev.from = nodes
+			prev.via = prev.via.WithSides(sides)
 
 			return prev
 		}
@@ -1239,30 +1317,21 @@ func (w *world) electPrimaries(s *graph.Snapshot, prev primaryRoutes) primaryRou
 		next.outages = patchOutages(prev.outages, nodes, groups, routes, touched)
 	}
 
-	var via *policyv2.ViaRoutes
+	electRoute := func(candidates views.Slice[types.NodeID], incumbent types.NodeID) (types.NodeID, bool) {
+		return electViaPrimary(nodes, candidates, incumbent)
+	}
 
-	// The seed only survives the pm == nil path: no policy means the last
-	// via binding must be dropped.
-	changed := pm == nil && prev.via != nil
-	if pm != nil {
-		electRoute := func(candidates views.Slice[types.NodeID], incumbent types.NodeID) (types.NodeID, bool) {
-			return electViaPrimary(nodes, candidates, incumbent)
-		}
+	via, changed := policyv2.ElectViaPlan(prev.via, plan, sides, touched, electRoute)
 
-		via, changed = pm.ElectViaRoutes(prev.via, touched, electRoute)
+	// The from-scratch reference for the incremental election above: every
+	// scope of the plan elected afresh must give what the world adopted.
+	// The sides audit holds it against the compile's scopes as well.
+	if policyAudit() {
+		policyAuditRuns.Add(1)
 
-		// The from-scratch reference for the incremental election above:
-		// seeded with the same incumbents, it must agree with what the
-		// world adopted.
-		if policyAudit() {
-			if pmv2, ok := pm.(*policyv2.PolicyManager); ok {
-				policyAuditRuns.Add(1)
-
-				if !pmv2.AuditViaElections(prev.via, via, electRoute) {
-					policyAuditFailures.Add(1)
-					log.Error().Msg("policy audit: via election differs from a full one")
-				}
-			}
+		if !plan.Elects(via, electRoute) {
+			policyAuditFailures.Add(1)
+			log.Error().Msg("policy audit: via election differs from a full one")
 		}
 	}
 
@@ -1270,7 +1339,7 @@ func (w *world) electPrimaries(s *graph.Snapshot, prev primaryRoutes) primaryRou
 		next.gen++
 	}
 
-	next.via, next.policy = via, pm
+	next.via = via
 
 	return next
 }
@@ -1278,8 +1347,9 @@ func (w *world) electPrimaries(s *graph.Snapshot, prev primaryRoutes) primaryRou
 // primaryRoutes holds global and via-scoped elections from the same snapshot.
 type primaryRoutes struct {
 	routes map[netip.Prefix]types.NodeID
-	via    *policyv2.ViaRoutes
-	policy policy.PolicyManager
+	// via holds the via elections, bound to the plan that scopes them and
+	// the sides that steer by them.
+	via *policyv2.ViaRoutes
 	// byNode is routes inverted, each node's prefixes sorted.
 	byNode map[types.NodeID][]netip.Prefix
 	// outages are the prefixes whose primary is unhealthy while no
@@ -2309,8 +2379,74 @@ func (s *Snapshot) ListPeers(id types.NodeID) views.Slice[types.NodeView] {
 	return views.SliceOf(s.gather(s.ListPeerIDs(id)))
 }
 
-// Policy returns the compiled policy.
+// Policy returns the compiled policy. It serves SSH, node capabilities,
+// tag owners, auto-approvers and DERP; packet filters, peers and routes
+// come from [Snapshot.FilterForNode], [Snapshot.PeerView] and
+// [Snapshot.RoutesForPeer].
 func (s *Snapshot) Policy() policy.PolicyManager { return s.s.Get(s.w.policy).pm }
+
+// FilterForNode returns the packet filter of node id: the policy's
+// templates written for it in IP form, with membership from the postings.
+// Callers share one slice until the next commit that moves a policy fact
+// of any node.
+func (s *Snapshot) FilterForNode(id types.NodeID) ([]tailcfg.FilterRule, error) {
+	return s.s.Get(s.w.filters).ForNode(id)
+}
+
+// Filter returns the rules every node's filter is reduced from, before its
+// own autogroup:self and via rules, with their matchers: for debugging and
+// the policy's tests. Matchers are parsed from the rules on each call.
+func (s *Snapshot) Filter() ([]tailcfg.FilterRule, []matcher.Match, error) {
+	rules, err := s.s.Get(s.w.filters).Global()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return rules, matcher.MatchesFromFilterRules(rules), nil
+}
+
+// globalFilterFor returns pm's global filter expanded over the users and
+// nodes of s, which pm must be compiled against: the served one for the
+// compile s holds, else one built from s's membership, which carries over
+// what pm's document shares with the one in force.
+func (s *Snapshot) globalFilterFor(pm policy.PolicyManager) ([]tailcfg.FilterRule, error) {
+	if pm == s.Policy() {
+		return s.s.Get(s.w.filters).Global()
+	}
+
+	pmv2, ok := pm.(*policyv2.PolicyManager)
+	if !ok {
+		return nil, errNotV2Policy
+	}
+
+	holders := func(uid uint) []types.NodeID {
+		ids, _ := s.index().byUserCopy.Groups.Get(uid)
+
+		return ids
+	}
+
+	sel := policyv2.SelectorsFor(s.s.Get(s.w.selectors), pmv2)
+	users := policyv2.NewUserSets(s.s.Get(s.w.userSets), sel, s.s.Get(s.w.policyUsers))
+	roles := s.s.Get(s.w.roles).Update(users, s.nodes(), holders)
+
+	return policyv2.NewFilters(policyv2.BuildTemplates(s.s.Get(s.w.templates), sel), s.s.Get(s.w.postings).Update(roles),
+		s.s.Get(s.w.approvals), s.s.Get(s.w.policyNodes).list).Global()
+}
+
+var errNotV2Policy = errors.New("not a v2 policy")
+
+// globalFilterOf is globalFilterFor for a candidate compiled against s's
+// users and node list.
+func (s *Snapshot) globalFilterOf(pm *policyv2.PolicyManager) ([]tailcfg.FilterRule, error) {
+	return s.globalFilterFor(pm)
+}
+
+// PeerViewAndSideSet is [Snapshot.PeerView] with id's side set:
+// everything that puts it on a side of a rule, which the routes its peers
+// carry for it read. The classes are keyed by it, so one lookup gives both.
+func (s *Snapshot) PeerViewAndSideSet(id types.NodeID) ([]types.NodeID, policyv2.RoleSet) {
+	return s.s.Get(s.w.peers).ViewAndSideSet(id)
+}
 
 // PolicyErr is the error of the latest failed policy compile, or nil when
 // the served policy is current.
@@ -2408,25 +2544,26 @@ func (s *Snapshot) ViaElection() *policyv2.ViaRoutes {
 	return s.s.Get(s.w.primaries).via
 }
 
-// RoutesForPeer returns the routes peer carries in viewer's AllowedIPs:
-// the primary routes it holds and its approved exit routes that viewer's
-// matchers allow, adjusted by via grants. A viewer advertising a prefix
+// RoutesForPeer returns the routes peer carries in viewer's AllowedIPs: the
+// primary routes it holds and its approved exit routes that the policy
+// lets viewer use, adjusted by via grants. A viewer advertising a prefix
 // the peer is primary for always sees it, so HA secondaries know the
-// primary.
-func (s *Snapshot) RoutesForPeer(viewer, peer types.NodeView, matchers []matcher.Match) []netip.Prefix {
+// primary. viewer and peer are views of this snapshot.
+func (s *Snapshot) RoutesForPeer(viewer, peer types.NodeView) []netip.Prefix {
 	via := s.s.Get(s.w.primaries).via.ForPeer(viewer, peer)
+	sides := s.s.Get(s.w.sides)
 	primaries := s.PrimaryRoutesForNode(peer.ID())
 	candidates := slices.Concat(primaries, peer.ExitRoutes())
 
 	var reduced []netip.Prefix
 
 	if len(via.Include) == 0 && len(via.Exclude) == 0 {
-		reduced = policy.ReduceRoutes(viewer, candidates, matchers)
+		reduced = sides.RouteAccess(viewer.ID(), candidates)
 	} else {
 		candidates = slices.DeleteFunc(candidates, func(p netip.Prefix) bool {
 			return slices.Contains(via.Exclude, p)
 		})
-		reduced = policy.ReduceRoutes(viewer, candidates, matchers)
+		reduced = sides.RouteAccess(viewer.ID(), candidates)
 
 		// The via grant is the authorization. Where a regular grant also
 		// covers the prefix, HA election decides: only the primary keeps it.
@@ -2459,8 +2596,9 @@ func (s *Snapshot) RoutesForPeer(viewer, peer types.NodeView, matchers []matcher
 	return reduced
 }
 
-// SelfRoutes returns the routes node carries in its own AllowedIPs: the
-// primary routes the global matchers allow, and its approved exit routes.
+// SelfRoutes returns the routes node carries in its own AllowedIPs: every
+// route it serves, approved and announced, exits included, whatever the
+// policy or the elections say.
 func (s *Snapshot) SelfRoutes(node types.NodeView) []netip.Prefix { return node.AllApprovedRoutes() }
 
 // Revisions report the commit at which a part of the world last changed,
@@ -2469,8 +2607,12 @@ func (s *Snapshot) SelfRoutes(node types.NodeView) []netip.Prefix { return node.
 // Change is what differs between two snapshots, for telling which map
 // sessions an update can reach.
 type Change struct {
-	// Global is set when something every map reads changed: the compiled
-	// policy, the DERP map or the extra DNS records.
+	// Global is set when the change can reach any map: the DERP map or the
+	// extra DNS records changed; commits coalesced over a move of the
+	// policy, the filters, the peers or the elections, or past the node
+	// log; a recompile whose filter changes the compile cannot narrow
+	// ([policyv2.PolicyManager.FilterChangedNodes] says all); or a
+	// recompile while a refused document stands, and the first after.
 	Global bool
 	// Resync means the node edit history was exceeded; consumers must
 	// check retained node state against the current snapshot.
@@ -2513,13 +2655,37 @@ func (s *Snapshot) Since(old *Snapshot) Change {
 		// session renders from the snapshot and sends just its diff, so one
 		// the change never concerned costs a render and sends nothing.
 		// Scoping this needs each commit's derived delta kept and unioned.
-		c.Global = c.Global || c.Resync || s.PolicyRev() != old.PolicyRev() ||
+		//
+		// TODO(capsrc/routing): FiltersRev here is untested until M5/M9:
+		// every input of the filters is a compile input, so it never moves
+		// without PolicyRev and dropping it fails no test. Once the compile
+		// stops recompiling on membership it needs a test that fails
+		// without it.
+		c.Global = c.Global || c.Resync || s.PolicyRev() != old.PolicyRev() || s.FiltersRev() != old.FiltersRev() ||
 			s.PeersRev() != old.PeersRev() || s.PrimariesRev() != old.PrimariesRev()
 		if c.Global {
 			return c
 		}
 	} else {
 		c.Nodes = graph.Changes(old.nodes(), s.nodes())
+	}
+
+	// TODO(capsrc/routing): whose served filter moved is read off the
+	// compile's FilterChangedNodes, which tells the served filters' moves
+	// only while the compile moves with them. It does not under a refused
+	// document, which freezes the compile while the served filters follow
+	// membership: a recompile then, or the first one after, wakes everyone,
+	// as would served filters moving without one (untested until M5/M9, for
+	// the reason above). Routing on postings replaces this.
+	//
+	// Production cannot reach a refused document today: both checks of
+	// State.SetPolicy refuse a document that does not compile, a compile of
+	// an accepted document does not fail on a node or user write, and boot
+	// fails on a stored one that does not compile. Only world tests that
+	// set one directly reach this branch.
+	refused := s.PolicyErr() != nil || old.PolicyErr() != nil
+	if moved := s.PolicyRev() != old.PolicyRev(); moved && refused || !moved && s.FiltersRev() != old.FiltersRev() {
+		c.Global = true
 	}
 
 	if s.PolicyRev() != old.PolicyRev() {
@@ -2617,8 +2783,13 @@ func (s *Snapshot) NodesTouchedSince(v NodesVersion) ([]types.NodeID, bool) {
 }
 
 // PeerPolicyRev is the revision of the latest policy compile that
-// renders nodes as peers differently.
+// renders nodes as peers differently, or of any recompile while a refused
+// document stands, and of the first one after.
 func (s *Snapshot) PeerPolicyRev() uint64 { return graph.ChangedAt(s.s, s.w.peerPolicy) }
+
+// FiltersRev is the revision of the latest change to what packet filters
+// are expanded from.
+func (s *Snapshot) FiltersRev() uint64 { return graph.ChangedAt(s.s, s.w.filters) }
 
 // PolicyRev is the revision of the latest policy compile.
 func (s *Snapshot) PolicyRev() uint64 { return graph.ChangedAt(s.s, s.w.policy) }

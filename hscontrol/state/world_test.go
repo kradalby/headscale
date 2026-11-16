@@ -1888,14 +1888,12 @@ func TestWorldViaPolicyLifecycle(t *testing.T) {
 		t.Helper()
 
 		viewer, _ := snap.GetNode(5)
-		matchers, err := snap.Policy().MatchersForNode(viewer)
-		require.NoError(t, err)
 
 		var ids []types.NodeID
 
 		for _, id := range []types.NodeID{3, 4} {
 			peer, ok := snap.GetNode(id)
-			if ok && slices.Contains(snap.RoutesForPeer(viewer, peer, matchers), route) {
+			if ok && slices.Contains(snap.RoutesForPeer(viewer, peer), route) {
 				ids = append(ids, id)
 			}
 		}
