@@ -8916,7 +8916,7 @@ func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *s
 		propcheck.CheckSSHIntent(t, p.world, intent, id, session.client.ssh, p.cfg.ServerURL)
 	}
 
-	checkStreamNodeInputs(t, p.world, id, session.client, p.cfg.DNSConfig.BaseDomain, p.packetIntent != nil || (p.policy >= 0 && p.policy <= 2), p.attrIntent)
+	checkStreamNodeInputs(t, p.world, id, session.client, p.cfg.DNSConfig.BaseDomain, p.packetIntent != nil || (p.policy >= 0 && p.policy <= 2), streamNodeAttrIntent(t, p.policyDoc, p.attrIntent))
 	checkStreamConnectivityInputs(t, p.world, id, session.client)
 
 	freshHub := NewHub()
@@ -10955,6 +10955,59 @@ func streamPacketIntent(world propcheck.World, kind int, explicit *propcheck.Pac
 	return intent
 }
 
+// Known absence also checks unrelated rich documents; unknown attribute rules stay unmodeled.
+func streamNodeAttrIntent(t require.TestingT, doc []byte, explicit *propcheck.NodeAttrIntent) *propcheck.NodeAttrIntent {
+	if explicit != nil {
+		return explicit
+	}
+
+	if len(doc) > 0 {
+		standard, err := hujson.Standardize(slices.Clone(doc))
+		require.NoError(t, err)
+
+		var fields struct {
+			NodeAttrs           []json.RawMessage `json:"nodeAttrs"`
+			RandomizeClientPort bool              `json:"randomizeClientPort"`
+		}
+
+		require.NoError(t, jsonv2.Unmarshal(standard, &fields, jsonv2.MatchCaseInsensitiveNames(true)))
+
+		if len(fields.NodeAttrs) > 0 || fields.RandomizeClientPort {
+			return nil
+		}
+	}
+
+	return &propcheck.NodeAttrIntent{}
+}
+
+func TestStreamNodeAttrIntentInputs(t *testing.T) {
+	for _, doc := range []string{"", `{}`, `{"nodeAttrs":null}`, `{"nodeAttrs":[]}`, `{"node-attrs":[],"randomize_client-port":false}`, "{ // owned comment\n \"nodeAttrs\": [], }", streamPropertyPolicies[3], streamPropertyPolicies[4], streamPropertyPolicies[6]} {
+		input := []byte(doc)
+		before := slices.Clone(input)
+		intent := streamNodeAttrIntent(t, input, nil)
+		require.NotNil(t, intent)
+		require.Empty(t, intent.Grants)
+		require.Equal(t, before, input, "owned attribute policy bytes")
+
+		// The same checker rejects stale markers even without a packet/simple-policy domain.
+		failure := &streamNodeInputFailure{}
+		require.PanicsWithValue(t, failure, func() {
+			propcheck.CheckNodeAttrIntent(failure, propcheck.World{}, intent, 1, tailcfg.NodeCapMap{"custom:probe": nil}, true)
+		})
+		require.Contains(t, failure.message, "attribute")
+	}
+
+	for _, doc := range []string{streamPropertyPolicies[5], `{"node-attrs":[{"target":["*"],"attr":["custom:probe"]}]}`, `{"randomizeClientPort":true}`, `{"randomize_client-port":true}`} {
+		parsed, err := policyv2.ParsePolicy([]byte(doc))
+		require.NoError(t, err)
+		require.NotNil(t, parsed)
+		require.Nil(t, streamNodeAttrIntent(t, []byte(doc), nil), "unknown attribute input stays unmodeled")
+	}
+
+	explicit := &propcheck.NodeAttrIntent{}
+	require.Same(t, explicit, streamNodeAttrIntent(t, []byte(streamPropertyPolicies[5]), explicit))
+}
+
 // A known SSH-free document means denial even when no generated intent exists.
 // Keep this derived expectation out of metadata so edits preserve original bytes.
 func streamSSHIntent(t require.TestingT, doc []byte, explicit *propcheck.SSHIntent) *propcheck.SSHIntent {
@@ -11976,6 +12029,11 @@ func TestStreamNodeAttrIntentHistory(t *testing.T) {
 				}
 
 				old, oldWorld := p.state.Snapshot(), p.world.Clone()
+
+				p.setPolicy(t, 3)
+				flush()
+				require.Nil(t, p.attrIntent, "unrelated rich policy clears attribute metadata")
+				set(first)
 
 				for _, attrs := range []*propcheck.NodeAttrIntent{second, {}, first} {
 					set(attrs)
@@ -13009,7 +13067,7 @@ func (p *streamPropertySystem) commit(t *rapid.T, last *state.Snapshot, operatio
 	oldIntent := streamPacketIntent(oldWorld, p.policy, p.packetIntent)
 	oldAppIntent := streamAppIntent(t, p.policyDoc, p.appIntent)
 	oldSSHIntent := streamSSHIntent(t, p.policyDoc, p.sshIntent)
-	oldAttrIntent := p.attrIntent
+	oldAttrIntent := streamNodeAttrIntent(t, p.policyDoc, p.attrIntent)
 	oldIdentityAddresses := oldIntent != nil || (p.policy >= 0 && p.policy <= 2)
 	oldDERP := p.effectiveDERP(t)
 	oldNode := old.ListNodes().At(0).ID()

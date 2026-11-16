@@ -984,3 +984,12 @@ The mixed-control history also installs and clears a positive group grant before
 restoring its packet/app/SSH/attribute document, completing every state while an
 owned control lease remains. Generated mixed-control histories include group
 membership replacements through the same input adapter and intent checkers.
+
+Attribute checks also derive known absence from owned policy bytes when explicit
+attribute metadata is missing, including unrelated rich packet/SSH documents.
+The fallback requires both an empty/absent `nodeAttrs` list and a false/absent
+`randomizeClientPort`; it uses the policy schema's case/delimiter folding and
+preserves unknown nonempty attribute rules. Fixed DB/file histories complete
+rich-policy replacement before restoring attributes, and retained maps capture
+the old derived expectation. This checks the four modeled markers, not every
+baseline capability or arbitrary attribute rule.
