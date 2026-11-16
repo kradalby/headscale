@@ -1097,3 +1097,10 @@ policy/DNS no-op zero-wake assertions remain unchanged.
 go test -p 1 ./hscontrol/mapper -run '^(TestRapidStreamSameNodeRequests|TestStreamSameNodeRequestContracts)$' -count=1 -timeout=10m -rapid.seed=2026111621 -rapid.checks=100 -rapid.nofailfile
 CGO_ENABLED=1 go test -race -p 1 ./hscontrol/mapper -run '^(TestRapidStreamSameNodeRequests|TestStreamSameNodeRequestContracts)$' -count=1 -timeout=10m -rapid.seed=2026111622 -rapid.checks=20 -rapid.nofailfile
 ```
+
+The common completed-session check also verifies two fixed configuration inputs:
+`Domain` is the hostname of the fixture's valid server URL, and service collection
+remains disabled. The same check covers generic retained maps; concurrent retained
+maps reuse the completed-session boundary. Literal controls reject missing/wrong
+domains and enabled collection through that exact checker. This adds independent
+expectations for these two fields, not arbitrary debug or startup DNS settings.

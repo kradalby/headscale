@@ -11,6 +11,7 @@ import (
 	"maps"
 	"math/rand/v2"
 	"net/netip"
+	"net/url"
 	"os"
 	"reflect"
 	"runtime"
@@ -8910,6 +8911,7 @@ func (p *streamPropertySystem) check(t *rapid.T, snap *state.Snapshot) {
 // Only this viewer is current; other sessions may legitimately still lag.
 func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *state.Snapshot, session *streamPropertySession) {
 	t.Helper()
+	checkStreamConfigInputs(t, p.cfg.ServerURL, session.client)
 	checkStreamPacketIntent(t, p.world, streamPacketIntent(p.world, p.policy, p.packetIntent), id, session.client, p.sourceProbes...)
 	checkStreamAppIntent(t, p.world, streamAppIntent(t, p.policyDoc, p.appIntent), id, session.client, p.sourceProbes...)
 
@@ -8983,6 +8985,40 @@ func (p *streamPropertySystem) checkSession(t *rapid.T, id types.NodeID, snap *s
 				require.ElementsMatch(t, allowed, wire.AllowedIPs, "independent allowed routes")
 			}
 		}
+	}
+}
+
+// The fixture keeps its valid server URL fixed throughout each history.
+func checkStreamConfigInputs(t require.TestingT, serverURL string, client *propertyClient) {
+	server, err := url.Parse(serverURL)
+	require.NoError(t, err)
+	require.NotEmpty(t, server.Hostname())
+	require.Equal(t, server.Hostname(), client.domain, "configured map domain")
+	require.False(t, client.collectServices, "service collection must remain disabled")
+}
+
+func TestStreamConfigInputContracts(t *testing.T) {
+	const serverURL = "https://control.example.test:8443/control"
+
+	valid := propertyClient{domain: "control.example.test"}
+	checkStreamConfigInputs(t, serverURL, &valid)
+
+	for _, tc := range []struct {
+		name, message string
+		corrupt       func(*propertyClient)
+	}{
+		{"missing-domain", "configured map domain", func(c *propertyClient) { c.domain = "" }},
+		{"wrong-domain", "configured map domain", func(c *propertyClient) { c.domain = "tailnet.example.test" }},
+		{"collect-services", "service collection", func(c *propertyClient) { c.collectServices = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := valid
+			tc.corrupt(&client)
+
+			failure := &streamConnectivityFailure{}
+			require.PanicsWithValue(t, failure, func() { checkStreamConfigInputs(failure, serverURL, &client) })
+			require.Contains(t, failure.message, tc.message)
+		})
 	}
 }
 
@@ -13459,6 +13495,7 @@ func (p *streamPropertySystem) commit(t *rapid.T, last *state.Snapshot, operatio
 		propcheck.CheckSSHIntent(t, oldWorld, oldSSHIntent, oldNode, oldClient.ssh, p.cfg.ServerURL)
 	}
 
+	checkStreamConfigInputs(t, p.cfg.ServerURL, oldClient)
 	checkStreamNodeInputs(t, oldWorld, oldNode, oldClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses, oldAttrIntent)
 	checkStreamConnectivityInputs(t, oldWorld, oldNode, oldClient)
 	oldHub.Close()
@@ -13532,6 +13569,7 @@ func (p *streamPropertySystem) commit(t *rapid.T, last *state.Snapshot, operatio
 		propcheck.CheckSSHIntent(t, oldWorld, oldSSHIntent, oldNode, lateClient.ssh, p.cfg.ServerURL)
 	}
 
+	checkStreamConfigInputs(t, p.cfg.ServerURL, lateClient)
 	checkStreamNodeInputs(t, oldWorld, oldNode, lateClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses, oldAttrIntent)
 	checkStreamConnectivityInputs(t, oldWorld, oldNode, lateClient)
 
