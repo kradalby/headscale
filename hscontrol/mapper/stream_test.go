@@ -10530,6 +10530,7 @@ func TestRouteWakesExitForCapabilitySource(t *testing.T) {
 func checkStreamNodeInputs(t require.TestingT, world propcheck.World, viewer types.NodeID, client *propertyClient, baseDomain string, identityAddresses bool, attrs *propcheck.NodeAttrIntent) {
 	require.NotNil(t, client.self, "viewer %d self", viewer)
 	require.Equal(t, viewer.NodeID(), client.self.ID, "self identity")
+	checkStreamRequestHostinfo(t, world, client)
 
 	if identityAddresses && attrs == nil {
 		// These callers own a simple or packet document with no node attributes.
@@ -12834,7 +12835,6 @@ func (p *streamPropertySystem) concurrentInputDelivery(t *rapid.T, frozenDNS map
 	oldClient := newPropertyClient(&tailcfg.MapResponse{})
 	applyStreamPropertyWire(t, p.hub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, retained)})
 	old.checkSession(t, viewer, before, &streamPropertySession{client: oldClient, capVer: version})
-	checkStreamRequestHostinfo(t, old.world, oldClient)
 	checkStreamDNSInputs(t, frozenDNS[viewer], old.dnsRecords, oldClient)
 
 	write()
@@ -12853,7 +12853,6 @@ func (p *streamPropertySystem) concurrentInputDelivery(t *rapid.T, frozenDNS map
 
 		// Unwoken clients must already contain both final accepted inputs.
 		p.checkSession(t, id, final, p.sessions[id])
-		checkStreamRequestHostinfo(t, p.world, p.sessions[id].client)
 		checkStreamDNSInputs(t, frozenDNS[id], p.dnsRecords, p.sessions[id].client)
 	}
 
@@ -12870,7 +12869,6 @@ func (p *streamPropertySystem) concurrentInputDelivery(t *rapid.T, frozenDNS map
 
 	for _, client := range []*propertyClient{oldClient, lateClient} {
 		old.checkSession(t, viewer, before, &streamPropertySession{client: client, capVer: version})
-		checkStreamRequestHostinfo(t, old.world, client)
 		checkStreamDNSInputs(t, frozenDNS[viewer], old.dnsRecords, client)
 	}
 
@@ -12888,26 +12886,64 @@ func checkStreamRequestHostinfo(t require.TestingT, world propcheck.World, clien
 			continue
 		}
 
-		require.Equal(t, input.Hostinfo.Hostname, wire.Hostinfo.Hostname(), "request Hostname")
-		require.Equal(t, wireJSON(t, input.Hostinfo.Services), wireJSON(t, wire.Hostinfo.Services().AsSlice()), "request Services")
+		if input.Hostinfo == nil {
+			require.False(t, wire.Hostinfo.Valid(), "Hostinfo absent from owned inputs")
+			continue
+		}
 
+		require.True(t, wire.Hostinfo.Valid(), "Hostinfo present in owned inputs")
+		require.Equal(t, input.Hostinfo.Hostname, wire.Hostinfo.Hostname(), "request Hostname")
+
+		services := slices.Clone(input.Hostinfo.Services)
 		if wire.ID != client.self.ID {
+			services = slices.DeleteFunc(services, func(service tailcfg.Service) bool { return service.Proto == tailcfg.PeerAPIDNS })
+
 			require.Equal(t, input.Hostinfo.OS, wire.Hostinfo.OS(), "request peer OS")
 		}
+
+		require.True(t, slices.EqualFunc(services, wire.Hostinfo.Services().AsSlice(), func(a, b tailcfg.Service) bool { return reflect.DeepEqual(a, b) }), "request Services")
 	}
 }
 
 func TestStreamConcurrentRequestContracts(t *testing.T) {
-	hi := &tailcfg.Hostinfo{Hostname: "reported", OS: "linux", Services: []tailcfg.Service{{Proto: "tcp", Port: 443}}}
+	hi := &tailcfg.Hostinfo{Hostname: "reported", OS: "linux", Services: []tailcfg.Service{{Proto: "tcp", Port: 443}, {Proto: tailcfg.PeerAPIDNS, Port: 1}}}
+	peerInfo := hi.Clone()
+	peerInfo.Services = peerInfo.Services[:1]
 	world := propcheck.World{Nodes: map[types.NodeID]*types.Node{1: {Hostinfo: hi.Clone()}, 2: {Hostinfo: hi.Clone()}}}
 	client := newPropertyClient(&tailcfg.MapResponse{
-		Node: &tailcfg.Node{ID: 1, Hostinfo: hi.Clone().View()}, Peers: []*tailcfg.Node{{ID: 2, Hostinfo: hi.Clone().View()}},
+		Node: &tailcfg.Node{ID: 1, Hostinfo: hi.Clone().View()}, Peers: []*tailcfg.Node{{ID: 2, Hostinfo: peerInfo.View()}},
 	})
 	checkStreamRequestHostinfo(t, world, client)
 
+	for _, present := range []bool{false, true} {
+		want, wire := world.Clone(), *client
+		wire.self = client.self.Clone()
+
+		if present {
+			wire.self.Hostinfo = tailcfg.HostinfoView{}
+		} else {
+			want.Nodes[1].Hostinfo = nil
+		}
+
+		failure := &streamConnectivityFailure{}
+		require.PanicsWithValue(t, failure, func() { checkStreamRequestHostinfo(failure, want, &wire) })
+		require.Contains(t, failure.message, "Hostinfo")
+	}
+
+	for _, services := range [][]tailcfg.Service{nil, {}, {{Proto: tailcfg.PeerAPIDNS, Port: 1}}} {
+		inputs, wire := world.Clone(), *client
+		inputs.Nodes[2].Hostinfo.Services = services
+		wire.peers = maps.Clone(client.peers)
+		wire.peers[2] = client.peers[2].Clone()
+		info := peerInfo.Clone()
+		info.Services = nil
+		wire.peers[2].Hostinfo = info.View()
+		checkStreamRequestHostinfo(t, inputs, &wire)
+	}
+
 	for _, field := range []string{"Hostname", "OS", "Services"} {
 		t.Run(field, func(t *testing.T) {
-			corrupt := hi.Clone()
+			corrupt := peerInfo.Clone()
 
 			switch field {
 			case "Hostname":

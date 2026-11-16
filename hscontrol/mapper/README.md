@@ -993,3 +993,10 @@ preserves unknown nonempty attribute rules. Fixed DB/file histories complete
 rich-policy replacement before restoring attributes, and retained maps capture
 the old derived expectation. This checks the four modeled markers, not every
 baseline capability or arbitrary attribute rule.
+
+The input-owned Hostinfo checker runs through the common node-projection boundary,
+so every completed map and common retained-map check compares reported Hostname,
+Services and peer OS. Nil input requires absent wire Hostinfo; nonnil input requires
+it present. Peer services exclude `PeerAPIDNS`, while self services retain it.
+Other Hostinfo fields remain outside this independent checker; endpoint and DERP
+projection retain their separate checks. Concurrent delivery reuses this boundary.
