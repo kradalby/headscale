@@ -9926,86 +9926,8 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 
 		last := p.state.Snapshot()
 		p.check(t, last)
-		commit := func(t *rapid.T) {
-			// Keep an old snapshot and its wire model across writes and
-			// cache advancement; a late renderer must still read it correctly.
-			old := p.state.Snapshot()
-			oldWorld := p.world.Clone()
-			oldIntent := streamPacketIntent(oldWorld, p.policy, p.packetIntent)
-			oldAppIntent := streamAppIntent(t, p.policyDoc, p.appIntent)
-			oldSSHIntent := streamSSHIntent(t, p.policyDoc, p.sshIntent)
-			oldAttrIntent := p.attrIntent
-			oldIdentityAddresses := oldIntent != nil || (p.policy >= 0 && p.policy <= 2)
-			oldDERP := p.effectiveDERP(t)
-			oldNode := old.ListNodes().At(0).ID()
-			oldHub := NewHub()
-			oldMap, err := NewStream(p.cfg, oldHub, oldNode, capVer).r.render(old)
-			require.NoError(t, err)
-
-			oldClient := newPropertyClient(&tailcfg.MapResponse{})
-			applyStreamPropertyWire(t, oldHub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, oldMap)})
-			checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, oldClient, p.sourceProbes...)
-			checkStreamAppIntent(t, oldWorld, oldAppIntent, oldNode, oldClient, p.sourceProbes...)
-
-			if oldSSHIntent != nil {
-				propcheck.CheckSSHIntent(t, oldWorld, oldSSHIntent, oldNode, oldClient.ssh, p.cfg.ServerURL)
-			}
-
-			checkStreamNodeInputs(t, oldWorld, oldNode, oldClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses, oldAttrIntent)
-			checkStreamConnectivityInputs(t, oldWorld, oldNode, oldClient)
-			oldHub.Close()
-
-			for range rapid.IntRange(1, 3).Draw(t, "coalesced-writes") {
-				p.apply(t, p.drawOperation(t, operations...))
-
-				if rapid.Bool().Draw(t, "intermediate-render") {
-					id := rapid.SampledFrom(slices.Sorted(maps.Keys(p.sessions))).Draw(t, "intermediate-viewer")
-
-					session := p.sessions[id]
-					if session.down {
-						p.open(t, id, p.state.Snapshot(), rapid.Bool().Draw(t, "partial-reconnect"))
-					} else {
-						p.update(t, id, p.state.Snapshot(), 0)
-					}
-				}
-			}
-
-			snap := p.state.Snapshot()
-			all, wake := Route(last, snap, snap.Since(last))
-			p.hub.advance(snap)
-
-			for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
-				session := p.sessions[id]
-				if session.down {
-					if rapid.Bool().Draw(t, "reconnect") {
-						p.open(t, id, snap, rapid.Bool().Draw(t, "partial-reconnect"))
-					}
-				} else if _, named := wake[id]; all || named {
-					p.update(t, id, snap, rapid.IntRange(0, 5).Draw(t, "delivery"))
-				}
-			}
-
-			p.check(t, snap)
-			propcheck.CheckWorld(t, oldWorld, old, p.probes)
-			require.Equal(t, oldDERP, old.DERPMap(), "retained DERP snapshot")
-			lateMap, err := NewStream(p.cfg, p.hub, oldNode, capVer).r.render(old)
-			require.NoError(t, err)
-
-			lateClient := newPropertyClient(&tailcfg.MapResponse{})
-			applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, lateMap)})
-			lateClient.check(t, oldClient)
-
-			checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, lateClient, p.sourceProbes...)
-			checkStreamAppIntent(t, oldWorld, oldAppIntent, oldNode, lateClient, p.sourceProbes...)
-
-			if oldSSHIntent != nil {
-				propcheck.CheckSSHIntent(t, oldWorld, oldSSHIntent, oldNode, lateClient.ssh, p.cfg.ServerURL)
-			}
-
-			checkStreamNodeInputs(t, oldWorld, oldNode, lateClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses, oldAttrIntent)
-			checkStreamConnectivityInputs(t, oldWorld, oldNode, lateClient)
-
-			last = snap
+		commit := func(t *rapid.T, required *streamOperation) {
+			last = p.commit(t, last, operations, required)
 		}
 
 		if len(kinds) > 0 {
@@ -10013,26 +9935,35 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 				for _, operation := range []string{"file-stage", "file-reload", "file-same", "file-comment", "invalid-policy", "file-empty", "file-missing", "file-reload", "policy-restore", "file-test-failure", "policy-restore"} {
 					operations = []string{operation}
 
-					commit(t)
+					commit(t, nil)
 				}
 			}
 
 			for _, operation := range mandatory {
 				operations = []string{operation}
 
-				commit(t)
+				commit(t, nil)
+			}
+
+			if control && slices.Contains(kinds, "attrs-clear") {
+				p.mixedControlHistory(t, commit, slices.Contains(kinds, "attrs-mixed"))
 			}
 
 			operations = kinds
 
 			for range rapid.IntRange(1, 8).Draw(t, "packet commits") {
-				commit(t)
+				commit(t, nil)
 			}
 		} else {
-			t.Repeat(map[string]func(*rapid.T){"commit": commit})
+			t.Repeat(map[string]func(*rapid.T){"commit": func(t *rapid.T) { commit(t, nil) }})
 		}
 
 		p.releaseControls(t, last)
+
+		for id, leases := range p.control {
+			require.Empty(t, leases, "unreleased control leases for node %d", id)
+			require.Zero(t, p.world.Nodes[id].ActiveSessions)
+		}
 
 		for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
 			if p.sessions[id].down {
@@ -12654,5 +12585,194 @@ func TestStreamAppAbsenceRejectsStaleCapabilities(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestRapidStreamMixedControl(t *testing.T) {
+	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
+		t.Run(string(mode), func(t *testing.T) {
+			t.Run("literal", func(t *testing.T) {
+				runRapidStreamSystem(t, mode, "connect", "attrs-clear", "noop")
+			})
+			t.Run("generated", func(t *testing.T) {
+				runRapidStreamSystem(t, mode,
+					"connect", "connect-request", "disconnect", "stale-connect", "zero-connect", "missing-connect",
+					"public-expiry", "utc-expiry", "invalid-expiry", "missing-expiry", "health", "endpoints", "request-hostinfo",
+					"attrs-mixed", "attrs-clear", "packet-policy", "packet-deny", "app-policy", "app-deny", "ssh-policy", "ssh-deny",
+					"policy-order", "policy-duplicate", "policy-restore", "invalid-policy", "dns", "derp", "derp-policy", "noop")
+			})
+		})
+	}
+}
+
+// commit retains the previous input and wire views across one delivered transaction.
+func (p *streamPropertySystem) commit(t *rapid.T, last *state.Snapshot, operations []string, required *streamOperation) *state.Snapshot {
+	// Keep an old snapshot and its wire model across writes and
+	// cache advancement; a late renderer must still read it correctly.
+	old := p.state.Snapshot()
+	oldWorld := p.world.Clone()
+	oldIntent := streamPacketIntent(oldWorld, p.policy, p.packetIntent)
+	oldAppIntent := streamAppIntent(t, p.policyDoc, p.appIntent)
+	oldSSHIntent := streamSSHIntent(t, p.policyDoc, p.sshIntent)
+	oldAttrIntent := p.attrIntent
+	oldIdentityAddresses := oldIntent != nil || (p.policy >= 0 && p.policy <= 2)
+	oldDERP := p.effectiveDERP(t)
+	oldNode := old.ListNodes().At(0).ID()
+	oldHub := NewHub()
+	oldMap, err := NewStream(p.cfg, oldHub, oldNode, capVer).r.render(old)
+	require.NoError(t, err)
+
+	oldClient := newPropertyClient(&tailcfg.MapResponse{})
+	applyStreamPropertyWire(t, oldHub, oldClient, []*tailcfg.MapResponse{fullResponse(p.cfg, oldMap)})
+	checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, oldClient, p.sourceProbes...)
+	checkStreamAppIntent(t, oldWorld, oldAppIntent, oldNode, oldClient, p.sourceProbes...)
+
+	if oldSSHIntent != nil {
+		propcheck.CheckSSHIntent(t, oldWorld, oldSSHIntent, oldNode, oldClient.ssh, p.cfg.ServerURL)
+	}
+
+	checkStreamNodeInputs(t, oldWorld, oldNode, oldClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses, oldAttrIntent)
+	checkStreamConnectivityInputs(t, oldWorld, oldNode, oldClient)
+	oldHub.Close()
+
+	writes := 1
+	if required == nil {
+		writes = rapid.IntRange(1, 3).Draw(t, "coalesced-writes")
+	}
+
+	for range writes {
+		op := required
+		if op == nil {
+			op = new(p.drawOperation(t, operations...))
+		}
+
+		p.apply(t, *op)
+
+		if rapid.Bool().Draw(t, "intermediate-render") {
+			id := rapid.SampledFrom(slices.Sorted(maps.Keys(p.sessions))).Draw(t, "intermediate-viewer")
+
+			session := p.sessions[id]
+			if session.down {
+				p.open(t, id, p.state.Snapshot(), rapid.Bool().Draw(t, "partial-reconnect"))
+			} else {
+				p.update(t, id, p.state.Snapshot(), 0)
+			}
+		}
+	}
+
+	snap := p.state.Snapshot()
+	all, wake := Route(last, snap, snap.Since(last))
+	p.hub.advance(snap)
+
+	for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+		session := p.sessions[id]
+		if session.down {
+			if rapid.Bool().Draw(t, "reconnect") {
+				p.open(t, id, snap, rapid.Bool().Draw(t, "partial-reconnect"))
+			}
+		} else if _, named := wake[id]; all || named {
+			p.update(t, id, snap, rapid.IntRange(0, 5).Draw(t, "delivery"))
+		}
+	}
+
+	p.check(t, snap)
+	// Required states must complete before replacement, after unwoken
+	// clients have been checked so reconnect cannot conceal a missed wake.
+	if required != nil {
+		for _, id := range slices.Sorted(maps.Keys(p.sessions)) {
+			if p.sessions[id].down {
+				p.open(t, id, snap, false)
+			}
+		}
+
+		p.check(t, snap)
+	}
+
+	propcheck.CheckWorld(t, oldWorld, old, p.probes)
+	require.Equal(t, oldDERP, old.DERPMap(), "retained DERP snapshot")
+	lateMap, err := NewStream(p.cfg, p.hub, oldNode, capVer).r.render(old)
+	require.NoError(t, err)
+
+	lateClient := newPropertyClient(&tailcfg.MapResponse{})
+	applyStreamPropertyWire(t, p.hub, lateClient, []*tailcfg.MapResponse{fullResponse(p.cfg, lateMap)})
+	lateClient.check(t, oldClient)
+
+	checkStreamPacketIntent(t, oldWorld, oldIntent, oldNode, lateClient, p.sourceProbes...)
+	checkStreamAppIntent(t, oldWorld, oldAppIntent, oldNode, lateClient, p.sourceProbes...)
+
+	if oldSSHIntent != nil {
+		propcheck.CheckSSHIntent(t, oldWorld, oldSSHIntent, oldNode, lateClient.ssh, p.cfg.ServerURL)
+	}
+
+	checkStreamNodeInputs(t, oldWorld, oldNode, lateClient, p.cfg.DNSConfig.BaseDomain, oldIdentityAddresses, oldAttrIntent)
+	checkStreamConnectivityInputs(t, oldWorld, oldNode, lateClient)
+
+	return snap
+}
+
+// mixedControlHistory composes required inputs; the shared commit owns delivery and checks.
+func (p *streamPropertySystem) mixedControlHistory(t *rapid.T, commit func(*rapid.T, *streamOperation), generated bool) {
+	// Coalesced releases can drain the earlier admissions entirely.
+	commit(t, new(p.drawOperation(t, "connect")))
+
+	owned := 0
+	for _, leases := range p.control {
+		owned += len(leases)
+	}
+
+	require.Positive(t, owned, "mixed policy requires an acquired control lease")
+
+	packet := &propcheck.PacketIntent{Grants: []propcheck.PacketGrant{{
+		Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"}, Protocol: ipproto.TCP, First: 22, Last: 22,
+	}}}
+	app := &propcheck.AppIntent{Grants: []propcheck.AppGrant{{
+		Src: propcheck.PacketSelector{User: "u1"}, Dst: propcheck.PacketSelector{User: "u2"},
+		Caps: tailcfg.PeerCapMap{"example.com/cap/roles": {`{"role":"read"}`}},
+	}}}
+	ssh := &propcheck.SSHIntent{Grants: []propcheck.SSHGrant{{
+		Src: propcheck.PacketSelector{User: "u1"}, DstTag: "tag:srv", Check: true, Users: []string{"alice"},
+	}}}
+	attrs := &propcheck.NodeAttrIntent{Grants: []propcheck.NodeAttrGrant{{
+		Target: propcheck.PacketSelector{User: "u1"}, Attrs: []nodecap.Cap{"custom:probe", nodecap.RandomizeClientPort},
+	}}}
+	mixed := streamOperation{
+		kind: "attrs-mixed", policy: -1, intent: packet, appIntent: app, sshIntent: ssh, attrIntent: attrs,
+		doc: attrs.AppendDocument(t, ssh.AppendDocument(t, app.Document(t, packet))),
+	}
+	require.True(t, packet.Allows(p.world, 1, 2, *p.world.Nodes[1].IPv4, *p.world.Nodes[2].IPv4, 22, ipproto.TCP))
+	require.NotEmpty(t, app.Capabilities(p.world, 1, 2, *p.world.Nodes[1].IPv4, *p.world.Nodes[2].IPv4))
+	require.Equal(t, "check", ssh.Decision(p.world, 1, 3, "alice"))
+	require.Contains(t, attrs.Capabilities(p.world, 1), nodecap.Cap("custom:probe"))
+	commit(t, &mixed)
+
+	for _, kind := range []string{"health", "request-hostinfo", "public-expiry", "utc-expiry", "stale-connect", "zero-connect", "missing-connect", "invalid-expiry", "missing-expiry", "invalid-policy"} {
+		commit(t, new(p.drawOperation(t, kind)))
+	}
+
+	if p.cfg.Policy.Mode == types.PolicyModeFile {
+		for _, kind := range []string{"file-same", "file-comment", "file-empty", "file-reload", "file-missing", "file-reload", "file-test-failure", "file-reload"} {
+			commit(t, new(p.drawOperation(t, kind)))
+		}
+	}
+
+	cleared := p.drawOperation(t, "attrs-clear")
+	// Explicit empty metadata keeps all four denial checks active.
+	cleared.appIntent, cleared.sshIntent = &propcheck.AppIntent{}, &propcheck.SSHIntent{}
+	if p.cfg.Policy.Mode == types.PolicyModeFile {
+		staged := cleared
+		staged.kind = "file-stage"
+		commit(t, &staged)
+		require.Same(t, app, p.appIntent, "staging must retain active mixed intent")
+		cleared = p.drawOperation(t, "file-reload")
+	}
+
+	commit(t, &cleared)
+
+	mixed.kind = "policy-restore"
+	commit(t, &mixed)
+	t.Log("completed mixed/clear/restore with an owned control lease")
+
+	if generated {
+		commit(t, new(p.drawOperation(t, "attrs-mixed")))
 	}
 }

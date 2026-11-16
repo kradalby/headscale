@@ -668,7 +668,7 @@ and unchanged fields from owned World inputs. First admission and final release
 validate SessionStart and LastSeen against their measured API call intervals,
 then adopt only those timestamps. Stale/zero keys and missing nodes refuse
 without publication. Direct graph online, key, identity, deletion, addition and
-expiry edits are rejected while the ledger is active; endpoint/Hostinfo,
+expiry edits are rejected while the ledger is active; endpoint/Hostinfo, health,
 policy, DNS and DERP histories still compose. This restriction prevents direct
 count edits or deleted leases from masquerading as supported transport events.
 
@@ -693,16 +693,51 @@ lost or stale offline timestamps and wrong self overrides.
 
 `TestStreamControlSessionHistory` guarantees overlapping sessions, release of
 the newer epoch before the older final release, final offline state, expired
-admission, expiry clear/restore while connected, refusal cases and two-router
-failover. All Route-selected consumers complete each phase, and unwoken clients
+admission, expiry clear/restore while connected, an unhealthy input before the
+final release, refusal cases and two-router failover. All Route-selected consumers
+complete each phase, and unwoken clients
 are checked before reconnect. The existing independent route reference remains
 authoritative: when no router is available, an approving incumbent remains the
 global fallback. Expired/offline does not imply route withdrawal. Both backends
 retain old World/snapshots and re-render them after each transition.
 
+`TestRapidStreamMixedControl` bridges public leases and all four intent models
+through the same commit body in both DB and policy-file modes. Its `literal`
+case installs one document with positive packet, app, SSH and node-attribute
+witnesses, completes a clear, then restores that exact accepted document. The
+clear carries explicit empty intent for all four checks. File mode also stages
+the clear without publishing, then reloads it. Public Hostinfo, expiry and
+refusal operations, graph-input health, and file refusal/reload operations run
+while mixed intent remains installed. These phases hold nodes and users fixed.
+
+The existing mandatory control batches can drain every lease: acquisition and
+release phases each draw 1–3 operations. The mixed sequence therefore acquires
+one additional lease and asserts a positive owned count before installation;
+none of its required mixed phases releases a lease. Every required state uses
+the existing Route-selected delivery and checks unwoken clients before fully
+reconnecting down clients. Thus a partial delivery cannot erase a clear before
+restore, and forced completion cannot conceal a missed Route wake. Final
+draining asserts empty owned ledgers and zero active counts.
+
+The separate `generated` case additionally installs `attrs-mixed` while leases
+remain held, then samples rich replacements, clear/deny, reorder/duplicate,
+historical restore, public control/expiry/refusals, health, Hostinfo, endpoints,
+DNS and DERP. All existing metadata, World/election, intent, retained-snapshot,
+Hub JSON/zstd, pinned replay and history checks remain active. Generated policy
+audits can stop before downstream checks; the literal case supplies distinct
+positive evidence and does not replace or suppress those diagnostics.
+
+Explicit-kind histories, including both mixed cases, run mandatory phases plus
+1–8 generated commits, each containing 1–3 writes. `-rapid.steps` controls only
+the default `TestRapidStreamSystem` history through `t.Repeat`; it does not
+extend these selected-family histories. This bounded composition adds no
+general linearizability, arbitrary lifecycle, or user-edit claim.
+
 ```sh
 go test -p 1 ./hscontrol/mapper -run '^(TestStreamConnectivityInputContracts|TestStreamConnectivityRejectsCorruptions|TestStreamControlSessionHistory)$' -count=1 -timeout=10m -rapid.seed=2026111613 -rapid.checks=20 -rapid.nofailfile
 go test -p 1 ./hscontrol/mapper -run '^TestRapidStreamControlSessions$' -count=1 -timeout=10m -rapid.seed=2026111612 -rapid.checks=20 -rapid.nofailfile
+go test -p 1 ./hscontrol/mapper -run '^TestRapidStreamMixedControl$/.*/^literal$' -count=1 -timeout=10m -rapid.seed=2026111644 -rapid.checks=5 -rapid.nofailfile
+go test -p 1 ./hscontrol/mapper -run '^TestRapidStreamMixedControl$/.*/^generated$' -count=1 -timeout=10m -rapid.seed=2026111642 -rapid.checks=5 -rapid.nofailfile
 ```
 
 The generated file campaign can expose the existing DERP score-clear diagnostic
