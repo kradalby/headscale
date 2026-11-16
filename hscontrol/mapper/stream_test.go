@@ -9168,7 +9168,7 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 
 	operations := kinds
 	if len(operations) == 0 {
-		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "group-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "ssh-policy", "ssh-deny", "ssh-mixed", "attrs-policy", "attrs-clear", "attrs-mixed", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request", "invalid-policy"}
+		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "group-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "ssh-policy", "ssh-deny", "ssh-mixed", "attrs-policy", "attrs-clear", "attrs-mixed", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "request-hostinfo", "request-collision", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request", "invalid-policy"}
 		if len(ids) > 3 {
 			operations = append(operations, "delete")
 		}
@@ -9426,19 +9426,19 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 		if op == "stale-request" {
 			result.request.NodeKey = key.NodePublic{}
 		}
-	case "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "request-routes", "missing-request":
+	case "request-hostinfo", "request-collision", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "request-routes", "missing-request":
 		result.request = tailcfg.MapRequest{
 			NodeKey: n.NodeKey, DiscoKey: n.DiscoKey,
 			Endpoints: slices.Clone(n.Endpoints), Hostinfo: n.Hostinfo.Clone(),
 		}
 		hi := result.request.Hostinfo
 		// Direct graph inputs can leave Hostinfo.Hostname unlike Node.Hostname.
-		// Public reports use the node label, avoiding unmodeled graph-name collisions.
+		// Reports retain the node label unless this operation changes it.
 		hi.Hostname = n.Hostname
 
 		switch op {
 		case "request-hostinfo":
-			// Per-ID labels cannot collide with another generated node's names.
+			// Exercise per-ID labels alongside the explicit shared-name operation.
 			hi.Hostname = fmt.Sprintf("request-%d-%d", id, rapid.IntRange(0, 3).Draw(t, "request-name"))
 			hi.OS = rapid.SampledFrom([]string{"linux", "windows", "android", ""}).Draw(t, "request-os")
 
@@ -9448,6 +9448,16 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 			}
 
 			hi.RequestTags = slices.Clone(rapid.SampledFrom([][]string{nil, {"tag:srv"}, {"tag:router", "tag:srv"}}).Draw(t, "requested-tags"))
+		case "request-collision":
+			holder := p.world.Nodes[rapid.SampledFrom(ids).Draw(t, "name-holder")]
+
+			names := []string{holder.GivenName, holder.Hostname, "laptop", "desktop", ""}
+			names = slices.DeleteFunc(names, func(name string) bool { return len(name) > 32 })
+
+			hi.Hostname = rapid.SampledFrom(names).Draw(t, "collision-name")
+			if rapid.Bool().Draw(t, "name-case") {
+				hi.Hostname = strings.ToUpper(hi.Hostname)
+			}
 		case "request-netinfo":
 			hi.NetInfo = &tailcfg.NetInfo{PreferredDERP: tailcfg.DERPRegionID(rapid.IntRange(0, 2).Draw(t, "request-derp"))}
 		case "request-omit-netinfo":
@@ -9578,7 +9588,7 @@ func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 	case "missing-request":
 		require.ErrorIs(t, p.state.UpdateNodeFromMapRequest(op.node.ID, op.request), state.ErrNodeNotInNodeStore)
 		require.Equal(t, before.Rev(), p.state.Snapshot().Rev(), "missing node published")
-	case "request", "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "request-routes":
+	case "request", "request-hostinfo", "request-collision", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "request-routes":
 		p.inputRequest(t, op)
 	default:
 		p.put(t, op.node)
@@ -9611,8 +9621,58 @@ func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 	p.checkCausal(t, before, after, op)
 }
 
+// streamRequestGivenName models short ASCII labels; all occupied names come from inputs.
+func streamRequestGivenName(world propcheck.World, node *types.Node, hostname string) string {
+	if hostname == "" || hostname == node.Hostname {
+		return node.GivenName
+	}
+
+	base := strings.ToLower(node.Hostname)
+	automatic := node.GivenName == base
+	// At most 255 node lifetimes can occupy a collision chain in this domain.
+	for suffix := 1; !automatic && suffix <= int(maxStreamPropertyNodeID); suffix++ {
+		automatic = node.GivenName == fmt.Sprintf("%s-%d", base, suffix)
+	}
+
+	if !automatic || strings.ToLower(hostname) == node.GivenName {
+		return node.GivenName
+	}
+
+	return world.Name(node.ID, strings.ToLower(hostname))
+}
+
+func TestStreamRequestGivenName(t *testing.T) {
+	world := propcheck.World{Nodes: map[types.NodeID]*types.Node{
+		1: {ID: 1, Hostname: "old", GivenName: "old-2"},
+		2: {ID: 2, GivenName: "Laptop", IsOnline: new(false)},
+		3: {ID: 3, GivenName: "LAPTOP-1", Tags: []string{"tag:srv"}, Expiry: new(propertyEpoch)},
+	}}
+
+	for _, tc := range []struct {
+		name, oldHost, given, reported, want string
+	}{
+		{"case-folded chain", "old", "old", "LAPTOP", "laptop-2"},
+		{"automatic suffix follows", "old", "old-2", "laptop", "laptop-2"},
+		{"self does not occupy", "old", "old-2", "old-2", "old-2"},
+		{"repeat keeps suffix", "old", "old-2", "old", "old-2"},
+		{"empty keeps suffix", "old", "old-2", "", "old-2"},
+		{"custom preserved", "old", "custom", "laptop", "custom"},
+		{"padded suffix custom", "old", "old-02", "laptop", "old-02"},
+		{"repeated hyphen custom", "old", "old--2", "laptop", "old--2"},
+		{"upper hostname automatic", "OLD", "old-2", "desktop", "desktop"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := world.Nodes[1].Clone()
+			node.Hostname, node.GivenName = tc.oldHost, tc.given
+			before := world.Clone()
+			require.Equal(t, tc.want, streamRequestGivenName(world, node, tc.reported))
+			require.Equal(t, before, world, "name reference owns no mutable output")
+		})
+	}
+}
+
 // inputRequest predicts the supported report domain before calling State.
-// Latency jitter, colliding/unsanitized names and policy auto-approval are outside it.
+// Latency jitter, general hostname sanitation and policy auto-approval are outside it.
 func (p *streamPropertySystem) inputRequest(t *rapid.T, op streamOperation) {
 	before, oldWorld := p.state.Snapshot(), p.world.Clone()
 	n := op.before.Clone()
@@ -9637,11 +9697,9 @@ func (p *streamPropertySystem) inputRequest(t *rapid.T, op streamOperation) {
 		}
 
 		changed = changed || !reflect.DeepEqual(n.Hostinfo, hi)
-		if hi.Hostname != "" {
-			if n.GivenName == n.Hostname {
-				n.GivenName = hi.Hostname
-			}
 
+		n.GivenName = streamRequestGivenName(p.world, n, hi.Hostname)
+		if hi.Hostname != "" {
 			n.Hostname = hi.Hostname
 		}
 
@@ -10119,7 +10177,7 @@ func TestRapidStreamOperationContracts(t *testing.T) {
 		{"endpoints", "hostinfo", "dns", "derp", "noop", "revert"},
 		{"derp", "derp-policy", "derp-noop", "derp-restore", "policy-restore"},
 		{"request", "stale-request", "invalid-policy"},
-		{"request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request"},
+		{"request-hostinfo", "request-collision", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request"},
 		{"generated-policy", "policy-order", "policy-duplicate", "policy-restore"},
 	} {
 		t.Run(kinds[0], func(t *testing.T) {
@@ -11105,10 +11163,39 @@ func TestStreamMapRequestHistory(t *testing.T) {
 				}
 
 				p.setPolicy(t, 0)
+				// Every phase completes so a later rename cannot conceal a stale name.
+				for _, phase := range []struct {
+					id              types.NodeID
+					hostname, given string
+				}{
+					{1, "laptop", "laptop"},
+					{2, "LAPTOP", "laptop-1"},
+					{3, "laptop", "laptop-2"},
+					{1, "desktop", "desktop"},
+					{2, "LAPTOP", "laptop-1"},
+					{2, "", "laptop-1"},
+					{2, "other", "other"},
+					{2, "laptop", "laptop"},
+					{3, "other", "other"},
+					{3, "laptop", "laptop-1"},
+					{1, "LAPTOP", "laptop-2"},
+					{1, "desktop", "desktop"},
+				} {
+					n := p.world.Nodes[phase.id].Clone()
+					hi := n.Hostinfo.Clone()
+					hi.Hostname = phase.hostname
+					t.Logf("name node %d hostname %q want %q", phase.id, phase.hostname, phase.given)
+					p.apply(t, streamOperation{kind: "request-collision", node: n, before: n.Clone(), request: tailcfg.MapRequest{
+						NodeKey: n.NodeKey, DiscoKey: n.DiscoKey, Endpoints: slices.Clone(n.Endpoints), Hostinfo: hi,
+					}})
+					require.Equal(t, phase.given, p.world.Nodes[phase.id].GivenName, "literal name transition")
+					flush(true)
+				}
+
 				// Seed existing approval provenance; the public reports below must
 				// preserve manual approval and revoke withdrawn automatic approval.
 				router := p.world.Nodes[3].Clone()
-				router.GivenName = "custom-router"
+				router.GivenName = "Custom-Router"
 				router.Hostinfo.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("10.1.0.0/24")}
 				router.ApprovedRoutes = slices.Clone(router.Hostinfo.RoutableIPs)
 				router.AutoApprovedRoutes = slices.Clone(router.Hostinfo.RoutableIPs[1:])
@@ -11136,11 +11223,13 @@ func TestStreamMapRequestHistory(t *testing.T) {
 				}
 
 				for _, id := range []types.NodeID{1, 3} {
-					for _, phase := range []string{"report", "same", "nil", "omit-netinfo", "derp-two", "derp-clear", "empty-name", "withdraw", "reannounce", "withdraw-again"} {
+					for _, phase := range []string{"collision", "report", "same", "nil", "omit-netinfo", "derp-two", "derp-clear", "empty-name", "withdraw", "reannounce", "withdraw-again"} {
 						n := p.world.Nodes[id].Clone()
 						hi := n.Hostinfo.Clone()
 
 						switch phase {
+						case "collision":
+							hi.Hostname = "CUSTOM-ROUTER"
 						case "report":
 							hi.Hostname = fmt.Sprintf("request-%d-0", id)
 							hi.OS = "windows"
@@ -11167,13 +11256,13 @@ func TestStreamMapRequestHistory(t *testing.T) {
 						p.apply(t, streamOperation{kind: "request-hostinfo", node: n, before: n.Clone(), request: tailcfg.MapRequest{
 							NodeKey: n.NodeKey, DiscoKey: n.DiscoKey, Endpoints: slices.Clone(n.Endpoints), Hostinfo: hi,
 						}})
-						flush(phase == "report" || phase == "derp-clear" || phase == "withdraw" || phase == "reannounce" || phase == "withdraw-again")
+						flush(slices.Contains([]string{"collision", "report", "derp-clear", "withdraw", "reannounce", "withdraw-again"}, phase))
 					}
 				}
 
 				require.Equal(t, "request-1-0", p.world.Nodes[1].GivenName)
 				require.Empty(t, p.world.Nodes[1].Tags, "requested tags do not grant ownership")
-				require.Equal(t, "custom-router", p.world.Nodes[3].GivenName)
+				require.Equal(t, "Custom-Router", p.world.Nodes[3].GivenName)
 				require.Equal(t, types.Strings{"tag:a", "tag:srv", "tag:router"}, p.world.Nodes[3].Tags)
 				require.Equal(t, types.Prefixes{netip.MustParsePrefix("10.0.0.0/24")}, p.world.Nodes[3].ApprovedRoutes)
 				require.Empty(t, p.world.Nodes[3].AutoApprovedRoutes)
@@ -11188,7 +11277,7 @@ func TestStreamMapRequestHistory(t *testing.T) {
 					p.setPolicy(t, rapid.IntRange(0, 1).Draw(t, "request policy"))
 
 					for range rapid.IntRange(1, 3).Draw(t, "request coalesced writes") {
-						p.apply(t, p.drawOperation(t, "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-nil", "request-same", "request-routes", "stale-request", "missing-request"))
+						p.apply(t, p.drawOperation(t, "request-hostinfo", "request-collision", "request-netinfo", "request-omit-netinfo", "request-nil", "request-same", "request-routes", "stale-request", "missing-request"))
 					}
 
 					flush(false)

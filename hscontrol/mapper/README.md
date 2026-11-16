@@ -368,11 +368,17 @@ Route failures.
 
 The input reference preserves stored Hostinfo on omission and stored NetInfo
 when only NetInfo is omitted. Explicit NetInfo replaces it, including DERP 0.
-Supported nonempty hostnames are short DNS-safe per-node labels: automatic
-GivenName follows them, custom names stay unchanged, and empty reported names
-preserve Node.Hostname/GivenName. Generated reports use the current Node.Hostname
+Supported nonempty hostnames are short ASCII DNS-safe labels, including case
+variants and collisions. Generated collision reports are at most 32 bytes, leaving
+room for suffixes without length trimming. `streamRequestGivenName` recognizes the lowercase old
+hostname and canonical positive suffixes through 255, then uses the existing
+input-owned `World.Name` scan to choose the first free case-insensitive label.
+All nodes occupy names regardless of user, tags, online state or expiry. Custom
+names stay unchanged; empty reported names preserve Node.Hostname/GivenName.
+Only a changed hostname can rederive a name, and only a changed GivenName needs
+allocation. Repeating a report does not reclaim a newly freed base. Generated reports use the current Node.Hostname
 unless explicitly changing it; older direct-graph Hostinfo operations can leave
-the two hostname fields inconsistent and do not define collision-free requests. Reported RequestTags never grant effective tags
+the two hostname fields inconsistent. Reported RequestTags never grant effective tags
 or change ownership. Identical reports change only measured LastSeen, without
 advancing the independently predicted substantive-report sequence.
 
@@ -396,13 +402,28 @@ ownership, approval provenance and health. The focused operation subset
 `TestRapidStreamOperationContracts/request-hostinfo` reuses the same generator
 and adapter under the existing policy fixtures.
 
-This domain excludes DERP latency jitter, arbitrary hostname sanitation and
-collisions, route duplicates, general auto-approver policy evaluation, tag claim
+Mandatory name phases allocate `laptop`, `laptop-1` and `laptop-2`, release the
+base, repeat and omit a hostname without reclaiming it, rename an automatic
+suffix again, and reuse freed base/suffix names. Every phase completes delivery;
+custom router reports also target an occupied name. Generated `request-collision`
+operations draw current owned names, hostnames, shared labels, case variants and
+empty reports through the same public adapter, including the broad default list.
+`TestStreamRequestGivenName` anchors the reference with literal case-folded
+holders, offline/expired/tagged occupancy, automatic suffixes and custom controls.
+World and retained snapshot checks cover complete records and exposed indexes;
+subsequent allocation/reuse exercises the private name index behaviorally.
+Existing downstream projection checks compare owned names with every completed
+consumer, including unwoken clients, through Hub JSON/zstd and pinned replay.
+
+This domain excludes DERP latency jitter, general Unicode/punctuation sanitation,
+maximum-length trimming, reserved DNS/challenge labels, registration/admin rename,
+route duplicates, general auto-approver policy evaluation, tag claim
 authorization, persistence failure/retry and concurrent request ordering. The
 existing State tests cover additional normalization cases. It does not change
 the enabled broad-domain wire or policy diagnostics.
 
 ```sh
+go test -p 1 ./hscontrol/mapper -run '^TestStreamRequestGivenName$' -count=1
 go test -p 1 ./hscontrol/mapper -run '^TestStreamMapRequestHistory$' -count=1 -rapid.seed=2026111571 -rapid.checks=30 -rapid.nofailfile
 go test -p 1 ./hscontrol/mapper -run '^TestRapidStreamOperationContracts$/^request-hostinfo$' -count=1 -rapid.seed=2026111572 -rapid.checks=100 -rapid.nofailfile
 CGO_ENABLED=1 go test -race -p 1 ./hscontrol/mapper -run '^TestStreamMapRequestHistory$' -count=1 -rapid.seed=2026111573 -rapid.checks=10 -rapid.nofailfile
