@@ -459,6 +459,75 @@ type AppIntent struct {
 	Grants []AppGrant
 }
 
+// GroupPolicy emits one group grant and independent concrete-user expectations.
+// Members are bare usernames in the bounded World domain, not general aliases.
+// Their order and duplicates survive in the document but not the expected set.
+// Packet selectors are replaced by members; only protocol and ports are used.
+func GroupPolicy(t require.TestingT, sources, destinations []string, packet PacketGrant, caps tailcfg.PeerCapMap) ([]byte, *PacketIntent, *AppIntent) {
+	require.Contains(t, []ipproto.Proto{ipproto.TCP, ipproto.UDP}, packet.Protocol)
+	require.LessOrEqual(t, packet.First, packet.Last)
+
+	groups := map[string][]string{}
+
+	for name, members := range map[string][]string{"group:source": sources, "group:destination": destinations} {
+		aliases := make([]string, len(members))
+		for i, member := range members {
+			aliases[i] = member + "@"
+		}
+
+		groups[name] = aliases
+	}
+
+	ownedCaps := make(tailcfg.PeerCapMap, len(caps))
+	for key, values := range caps {
+		ownedCaps[key] = slices.Clone(values)
+	}
+
+	protocol := "tcp"
+	if packet.Protocol == ipproto.UDP {
+		protocol = "udp"
+	}
+
+	doc := policyJSON(t, map[string]any{
+		"groups": groups,
+		"grants": []any{map[string]any{
+			"src": []string{"group:source"}, "dst": []string{"group:destination"},
+			"ip": []string{fmt.Sprintf("%s:%d-%d", protocol, packet.First, packet.Last)}, "app": ownedCaps,
+		}},
+	})
+	ports, app := &PacketIntent{}, &AppIntent{}
+
+	for _, source := range slices.Compact(slices.Sorted(slices.Values(sources))) {
+		for _, destination := range slices.Compact(slices.Sorted(slices.Values(destinations))) {
+			grant := packet
+			grant.Src, grant.Dst = PacketSelector{User: source}, PacketSelector{User: destination}
+			ports.Grants = append(ports.Grants, grant)
+			app.Grants = append(app.Grants, AppGrant{Src: grant.Src, Dst: grant.Dst, Caps: ownedCaps})
+		}
+	}
+
+	return doc, ports, app
+}
+
+// DrawGroupPolicy includes empty, reordered and repeated username members.
+func DrawGroupPolicy(t *rapid.T, m World) ([]byte, *PacketIntent, *AppIntent) {
+	users := make([]string, 0, len(m.Users))
+	for _, user := range m.Users {
+		users = append(users, user.Name)
+	}
+
+	sources := rapid.SliceOfN(rapid.SampledFrom(users), 0, 4).Draw(t, "source members")
+	destinations := rapid.SliceOfN(rapid.SampledFrom(users), 0, 4).Draw(t, "destination members")
+	packet := PacketGrant{
+		Protocol: rapid.SampledFrom([]ipproto.Proto{ipproto.TCP, ipproto.UDP}).Draw(t, "group protocol"),
+		First:    rapid.SampledFrom(packetPortStarts).Draw(t, "group first port"),
+	}
+	packet.Last = packet.First + rapid.Uint16Range(0, min(packetMaxPortWidth, 65535-packet.First)).Draw(t, "group port width")
+	caps := drawAppCapabilities(t)
+
+	return GroupPolicy(t, sources, destinations, packet, caps)
+}
+
 // Document composes independent packet and app inputs in one policy document.
 // An explicit empty packet intent proves app-only grants open no TCP/UDP ports.
 func (a *AppIntent) Document(t require.TestingT, packet *PacketIntent) []byte {
@@ -522,30 +591,34 @@ func DrawAppIntent(t *rapid.T, m World) *AppIntent {
 	}
 
 	for i := range a.Grants {
-		caps := tailcfg.PeerCapMap{}
-
-		for _, key := range rapid.SliceOfNDistinct(rapid.SampledFrom([]peercap.Cap{
-			"example.com/cap/read", "example.com/cap/write", "example.com/cap/audit",
-		}), 1, 3, func(key peercap.Cap) peercap.Cap { return key }).Draw(t, "app keys") {
-			var values []tailcfg.RawMessage
-
-			if rapid.Bool().Draw(t, "app nonnil values") {
-				values = make([]tailcfg.RawMessage, 0, 3)
-				for range rapid.IntRange(0, 3).Draw(t, "app values") {
-					values = append(values, tailcfg.RawMessage(policyJSON(t, map[string]any{
-						"role":  rapid.SampledFrom([]string{"read", "write", "audit"}).Draw(t, "app role"),
-						"level": rapid.IntRange(0, 2).Draw(t, "app level"),
-					})))
-				}
-			}
-
-			caps[key] = values
-		}
-
-		a.Grants[i].Caps = caps
+		a.Grants[i].Caps = drawAppCapabilities(t)
 	}
 
 	return a
+}
+
+func drawAppCapabilities(t *rapid.T) tailcfg.PeerCapMap {
+	caps := tailcfg.PeerCapMap{}
+
+	for _, key := range rapid.SliceOfNDistinct(rapid.SampledFrom([]peercap.Cap{
+		"example.com/cap/read", "example.com/cap/write", "example.com/cap/audit",
+	}), 1, 3, func(key peercap.Cap) peercap.Cap { return key }).Draw(t, "app keys") {
+		var values []tailcfg.RawMessage
+
+		if rapid.Bool().Draw(t, "app nonnil values") {
+			values = make([]tailcfg.RawMessage, 0, 3)
+			for range rapid.IntRange(0, 3).Draw(t, "app values") {
+				values = append(values, tailcfg.RawMessage(policyJSON(t, map[string]any{
+					"role":  rapid.SampledFrom([]string{"read", "write", "audit"}).Draw(t, "app role"),
+					"level": rapid.IntRange(0, 2).Draw(t, "app level"),
+				})))
+			}
+		}
+
+		caps[key] = values
+	}
+
+	return caps
 }
 
 // Capabilities scans only owned input grants and World identities. Missing keys

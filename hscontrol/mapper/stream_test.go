@@ -9168,7 +9168,7 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 
 	operations := kinds
 	if len(operations) == 0 {
-		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "ssh-policy", "ssh-deny", "ssh-mixed", "attrs-policy", "attrs-clear", "attrs-mixed", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request", "invalid-policy"}
+		operations = []string{"endpoints", "hostinfo", "keys", "expiry", "online", "identity", "routes", "health", "policy", "generated-policy", "group-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "ssh-policy", "ssh-deny", "ssh-mixed", "attrs-policy", "attrs-clear", "attrs-mixed", "policy-order", "policy-duplicate", "policy-restore", "user", "dns", "derp", "derp-policy", "derp-noop", "derp-restore", "noop", "revert", "request", "request-hostinfo", "request-netinfo", "request-omit-netinfo", "request-same", "request-nil", "stale-request", "missing-request", "invalid-policy"}
 		if len(ids) > 3 {
 			operations = append(operations, "delete")
 		}
@@ -9286,6 +9286,9 @@ func (p *streamPropertySystem) drawOperation(t *rapid.T, kinds ...string) stream
 		result.doc = []byte(streamPropertyPolicies[result.policy])
 	case "generated-policy":
 		result.policy, result.doc = -1, propcheck.DrawPolicy(t)
+	case "group-policy":
+		result.policy = -1
+		result.doc, result.intent, result.appIntent = propcheck.DrawGroupPolicy(t, p.world)
 	case "packet-policy":
 		result.intent = propcheck.DrawPacketIntent(t, p.world)
 		result.policy, result.doc = -1, result.intent.Document(t)
@@ -9523,7 +9526,7 @@ func (p *streamPropertySystem) apply(t *rapid.T, op streamOperation) {
 		p.inputControl(t, op)
 	case "public-expiry", "utc-expiry", "invalid-expiry", "missing-expiry":
 		p.inputExpiry(t, op)
-	case "policy", "generated-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "ssh-policy", "ssh-deny", "ssh-mixed", "attrs-policy", "attrs-clear", "attrs-mixed", "policy-order", "policy-duplicate", "policy-restore", "derp-policy", "file-stage", "file-reload", "file-same", "file-comment", "file-empty", "file-missing", "file-test-failure":
+	case "policy", "generated-policy", "group-policy", "packet-policy", "packet-deny", "app-policy", "app-deny", "mixed-policy", "ssh-policy", "ssh-deny", "ssh-mixed", "attrs-policy", "attrs-clear", "attrs-mixed", "policy-order", "policy-duplicate", "policy-restore", "derp-policy", "file-stage", "file-reload", "file-same", "file-comment", "file-empty", "file-missing", "file-test-failure":
 		p.inputPolicy(t, op)
 	case "invalid-policy":
 		op.doc, op.reject = []byte(`{"grants":`), true
@@ -11267,7 +11270,7 @@ func checkStreamAppIntent(t require.TestingT, world propcheck.World, intent *pro
 func TestRapidStreamAppIntent(t *testing.T) {
 	for _, mode := range []types.PolicyMode{types.PolicyModeDB, types.PolicyModeFile} {
 		t.Run(string(mode), func(t *testing.T) {
-			runRapidStreamSystem(t, mode, "app-policy", "mixed-policy", "app-deny", "policy-order", "policy-duplicate", "policy-restore", "identity", "user", "request-hostinfo", "derp-policy", "noop")
+			runRapidStreamSystem(t, mode, "app-policy", "group-policy", "mixed-policy", "app-deny", "policy-order", "policy-duplicate", "policy-restore", "identity", "user", "request-hostinfo", "derp-policy", "noop")
 		})
 	}
 }
@@ -11386,6 +11389,63 @@ func TestStreamAppIntentHistory(t *testing.T) {
 				flush()
 				require.Same(t, first, p.appIntent)
 
+				groupDoc, groupPacket, groupApp := propcheck.GroupPolicy(t, []string{"u1"}, []string{"u2"}, mixed.Grants[0], first.Grants[0].Caps)
+				setGroup := func(doc []byte, ports *propcheck.PacketIntent, app *propcheck.AppIntent) {
+					p.apply(t, streamOperation{kind: "group-policy", policy: -1, doc: doc, intent: ports, appIntent: app})
+					flush()
+				}
+				setGroup(groupDoc, groupPacket, groupApp)
+
+				groupOld, groupWorld := p.state.Snapshot(), p.world.Clone()
+				groupSaved := p.policies[len(p.policies)-1]
+
+				for _, members := range [][2][]string{
+					{{"u1", "u3"}, {"u2", "u3"}},
+					{{"u3", "u1", "u3"}, {"u3", "u2", "u2"}},
+					{{"u3"}, {"u2"}},
+					{nil, {"u2"}},
+					{{"u1"}, {"u2"}},
+					{{"u1"}, {"u3"}},
+					{{"u1"}, nil},
+					{{"u1"}, {"u2"}},
+				} {
+					doc, ports, app := propcheck.GroupPolicy(t, members[0], members[1], mixed.Grants[0], first.Grants[0].Caps)
+					setGroup(doc, ports, app)
+				}
+
+				for _, id := range []types.NodeID{1, 2} {
+					before := p.world.Nodes[id].Clone()
+					tagged := before.Clone()
+					tagged.Tags = []string{"tag:srv"}
+					p.apply(t, streamOperation{kind: "identity", before: before, node: tagged})
+					flush()
+					p.apply(t, streamOperation{kind: "identity", before: tagged, node: before})
+					flush()
+				}
+
+				for range rapid.IntRange(1, 4).Draw(t, "group replacements") {
+					p.apply(t, p.drawOperation(t, "group-policy"))
+					flush()
+				}
+
+				setGroup(groupDoc, groupPacket, groupApp)
+
+				clearDoc, clearPacket, clearApp := propcheck.GroupPolicy(t, nil, []string{"u2"}, mixed.Grants[0], first.Grants[0].Caps)
+				if mode == types.PolicyModeFile {
+					p.apply(t, streamOperation{kind: "file-stage", policy: -1, doc: clearDoc, intent: clearPacket, appIntent: clearApp})
+					flush()
+					require.Equal(t, groupDoc, p.policyDoc, "staging keeps active membership")
+					p.apply(t, p.drawOperation(t, "file-reload"))
+					flush()
+				} else {
+					setGroup(clearDoc, clearPacket, clearApp)
+				}
+
+				p.policies = []streamPropertyPolicy{groupSaved}
+				p.apply(t, p.drawOperation(t, "policy-restore"))
+				flush()
+				require.Equal(t, groupDoc, p.policyDoc, "restore keeps raw groups")
+				require.Same(t, groupApp, p.appIntent)
 				// Every selected source belongs to the retained first-eight pool.
 				// Complete user/tag revocation before changing to raw-address controls.
 				for _, id := range []types.NodeID{1, 3} {
@@ -11418,6 +11478,15 @@ func TestStreamAppIntentHistory(t *testing.T) {
 
 					set(&propcheck.AppIntent{}, packet)
 				}
+
+				// Resolve the retained group against its old World after live sources are deleted.
+				groupLate, err := NewStream(p.cfg, p.hub, 2, capVer).r.render(groupOld)
+				require.NoError(t, err)
+
+				groupClient := newPropertyClient(&tailcfg.MapResponse{})
+				applyStreamPropertyWire(t, p.hub, groupClient, []*tailcfg.MapResponse{fullResponse(p.cfg, groupLate)})
+				checkStreamAppIntent(t, groupWorld, groupApp, 2, groupClient, p.sourceProbes...)
+				checkStreamPacketIntent(t, groupWorld, groupPacket, 2, groupClient, p.sourceProbes...)
 
 				late, err := NewStream(p.cfg, p.hub, 2, capVer).r.render(old)
 				require.NoError(t, err)

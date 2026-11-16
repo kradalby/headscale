@@ -863,3 +863,57 @@ an app policy with simple or packet-only policy still checks capability revocati
 Fixed DB/file histories complete those replacements before restoring app grants.
 Literal live/retired IPv4/IPv6 controls prove the same checker rejects stale
 capability-only rules that packet permission and identical-render comparisons accept.
+
+## Input-owned group membership
+
+`propcheck.GroupPolicy` emits a group-based packet/app grant and independently
+expands unique bare username members into `PacketIntent` and `AppIntent`.
+The actual `src` and `dst` reference `group:source` and `group:destination`;
+raw member order and duplicate entries remain in the document. Empty membership
+serializes as `[]`, never `null`. A document contract pins these fields so the
+subject cannot accidentally become a concrete-user policy. PacketGrant selectors
+are replaced by the member lists; only its TCP/UDP protocol and ports are used.
+Capability maps and ordered value slices are owned copies. Duplicate members
+select an IP set and do not multiply capability payloads; repeated payload values
+inside the original grant remain repeated.
+
+`Group.resolve` unions current Username resolution (`policy/v2/types.go`), which
+excludes tagged creators. Expectations use existing World username selectors,
+not that resolver or the compiled policy. Retained expectations preserve their
+original member names and are evaluated against their supplied old/current World.
+`TestIncrementalPolicyRapidGroupIntent` reuses the manager history and checks
+incremental, fresh and retained managers. Fixed phases include a positive u1 to
+u2 witness, source revoke/clear/restore, destination replacement/clear, member
+permutation/duplication, tagged creator exclusion and username rename/restore.
+`TestGroupIntentRejectsStaleAndDuplicateRules` feeds old actual rules to the same
+packet/app checkers after source or destination membership is revoked. A doubled
+actual rule list must also fail the app-value check, with positive controls.
+
+`group-policy` uses `DrawGroupPolicy` in the shared operation generator and broad
+stream history. It draws zero to four members per group from current World
+usernames, the existing TCP/UDP port islands and custom capability value domain.
+A private capability-value generator is shared with `DrawAppIntent`; group draws
+do not require live nodes or consume unrelated app witnesses/selectors/grants.
+`TestGroupPolicyGenerationWithoutNodes` pins that boundary.
+`TestStreamAppIntentHistory` composes fixed group phases and generated group
+replacements through both DB-mode `State.SetPolicy` and file-mode
+`State.ReloadPolicy`, actual Hub JSON/zstd encoding, client replay and retained
+late maps. Its existing flush completes destination 2 before restoration, checks
+unwoken clients, and retains partial/reconnect schedules for other sessions.
+Staged file bytes retain old active membership until reload; historical restore
+recovers the original group document and intent.
+
+The existing broad driver and `TestRapidStreamAppIntent` both include
+`group-policy`. Their other phases can encounter known diagnostics before a
+generated group operation; the fixed app history keeps group coverage reachable
+independently. No audit or known diagnostic is disabled. Existing
+`policy-order`/`policy-duplicate` with explicit AppIntent
+reconstructs concrete-user grants and retains unrelated group fields: those
+operations do not claim to permute group members. Explicit fixed group documents
+supply the membership equivalence cases.
+
+This adds only bare usernames in the existing bounded World domain. Arbitrary
+aliases, recursive groups, hosts, autogroups, email/OIDC resolution and transport
+remain outside these independent expectations; unknown rich aliases retain the
+existing compiler/fresh-render boundary. This is sampled semantic evidence,
+not a production performance claim.
