@@ -922,7 +922,11 @@ replacements through both DB-mode `State.SetPolicy` and file-mode
 late maps. Its existing flush completes destination 2 before restoration, checks
 unwoken clients, and retains partial/reconnect schedules for other sessions.
 Staged file bytes retain old active membership until reload; historical restore
-recovers the original group document and intent.
+recovers the original group document and intent. A separate live group member is
+then added and deleted without changing those bytes; destination 2 completes the
+revocation before the history moves on. Its two addresses remain explicit probes
+for this fixed witness even when its ID is beyond the generated first-eight pool.
+Existing concrete user/tag deletion and retained old-group checks remain.
 
 The existing broad driver and `TestRapidStreamAppIntent` both include
 `group-policy`. Their other phases can encounter known diagnostics before a

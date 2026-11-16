@@ -11541,6 +11541,21 @@ func TestStreamAppIntentHistory(t *testing.T) {
 				flush()
 				require.Equal(t, groupDoc, p.policyDoc, "restore keeps raw groups")
 				require.Same(t, groupApp, p.appIntent)
+
+				// Delete a live group member without replacing the group document.
+				member := p.drawNode(t, p.lastNodeID+1)
+				member.User, member.UserID = p.world.Users[0].Clone(), new(p.world.Users[0].ID)
+				p.apply(t, streamOperation{kind: "add", node: member})
+				flush()
+				require.True(t, groupPacket.Allows(p.world, member.ID, 2, *member.IPv4, *p.world.Nodes[2].IPv4, 22, ipproto.TCP))
+				require.NotEmpty(t, groupApp.Capabilities(p.world, member.ID, 2, *member.IPv4, *p.world.Nodes[2].IPv4))
+				p.apply(t, streamOperation{kind: "delete", node: member})
+				flush()
+				require.Equal(t, groupDoc, p.policyDoc, "deletion keeps the active group document")
+				// This fixed witness can be lifetime 9, beyond the generated first-eight pool.
+				checkStreamPacketIntent(t, p.world, groupPacket, 2, p.sessions[2].client, *member.IPv4, *member.IPv6)
+				checkStreamAppIntent(t, p.world, groupApp, 2, p.sessions[2].client, *member.IPv4, *member.IPv6)
+
 				// Every selected source belongs to the retained first-eight pool.
 				// Complete user/tag revocation before changing to raw-address controls.
 				for _, id := range []types.NodeID{1, 3} {
