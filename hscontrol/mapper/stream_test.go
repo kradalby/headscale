@@ -9867,6 +9867,25 @@ func TestRapidStreamPolicyFiles(t *testing.T) {
 func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) {
 	t.Helper()
 
+	initial := "packet-policy"
+	mandatory := []string{"policy-order", "policy-duplicate", "packet-deny", "policy-restore", "packet-policy", "identity"}
+
+	for _, family := range []struct {
+		kind       string
+		operations []string
+	}{
+		{"app-policy", []string{"app-deny", "policy-restore", "mixed-policy", "app-policy", "identity", "policy-order", "policy-duplicate"}},
+		{"ssh-policy", []string{"ssh-deny", "policy-restore", "ssh-policy", "identity", "policy-order", "policy-duplicate", "ssh-mixed"}},
+		{"attrs-policy", []string{"attrs-clear", "policy-restore", "attrs-policy", "identity", "policy-order", "policy-duplicate", "attrs-mixed"}},
+		{"connect", []string{"connect", "connect-request", "public-expiry", "disconnect", "stale-connect", "zero-connect", "missing-connect", "invalid-expiry", "utc-expiry", "missing-expiry"}},
+	} {
+		if slices.Contains(kinds, family.kind) {
+			initial, mandatory = family.kind, family.operations
+		}
+	}
+
+	control := slices.Contains(kinds, "connect")
+
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
 	rapid.Check(t, func(t *rapid.T) {
 		operations := kinds
@@ -9874,25 +9893,11 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 
 		p := newStreamPropertySystem(t, mode)
 
-		control := slices.Contains(kinds, "connect")
 		if control {
 			p.enableControl(t)
 		}
 
 		if len(kinds) > 0 {
-			initial := "packet-policy"
-			if slices.Contains(kinds, "app-policy") {
-				initial = "app-policy"
-			}
-
-			if slices.Contains(kinds, "ssh-policy") {
-				initial = "ssh-policy"
-			}
-
-			if slices.Contains(kinds, "attrs-policy") {
-				initial = "attrs-policy"
-			}
-
 			if control {
 				p.setPolicy(t, 0)
 			} else {
@@ -9999,23 +10004,6 @@ func runRapidStreamSystem(t *testing.T, mode types.PolicyMode, kinds ...string) 
 
 					commit(t)
 				}
-			}
-
-			mandatory := []string{"policy-order", "policy-duplicate", "packet-deny", "policy-restore", "packet-policy", "identity"}
-			if slices.Contains(kinds, "app-policy") {
-				mandatory = []string{"app-deny", "policy-restore", "mixed-policy", "app-policy", "identity", "policy-order", "policy-duplicate"}
-			}
-
-			if slices.Contains(kinds, "ssh-policy") {
-				mandatory = []string{"ssh-deny", "policy-restore", "ssh-policy", "identity", "policy-order", "policy-duplicate", "ssh-mixed"}
-			}
-
-			if slices.Contains(kinds, "attrs-policy") {
-				mandatory = []string{"attrs-clear", "policy-restore", "attrs-policy", "identity", "policy-order", "policy-duplicate", "attrs-mixed"}
-			}
-
-			if control {
-				mandatory = []string{"connect", "connect-request", "public-expiry", "disconnect", "stale-connect", "zero-connect", "missing-connect", "invalid-expiry", "utc-expiry", "missing-expiry"}
 			}
 
 			for _, operation := range mandatory {
