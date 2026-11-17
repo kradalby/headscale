@@ -765,17 +765,20 @@ func TestWorldServedFilterFollowsMembership(t *testing.T) {
 	assert.Equal(t, []string{"100.64.0.1", "100.64.0.9"}, sources(1), "a write no policy reads keeps the filter")
 }
 
-// TestWorldServesMembershipUnderRefusedPolicy pins what the switch to the
-// expanded filters serves while a refused document stands: the served
-// filter follows a join under the last good policy, and since the compile
-// does not, change routing wakes every session at a recompile then and at
-// the first one after; a write no policy reads still wakes nobody new.
+// TestWorldServesMembershipUnderRefusedPolicy pins what is served and
+// routed while a refused document stands: the served filter follows a join
+// under the last good policy while the compile does not, and change
+// routing, which reads what is served, follows it too: the join wakes the
+// nodes whose filter it changed, and the refusal and the first compile
+// after it, which move nothing served, wake nobody.
 func TestWorldServesMembershipUnderRefusedPolicy(t *testing.T) {
 	const good = `{"acls": [{"action": "accept", "src": ["alice@"], "dst": ["alice@:22"]}]}`
 
-	users := []types.User{{ID: 1, Name: "alice"}}
+	users := []types.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
 
-	w, err := newWorld(types.Nodes{worldNode(1, &users[0], "100.64.0.1")}, users, []byte(good), types.DNSView{})
+	// bob's node is in no rule: a change to alice's rules does not reach it.
+	w, err := newWorld(types.Nodes{worldNode(1, &users[0], "100.64.0.1"), worldNode(3, &users[1], "100.64.0.3")},
+		users, []byte(good), types.DNSView{})
 	require.NoError(t, err)
 
 	accepted := w.snapshot()
@@ -785,7 +788,10 @@ func TestWorldServesMembershipUnderRefusedPolicy(t *testing.T) {
 
 	refused := w.snapshot()
 	require.Error(t, refused.PolicyErr())
-	assert.True(t, refused.Since(accepted).Global, "a refusal wakes everyone")
+
+	c := refused.Since(accepted)
+	assert.False(t, c.Global, "a refusal serves nothing new")
+	assert.Empty(t, c.Filters, "a refusal serves nothing new")
 
 	w.PutNode(*worldNode(2, &users[0], "100.64.0.2"))
 
@@ -799,23 +805,29 @@ func TestWorldServesMembershipUnderRefusedPolicy(t *testing.T) {
 
 	frozen, err := joined.Policy().FilterForNode(node1)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"100.64.0.1"}, frozen[0].SrcIPs, "the compile is frozen, so it cannot route the join")
+	assert.Equal(t, []string{"100.64.0.1"}, frozen[0].SrcIPs, "the compile is frozen, and routing does not read it")
 
-	assert.True(t, joined.Since(refused).Global, "a recompile under a refused document wakes everyone")
-	assert.NotEqual(t, refused.PeerPolicyRev(), joined.PeerPolicyRev(), "routed peers render again under a refused document")
+	c = joined.Since(refused)
+	assert.False(t, c.Global, "routing follows what is served")
+	assert.Equal(t, []types.NodeID{1, 2}, c.Filters, "the join reaches the filter it changed")
 
 	_, ok = w.UpdateNode(2, func(n *types.Node) { n.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")} })
 	require.True(t, ok)
 
 	quiet := w.snapshot()
-	assert.False(t, quiet.Since(joined).Global, "a write no policy reads recompiles nothing")
+	c = quiet.Since(joined)
+	assert.False(t, c.Global, "a write no policy reads recompiles nothing")
+	assert.Empty(t, c.Filters, "a write no policy reads recompiles nothing")
 
 	_, err = w.SetPolicy([]byte(good), noCheck)
 	require.NoError(t, err)
 
 	fixed := w.snapshot()
 	require.NoError(t, fixed.PolicyErr())
-	assert.True(t, fixed.Since(quiet).Global, "the first compile after a refusal wakes everyone")
+
+	c = fixed.Since(quiet)
+	assert.False(t, c.Global, "the first compile after a refusal serves what was served")
+	assert.Empty(t, c.Filters, "the first compile after a refusal serves what was served")
 }
 
 // shapeNode is a node of the shapes test: owner (nil for tagged), one or
@@ -979,5 +991,49 @@ func TestWorldFilterShapes(t *testing.T) {
 		})
 	}
 
+	assert.Zero(t, PolicyAuditFailures()-failures, "audit failures")
+}
+
+// TestPolicyAuditLeavesServedFiltersAlone pins that the policy audit
+// observes the served filters as production serves them rather than
+// serving them its own way: a commit cuts no served filter and works out
+// no change, so filters are carried across commits nobody read; a filter
+// read is held to one cut afresh.
+func TestPolicyAuditLeavesServedFiltersAlone(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+
+	failures := PolicyAuditFailures()
+
+	users := []types.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}, {ID: 3, Name: "carol"}}
+	alice, carol := &users[0], &users[2]
+
+	w, err := newWorld(types.Nodes{
+		worldNode(1, alice, "100.64.0.1"),
+		worldNode(2, alice, "100.64.0.2"),
+		worldNode(3, carol, "100.64.0.3"),
+	}, users, []byte(filterCostPolicy), types.DNSView{})
+	require.NoError(t, err)
+
+	for _, id := range []types.NodeID{1, 2, 3} {
+		_, err := w.snapshot().FilterForNode(id)
+		require.NoError(t, err)
+	}
+
+	audits, cuts := FilterAuditRuns(), FilterCuts()
+
+	w.PutNode(*worldNode(4, carol, "100.64.0.4"))
+	w.PutNode(*worldNode(5, alice, "100.64.0.5"))
+
+	require.Equal(t, audits+2, FilterAuditRuns(), "test sanity: both joins were audited")
+	assert.Equal(t, cuts, FilterCuts(), "the audit cut no filter at the commits")
+
+	served := ServedAuditRuns()
+
+	for _, id := range []types.NodeID{1, 2, 3, 4, 5} {
+		_, err := w.snapshot().FilterForNode(id)
+		require.NoError(t, err)
+	}
+
+	assert.Equal(t, served+5, ServedAuditRuns(), "every filter read was held to a fresh cut")
 	assert.Zero(t, PolicyAuditFailures()-failures, "audit failures")
 }

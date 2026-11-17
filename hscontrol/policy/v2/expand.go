@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
 	"reflect"
 	"slices"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/puzpuzpuz/xsync/v4"
@@ -727,8 +729,9 @@ func (x *Expansion) allDstPorts(gt *GrantTemplate, ports []tailcfg.PortRange) []
 // Filters serves packet filters from templates, postings and the approved
 // subnet routes over one node list: the expansion is built on first use and
 // each node's filter once, so it costs the sessions that render, not every
-// commit. A change to any of its inputs makes new Filters, so a cached
-// filter lives until the next commit moving a policy fact of any node.
+// commit. A change to any of its inputs makes new Filters; those made by
+// [FollowFilters] carry over the cached filters [Filters.Changed] says the
+// change cannot reach.
 type Filters struct {
 	t      *Templates
 	posts  Postings
@@ -743,7 +746,39 @@ type Filters struct {
 	byNode     *xsync.Map[types.NodeID, []tailcfg.FilterRule]
 	globalOnce sync.Once
 	global     []tailcfg.FilterRule
+
+	// id names these filters to the ones that follow them. sides, when
+	// hasSides, tells who receives a rule; without them Changed says all.
+	id       uint64
+	sides    Sides
+	hasSides bool
+
+	// prevID names the filters these follow, whose change changeOnce
+	// keeps. from is them, until the change is worked out: then carried
+	// holds what they carried and cut, less what the change reaches (or
+	// nothing, when every node's filter was compared and these cut their
+	// own), and none of their inputs (an older document among them) stays
+	// alive through these.
+	prevID     uint64
+	from       atomic.Pointer[Filters]
+	carried    atomic.Pointer[cutFilters]
+	changeOnce sync.Once
+	change     filterChange
+
+	// fresh is [Filters.Fresh], once asked for.
+	fresh atomic.Pointer[Filters]
 }
+
+// cutFilters are filters cut for some nodes, carried from one Filters to
+// the next: each carries what it was given and what it cut, less what its
+// change reaches, an edit costing what moved.
+type cutFilters = graph.Map[types.NodeID, []tailcfg.FilterRule]
+
+func sameCut(a, b []tailcfg.FilterRule) bool {
+	return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0])
+}
+
+var filtersIDs atomic.Uint64
 
 // NewFilters returns the filters t expands to under posts, with approvals
 // the approved subnet routes of nodes, the node list sorted by ID.
@@ -751,7 +786,54 @@ func NewFilters(t *Templates, posts Postings, approvals SubnetApprovals, nodes v
 	return &Filters{
 		t: t, posts: posts, routes: approvals.Strings(), nodes: nodes,
 		byNode: xsync.NewMap[types.NodeID, []tailcfg.FilterRule](),
+		id:     filtersIDs.Add(1),
 	}
+}
+
+// FollowFilters is [NewFilters] following prev, with sides those of the
+// same commit: a node's filter that [Filters.Changed] says prev and these
+// share is prev's slice, cut no second time.
+func FollowFilters(prev *Filters, t *Templates, posts Postings, approvals SubnetApprovals, nodes views.Slice[types.NodeView], sides Sides) *Filters {
+	f := NewFilters(t, posts, approvals, nodes)
+	f.sides, f.hasSides = sides, true
+
+	if prev != nil {
+		from := prev
+
+		// While prev's change is not worked out, it carries nothing yet:
+		// follow what it would carry from, which a diff to f compares
+		// directly. A run of commits nobody read then keeps one Filters
+		// alive, not each.
+		if p := prev.from.Load(); p != nil {
+			from = p
+		}
+
+		f.prevID = from.id
+		f.from.Store(from)
+	}
+
+	return f
+}
+
+// Uncached returns filters of the same inputs that share nothing with f
+// and carry nothing over: an oracle for whatever f carried over.
+func (f *Filters) Uncached() *Filters {
+	u := NewFilters(f.t, f.posts, SubnetApprovals{}, f.nodes)
+	u.routes = f.routes
+
+	return u
+}
+
+// Fresh is [Filters.Uncached], one instance per f: what audits hold f to,
+// each node cut once however often they ask.
+func (f *Filters) Fresh() *Filters {
+	if u := f.fresh.Load(); u != nil {
+		return u
+	}
+
+	f.fresh.CompareAndSwap(nil, f.Uncached())
+
+	return f.fresh.Load()
 }
 
 func (f *Filters) expansion() (*Expansion, error) {
@@ -783,7 +865,9 @@ func FilterCuts() uint64 { return filterCuts.Load() }
 
 // ForNode returns the packet filter of node id, cut for the list's own
 // view of it, so no caller's view can stand for another snapshot's facts:
-// the same slice for every caller. Concurrent misses keep the first.
+// the same slice for every caller. Concurrent misses keep the first. A
+// filter the filters f follows cut, and that [Filters.Changed] leaves out,
+// is that one.
 func (f *Filters) ForNode(id types.NodeID) ([]tailcfg.FilterRule, error) {
 	if rules, ok := f.byNode.Load(id); ok {
 		return rules, nil
@@ -794,6 +878,19 @@ func (f *Filters) ForNode(id types.NodeID) ([]tailcfg.FilterRule, error) {
 		return nil, fmt.Errorf("%w: %d", errUnlisted, id)
 	}
 
+	if from := f.from.Load(); from != nil {
+		f.Changed(from)
+	}
+
+	if rules, ok := f.carried.Load().Get(id); ok {
+		return rules, nil
+	}
+
+	return f.cut(n)
+}
+
+// cut cuts n's filter and caches it.
+func (f *Filters) cut(n types.NodeView) ([]tailcfg.FilterRule, error) {
 	x, err := f.expansion()
 	if err != nil {
 		return nil, err
@@ -801,7 +898,7 @@ func (f *Filters) ForNode(id types.NodeID) ([]tailcfg.FilterRule, error) {
 
 	filterCuts.Add(1)
 
-	rules, _ := f.byNode.LoadOrStore(id, x.FilterForNode(n))
+	rules, _ := f.byNode.LoadOrStore(n.ID(), x.FilterForNode(n))
 
 	return rules, nil
 }
@@ -816,6 +913,625 @@ func (f *Filters) Global() ([]tailcfg.FilterRule, error) {
 	f.globalOnce.Do(func() { f.global = x.Filter() })
 
 	return f.global, nil
+}
+
+// filterChange is what [Filters.Changed] found. compared reports that
+// every node's filter was compared, so the filters followed hold a cut of
+// every node they did not name.
+type filterChange struct {
+	ids      []types.NodeID
+	all      bool
+	compared bool
+}
+
+// Changed returns, sorted, the nodes whose filter can differ between old
+// and f, or all when it cannot tell: the nodes whose own facts moved; the
+// receivers of every rule whose sources, merge key or capability moved; the
+// nodes whose addresses, or routes, hold an address a destination gained or
+// lost; the owners whose autogroup:self rules moved, by membership or by
+// address; the receivers of every rule merged at a position that moved; the
+// via routers of a via grant that moved; and, when any rule moved, every
+// exit node and subnet router. Across a change of which selectors or grants
+// there are, or without the sides [FollowFilters] gives, it compares every
+// node's filter instead. The change from the filters f follows is worked
+// out once.
+func (f *Filters) Changed(old *Filters) ([]types.NodeID, bool) {
+	switch {
+	case old == f:
+		return nil, false
+	case old == nil:
+		return nil, true
+	case old.id == f.prevID:
+		f.changeOnce.Do(func() {
+			f.change = changedFilters(old, f)
+			if !f.change.all && !f.change.compared {
+				f.carried.Store(carryOver(old, f.change.ids))
+			}
+
+			f.from.Store(nil)
+		})
+
+		return f.change.ids, f.change.all
+	}
+
+	c := changedFilters(old, f)
+
+	return c.ids, c.all
+}
+
+// carryOver returns what old carried and cut, less the nodes moved, sorted:
+// an edit costs the cuts kept and the carried filters dropped.
+func carryOver(old *Filters, moved []types.NodeID) *cutFilters {
+	base := old.carried.Load()
+	if base == nil {
+		base = graph.NewMap[types.NodeID](sameCut, nil)
+	}
+
+	isMoved := func(id types.NodeID) bool {
+		_, found := slices.BinarySearch(moved, id)
+
+		return found
+	}
+
+	e := base.Edit()
+
+	old.byNode.Range(func(id types.NodeID, rules []tailcfg.FilterRule) bool {
+		if !isMoved(id) {
+			e.Set(id, rules)
+		}
+
+		return true
+	})
+
+	if base.Len() > 0 {
+		for _, id := range moved {
+			e.Delete(id)
+		}
+	}
+
+	return e.Done()
+}
+
+// sourcesByAddress reports whether receiver is sent gt's sources as
+// addresses, so that who they resolve to reaches its filter. In IP form
+// every pair is.
+func sourcesByAddress(*GrantTemplate, types.NodeID) bool { return true }
+
+// filterRoute collects what moved between two filters, and whom it reaches.
+type filterRoute struct {
+	o, n   *Filters
+	xo, xn *Expansion
+
+	out map[types.NodeID]struct{}
+	// moved are the nodes whose own facts moved; delta, by identity
+	// selector, the addresses its resolution gained or lost; lits the
+	// address selectors whose literal moved.
+	moved []types.NodeID
+	delta map[SelectorID][]netip.Addr
+	lits  map[SelectorID]bool
+	// touched is set once a rule moved: every exit node carries it, and
+	// every subnet router is named unless narrow.
+	touched bool
+	narrow  bool
+}
+
+func changedFilters(o, n *Filters) filterChange { return routeFilters(o, n, false) }
+
+// routeFilters is [Filters.Changed]'s diff. Narrow leaves out the subnet
+// routers no moved rule reaches by its destinations: what routing would
+// name were the cover and address indexes trusted, which a test holds to a
+// fresh comparison.
+func routeFilters(o, n *Filters, narrow bool) filterChange {
+	all := filterChange{all: true}
+
+	xo, err := o.expansion()
+	if err != nil {
+		return all
+	}
+
+	xn, err := n.expansion()
+	if err != nil {
+		return all
+	}
+
+	// Grants that are not the same grants, position for position, cannot
+	// be compared rule by rule: where merged rules sit moves with them.
+	if !o.hasSides || !n.hasSides || o.t.table() != n.t.table() || len(o.t.grants) != len(n.t.grants) {
+		return compareFilters(o, n)
+	}
+
+	r := &filterRoute{o: o, n: n, xo: xo, xn: xn, out: map[types.NodeID]struct{}{}, narrow: narrow}
+	r.movedNodes()
+	r.resolutions()
+
+	for g := range n.t.grants {
+		r.grant(g)
+	}
+
+	r.anchors()
+
+	if r.touched {
+		r.holders(atomExit)
+
+		// A router's filter follows the nodes inside its routes through the
+		// cover and address indexes; a stale one admits traffic into its
+		// subnets, so a moved rule recuts every router rather than trust
+		// them.
+		if !r.narrow {
+			r.routers()
+		}
+	}
+
+	return namesAll(slices.Sorted(maps.Keys(r.out)), n.nodes)
+}
+
+// namesAll returns ids as a change, all when they name every node of list:
+// telling every session costs less than naming each.
+func namesAll(ids []types.NodeID, list views.Slice[types.NodeView]) filterChange {
+	if len(ids) < list.Len() {
+		return filterChange{ids: ids}
+	}
+
+	for _, n := range list.All() {
+		if _, found := slices.BinarySearch(ids, n.ID()); !found {
+			return filterChange{ids: ids}
+		}
+	}
+
+	return filterChange{all: true}
+}
+
+// compareFilters returns the nodes whose filter differs at the two ends:
+// what o holds, cut or carried, against n's cut, which n keeps for the
+// sessions that read it next. A node o holds none for was served none from
+// o, so it is named and cut at neither end. A document edit that changes
+// which selectors or grants there are pays a cut per node o holds.
+func compareFilters(o, n *Filters) filterChange {
+	var ids []types.NodeID
+
+	for _, id := range listIDs(o.nodes, n.nodes) {
+		was, held := o.held(id)
+		nv, listed := n.node(id)
+
+		if !held || !listed {
+			ids = append(ids, id)
+
+			continue
+		}
+
+		is, err := n.cut(nv)
+		if err != nil || !reflect.DeepEqual(was, is) {
+			ids = append(ids, id)
+		}
+	}
+
+	c := namesAll(ids, n.nodes)
+	c.compared = true
+
+	return c
+}
+
+// held returns the filter f holds for id, cut or carried, cutting none.
+func (f *Filters) held(id types.NodeID) ([]tailcfg.FilterRule, bool) {
+	if rules, ok := f.byNode.Load(id); ok {
+		return rules, true
+	}
+
+	return f.carried.Load().Get(id)
+}
+
+// listIDs returns, sorted, the IDs in either sorted list.
+func listIDs(a, b views.Slice[types.NodeView]) []types.NodeID {
+	out := make([]types.NodeID, 0, max(a.Len(), b.Len()))
+
+	for i, j := 0, 0; i < a.Len() || j < b.Len(); {
+		switch {
+		case j == b.Len() || i < a.Len() && a.At(i).ID() < b.At(j).ID():
+			out = append(out, a.At(i).ID())
+			i++
+		case i == a.Len() || b.At(j).ID() < a.At(i).ID():
+			out = append(out, b.At(j).ID())
+			j++
+		default:
+			out = append(out, a.At(i).ID())
+			i++
+			j++
+		}
+	}
+
+	return out
+}
+
+func (r *filterRoute) add(ids ...types.NodeID) {
+	for _, id := range ids {
+		r.out[id] = struct{}{}
+	}
+}
+
+// sides returns the sides of both ends.
+func (r *filterRoute) sides() [2]Sides { return [2]Sides{r.o.sides, r.n.sides} }
+
+// holders adds the nodes holding atom a at either end.
+func (r *filterRoute) holders(a Role) {
+	for _, s := range r.sides() {
+		r.add(s.Holders(a)...)
+	}
+}
+
+// routers adds every node serving a subnet route at either end.
+func (r *filterRoute) routers() {
+	for _, s := range r.sides() {
+		for _, ids := range s.routers.Groups.All() {
+			r.add(ids...)
+		}
+	}
+}
+
+// movedNodes adds the nodes that joined, left, or changed a fact the
+// policy reads between the two node lists.
+func (r *filterRoute) movedNodes() {
+	a, b := r.o.nodes, r.n.nodes
+
+	for i, j := 0, 0; i < a.Len() || j < b.Len(); {
+		switch {
+		case j == b.Len() || i < a.Len() && a.At(i).ID() < b.At(j).ID():
+			r.moved = append(r.moved, a.At(i).ID())
+			i++
+		case i == a.Len() || b.At(j).ID() < a.At(i).ID():
+			r.moved = append(r.moved, b.At(j).ID())
+			j++
+		default:
+			if va, vb := a.At(i), b.At(j); va != vb && va.HasPolicyChange(vb) {
+				r.moved = append(r.moved, va.ID())
+			}
+
+			i++
+			j++
+		}
+	}
+
+	r.add(r.moved...)
+}
+
+// resolutions records which selectors resolve otherwise at the two ends.
+func (r *filterRoute) resolutions() {
+	r.delta = map[SelectorID][]netip.Addr{}
+
+	for _, s := range r.n.t.table().sels {
+		if !s.Kind.HoldsNodes() {
+			continue
+		}
+
+		if d := addressDelta(r.xo.resolved[s.ID], r.xn.resolved[s.ID]); len(d) > 0 {
+			r.delta[s.ID] = d
+		}
+	}
+
+	if r.o.t == r.n.t {
+		return
+	}
+
+	r.lits = map[SelectorID]bool{}
+
+	for _, s := range r.n.t.table().sels {
+		if !s.Kind.HoldsNodes() && !reflect.DeepEqual(r.o.t.literals[s.ID], r.n.t.literals[s.ID]) {
+			r.lits[s.ID] = true
+		}
+	}
+}
+
+// addressDelta returns the addresses in only one of a and b.
+func addressDelta(a, b ResolvedAddresses) []netip.Addr {
+	var as, bs []string
+	if a != nil {
+		as = a.Strings()
+	}
+
+	if b != nil {
+		bs = b.Strings()
+	}
+
+	if slices.Equal(as, bs) {
+		return nil
+	}
+
+	var out []netip.Addr
+
+	for _, pair := range [2][2]ResolvedAddresses{{a, b}, {b, a}} {
+		if pair[0] == nil {
+			continue
+		}
+
+		for ip := range pair[0].Iter() {
+			if pair[1] == nil || !pair[1].Contains(ip) {
+				out = append(out, ip)
+			}
+		}
+	}
+
+	return out
+}
+
+// addresses adds the nodes holding one of addrs, and the routers whose
+// subnet routes hold one, at either end.
+func (r *filterRoute) addresses(addrs []netip.Addr) {
+	for _, s := range r.sides() {
+		for _, ip := range addrs {
+			ids, _ := s.byAddr.Groups.Get(ip)
+			r.add(ids...)
+
+			containing(s.routers.Groups, s.routerLens, ip, func(_ netip.Prefix, ids []types.NodeID) { r.add(ids...) })
+		}
+	}
+}
+
+// receivers adds the nodes a rule of grant g every node shares can reach,
+// at either end, that are sent its sources as addresses: those on its
+// destination side.
+func (r *filterRoute) receivers(g int) {
+	for i, s := range r.sides() {
+		gt := [2]*GrantTemplate{r.o.t.grants[g], r.n.t.grants[g]}[i]
+		gs := &s.plan.grants[g]
+
+		for _, a := range slices.Concat(gs.portDst, gs.capDst) {
+			for _, id := range s.Holders(a) {
+				if sourcesByAddress(gt, id) {
+					r.add(id)
+				}
+			}
+		}
+	}
+}
+
+// grant adds whom what moved of grant g reaches.
+func (r *filterRoute) grant(g int) {
+	gto, gtn := r.o.t.grants[g], r.n.t.grants[g]
+	if gto.none && gtn.none {
+		return
+	}
+
+	geo, gen := &r.xo.grants[g], &r.xn.grants[g]
+	tmpl := gto != gtn
+
+	if gto.kind == grantVia || gtn.kind == grantVia {
+		r.via(gto, gtn, geo, gen)
+
+		if !tmpl || gto.kind == grantVia && gtn.kind == grantVia {
+			return
+		}
+	}
+
+	if tmpl || !slices.Equal(geo.srcStrs, gen.srcStrs) || !slices.Equal(geo.capSrcs, gen.capSrcs) ||
+		!slices.Equal(geo.keys, gen.keys) || geo.capGrant != gen.capGrant {
+		r.touched = true
+		r.receivers(g)
+	}
+
+	// Companions run from the destinations to the sources, which receive
+	// them.
+	if tmpl || !slices.Equal(geo.dstIPs, gen.dstIPs) || !sameSourceSets(geo, gen) {
+		for _, s := range r.sides() {
+			if gs := &s.plan.grants[g]; gs.comp {
+				r.touched = true
+
+				for _, a := range gs.compDst {
+					r.add(s.Holders(a)...)
+				}
+			}
+		}
+	}
+
+	r.destinations(gtn.dsts)
+
+	if gto.kind == grantSelf || gtn.kind == grantSelf {
+		r.self(gtn, tmpl || slices.ContainsFunc(gtn.srcs, func(id SelectorID) bool { return r.lits[id] }))
+	}
+}
+
+// via adds the via routers of a via grant whose rules can have moved:
+// every node carrying one of its tags at either end.
+func (r *filterRoute) via(gto, gtn *GrantTemplate, geo, gen *grantExpansion) {
+	if gto == gtn && slices.Equal(geo.srcStrs, gen.srcStrs) && slices.Equal(geo.viaDsts, gen.viaDsts) &&
+		slices.Equal(geo.viaKeys, gen.viaKeys) {
+		return
+	}
+
+	r.touched = true
+
+	for _, gt := range [2]*GrantTemplate{gto, gtn} {
+		for _, tag := range gt.via {
+			if s, ok := r.n.t.table().Lookup(string(tag)); ok {
+				r.add(r.o.posts.Nodes(SelectorRole(s.ID))...)
+				r.add(r.n.posts.Nodes(SelectorRole(s.ID))...)
+			}
+		}
+	}
+}
+
+// destinations adds the nodes whose reach of dsts can have moved: those
+// holding, or routing over, an address a destination gained or lost, and
+// those inside a literal that moved.
+func (r *filterRoute) destinations(dsts []SelectorID) {
+	for _, id := range dsts {
+		if d := r.delta[id]; len(d) > 0 {
+			r.touched = true
+			r.addresses(d)
+		}
+
+		if r.lits[id] {
+			r.touched = true
+			r.holders(literalRole(id))
+		}
+	}
+}
+
+// sameSourceSets reports whether a and b resolve each source alike.
+func sameSourceSets(a, b *grantExpansion) bool {
+	return slices.Equal(a.srcIDs, b.srcIDs) && slices.EqualFunc(a.srcSets, b.srcSets, func(x, y ResolvedAddresses) bool {
+		return slices.Equal(x.Strings(), y.Strings())
+	})
+}
+
+// self adds the nodes of every owner whose autogroup:self rules of grant gt
+// can have moved: all of them when all, else those whose nodes moved, and
+// those a source names, by address, otherwise than it did. A self rule
+// lists every node of its owner, and a source names an owner's node by its
+// addresses: a node sharing an address with one that moved moves its
+// owner's rules.
+func (r *filterRoute) self(gt *GrantTemplate, all bool) {
+	owners := map[uint]struct{}{}
+
+	if all {
+		for _, p := range [2]Postings{r.o.posts, r.n.posts} {
+			for role := range p.All() {
+				if uid, ok := role.Owner(); ok {
+					owners[uid] = struct{}{}
+				}
+			}
+		}
+	} else {
+		moved, _ := r.n.posts.Changed(r.o.posts)
+		for _, role := range moved {
+			if uid, ok := role.Owner(); ok {
+				owners[uid] = struct{}{}
+			}
+		}
+
+		for _, id := range r.moved {
+			r.ownersOf(id, owners)
+		}
+
+		for _, src := range gt.srcs {
+			for _, ip := range r.delta[src] {
+				for _, s := range r.sides() {
+					ids, _ := s.byAddr.Groups.Get(ip)
+					for _, id := range ids {
+						r.ownersOf(id, owners)
+					}
+				}
+			}
+		}
+	}
+
+	if len(owners) == 0 {
+		return
+	}
+
+	r.touched = true
+	r.ownerNodes(owners)
+}
+
+// ownersOf adds to owners the users node id is an owner node of, at either
+// end.
+func (r *filterRoute) ownersOf(id types.NodeID, owners map[uint]struct{}) {
+	for _, p := range [2]Postings{r.o.posts, r.n.posts} {
+		rs, _ := p.byRole.In.Get(id)
+		for role := range rs.All() {
+			if uid, ok := role.Owner(); ok {
+				owners[uid] = struct{}{}
+			}
+		}
+	}
+}
+
+// ownerNodes adds the owner nodes of owners at either end.
+func (r *filterRoute) ownerNodes(owners map[uint]struct{}) {
+	for uid := range owners {
+		r.add(r.o.posts.Nodes(OwnerRole(uid))...)
+		r.add(r.n.posts.Nodes(OwnerRole(uid))...)
+	}
+}
+
+// anchors adds the receivers of every rule merged at a position that moved:
+// a merged rule sits at the first rule, of any receiver, with its key, so a
+// key gained or lost earlier in the list reorders filters it never reached.
+func (r *filterRoute) anchors() {
+	keys := map[string]struct{}{}
+
+	for k, p := range r.xn.first {
+		if q, ok := r.xo.first[k]; !ok || q != p {
+			keys[k] = struct{}{}
+		}
+	}
+
+	for k := range r.xo.first {
+		if _, ok := r.xn.first[k]; !ok {
+			keys[k] = struct{}{}
+		}
+	}
+
+	if len(keys) == 0 {
+		return
+	}
+
+	r.touched = true
+
+	self := false
+
+	for g, gt := range r.n.t.grants {
+		og := r.o.t.grants[g]
+		self = self || gt.kind == grantSelf && !gt.none || og.kind == grantSelf && !og.none
+	}
+
+	hit := func(ge *grantExpansion) bool {
+		return slices.ContainsFunc(ge.keys, func(k string) bool { _, ok := keys[k]; return ok })
+	}
+
+	for g := range r.n.t.grants {
+		geo, gen := &r.xo.grants[g], &r.xn.grants[g]
+		if !hit(geo) && !hit(gen) {
+			continue
+		}
+
+		r.receivers(g)
+
+		// An owner's self rule merges there too when its sources are these:
+		// the addresses of nodes of its own.
+		for _, ge := range []*grantExpansion{geo, gen} {
+			if self && hit(ge) {
+				r.selfMerging(ge.srcStrs)
+			}
+		}
+	}
+}
+
+// selfMerging adds the nodes of the owners holding every one of srcs, all
+// addresses: a self rule's sources are its owner's nodes' addresses, so
+// only such an owner can have one with their merge key.
+func (r *filterRoute) selfMerging(srcs []string) {
+	var owners map[uint]struct{}
+
+	for _, src := range srcs {
+		ip, err := netip.ParseAddr(src)
+		if err != nil {
+			return
+		}
+
+		held := map[uint]struct{}{}
+
+		for _, s := range r.sides() {
+			ids, _ := s.byAddr.Groups.Get(ip)
+			for _, id := range ids {
+				r.ownersOf(id, held)
+			}
+		}
+
+		if owners == nil {
+			owners = held
+		} else {
+			maps.DeleteFunc(owners, func(uid uint, _ struct{}) bool {
+				_, ok := held[uid]
+
+				return !ok
+			})
+		}
+
+		if len(owners) == 0 {
+			return
+		}
+	}
+
+	r.ownerNodes(owners)
 }
 
 // FilterShapes counts the shapes cutting filters met, so a test can tell
@@ -1469,11 +2185,6 @@ type FilterAudit struct {
 	// TemplatesAudited reports that these templates matched a build from
 	// scratch already: templates never change, so they still do.
 	TemplatesAudited bool
-
-	// Served, when set, is what the world serves from these inputs: its
-	// filters, as sessions have cached them, are held against the oracle
-	// as well as an expansion built here.
-	Served *Filters
 }
 
 // FilterReport counts what an audit compared.
@@ -1559,34 +2270,12 @@ func AuditFilters(a FilterAudit) (FilterReport, error) {
 			return rep, fmt.Errorf("%w: node %d:\ncompile  %v\nexpanded %v", errFilterAudit, n.ID(), want, got)
 		}
 
-		if a.Served != nil {
-			served, err := a.Served.ForNode(n.ID())
-			if err != nil {
-				return rep, err
-			}
-
-			if !reflect.DeepEqual(want, served) {
-				return rep, fmt.Errorf("%w: node %d:\ncompile %v\nserved  %v", errFilterAudit, n.ID(), want, served)
-			}
-		}
-
 		rep.Nodes++
 		rep.Rules += len(got)
 	}
 
 	if got := x.Filter(); !reflect.DeepEqual(oracle.filter, got) {
 		return rep, fmt.Errorf("%w: global filter:\ncompile  %v\nexpanded %v", errFilterAudit, oracle.filter, got)
-	}
-
-	if a.Served != nil {
-		served, err := a.Served.Global()
-		if err != nil {
-			return rep, err
-		}
-
-		if !reflect.DeepEqual(oracle.filter, served) {
-			return rep, fmt.Errorf("%w: global filter:\ncompile %v\nserved  %v", errFilterAudit, oracle.filter, served)
-		}
 	}
 
 	rep.Shapes.SelfByAddress = x.byAddress

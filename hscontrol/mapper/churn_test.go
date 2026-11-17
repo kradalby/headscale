@@ -710,37 +710,40 @@ func TestScalingWriteWorkChurn(t *testing.T) {
 	// addresses, so every session receiving that rule is sent a new
 	// filter: all of them under mesh, group-all and routers, where the
 	// rule reaches every member or every node, and none under allow-all,
-	// whose source is "*". A group-all rule has a "*" destination, so its
-	// recompile wakes every session (Change.Global). The routers shape's
-	// routers re-render every routed peer after each recompile.
+	// whose source is "*". A destination naming it moves only the filters
+	// of the nodes holding the addresses that came or went, so a tag:tN
+	// node's join leaves the other tag:tN nodes' filters alone. A routed
+	// peer renders again only for a viewer whose side set moved, or when
+	// its routes' cover or what every route reads did: a join or a group
+	// edit elsewhere moves neither for the routers' subnets.
 	ceilings := map[string][4]int{
 		"group/group-all": {400, 400, 1600, 360},
-		"group/routers":   {272, 112, 3840, 80},
-		"group/selectors": {400, 280, 0, 248},
+		"group/routers":   {112, 112, 640, 80},
+		"group/selectors": {280, 280, 0, 248},
 		"join/allow-all":  {400, 400, 400, 0},
 		"join/group-all":  {400, 400, 400, 400},
 		"join/mesh":       {400, 400, 400, 400},
-		"join/routers":    {400, 400, 3600, 400},
+		"join/routers":    {400, 400, 400, 400},
 		"join/selectors":  {308, 308, 308, 248},
 		"join/self":       {40, 40, 40, 40},
-		"join/tags":       {60, 40, 40, 20},
+		"join/tags":       {40, 40, 40, 20},
 		"join/users":      {40, 40, 40, 40},
-		"join/via":        {400, 400, 2380, 40},
+		"join/via":        {400, 400, 400, 40},
 		"leave/allow-all": {396, 396, 0, 0},
 		"leave/group-all": {396, 396, 0, 396},
 		"leave/mesh":      {396, 396, 0, 396},
-		"leave/routers":   {396, 396, 3120, 396},
+		"leave/routers":   {396, 396, 0, 396},
 		"leave/selectors": {304, 304, 0, 244},
 		"leave/self":      {36, 36, 0, 36},
-		"leave/tags":      {56, 40, 0, 20},
+		"leave/tags":      {40, 40, 0, 20},
 		"leave/users":     {36, 36, 0, 36},
-		"leave/via":       {396, 396, 1960, 40},
+		"leave/via":       {396, 396, 0, 40},
 		"tag/group-all":   {400, 400, 196, 396},
 		"tag/mesh":        {400, 400, 0, 396},
-		"tag/routers":     {400, 400, 3120, 396},
+		"tag/routers":     {400, 400, 0, 396},
 		"tag/selectors":   {308, 308, 120, 244},
 		"tag/tags":        {80, 80, 72, 40},
-		"tag/via":         {400, 400, 2376, 40},
+		"tag/via":         {400, 400, 416, 40},
 	}
 
 	for _, kind := range slices.Sorted(maps.Keys(churnWrites)) {
@@ -796,7 +799,16 @@ func TestChurnWakesEverySessionItChanges(t *testing.T) {
 					w.write(cr, t, i)
 					cr.deliver(t)
 
+					// Against a render of its own first: the session's next
+					// update reads the caches routing left it, and would
+					// share a mistake of theirs.
+					fresh := s.Snapshot().Uncached()
+
 					for _, st := range cr.streams {
+						stale, err := freshDiff(st.cfg, fresh, st.nodeID, capVer, st.sent, &versionCache{})
+						require.NoError(t, err)
+						require.Empty(t, stale, "write %d left node %d holding a stale map: %s", i, st.nodeID, describeResponses(stale))
+
 						out, err := st.Update(s.Snapshot())
 						require.NoError(t, err)
 						require.Empty(t, out, "write %d left node %d something to send", i, st.nodeID)

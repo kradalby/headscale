@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"maps"
@@ -744,6 +745,175 @@ func (s Sides) Holders(r Role) []types.NodeID {
 // and how many every update up to it did: a cell that did not recompute
 // keeps both.
 func (s Sides) Computed() (int, int) { return s.computed, s.total }
+
+// RouteCover is the cover of every subnet route a node serves, what route
+// access and via steering read of the nodes inside a peer's routes. A
+// reader keeps it to ask later sides whose routes' cover moved.
+type RouteCover struct {
+	m *graph.Map[netip.Prefix, coverAtoms]
+}
+
+// RouteCover returns the cover of s's routes.
+func (s Sides) RouteCover() RouteCover {
+	if s.sidesState == nil {
+		return RouteCover{}
+	}
+
+	return RouteCover{m: s.cover}
+}
+
+// RoutersMovedSince returns, sorted, the nodes serving a subnet route whose
+// cover gained or lost an atom since c: the routes they offer a viewer can
+// differ though neither changed. A count that moved alone moves nothing.
+func (s Sides) RoutersMovedSince(c RouteCover) []types.NodeID {
+	if s.sidesState == nil || c.m == s.cover {
+		return nil
+	}
+
+	var out []types.NodeID
+
+	for _, p := range graph.Changes(c.m, s.cover) {
+		was, _ := c.m.Get(p)
+		if is, ok := s.cover.Get(p); ok && samePresence(was, is) {
+			continue
+		}
+
+		ids, _ := s.routers.Groups.Get(p)
+		out = append(out, ids...)
+	}
+
+	slices.Sort(out)
+
+	return slices.Compact(out)
+}
+
+// samePresence reports whether a and b hold the same atoms, whatever their
+// counts.
+func samePresence(a, b coverAtoms) bool {
+	return slices.EqualFunc(a, b, func(x, y atomCount) bool { return x.r == y.r })
+}
+
+// ViewerFacts is what route access reads of a viewer beyond its side set
+// and its node's addresses and routes: the user it owns a node of, and the
+// via grants it routes for. A node without addresses holds neither in its
+// side set.
+type ViewerFacts struct {
+	owner   uint
+	owned   bool
+	targets string
+}
+
+func viewerFacts(f *sideFacts) ViewerFacts {
+	if f == nil {
+		return ViewerFacts{}
+	}
+
+	vf := ViewerFacts{owner: f.owner, owned: f.owned}
+
+	if len(f.targets) > 0 {
+		b := make([]byte, 0, 4*len(f.targets))
+		for _, g := range f.targets {
+			b = binary.BigEndian.AppendUint32(b, uint32(g)) //nolint:gosec // a grant index
+		}
+
+		vf.targets = string(b)
+	}
+
+	return vf
+}
+
+// ViewerFacts returns id's.
+func (s Sides) ViewerFacts(id types.NodeID) ViewerFacts {
+	if s.sidesState == nil {
+		return ViewerFacts{}
+	}
+
+	f, _ := s.facts.Get(id)
+
+	return viewerFacts(f)
+}
+
+// ViewersMovedSince returns, sorted, the nodes whose side set or
+// [ViewerFacts] differ between old and s: the routes every peer offers them
+// can.
+func (s Sides) ViewersMovedSince(old Sides) []types.NodeID {
+	if s.sidesState == nil || old.sidesState == nil || s.sidesState == old.sidesState {
+		return nil
+	}
+
+	out := graph.Changes(old.sets, s.sets)
+
+	for _, id := range graph.Changes(old.facts, s.facts) {
+		was, _ := old.facts.Get(id)
+		is, _ := s.facts.Get(id)
+
+		if viewerFacts(was) != viewerFacts(is) {
+			out = append(out, id)
+		}
+	}
+
+	slices.Sort(out)
+
+	return slices.Compact(out)
+}
+
+// RouteRules is what the routes a viewer is sent read besides the viewer,
+// the peer and the cover of the peer's routes: the rules, the identity
+// selectors with a public member, the users with a public owner node, and
+// the via plan. The rules are the templates' and read no membership; the
+// rest moves with it, and the cover and side sets are followed apart.
+type RouteRules struct {
+	plan   *sidePlan
+	pubSel []SelectorID
+	owners map[uint]bool
+	via    *ViaPlan
+}
+
+// RouteRules returns s's, with via the plan steering reads.
+func (s Sides) RouteRules(via *ViaPlan) RouteRules {
+	if s.sidesState == nil {
+		return RouteRules{via: via}
+	}
+
+	return RouteRules{plan: s.plan, pubSel: s.pubSel, owners: s.owners, via: via}
+}
+
+// Same reports whether r and o route every viewer alike, given the same
+// viewer, peer and cover: the same rules, by content, as a document edit
+// builds new ones even where it changes none.
+func (r RouteRules) Same(o RouteRules) bool {
+	return r.plan.sameRoutes(o.plan) && r.via.sameRoutes(o.via) && slices.Equal(r.pubSel, o.pubSel) && maps.Equal(r.owners, o.owners)
+}
+
+// sameRoutes reports whether p and o hold the same rules for route access
+// and via steering: each grant's sides, the self and via grants, the
+// steering grants and the literals.
+func (p *sidePlan) sameRoutes(o *sidePlan) bool {
+	if p == o {
+		return true
+	}
+
+	if p == nil || o == nil || p.table != o.table {
+		return false
+	}
+
+	return reflect.DeepEqual(p.grants, o.grants) && reflect.DeepEqual(p.selfPort, o.selfPort) &&
+		reflect.DeepEqual(p.selfApp, o.selfApp) && reflect.DeepEqual(p.selfComp, o.selfComp) &&
+		slices.Equal(p.vias, o.vias) && p.hasVia == o.hasVia && reflect.DeepEqual(p.steer, o.steer) &&
+		slices.Equal(p.viaReads, o.viaReads) && slices.Equal(p.viaIdents, o.viaIdents) &&
+		reflect.DeepEqual(p.lit, o.lit) && slices.Equal(p.litInet, o.litInet) &&
+		reflect.DeepEqual(p.t.literals, o.t.literals)
+}
+
+// sameRoutes reports whether v and o steer alike: the same rules and the
+// same scopes and destinations.
+func (v *ViaPlan) sameRoutes(o *ViaPlan) bool {
+	if v == o {
+		return true
+	}
+
+	return v != nil && o != nil && v.plan.sameRoutes(o.plan) && v.sameContent(o)
+}
 
 // UpdateSides returns the sides of nodes under t, with roles and posts the
 // membership of nodes and approvals their approved routes, recomputing from
@@ -2198,6 +2368,42 @@ func (c *PeerClasses) SameKeyed(o *PeerClasses) bool {
 	}
 
 	return c.keyed.views == o.keyed.views && c.keyed.sides.sets == o.keyed.sides.sets
+}
+
+// changedSince returns the nodes whose view differs between old and kc: a
+// node keeping its side set sees what its class does, so only nodes that
+// moved class and the members of classes whose view moved are compared,
+// not every node.
+func (kc *keyedClasses) changedSince(old *keyedClasses) []types.NodeID {
+	var out []types.NodeID
+
+	differs := func(id types.NodeID) bool {
+		_, had := old.sides.sets.Get(id)
+		_, has := kc.sides.sets.Get(id)
+		was, is := old.view(id), kc.view(id)
+
+		return had != has || !sameSlice(was, is) && !slices.Equal(was, is)
+	}
+
+	for _, id := range graph.Changes(old.sides.sets, kc.sides.sets) {
+		if differs(id) {
+			out = append(out, id)
+		}
+	}
+
+	for _, rs := range graph.Changes(old.views, kc.views) {
+		members, _ := kc.members.Groups.Get(rs)
+		for _, id := range members {
+			// A member that moved class was compared above.
+			if was, _ := old.sides.sets.Get(id); was == rs {
+				out = append(out, id)
+			}
+		}
+	}
+
+	slices.Sort(out)
+
+	return slices.Compact(out)
 }
 
 // RouteAccess returns the routes among routes viewer may use, in input

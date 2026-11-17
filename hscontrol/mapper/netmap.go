@@ -126,11 +126,17 @@ type renderer struct {
 	lastClass   *peerMap
 	lastKey     renderKey
 	lastPeerIDs []types.NodeID // the snapshot's shared view, see [state.Snapshot.PeerView]
-	// lastPeersRev is the peers revision lastPeerIDs and lastKey.side are of.
+	// lastPeersRev is the peers revision lastPeerIDs and lastKey.side are
+	// of; lastSidesRev the sides revision lastKey.facts and lastCover are
+	// of.
 	lastPeersRev uint64
-	lastSelf     types.NodeView
-	lastNodes    state.NodesVersion
-	lastCaps     state.CapsVersion
+	lastSidesRev uint64
+	// lastCover is the cover of the routes rendered last, for telling the
+	// routers whose routes' cover moved since.
+	lastCover policyv2.RouteCover
+	lastSelf  types.NodeView
+	lastNodes state.NodesVersion
+	lastCaps  state.CapsVersion
 	// overlaid holds the peers this viewer has its own copy of, with its
 	// routes or without the IPv4 identity, so losing the last restores the
 	// shared class map. It is kept by ID, not told from the last class
@@ -147,8 +153,8 @@ type renderer struct {
 	routedVia       weak.Pointer[policyv2.ViaRoutes]
 	routedWinners   *policyv2.ViaRoutes
 
-	// dns is reused while its inputs, the node and the policy's capability
-	// map and the extra records, are unchanged.
+	// dns is reused while its inputs, the node, the policy's capability
+	// maps and the extra records, are unchanged.
 	dns    *tailcfg.DNSConfig
 	dnsKey dnsKey
 
@@ -163,22 +169,20 @@ type renderer struct {
 	rendered int
 }
 
-// renderKey is what a peer's rendering reads besides the peer and the
-// viewer: how the policy renders peers, the primary routes, and the
-// viewer's side set, which the routes it is served read.
-//
-// TODO(capsrc/routing): policy is the compile's [state.Snapshot.PeerPolicyRev],
-// a proxy for what else the served routes read (the routers' cover counts,
-// the via plan, other nodes' side sets) that holds while the compile moves
-// with membership; routing on roles replaces it.
+// renderKey is what the routes of the peers rendered read besides the
+// peers and their routes' cover: what every route reads, the primary
+// routes, and the viewer's side set and side facts. The via election and
+// the viewer's own addresses and routes are read too, and checked apart
+// (see [renderer.routedCandidates]).
 type renderKey struct {
-	policy, primaries uint64
+	routes, primaries uint64
 	side              policyv2.RoleSet
+	facts             policyv2.ViewerFacts
 }
 
 type dnsKey struct {
-	self        types.NodeView
-	policy, dns uint64
+	self      types.NodeView
+	caps, dns uint64
 }
 
 // selfKey holds what the node's own entry renders from. dns is there for
@@ -223,7 +227,7 @@ type versionCache struct {
 
 // peerRenders shares, across sessions, the part of a peer's rendering that
 // does not depend on who views it: everything but its routes. Each stored
-// node is rendered once per policy, not once per viewer.
+// node is rendered once per caps it is given, not once per viewer.
 type peerRenders struct {
 	m sync.Map // types.NodeID -> *atomic.Pointer[peerRender]
 	// mu serialises admission with deletion; floor rejects misses from
@@ -268,10 +272,12 @@ func (pr *peerRenders) of(node types.NodeID, rev uint64) *atomic.Pointer[peerRen
 }
 
 type peerRender struct {
-	node   types.NodeView
-	policy uint64
-	caps   tailcfg.NodeCapMap // the policy's caps for node, all it reads of the policy
-	tn     *tailcfg.Node
+	node types.NodeView
+	// capsRev is the caps revision caps were read at: until it moves, every
+	// node keeps its caps.
+	capsRev uint64
+	caps    tailcfg.NodeCapMap // the policy's caps for node, all it reads of the policy
+	tn      *tailcfg.Node
 }
 
 // render returns peer rendered without routes. The result is shared and
@@ -280,7 +286,7 @@ func (pr *peerRenders) render(
 	cfg *types.Config,
 	dns types.DNSView,
 	capVer tailcfg.CapabilityVersion,
-	rev, policy uint64,
+	rev, capsRev uint64,
 	peer types.NodeView,
 	capMaps map[types.NodeID]tailcfg.NodeCapMap,
 ) (*tailcfg.Node, error) {
@@ -289,14 +295,14 @@ func (pr *peerRenders) render(
 
 	prev := slot.Load()
 	if prev != nil {
-		if prev.node == peer && prev.policy == policy {
+		if prev.node == peer && prev.capsRev == capsRev {
 			return prev.tn, nil
 		}
 
-		// A new policy that gives the peer the same caps renders it the
-		// same: keep the render, so sessions see nothing to send.
+		// Other caps that give the peer the same caps render it the same:
+		// keep the render, so sessions see nothing to send.
 		if prev.node == peer && reflect.DeepEqual(prev.caps, caps) {
-			slot.Store(&peerRender{node: peer, policy: policy, caps: caps, tn: prev.tn})
+			slot.Store(&peerRender{node: peer, capsRev: capsRev, caps: caps, tn: prev.tn})
 
 			return prev.tn, nil
 		}
@@ -332,7 +338,7 @@ func (pr *peerRenders) render(
 		tn.Hostinfo = prev.tn.Hostinfo
 	}
 
-	slot.Store(&peerRender{node: peer, policy: policy, caps: caps, tn: tn})
+	slot.Store(&peerRender{node: peer, capsRev: capsRev, caps: caps, tn: tn})
 
 	return tn, nil
 }
@@ -422,7 +428,7 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 		return nil, err
 	}
 
-	ssh, err := pm.SSHPolicy(r.cfg.ServerURL, self)
+	ssh, err := snap.SSHPolicy(r.cfg.ServerURL, self)
 	if err != nil {
 		// Fail closed: a nil SSHPolicy would leave the client's previous
 		// rules in force.
@@ -432,7 +438,7 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 		ssh = &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}}
 	}
 
-	if k := (dnsKey{self: self, policy: snap.PolicyRev(), dns: snap.DNSRev()}); r.dns == nil || k != r.dnsKey {
+	if k := (dnsKey{self: self, caps: snap.CapsRev(), dns: snap.DNSRev()}); r.dns == nil || k != r.dnsKey {
 		r.dns, r.dnsKey = generateDNSConfig(dns, self, capMaps[self.ID()]), k
 	}
 
@@ -463,27 +469,33 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 // nm.removed the peers that can differ from the base, so a diff looks at
 // only them: those added to or gone from the view, those whose node
 // changed, and those whose render reads something that moved without
-// their node changing (their policy caps, or their routes, which come from
-// the policy, the primary routes and the node's own routes).
+// their node changing (their policy caps, or their routes, which read the
+// rules, the primary routes, their routes' cover and the viewer).
 func (r *renderer) renderPeers(
 	snap *state.Snapshot,
 	self types.NodeView,
 	capMaps map[types.NodeID]tailcfg.NodeCapMap,
 	nm *netMap,
 ) error {
-	// An unmoved peers cell holds the same views and side sets.
-	view, side := r.lastPeerIDs, r.lastKey.side
+	// An unmoved peers cell holds the same views and side sets, unmoved
+	// sides the same facts.
+	view, side, facts := r.lastPeerIDs, r.lastKey.side, r.lastKey.facts
 	if nm.base == nil || snap.PeersRev() != r.lastPeersRev {
 		view, side = snap.PeerViewAndSideSet(r.nodeID)
 	}
 
-	key := renderKey{
-		policy:    snap.PeerPolicyRev(),
-		primaries: snap.PrimariesRev(),
-		side:      side,
+	if nm.base == nil || snap.SidesRev() != r.lastSidesRev {
+		facts = snap.ViewerFacts(r.nodeID)
 	}
 
-	class, profiles, nodes := r.classes.get(r.cfg, r.renders, snap, view, r.peerCapVer, key.policy, capMaps)
+	key := renderKey{
+		routes:    snap.RouteRulesRev(),
+		primaries: snap.PrimariesRev(),
+		side:      side,
+		facts:     facts,
+	}
+
+	class, profiles, nodes := r.classes.get(r.cfg, r.renders, snap, view, r.peerCapVer, snap.CapsRev(), capMaps)
 	nm.peers, nm.profiles = class, profiles
 
 	base := nm.base
@@ -675,22 +687,20 @@ func (nm *netMap) recordPeerChanges(base *netMap, candidates []tailcfg.NodeID, s
 }
 
 // routedCandidates returns the routed peers whose routes snap can render
-// differently from the last render: every one after a policy or viewer
-// change, those whose primaries moved after a primary move.
+// differently from the last render: every one after a change to what every
+// route reads or to the viewer, those whose primaries moved after a primary
+// move, those whose routes' cover moved, and those a via election moved.
 func (r *renderer) routedCandidates(snap *state.Snapshot, self types.NodeView, key renderKey, first bool) []tailcfg.NodeID {
 	var out []tailcfg.NodeID
 
 	via := weak.Make(snap.ViaElection())
 
 	switch {
-	case first || key.policy != r.lastKey.policy || key.side != r.lastKey.side || !sameRouteFacts(r.lastSelf, self):
-		// A policy or viewer change can steer any router's routes for this
-		// viewer.
-		//
-		// TODO(capsrc/routing): untested until M5. While the compile runs,
-		// PeerPolicyRev moves whenever a viewer's side set does, so dropping
-		// the side comparison fails no test; when M5 replaces PeerPolicyRev
-		// it needs a test that fails without it.
+	case first || key.routes != r.lastKey.routes || key.side != r.lastKey.side || key.facts != r.lastKey.facts ||
+		!sameRouteFacts(r.lastSelf, self):
+		// The rules or the viewer's own side can move any router's routes
+		// for this viewer: route access and via steering read its side set
+		// and facts, which nothing else here follows.
 		r.routedPrimaries = nil
 
 		for _, id := range snap.RoutedNodes() {
@@ -706,6 +716,14 @@ func (r *renderer) routedCandidates(snap *state.Snapshot, self types.NodeView, k
 			if was, ok := r.routedPrimaries[id.NodeID()]; !ok || !slices.Equal(was, snap.PrimaryRoutesForNode(id)) {
 				out = append(out, id.NodeID())
 			}
+		}
+	}
+
+	if snap.SidesRev() != r.lastSidesRev {
+		// With the same rules and viewer, a router's routes read the nodes
+		// inside them only through the atoms they hold.
+		for _, id := range snap.RoutersMovedSince(r.lastCover) {
+			out = append(out, id.NodeID())
 		}
 	}
 
@@ -733,6 +751,10 @@ func (r *renderer) markRendered(snap *state.Snapshot, key renderKey, self types.
 	r.lastClass, r.lastKey = class, key
 	r.lastPeerIDs, r.lastPeersRev, r.lastSelf = view, snap.PeersRev(), self
 	r.lastNodes, r.lastCaps = nodes, snap.CapsVersion()
+
+	if rev := snap.SidesRev(); rev != r.lastSidesRev || r.lastCover == (policyv2.RouteCover{}) {
+		r.lastSidesRev, r.lastCover = rev, snap.RouteCover()
+	}
 
 	via := weak.Make(snap.ViaElection())
 	if via != r.routedVia {
@@ -859,7 +881,7 @@ func (cm *classMaps) get(
 	snap *state.Snapshot,
 	view []types.NodeID,
 	capVer tailcfg.CapabilityVersion,
-	policy uint64,
+	capsRev uint64,
 	capMaps map[types.NodeID]tailcfg.NodeCapMap,
 ) (*peerMap, *profileMap, state.NodesVersion) {
 	renders.advance(snap.Rev())
@@ -941,7 +963,7 @@ func (cm *classMaps) get(
 			continue
 		}
 
-		tn, err := renders.render(cfg, dns, capVer, snap.Rev(), policy, peer, capMaps)
+		tn, err := renders.render(cfg, dns, capVer, snap.Rev(), capsRev, peer, capMaps)
 		if err != nil {
 			// One peer with invalid data must not blank out the map for
 			// every node that can see it.

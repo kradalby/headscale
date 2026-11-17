@@ -60,7 +60,7 @@ func TestWorldDNSNoOpPublication(t *testing.T) {
 	after := w.snapshot()
 	require.Greater(t, after.DNSRev(), before.DNSRev())
 	assert.Equal(t, before.PolicyRev(), after.PolicyRev())
-	assert.Equal(t, before.PeerPolicyRev(), after.PeerPolicyRev())
+	assert.Equal(t, before.CapsRev(), after.CapsRev())
 	assert.Equal(t, before.PeersRev(), after.PeersRev())
 
 	select {

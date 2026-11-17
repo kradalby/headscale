@@ -1,10 +1,17 @@
 package v2
 
 import (
+	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"net/netip"
+	"os"
 	"reflect"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -448,4 +455,789 @@ func TestFiltersServeTheirOwnNodes(t *testing.T) {
 	global, err := f.Global()
 	require.NoError(t, err)
 	assert.Equal(t, pm.filter, global)
+}
+
+// TestFiltersChangedCoversEveryMovedFilter holds [Filters.Changed] to the
+// filters themselves, with no audit: over the random differential's
+// policies and topologies, moved by joins, leaves and replacements, by
+// single facts of one node, by user renames, by document edits that keep
+// the selectors where they can (rules swapped, a source or destination
+// moved to a selector named elsewhere, ports, protocols, apps, via tags,
+// a host's prefix, a group's members) and by documents replaced, every
+// node whose filter, cut afresh, differs between two states must be one
+// Changed names, and one its routing names without the subnet routers it
+// adds wholesale. And a filter served must be the one cut afresh: sessions
+// read some filters at each commit and none at others, so what is served
+// is carried across commits, some of it across several. HEADSCALE_SIDES_SEED
+// replays a run.
+func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
+	seed := uint64(time.Now().UnixNano()) //nolint:gosec // any seed
+
+	if v := os.Getenv("HEADSCALE_SIDES_SEED"); v != "" {
+		var err error
+
+		seed, err = strconv.ParseUint(v, 10, 64)
+		require.NoError(t, err)
+	}
+
+	t.Logf("HEADSCALE_SIDES_SEED=%d", seed)
+
+	rounds := 450
+	if testing.Short() {
+		rounds = 40
+	}
+
+	edits := [][2]string{
+		{`:22"`, `:*"`},
+		{`"tcp:22"`, `"*"`},
+		{`"group:g": ["alice@", "carol@example.com"]`, `"group:g": ["bob@"]`},
+		{`"hnet": "10.0.0.0/24"`, `"hnet": "10.0.0.0/16"`},
+	}
+
+	for _, public := range []bool{false, true} {
+		t.Run(fmt.Sprintf("public=%t", public), func(t *testing.T) {
+			var stream uint64 = 2
+			if public {
+				stream = 3
+			}
+
+			g := sideGen{r: rand.New(rand.NewPCG(seed, stream)), public: public} //nolint:gosec // reproducible
+
+			var moved, named, kept, carried, multiHop, unreadNodes, unread int
+
+			reach := map[string]int{}
+
+			for round := range rounds {
+				pol := g.policy()
+
+				nodes := make(types.Nodes, 0, 10)
+				for i := range 3 + g.r.IntN(6) {
+					nodes = append(nodes, g.node(types.NodeID(i+1))) //nolint:gosec // bounded
+				}
+
+				pm, err := NewPolicyManager(pol, sideUsers, nodes.ViewSlice())
+				if err != nil {
+					continue
+				}
+
+				m := newSideModel(t, pm, sideUsers, nodes)
+				us := NewUserSets(nil, m.t.sel, sideUsers)
+				prev := FollowFilters(nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+
+				// gen counts the filters followed; read, by node, the last
+				// one its filter was read from.
+				gen := 0
+				read := map[types.NodeID]int{}
+
+				// Every node read, as sessions read theirs, so there is a
+				// cache to carry over.
+				for _, n := range m.list {
+					_, err := prev.ForNode(n.ID)
+					require.NoError(t, err)
+
+					read[n.ID] = gen
+				}
+
+				for step := range 12 {
+					was := m.list
+
+					after, ok := g.move(t, m, us, edits, reach)
+					if !ok {
+						continue
+					}
+
+					us = after
+
+					next := FollowFilters(prev, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+					gen++
+
+					// A commit nobody routes or reads: the next filters carry
+					// from what these would have.
+					if g.r.IntN(4) == 0 {
+						prev = next
+						unread++
+
+						continue
+					}
+
+					ids, all := next.Changed(prev)
+					narrow := routeFilters(prev, next, true)
+
+					fail := func(format string, args ...any) {
+						t.Helper()
+						t.Fatalf("HEADSCALE_SIDES_SEED=%d public=%t round %d step %d: %s\npolicy:\n%s\nbefore:\n%s\nafter:\n%s",
+							seed, public, round, step, fmt.Sprintf(format, args...), m.pm.src, describeNodes(was), describeNodes(m.list))
+					}
+
+					freshOld, freshNew := prev.Uncached(), next.Uncached()
+
+					for _, n := range slices.Concat(was, m.list) {
+						before, errBefore := freshOld.ForNode(n.ID)
+						after, errAfter := freshNew.ForNode(n.ID)
+
+						_, listed := slices.BinarySearch(ids, n.ID)
+
+						if (errBefore == nil) != (errAfter == nil) || !reflect.DeepEqual(before, after) {
+							moved++
+
+							if !all && !listed {
+								fail("node %d's filter moved from %v to %v, and Changed (%v) leaves it out", n.ID, before, after, ids)
+							}
+
+							if _, ok := slices.BinarySearch(narrow.ids, n.ID); !narrow.all && !ok {
+								fail("node %d's filter moved from %v to %v, and routing without routers wholesale (%v) leaves it out", n.ID, before, after, narrow.ids)
+							}
+
+							named++
+						} else if !listed {
+							kept++
+						}
+
+						if errAfter != nil {
+							continue
+						}
+
+						// Sessions read some filters only.
+						if g.r.IntN(3) == 0 {
+							unreadNodes++
+
+							continue
+						}
+
+						served, err := next.ForNode(n.ID)
+						require.NoError(t, err)
+
+						if !reflect.DeepEqual(after, served) {
+							fail("node %d is served %v, cut afresh %v", n.ID, served, after)
+						}
+
+						if !all && !listed {
+							carried++
+
+							if read[n.ID] < gen-1 {
+								multiHop++
+							}
+						}
+
+						read[n.ID] = gen
+					}
+
+					prev = next
+				}
+			}
+
+			t.Logf("moved filters %d (named %d), unmoved left out %d, carried over %d (%d across several commits), unread filters %d, unread commits %d; %v",
+				moved, named, kept, carried, multiHop, unreadNodes, unread, reach)
+			require.Positive(t, moved, "filters moved")
+			require.Positive(t, unread, "commits went unread")
+			require.Positive(t, unreadNodes, "filters went unread")
+			require.Positive(t, carried, "filters were carried over")
+			require.Positive(t, multiHop, "filters were carried across several commits")
+			require.Positive(t, reach["edits"], "documents were edited")
+			require.Positive(t, reach["documents replaced"], "documents were replaced")
+
+			// A short run is too few rounds to reach every kind.
+			if testing.Short() {
+				return
+			}
+
+			for _, kind := range []string{
+				"single node fact", "user renamed", "edit keeping the selectors",
+				"edit: swap", "edit: src", "edit: dst", "edit: ports", "edit: proto", "edit: app", "edit: via", "edit: host", "edit: group",
+			} {
+				assert.Positive(t, reach[kind], "%s reached", kind)
+			}
+		})
+	}
+}
+
+// move moves m one step the way the Filters.Changed oracle draws them:
+// joins, leaves and replacements; one node's fact; a document edit, a user
+// renamed, a textual edit or another document. False when the step drew
+// nothing that applies.
+func (g sideGen) move(t *testing.T, m *sideModel, us *UserSets, edits [][2]string, reach map[string]int) (*UserSets, bool) {
+	t.Helper()
+
+	var (
+		src   []byte
+		label string
+	)
+
+	switch op := g.r.IntN(20); {
+	case op < 5:
+		m.step(t, us, g.step(m.list))
+
+		return us, true
+	case op < 9:
+		m.step(t, us, g.tweak(m.list))
+
+		reach["single node fact"]++
+
+		return us, true
+	case op < 15:
+		var kind string
+
+		src, kind = g.docEdit(m.pm.src)
+		if src == nil {
+			return us, false
+		}
+
+		table := m.t.table()
+
+		next, ok := m.edit(t, us, src)
+		if !ok {
+			return us, false
+		}
+
+		reach["edits"]++
+		reach["edit: "+kind]++
+
+		if m.t.table() == table {
+			reach["edit keeping the selectors"]++
+		}
+
+		return next, true
+	case op < 17:
+		reach["user renamed"]++
+
+		return m.rename(t, us, g.r.IntN(len(m.users))), true
+	case op < 19:
+		e := edits[g.r.IntN(len(edits))]
+
+		src = []byte(strings.Replace(string(m.pm.src), e[0], e[1], 1))
+		if string(src) == string(m.pm.src) {
+			return us, false
+		}
+
+		label = "edits"
+	default:
+		// Another document, most likely naming other selectors.
+		src, label = g.policy(), "documents replaced"
+	}
+
+	next, ok := m.edit(t, us, src)
+	if ok {
+		reach[label]++
+	}
+
+	return next, ok
+}
+
+// docEdit returns src edited the way documents are, and what it edited:
+// two rules swapped; a source or destination moved to a selector the
+// document names; a port, protocol, app or via tag changed; a host's
+// prefix or a group's members moved. Nil when src offers nothing to edit.
+func (g sideGen) docEdit(src []byte) ([]byte, string) {
+	var doc map[string]any
+
+	err := json.Unmarshal(src, &doc)
+	if err != nil {
+		return nil, ""
+	}
+
+	acls, _ := doc["acls"].([]any)
+	grants, _ := doc["grants"].([]any)
+	rules := slices.Concat(acls, grants)
+
+	if len(rules) == 0 {
+		return nil, ""
+	}
+
+	named := docSelectors(rules)
+
+	rule, _ := rules[g.r.IntN(len(rules))].(map[string]any)
+	_, acl := rule["action"]
+
+	kind := g.pick("swap", "src", "dst", "ports", "proto", "app", "via", "host", "group")
+	switch kind {
+	case "swap":
+		list := acls
+		if len(list) < 2 || len(grants) >= 2 && g.r.IntN(2) == 0 {
+			list = grants
+		}
+
+		if len(list) < 2 {
+			return nil, ""
+		}
+
+		i, j := g.r.IntN(len(list)), g.r.IntN(len(list))
+		list[i], list[j] = list[j], list[i]
+	case "src", "dst":
+		vs, _ := rule[kind].([]any)
+		i := g.r.IntN(len(vs))
+		to := named[g.r.IntN(len(named))]
+
+		if kind == "dst" && acl {
+			d, _ := vs[i].(string)
+			to += d[len(aclBase(d)):]
+		}
+
+		vs[i] = to
+	case "ports":
+		if acl {
+			vs, _ := rule["dst"].([]any)
+			i := g.r.IntN(len(vs))
+			d, _ := vs[i].(string)
+			vs[i] = aclBase(d) + ":" + g.pick("*", "22", "80,443")
+		} else {
+			rule["ip"] = []any{g.pick("*", "tcp:22", "udp:53", "tcp:80,443")}
+		}
+	case "proto":
+		if !acl {
+			return nil, ""
+		}
+
+		if _, ok := rule["proto"]; ok {
+			delete(rule, "proto")
+		} else {
+			rule["proto"] = g.pick("tcp", "udp")
+		}
+	case "app":
+		if acl {
+			return nil, ""
+		}
+
+		rule["app"] = map[string]any{g.pick("tailscale.com/cap/relay", "example.com/cap/x", "example.com/cap/y"): []any{map[string]any{}}}
+	case "via":
+		if _, ok := rule["via"]; acl || !ok {
+			return nil, ""
+		}
+
+		rule["via"] = []any{g.pick("tag:r", "tag:a", "tag:e")}
+	case "host":
+		hosts, _ := doc["hosts"].(map[string]any)
+		hosts["hnet"] = g.pick("10.0.0.0/24", "10.0.0.0/16", "100.64.0.0/30", "100.64.0.4/32")
+		hosts["hpub"] = g.pick("8.8.8.0/24", "8.8.8.9/32")
+	case "group":
+		var members []any
+
+		for _, u := range []string{"alice@", "bob@", "carol@example.com"} {
+			if g.r.IntN(2) == 0 {
+				members = append(members, u)
+			}
+		}
+
+		groups, _ := doc["groups"].(map[string]any)
+		groups["group:g"] = members
+	}
+
+	out, err := json.Marshal(doc)
+	if err != nil {
+		panic(err)
+	}
+
+	return out, kind
+}
+
+// aclBase returns an ACL destination without the ports after its last
+// colon.
+func aclBase(d string) string {
+	if before, _, ok := strings.CutLast(d, ":"); ok {
+		return before
+	}
+
+	return d
+}
+
+// docSelectors returns the selectors rules name, but autogroup:self, which
+// only a destination of its own can be.
+func docSelectors(rules []any) []string {
+	var named []string
+
+	for _, r := range rules {
+		rule, _ := r.(map[string]any)
+		_, acl := rule["action"]
+
+		for _, key := range []string{"src", "dst"} {
+			vs, _ := rule[key].([]any)
+			for _, v := range vs {
+				name, _ := v.(string)
+				if acl && key == "dst" {
+					name = aclBase(name)
+				}
+
+				if name != "autogroup:self" {
+					named = append(named, name)
+				}
+			}
+		}
+	}
+
+	slices.Sort(named)
+
+	return slices.Compact(named)
+}
+
+// tweak returns nodes with one fact of one node changed: an address, its
+// tags, its owner, or one of its routes.
+func (g sideGen) tweak(nodes types.Nodes) types.Nodes {
+	next := slices.Clone(nodes)
+	i := g.r.IntN(len(next))
+
+	n := *next[i]
+	n.Hostinfo = n.Hostinfo.Clone()
+
+	switch g.r.IntN(4) {
+	case 0:
+		v4, _ := g.addrs()
+		n.IPv4 = new(netip.MustParseAddr(g.pick(v4...)))
+	case 1:
+		switch {
+		case len(n.Tags) == 0:
+			n.Tags = []string{g.pick("tag:a", "tag:r", "tag:e")}
+		case n.User != nil:
+			n.Tags = nil
+		default:
+			n.Tags = []string{g.pick("tag:a", "tag:r", "tag:e")}
+		}
+	case 2:
+		if n.IsTagged() {
+			n.Tags = append(slices.Clone(n.Tags), g.pick("tag:a", "tag:r", "tag:e"))
+			slices.Sort(n.Tags)
+			n.Tags = slices.Compact(n.Tags)
+		} else {
+			n.User = &sideUsers[g.r.IntN(len(sideUsers))]
+			n.UserID = &n.User.ID
+		}
+	default:
+		p := netip.MustParsePrefix(g.pick("10.0.0.0/24", "100.64.0.0/30", "100.64.0.4/32", "0.0.0.0/0", "192.168.0.0/24"))
+		if slices.Contains(n.ApprovedRoutes, p) {
+			n.ApprovedRoutes = slices.DeleteFunc(slices.Clone(n.ApprovedRoutes), func(q netip.Prefix) bool { return q == p })
+		} else {
+			n.ApprovedRoutes = append(slices.Clone(n.ApprovedRoutes), p)
+			n.Hostinfo.RoutableIPs = append(n.Hostinfo.RoutableIPs, p)
+		}
+	}
+
+	next[i] = &n
+
+	return next
+}
+
+// rename renames user i, or renames it back, and moves the model to it:
+// its name, and an email where it has one.
+func (m *sideModel) rename(t *testing.T, us *UserSets, i int) *UserSets {
+	t.Helper()
+
+	users := slices.Clone(m.users)
+	u := &users[i]
+
+	if base, ok := strings.CutSuffix(u.Name, "-renamed"); ok {
+		u.Name = base
+	} else {
+		u.Name += "-renamed"
+	}
+
+	switch u.Email {
+	case "carol@example.com":
+		u.Email = "carol@other.example"
+	case "carol@other.example":
+		u.Email = "carol@example.com"
+	}
+
+	m.users = users
+	us = NewUserSets(us, m.t.sel, users)
+	m.roles = m.roles.Update(us, m.nodes, nil)
+	m.posts = m.posts.Update(m.roles)
+	m.sides = UpdateSides(m.sides, m.t, m.roles, m.posts, m.appr, m.nodes)
+	m.peers = RolePeers(m.peers, m.sides)
+	m.via = UpdateViaPlans(m.via, m.sides)
+
+	var err error
+
+	m.pm, err = NewPolicyManagerFrom(m.pm, m.pm.src, users, m.list.ViewSlice())
+	require.NoError(t, err)
+
+	return us
+}
+
+// edit moves the model to the document src, compiled against the same
+// users and nodes, returning its user sets; false when src does not
+// compile.
+func (m *sideModel) edit(t *testing.T, us *UserSets, src []byte) (*UserSets, bool) {
+	t.Helper()
+
+	pm, err := NewPolicyManagerFrom(m.pm, src, m.users, m.list.ViewSlice())
+	if err != nil {
+		return us, false
+	}
+
+	sel := SelectorsFor(m.t.sel, pm)
+	m.pm = pm
+	us = NewUserSets(us, sel, m.users)
+	m.t = BuildTemplates(m.t, sel)
+	m.roles = m.roles.Update(us, m.nodes, nil)
+	m.posts = m.posts.Update(m.roles)
+	m.sides = UpdateSides(m.sides, m.t, m.roles, m.posts, m.appr, m.nodes)
+	m.peers = RolePeers(m.peers, m.sides)
+	m.via = UpdateViaPlans(m.via, m.sides)
+
+	return us, true
+}
+
+// TestFiltersChangedFollowsSelfSourcesByAddress pins that an autogroup:self
+// source names an owner's nodes by address: bob's node b1 holds alice's
+// address, so group:g, alice alone, names b1, and bob gets a self rule on
+// both his nodes. Alice's node moving to another address takes that rule
+// from b2 too, though nothing of bob's moved.
+func TestFiltersChangedFollowsSelfSourcesByAddress(t *testing.T) {
+	pol := []byte(`{"groups": {"group:g": ["alice@"]},
+		"acls": [{"action": "accept", "src": ["group:g"], "dst": ["autogroup:self:*"]}]}`)
+	alice, bob, carol := &sideUsers[0], &sideUsers[1], &sideUsers[2]
+
+	// carol's node is in no rule, so the change does not name every node.
+	nodes := types.Nodes{
+		sideNode(1, alice, "100.64.0.1", "", nil),
+		sideNode(2, bob, "100.64.0.1", "", nil),
+		sideNode(3, bob, "100.64.0.2", "", nil),
+		sideNode(4, carol, "100.64.0.3", "", nil),
+	}
+
+	pm, err := NewPolicyManager(pol, sideUsers, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	m := newSideModel(t, pm, sideUsers, nodes)
+	us := NewUserSets(nil, m.t.sel, sideUsers)
+	prev := FollowFilters(nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+
+	was, err := prev.ForNode(3)
+	require.NoError(t, err)
+	require.NotEmpty(t, was, "test sanity: b2 gets bob's self rule, named through b1's address")
+
+	moved := slices.Clone(nodes)
+	moved[0] = sideNode(1, alice, "100.64.0.5", "", nil)
+	m.step(t, us, moved)
+
+	next := FollowFilters(prev, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+	ids, all := next.Changed(prev)
+	require.False(t, all)
+	assert.Contains(t, ids, types.NodeID(3), "b2's self rule went with the address that named bob")
+
+	is, err := next.ForNode(3)
+	require.NoError(t, err)
+	assert.Empty(t, is, "b2 is served its filter without the rule, not a carried one")
+}
+
+// TestFiltersChangedFollowsSelfRuleMergeKeys pins that an owner's self rule
+// merges at the first shared rule with its key: alice's self rule has the
+// sources group:g's rule has while group:g is alice alone, so on alice's
+// node it sits first, before the tag:t rule. Bob joining group:g moves
+// that rule's key away, and the self rule falls back behind, though
+// nothing alice's node holds, or is named by, moved.
+func TestFiltersChangedFollowsSelfRuleMergeKeys(t *testing.T) {
+	doc := func(members string) []byte {
+		return fmt.Appendf(nil, `{"groups": {"group:g": [%s]},
+		"tagOwners": {"tag:x": [], "tag:t": []},
+		"acls": [{"action": "accept", "src": ["group:g"], "dst": ["tag:x:22"]},
+			{"action": "accept", "src": ["tag:t"], "dst": ["alice@:80"]},
+			{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:443"]}]}`, members)
+	}
+	alice, bob, carol := &sideUsers[0], &sideUsers[1], &sideUsers[2]
+
+	nodes := types.Nodes{
+		sideNode(1, alice, "100.64.0.1", "", nil),
+		sideNode(2, bob, "100.64.0.2", "", nil),
+		sideNode(3, nil, "100.64.0.3", "", []string{"tag:x"}),
+		sideNode(4, nil, "100.64.0.4", "", []string{"tag:t"}),
+		sideNode(5, carol, "100.64.0.5", "", nil),
+	}
+
+	pm, err := NewPolicyManager(doc(`"alice@"`), sideUsers, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	m := newSideModel(t, pm, sideUsers, nodes)
+	us := NewUserSets(nil, m.t.sel, sideUsers)
+	prev := FollowFilters(nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+
+	ports := func(rules []tailcfg.FilterRule) []uint16 {
+		out := make([]uint16, 0, len(rules))
+		for _, r := range rules {
+			out = append(out, r.DstPorts[0].Ports.First)
+		}
+
+		return out
+	}
+
+	was, err := prev.ForNode(1)
+	require.NoError(t, err)
+	require.Equal(t, []uint16{443, 80}, ports(was), "test sanity: the self rule sits where group:g's rule does")
+
+	_, ok := m.edit(t, us, doc(`"alice@", "bob@"`))
+	require.True(t, ok)
+
+	next := FollowFilters(prev, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+	ids, all := next.Changed(prev)
+	require.False(t, all)
+	assert.Contains(t, ids, types.NodeID(1), "the self rule's merged position moved")
+
+	is, err := next.ForNode(1)
+	require.NoError(t, err)
+	assert.Equal(t, []uint16{80, 443}, ports(is), "alice's node is served the reordered filter, not a carried one")
+}
+
+// TestFiltersChangedFollowsSelfNamedNodes pins that a self rule's sources
+// are the owner's nodes a source names by address: b1, holding alice's
+// address, is bob's only named node, and the source of the rule b2 gets.
+// b1 moving to an address of its own takes that rule from b2, though no
+// source's members moved and b2 did not.
+func TestFiltersChangedFollowsSelfNamedNodes(t *testing.T) {
+	pol := []byte(`{"groups": {"group:g": ["alice@"]},
+		"acls": [{"action": "accept", "src": ["group:g"], "dst": ["autogroup:self:*"]}]}`)
+	alice, bob, carol := &sideUsers[0], &sideUsers[1], &sideUsers[2]
+
+	nodes := types.Nodes{
+		sideNode(1, alice, "100.64.0.1", "", nil),
+		sideNode(2, bob, "100.64.0.1", "", nil),
+		sideNode(3, bob, "100.64.0.2", "", nil),
+		sideNode(4, carol, "100.64.0.3", "", nil),
+	}
+
+	pm, err := NewPolicyManager(pol, sideUsers, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	m := newSideModel(t, pm, sideUsers, nodes)
+	us := NewUserSets(nil, m.t.sel, sideUsers)
+	prev := FollowFilters(nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+
+	was, err := prev.ForNode(3)
+	require.NoError(t, err)
+	require.NotEmpty(t, was, "test sanity: b2 gets bob's self rule, from b1")
+
+	moved := slices.Clone(nodes)
+	moved[1] = sideNode(2, bob, "100.64.0.6", "", nil)
+	m.step(t, us, moved)
+
+	next := FollowFilters(prev, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+	ids, all := next.Changed(prev)
+	require.False(t, all)
+	assert.Contains(t, ids, types.NodeID(3), "b2's self rule went with b1's address")
+
+	is, err := next.ForNode(3)
+	require.NoError(t, err)
+	assert.Empty(t, is, "b2 is served its filter without the rule, not a carried one")
+}
+
+// TestFiltersChangedFollowsMovedDestinations moves a rule's destination
+// from tag:a to tag:b, both named elsewhere, so the selectors stay those of
+// the document before: tag:a's holders lose the rule, though no source,
+// member or merge position moved.
+func TestFiltersChangedFollowsMovedDestinations(t *testing.T) {
+	doc := func(dst string) []byte {
+		return fmt.Appendf(nil, `{"tagOwners": {"tag:a": [], "tag:b": []},
+		"acls": [{"action": "accept", "src": ["alice@"], "dst": ["%s:22"]},
+			{"action": "accept", "src": ["bob@"], "dst": ["tag:b:80"]},
+			{"action": "accept", "src": ["bob@"], "dst": ["tag:a:443"]}]}`, dst)
+	}
+	alice, bob, carol := &sideUsers[0], &sideUsers[1], &sideUsers[2]
+
+	nodes := types.Nodes{
+		sideNode(1, alice, "100.64.0.1", "", nil),
+		sideNode(2, bob, "100.64.0.2", "", nil),
+		sideNode(3, nil, "100.64.0.3", "", []string{"tag:a"}),
+		sideNode(4, nil, "100.64.0.4", "", []string{"tag:b"}),
+		sideNode(5, carol, "100.64.0.5", "", nil),
+	}
+
+	pm, err := NewPolicyManager(doc("tag:a"), sideUsers, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	m := newSideModel(t, pm, sideUsers, nodes)
+	us := NewUserSets(nil, m.t.sel, sideUsers)
+	prev := FollowFilters(nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+
+	for _, n := range m.list {
+		_, err := prev.ForNode(n.ID)
+		require.NoError(t, err)
+	}
+
+	table := m.t.table()
+
+	_, ok := m.edit(t, us, doc("tag:b"))
+	require.True(t, ok)
+	require.Same(t, table, m.t.table(), "test sanity: the document names the same selectors")
+
+	next := FollowFilters(prev, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+	ids, all := next.Changed(prev)
+	require.False(t, all)
+	assert.Contains(t, ids, types.NodeID(3), "tag:a's holder lost the rule")
+	assert.Contains(t, ids, types.NodeID(4), "tag:b's holder gained it")
+
+	for _, id := range []types.NodeID{3, 4} {
+		served, err := next.ForNode(id)
+		require.NoError(t, err)
+
+		want, err := next.Uncached().ForNode(id)
+		require.NoError(t, err)
+		assert.Equal(t, want, served, "node %d is served its new filter, not a carried one", id)
+	}
+}
+
+// TestFiltersChangedNamesOnlySelfOwnersSharingAKey joins a member under a
+// grant from every member and a self grant: the member grant's sources,
+// and so its merge key, move, but no owner holds every member's address,
+// so no other owner's self rule can share it. Only what the join reaches
+// is named: the grant's destinations, the joiner's owner and the joiner.
+func TestFiltersChangedNamesOnlySelfOwnersSharingAKey(t *testing.T) {
+	pol := []byte(`{"tagOwners": {"tag:server": []},
+		"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["tag:server:*"]},
+			{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]}]}`)
+	alice, bob, carol := &sideUsers[0], &sideUsers[1], &sideUsers[2]
+
+	nodes := types.Nodes{
+		sideNode(1, nil, "100.64.0.1", "", []string{"tag:server"}),
+		sideNode(2, nil, "100.64.0.2", "", []string{"tag:server"}),
+		sideNode(3, alice, "100.64.0.3", "", nil),
+		sideNode(4, alice, "100.64.0.4", "", nil),
+		sideNode(5, bob, "100.64.0.5", "", nil),
+		sideNode(6, bob, "100.64.0.6", "", nil),
+		sideNode(7, carol, "100.64.0.7", "", nil),
+		sideNode(8, carol, "100.64.0.8", "", nil),
+	}
+
+	pm, err := NewPolicyManager(pol, sideUsers, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	m := newSideModel(t, pm, sideUsers, nodes)
+	us := NewUserSets(nil, m.t.sel, sideUsers)
+	prev := FollowFilters(nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+
+	m.step(t, us, append(slices.Clone(nodes), sideNode(9, alice, "100.64.0.9", "", nil)))
+
+	next := FollowFilters(prev, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+	ids, all := next.Changed(prev)
+	require.False(t, all)
+	assert.Equal(t, []types.NodeID{1, 2, 3, 4, 9}, ids)
+}
+
+// TestSSHPolicyAfreshFillsNoCache pins that an audit's SSH read leaves the
+// compile as it was: SSH routing says every node may have moved until a
+// session has asked the compile for SSH, so a read that prepared it would
+// narrow what it measures.
+func TestSSHPolicyAfreshFillsNoCache(t *testing.T) {
+	pol := []byte(`{"tagOwners": {"tag:a": []},
+		"ssh": [{"action": "accept", "src": ["alice@"], "dst": ["tag:a"], "users": ["root"]}]}`)
+	nodes := types.Nodes{
+		sideNode(1, &sideUsers[0], "100.64.0.1", "", nil),
+		sideNode(2, nil, "100.64.0.2", "", []string{"tag:a"}),
+	}
+
+	pm, err := NewPolicyManager(pol, sideUsers, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	afresh, err := pm.SSHPolicyAfresh("https://headscale.test", nodes[1].View())
+	require.NoError(t, err)
+	require.NotEmpty(t, afresh.Rules, "test sanity: the destination has SSH rules")
+
+	assert.Zero(t, pm.sshPreps.Size(), "no rules prepared")
+	assert.Zero(t, pm.sshPolicyMap.Size(), "no policy cached")
+
+	next, err := NewPolicyManagerFrom(pm, pol, sideUsers, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	_, all := next.SSHChangedNodes(pm)
+	assert.True(t, all, "routing still cannot tell")
+
+	cached, err := pm.SSHPolicy("https://headscale.test", nodes[1].View())
+	require.NoError(t, err)
+	assert.Equal(t, afresh, cached, "the same policy either way")
 }

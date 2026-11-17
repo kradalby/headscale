@@ -1338,7 +1338,8 @@ func (g sideGen) policy() []byte {
 	"acls": [%s], "grants": [%s]}`, strings.Join(rules, ",\n\t\t"), strings.Join(grants, ",\n\t\t"))
 }
 
-func (g sideGen) node(id types.NodeID) *types.Node {
+// addrs are the addresses nodes draw from: few, so they share them.
+func (g sideGen) addrs() ([]string, []string) {
 	v4 := []string{"100.64.0.1", "100.64.0.2", "100.64.0.3", "100.64.0.4", "100.64.0.5", "10.0.0.5"}
 	v6 := []string{"fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2", "fd7a:115c:a1e0::3"}
 
@@ -1346,6 +1347,12 @@ func (g sideGen) node(id types.NodeID) *types.Node {
 		v4 = append(v4, "8.8.8.1", "8.8.8.2", "8.8.8.9", "192.168.0.6")
 		v6 = append(v6, "2606:4700::1")
 	}
+
+	return v4, v6
+}
+
+func (g sideGen) node(id types.NodeID) *types.Node {
+	v4, v6 := g.addrs()
 
 	var user *types.User
 
@@ -1436,6 +1443,55 @@ func describeNodes(nodes types.Nodes) string {
 	return b.String()
 }
 
+// requireRouteRulesSame holds [RouteRules.Same] to what it stands for:
+// across a step that keeps the route rules, every viewer whose node, side
+// set and facts are the same is given the same routes by every router whose
+// node and routes' cover are the same, as routing assumes in waking none of
+// them. It returns how many pairs it held.
+func requireRouteRulesSame(t *testing.T, was, is Sides, wasList, isList types.Nodes, via *ViaPlan, where ...any) int {
+	t.Helper()
+
+	if !is.RouteRules(via).Same(was.RouteRules(via)) {
+		return 0
+	}
+
+	unchanged := func(moved []types.NodeID) map[types.NodeID]*types.Node {
+		out := map[types.NodeID]*types.Node{}
+
+		for _, a := range wasList {
+			for _, b := range isList {
+				if a == b && !slices.Contains(moved, a.ID) {
+					out[a.ID] = a
+				}
+			}
+		}
+
+		return out
+	}
+
+	viewers, routers := unchanged(is.ViewersMovedSince(was)), unchanged(is.RoutersMovedSince(was.RouteCover()))
+
+	held := 0
+
+	for vid := range viewers {
+		for _, r := range routers {
+			routes := slices.Concat(r.SubnetRoutes(), r.ExitRoutes())
+			if r.ID == vid || len(routes) == 0 {
+				continue
+			}
+
+			before, after := was.RouteAccess(vid, routes), is.RouteAccess(vid, routes)
+			if !slices.Equal(before, after) {
+				t.Fatalf("%v: the route rules are the same, but viewer %d is given %v of router %d's routes, was %v", where, vid, after, r.ID, before)
+			}
+
+			held++
+		}
+	}
+
+	return held
+}
+
 // TestSidesRandomDifferential draws compilable policies and topologies at
 // random and holds the role-based visibility, route access and steering,
 // built from scratch and then moved by coalesced joins, leaves and
@@ -1472,6 +1528,9 @@ func TestSidesRandomDifferential(t *testing.T) {
 			var (
 				rep      SidesReport
 				compiled int
+				// keptPairs counts the pairs held to their routes across a
+				// step that kept the route rules.
+				keptPairs int
 			)
 
 			for round := range rounds {
@@ -1494,7 +1553,10 @@ func TestSidesRandomDifferential(t *testing.T) {
 
 				for step := range 4 {
 					if step > 0 {
+						was, wasList := m.sides, m.list
 						m.step(t, us, g.step(m.list))
+						keptPairs += requireRouteRulesSame(t, was, m.sides, wasList, m.list, m.via.Plan,
+							"seed", seed, "public", public, "round", round, "step", step)
 					}
 
 					got, err := m.audit()
@@ -1546,6 +1608,8 @@ func TestSidesRandomDifferential(t *testing.T) {
 				"named by address only": rep.NamedByAddressOnly, "unaddressed covering own": rep.UnaddressedCoveringOwn,
 				"routes kept": rep.RoutesKept,
 			}
+			shapes["pairs kept with the route rules"] = keptPairs
+
 			if public {
 				shapes["public"] = rep.Public
 				shapes["public route"] = rep.PublicRoute

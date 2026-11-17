@@ -447,6 +447,27 @@ func (pm *PolicyManager) SSHPolicy(baseURL string, node types.NodeView) (*tailcf
 	return sshPol, nil
 }
 
+// SSHPolicyAfresh is [PolicyManager.SSHPolicy] filling none of its caches:
+// for an audit, since which rules SSH prepared is what
+// [PolicyManager.SSHChangedNodes] compares.
+func (pm *PolicyManager) SSHPolicyAfresh(baseURL string, node types.NodeView) (*tailcfg.SSHPolicy, error) {
+	if sshPol, ok := pm.sshPolicyMap.Load(sshKey{baseURL, node.ID()}); ok {
+		return sshPol, nil
+	}
+
+	prep, ok := pm.sshPreps.Load(baseURL)
+	if !ok {
+		var err error
+
+		prep, err = pm.pol.prepareSSH(baseURL, pm.users, pm.nodes)
+		if err != nil {
+			return nil, fmt.Errorf("compiling SSH policy: %w", err)
+		}
+	}
+
+	return prep.forNode(node), nil
+}
+
 // SSHCheckParams resolves the SSH check period for src logging in to dst
 // as localUser by looking up the current policy. This avoids trusting URL
 // parameters that a client could tamper with. First-match wins across
@@ -837,6 +858,31 @@ func notUserSource(a Alias) bool {
 	}
 }
 
+// SSHChangedNodes returns the nodes whose SSH policy can differ between
+// prev and pm, any two compiles, or all when it cannot tell: the compile
+// serves SSH, so it alone can say whom an SSH change reaches. Either side
+// nil, as when no policy has compiled, sets all.
+func (pm *PolicyManager) SSHChangedNodes(prev *PolicyManager) ([]types.NodeID, bool) {
+	switch {
+	case pm == prev:
+		return nil, false
+	case pm == nil || prev == nil:
+		return nil, true
+	case !pm.HasSSH() && !prev.HasSSH():
+		return nil, false
+	case pm.pol == nil || prev.pol == nil:
+		return nil, true
+	}
+
+	return pm.sshChangedNodes(prev)
+}
+
+// HasSSH reports whether pm's policy has SSH rules: without, every node is
+// sent the same empty SSH policy whatever the nodes.
+func (pm *PolicyManager) HasSSH() bool {
+	return pm != nil && pm.pol != nil && len(pm.pol.SSHs) > 0
+}
+
 // sshChangedNodes returns the nodes whose SSH policy can differ between
 // prev and pm: for every rule that prepared differently, the nodes in its
 // destinations, the users' own nodes for autogroup:self, and its sources
@@ -1095,8 +1141,10 @@ var compileIDs atomic.Uint64
 // SameForPeers reports whether pm and prev render every node as a peer
 // the same: neither has per-node rules (autogroup:self, via), so peer
 // visibility and routes read only the global filter, and both hold the
-// same filter and node capabilities. A recompile after a join usually
-// does, and then no session needs to look at its peers again.
+// same filter and node capabilities.
+//
+// TODO(capsrc/compile): change routing reads the served cells, not this;
+// it goes with the compile's filter.
 func (pm *PolicyManager) SameForPeers(prev *PolicyManager) bool {
 	return pm != nil && prev != nil &&
 		!pm.needsPerNodeFilter && !prev.needsPerNodeFilter &&
@@ -1356,6 +1404,10 @@ func (c *PeerClasses) Changed(old *PeerClasses) []types.NodeID {
 		c.nodes(func(id types.NodeID, _ []types.NodeID) { out = append(out, id) })
 
 		return out
+	}
+
+	if c.keyed != nil && old.keyed != nil {
+		return c.keyed.changedSince(old.keyed)
 	}
 
 	if c.keyed != nil || old.keyed != nil {

@@ -5,19 +5,25 @@ import (
 	jsonv1 "encoding/json"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
+	"errors"
+	"fmt"
 	"io"
 	"reflect"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"weak"
 
 	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/rs/zerolog/log"
 	"tailscale.com/tailcfg"
 )
 
@@ -87,6 +93,8 @@ func (st *Stream) Initial(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) 
 	st.sent = nm
 	nm.base = nil
 
+	st.record(snap)
+
 	st.pending = &sentView{ids: st.r.lastPeerIDs, rev: snap.Rev()}
 	st.hub.mayHavePeers(st.sess, st.nodeID, *st.pending)
 	st.dump(out)
@@ -116,6 +124,8 @@ func (st *Stream) Update(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) {
 	// this stream ever made.
 	nm.base = nil
 
+	st.record(snap)
+
 	if len(out) > 0 {
 		if peersMoved {
 			st.pending = &sentView{ids: st.r.lastPeerIDs, rev: snap.Rev()}
@@ -126,6 +136,14 @@ func (st *Stream) Update(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) {
 	}
 
 	return out, nil
+}
+
+// record keeps, under the policy audit, what the session now holds for
+// the hub's route audit.
+func (st *Stream) record(snap *state.Snapshot) {
+	if st.sess != nil && state.PolicyAudit() {
+		st.sess.sent.Store(&sentRecord{nm: st.sent, rev: snap.Rev(), cfg: st.cfg, capVer: st.r.capVer})
+	}
 }
 
 // peerSetChanged reports whether nm sees other peers than its base.
@@ -409,6 +427,20 @@ type Session struct {
 	// its node was deleted; a write still in flight then records nothing.
 	left     bool
 	admitted uint64
+
+	// woken is, under the policy audit and the hub's lock, the latest
+	// commit that woke the session; sent what its stream last rendered.
+	woken uint64
+	sent  atomic.Pointer[sentRecord]
+}
+
+// sentRecord is what a session's stream rendered, at which commit, for
+// the route audit.
+type sentRecord struct {
+	nm     *netMap
+	rev    uint64
+	cfg    *types.Config
+	capVer tailcfg.CapabilityVersion
 }
 
 // Pings delivers ping requests for the session's node.
@@ -559,7 +591,17 @@ func (h *Hub) watch(s *state.State, sub *graph.Subscription, last *state.Snapsho
 			}
 		}
 
-		h.wake(all, wake)
+		if !state.PolicyAudit() {
+			h.wake(all, wake)
+
+			continue
+		}
+
+		h.wakeAt(all, wake, snap.Rev())
+
+		if !all {
+			h.auditRoutes(snap, wake)
+		}
 	}
 }
 
@@ -636,12 +678,14 @@ func (h *Hub) advance(snap *state.Snapshot) {
 // peers and what every map reads, so a change reaches
 //   - every node, when something every map reads changed;
 //   - a node, when it changed, gained or lost a primary route, its peers
-//     or its policy capabilities changed, or a recompile can have changed
-//     its filter;
+//     or its policy capabilities changed, its packet filter or SSH policy
+//     can have changed, or its side set or side facts did, which the
+//     routes every peer offers it read;
 //   - a node's peers before and after, when it changed, its primary
-//     routes moved or its capabilities changed;
-//   - after a recompile, the peers of every node serving routes, as the
-//     routes a viewer is sent come from the policy.
+//     routes moved, its capabilities changed, or it serves a route whose
+//     cover moved, which the routes it offers them read;
+//   - the peers of every node serving routes, when what every route reads
+//     moved.
 //
 // Peer visibility is symmetric, so a node's peers are the nodes that see
 // it. An online flip needs no check of the node's role (router, relay,
@@ -674,20 +718,11 @@ func Route(old, cur *state.Snapshot, c state.Change) (bool, map[types.NodeID]str
 	add(c.PeerSets)
 	add(c.Filters)
 	add(c.Caps)
+	add(c.RouteViewers)
 
-	viewed := [][]types.NodeID{nodes, c.Primaries, c.Caps}
+	viewed := [][]types.NodeID{nodes, c.Primaries, c.Caps, c.Routers}
 
-	// The routes a viewer is served read side sets, routers' cover counts
-	// and the via plan; they move only with a compile that renders peers
-	// differently, so any other recompile would wake routers to send
-	// nothing.
-	//
-	// TODO(capsrc/routing): the compile's revision stands for those inputs
-	// while it moves with membership. Routing on roles replaces it.
-	if old.PeerPolicyRev() != cur.PeerPolicyRev() {
-		add(old.RoutedNodes())
-		add(cur.RoutedNodes())
-
+	if c.AllRouters {
 		viewed = append(viewed, old.RoutedNodes(), cur.RoutedNodes())
 	}
 
@@ -732,14 +767,27 @@ func reachedViews(old, cur *state.Snapshot, ids ...[]types.NodeID) [][]types.Nod
 }
 
 // wake wakes every session, or the sessions of the nodes in ids.
-func (h *Hub) wake(all bool, ids map[types.NodeID]struct{}) {
+func (h *Hub) wake(all bool, ids map[types.NodeID]struct{}) { h.wakeAt(all, ids, 0) }
+
+// wakeAt is [Hub.wake] for commit rev, which the route audit tells the
+// sessions still to render it by; zero, as without the audit, records
+// nothing.
+func (h *Hub) wakeAt(all bool, ids map[types.NodeID]struct{}, rev uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	woke := func(s *Session) {
+		if rev != 0 {
+			s.woken = max(s.woken, rev)
+		}
+
+		s.wake()
+	}
 
 	if all {
 		for _, set := range h.sessions {
 			for s := range set {
-				s.wake()
+				woke(s)
 			}
 		}
 
@@ -748,9 +796,159 @@ func (h *Hub) wake(all bool, ids map[types.NodeID]struct{}) {
 
 	for id := range ids {
 		for s := range h.sessions[id] {
-			s.wake()
+			woke(s)
 		}
 	}
+}
+
+var (
+	routeAuditRuns     atomic.Uint64
+	routeAuditFailures atomic.Uint64
+)
+
+// RouteAuditRuns counts the sessions the route audit rendered afresh.
+func RouteAuditRuns() uint64 { return routeAuditRuns.Load() }
+
+// RouteAuditFailures counts the sessions the route audit found holding a
+// map other than a fresh render's.
+func RouteAuditFailures() uint64 { return routeAuditFailures.Load() }
+
+// auditRoutes holds routing to the snapshot, under the policy audit: every
+// session [Route] did not wake for snap, single or coalesced, and that
+// rendered no earlier than it was last woken, must hold what a fresh render
+// of snap gives, or a write it was never told of left it stale. A change
+// that wakes everyone is not audited: coalesced commits that moved anything
+// a map renders besides the nodes are such a change, so under load, when
+// commits coalesce, fewer are audited.
+//
+// A fresh render has render caches of its own and filters cut afresh, none
+// carried over on routing's word, and reads SSH without filling the
+// compile's caches, which SSH routing reads; it shares only the snapshot's
+// lazily built values, which no routing decision reads. What sessions hold
+// is immutable once recorded, and the renders run on the hub's goroutine,
+// after waking, under no lock commits wait on.
+func (h *Hub) auditRoutes(snap *state.Snapshot, woken map[types.NodeID]struct{}) {
+	type held struct {
+		id  types.NodeID
+		rec *sentRecord
+	}
+
+	var todo []held
+
+	h.mu.Lock()
+
+	for id, set := range h.sessions {
+		if _, ok := woken[id]; ok {
+			continue
+		}
+
+		for s := range set {
+			if rec := s.sent.Load(); !s.left && rec != nil && rec.rev >= s.woken && rec.rev <= snap.Rev() {
+				todo = append(todo, held{id: id, rec: rec})
+			}
+		}
+	}
+
+	h.mu.Unlock()
+
+	if len(todo) == 0 {
+		return
+	}
+
+	fresh := snap.Uncached()
+	caches := map[tailcfg.CapabilityVersion]*versionCache{}
+
+	for _, t := range todo {
+		pcv := peerCapVer(t.rec.capVer)
+		if caches[pcv] == nil {
+			caches[pcv] = &versionCache{}
+		}
+
+		out, err := freshDiff(t.rec.cfg, fresh, t.id, t.rec.capVer, t.rec.nm, caches[pcv])
+		if errors.Is(err, ErrNodeGone) {
+			continue
+		}
+
+		routeAuditRuns.Add(1)
+
+		if err != nil {
+			log.Error().Err(err).Uint64(zf.NodeID, t.id.Uint64()).Msg("policy audit: route: rendering afresh")
+
+			continue
+		}
+
+		if len(out) > 0 {
+			routeAuditFailures.Add(1)
+			log.Error().Uint64(zf.NodeID, t.id.Uint64()).Uint64("sent.rev", t.rec.rev).Uint64("rev", snap.Rev()).
+				Str("diff", describeResponses(out)).Msg("policy audit: route: a session routing did not wake holds a stale map")
+		}
+	}
+}
+
+// freshDiff renders node's map from snap with caches of its own, vc, and
+// returns what would bring a client holding sent to it: nothing when sent
+// is what the session should hold.
+func freshDiff(cfg *types.Config, snap *state.Snapshot, node types.NodeID, capVer tailcfg.CapabilityVersion, sent *netMap, vc *versionCache) ([]*tailcfg.MapResponse, error) {
+	r := &renderer{cfg: cfg, nodeID: node, capVer: capVer, peerCapVer: peerCapVer(capVer), renders: &vc.renders, classes: &vc.classes}
+
+	nm, err := r.render(snap)
+	if err != nil {
+		return nil, err
+	}
+
+	return diff(sent, nm, nil), nil
+}
+
+// describeResponses names what responses carry, for a log line.
+func describeResponses(resps []*tailcfg.MapResponse) string {
+	var parts []string
+
+	for _, r := range resps {
+		if r.Node != nil {
+			parts = append(parts, "self")
+		}
+
+		if r.PacketFilters != nil {
+			parts = append(parts, "filter")
+		}
+
+		if r.SSHPolicy != nil {
+			parts = append(parts, "ssh")
+		}
+
+		if r.DNSConfig != nil {
+			parts = append(parts, "dns")
+		}
+
+		if r.DERPMap != nil {
+			parts = append(parts, "derp")
+		}
+
+		if len(r.UserProfiles) > 0 {
+			parts = append(parts, "profiles")
+		}
+
+		for _, ids := range [][]tailcfg.NodeID{peerIDsOf(r.Peers), peerIDsOf(r.PeersChanged), r.PeersRemoved} {
+			if len(ids) > 0 {
+				parts = append(parts, fmt.Sprintf("peers%v", ids))
+			}
+		}
+
+		for _, p := range r.PeersChangedPatch {
+			parts = append(parts, fmt.Sprintf("patch[%d]", p.NodeID))
+		}
+	}
+
+	return strings.Join(parts, " ")
+}
+
+func peerIDsOf(nodes []*tailcfg.Node) []tailcfg.NodeID {
+	ids := make([]tailcfg.NodeID, 0, len(nodes))
+	for _, n := range nodes {
+		ids = append(ids, n.ID)
+	}
+
+	return ids
 }
 
 // forget ends the sessions of a deleted node and drops its hub state.
