@@ -1045,11 +1045,62 @@ func (pm *PolicyManager) filterChangedNodes(prev *PolicyManager, perNode bool) (
 		for _, r := range ranges {
 			out = append(out, idx.inRange(r)...)
 		}
+
+		if perNode {
+			out = append(out, m.selfMergingNodes(changed)...)
+		}
 	}
 
 	slices.Sort(out)
 
 	return slices.Compact(out), false
+}
+
+// selfMergingNodes returns the owner nodes whose autogroup:self rules can
+// merge with one of rules: a node's filter merges its own rules with the
+// shared ones at the first rule of each key, so a shared rule whose sources
+// change moves a merged self rule though it reaches none of the owner's
+// nodes. A self rule's sources are addresses of its owner's nodes, so only
+// an owner holding every source of a rule can have one with its key.
+func (pm *PolicyManager) selfMergingNodes(rules []tailcfg.FilterRule) []types.NodeID {
+	owners := map[netip.Addr][]uint{}
+
+	for uid, nodes := range pm.userNodeIdx {
+		for _, n := range nodes {
+			for _, ip := range n.IPs() {
+				owners[ip] = append(owners[ip], uid)
+			}
+		}
+	}
+
+	var out []types.NodeID
+
+	for _, rule := range rules {
+		var holding []uint
+
+		for i, src := range rule.SrcIPs {
+			ip, err := netip.ParseAddr(src)
+			if err != nil {
+				holding = nil
+
+				break
+			}
+
+			if i == 0 {
+				holding = slices.Clone(owners[ip])
+			} else {
+				holding = slices.DeleteFunc(holding, func(uid uint) bool { return !slices.Contains(owners[ip], uid) })
+			}
+		}
+
+		for _, uid := range holding {
+			for _, n := range pm.userNodeIdx[uid] {
+				out = append(out, n.ID())
+			}
+		}
+	}
+
+	return out
 }
 
 // changedRules returns the rules in only one of a and b.

@@ -7263,3 +7263,58 @@ func TestSideIndexCapacity(t *testing.T) {
 		})
 	}
 }
+
+// TestIncrementalCompileFollowsSelfMergeAnchors pins that the incremental
+// compile recomputes a node whose own autogroup:self rule merged with a
+// shared rule that never reaches it: a tag:a node joining changes that
+// rule's sources, so alice's self rule on 100.64.0.5 stops merging there and
+// moves behind the self app rule, though nothing alice's node holds moved.
+func TestIncrementalCompileFollowsSelfMergeAnchors(t *testing.T) {
+	t.Parallel()
+
+	pol := []byte(`{
+		"tagOwners": {"tag:a": []},
+		"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]}],
+		"grants": [
+			{"src": ["alice@", "tag:a"], "dst": ["100.64.0.0/30"], "ip": ["*"]},
+			{"src": ["autogroup:member"], "dst": ["autogroup:self"], "app": {"example.com/cap/x": [{}]}}
+		]
+	}`)
+
+	users := sideUsers
+	nodes := types.Nodes{
+		sideNode(1, &users[0], "100.64.0.1", "", nil),
+		sideNode(2, &users[0], "100.64.0.5", "", nil),
+		sideNode(3, &users[1], "100.64.0.6", "", nil),
+	}
+
+	pm, err := NewPolicyManager(pol, users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	// Every node's filter cached, as sessions read them.
+	for _, n := range nodes {
+		_, err := pm.FilterForNode(n.View())
+		require.NoError(t, err)
+	}
+
+	next := append(slices.Clone(nodes), sideNode(4, nil, "100.64.0.7", "", []string{"tag:a"}))
+
+	inc, err := NewPolicyManagerFrom(pm, pol, users, next.ViewSlice())
+	require.NoError(t, err)
+
+	fresh, err := NewPolicyManager(pol, users, next.ViewSlice())
+	require.NoError(t, err)
+
+	changed, _ := inc.FilterChangedNodes(pm)
+	require.Contains(t, changed, types.NodeID(2), "the node whose merged rule moved is named")
+
+	for _, n := range next {
+		got, err := inc.FilterForNode(n.View())
+		require.NoError(t, err)
+
+		want, err := fresh.FilterForNode(n.View())
+		require.NoError(t, err)
+
+		require.Equalf(t, want, got, "node %d: incremental compile against one from scratch", n.ID)
+	}
+}
