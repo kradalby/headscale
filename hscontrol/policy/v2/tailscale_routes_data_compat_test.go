@@ -1807,7 +1807,7 @@ func TestRoutesCompatPeerCapMap(t *testing.T) {
 					}
 
 					got := stripUnmodelledTailnetStateCaps(
-						PeerCapMap(peer.View(), capMaps[peer.ID]),
+						PeerCapMap(peer.View(), capMaps[peer.ID], false),
 					)
 					want := stripUnmodelledTailnetStateCaps(
 						capMapFromView(nmPeer.CapMap()),

@@ -1241,6 +1241,13 @@ func BenchmarkRouteAccess(b *testing.B) {
 type sideGen struct {
 	r      *rand.Rand
 	public bool
+
+	// facts, when set, draws what each node's client reports beyond the
+	// policy: its client, app connector and announced routes; sparse
+	// draws from more addresses and gives fewer nodes routes, so most
+	// nodes are sent capabilities.
+	facts  *rand.Rand
+	sparse bool
 }
 
 func (g sideGen) pick(from ...string) string { return from[g.r.IntN(len(from))] }
@@ -1326,7 +1333,14 @@ func (g sideGen) policy() []byte {
 		case 2:
 			parts = append(parts, `"ip": ["*"]`, `"app": {"tailscale.com/cap/relay": [{}]}`)
 		default:
-			parts = append(parts, fmt.Sprintf(`"ip": [%q]`, g.pick("*", "tcp:22")))
+			ip := g.pick("*", "tcp:22")
+			if g.facts != nil && g.facts.IntN(5) == 0 {
+				// A protocol without ports, which the client matches by
+				// address only.
+				ip = "gre:*"
+			}
+
+			parts = append(parts, fmt.Sprintf(`"ip": [%q]`, ip))
 		}
 
 		grants = append(grants, fmt.Sprintf(`{"src": %s, "dst": %s, %s}`, quoted(src), quoted(dst), strings.Join(parts, ", ")))
@@ -1346,6 +1360,13 @@ func (g sideGen) addrs() ([]string, []string) {
 	if g.public {
 		v4 = append(v4, "8.8.8.1", "8.8.8.2", "8.8.8.9", "192.168.0.6")
 		v6 = append(v6, "2606:4700::1")
+	}
+
+	if g.sparse {
+		for i := 6; i < 40; i++ {
+			v4 = append(v4, fmt.Sprintf("100.64.0.%d", i))
+			v6 = append(v6, fmt.Sprintf("fd7a:115c:a1e0::%x", i))
+		}
 	}
 
 	return v4, v6
@@ -1381,6 +1402,10 @@ func (g sideGen) node(id types.NodeID) *types.Node {
 	var routes []string
 
 	n := g.r.IntN(3)
+	if g.sparse && g.r.IntN(4) > 0 {
+		n = 0
+	}
+
 	if slices.Contains(tags, "tag:r") {
 		n++
 	}
@@ -1404,7 +1429,28 @@ func (g sideGen) node(id types.NodeID) *types.Node {
 		node.Tags = tags
 	}
 
+	g.clientFacts(node)
+
 	return node
+}
+
+// clientFacts draws, when g draws facts, what n's client reports of
+// itself: mostly the official client; else tailscale-rs, a client that
+// says nothing, or an app connector.
+func (g sideGen) clientFacts(n *types.Node) {
+	if g.facts == nil {
+		return
+	}
+
+	switch g.facts.IntN(10) {
+	case 0:
+		n.Hostinfo.App = "tailscale-rs"
+	case 1:
+	case 2:
+		officialHostinfo(n.Hostinfo).AppConnector.Set(true)
+	default:
+		officialHostinfo(n.Hostinfo)
+	}
 }
 
 // step is one to three joins, leaves and replacements, coalesced.
@@ -1516,14 +1562,30 @@ func TestSidesRandomDifferential(t *testing.T) {
 		rounds = 40
 	}
 
-	for _, public := range []bool{false, true} {
-		t.Run(fmt.Sprintf("public=%t", public), func(t *testing.T) {
-			var stream uint64
-			if public {
-				stream = 1
-			}
+	// The capability variants also hold every node's capability form to
+	// its address form through the client (check D); sparse ones give
+	// fewer nodes routes and shared addresses, so most are sent
+	// capabilities.
+	variants := []struct {
+		public, caps, sparse bool
+		stream               uint64
+	}{
+		{stream: 0},
+		{public: true, stream: 1},
+		{caps: true, stream: 10},
+		{caps: true, sparse: true, stream: 11},
+		{public: true, caps: true, stream: 12},
+		{public: true, caps: true, sparse: true, stream: 13},
+	}
 
-			g := sideGen{r: rand.New(rand.NewPCG(seed, stream)), public: public} //nolint:gosec // reproducible
+	for _, v := range variants {
+		public := v.public
+
+		t.Run(fmt.Sprintf("public=%t/caps=%t/sparse=%t", v.public, v.caps, v.sparse), func(t *testing.T) {
+			g := sideGen{r: rand.New(rand.NewPCG(seed, v.stream)), public: public, sparse: v.sparse} //nolint:gosec // reproducible
+			if v.caps {
+				g.facts = rand.New(rand.NewPCG(seed, v.stream+100)) //nolint:gosec // reproducible
+			}
 
 			var (
 				rep      SidesReport
@@ -1531,6 +1593,7 @@ func TestSidesRandomDifferential(t *testing.T) {
 				// keptPairs counts the pairs held to their routes across a
 				// step that kept the route rules.
 				keptPairs int
+				reach     = capReach{}
 			)
 
 			for round := range rounds {
@@ -1574,7 +1637,7 @@ func TestSidesRandomDifferential(t *testing.T) {
 						want, err := m.pm.FilterForNode(n.View())
 						require.NoError(t, err)
 
-						served, err := filters.ForNode(n.ID)
+						served, err := filters.ForNode(n.ID, ReceiverFacts{})
 						require.NoError(t, err)
 
 						if !reflect.DeepEqual(want, served) {
@@ -1584,7 +1647,25 @@ func TestSidesRandomDifferential(t *testing.T) {
 					}
 
 					requireServedAgreesWithGlobal(t, filters, m.list.ViewSlice(), "seed", seed, "public", public, "round", round, "step", step)
+
+					if v.caps {
+						cm := newCapModel(t, m)
+						for _, n := range m.list {
+							p := cm.requireCapEquivalent(t, n.ID, "HEADSCALE_SIDES_SEED", seed, "round", round, "step", step, "policy", string(pol), "nodes", describeNodes(m.list))
+							cm.reach(t, n.ID, p, reach)
+						}
+					}
 				}
+			}
+
+			if v.caps {
+				t.Logf("capability form held to address form: %v", reach)
+
+				if !testing.Short() {
+					reach.require(t)
+				}
+
+				return
 			}
 
 			checked, own := agreementOf(t)

@@ -438,18 +438,18 @@ func TestFiltersServeTheirOwnNodes(t *testing.T) {
 	x, roles := expansionOf(t, pm, users, nodeMapOf(nodes))
 	f := NewFilters(x.t, Postings{}.Update(roles), SubnetApprovals{}.Update(nodeMapOf(nodes)), nodes.ViewSlice())
 
-	first, err := f.ForNode(nodes[0].ID)
+	first, err := f.ForNode(nodes[0].ID, ReceiverFacts{})
 	require.NoError(t, err)
 
 	want, err := pm.FilterForNode(nodes[0].View())
 	require.NoError(t, err)
 	require.Equal(t, want, first)
 
-	again, err := f.ForNode(nodes[0].ID)
+	again, err := f.ForNode(nodes[0].ID, ReceiverFacts{})
 	require.NoError(t, err)
 	assert.Same(t, &first[0], &again[0], "readers of one node share its filter")
 
-	_, err = f.ForNode(99)
+	_, err = f.ForNode(99, ReceiverFacts{})
 	require.ErrorIs(t, err, errUnlisted)
 
 	global, err := f.Global()
@@ -494,14 +494,30 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 		{`"hnet": "10.0.0.0/24"`, `"hnet": "10.0.0.0/16"`},
 	}
 
-	for _, public := range []bool{false, true} {
-		t.Run(fmt.Sprintf("public=%t", public), func(t *testing.T) {
-			var stream uint64 = 2
-			if public {
-				stream = 3
+	// The capability variants serve capability form, with client facts
+	// drawn and flipped; sparse ones send most nodes capabilities.
+	variants := []struct {
+		public, caps, sparse bool
+		stream               uint64
+	}{
+		{stream: 2}, {public: true, stream: 3}, {caps: true, stream: 12}, {caps: true, sparse: true, stream: 13},
+	}
+
+	for _, v := range variants {
+		public := v.public
+
+		t.Run(fmt.Sprintf("public=%t/caps=%t/sparse=%t", v.public, v.caps, v.sparse), func(t *testing.T) {
+			g := sideGen{r: rand.New(rand.NewPCG(seed, v.stream)), public: public, sparse: v.sparse} //nolint:gosec // reproducible
+			if v.caps {
+				g.facts = rand.New(rand.NewPCG(seed, v.stream+100)) //nolint:gosec // reproducible
 			}
 
-			g := sideGen{r: rand.New(rand.NewPCG(seed, stream)), public: public} //nolint:gosec // reproducible
+			// mode is how the filters name sources; recv each state's
+			// receiver facts, which choose a receiver's form when read.
+			mode := AddressSources
+			if v.caps {
+				mode = CapabilitySources
+			}
 
 			var moved, named, kept, carried, multiHop, unreadNodes, unread int
 
@@ -522,7 +538,8 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 
 				m := newSideModel(t, pm, sideUsers, nodes)
 				us := NewUserSets(nil, m.t.sel, sideUsers)
-				prev := FollowFilters(nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+				prev := FollowFiltersFor(mode, nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+				prevRecv := modelReceivers(v.caps, m)
 
 				// gen counts the filters followed; read, by node, the last
 				// one its filter was read from.
@@ -532,7 +549,7 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 				// Every node read, as sessions read theirs, so there is a
 				// cache to carry over.
 				for _, n := range m.list {
-					_, err := prev.ForNode(n.ID)
+					_, err := prev.ForNode(n.ID, prevRecv.Of(n.ID))
 					require.NoError(t, err)
 
 					read[n.ID] = gen
@@ -548,20 +565,28 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 
 					us = after
 
-					next := FollowFilters(prev, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+					next := FollowFiltersFor(mode, prev, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+					nextRecv := modelReceivers(v.caps, m)
 					gen++
 
 					// A commit nobody routes or reads: the next filters carry
 					// from what these would have.
 					if g.r.IntN(4) == 0 {
-						prev = next
+						prev, prevRecv = next, nextRecv
 						unread++
 
 						continue
 					}
 
+					// As Since routes them: what the filters say moved, and
+					// the nodes whose facts moved, served their other form.
 					ids, all := next.Changed(prev)
-					narrow := routeFilters(prev, next, true)
+					flipped := nextRecv.ChangedSince(prevRecv)
+					ids = slices.Compact(slices.Sorted(slices.Values(slices.Concat(ids, flipped))))
+					narrow := routeFilters(prev, next, func(end int, id types.NodeID) ReceiverFacts {
+						return [2]Receivers{prevRecv, nextRecv}[end].Of(id)
+					})
+					narrow.ids = slices.Compact(slices.Sorted(slices.Values(slices.Concat(narrow.ids, flipped))))
 
 					fail := func(format string, args ...any) {
 						t.Helper()
@@ -571,9 +596,11 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 
 					freshOld, freshNew := prev.Uncached(), next.Uncached()
 
+					capRoutingReach(v.caps, prevRecv, nextRecv, ids, all, narrow, m.list, reach)
+
 					for _, n := range slices.Concat(was, m.list) {
-						before, errBefore := freshOld.ForNode(n.ID)
-						after, errAfter := freshNew.ForNode(n.ID)
+						before, errBefore := freshOld.ForNode(n.ID, prevRecv.Of(n.ID))
+						after, errAfter := freshNew.ForNode(n.ID, nextRecv.Of(n.ID))
 
 						_, listed := slices.BinarySearch(ids, n.ID)
 
@@ -604,7 +631,7 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 							continue
 						}
 
-						served, err := next.ForNode(n.ID)
+						served, err := next.ForNode(n.ID, nextRecv.Of(n.ID))
 						require.NoError(t, err)
 
 						if !reflect.DeepEqual(after, served) {
@@ -622,7 +649,7 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 						read[n.ID] = gen
 					}
 
-					prev = next
+					prev, prevRecv = next, nextRecv
 				}
 			}
 
@@ -641,13 +668,48 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 				return
 			}
 
-			for _, kind := range []string{
+			kinds := []string{
 				"single node fact", "user renamed", "edit keeping the selectors",
 				"edit: swap", "edit: src", "edit: dst", "edit: ports", "edit: proto", "edit: app", "edit: via", "edit: host", "edit: group",
-			} {
+			}
+			if v.caps {
+				kinds = append(kinds, "receiver form flipped", "capability pairs left out by narrow routing")
+			}
+
+			for _, kind := range kinds {
 				assert.Positive(t, reach[kind], "%s reached", kind)
 			}
 		})
+	}
+}
+
+// modelReceivers is every node's facts in m's current state, none unless
+// caps.
+func modelReceivers(caps bool, m *sideModel) Receivers {
+	if !caps {
+		return Receivers{}
+	}
+
+	return capReceivers(m.nodes, m.pm.NodeCapMaps())
+}
+
+// capRoutingReach counts, in capability mode, the receivers whose form
+// flipped between prev and next, and the steps where narrow routing left
+// out pairs sent capabilities that Changed names.
+func capRoutingReach(caps bool, prev, next Receivers, ids []types.NodeID, all bool, narrow filterChange, list types.Nodes, reach map[string]int) {
+	if !caps {
+		return
+	}
+
+	if !all && !narrow.all && len(narrow.ids) < len(ids) {
+		reach["capability pairs left out by narrow routing"]++
+	}
+
+	for _, n := range list {
+		was, is := prev.Of(n.ID), next.Of(n.ID)
+		if receiverForm(CapabilitySources, was) != receiverForm(CapabilitySources, is) {
+			reach["receiver form flipped"]++
+		}
 	}
 }
 
@@ -877,7 +939,24 @@ func (g sideGen) tweak(nodes types.Nodes) types.Nodes {
 	n := *next[i]
 	n.Hostinfo = n.Hostinfo.Clone()
 
-	switch g.r.IntN(4) {
+	kinds := 4
+	if g.facts != nil {
+		kinds = 6
+	}
+
+	switch g.r.IntN(kinds) {
+	case 4:
+		// What the client reports: another client, or an app connector.
+		n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: n.Hostinfo.RoutableIPs}
+		g.clientFacts(&n)
+	case 5:
+		// A route announced and not approved, or no longer announced.
+		p := netip.MustParsePrefix(g.pick("10.0.0.0/24", "192.168.0.0/24"))
+		if slices.Contains(n.Hostinfo.RoutableIPs, p) {
+			n.Hostinfo.RoutableIPs = slices.DeleteFunc(slices.Clone(n.Hostinfo.RoutableIPs), func(q netip.Prefix) bool { return q == p })
+		} else {
+			n.Hostinfo.RoutableIPs = append(slices.Clone(n.Hostinfo.RoutableIPs), p)
+		}
 	case 0:
 		v4, _ := g.addrs()
 		n.IPv4 = new(netip.MustParseAddr(g.pick(v4...)))
@@ -1000,7 +1079,7 @@ func TestFiltersChangedFollowsSelfSourcesByAddress(t *testing.T) {
 	us := NewUserSets(nil, m.t.sel, sideUsers)
 	prev := FollowFilters(nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
 
-	was, err := prev.ForNode(3)
+	was, err := prev.ForNode(3, ReceiverFacts{})
 	require.NoError(t, err)
 	require.NotEmpty(t, was, "test sanity: b2 gets bob's self rule, named through b1's address")
 
@@ -1013,7 +1092,7 @@ func TestFiltersChangedFollowsSelfSourcesByAddress(t *testing.T) {
 	require.False(t, all)
 	assert.Contains(t, ids, types.NodeID(3), "b2's self rule went with the address that named bob")
 
-	is, err := next.ForNode(3)
+	is, err := next.ForNode(3, ReceiverFacts{})
 	require.NoError(t, err)
 	assert.Empty(t, is, "b2 is served its filter without the rule, not a carried one")
 }
@@ -1058,7 +1137,7 @@ func TestFiltersChangedFollowsSelfRuleMergeKeys(t *testing.T) {
 		return out
 	}
 
-	was, err := prev.ForNode(1)
+	was, err := prev.ForNode(1, ReceiverFacts{})
 	require.NoError(t, err)
 	require.Equal(t, []uint16{443, 80}, ports(was), "test sanity: the self rule sits where group:g's rule does")
 
@@ -1070,7 +1149,7 @@ func TestFiltersChangedFollowsSelfRuleMergeKeys(t *testing.T) {
 	require.False(t, all)
 	assert.Contains(t, ids, types.NodeID(1), "the self rule's merged position moved")
 
-	is, err := next.ForNode(1)
+	is, err := next.ForNode(1, ReceiverFacts{})
 	require.NoError(t, err)
 	assert.Equal(t, []uint16{80, 443}, ports(is), "alice's node is served the reordered filter, not a carried one")
 }
@@ -1099,7 +1178,7 @@ func TestFiltersChangedFollowsSelfNamedNodes(t *testing.T) {
 	us := NewUserSets(nil, m.t.sel, sideUsers)
 	prev := FollowFilters(nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
 
-	was, err := prev.ForNode(3)
+	was, err := prev.ForNode(3, ReceiverFacts{})
 	require.NoError(t, err)
 	require.NotEmpty(t, was, "test sanity: b2 gets bob's self rule, from b1")
 
@@ -1112,7 +1191,7 @@ func TestFiltersChangedFollowsSelfNamedNodes(t *testing.T) {
 	require.False(t, all)
 	assert.Contains(t, ids, types.NodeID(3), "b2's self rule went with b1's address")
 
-	is, err := next.ForNode(3)
+	is, err := next.ForNode(3, ReceiverFacts{})
 	require.NoError(t, err)
 	assert.Empty(t, is, "b2 is served its filter without the rule, not a carried one")
 }
@@ -1146,7 +1225,7 @@ func TestFiltersChangedFollowsMovedDestinations(t *testing.T) {
 	prev := FollowFilters(nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
 
 	for _, n := range m.list {
-		_, err := prev.ForNode(n.ID)
+		_, err := prev.ForNode(n.ID, ReceiverFacts{})
 		require.NoError(t, err)
 	}
 
@@ -1163,10 +1242,10 @@ func TestFiltersChangedFollowsMovedDestinations(t *testing.T) {
 	assert.Contains(t, ids, types.NodeID(4), "tag:b's holder gained it")
 
 	for _, id := range []types.NodeID{3, 4} {
-		served, err := next.ForNode(id)
+		served, err := next.ForNode(id, ReceiverFacts{})
 		require.NoError(t, err)
 
-		want, err := next.Uncached().ForNode(id)
+		want, err := next.Uncached().ForNode(id, ReceiverFacts{})
 		require.NoError(t, err)
 		assert.Equal(t, want, served, "node %d is served its new filter, not a carried one", id)
 	}

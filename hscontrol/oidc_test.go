@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/key"
 )
 
@@ -1594,6 +1595,11 @@ func TestOIDCCallbackDispatchesUserIdentityChange(t *testing.T) {
 	initial := frames[0]
 	require.NotEmpty(t, initial.PacketFilters["base"])
 
+	capForm := b.app.state.Snapshot().CapabilitySources()
+	if capForm {
+		require.Contains(t, initial.Node.CapMap, nodecap.Cap("https://headscale.net/cap/src/alice@old.example"), "the node holds its stamp")
+	}
+
 	b.idp.QueueUser(&mockoidc.MockUser{
 		Subject: "identity-change", PreferredUsername: "alice",
 		Email: "alice@new.example", EmailVerified: true,
@@ -1618,13 +1624,21 @@ func TestOIDCCallbackDispatchesUserIdentityChange(t *testing.T) {
 				if present && len(filters) == 0 {
 					return true
 				}
+
+				// In capability form the rule names alice@old.example
+				// whoever holds it; the node's own stamp goes instead.
+				if capForm && response.Node != nil {
+					if _, held := response.Node.CapMap[nodecap.Cap("https://headscale.net/cap/src/alice@old.example")]; !held {
+						return true
+					}
+				}
 			}
 
 			return false
 		default:
 			return false
 		}
-	}, 3*time.Second, 20*time.Millisecond, "the connected node must receive the updated filter before registration confirmation")
+	}, 3*time.Second, 20*time.Millisecond, "the connected node must receive the updated filter, or lose its stamp, before registration confirmation")
 }
 
 func (b *oidcBrowser) pendingSSHCheck(t *testing.T) (types.AuthID, types.Nodes) {

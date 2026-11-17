@@ -20,27 +20,39 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/util/mak"
 )
 
-// PeerCapMap returns [nodecap.SuggestExitNode] for an approved exit node,
-// preserving its policy value from peerSelfCaps. Other peers return nil,
-// matching the wire shape where [tailcfg.Node.CapMap] is omitted.
+// PeerCapMap returns, when stamped, the source capabilities the peer is
+// stamped with and, for an approved exit node, [nodecap.SuggestExitNode], preserving its
+// policy value from peerSelfCaps. A peer with neither returns nil, matching
+// the wire shape where [tailcfg.Node.CapMap] is omitted.
 //
 // Mapper peer rendering and compatibility tests share this emission rule.
-func PeerCapMap(peer types.NodeView, peerSelfCaps tailcfg.NodeCapMap) tailcfg.NodeCapMap {
+func PeerCapMap(peer types.NodeView, peerSelfCaps tailcfg.NodeCapMap, stamped bool) tailcfg.NodeCapMap {
+	var out tailcfg.NodeCapMap
+
+	// The source capabilities the peer is stamped with, in capability mode:
+	// a viewer's filter names them, and the viewer looks them up on the peer.
+	//
+	// TODO(capsrc/trim): lift when per-viewer trimming is worth giving up renders shared across viewers; every viewer sees every selector a peer is in
+	for c := range peerSelfCaps {
+		if stamped && IsSourceCap(string(c)) {
+			mak.Set(&out, c, nil)
+		}
+	}
+
 	// suggest-exit-node — surfaced on Peer.CapMap when the peer
 	// advertises exit routes AND those routes are approved, with or
 	// without a nodeAttrs grant: SaaS stamps it by default, and Apple
 	// clients hide the exit-node list without a suggestion. A policy
 	// value, if any, wins. Approval gating prevents the suggestion from
 	// following an advertised-but-not-yet-trusted node.
-	if !peer.IsExitNode() {
-		return nil
+	if peer.IsExitNode() {
+		mak.Set(&out, nodecap.SuggestExitNode, peerSelfCaps[nodecap.SuggestExitNode])
 	}
 
-	return tailcfg.NodeCapMap{
-		nodecap.SuggestExitNode: peerSelfCaps[nodecap.SuggestExitNode],
-	}
+	return out
 }
 
 // unmodelledTailnetStateCaps lists [tailcfg.NodeCapability] values

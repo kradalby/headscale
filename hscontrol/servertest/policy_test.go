@@ -308,7 +308,7 @@ func TestUserEmailDomainChangeRevokesLiveAccess(t *testing.T) {
 								return true
 							}
 
-							packetFilter := filter.New(nm.PacketFilter, nil, local, nil, nil, logger.Discard)
+							packetFilter := filter.New(nm.PacketFilter, servertest.CapLookup(nm), local, nil, nil, logger.Discard)
 
 							for family, dst := range targetNode.Addresses().All() {
 								src := sourceNode.Addresses().At(family).Addr()

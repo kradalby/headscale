@@ -143,6 +143,9 @@ func mentions(resps []*tailcfg.MapResponse, id types.NodeID) bool {
 }
 
 func TestStreamMembershipDeltaCandidates(t *testing.T) {
+	// Pinned to address form: a membership edit moves the stamps of the nodes it moves, whose viewers render them again.
+	t.Setenv(state.TestCapabilitySourcesEnv, "false")
+
 	for _, kind := range []string{"join", "leave", "replace", "coalesced", "coalesced-outside", "caps", "visibility", "invalid", "repair"} {
 		t.Run(kind, func(t *testing.T) {
 			policy := ""
@@ -232,7 +235,7 @@ func TestStreamMembershipDeltaCandidates(t *testing.T) {
 			after := s.Snapshot()
 			view := after.PeerView(ids[0])
 			require.False(t, len(view) == len(st.r.lastPeerIDs) && len(view) > 0 && &view[0] == &st.r.lastPeerIDs[0], "fixture must replace view identity")
-			class, _, _ := st.r.classes.get(cfg, st.r.renders, after, view, capVer, after.CapsRev(), after.Policy().NodeCapMaps())
+			class, _, _ := st.r.classes.get(cfg, st.r.renders, after, view, capVer, after.CapsRev(), after.NodeCaps)
 			misses := graph.MapLogMisses()
 			candidates := st.r.peerCandidates(after, class, view)
 
@@ -293,7 +296,7 @@ func TestStreamSharesClassNodeCursor(t *testing.T) {
 			st.Delivered()
 		}
 
-		_, _, cursor := streams[0].r.classes.get(cfg, streams[0].r.renders, snap, snap.PeerView(ids[0]), capVer, snap.CapsRev(), snap.Policy().NodeCapMaps())
+		_, _, cursor := streams[0].r.classes.get(cfg, streams[0].r.renders, snap, snap.PeerView(ids[0]), capVer, snap.CapsRev(), snap.NodeCaps)
 		for _, st := range streams {
 			if cursor != st.r.lastNodes {
 				t.Fatal("sessions must share their class's existing cursor")
@@ -569,6 +572,30 @@ type modelClient struct {
 	// deltaPeers is the peer set of a consumer that learns removals only
 	// from PeersRemoved: a peer dropped without one stays here.
 	deltaPeers map[tailcfg.NodeID]bool
+}
+
+// capHolders returns the addresses of the nodes the client holds, itself
+// and its peers, whose CapMap has capability.
+func (c *modelClient) capHolders(capability nodecap.Cap) []netip.Addr {
+	var out []netip.Addr
+
+	for _, n := range append([]*tailcfg.Node{c.self}, slices.Collect(maps.Values(c.peers))...) {
+		if n == nil {
+			continue
+		}
+
+		if _, ok := n.CapMap[capability]; !ok {
+			continue
+		}
+
+		for _, p := range n.Addresses {
+			if p.IsSingleIP() {
+				out = append(out, p.Addr())
+			}
+		}
+	}
+
+	return out
 }
 
 func newModelClient(full *tailcfg.MapResponse) *modelClient {
@@ -2138,7 +2165,17 @@ func requireSessionsMatchCompile(t *testing.T, step int, snap *state.Snapshot, s
 		filter, err := pm.FilterForNode(self)
 		require.NoError(t, err)
 
-		if !reflect.DeepEqual(filter, sess.client.filter) && (len(filter) > 0 || len(sess.client.filter) > 0) {
+		switch {
+		case len(filter) == 0 && len(sess.client.filter) == 0:
+		case snap.CapabilitySources():
+			// Capability form must say what the compile says once each
+			// capability is the addresses of the nodes this client holds
+			// with it, itself and its peers, as the client looks them up.
+			err := policyv2.AgreesWithAddressForm(sess.client.filter, filter, sess.client.capHolders)
+			if err != nil {
+				t.Fatalf("step %d: session %d: %v", step, id, err)
+			}
+		case !reflect.DeepEqual(filter, sess.client.filter):
 			t.Fatalf("step %d: session %d holds filter %v, the compile's %v", step, id, sess.client.filter, filter)
 		}
 
@@ -2980,6 +3017,9 @@ func (sc *scalingRun) requireSettled(tb testing.TB, kind string) {
 // Rows above what the write needs say so, with the item that would lower
 // them.
 func TestScalingWriteWork(t *testing.T) {
+	// Pinned to address form: the counts are address mode's work; capability mode re-renders the peers whose stamps a write moves, and sends fewer filters (BenchmarkScalingWrites reports both).
+	t.Setenv(state.TestCapabilitySourcesEnv, "false")
+
 	const n, writes = 100, 4
 
 	// Sessions woken, sessions sent an update and peers rendered, over the
@@ -4633,7 +4673,7 @@ func BenchmarkClassMapsUpdate(b *testing.B) {
 					renders peerRenders
 				)
 				for _, view := range before.PeerViews() {
-					cm.get(cfg, &renders, before, view, capVer, before.CapsRev(), before.Policy().NodeCapMaps())
+					cm.get(cfg, &renders, before, view, capVer, before.CapsRev(), before.NodeCaps)
 				}
 
 				previous := make(map[*classEntry]*classPeers, len(cm.m))
@@ -4689,7 +4729,7 @@ func BenchmarkClassMapsUpdate(b *testing.B) {
 
 				for _, view := range views {
 					require.NotNil(b, cm.m[classKey{view: &view[0], n: len(view)}], "the delta keeps view identity")
-					cm.get(cfg, &renders, after, view, capVer, after.CapsRev(), after.Policy().NodeCapMaps())
+					cm.get(cfg, &renders, after, view, capVer, after.CapsRev(), after.NodeCaps)
 				}
 
 				b.ReportAllocs()
@@ -4704,7 +4744,7 @@ func BenchmarkClassMapsUpdate(b *testing.B) {
 					b.StartTimer()
 
 					for _, view := range views {
-						cm.get(cfg, &renders, after, view, capVer, after.CapsRev(), after.Policy().NodeCapMaps())
+						cm.get(cfg, &renders, after, view, capVer, after.CapsRev(), after.NodeCaps)
 					}
 				}
 			})
@@ -4731,7 +4771,7 @@ func TestClassMapsChangedCandidates(t *testing.T) {
 	)
 
 	before := s.Snapshot()
-	old, oldProfiles, _ := cm.get(cfg, &renders, before, view, capVer, before.CapsRev(), before.Policy().NodeCapMaps())
+	old, oldProfiles, _ := cm.get(cfg, &renders, before, view, capVer, before.CapsRev(), before.NodeCaps)
 
 	oldNodes := maps.Collect(old.All())
 	for id, node := range oldNodes {
@@ -4760,11 +4800,11 @@ func TestClassMapsChangedCandidates(t *testing.T) {
 
 		snap := s.Snapshot()
 		cm.pruned = snap.PeersRev() // Keep testing the supplied view after a deletion changes live classes.
-		got, profiles, _ := cm.get(cfg, &renders, snap, view, capVer, snap.CapsRev(), snap.Policy().NodeCapMaps())
+		got, profiles, _ := cm.get(cfg, &renders, snap, view, capVer, snap.CapsRev(), snap.NodeCaps)
 
 		var fresh classMaps
 
-		want, wantProfiles, _ := fresh.get(cfg, &renders, snap, view, capVer, snap.CapsRev(), snap.Policy().NodeCapMaps())
+		want, wantProfiles, _ := fresh.get(cfg, &renders, snap, view, capVer, snap.CapsRev(), snap.NodeCaps)
 		require.Equal(t, maps.Collect(want.All()), maps.Collect(got.All()))
 		require.Equal(t, maps.Collect(wantProfiles.All()), maps.Collect(profiles.All()))
 
@@ -4777,7 +4817,7 @@ func TestClassMapsChangedCandidates(t *testing.T) {
 	s.DeleteNodeFromStoreForTest(ids[1])
 	check()
 
-	stale, staleProfiles, _ := cm.get(cfg, &renders, before, view, capVer, before.CapsRev(), before.Policy().NodeCapMaps())
+	stale, staleProfiles, _ := cm.get(cfg, &renders, before, view, capVer, before.CapsRev(), before.NodeCaps)
 	require.Equal(t, oldNodes, maps.Collect(stale.All()))
 	require.Equal(t, oldOwners, maps.Collect(staleProfiles.All()))
 	check()
@@ -5527,6 +5567,9 @@ func TestRouteWakesNodeWhoseCapsAloneChanged(t *testing.T) {
 // compile, while every node keeps the caps it had: the peer it saw before
 // must keep its render, so it is not sent again.
 func TestPeerRenderSurvivesEqualCapsRecompile(t *testing.T) {
+	// Pinned to address form: its recompile keeps the policy's caps, not the stamps, which name the selectors the document uses.
+	t.Setenv(state.TestCapabilitySourcesEnv, "false")
+
 	cfg, s, ids := streamTestState(t, ownUserOnly)
 
 	st := NewStream(cfg, NewHub(), ids[0], capVer)
@@ -8988,6 +9031,9 @@ func TestRouteWakesRouterCoveringANewDestination(t *testing.T) {
 // behind its rule from tag:t, though none of V's own rules' members moved
 // and the tag:s rule never reached V.
 func TestRouteReordersFilterWhenAnotherRuleSplitsItsKey(t *testing.T) {
+	// Pinned to address form: capability form keeps each grant's rules apart, so no merge position moves.
+	t.Setenv(state.TestCapabilitySourcesEnv, "false")
+
 	cfg, s, ids := streamTestState(t, `{"tagOwners":{"tag:s":["u1@"],"tag:s2":["u1@"],"tag:a":["u1@"],"tag:t":["u1@"],"tag:v":["u1@"]},"acls":[
 		{"action":"accept","src":["tag:s"],"dst":["tag:a:22"]},
 		{"action":"accept","src":["tag:t"],"dst":["tag:v:80"]},
@@ -9040,4 +9086,159 @@ func TestRouteReordersFilterWhenAnotherRuleSplitsItsKey(t *testing.T) {
 	stale, err := freshDiff(cfg, after.Uncached(), v, capVer, st.sent, &versionCache{})
 	require.NoError(t, err)
 	assert.Empty(t, stale, "it holds what a fresh render gives: %s", describeResponses(stale))
+}
+
+// TestStreamStampRevocationSendsFullPeer pins how a viewer loses a peer's
+// last source capability: the peer comes whole, its CapMap empty, as a
+// patch would carry no CapMap and leave the viewer's in place; and a stamp
+// that comes is sent, as a patch.
+func TestStreamStampRevocationSendsFullPeer(t *testing.T) {
+	const (
+		stamped = `{"groups": {"group:g": ["u1@"]}, "acls": [
+			{"action": "accept", "src": ["group:g"], "dst": ["*:*"]},
+			{"action": "accept", "src": ["u2@"], "dst": ["*:*"]}]}`
+		stamp = "https://headscale.net/cap/src/group:g"
+	)
+
+	cfg, s, ids := streamTestState(t, stamped, func(c *types.Config) { c.Policy.CapabilitySources = true })
+
+	st := NewStream(cfg, NewHub(), ids[2], capVer)
+
+	initial, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+	require.Len(t, initial, 1)
+
+	var peer *tailcfg.Node
+
+	for _, p := range initial[0].Peers {
+		if p.ID == ids[0].NodeID() {
+			peer = p
+		}
+	}
+
+	require.NotNil(t, peer)
+	require.Contains(t, peer.CapMap, nodecap.Cap(stamp), "the peer comes stamped")
+
+	_, err = s.SetPolicy([]byte(strings.Replace(stamped, `["u1@"]`, `[]`, 1)))
+	require.NoError(t, err)
+
+	resps, err := st.Update(s.Snapshot())
+	require.NoError(t, err)
+
+	var full *tailcfg.Node
+
+	for _, r := range resps {
+		for _, p := range r.PeersChangedPatch {
+			require.NotEqual(t, ids[0].NodeID(), p.NodeID, "a revoked stamp is not a patch")
+		}
+
+		for _, p := range r.PeersChanged {
+			if p.ID == ids[0].NodeID() {
+				full = p
+			}
+		}
+	}
+
+	require.NotNil(t, full, "the peer comes whole")
+	require.Empty(t, full.CapMap)
+
+	_, err = s.SetPolicy([]byte(stamped))
+	require.NoError(t, err)
+
+	resps, err = st.Update(s.Snapshot())
+	require.NoError(t, err)
+	require.True(t, slices.ContainsFunc(resps, func(r *tailcfg.MapResponse) bool {
+		return slices.ContainsFunc(r.PeersChangedPatch, func(p *tailcfg.PeerChange) bool {
+			_, ok := p.CapMap[nodecap.Cap(stamp)]
+
+			return p.NodeID == ids[0].NodeID() && ok
+		})
+	}), "a stamp that comes is a patch: %v", resps)
+}
+
+// TestStreamRemovalOfSharedAddressSendsPeerList pins that, in capability
+// mode, a peer removed while another peer holds one of its addresses comes
+// with a whole peer list, the one response that indexes the address again
+// on the client; a removal sharing nothing goes as a removal alone.
+func TestStreamRemovalOfSharedAddressSendsPeerList(t *testing.T) {
+	const pol = `{"acls": [{"action": "accept", "src": ["u1@"], "dst": ["*:*"]}]}`
+
+	for _, capSources := range []bool{false, true} {
+		t.Run(fmt.Sprintf("capability=%t", capSources), func(t *testing.T) {
+			t.Setenv(state.TestCapabilitySourcesEnv, "false")
+			cfg, s, ids := streamTestState(t, pol, func(c *types.Config) { c.Policy.CapabilitySources = capSources })
+
+			n1, n1b := mustNode(t, s, ids[0]), mustNode(t, s, ids[1])
+
+			// n1b holds n1's IPv4 address besides its own IPv6 one.
+			shared := n1b.AsStruct()
+			shared.IPv4 = n1.AsStruct().IPv4
+			s.PutNodeInStoreForTest(*shared)
+
+			st := NewStream(cfg, NewHub(), ids[2], capVer)
+
+			_, err := st.Initial(s.Snapshot())
+			require.NoError(t, err)
+
+			s.DeleteNodeFromStoreForTest(ids[1])
+
+			resps, err := st.Update(s.Snapshot())
+			require.NoError(t, err)
+
+			peerList := slices.ContainsFunc(resps, func(r *tailcfg.MapResponse) bool { return r.Peers != nil })
+			require.Equal(t, capSources, peerList, "a whole peer list follows the removal: %s", describeResponses(resps))
+			require.True(t, slices.ContainsFunc(resps, func(r *tailcfg.MapResponse) bool {
+				return slices.Contains(r.PeersRemoved, ids[1].NodeID())
+			}), "the removal is sent: %s", describeResponses(resps))
+
+			// n1 removed in turn shares no address any more.
+			s.DeleteNodeFromStoreForTest(ids[0])
+
+			resps, err = st.Update(s.Snapshot())
+			require.NoError(t, err)
+			require.False(t, slices.ContainsFunc(resps, func(r *tailcfg.MapResponse) bool { return r.Peers != nil }),
+				"a removal sharing nothing goes alone: %s", describeResponses(resps))
+		})
+	}
+}
+
+// TestRouteWakesViewersOfARevokedStamp edits a group's members by policy,
+// in capability mode: the rule naming the group stays, no node's policy
+// capabilities move, and only the removed member's stamp goes. Every node
+// it is sent to must wake and be sent the peer without it.
+func TestRouteWakesViewersOfARevokedStamp(t *testing.T) {
+	const (
+		pol = `{"groups": {"group:g": ["u1@", "u2@"]}, "acls": [
+			{"action": "accept", "src": ["group:g"], "dst": ["*:*"]}]}`
+		stamp = nodecap.Cap("https://headscale.net/cap/src/group:g")
+	)
+
+	cfg, s, ids := streamTestState(t, pol, func(c *types.Config) { c.Policy.CapabilitySources = true })
+
+	st := NewStream(cfg, NewHub(), ids[2], capVer)
+
+	_, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	before := s.Snapshot()
+	require.Contains(t, before.NodeCaps(ids[0]), stamp)
+
+	_, err = s.SetPolicy([]byte(strings.Replace(pol, `["u1@", "u2@"]`, `["u2@"]`, 1)))
+	require.NoError(t, err)
+
+	after := s.Snapshot()
+	require.NotContains(t, after.NodeCaps(ids[0]), stamp)
+
+	all, wake := Route(before, after, after.Since(before))
+	require.True(t, all || slices.Contains(slices.Collect(maps.Keys(wake)), ids[2]), "u2's node, sent n1, wakes: %v", wake)
+
+	resps, err := st.Update(after)
+	require.NoError(t, err)
+	require.True(t, slices.ContainsFunc(resps, func(r *tailcfg.MapResponse) bool {
+		return slices.ContainsFunc(r.PeersChanged, func(p *tailcfg.Node) bool {
+			_, held := p.CapMap[stamp]
+
+			return p.ID == ids[0].NodeID() && !held
+		})
+	}), "n1 comes without the stamp: %s", describeResponses(resps))
 }

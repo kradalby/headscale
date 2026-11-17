@@ -80,6 +80,14 @@ func diff(sent, next *netMap, frames *frameCache) []*tailcfg.MapResponse {
 		}
 	}
 
+	// A peer removed, or moved off an address, takes the address out of
+	// the client's index without indexing another node holding it (see
+	// TestCanaryCapLookupForgetsAddressOnRemoval): a capability source from
+	// it would match no node until a whole peer list indexes it again.
+	if !refresh && next.holders.Valid() {
+		refresh = evictsHeldAddress(sent, next, changedIDs, removed)
+	}
+
 	if refresh {
 		// The client turns a PeersChanged entry back into a patch, which
 		// cannot express this clear; only a whole peer list applies it.
@@ -304,6 +312,47 @@ func peerChanges(sent, next *netMap) ([]tailcfg.NodeID, []tailcfg.NodeID) {
 	slices.Sort(removed)
 
 	return peerIDs(next), removed
+}
+
+// evictsHeldAddress reports whether a removed peer, or a changed peer
+// moving off an address, leaves an address of its own that next's node or
+// another of its peers holds.
+func evictsHeldAddress(sent, next *netMap, changed, removed []tailcfg.NodeID) bool {
+	held := func(before, after *tailcfg.Node) bool {
+		for _, p := range before.Addresses {
+			if !p.IsSingleIP() || after != nil && slices.Contains(after.Addresses, p) {
+				continue
+			}
+
+			for _, id := range next.holders.Of(p.Addr()) {
+				other := id.NodeID()
+				if other == before.ID {
+					continue
+				}
+
+				if _, ok := next.peer(other); ok || next.self != nil && other == next.self.ID {
+					return true
+				}
+			}
+		}
+
+		return false
+	}
+
+	for _, id := range removed {
+		if before, ok := sent.peer(id); ok && held(before, nil) {
+			return true
+		}
+	}
+
+	for _, id := range changed {
+		before, ok := sent.peer(id)
+		if after, _ := next.peer(id); ok && before != after && after != nil && held(before, after) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // needsPeerListRefresh reports a change only a whole peer list can apply:

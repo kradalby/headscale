@@ -25,6 +25,7 @@ import (
 	"gorm.io/gorm"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
@@ -1216,8 +1217,30 @@ func TestAddressChangeReachesFiltersAndPeers(t *testing.T) {
 		}
 
 		rules := nm.PacketFilterRules.AsSlice()
+		if len(rules) != 1 {
+			return false
+		}
 
-		return len(rules) == 1 && slices.Equal(rules[0].SrcIPs, srcs) && reflect.DeepEqual(rules[0].DstPorts, dsts)
+		// A capability source stands for the addresses the client admits
+		// for it.
+		var got []string
+
+		for _, s := range rules[0].SrcIPs {
+			c, ok := strings.CutPrefix(s, "cap:")
+			if !ok {
+				got = append(got, s)
+
+				continue
+			}
+
+			for _, p := range servertest.CapHolders(nm, nodecap.Cap(c)) {
+				got = append(got, p.Addr().String())
+			}
+		}
+
+		slices.Sort(got)
+
+		return slices.Equal(got, srcs) && reflect.DeepEqual(rules[0].DstPorts, dsts)
 	}
 
 	b.WaitForCondition(t, "the filter allows a's addresses", 10*time.Second, func(nm *netmap.NetworkMap) bool {

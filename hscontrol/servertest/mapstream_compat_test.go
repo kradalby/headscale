@@ -801,13 +801,22 @@ func deliveryChecks(d *deliveryStep) []stepCheck {
 			}
 		}
 
-		checks = append(checks, stepCheck{x + "/frames", wantFrames, func() string {
-			if cl.UpdateCount() > d.updates[x] {
-				return "frame"
-			}
+		// Which steps send a frame is SaaS's address form: in capability
+		// form a membership move patches peers' stamps instead of filters,
+		// so there the session is held to a fresh one's map instead.
+		if r.srv.State().Snapshot().CapabilitySources() {
+			// A client that went down holds what it last got.
+			fresh = cl.Polling()
+		} else {
+			checks = append(checks, stepCheck{x + "/frames", wantFrames, func() string {
+				if cl.UpdateCount() > d.updates[x] {
+					return "frame"
+				}
 
-			return "silent"
-		}})
+				return "silent"
+			}})
+		}
+
 		if fresh {
 			checks = append(checks, stepCheck{x + "/fresh-map", "equal", func() string {
 				return d.freshMapDifference(x)
@@ -880,10 +889,17 @@ func (d *deliveryStep) freshMapDifference(alias string) string {
 		return fmt.Sprintf("devices %d", len(nodes))
 	}
 
+	return freshNetmapDifference(d.r.srv, nodes[0].ID(), d.r.clients[alias].Netmap())
+}
+
+// freshNetmapDifference compares got, what a client holds for node id, with
+// what a fresh session of the node would be sent, through the wire: "equal"
+// or the first part that differs.
+func freshNetmapDifference(srv *servertest.TestServer, id types.NodeID, got *netmap.NetworkMap) string {
 	hub := mapper.NewHub()
 	defer hub.Close()
 
-	fresh, err := mapper.NewStream(d.r.srv.State().DebugConfig(), hub, nodes[0].ID(), tailcfg.CurrentCapabilityVersion).Initial(d.r.srv.State().Snapshot())
+	fresh, err := mapper.NewStream(srv.State().DebugConfig(), hub, id, tailcfg.CurrentCapabilityVersion).Initial(srv.State().Snapshot())
 	if err != nil {
 		return err.Error()
 	}
@@ -906,7 +922,6 @@ func (d *deliveryStep) freshMapDifference(alias string) string {
 		return err.Error()
 	}
 
-	got := d.r.clients[alias].Netmap()
 	// Match controlclient.initDisplayNames (control/controlclient/direct.go).
 	// These display names are computed after receipt, never sent by control.
 	suffix := netmap.MagicDNSSuffixOfNodeName(want.Node.Name)
@@ -1163,13 +1178,25 @@ func renderMatches(nm *netmap.NetworkMap, names map[netip.Addr]string) string {
 	var out []string
 
 	for _, m := range nm.PacketFilter {
+		// A capability source stands for the addresses the client admits
+		// for it.
+		srcs := slices.Clone(m.Srcs)
+		for _, c := range m.SrcCaps {
+			srcs = append(srcs, servertest.CapHolders(nm, c)...)
+		}
+
+		// A capability rule nobody holds admits no one, as no rule does.
+		if len(srcs) == 0 {
+			continue
+		}
+
 		for _, d := range m.Dsts {
 			dst := d.Net.String()
 			if name, ok := names[d.Net.Addr()]; ok && d.Net.IsSingleIP() {
 				dst = name
 			}
 
-			out = append(out, filterLine(m.Srcs, names, d.Ports.First, d.Ports.Last)+" to "+dst)
+			out = append(out, filterLine(srcs, names, d.Ports.First, d.Ports.Last)+" to "+dst)
 		}
 	}
 
@@ -1383,7 +1410,14 @@ func replayVisibility(t *testing.T, id string) {
 		})
 	}
 
+	// Capability form compares no presence.
+	capForm := r.srv.State().Snapshot().CapabilitySources()
+
 	for k := range mapStreamSkipReasons {
+		if capForm && strings.HasSuffix(k, "/presence") {
+			continue
+		}
+
 		if strings.HasPrefix(k, id+"/") && !evaluated[k] {
 			t.Errorf("skip entry %q names no check", k)
 		}
@@ -1411,14 +1445,25 @@ func visibilityChecks(t *testing.T, r *stepReplay, step testcapture.Step, before
 
 		mark := before[x]
 
-		checks = append(checks,
-			stepCheck{x + "/presence", saasPresence(step.Frames[x], slices.Contains(subjects, x)), func() string {
+		// Which nodes are sent a frame is SaaS's address form: in capability
+		// form a router's own filter changes form as it announces routes,
+		// and a membership move patches stamps instead of filters. These
+		// clients take delta updates, whose netmap does not follow every
+		// filter (a fresh map is no oracle for it), so capability form
+		// compares removals and peers only.
+		var presence []stepCheck
+		if !r.srv.State().Snapshot().CapabilitySources() {
+			presence = append(presence, stepCheck{x + "/presence", saasPresence(step.Frames[x], slices.Contains(subjects, x)), func() string {
 				if cl.Frames() > mark.frames {
 					return "frame"
 				}
 
 				return "silent"
-			}},
+			}})
+		}
+
+		checks = append(checks, presence...)
+		checks = append(checks,
 			stepCheck{x + "/removed", saasRemovedPeers(step.Frames[x], r.saasAlias), func() string {
 				return r.hsRemovedPeers(cl, mark)
 			}},

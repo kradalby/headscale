@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"path"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ import (
 	"tailscale.com/types/persist"
 	"tailscale.com/types/views"
 	"tailscale.com/util/eventbus"
+	"tailscale.com/version"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -77,6 +79,9 @@ type TestClient struct {
 	// streams and streamMaps: see [TestClient.Stream].
 	streams, streamMaps int
 
+	// unknownClient: see [WithUnknownClient].
+	unknownClient bool
+
 	// deltaUpdates, deltaRemoved and deltaSeen: see [WithDeltaUpdates].
 	deltaUpdates bool
 	deltaRemoved []tailcfg.NodeID
@@ -115,6 +120,7 @@ type clientConfig struct {
 	deltaUpdates  bool
 	noHistory     bool
 	hostinfo      *tailcfg.Hostinfo
+	unknownClient bool
 	approve       func(authID string) error
 	loginFlags    controlclient.LoginFlags
 	endpoints     []tailcfg.Endpoint
@@ -161,6 +167,14 @@ func WithAuthKey(key string) ClientOption {
 // registration.
 func WithHostinfo(hi *tailcfg.Hostinfo) ClientOption {
 	return func(c *clientConfig) { c.hostinfo = hi }
+}
+
+// WithUnknownClient makes the client report no Go client and no Tailscale
+// version, as tailscale-rs does: the server cannot tell it applies
+// capability sources. Without it, every Hostinfo the client sends carries
+// the Go and Tailscale versions the official client reports.
+func WithUnknownClient() ClientOption {
+	return func(c *clientConfig) { c.unknownClient = true }
 }
 
 // WithInteractiveLogin registers without an auth key, as `tailscale up`
@@ -285,8 +299,9 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 		dialer:     dialer,
 		tracker:    tracker,
 
-		deltaUpdates: cc.deltaUpdates,
-		noHistory:    cc.noHistory,
+		deltaUpdates:  cc.deltaUpdates,
+		noHistory:     cc.noHistory,
+		unknownClient: cc.unknownClient,
 	}
 
 	tc.logf = func(format string, args ...any) {
@@ -376,7 +391,7 @@ func NewAutoClient(
 		GetMachinePrivateKey: func() (key.MachinePrivate, error) { return machineKey, nil },
 		ServerURL:            server.URL,
 		AuthKey:              server.CreatePreAuthKey(tb, types.UserID(user.ID)),
-		Hostinfo:             hi,
+		Hostinfo:             officialHostinfo(hi),
 		DiscoPublicKey:       key.NewDisco().Public(),
 		Logf:                 tb.Logf,
 		HealthTracker:        health.NewTracker(bus),
@@ -409,7 +424,7 @@ func (c *TestClient) newDirect(
 		GetMachinePrivateKey: func() (key.MachinePrivate, error) { return c.machineKey, nil },
 		ServerURL:            c.server.URL,
 		AuthKey:              authKey,
-		Hostinfo:             hi,
+		Hostinfo:             c.clientHostinfo(hi),
 		DiscoPublicKey:       c.discoKey,
 		Logf:                 c.logf,
 		HealthTracker:        c.tracker,
@@ -422,6 +437,35 @@ func (c *TestClient) newDirect(
 	}
 
 	return direct, err
+}
+
+// clientHostinfo is hi as the client sends it: with the Go and Tailscale
+// versions [hostinfo.New] fills in, unless the client is unknown.
+func (c *TestClient) clientHostinfo(hi *tailcfg.Hostinfo) *tailcfg.Hostinfo {
+	if c.unknownClient {
+		return hi
+	}
+
+	return officialHostinfo(hi)
+}
+
+// officialHostinfo is hi with the Go and Tailscale versions [hostinfo.New]
+// fills in, where it has none; a copy.
+func officialHostinfo(hi *tailcfg.Hostinfo) *tailcfg.Hostinfo {
+	if hi == nil || hi.GoVersion != "" && hi.IPNVersion != "" {
+		return hi
+	}
+
+	out := hi.Clone()
+	if out.GoVersion == "" {
+		out.GoVersion = runtime.Version()
+	}
+
+	if out.IPNVersion == "" {
+		out.IPNVersion = version.Long()
+	}
+
+	return out
 }
 
 // register performs the initial [controlclient.Direct.TryLogin] to register the client.
@@ -668,6 +712,21 @@ func (c *TestClient) Disconnect(tb testing.TB) {
 	if c.pollCancel != nil {
 		c.pollCancel()
 		<-c.pollDone
+	}
+}
+
+// Polling reports whether the client's long-poll session is running: a
+// client that disconnected, or went down, holds the netmap it last got.
+func (c *TestClient) Polling() bool {
+	if c.pollDone == nil {
+		return false
+	}
+
+	select {
+	case <-c.pollDone:
+		return false
+	default:
+		return true
 	}
 }
 

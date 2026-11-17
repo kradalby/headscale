@@ -9,6 +9,7 @@ import (
 	"maps"
 	"net/netip"
 	"os"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/util/zstdframe"
+	"tailscale.com/version"
 )
 
 // engUsers are group:eng's users in the churn shapes. A group write adds
@@ -421,7 +423,7 @@ func (cr *churnRun) register(tb testing.TB, who identity, hostname string) types
 	nv, err := cr.s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
 		Auth:     &tailcfg.RegisterResponseAuth{AuthKey: cr.authKeys[who]},
 		NodeKey:  cr.node,
-		Hostinfo: &tailcfg.Hostinfo{Hostname: hostname},
+		Hostinfo: &tailcfg.Hostinfo{Hostname: hostname, GoVersion: runtime.Version(), IPNVersion: version.Long()},
 	}, cr.machine)
 	if err != nil {
 		tb.Fatal(err)
@@ -700,6 +702,9 @@ func BenchmarkEndpointAfterChurn(b *testing.B) {
 // adding the sessions other than the subjects' sent a packet filter: the
 // fan-out a write's filter change costs. The counts are exact, as there.
 func TestScalingWriteWorkChurn(t *testing.T) {
+	// Pinned to address form: the counts are address mode's work; capability mode re-renders the peers whose stamps a write moves, and sends fewer filters (BenchmarkScalingWrites reports both).
+	t.Setenv(state.TestCapabilitySourcesEnv, "false")
+
 	const n, writes = 100, 4
 
 	// Sessions woken, sessions sent an update, peers rendered, and
@@ -888,6 +893,9 @@ func (e *sizedEncoder) encode(resp *tailcfg.MapResponse, compress bool) ([]byte,
 // poll loop does, and that the filter bytes it counts are the encoding of
 // PacketFilters, on the maps of a churning tailnet.
 func TestSizedEncoderMatchesMarshal(t *testing.T) {
+	// Pinned to address form: it needs writes that send filters, which capability form spares the receivers it reaches.
+	t.Setenv(state.TestCapabilitySourcesEnv, "false")
+
 	s, streams := scalingTailnet(t, 40, "selectors")
 	e := newSizedEncoder()
 

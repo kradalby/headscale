@@ -34,6 +34,12 @@ type Templates struct {
 	// plan is what the templates say about sides, built on first use.
 	planOnce sync.Once
 	plan     *sidePlan
+
+	// stampTab is which capabilities the rules can name, built on first
+	// use; stampCache each role set's stamps.
+	stampOnce  sync.Once
+	stampTab   *stampTable
+	stampCache stampMemo
 }
 
 // literal is an address selector resolved as the compile resolves it,

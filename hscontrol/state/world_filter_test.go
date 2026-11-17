@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 )
 
 func (s *Snapshot) templates() *policyv2.Templates      { return s.s.Get(s.w.templates) }
@@ -724,6 +726,9 @@ func TestWorldFilterFollowsMembershipUnderRefusedPolicy(t *testing.T) {
 // the writes give, worked out by hand: a filter read before a join, a
 // leave or an address change must not be served after it.
 func TestWorldServedFilterFollowsMembership(t *testing.T) {
+	// Pinned to address form: it pins the sources a join writes into a filter; in capability form the filter names the selector and the stamps follow membership (TestWorldStampsFollowMembership).
+	t.Setenv(TestCapabilitySourcesEnv, "false")
+
 	const src = `{"acls": [{"action": "accept", "src": ["alice@"], "dst": ["alice@:22"]}]}`
 
 	users := []types.User{{ID: 1, Name: "alice"}}
@@ -772,6 +777,9 @@ func TestWorldServedFilterFollowsMembership(t *testing.T) {
 // nodes whose filter it changed, and the refusal and the first compile
 // after it, which move nothing served, wake nobody.
 func TestWorldServesMembershipUnderRefusedPolicy(t *testing.T) {
+	// Pinned to address form: it pins the sources a join writes into a filter under a refused document; in capability form the filter names the selector.
+	t.Setenv(TestCapabilitySourcesEnv, "false")
+
 	const good = `{"acls": [{"action": "accept", "src": ["alice@"], "dst": ["alice@:22"]}]}`
 
 	users := []types.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
@@ -1036,4 +1044,394 @@ func TestPolicyAuditLeavesServedFiltersAlone(t *testing.T) {
 
 	assert.Equal(t, served+5, ServedAuditRuns(), "every filter read was held to a fresh cut")
 	assert.Zero(t, PolicyAuditFailures()-failures, "audit failures")
+}
+
+// capWorldNode is worldNode, tagged when tags are given.
+func capWorldNode(id types.NodeID, user *types.User, ip string, tags ...string) *types.Node {
+	if user == nil {
+		user = &types.User{}
+	}
+
+	n := worldNode(id, user, ip)
+
+	if len(tags) > 0 {
+		n.Tags, n.UserID, n.User = tags, nil, nil
+	}
+
+	return n
+}
+
+const capGroupPolicy = `{
+	"groups": {"group:eng": ["alice@"]},
+	"tagOwners": {"tag:web": ["alice@"]},
+	"grants": [{"src": ["group:eng"], "dst": ["tag:web"], "ip": ["tcp:443"]}]
+}`
+
+// TestWorldStampsFollowMembership pins the stamps in capability mode: a
+// member is stamped with the selectors some rule can name, as a peer and as
+// itself; a join stamps the joiner and leaves the receiver's filter as it
+// was; a group edit takes the stamps away and names the nodes whose stamps
+// moved in Change.Caps, which wakes their viewers. Without capability
+// sources nothing is stamped.
+func TestWorldStampsFollowMembership(t *testing.T) {
+	const eng = "https://headscale.net/cap/src/group:eng"
+
+	users := []types.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
+
+	nodes := func() types.Nodes {
+		return types.Nodes{capWorldNode(1, nil, "100.64.0.10", "tag:web"), capWorldNode(2, &users[0], "100.64.0.1"), capWorldNode(3, &users[1], "100.64.0.2")}
+	}
+
+	off, err := newWorldMode(nodes(), users, []byte(capGroupPolicy), types.DNSView{}, false)
+	require.NoError(t, err)
+
+	if !off.capSources {
+		require.Empty(t, off.snapshot().Stamps(2), "address mode stamps nothing")
+		require.NotContains(t, off.snapshot().NodeCaps(2), nodecap.Cap(eng))
+	}
+
+	w, err := newWorldMode(nodes(), users, []byte(capGroupPolicy), types.DNSView{}, true)
+	require.NoError(t, err)
+
+	snap := w.snapshot()
+	require.Equal(t, policyv2.Stamps{eng}, snap.Stamps(2))
+	require.Contains(t, snap.NodeCaps(2), nodecap.Cap(eng), "rendered with its stamps")
+	require.Empty(t, snap.Stamps(3), "bob holds no selector a rule names")
+	require.Empty(t, snap.Stamps(1), "tag:web is named by no source")
+
+	web, err := snap.FilterForNode(1)
+	require.NoError(t, err)
+	require.Len(t, web, 1)
+	require.Equal(t, []string{"cap:" + eng}, web[0].SrcIPs)
+
+	before := w.snapshot()
+	w.PutNode(*capWorldNode(4, &users[0], "100.64.0.4"))
+
+	after := w.snapshot()
+	require.Equal(t, policyv2.Stamps{eng}, after.Stamps(4), "the joiner is stamped")
+
+	again, err := after.FilterForNode(1)
+	require.NoError(t, err)
+	require.Equal(t, web, again, "a join leaves the receiver's capability form as it was")
+
+	c := after.Since(before)
+	require.Contains(t, c.Caps, types.NodeID(4))
+
+	before = after
+
+	_, err = w.SetPolicy([]byte(strings.Replace(capGroupPolicy, `["alice@"]`, `["bob@"]`, 1)), noCheck)
+	require.NoError(t, err)
+
+	after = w.snapshot()
+	require.Empty(t, after.Stamps(2), "alice left group:eng")
+	require.NotContains(t, after.NodeCaps(2), nodecap.Cap(eng))
+	require.Equal(t, policyv2.Stamps{eng}, after.Stamps(3), "bob joined it")
+
+	c = after.Since(before)
+	for _, id := range []types.NodeID{2, 3, 4} {
+		require.Containsf(t, c.Caps, id, "node %d's stamps moved: its viewers render it again", id)
+	}
+}
+
+// TestWorldReceiverFactsFlipFilterForm pins that what a node announces and
+// what its client is, no policy facts, flip the form of its filter, are
+// routed to it and are not served stale from the carried cache: announcing
+// a route it is not approved for sends it addresses, as does reporting
+// another client; undoing either sends it capabilities again.
+func TestWorldReceiverFactsFlipFilterForm(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
+
+	w, err := newWorldMode(types.Nodes{capWorldNode(1, nil, "100.64.0.10", "tag:web"), capWorldNode(2, &users[0], "100.64.0.1")},
+		users, []byte(capGroupPolicy), types.DNSView{}, true)
+	require.NoError(t, err)
+
+	sources := func() []string {
+		t.Helper()
+
+		rules, err := w.snapshot().FilterForNode(1)
+		require.NoError(t, err)
+		require.Len(t, rules, 1)
+
+		return rules[0].SrcIPs
+	}
+
+	capForm := []string{"cap:https://headscale.net/cap/src/group:eng"}
+	require.Equal(t, capForm, sources())
+
+	flip := func(what string, fn func(*types.Node), want []string) {
+		t.Helper()
+
+		before := w.snapshot()
+
+		_, ok := w.UpdateNode(1, func(n *types.Node) {
+			n.Hostinfo = n.Hostinfo.Clone()
+			fn(n)
+		})
+		require.True(t, ok)
+
+		after := w.snapshot()
+		require.Equalf(t, after.PolicyRev(), before.PolicyRev(), "%s: no policy fact moved", what)
+		require.Containsf(t, after.Since(before).Filters, types.NodeID(1), "%s: routed to the node", what)
+		require.Equalf(t, want, sources(), "%s", what)
+	}
+
+	flip("announcing a route", func(n *types.Node) { n.Hostinfo.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.9.0.0/24")} },
+		[]string{"100.64.0.1"})
+	flip("announcing none", func(n *types.Node) { n.Hostinfo.RoutableIPs = nil }, capForm)
+	flip("another client", func(n *types.Node) { n.Hostinfo.GoVersion, n.Hostinfo.App = "", "tailscale-rs" }, []string{"100.64.0.1"})
+	flip("the official client", func(n *types.Node) { n.Hostinfo.GoVersion, n.Hostinfo.App = "go1.27.3", "" }, capForm)
+	flip("an app connector", func(n *types.Node) { n.Hostinfo.AppConnector.Set(true) }, []string{"100.64.0.1"})
+}
+
+// TestWorldAddressModeDoesNoNewWork pins that address mode registers and
+// builds nothing capability sources need: a census read, as each metrics
+// scrape makes, builds no expansion.
+func TestWorldAddressModeDoesNoNewWork(t *testing.T) {
+	t.Setenv(TestCapabilitySourcesEnv, "false")
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "")
+
+	users := []types.User{{ID: 1, Name: "alice"}}
+
+	w, err := newWorldMode(types.Nodes{capWorldNode(1, nil, "100.64.0.10", "tag:web"), capWorldNode(2, &users[0], "100.64.0.1")},
+		users, []byte(capGroupPolicy), types.DNSView{}, false)
+	require.NoError(t, err)
+
+	snap := w.snapshot()
+	builds := ExpansionBuilds()
+
+	census, err := snap.FallbackCensus()
+	require.NoError(t, err)
+	require.Equal(t, policyv2.FallbackCensus{}, census)
+	require.Equal(t, builds, ExpansionBuilds(), "a census read builds no expansion")
+
+	require.False(t, snap.AddressHolders().Valid())
+	require.Equal(t, policyv2.ReceiverFacts{}, snap.ReceiverFacts(2))
+	require.Empty(t, snap.Stamps(2))
+	require.False(t, w.capSources, "the capability cells are not registered")
+}
+
+// TestWorldCarriedFormAfterFlip pins that a filter carried over a commit
+// is carried in the form it was cut in: after a join that moves the
+// address form, a node flipping to address form is sent the joiner's
+// address; after one moving neither, each form is carried as itself.
+func TestWorldCarriedFormAfterFlip(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
+
+	w, err := newWorldMode(types.Nodes{capWorldNode(1, nil, "100.64.0.10", "tag:web"), capWorldNode(2, &users[0], "100.64.0.1")},
+		users, []byte(capGroupPolicy), types.DNSView{}, true)
+	require.NoError(t, err)
+
+	sources := func() []string {
+		t.Helper()
+
+		rules, err := w.snapshot().FilterForNode(1)
+		require.NoError(t, err)
+		require.Len(t, rules, 1)
+
+		return rules[0].SrcIPs
+	}
+
+	announce := func(routes ...netip.Prefix) {
+		_, ok := w.UpdateNode(1, func(n *types.Node) {
+			n.Hostinfo = n.Hostinfo.Clone()
+			n.Hostinfo.RoutableIPs = routes
+		})
+		require.True(t, ok)
+	}
+
+	route := netip.MustParsePrefix("10.9.0.0/24")
+	capForm := []string{"cap:https://headscale.net/cap/src/group:eng"}
+
+	// Both forms cut under one filters.
+	announce(route)
+	require.Equal(t, []string{"100.64.0.1"}, sources())
+	announce()
+	require.Equal(t, capForm, sources())
+
+	w.PutNode(*capWorldNode(3, &users[0], "100.64.0.3"))
+	require.Equal(t, capForm, sources(), "the capability form is carried")
+
+	announce(route)
+	require.Equal(t, []string{"100.64.0.1", "100.64.0.3"}, sources(), "the address form is cut again")
+
+	// A join moving neither form carries each as it was cut.
+	announce()
+	require.Equal(t, capForm, sources())
+
+	w.PutNode(*capWorldNode(4, &users[1], "100.64.0.4"))
+	require.Equal(t, capForm, sources())
+
+	announce(route)
+	require.Equal(t, []string{"100.64.0.1", "100.64.0.3"}, sources(), "the address form is carried as address form")
+}
+
+// TestWorldStampsFollowRetag pins that a node's stamps follow its role
+// set: a retag away from the tag a rule names takes its stamp, and an
+// owned node tagged trades its user's selectors for the tag's.
+func TestWorldStampsFollowRetag(t *testing.T) {
+	const (
+		pol = `{
+			"groups": {"group:eng": ["alice@"]},
+			"tagOwners": {"tag:web": ["alice@"], "tag:dev": ["alice@"], "tag:idle": ["alice@"]},
+			"grants": [{"src": ["group:eng", "tag:dev"], "dst": ["tag:web"], "ip": ["tcp:443"]}]
+		}`
+		eng = "https://headscale.net/cap/src/group:eng"
+		dev = "https://headscale.net/cap/src/tag:dev"
+	)
+
+	users := []types.User{{ID: 1, Name: "alice"}}
+
+	w, err := newWorldMode(types.Nodes{
+		capWorldNode(1, nil, "100.64.0.10", "tag:web"),
+		capWorldNode(2, &users[0], "100.64.0.1"),
+		capWorldNode(3, nil, "100.64.0.3", "tag:dev"),
+	}, users, []byte(pol), types.DNSView{}, true)
+	require.NoError(t, err)
+
+	require.Equal(t, policyv2.Stamps{dev}, w.snapshot().Stamps(3))
+
+	retag := func(id types.NodeID, tags []string, want policyv2.Stamps, gone ...string) {
+		t.Helper()
+
+		before := w.snapshot()
+
+		_, ok := w.UpdateNode(id, func(n *types.Node) {
+			if n.UserID != nil {
+				n.UserID, n.User = nil, nil
+			}
+
+			n.Tags = tags
+		})
+		require.True(t, ok)
+
+		after := w.snapshot()
+		require.Equal(t, want, after.Stamps(id))
+		require.Contains(t, after.Since(before).Caps, id, "its viewers render it again")
+
+		for _, c := range gone {
+			require.NotContains(t, after.NodeCaps(id), nodecap.Cap(c))
+		}
+	}
+
+	retag(3, []string{"tag:idle"}, nil, dev)
+	retag(3, []string{"tag:dev"}, policyv2.Stamps{dev})
+	retag(2, []string{"tag:dev"}, policyv2.Stamps{dev}, eng)
+}
+
+// BenchmarkWorldReceiverFlip measures one node flipping the client it
+// reports, under a mesh: the commit, routing it, and the flipped node's
+// filter read again. It concerns that node's filter form only.
+func BenchmarkWorldReceiverFlip(b *testing.B) {
+	const mesh = `{"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:member:*"]}]}`
+
+	for _, capSources := range []bool{false, true} {
+		for _, n := range []int{300, 3000} {
+			b.Run(fmt.Sprintf("capability=%t/nodes=%d", capSources, n), func(b *testing.B) {
+				alice := &types.User{ID: 1, Name: "alice"}
+
+				nodes := make(types.Nodes, n)
+				for i := range nodes {
+					nodes[i] = capWorldNode(types.NodeID(i+1), alice, netip.AddrFrom4([4]byte{100, 64, byte(i >> 8), byte(i)}).String())
+				}
+
+				w, err := newWorldMode(nodes, []types.User{*alice}, []byte(mesh), types.DNSView{}, capSources)
+				require.NoError(b, err)
+
+				for _, nd := range nodes {
+					_, err := w.snapshot().FilterForNode(nd.ID)
+					require.NoError(b, err)
+				}
+
+				cuts := FilterCuts()
+				flips := 0
+
+				b.ReportAllocs()
+
+				for b.Loop() {
+					before := w.snapshot()
+
+					_, ok := w.UpdateNode(1, func(nd *types.Node) {
+						nd.Hostinfo = nd.Hostinfo.Clone()
+						if nd.Hostinfo.GoVersion == "" {
+							nd.Hostinfo.GoVersion = "go1.27.3"
+						} else {
+							nd.Hostinfo.GoVersion = ""
+						}
+					})
+					require.True(b, ok)
+
+					after := w.snapshot()
+					_ = after.Since(before)
+
+					_, err := after.FilterForNode(1)
+					require.NoError(b, err)
+
+					flips++
+				}
+
+				b.ReportMetric(float64(FilterCuts()-cuts)/float64(flips), "filter-cuts/op")
+			})
+		}
+	}
+}
+
+// TestWorldReceiverFlipCostFollowsNode pins that a node flipping what
+// decides its filter's form costs that node only, at any tailnet size: no
+// new filters, no expansion, one cut at most, routing naming it alone.
+func TestWorldReceiverFlipCostFollowsNode(t *testing.T) {
+	// The audit cuts afresh at every read; this counts the served path.
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "")
+
+	const mesh = `{"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:member:*"]}]}`
+
+	for _, n := range []int{50, 500} {
+		t.Run(fmt.Sprintf("nodes=%d", n), func(t *testing.T) {
+			alice := &types.User{ID: 1, Name: "alice"}
+
+			nodes := make(types.Nodes, n)
+			for i := range nodes {
+				nodes[i] = capWorldNode(types.NodeID(i+1), alice, netip.AddrFrom4([4]byte{100, 64, byte(i >> 8), byte(i)}).String())
+			}
+
+			w, err := newWorldMode(nodes, []types.User{*alice}, []byte(mesh), types.DNSView{}, true)
+			require.NoError(t, err)
+
+			for _, nd := range nodes {
+				_, err := w.snapshot().FilterForNode(nd.ID)
+				require.NoError(t, err)
+			}
+
+			for _, flip := range []func(*types.Node){
+				func(nd *types.Node) { nd.Hostinfo.GoVersion = "" },
+				func(nd *types.Node) { nd.Hostinfo.GoVersion = "go1.27.3" },
+				func(nd *types.Node) { nd.Hostinfo.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.9.0.0/24")} },
+				func(nd *types.Node) { nd.Hostinfo.RoutableIPs = nil },
+			} {
+				before := w.snapshot()
+				cuts, builds := FilterCuts(), ExpansionBuilds()
+
+				_, ok := w.UpdateNode(1, func(nd *types.Node) {
+					nd.Hostinfo = nd.Hostinfo.Clone()
+					flip(nd)
+				})
+				require.True(t, ok)
+
+				after := w.snapshot()
+				c := after.Since(before)
+
+				require.False(t, c.Global)
+				require.Equal(t, []types.NodeID{1}, c.Filters, "routing names the node alone")
+				require.Same(t, before.s.Get(before.w.filters), after.s.Get(after.w.filters), "the filters stay")
+
+				_, err := after.FilterForNode(1)
+				require.NoError(t, err)
+
+				_, err = after.FilterForNode(2)
+				require.NoError(t, err)
+
+				require.LessOrEqual(t, FilterCuts()-cuts, uint64(1), "one cut at most: the node's other form")
+				require.Equal(t, builds, ExpansionBuilds(), "no expansion is built")
+			}
+		})
+	}
 }

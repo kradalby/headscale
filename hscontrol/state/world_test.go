@@ -136,7 +136,8 @@ func worldNode(id types.NodeID, user *types.User, ip string) *types.Node {
 		UserID:     &uid,
 		User:       user,
 		IsOnline:   new(true),
-		Hostinfo:   &tailcfg.Hostinfo{},
+		// What the official client reports of itself.
+		Hostinfo: &tailcfg.Hostinfo{GoVersion: "go1.27.3", IPNVersion: "1.94.1"},
 	}
 }
 

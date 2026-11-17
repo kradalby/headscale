@@ -215,7 +215,7 @@ func (e *expiryStep) selfChecks(t *testing.T, x string) []stepCheck {
 				return "no netmap"
 			}
 
-			return strings.Join(hsFilterTriples(nm.PacketFilter, e.r.addrNames()), "\n")
+			return strings.Join(hsFilterTriples(nm, e.r.addrNames()), "\n")
 		}},
 		{x + "/ssh-rules", renderSSHRules(saas, e.saasNames), func() string { return renderSSHRules(cl.Netmap(), e.r.addrNames()) }},
 	}

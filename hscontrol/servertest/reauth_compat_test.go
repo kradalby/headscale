@@ -879,7 +879,7 @@ func (r *stepReplay) filterChecks(t *testing.T, step testcapture.Step, devices [
 			var got []string
 
 			for _, m := range nm.PacketFilter {
-				got = append(got, matchLines(m, names)...)
+				got = append(got, matchLines(nm, m, names)...)
 			}
 
 			return filterLines(got)
@@ -889,10 +889,22 @@ func (r *stepReplay) filterChecks(t *testing.T, step testcapture.Step, devices [
 	return checks
 }
 
-func matchLines(m filter.Match, names map[netip.Addr]string) []string {
+// matchLines renders m's destinations, a capability source standing for
+// the addresses the client holding nm admits for it; a rule that admits no
+// one renders as no rule.
+func matchLines(nm *netmap.NetworkMap, m filter.Match, names map[netip.Addr]string) []string {
+	srcs := slices.Clone(m.Srcs)
+	for _, c := range m.SrcCaps {
+		srcs = append(srcs, servertest.CapHolders(nm, c)...)
+	}
+
+	if len(srcs) == 0 {
+		return nil
+	}
+
 	out := make([]string, 0, len(m.Dsts))
 	for _, d := range m.Dsts {
-		out = append(out, filterLine(m.Srcs, names, d.Ports.First, d.Ports.Last))
+		out = append(out, filterLine(srcs, names, d.Ports.First, d.Ports.Last))
 	}
 
 	return out

@@ -273,6 +273,9 @@ func (r Roles) Same(o Roles) bool { return r.sets == o.sets }
 // Of returns the role set of node id.
 func (r Roles) Of(id types.NodeID) (RoleSet, bool) { return r.sets.Get(id) }
 
+// Sets returns every node's role set, for a reader to diff two of them.
+func (r Roles) Sets() *graph.Map[types.NodeID, RoleSet] { return r.sets }
+
 // All returns every node's role set.
 func (r Roles) All() iter.Seq2[types.NodeID, RoleSet] { return r.sets.All() }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"net/netip"
+	"os"
 	"reflect"
 	"runtime/debug"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/derp"
@@ -29,6 +31,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
@@ -61,6 +64,17 @@ var (
 		Name:      "world_commit_panics_total",
 		Help:      "Node write commits that panicked; a batch's writers are retried individually, so only the writers that panic again fail. The graph kept serving.",
 	}, func() float64 { return float64(worldCommitPanics.Load()) })
+	_ = promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: prometheusNamespace,
+		Name:      "policy_capability_sources_enabled",
+		Help:      "1 when the latest server names filter sources by node capability (policy.capability_sources).",
+	}, func() float64 {
+		if w := censusWorld.Load(); w != nil && w.capSources {
+			return 1
+		}
+
+		return 0
+	})
 	worldNodes = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: prometheusNamespace,
 		Name:      "world_nodes",
@@ -106,6 +120,9 @@ func PolicyAudit() bool { return policyAudit() }
 // FilterCuts counts the node filters the served filters have cut, so a
 // benchmark can tell how many renders recut an unchanged filter.
 func FilterCuts() uint64 { return policyv2.FilterCuts() }
+
+// ExpansionBuilds counts the expansions the served filters have built.
+func ExpansionBuilds() uint64 { return policyv2.ExpansionBuilds() }
 
 // FilterAuditRuns counts the filter audits that ran, and ServedAuditRuns
 // the served filters held to a fresh cut when read, so a test can prove
@@ -294,6 +311,21 @@ type world struct {
 	// a reader finds whose caps a recompile changed.
 	nodeCaps graph.Derived[*capsMap]
 
+	// capSources is policy.capability_sources, fixed for the world's life.
+	// With it, receivers holds what decides each node's filter form beyond
+	// the policy, stamps the source capabilities each node holds, and
+	// renderCaps each node's capabilities as peers and itself are sent
+	// them: the policy's and its stamps. Without, none is registered and
+	// nodes are rendered with the policy's capabilities.
+	capSources bool
+	receivers  graph.Derived[policyv2.Receivers]
+	stamps     graph.Derived[stampsMap]
+	renderCaps graph.Derived[renderCaps]
+	// holders is, in capability mode, the nodes holding each address,
+	// which a session reads to tell when a client's address index needs a
+	// whole peer list.
+	holders graph.Derived[addressHolders]
+
 	// Membership: the selectors the policy in force names; the users each
 	// user selector names; each node's role set; and each role's nodes.
 	// Each recomputes only for what its inputs changed, so a user outside
@@ -390,11 +422,46 @@ type compiledPolicy struct {
 	err error
 }
 
-// newWorld builds the graph and publishes its first snapshot. It fails
-// when the policy does not compile against users and nodes.
+// newWorld builds the graph and publishes its first snapshot, naming
+// filter sources by address (unless a test binary asks otherwise, see
+// [capabilitySourcesForTest]). It fails when the policy does not compile
+// against users and nodes.
 func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DNSView) (*world, error) {
+	return newWorldMode(nodes, users, polSrc, dns, false)
+}
+
+// TestCapabilitySourcesEnv, set to a boolean in a test binary's
+// environment, names filter sources by capability in every world the
+// test builds with policy.capability_sources off, so a suite runs in either
+// mode: `make test-capability-sources`. Tests needing one mode set it.
+// Production binaries never read it.
+const TestCapabilitySourcesEnv = "HEADSCALE_TEST_CAPABILITY_SOURCES"
+
+// capabilitySourcesForTest reports [TestCapabilitySourcesEnv] in a test
+// binary, and false anywhere else; a value that is no boolean panics.
+func capabilitySourcesForTest() bool {
+	if !testing.Testing() {
+		return false
+	}
+
+	v := os.Getenv(TestCapabilitySourcesEnv)
+	if v == "" {
+		return false
+	}
+
+	on, err := strconv.ParseBool(v)
+	if err != nil {
+		panic(fmt.Sprintf("%s=%q: %v", TestCapabilitySourcesEnv, v, err))
+	}
+
+	return on
+}
+
+// newWorldMode is [newWorld] naming filter sources by capability when
+// capSources is set (policy.capability_sources).
+func newWorldMode(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DNSView, capSources bool) (*world, error) {
 	g := graph.New()
-	w := &world{g: g, full: make(chan struct{}, 1), beforePolicyCommit: func() {}}
+	w := &world{g: g, full: make(chan struct{}, 1), beforePolicyCommit: func() {}, capSources: capSources || capabilitySourcesForTest()}
 
 	byID := uniqueGivenNames(nodes)
 
@@ -524,9 +591,30 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 	// served. Building is left to the first session that reads one, and
 	// filters the change cannot reach are carried over; the sides say who
 	// receives a rule.
+	if w.capSources {
+		// From the nodes and the policy's caps: what a node announces and
+		// what its client is are no policy facts, yet decide the form of
+		// its filter.
+		w.receivers = graph.NewDerived(g, "receivers", policyv2.Receivers.Same,
+			func(s *graph.Snapshot, prev policyv2.Receivers) policyv2.Receivers {
+				return prev.Update(s.Get(w.nodes), s.Get(w.nodeCaps))
+			})
+		w.stamps = graph.NewDerived(g, "stamps", sameStamps, w.deriveStamps)
+		w.renderCaps = graph.NewDerived(g, "render-caps", sameRenderCaps, w.deriveRenderCaps)
+		w.holders = graph.NewDerived(g, "address-holders", sameHolders, w.deriveHolders)
+	}
+
+	// Not from the receivers: a node's facts choose which of its two forms
+	// it is served when its filter is read, so a flip touches no other
+	// node's filter and builds nothing.
+	mode := policyv2.AddressSources
+	if w.capSources {
+		mode = policyv2.CapabilitySources
+	}
+
 	w.filters = graph.NewDerived(g, "filters", graph.Same[*policyv2.Filters],
 		func(s *graph.Snapshot, prev *policyv2.Filters) *policyv2.Filters {
-			return policyv2.FollowFilters(prev, s.Get(w.templates), s.Get(w.postings), s.Get(w.approvals), s.Get(w.policyNodes).list, s.Get(w.sides))
+			return policyv2.FollowFiltersFor(mode, prev, s.Get(w.templates), s.Get(w.postings), s.Get(w.approvals), s.Get(w.policyNodes).list, s.Get(w.sides))
 		})
 	w.peers = graph.NewDerived(g, "peers", (*policyv2.PeerClasses).SameKeyed,
 		func(s *graph.Snapshot, prev *policyv2.PeerClasses) *policyv2.PeerClasses {
@@ -602,6 +690,171 @@ func (w *world) deriveNodeCaps(s *graph.Snapshot, prev *capsMap) *capsMap {
 	}
 
 	return e.Done()
+}
+
+// stampsMap holds the source capabilities each node holds, from the role
+// sets and templates it was built for.
+type stampsMap struct {
+	m     *graph.Map[types.NodeID, policyv2.Stamps]
+	roles policyv2.Roles
+	t     *policyv2.Templates
+}
+
+func sameStampSets(a, b policyv2.Stamps) bool { return slices.Equal(a, b) }
+
+func sameStamps(a, b stampsMap) bool { return a.m == b.m }
+
+// deriveStamps is the stamps cell: each node's stamps from its role set,
+// recomputed for the nodes whose role set moved, or for every node when
+// the templates did.
+func (w *world) deriveStamps(s *graph.Snapshot, prev stampsMap) stampsMap {
+	roles, t := s.Get(w.roles), s.Get(w.templates)
+	next := stampsMap{m: prev.m, roles: roles, t: t}
+
+	if next.m == nil {
+		next.m = graph.NewMap[types.NodeID](sameStampSets, nil)
+	}
+
+	var changed []types.NodeID
+
+	switch {
+	case prev.t != t:
+		// Edited, not built anew, so readers diff it through its log.
+		for id := range roles.All() {
+			changed = append(changed, id)
+		}
+
+		for id := range next.m.All() {
+			changed = append(changed, id)
+		}
+	case !prev.roles.Same(roles):
+		changed = graph.Changes(prev.roles.Sets(), roles.Sets())
+	}
+
+	if len(changed) == 0 {
+		return next
+	}
+
+	e := next.m.Edit()
+
+	for _, id := range changed {
+		rs, ok := roles.Of(id)
+		if stamps := t.StampsOf(rs); ok && len(stamps) > 0 {
+			e.Set(id, stamps)
+		} else {
+			e.Delete(id)
+		}
+	}
+
+	next.m = e.Done()
+
+	return next
+}
+
+// renderCaps holds each node's capabilities as it is rendered, to peers
+// and to itself: the policy's, and its stamps. from and stamps are what it
+// was merged from.
+type renderCaps struct {
+	m      *capsMap
+	from   *capsMap
+	stamps *graph.Map[types.NodeID, policyv2.Stamps]
+}
+
+func sameRenderCaps(a, b renderCaps) bool { return a.m == b.m }
+
+// deriveRenderCaps merges the policy's capabilities and the stamps, for the
+// nodes either moved for.
+func (w *world) deriveRenderCaps(s *graph.Snapshot, prev renderCaps) renderCaps {
+	caps, stamps := s.Get(w.nodeCaps), s.Get(w.stamps).m
+	next := renderCaps{m: prev.m, from: caps, stamps: stamps}
+
+	if next.m == nil {
+		next.m = graph.NewMap[types.NodeID](sameCaps, nil)
+	}
+
+	changed := slices.Concat(graph.Changes(prev.from, caps), graph.Changes(prev.stamps, stamps))
+	if len(changed) == 0 {
+		return next
+	}
+
+	e := next.m.Edit()
+
+	for _, id := range changed {
+		c, hasCaps := caps.Get(id)
+		st, hasStamps := stamps.Get(id)
+
+		if !hasCaps && !hasStamps {
+			e.Delete(id)
+
+			continue
+		}
+
+		e.Set(id, policyv2.WithStamps(c, st))
+	}
+
+	next.m = e.Done()
+
+	return next
+}
+
+// addressHolders holds the nodes holding each address, from nodes.
+type addressHolders struct {
+	m     *graph.Map[netip.Addr, []types.NodeID]
+	nodes *nodeMap
+}
+
+func sameHolders(a, b addressHolders) bool { return a.m == b.m }
+
+// deriveHolders moves the nodes whose addresses changed.
+func (w *world) deriveHolders(s *graph.Snapshot, prev addressHolders) addressHolders {
+	nodes := s.Get(w.nodes)
+	next := addressHolders{m: prev.m, nodes: nodes}
+
+	if next.m == nil {
+		next.m = graph.NewMap[netip.Addr](slices.Equal[[]types.NodeID], nil)
+	}
+
+	changed := graph.Changes(prev.nodes, nodes)
+	if len(changed) == 0 {
+		return next
+	}
+
+	e := next.m.Edit()
+
+	for _, id := range changed {
+		var was, is []netip.Addr
+
+		if n, ok := prev.nodes.Get(id); ok {
+			was = n.IPs()
+		}
+
+		if n, ok := nodes.Get(id); ok {
+			is = n.IPs()
+		}
+
+		for _, a := range was {
+			if slices.Contains(is, a) {
+				continue
+			}
+
+			ids, _ := e.Get(a)
+			if ids = slices.DeleteFunc(slices.Clone(ids), func(h types.NodeID) bool { return h == id }); len(ids) > 0 {
+				e.Set(a, ids)
+			} else {
+				e.Delete(a)
+			}
+		}
+
+		for _, a := range is {
+			if ids, _ := e.Get(a); !slices.Contains(ids, id) {
+				e.Set(a, append(slices.Clone(ids), id))
+			}
+		}
+	}
+
+	next.m = e.Done()
+
+	return next
 }
 
 // membershipAudit is the revision the membership audit last checked, and
@@ -2404,7 +2657,7 @@ func (s *Snapshot) Policy() policy.PolicyManager { return s.s.Get(s.w.policy).pm
 // Callers share one slice, across commits that cannot change it. Under the
 // policy audit, each served filter read is held to one cut afresh.
 func (s *Snapshot) FilterForNode(id types.NodeID) ([]tailcfg.FilterRule, error) {
-	rules, err := s.served().ForNode(id)
+	rules, err := s.served().ForNode(id, s.ReceiverFacts(id))
 	if err == nil && s.uncached == nil && s.w.auditing {
 		s.auditServed(id, rules)
 	}
@@ -2417,9 +2670,27 @@ func (s *Snapshot) FilterForNode(id types.NodeID) ([]tailcfg.FilterRule, error) 
 func (s *Snapshot) auditServed(id types.NodeID, served []tailcfg.FilterRule) {
 	servedAuditRuns.Add(1)
 
-	want, err := s.s.Get(s.w.filters).Fresh().ForNode(id)
+	fresh := s.s.Get(s.w.filters).Fresh()
+
+	want, err := fresh.ForNode(id, s.ReceiverFacts(id))
 	if err == nil && !reflect.DeepEqual(want, served) {
 		err = fmt.Errorf("%w: node %d at commit %d:\nserved %v\nafresh %v", errServedFilter, id, s.Rev(), served, want)
+	}
+
+	// In capability form, the filter must say what address form says once
+	// each capability is the addresses of the nodes the receiver is sent
+	// with it: itself and its peers, as the client looks them up.
+	if err == nil && s.w.capSources {
+		var ipForm []tailcfg.FilterRule
+
+		ipForm, err = fresh.AddressForm(id)
+		if err == nil {
+			err = policyv2.AgreesWithAddressForm(served, ipForm, s.holdersFor(id))
+		}
+
+		if err != nil {
+			err = fmt.Errorf("node %d at commit %d: %w", id, s.Rev(), err)
+		}
 	}
 
 	if err != nil {
@@ -2429,6 +2700,28 @@ func (s *Snapshot) auditServed(id types.NodeID, served []tailcfg.FilterRule) {
 }
 
 var errServedFilter = errors.New("served filter differs from one cut afresh")
+
+// holdersFor returns, for a capability, the addresses of the nodes viewer
+// is sent holding it: itself and its peers.
+func (s *Snapshot) holdersFor(viewer types.NodeID) func(nodecap.Cap) []netip.Addr {
+	nodes := append([]types.NodeID{viewer}, s.PeerView(viewer)...)
+
+	return func(c nodecap.Cap) []netip.Addr {
+		var out []netip.Addr
+
+		for _, id := range nodes {
+			if _, ok := s.NodeCaps(id)[c]; !ok {
+				continue
+			}
+
+			if n, ok := s.GetNode(id); ok {
+				out = append(out, n.IPs()...)
+			}
+		}
+
+		return out
+	}
+}
 
 // SSHPolicy returns node's SSH policy from the compile. An uncached
 // snapshot fills none of the compile's SSH caches.
@@ -2738,6 +3031,13 @@ func (s *Snapshot) Since(old *Snapshot) Change {
 		c.Filters = filters
 	}
 
+	// A node whose facts moved is served its filter's other form, which
+	// concerns it alone. Across coalesced commits the node log names it,
+	// and a change of the policy's caps escalates above.
+	if s.w.capSources && graph.ChangedAt(s.s, s.w.receivers) != graph.ChangedAt(old.s, old.w.receivers) {
+		c.Filters = append(c.Filters, s.s.Get(s.w.receivers).ChangedSince(old.s.Get(old.w.receivers))...)
+	}
+
 	if s.sshMoved(old) {
 		next, _ := s.Policy().(*policyv2.PolicyManager)
 		last, _ := old.Policy().(*policyv2.PolicyManager)
@@ -2751,7 +3051,7 @@ func (s *Snapshot) Since(old *Snapshot) Change {
 	}
 
 	if s.CapsRev() != old.CapsRev() {
-		c.Caps = graph.Changes(old.s.Get(old.w.nodeCaps), s.s.Get(s.w.nodeCaps))
+		c.Caps = graph.Changes(old.caps(), s.caps())
 	}
 
 	if s.PrimariesRev() != old.PrimariesRev() {
@@ -2833,12 +3133,91 @@ func (s *Snapshot) RoutedNodes() []types.NodeID {
 type CapsVersion struct{ m *capsMap }
 
 // CapsVersion returns the node capabilities of s.
-func (s *Snapshot) CapsVersion() CapsVersion { return CapsVersion{m: s.s.Get(s.w.nodeCaps)} }
+func (s *Snapshot) CapsVersion() CapsVersion { return CapsVersion{m: s.caps()} }
 
-// CapsChangedSince returns the nodes whose policy capabilities differ
+// CapsChangedSince returns the nodes whose capabilities as rendered differ
 // between v and s.
 func (s *Snapshot) CapsChangedSince(v CapsVersion) []types.NodeID {
-	return graph.Changes(v.m, s.s.Get(s.w.nodeCaps))
+	return graph.Changes(v.m, s.caps())
+}
+
+// caps returns every node's capabilities as peers and the node itself are
+// sent them: the policy's, with the stamps in capability mode.
+func (s *Snapshot) caps() *capsMap {
+	if s.w.capSources {
+		return s.s.Get(s.w.renderCaps).m
+	}
+
+	return s.s.Get(s.w.nodeCaps)
+}
+
+// NodeCaps returns node id's capabilities as it and its peers are sent
+// them. The map is shared and must not be modified.
+func (s *Snapshot) NodeCaps(id types.NodeID) tailcfg.NodeCapMap {
+	c, _ := s.caps().Get(id)
+
+	return c
+}
+
+// AddressHolders are the nodes holding each address of a snapshot.
+type AddressHolders struct {
+	m *graph.Map[netip.Addr, []types.NodeID]
+}
+
+// Valid reports whether h holds anything: false in address mode, where no
+// session reads it.
+func (h AddressHolders) Valid() bool { return h.m != nil }
+
+// Of returns the nodes holding addr. The slice is shared.
+func (h AddressHolders) Of(addr netip.Addr) []types.NodeID {
+	ids, _ := h.m.Get(addr)
+
+	return ids
+}
+
+// AddressHolders returns the nodes holding each address, in capability
+// mode only.
+func (s *Snapshot) AddressHolders() AddressHolders {
+	if !s.w.capSources {
+		return AddressHolders{}
+	}
+
+	return AddressHolders{m: s.s.Get(s.w.holders).m}
+}
+
+// CapabilitySources reports whether s names filter sources by capability.
+func (s *Snapshot) CapabilitySources() bool { return s.w.capSources }
+
+// Stamps returns the source capabilities node id holds; none without
+// capability sources.
+func (s *Snapshot) Stamps(id types.NodeID) policyv2.Stamps {
+	if !s.w.capSources {
+		return nil
+	}
+
+	st, _ := s.s.Get(s.w.stamps).m.Get(id)
+
+	return st
+}
+
+// ReceiverFacts returns what decides the form of node id's filter beyond
+// the policy; nothing without capability sources.
+func (s *Snapshot) ReceiverFacts(id types.NodeID) policyv2.ReceiverFacts {
+	if !s.w.capSources {
+		return policyv2.ReceiverFacts{}
+	}
+
+	return s.s.Get(s.w.receivers).Of(id)
+}
+
+// FallbackCensus counts what the served filters' fallbacks send as
+// addresses, see [policyv2.FallbackCensus]; nothing in address mode.
+func (s *Snapshot) FallbackCensus() (policyv2.FallbackCensus, error) {
+	if !s.w.capSources {
+		return policyv2.FallbackCensus{}, nil
+	}
+
+	return s.s.Get(s.w.filters).Census(s.s.Get(s.w.receivers))
 }
 
 // NodesVersion identifies the nodes of a snapshot, which a reader keeps to
@@ -2857,9 +3236,15 @@ func (s *Snapshot) NodesTouchedSince(v NodesVersion) ([]types.NodeID, bool) {
 	return s.nodes().ChangedSince(v.m)
 }
 
-// CapsRev is the revision of the latest change to any node's policy
-// capabilities: a peer's render reads its node and its caps only.
-func (s *Snapshot) CapsRev() uint64 { return graph.ChangedAt(s.s, s.w.nodeCaps) }
+// CapsRev is the revision of the latest change to any node's capabilities
+// as rendered: a peer's render reads its node and its caps only.
+func (s *Snapshot) CapsRev() uint64 {
+	if s.w.capSources {
+		return graph.ChangedAt(s.s, s.w.renderCaps)
+	}
+
+	return graph.ChangedAt(s.s, s.w.nodeCaps)
+}
 
 // SidesRev is the revision of the latest change to the side sets, side
 // facts or routes' cover the routes a viewer is sent read.
@@ -2977,3 +3362,67 @@ func (s *Snapshot) RouterSession(id types.NodeID) (time.Time, bool) {
 
 // SameWorld reports whether both snapshots belong to the same graph.
 func (s *Snapshot) SameWorld(other *Snapshot) bool { return s != nil && other != nil && s.w == other.w }
+
+// censusWorld is the world of the latest server, whose fallbacks the
+// census metrics report.
+var censusWorld atomic.Pointer[world]
+
+// censusCollector reports, per reason, the nodes whose filter goes as
+// addresses and the rules with a source that does, read off the latest
+// snapshot at each scrape; and the filters and rules cut so, as counters.
+type censusCollector struct {
+	receivers, rules, cuts, ruleCuts *prometheus.Desc
+}
+
+func newCensusCollector() censusCollector {
+	desc := func(name, help string) *prometheus.Desc {
+		return prometheus.NewDesc(prometheus.BuildFQName(prometheusNamespace, "", name), help, []string{"reason"}, nil)
+	}
+
+	return censusCollector{
+		receivers: desc("policy_address_form_receivers",
+			"Nodes by why their whole packet filter is sent with every source as addresses; capability counts those sent capability sources."),
+		rules: desc("policy_address_form_rules",
+			"Rules of filters sent capability sources, by why a source of theirs is sent as addresses; an autogroup:self rule counts once per owner; capability counts rules with none."),
+		cuts:     desc("policy_address_form_filters_cut_total", "Packet filters cut with every source as addresses, by reason."),
+		ruleCuts: desc("policy_address_form_rules_cut_total", "Rules cut with a source as addresses into filters otherwise sent capabilities, by reason."),
+	}
+}
+
+func (c censusCollector) Describe(ch chan<- *prometheus.Desc) {
+	for _, d := range []*prometheus.Desc{c.receivers, c.rules, c.cuts, c.ruleCuts} {
+		ch <- d
+	}
+}
+
+func (c censusCollector) Collect(ch chan<- prometheus.Metric) {
+	filters, rules := policyv2.AddressFormCounts()
+	for reason, n := range filters {
+		ch <- prometheus.MustNewConstMetric(c.cuts, prometheus.CounterValue, float64(n), reason)
+	}
+
+	for reason, n := range rules {
+		ch <- prometheus.MustNewConstMetric(c.ruleCuts, prometheus.CounterValue, float64(n), reason)
+	}
+
+	w := censusWorld.Load()
+	if w == nil {
+		return
+	}
+
+	census, err := w.snapshot().FallbackCensus()
+	if err != nil {
+		return
+	}
+
+	receivers, perRule := census.Labelled()
+	for reason, n := range receivers {
+		ch <- prometheus.MustNewConstMetric(c.receivers, prometheus.GaugeValue, float64(n), reason)
+	}
+
+	for reason, n := range perRule {
+		ch <- prometheus.MustNewConstMetric(c.rules, prometheus.GaugeValue, float64(n), reason)
+	}
+}
+
+func init() { prometheus.MustRegister(newCensusCollector()) }

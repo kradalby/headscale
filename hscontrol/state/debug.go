@@ -289,6 +289,35 @@ func (s *State) DebugFilter() ([]tailcfg.FilterRule, error) {
 	return filter, nil
 }
 
+// DebugCapabilitySourcesInfo is what the fallbacks of capability sources
+// cost: per reason, the nodes whose whole filter goes as addresses and the
+// rules with a source that does, now; and the filters and rules cut so
+// since the process started.
+type DebugCapabilitySourcesInfo struct {
+	Enabled   bool              `json:"enabled"`
+	Receivers map[string]int    `json:"receivers"`
+	Rules     map[string]int    `json:"rules"`
+	CutTotals map[string]uint64 `json:"filters_cut_in_address_form"`
+	RuleTotal map[string]uint64 `json:"rules_cut_with_address_sources"`
+}
+
+// DebugCapabilitySources reports, from one [Snapshot], what the fallbacks
+// of capability sources send as addresses.
+func (s *State) DebugCapabilitySources() (DebugCapabilitySourcesInfo, error) {
+	snap := s.Snapshot()
+
+	census, err := snap.FallbackCensus()
+	if err != nil {
+		return DebugCapabilitySourcesInfo{}, err
+	}
+
+	info := DebugCapabilitySourcesInfo{Enabled: snap.CapabilitySources()}
+	info.Receivers, info.Rules = census.Labelled()
+	info.CutTotals, info.RuleTotal = policyv2.AddressFormCounts()
+
+	return info, nil
+}
+
 // DebugRoutes returns the current primary routes information as a
 // structured object built from one [Snapshot].
 func (s *State) DebugRoutes() types.DebugRoutes {

@@ -114,6 +114,7 @@ var (
 	ErrNodeAttrUnsupported          = errors.New("nodeAttrs uses a feature headscale does not yet support")
 	ErrNodeAttrIPPoolUnsupported    = errors.New("nodeAttrs ipPool requires the IP allocator (https://github.com/juanfont/headscale/issues/2912)")
 	ErrNodeAttrTargetUnsupported    = errors.New("nodeAttrs target alias type is not supported")
+	ErrCapReserved                  = errors.New("capabilities under " + selectorCapPrefix + " are reserved for headscale's source capabilities")
 )
 
 // NextDNSAttrPrefix is the form Tailscale uses for per-node NextDNS profile
@@ -2803,6 +2804,12 @@ func (p *Policy) validate() error {
 		// Tailscale requires cap names to be {domain}/{path} (no URL scheme)
 		// and rejects caps in the tailscale.com domain.
 		for capName := range grant.App {
+			if IsSourceCap(string(capName)) {
+				errs = append(errs, fmt.Errorf("%w: app %q", ErrCapReserved, capName))
+
+				continue
+			}
+
 			err := validateCapabilityName(string(capName))
 			if err != nil {
 				errs = append(errs, err)
@@ -2987,6 +2994,10 @@ func (p *Policy) validate() error {
 		}
 
 		for _, attr := range na.Attrs {
+			if IsSourceCap(string(attr)) {
+				errs = append(errs, fmt.Errorf("%w: nodeAttrs %q", ErrCapReserved, attr))
+			}
+
 			issue, ok := nodeAttrUnsupportedCaps[attr]
 			if ok {
 				errs = append(errs, fmt.Errorf("%w: %q tracked in %s", ErrNodeAttrUnsupported, attr, issue))

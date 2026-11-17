@@ -58,6 +58,7 @@ func TestConfigFields(t *testing.T) {
 		"prefixes.allocation",
 		"policy.path",
 		"policy.mode",
+		"policy.capability_sources",
 		"log.level",
 		"log.format",
 		"node.expiry",

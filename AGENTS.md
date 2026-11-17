@@ -82,6 +82,7 @@ make dev
 # Individual targets
 make build           # build the headscale binary
 make test            # go test -race ./...
+make test-capability-sources  # the suite with policy.capability_sources on
 make fmt             # format Go, docs, proto
 make lint            # lint Go, proto
 make generate        # regenerate protobuf code (after changes to proto/)
@@ -386,6 +387,13 @@ a broken one.
   `mapper/` or the policy compile: `BenchmarkScalingWrites` and
   `BenchmarkFirstMap` (`hscontrol/mapper`, `HEADSCALE_SCALE_NODES=10000`
   for one size), `BenchmarkWorldEndpointWrite` (`hscontrol/state`).
+- **Two source modes**: `make test` runs the suite naming filter sources by
+  address (the default), `make test-capability-sources` by capability
+  (`HEADSCALE_TEST_CAPABILITY_SOURCES=true`, read by test binaries only).
+  A test that needs one mode pins it with
+  `t.Setenv(state.TestCapabilitySourcesEnv, "false")` or builds its server
+  with the config option; it never inherits the mode. With the policy audit
+  on, capability mode needs a `-timeout` well past the default 10 minutes.
 - **Incremental policy compiles** reuse what a node change cannot reach.
   `HEADSCALE_DEBUG_POLICY_AUDIT=1` (on in integration tests) compiles from
   scratch as well and logs any difference; a mismatch fails the test.

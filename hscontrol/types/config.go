@@ -885,6 +885,17 @@ type PolicyConfig struct {
 	// Mode is where the policy is kept: in the file `policy.path`, or in
 	// the database, edited through the CLI or API.
 	Mode PolicyMode `example:"\"database\"" koanf:"mode"`
+
+	// CapabilitySources sends a rule's users, groups, tags and autogroups
+	// as node capabilities their members are stamped with: a member
+	// joining or leaving changes the capabilities its peers are sent with
+	// it, not the packet filter nodes in capability form are sent. Every
+	// peer then sees the selectors a node is in. Sources the client cannot
+	// match this way, and nodes that cannot be sent them (routers, app
+	// connectors, clients other than Tailscale's), stay as addresses. Read
+	// at startup only. In either mode a policy naming a capability under
+	// `https://headscale.net/cap/src/` is refused, a stored one at startup.
+	CapabilitySources bool `koanf:"capability_sources"`
 }
 
 func (p *PolicyConfig) IsEmpty() bool {

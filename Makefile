@@ -47,6 +47,13 @@ test: check-deps $(GO_SOURCES) go.mod go.sum
 	@echo "Running Go tests..."
 	CGO_ENABLED=1 go test -race ./...
 
+# The suite with filter sources named by capability (policy.capability_sources)
+# wherever a test does not pin the mode. The mapper alone runs past go test's
+# default 10-minute timeout with HEADSCALE_DEBUG_POLICY_AUDIT=1.
+.PHONY: test-capability-sources
+test-capability-sources: check-deps $(GO_SOURCES) go.mod go.sum
+	@echo "Running Go tests with capability sources..."
+	HEADSCALE_TEST_CAPABILITY_SOURCES=true go test -timeout 60m ./...
 
 # Formatting targets
 .PHONY: fmt

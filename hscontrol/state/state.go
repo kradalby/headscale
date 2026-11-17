@@ -425,10 +425,12 @@ func NewState(cfg *types.Config) (*State, error) {
 		return nil, fmt.Errorf("loading policy: %w", err)
 	}
 
-	w, err := newWorld(nodes, users, pol, cfg.DNSView())
+	w, err := newWorldMode(nodes, users, pol, cfg.DNSView(), cfg.Policy.CapabilitySources)
 	if err != nil {
 		return nil, fmt.Errorf("initializing policy manager: %w", err)
 	}
+
+	censusWorld.Store(w)
 
 	w.batchSize, w.batchTimeout = cfg.Tuning.NodeStoreBatchSize, cfg.Tuning.NodeStoreBatchTimeout
 	w.servesRoute = cfg.ServesRoute

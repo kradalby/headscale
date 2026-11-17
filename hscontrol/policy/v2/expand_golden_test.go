@@ -88,7 +88,7 @@ func requireExpandsLikeCompile(t *testing.T, x *Expansion, pm *PolicyManager, no
 		want, err := pm.FilterForNode(n.View())
 		require.NoError(t, err)
 
-		got := expandFilter(x.capFilterFor(n.View(), &shapes), x.holders)
+		got := expandFilter(x.capFilterFor(n.View(), &shapes), x.holders, reasonAddressMode)
 		if !reflect.DeepEqual(want, got) {
 			require.Failf(t, "expanded filter differs from the compile's", "node %s (%d) %s:\n%s",
 				n.GivenName, n.ID, fmt.Sprint(msgAndArgs...), cmp.Diff(want, got, inOrderOpts...))
@@ -166,7 +166,7 @@ func requireServedAgreesWithGlobal(t *testing.T, f *Filters, nodes views.Slice[t
 			continue
 		}
 
-		served, err := f.ForNode(n.ID())
+		served, err := f.ForNode(n.ID(), ReceiverFacts{})
 		require.NoError(t, err)
 
 		if want := reducer.Reduce(n); !reflect.DeepEqual(want, served) {
@@ -393,7 +393,7 @@ func goldenExpansion(t *testing.T, tally *expandTally, id string, src []byte, us
 			// Sources and keys from the netmap's holders alone.
 			cut := x.capFilterFor(node.View(), nil)
 			cut.srcs, cut.keys = nil, nil
-			viaNetmap := expandFilter(cut, netmapHolders(capture.Netmap, nodes, roles, x.table).holders)
+			viaNetmap := expandFilter(cut, netmapHolders(capture.Netmap, nodes, roles, x.table).holders, reasonAddressMode)
 			same := reflect.DeepEqual(got, viaNetmap)
 			announces := capture.Netmap.SelfNode.Hostinfo().RoutableIPs().Len() > 0
 

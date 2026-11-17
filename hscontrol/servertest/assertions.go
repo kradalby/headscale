@@ -1,11 +1,15 @@
 package servertest
 
 import (
+	"net/netip"
 	"slices"
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/types/netmap"
+	"tailscale.com/wgengine/filter"
 )
 
 // AssertMeshComplete verifies that every client in the slice sees
@@ -166,4 +170,54 @@ func AssertSelfHasAddresses(tb testing.TB, client *TestClient) {
 	if nm.SelfNode.Addresses().Len() == 0 {
 		tb.Errorf("AssertSelfHasAddresses: %s self node has no addresses", client.Name)
 	}
+}
+
+// CapLookup answers capability-source questions as a client holding nm
+// does: an address names the node, itself or a peer, that nm lists last
+// among those holding it as their own, and that node's CapMap answers.
+// Pass it to [filter.New], or the client's filter matches no cap: source.
+func CapLookup(nm *netmap.NetworkMap) filter.CapTestFunc {
+	byAddr := nodesByAddr(nm)
+
+	return func(src netip.Addr, c nodecap.Cap) bool {
+		n, ok := byAddr[src]
+
+		return ok && c != "" && !n.UnsignedPeerAPIOnly() && n.HasCap(c)
+	}
+}
+
+// CapHolders returns, as single-address prefixes, the addresses [CapLookup]
+// admits for capability c.
+func CapHolders(nm *netmap.NetworkMap, c nodecap.Cap) []netip.Prefix {
+	lookup := CapLookup(nm)
+
+	var out []netip.Prefix
+
+	for addr := range nodesByAddr(nm) {
+		if lookup(addr, c) {
+			out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
+		}
+	}
+
+	slices.SortFunc(out, netip.Prefix.Compare)
+
+	return out
+}
+
+func nodesByAddr(nm *netmap.NetworkMap) map[netip.Addr]tailcfg.NodeView {
+	byAddr := map[netip.Addr]tailcfg.NodeView{}
+
+	for _, n := range append([]tailcfg.NodeView{nm.SelfNode}, nm.Peers...) {
+		if !n.Valid() {
+			continue
+		}
+
+		for _, p := range n.Addresses().All() {
+			if p.IsSingleIP() {
+				byAddr[p.Addr()] = n
+			}
+		}
+	}
+
+	return byAddr
 }

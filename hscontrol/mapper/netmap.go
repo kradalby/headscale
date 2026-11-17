@@ -102,6 +102,10 @@ type netMap struct {
 	// ownerless is set when self had no owner, so no profiles were sent
 	// though peers were.
 	ownerless bool
+
+	// holders are the nodes holding each address, in capability mode only,
+	// where a client finds a source's capabilities through its address.
+	holders state.AddressHolders
 }
 
 // renderer renders one node's netMap. After the first render it renders a
@@ -153,10 +157,12 @@ type renderer struct {
 	routedVia       weak.Pointer[policyv2.ViaRoutes]
 	routedWinners   *policyv2.ViaRoutes
 
-	// dns is reused while its inputs, the node, the policy's capability
-	// maps and the extra records, are unchanged.
-	dns    *tailcfg.DNSConfig
-	dnsKey dnsKey
+	// dns is reused while its inputs, the node, its own capabilities and
+	// the extra records, are unchanged; dnsCaps are the capabilities it
+	// was generated with.
+	dns     *tailcfg.DNSConfig
+	dnsKey  dnsKey
+	dnsCaps tailcfg.NodeCapMap
 
 	// self is reused while the node, its policy caps and the primary routes,
 	// which its own routes come from, are unchanged.
@@ -181,8 +187,8 @@ type renderKey struct {
 }
 
 type dnsKey struct {
-	self      types.NodeView
-	caps, dns uint64
+	self types.NodeView
+	dns  uint64
 }
 
 // selfKey holds what the node's own entry renders from. dns is there for
@@ -280,6 +286,18 @@ type peerRender struct {
 	tn      *tailcfg.Node
 }
 
+// capsOf returns a node's capabilities as it and its peers are sent them;
+// nil holds none.
+type capsOf func(types.NodeID) tailcfg.NodeCapMap
+
+func (c capsOf) of(id types.NodeID) tailcfg.NodeCapMap {
+	if c == nil {
+		return nil
+	}
+
+	return c(id)
+}
+
 // render returns peer rendered without routes. The result is shared and
 // must not be modified; see [withRoutes].
 func (pr *peerRenders) render(
@@ -288,10 +306,11 @@ func (pr *peerRenders) render(
 	capVer tailcfg.CapabilityVersion,
 	rev, capsRev uint64,
 	peer types.NodeView,
-	capMaps map[types.NodeID]tailcfg.NodeCapMap,
+	capMaps capsOf,
+	stamped bool,
 ) (*tailcfg.Node, error) {
 	slot := pr.of(peer.ID(), rev)
-	caps := capMaps[peer.ID()]
+	caps := capMaps.of(peer.ID())
 
 	prev := slot.Load()
 	if prev != nil {
@@ -318,8 +337,9 @@ func (pr *peerRenders) render(
 	}
 
 	// A peer's CapMap carries only the caps clients read from the peer
-	// view; see [policyv2.PeerCapMap].
-	tn.CapMap = policyv2.PeerCapMap(peer, caps)
+	// view, and in capability mode its source capabilities; see
+	// [policyv2.PeerCapMap].
+	tn.CapMap = policyv2.PeerCapMap(peer, caps, stamped)
 
 	tn.Hostinfo = types.PeerHostinfo(tn.Hostinfo)
 
@@ -393,11 +413,10 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 		return nil, ErrNodeGone
 	}
 
-	pm := snap.Policy()
-	capMaps := pm.NodeCapMaps()
+	capMaps := capsOf(snap.NodeCaps)
 
 	dns := snap.DNS()
-	selfCaps := capMaps[self.ID()]
+	selfCaps := capMaps.of(self.ID())
 
 	if k := (selfKey{self: self, primaries: snap.PrimariesRev(), dns: snap.DNSRev()}); r.self == nil || k != r.selfKey || !r.selfCaps.Equal(selfCaps) {
 		tn, err := self.TailNode(r.capVer, func(types.NodeID) []netip.Prefix {
@@ -438,8 +457,10 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 		ssh = &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}}
 	}
 
-	if k := (dnsKey{self: self, caps: snap.CapsRev(), dns: snap.DNSRev()}); r.dns == nil || k != r.dnsKey {
-		r.dns, r.dnsKey = generateDNSConfig(dns, self, capMaps[self.ID()]), k
+	// The DNS config reads the node's own capabilities, not the tailnet's:
+	// a peer's stamp moving leaves it.
+	if k := (dnsKey{self: self, dns: snap.DNSRev()}); r.dns == nil || k != r.dnsKey || !r.dnsCaps.Equal(selfCaps) {
+		r.dns, r.dnsKey, r.dnsCaps = generateDNSConfig(dns, self, selfCaps), k, selfCaps
 	}
 
 	nm := &netMap{
@@ -450,6 +471,7 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 		dns:     r.dns,
 		derpMap: snap.DERPMap(),
 		base:    r.last,
+		holders: snap.AddressHolders(),
 	}
 
 	err = r.renderPeers(snap, self, capMaps, nm)
@@ -474,7 +496,7 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 func (r *renderer) renderPeers(
 	snap *state.Snapshot,
 	self types.NodeView,
-	capMaps map[types.NodeID]tailcfg.NodeCapMap,
+	capMaps capsOf,
 	nm *netMap,
 ) error {
 	// An unmoved peers cell holds the same views and side sets, unmoved
@@ -514,7 +536,7 @@ func (r *renderer) renderPeers(
 
 	candidates = append(candidates, r.routedCandidates(snap, self, key, base == nil)...)
 
-	_, ipv4Disabled := capMaps[self.ID()][types.NodeAttrDisableIPv4]
+	_, ipv4Disabled := capMaps.of(self.ID())[types.NodeAttrDisableIPv4]
 	if (base == nil && ipv4Disabled) || (base != nil && ipv4Disabled != r.lastIPv4Disabled) {
 		for id := range class.All() {
 			candidates = append(candidates, id)
@@ -882,7 +904,7 @@ func (cm *classMaps) get(
 	view []types.NodeID,
 	capVer tailcfg.CapabilityVersion,
 	capsRev uint64,
-	capMaps map[types.NodeID]tailcfg.NodeCapMap,
+	capMaps capsOf,
 ) (*peerMap, *profileMap, state.NodesVersion) {
 	renders.advance(snap.Rev())
 
@@ -963,7 +985,7 @@ func (cm *classMaps) get(
 			continue
 		}
 
-		tn, err := renders.render(cfg, dns, capVer, snap.Rev(), capsRev, peer, capMaps)
+		tn, err := renders.render(cfg, dns, capVer, snap.Rev(), capsRev, peer, capMaps, snap.CapabilitySources())
 		if err != nil {
 			// One peer with invalid data must not blank out the map for
 			// every node that can see it.
