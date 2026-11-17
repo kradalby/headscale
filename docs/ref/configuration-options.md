@@ -423,6 +423,7 @@ Where the access control policy is kept: in a file headscale reads, or in the da
     policy:
       path: ""
       mode: file
+      capability_sources: false
     ```
 
 ### `policy.path` { #policy.path data-toc-label="path" }
@@ -484,6 +485,33 @@ Where the policy is kept: in the file [`policy.path`](#policy.path), or in the d
 
     ```nix
     services.headscale.settings.policy.mode = "database";
+    ```
+
+### `policy.capability_sources` { #policy.capability_sources data-toc-label="capability_sources" }
+
+- **Type:** [boolean](#type-boolean)
+- **Default:** `false`
+- **Env:** `HEADSCALE_POLICY_CAPABILITY_SOURCES`
+
+Sends a rule's users, groups, tags and autogroups as node capabilities their members are stamped with: a member joining or leaving changes the capabilities its peers are sent with it, not the packet filter nodes in capability form are sent. Every peer then sees the selectors a node is in. Sources the client cannot match this way, and nodes that cannot be sent them (routers, app connectors, clients other than Tailscale's), stay as addresses. Read at startup only. In either mode a policy naming a capability under `https://headscale.net/cap/src/` is refused, a stored one at startup.
+
+=== "YAML"
+
+    ```yaml
+    policy:
+      capability_sources: true
+    ```
+
+=== "Environment"
+
+    ```shell
+    export HEADSCALE_POLICY_CAPABILITY_SOURCES=true
+    ```
+
+=== "NixOS"
+
+    ```nix
+    services.headscale.settings.policy.capability_sources = true;
     ```
 
 ## `log` { #log data-toc-label="log" }
