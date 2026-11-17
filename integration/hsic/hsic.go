@@ -151,6 +151,18 @@ func WithConfigEnv(configEnv map[string]string) Option {
 	}
 }
 
+// WithCapabilitySources names filter sources by node capability
+// (policy.capability_sources).
+func WithCapabilitySources() Option {
+	return func(hsic *HeadscaleInContainer) {
+		hsic.env["HEADSCALE_POLICY_CAPABILITY_SOURCES"] = "true"
+	}
+}
+
+// capabilitySourcesEnv, a boolean that `hi` passes through, runs every
+// headscale a suite starts with [WithCapabilitySources].
+const capabilitySourcesEnv = "HEADSCALE_INTEGRATION_CAPABILITY_SOURCES"
+
 // WithPort sets the port on where to run Headscale.
 func WithPort(port int) Option {
 	return func(hsic *HeadscaleInContainer) {
@@ -349,6 +361,17 @@ func New(
 		env:              DefaultConfigEnv(),
 		filesInContainer: []fileInContainer{},
 		policyMode:       types.PolicyModeFile,
+	}
+
+	if v := os.Getenv(capabilitySourcesEnv); v != "" {
+		on, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("%s=%q: %w", capabilitySourcesEnv, v, err)
+		}
+
+		if on {
+			WithCapabilitySources()(hsic)
+		}
 	}
 
 	for _, opt := range opts {

@@ -2,15 +2,18 @@ package integration
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/integration/hsic"
 	"github.com/juanfont/headscale/integration/tsic"
 	"github.com/juanfont/headscale/integration/tsric"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/tailcfg"
 )
 
 // TestTailscaleRustAxum tests that the tailscale-rs axum example can join a
@@ -270,4 +273,110 @@ func TestTailscaleRustAxum(t *testing.T) {
 		"counter should increment between sequential POST requests")
 
 	t.Log("TestTailscaleRustAxum: all checks passed")
+}
+
+// TestTailscaleRustCapabilitySources is the canary of the client fallback
+// (TODO(capsrc/client)): with capability sources on and a rule whose source
+// is an identity selector, the tailscale-rs node, which looks no capability
+// up, must be sent the source as addresses and so still admit traffic,
+// while the official client beside it is sent the capability.
+func TestTailscaleRustCapabilitySources(t *testing.T) {
+	IntegrationSkip(t)
+
+	scenario, err := NewScenario(ScenarioSpec{NodesPerUser: 1, Users: []string{"user1"}})
+	require.NoError(t, err)
+
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	err = scenario.CreateHeadscaleEnv(
+		[]tsic.Option{},
+		hsic.WithTestName("tsrscapsrc"),
+		hsic.WithACLPolicy(&policyv2.Policy{ACLs: []policyv2.ACL{{
+			Action:       "accept",
+			Sources:      []policyv2.Alias{usernamep("user1@")},
+			Destinations: []policyv2.AliasWithPorts{aliasWithPorts(usernamep("user1@"), tailcfg.PortRangeAny)},
+		}}}),
+		hsic.WithCapabilitySources(),
+		// As in TestTailscaleRustAxum: tailscale-rs trusts neither the
+		// embedded DERP's certificate nor headscale's.
+		hsic.WithPublicDERP(),
+		hsic.WithoutTLS(),
+	)
+	requireNoErrHeadscaleEnv(t, err)
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	allClients, err := scenario.ListTailscaleClients()
+	requireNoErrListClients(t, err)
+	require.Len(t, allClients, 1)
+
+	probe := allClients[0]
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		nm, err := probe.Netmap()
+		if !assert.NoError(c, err) {
+			return
+		}
+
+		assert.True(c, slices.ContainsFunc(nm.PacketFilterRules.AsSlice(), func(r tailcfg.FilterRule) bool {
+			return slices.ContainsFunc(r.SrcIPs, func(s string) bool { return strings.HasPrefix(s, "cap:") })
+		}), "the official client is sent a capability source")
+	}, 30*time.Second, time.Second, "capability sources are on")
+
+	users, err := headscale.ListUsers()
+	require.NoError(t, err)
+
+	var userID uint64
+
+	for _, u := range users {
+		if u.Name == "user1" {
+			userID = mustParseID(u.Id)
+		}
+	}
+
+	require.NotZero(t, userID)
+
+	pak, err := headscale.CreateAuthKey(userID, false, true)
+	require.NoError(t, err)
+
+	network := scenario.Networks()[0]
+
+	tsrs, err := tsric.New(scenario.Pool(),
+		tsric.WithNetwork(network),
+		tsric.WithHeadscaleURL(headscale.GetEndpoint()),
+		tsric.WithAuthKey(pak.Key),
+		tsric.WithExtraHosts([]string{headscale.GetHostname() + ":" + headscale.GetIPInNetwork(network)}),
+	)
+	require.NoError(t, err)
+
+	defer func() {
+		_, _, err := tsrs.Shutdown()
+		if err != nil {
+			t.Logf("shutting down tailscale-rs: %s", err)
+		}
+	}()
+
+	var rustIPv4 string
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		nodes, err := headscale.ListNodes()
+		assert.NoError(c, err)
+
+		for _, n := range nodes {
+			if strings.HasPrefix(n.GivenName, "tsrs-") && len(n.IpAddresses) > 0 {
+				rustIPv4 = n.IpAddresses[0]
+			}
+		}
+
+		assert.NotEmpty(c, rustIPv4, "tailscale-rs registers")
+	}, 120*time.Second, 2*time.Second)
+
+	require.NotEmpty(t, rustIPv4)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		result, err := probe.Curl(fmt.Sprintf("http://%s/index.html", rustIPv4))
+		assert.NoError(c, err)
+		assert.Contains(c, result, "tailscale-rs")
+	}, 120*time.Second, 2*time.Second, "tailscale-rs admits the user1@ source sent to it as addresses")
 }
