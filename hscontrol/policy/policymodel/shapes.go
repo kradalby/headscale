@@ -255,6 +255,238 @@ func gained(was, is netip.Addr) bool { return !was.IsValid() && is.IsValid() }
 func lost(was, is netip.Addr) bool   { return was.IsValid() && !is.IsValid() }
 func moved(was, is netip.Addr) bool  { return was.IsValid() && is.IsValid() && was != is }
 
+// compiledRefs is every rule in the order the compile lists them, which
+// is where merged rules sit: grants, then ACLs.
+func compiledRefs(p Policy) []RuleRef {
+	refs := p.Refs()
+
+	return slices.Concat(refs[len(p.ACLs):], refs[:len(p.ACLs)])
+}
+
+// dstMembers is the nodes r's destinations name.
+func (v *View) dstMembers(r Rule) []Node {
+	sels := make([]Sel, len(r.Dst))
+	for i, d := range r.Dst {
+		sels[i] = d.Sel
+	}
+
+	return v.MembersOf(sels...)
+}
+
+// sourcesResolve reports whether sels resolve to some address: one names
+// addresses, or a member holding one.
+func (v *View) sourcesResolve(sels []Sel) bool {
+	return slices.ContainsFunc(sels, func(s Sel) bool {
+		switch s.Kind { //nolint:exhaustive // identities resolve through their members, below
+		case SelAll, SelDangerAll, SelHost, SelPrefix:
+			return true
+		}
+
+		return slices.ContainsFunc(v.MembersOf(s), func(n Node) bool { return len(n.Addrs()) > 0 })
+	})
+}
+
+// anchor is a merged rule placed by an earlier rule of its key: first and
+// then share a merge key; first reaches some node but not recv; recv
+// receives then, and between, a rule of another key that sits between
+// the two. In address form recv's merged rule sits at first's place,
+// before between's.
+type anchor struct {
+	first, between, then RuleRef
+	recv                 types.NodeID
+}
+
+// anchors returns every anchor of v's document.
+func (v *View) anchors() []anchor {
+	p := v.World.Policy
+	refs := compiledRefs(p)
+
+	plain := func(r Rule) bool { return !r.selfRule() && len(r.Via) == 0 }
+
+	var out []anchor
+
+	for i, fr := range refs {
+		first := p.Rule(fr)
+
+		reached := v.dstMembers(first)
+		if !plain(first) || len(reached) == 0 || !v.sourcesResolve(first.Src) {
+			continue
+		}
+
+		for j := i + 2; j < len(refs); j++ {
+			then := p.Rule(refs[j])
+			if !plain(then) || !sameSourcesAndProtocol(first, fr.Grant, then, refs[j].Grant) {
+				continue
+			}
+
+			for _, n := range v.dstMembers(then) {
+				if slices.ContainsFunc(reached, func(m Node) bool { return m.ID == n.ID }) {
+					continue
+				}
+
+				for _, br := range refs[i+1 : j] {
+					b := p.Rule(br)
+					if !sameSourcesAndProtocol(first, fr.Grant, b, br.Grant) && v.sourcesResolve(b.Src) &&
+						slices.ContainsFunc(v.dstMembers(b), func(m Node) bool { return m.ID == n.ID }) {
+						out = append(out, anchor{fr, br, refs[j], n.ID})
+					}
+				}
+			}
+		}
+	}
+
+	return out
+}
+
+// anchorMoved reports whether a policy-only step keeping the selector
+// table moved the key of an anchor's first rule, and nothing else of it,
+// with its receiver reading in address form after.
+func anchorMoved(b, a *View, st Step) bool {
+	if !onlyPolicy(st) || !sameSet(b.World.Policy.Selectors(), a.World.Policy.Selectors()) {
+		return false
+	}
+
+	return slices.ContainsFunc(b.anchors(), func(an anchor) bool {
+		n, ok := a.World.Topology.Node(an.recv)
+		if !ok || a.Eligible(n) || !slices.Contains(st.Reads, an.recv) {
+			return false
+		}
+
+		if !ruleChanged(b, a, an.first) || ruleChanged(b, a, an.between) || ruleChanged(b, a, an.then) {
+			return false
+		}
+
+		p := a.World.Policy
+
+		return !sameSourcesAndProtocol(p.Rule(an.first), an.first.Grant, p.Rule(an.then), an.then.Grant)
+	})
+}
+
+// identitySourceAddrs is, sorted, the addresses of the members of the
+// identity sources of the rules whose destinations name n: what n's
+// address form names that its capability form does not.
+func (v *View) identitySourceAddrs(n Node) []netip.Addr {
+	var out []netip.Addr
+
+	for _, ref := range v.World.Policy.Refs() {
+		r := v.World.Policy.Rule(ref)
+		if !slices.ContainsFunc(r.Dst, func(d Dest) bool { return v.names(d.Sel, n) }) {
+			continue
+		}
+
+		for _, s := range r.Src {
+			switch s.Kind { //nolint:exhaustive // the other kinds name addresses
+			case SelUser, SelGroup, SelTag, SelMember, SelTagged:
+				for _, m := range v.MembersOf(s) {
+					out = append(out, m.Addrs()...)
+				}
+			}
+		}
+	}
+
+	slices.SortFunc(out, netip.Addr.Compare)
+
+	return slices.Compact(out)
+}
+
+// flipSourceMovesFlipBack reports whether a node's session read in
+// address form, then, with it not reading, the node turned eligible, a
+// source of its rules gained or lost an address while the node itself
+// stayed as it was, and it turned back; and then it read: its address
+// form was carried across a change only that form sees.
+func flipSourceMovesFlipBack(vs []*View, steps []Step) bool {
+	for _, n := range vs[0].nodes {
+		stage := 0
+
+		for i := range vs {
+			is, ok := vs[i].World.Topology.Node(n.ID)
+			if !ok {
+				break
+			}
+
+			elig, read := vs[i].Eligible(is), readAt(steps, i, n.ID)
+
+			if i == 0 {
+				if !elig {
+					stage = 1
+				}
+
+				continue
+			}
+
+			was, _ := vs[i-1].World.Topology.Node(n.ID)
+			flip := vs[i-1].Eligible(was) != elig
+			source := !flip && reflect.DeepEqual(was, is) && !slices.Equal(vs[i-1].identitySourceAddrs(was), vs[i].identitySourceAddrs(is))
+
+			switch {
+			case stage == 1 && flip && !read:
+				stage = 2
+			case stage == 2 && source && !read:
+				stage = 3
+			case stage == 3 && flip && read:
+				return true
+			case stage == 3 && flip:
+				stage = 4
+			case stage == 4 && read && !elig:
+				return true
+			case read || flip:
+				stage = 0
+				if read && !elig {
+					stage = 1
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// selfNamed reports whether a self rule's sources hold an address of n:
+// the compile then names n among its owner's sources.
+func (v *View) selfNamed(n Node) bool {
+	return v.anyRule(func(r Rule, _ bool) bool { return r.selfRule() && v.holds(r.Src, n) })
+}
+
+// selfSourceSharerMoved reports whether a step left a node as it was but
+// moved whether a self rule's sources name it, while it shares an address
+// the step left alone with another node: the node's side facts move, and
+// with them the sides of the one sharing it.
+func selfSourceSharerMoved(b, a *View, _ Step) bool {
+	for _, x := range b.nodes {
+		now, ok := a.World.Topology.Node(x.ID)
+		if x.Tagged() || !ok || !reflect.DeepEqual(x, now) || b.selfNamed(x) == a.selfNamed(now) {
+			continue
+		}
+
+		if slices.ContainsFunc(now.Addrs(), func(o netip.Addr) bool { return a.heldByOther(now, o) && untouched(b, a, o) }) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// untouched reports whether every node holding o before or after a step
+// is there on both sides and the same.
+func untouched(b, a *View, o netip.Addr) bool {
+	for _, v := range []*View{b, a} {
+		for _, n := range v.nodes {
+			if !slices.Contains(n.Addrs(), o) {
+				continue
+			}
+
+			was, okb := b.World.Topology.Node(n.ID)
+			is, oka := a.World.Topology.Node(n.ID)
+
+			if !okb || !oka || !reflect.DeepEqual(was, is) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
 // readAt reports whether node id's session reads after step i (0 is the
 // start, which every session reads).
 func readAt(steps []Step, i int, id types.NodeID) bool {
@@ -411,6 +643,12 @@ var Required = []Shape{
 		}
 
 		return false
+	}},
+	{Name: "merge-anchor", Why: "a merged rule placed by an earlier rule of its key that its receiver does not hold", Min: 0.03, World: func(v *View) bool {
+		return len(v.anchors()) > 0
+	}},
+	{Name: "provider-token", Why: "a token naming a user by provider identifier", Min: 0.15, World: func(v *View) bool {
+		return slices.Contains(v.World.Policy.userRefs(), providerRef) && len(v.RefUsers(providerRef)) > 0
 	}},
 	{Name: "group-member-names-nobody", Why: "a group member that adds no one", Min: 0.35, World: func(v *View) bool {
 		for _, g := range v.World.Policy.Groups {
@@ -621,11 +859,14 @@ var Required = []Shape{
 
 		return false
 	}},
+	{Name: "merge-anchor-moved", Why: "an anchor's key moves while an address-form receiver of its merged rule reads", Min: 0.015, Step: anchorMoved},
+	{Name: "self-source-sharer-moved", Why: "whether a self rule names a node moves, and another node shares an address the step left alone (database only)", Min: 0.008, Step: selfSourceSharerMoved},
 	{Name: "partial-read", Why: "some sessions read a commit, others do not", Min: 0.25, Step: func(_, a *View, st Step) bool {
 		return len(st.Reads) > 0 && len(st.Reads) < len(a.nodes)
 	}},
 	{Name: "long-unread", Why: "a session reads after three commits it did not", Min: 0.1, Seq: longUnread},
 	{Name: "flip-move-flip-back", Why: "a filter carried across a form flip, a move and a flip back", Min: 0.04, Seq: flipMoveFlipBack},
+	{Name: "flip-source-moves-flip-back", Why: "an address form carried across a flip, a source moving only it sees, and a flip back", Min: 0.01, Seq: flipSourceMovesFlipBack},
 }
 
 // longUnread reports whether some node's session reads after three or

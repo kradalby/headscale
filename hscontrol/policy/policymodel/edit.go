@@ -1128,16 +1128,28 @@ func (e ReplaceUserRefs) apply(w *World) {
 	})
 }
 
-// undo has no write to take the replacement back when the document held a
-// token it replaced with already: replacing back would replace that too.
+// undo replaces back the tokens the document held. It has none when it
+// wrote one of them onto a token the document held already, or two onto
+// one: replacing back cannot tell them apart.
 func (e ReplaceUserRefs) undo(w World) (Edit, bool) {
 	held := w.Policy.userRefs()
 
-	if slices.ContainsFunc(e.To, func(r int) bool { return slices.Contains(held, r) && !slices.Contains(e.From, r) }) {
-		return nil, false
+	var inv ReplaceUserRefs
+
+	for i, from := range e.From {
+		if !slices.Contains(held, from) {
+			continue
+		}
+
+		to := e.To[i]
+		if slices.Contains(inv.From, to) || slices.Contains(held, to) && !slices.Contains(e.From, to) {
+			return nil, false
+		}
+
+		inv.From, inv.To = append(inv.From, to), append(inv.To, from)
 	}
 
-	return ReplaceUserRefs{e.To, e.From}, true
+	return inv, true
 }
 
 func (e ReplaceUserRefs) String() string {

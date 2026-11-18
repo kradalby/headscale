@@ -42,16 +42,45 @@ func Worlds() *rapid.Generator[World] { return worlds }
 func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 	return rapid.Custom(func(t *rapid.T) Scenario {
 		s := Scenario{Start: worlds.Draw(t, "start")}
+
+		// Scripts begin some scenarios with sequences no run of single
+		// draws reaches: an anchor's key moving, where the start holds
+		// one; a node stopping being named through an address it shares,
+		// where the start shares addresses; a node's form flipping, its
+		// address moving and its form flipping back, unread until the
+		// end; and the same with a source of its rules moving instead.
+		move := chance(t, 2, "anchor-move")
+		chain := chance(t, 2, "share-chain")
+		script := chance(t, 8, "flip-script")
+		elsewhere := chance(t, 8, "flip-elsewhere")
+		who := rapid.IntRange(0, 15).Draw(t, "flipper")
+
+		var scripted []Step
+
+		if chain {
+			s.Start, scripted = shareChain(s.Start, who)
+		}
+
 		w := s.Start
 
-		// One in eight starts with a node's form flipping, its address
-		// moving and its form flipping back, unread until the end: the
-		// carried-filter sequence no run of single draws reaches.
-		script := chance(t, 8, "flip-script")
-		who := rapid.IntRange(0, 15).Draw(t, "flipper")
+		if move {
+			scripted = append(anchorMove(w), scripted...)
+		}
+
+		for _, st := range scripted {
+			w = w.Apply(st.Edits...)
+			s.Steps = append(s.Steps, st)
+		}
 
 		if script {
 			for _, st := range flipScript(w, who) {
+				w = w.Apply(st.Edits...)
+				s.Steps = append(s.Steps, st)
+			}
+		}
+
+		if elsewhere {
+			for _, st := range flipElsewhereScript(w, who+1) {
 				w = w.Apply(st.Edits...)
 				s.Steps = append(s.Steps, st)
 			}
@@ -112,6 +141,149 @@ func flipScript(w World, who int) []Step {
 	}
 }
 
+// flipElsewhereScript is four steps on an eligible node of w, which
+// cut its address form and carry it across a change only that form sees:
+// its client stops being official and it reads; it is official again;
+// a node joins a source of its rules; its client stops being official
+// again and it reads. None when no eligible node's rules have another
+// node in such a source.
+func flipElsewhereScript(w World, who int) []Step {
+	v := NewView(w)
+
+	var eligible []Node
+
+	for _, n := range w.Topology.Nodes {
+		if v.Eligible(n) {
+			eligible = append(eligible, n)
+		}
+	}
+
+	// The joiner is like a member of an identity source of n's rules, so
+	// it joins that source.
+	like := func(n Node) (Node, bool) {
+		for _, ref := range w.Policy.Refs() {
+			r := w.Policy.Rule(ref)
+			if !slices.ContainsFunc(r.Dst, func(d Dest) bool { return v.names(d.Sel, n) }) {
+				continue
+			}
+
+			for _, s := range r.Src {
+				if s.Kind != SelUser && s.Kind != SelGroup && s.Kind != SelTag && s.Kind != SelMember && s.Kind != SelTagged {
+					continue
+				}
+
+				if i := slices.IndexFunc(v.MembersOf(s), func(m Node) bool { return m.ID != n.ID }); i >= 0 {
+					return v.MembersOf(s)[i], true
+				}
+			}
+		}
+
+		return Node{}, false
+	}
+
+	for k := range eligible {
+		n := eligible[(who+k)%len(eligible)]
+
+		m, ok := like(n)
+		if !ok {
+			continue
+		}
+
+		id := w.Topology.nextID()
+		joiner := Node{ID: id, User: m.User, Tags: m.Tags, V4: ownAddr(4, uint64(id)), V6: ownAddr(6, uint64(id))}
+
+		return []Step{
+			{Edits: []Edit{SetClient{n.ID, Unknown}}, Reads: []types.NodeID{n.ID}},
+			{Edits: []Edit{SetClient{n.ID, Official}}},
+			{Edits: []Edit{Join{joiner}}},
+			{Edits: []Edit{SetClient{n.ID, Unknown}}, Reads: []types.NodeID{n.ID}},
+		}
+	}
+
+	return nil
+}
+
+// anchorMove moves the key of the first anchor w's document holds by its
+// first rule's protocol, which keeps the selector table, and every
+// session reads. None when w holds no anchor.
+func anchorMove(w World) []Step {
+	ans := NewView(w).anchors()
+	if len(ans) == 0 {
+		return nil
+	}
+
+	ref, then := ans[0].first, w.Policy.Rule(ans[0].then)
+	r := w.Policy.Rule(ref)
+
+	// The ip entry sharing then's protocol, for a grant.
+	at, cur := 0, r.Proto
+	if ref.Grant {
+		at = slices.IndexFunc(r.IP, func(ip IP) bool { return slices.Contains(protos(then, ans[0].then.Grant), ip.Proto) })
+		cur = r.IP[at].Proto
+	}
+
+	// TCP takes the ports every protocol before it does.
+	proto := slices.Index(Protos, "tcp")
+	if cur == proto {
+		proto = 0
+	}
+
+	st := Step{Edits: []Edit{SetProto{ref, at, proto}}}
+	for _, n := range w.Topology.Nodes {
+		st.Reads = append(st.Reads, n.ID)
+	}
+
+	return []Step{st}
+}
+
+// shareChain, in a world that shares addresses already, has a node of the
+// second user hold one address of a node of alice's and the other of a
+// third node, and puts alice's self rule in front of the ACLs, whose
+// source names the node by the address it shares with hers. The step
+// deletes her node, which unnames it, and every session reads: the
+// node's side facts move though nothing wrote it, and the third node's
+// sides with them. w as it was, and no step, in a world sharing no
+// address, with fewer than three nodes or two users, or where two users
+// answer to alice@.
+func shareChain(w World, who int) (World, []Step) {
+	if v := NewView(w); len(w.Topology.Nodes) < 3 || len(w.Topology.Users) < 2 || !v.sharedAddr() || v.Ambiguous(0) {
+		return w, nil
+	}
+
+	w = w.clone()
+	nodes := w.Topology.Nodes
+	second := w.Topology.Users[1].ID
+
+	d := &nodes[0]
+	x := &nodes[1+who%(len(nodes)-1)]
+	y := &nodes[1+(who+1)%(len(nodes)-1)]
+
+	d.User, d.Tags = 1, nil
+	if !d.V6.IsValid() {
+		d.V6 = ownAddr(6, uint64(d.ID))
+	}
+
+	// On an address her node does not hold, and not hers either: her
+	// source would name x by it too.
+	y.V4 = ownAddr(4, uint64(y.ID))
+	if y.User == 1 {
+		y.User = second
+	}
+
+	x.User, x.Tags, x.V4, x.V6 = second, nil, y.V4, d.V6
+
+	self := Rule{Src: []Sel{{Kind: SelUser}}, Dst: []Dest{{Sel: Sel{Kind: SelSelf}}}}
+	w.Policy.ACLs, w.Policy.AllowAll = append([]Rule{self}, w.Policy.ACLs...), false
+	w = settle(w)
+
+	st := Step{Edits: []Edit{Leave{d.ID}}}
+	for _, n := range w.Topology.Nodes[1:] {
+		st.Reads = append(st.Reads, n.ID)
+	}
+
+	return w, []Step{st}
+}
+
 // Steps draws one step valid against w, for a state machine that takes
 // its steps as it goes: one edit mostly; sometimes several committed
 // together, a node deleted and another registered at its address, or a
@@ -145,11 +317,14 @@ var (
 		w := World{Policy: policies.Draw(t, "policy"), Topology: topologies.Draw(t, "topology")}
 
 		// Shapes a policy and a topology make only together, each in one
-		// world in eight to twelve: a tag a rule's destination names whose nodes
+		// world in eight to sixteen: a tag a rule's destination names whose nodes
 		// lose their addresses; an own rule that reaches nothing on its
 		// receiver yet places a merged rule; an app grant to public space
-		// that exits see one way.
+		// that exits see one way; a merged rule placed by an earlier rule
+		// its receiver does not get. The last goes in last, as the one
+		// before it takes every ACL away.
 		hide := chance(t, 12, "hidden-tag")
+		merge := chance(t, 16, "merge-anchor")
 		anchor := chance(t, 8, "own-anchor")
 		oneWay := chance(t, 8, "one-way-world")
 		who := rapid.IntRange(0, 15).Draw(t, "who")
@@ -164,6 +339,10 @@ var (
 
 		if oneWay {
 			oneWayWorld(&w, who)
+		}
+
+		if merge {
+			mergeAnchor(&w, who+1)
 		}
 
 		return settle(w)
@@ -201,6 +380,48 @@ func ownAnchor(w *World, who int) {
 	n := &nodes[1+who%(len(nodes)-1)]
 	n.User, n.Tags, n.V4, n.V6 = 1, nil, netip.Addr{}, netip.Addr{}
 	n.Announced, n.Approved = []int{0}, []int{0}
+}
+
+// mergeAnchor puts in front of w's ACLs two UDP rules from the members,
+// one to themselves and one to tag:c, with a rule from * to tag:c
+// between; and makes a node of w a tag:c node whose client looks no
+// capability up, so its filter goes as addresses. There the second
+// member rule merges at the first's place, which the node does not
+// receive: moving the first's key moves where the merged rule sits.
+func mergeAnchor(w *World, who int) {
+	members, tag := Sel{Kind: SelMember}, Sel{Kind: SelTag, I: 2}
+	udp := slices.Index(Protos, "udp")
+	rules := []Rule{
+		{Src: []Sel{members}, Dst: []Dest{{Sel: members}}, Proto: udp},
+		{Src: []Sel{{Kind: SelAll}}, Dst: []Dest{{Sel: tag}}},
+		{Src: []Sel{members}, Dst: []Dest{{Sel: tag}}, Proto: udp},
+	}
+	w.Policy.ACLs, w.Policy.AllowAll = append(rules, w.Policy.ACLs...), false
+
+	// A node to receive them, joining a world of one.
+	if t := &w.Topology; len(t.Nodes) == 1 {
+		id := t.nextID()
+		t.Nodes, t.NextID = append(t.Nodes, Node{ID: id}), id+1
+	}
+
+	nodes := w.Topology.Nodes
+
+	// The members' rules reach a member with addresses.
+	m := &nodes[0]
+	m.User, m.Tags = 1, nil
+
+	if len(m.Addrs()) == 0 {
+		m.V4, m.V6 = ownAddr(4, uint64(m.ID)), ownAddr(6, uint64(m.ID))
+	}
+
+	// Not a router: those are recut whenever any rule moves.
+	r := &nodes[1+who%(len(nodes)-1)]
+	r.User, r.Tags, r.Client = 0, []int{tag.I}, Unknown
+	r.Announced, r.Approved, r.AutoApproved = nil, nil, nil
+
+	if len(r.Addrs()) == 0 {
+		r.V4, r.V6 = ownAddr(4, uint64(r.ID)), ownAddr(6, uint64(r.ID))
+	}
 }
 
 // oneWayWorld leaves w one rule, alice's app grant to public space, and

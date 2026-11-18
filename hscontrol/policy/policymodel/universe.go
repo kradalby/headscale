@@ -38,17 +38,19 @@ import (
 // rules naming one selector, a route over another node's address, two
 // nodes on one address.
 
-// UserRefs are the user tokens a policy names: by name, by e-mail and by
-// e-mail domain. Which user each resolves to depends on the topology.
-//
-// A token naming a user by provider identifier, as headscale's OIDC
-// documentation allows (providerPrefix + "3@"), belongs here once the
-// reference resolves provider identifiers.
-var UserRefs = []string{"alice@", "bob@example.com", "carol@example.org", "dave@", "user:*@example.com"}
+// UserRefs are the user tokens a policy names: by name, by e-mail, by
+// e-mail domain, and by provider identifier, as headscale's OIDC
+// documentation allows. Which user each resolves to depends on the
+// topology: the provider identifier names whoever took ID 3 at an OIDC
+// login, so nobody when that user is gone or was created through the API.
+var UserRefs = []string{"alice@", "bob@example.com", "carol@example.org", "dave@", "user:*@example.com", providerPrefix + "3@"}
 
 // refUsers counts the UserRefs naming at most one user by name or e-mail;
-// the domain comes after.
+// the domain and the provider identifier come after.
 const refUsers = 4
+
+// providerRef is the UserRefs entry naming a user by provider identifier.
+const providerRef = 5
 
 // providerPrefix is the identity provider's issuer: an OIDC user's
 // identifier is it followed by the user's ID, so identifiers are unique.
