@@ -428,6 +428,11 @@ func TestWorldMatchesScratchWorld(t *testing.T) {
 					// node's change moves which targets hold its address, and
 					// the attribute stays once the address is no longer
 					// shared. Database-only; counted, and judged no further.
+					//
+					// TODO(kradalby): policy/stale-under-shared-address:
+					// delete this exception with the one in
+					// TestPipelineIncrementalMatchesScratch
+					// (policy/v2/incremental_property_test.go).
 					known["node attributes stale under a shared address"]++
 
 					break

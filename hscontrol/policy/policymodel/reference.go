@@ -369,33 +369,113 @@ const (
 	// one of the user's devices at one end: it sends them to those devices
 	// and to exit nodes, gives routes by a viewer's own user's, and links
 	// two nodes only when one is the user's. Fails closed.
+	//
+	// TODO(kradalby): policy/others-self: fails closed. With
+	// `* -> autogroup:self:*`, a node of u2 routing a prefix that holds
+	// u1's device takes none of u1's self rule for it, sees only its own
+	// user's devices and gets routes by no other user's self rules. The
+	// docs define self by user (docs/ref/policy.md) and say nothing of
+	// routers; no capture decides it. The properties in
+	// policy/v2/reference_test.go count it under "others' self rules".
+	// Production: cutSelf in policy/v2/expand.go and the self rules of
+	// visibility.go. Delete the clause once one reading is chosen: fix
+	// production, or make headscale's reading the reference's own.
 	OthersSelf Contested = 1 << iota
 	// StarApprovedRoutes: * as a source adds the routes nodes serve.
 	// Headscale adds every approved route, served or not. Fails open.
+	//
+	// TODO(kradalby): policy/star-approved-routes: fails open. With
+	// `* -> *:*` and 10.0.0.0/24 approved for n1 but not announced, every
+	// node accepts sources in 10.0.0.0/24, a range nobody routes into the
+	// tailnet. Production (approvedSubnetRoutes in policy/v2/types.go, the
+	// approved atom of visibility.go) cites Tailscale's "any approved
+	// subnets" and the hosted service keeping a withdrawn route's
+	// approval; no capture holds an approved, unannounced route, so
+	// neither side is confirmed. The properties in
+	// policy/v2/reference_test.go count it under "* adds approved routes".
+	// Delete the clause once a capture decides it, or once production
+	// reads served routes.
 	StarApprovedRoutes
 	// InternetAtSubnetRouters: autogroup:internet is the internet through
 	// exit nodes. Headscale reads it as an address set like any other, so a
 	// subnet router serving a public prefix takes it, is on its side, and
 	// its route is given by it. Fails open.
+	//
+	// TODO(kradalby): policy/internet-at-subnet-routers: fails open. With
+	// `* -> autogroup:internet:*`, a subnet router serving 8.8.8.0/24
+	// accepts the sources' packets to it, is shown to them and its route
+	// given to them, though no exit node is involved. docs/ref/policy.md:
+	// autogroup:internet "allows access to the internet through exit
+	// nodes"; no capture has a public subnet route under it. The
+	// properties in policy/v2/reference_test.go count it under "internet
+	// at subnet routers". Production: AutoGroup.resolve in
+	// policy/v2/types.go reads it as util.TheInternet. Delete the clause
+	// once production keeps it to exit nodes, or once a capture shows the
+	// hosted service reading it as addresses.
 	InternetAtSubnetRouters
 	// ViaOwnAddress: a via grant reaches what its via routers route.
 	// Headscale writes each destination prefix whole at a via router with a
 	// route overlapping it, so the router also takes it for its own
 	// address. Fails open.
+	//
+	// TODO(kradalby): policy/via-own-address: fails open. With
+	// `* -> * via tag:a`, a tag:a router on 100.64.0.1 serving
+	// 100.64.0.2/32 is given the overlapping tailnet prefix whole, so it
+	// accepts every tailnet source to its own address on every port. The
+	// plain reading reaches only what the router routes; no capture
+	// decides it. The properties in policy/v2/reference_test.go count it
+	// under "via own address", alone or with "via reach". Production:
+	// cutVia in policy/v2/expand.go (viaDstsForNode in compiled.go) emits
+	// the destination literal by design. Delete the clause, and its branch
+	// in dstsAt, once that rule is cut to the router's routes, or once the
+	// whole prefix is decided intended and the reference says so.
 	ViaOwnAddress
 	// ViaReach: a via grant reaches every route its via routers serve, *
 	// being everything, exit routes included. Headscale reaches subnet
 	// routes only, exits only for autogroup:internet, and reads * as the
 	// tailnet's ranges. Fails closed.
+	//
+	// TODO(kradalby): policy/via-reach: fails closed. With
+	// `alice@ -> 8.8.8.0/24 via tag:a`, a tag:a exit node refuses alice's
+	// packets to 8.8.8.0/24; with * as a via destination, nothing outside
+	// the tailnet's ranges is reached. The via goldens decide subnet
+	// destinations only, which agree; none holds * or a public prefix at a
+	// via-tagged exit. The properties in policy/v2/reference_test.go count
+	// it under "via reach". Production: cutVia (subnet routes only) and
+	// the via case of expandGrant (* resolved as the tailnet) in
+	// policy/v2/expand.go. Delete the clause once one reading is chosen:
+	// fix production, or make headscale's reading the reference's own.
 	ViaReach
 	// ViaRouterAddress: a via router routing a via grant's destination is
 	// on its destinations' side whether or not it has an address.
 	// Headscale shows only one that has, so the grant's sources do not see
 	// an address-less one (a database-only node). Fails closed.
+	//
+	// TODO(kradalby): policy/via-router-address: fails closed, and only
+	// for a node without addresses, a database-only shape. With
+	// `* -> * via tag:a`, an address-less tag:a router serving
+	// 100.64.0.0/30 is not shown to the grant's sources. No capture or
+	// document decides it. The properties in policy/v2/reference_test.go
+	// count it under "via router without address". Production: Sides.setOf
+	// in policy/v2/visibility.go gives the via role to addressed nodes
+	// only (viaPeerRule in compiled.go names the router's own addresses).
+	// Delete the clause once one reading is chosen, or once such nodes
+	// leave the reference's domain.
 	ViaRouterAddress
 	// ViaSelf: a via grant to autogroup:self reaches each user's devices
 	// through the via routers routing their addresses. Headscale gives it
 	// no rule. Fails closed.
+	//
+	// TODO(kradalby): policy/via-self: fails closed. With
+	// `alice@ -> autogroup:self via tag:a`, a tag:a router serving the
+	// prefix that holds alice's device gets no rule, so alice reaches
+	// nothing through it. No capture or document decides it; the generated
+	// scenarios rarely draw it, so the properties in
+	// policy/v2/reference_test.go seldom count it under "via to self".
+	// Production: the via case of expandGrant in policy/v2/expand.go
+	// resolves autogroup:self to nothing. Delete the clause once one
+	// reading is chosen: fix production, or make headscale's reading the
+	// reference's own.
 	ViaSelf
 	// ExitDestinationRoutes: an exit node serving an internet-reaching
 	// rule, through via or not, is on its destinations' side for route
@@ -403,6 +483,17 @@ const (
 	// hosts behind a subnet router can use it. Captured: routes-b18 gives
 	// the exit node those routes. Headscale gives it none (believed
 	// wrong). Fails closed.
+	//
+	// TODO(kradalby): policy/exit-destination-routes: fails closed,
+	// believed wrong. With `* -> autogroup:internet:*`, n1 an exit node and
+	// n2 routing 10.0.0.0/24, n1 is not given 10.0.0.0/24, so hosts behind
+	// n2 cannot use n1; through via the same. The hosted service gives it:
+	// capture issue_3212/routes-b18-autogroup-internet-wildcard-src-with-exit-autoapprover
+	// (juanfont/headscale#3212), held by TestReferenceAgreesWithCaptures.
+	// TestPeersAndRoutesFollowReference counts it under "exit routes as
+	// destination". Production: Sides.RouteAccess in
+	// policy/v2/visibility.go. Delete the clause, and its branch in
+	// Routes, once route access takes such an exit node as a destination.
 	ExitDestinationRoutes
 	// AppWildcard: * in an app grant is everything as a destination, as
 	// it is for the grant's ports: a viewer among its sources gets subnet
@@ -410,6 +501,17 @@ const (
 	// v84), and a companion to * reaches the internet, so exit nodes see
 	// its sources. Headscale reads * as the tailnet's ranges for app
 	// capabilities, both ways. Fails closed.
+	//
+	// TODO(kradalby): policy/app-wildcard: fails closed. With an app grant
+	// `autogroup:member -> *`, a member is not given a router's
+	// 10.0.0.0/24, which an app grant to 10.0.0.0/24 would give (via
+	// golden v84); with a companion to *, an exit node is not shown the
+	// sources. No capture holds * as an app destination. The properties in
+	// policy/v2/reference_test.go count it under "* as app destination".
+	// Production: sidePlan.atoms and sidePlan.inet in
+	// policy/v2/visibility.go take * as everything only as a port
+	// destination. Delete the clause once one reading is chosen: fix
+	// production, or make headscale's reading the reference's own.
 	AppWildcard
 )
 

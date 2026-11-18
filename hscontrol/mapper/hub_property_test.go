@@ -1243,6 +1243,12 @@ func allocatorAddresses(w policymodel.World) bool {
 // on: addresses stay the allocator's, and no rule swaps places, after
 // which the compile's incremental filter differs from its compile from
 // scratch.
+//
+// TODO(kradalby): policy/stale-under-shared-address: keeping each
+// address to one node here stands in for the compile's stale attributes
+// and SSH policies under a shared address (see the exception in
+// TestPipelineIncrementalMatchesScratch); let addresses be shared when
+// that exception goes. The rest of the limit is the filter audit's.
 func audited(w policymodel.World, st policymodel.Step) bool {
 	for _, e := range st.Edits {
 		switch e.(type) {

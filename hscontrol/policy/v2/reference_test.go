@@ -745,6 +745,14 @@ func (c *verdictClasses) judge(rep policymodel.Report, ref *policymodel.Ref, n p
 	}
 
 	rep.Caps = slices.DeleteFunc(rep.Caps, func(d policymodel.CapsDiff) bool {
+		// TODO(kradalby): policy/app-values-repeated: cosmetic, no verdict
+		// moves. An app grant with "dst": ["*", "*"] gives the receiver
+		// its capability values twice in CapsWithValues: production
+		// writes one CapGrant per destination entry naming the receiver
+		// (capGrantRules in expand.go), the reference one per grant. No
+		// capture holds an app grant with two destinations. Delete this
+		// allowance once production merges the entries, or once a capture
+		// shows the hosted service repeating them.
 		if sameUpToRepeats(d.Ref, d.Cand) {
 			c.repeatedValues++
 
@@ -769,6 +777,19 @@ func (c *verdictClasses) judge(rep policymodel.Report, ref *policymodel.Ref, n p
 		case star(d.Probe):
 			c.unrouted++
 		case whole(d.Probe):
+			// TODO(kradalby): policy/unrouted-whole-destination: fails
+			// open, narrow. A destination entry that reaches the node is
+			// written whole, so the client also accepts the rest of it
+			// inside a route the node announces unapproved: host h-pub
+			// 100.64.0.0/30, `* -> h-pub:*`, n1 on 100.64.0.1 announcing
+			// 100.64.0.0/30 unapproved accepts packets to 100.64.0.0.
+			// Nobody routes those to n1. The captures show this only
+			// through *, which the case above accepts; none decides any
+			// other entry. Production: dstPorts in expand.go keeps a
+			// literal entry whole once receiver.overlaps finds it
+			// reaching the node. Delete this case once entries are cut to
+			// what the node serves, or once a capture shows the hosted
+			// service doing it.
 			c.unroutedWhole++
 		default:
 			return false

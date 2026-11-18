@@ -654,6 +654,24 @@ func TestPipelineIncrementalMatchesScratch(t *testing.T) {
 					// attribute stays once the address is no longer shared.
 					// Database-only; counted, and the scenario judged no
 					// further.
+					//
+					// TODO(kradalby): policy/stale-under-shared-address:
+					// fails open or closed, by attribute.
+					// compileNodeAttrsFrom in compiled.go reuses an
+					// unchanged node's attributes, but targets resolve to
+					// addresses (policy/nodeattrs-by-address), so another
+					// holder of its address joining, leaving or retagging
+					// moves them:
+					// with nodeAttrs autogroup:tagged service-host and n1,
+					// n2 sharing an IPv6, retagging n1 leaves n2 without
+					// service-host until a document edit. The debug audit
+					// reports SSH policies stale under such writes too
+					// (that path is not traced). Database-only: State
+					// shares no address. Delete this exception, its
+					// siblings and the address limit of audited in
+					// mapper/hub_property_test.go once the compile
+					// recomputes every holder of a moved node's addresses,
+					// or reuses nothing while an address is shared.
 					known.add("node attributes stale under a shared address")
 
 					return

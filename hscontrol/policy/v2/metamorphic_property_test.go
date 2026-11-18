@@ -261,6 +261,10 @@ func TestEditThenInverseRestoresServedState(t *testing.T) {
 					// The compile's stale node attributes under a shared
 					// address (TestPipelineIncrementalMatchesScratch): a
 					// document edit compiles them afresh.
+					//
+					// TODO(kradalby): policy/stale-under-shared-address:
+					// delete this exception with the one in
+					// TestPipelineIncrementalMatchesScratch.
 					tally.add("node attributes stale under a shared address")
 
 					return

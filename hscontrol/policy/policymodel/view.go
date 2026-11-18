@@ -204,6 +204,16 @@ func (v *View) selPrefix(s Sel) netip.Prefix {
 // resolve their targets to addresses and grant to every node holding one:
 // a node sharing a target's address gets them too, and a node without
 // addresses never does.
+//
+// TODO(kradalby): policy/nodeattrs-by-address: nodeAttrs targets that
+// name identities (users, groups, tags) grant by address: a node sharing
+// a target's address gets the target's attributes (fails open), an
+// address-less target none (fails closed). Only database-only shapes
+// tell the two apart: State hands out neither. service-host also moves
+// the node's filter form. TestModelMatchesProduction holds the model to
+// production here. Production: capsFor in compileNodeAttrsFrom
+// (policy/v2/compiled.go). Decide which is intended; if identity, change
+// both here and there.
 func (v *View) ServiceHosts() []types.NodeID {
 	if !v.built {
 		v.built = true
