@@ -27,6 +27,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
 	"github.com/juanfont/headscale/hscontrol/policy/policyutil"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
@@ -267,7 +268,7 @@ func goldenNodeOracles(t *testing.T, tally *goldenTally, key string, gn goldenNo
 	got, err := gn.pm.FilterForNode(gn.node.View())
 	require.NoError(t, err)
 
-	view := clientViewFromNetmap(gn.netmap)
+	view := policymodel.ViewFromNetmap(gn.netmap)
 
 	t.Run("probes", func(t *testing.T) {
 		goldenProbe(t, tally, key+"/manager", gn.want, got, view)
@@ -296,18 +297,18 @@ func goldenNodeOracles(t *testing.T, tally *goldenTally, key string, gn goldenNo
 	})
 }
 
-func goldenProbe(t *testing.T, tally *goldenTally, key string, want, got []tailcfg.FilterRule, view clientView) {
+func goldenProbe(t *testing.T, tally *goldenTally, key string, want, got []tailcfg.FilterRule, view policymodel.ClientView) {
 	t.Helper()
 
 	exact := cmp.Diff(want, got, append(cmpOptions(), cmpopts.EquateEmpty())...) == ""
-	rep := probeFilters(want, got, view)
+	rep := policymodel.Compare(want, got, view)
 
 	tally.add(func(g *goldenTally) {
 		g.pairs++
-		g.probes += rep.probes
+		g.probes += rep.Probes
 
 		switch {
-		case !rep.equivalent():
+		case !rep.Equivalent():
 			g.semantic++
 			g.semanticReports = append(g.semanticReports, key+": "+rep.String())
 		case exact:
@@ -321,11 +322,11 @@ func goldenProbe(t *testing.T, tally *goldenTally, key string, want, got []tailc
 	reason, listed := goldenProbeDivergences[key]
 
 	switch {
-	case listed && rep.equivalent():
+	case listed && rep.Equivalent():
 		t.Errorf("enforced alike; delete the divergence entry %q (%s)", key, reason)
 	case listed:
 		t.Skip(reason)
-	case !rep.equivalent():
+	case !rep.Equivalent():
 		t.Errorf("SaaS and headscale filters are enforced differently (reference SaaS, candidate headscale): %s", rep)
 	}
 }
@@ -334,11 +335,11 @@ func goldenProbe(t *testing.T, tally *goldenTally, key string, want, got []tailc
 // source and a port range one wider, and requires the probes to tell the
 // result from the capture unless another rule already allows what the
 // mutation changes, which a plain reading of the rules decides.
-func goldenMutations(t *testing.T, tally *goldenTally, key string, want []tailcfg.FilterRule, view clientView) {
+func goldenMutations(t *testing.T, tally *goldenTally, key string, want []tailcfg.FilterRule, view policymodel.ClientView) {
 	t.Helper()
 
 	try := func(what string, mutated []tailcfg.FilterRule, redundant func() bool) {
-		caught := !probeFilters(want, mutated, view).equivalent()
+		caught := !policymodel.Compare(want, mutated, view).Equivalent()
 		explained := !caught && redundant()
 
 		tally.add(func(g *goldenTally) {
@@ -368,7 +369,7 @@ func goldenMutations(t *testing.T, tally *goldenTally, key string, want []tailcf
 		dropped := r.SrcIPs[len(r.SrcIPs)-1]
 		mutated[i].SrcIPs = slices.Clip(r.SrcIPs[:len(r.SrcIPs)-1])
 		try(fmt.Sprintf("rule %d without source %s", i, dropped), mutated, func() bool {
-			return droppedSourceAllowed(mutated, i, dropped, view.localNets)
+			return droppedSourceAllowed(mutated, i, dropped, view.LocalNets)
 		})
 
 		break
@@ -384,7 +385,7 @@ func goldenMutations(t *testing.T, tally *goldenTally, key string, want []tailcf
 		mutated[i].DstPorts = slices.Clone(r.DstPorts)
 		mutated[i].DstPorts[j].Ports.Last++
 		try(fmt.Sprintf("rule %d destination %s ports to %d", i, r.DstPorts[j].IP, mutated[i].DstPorts[j].Ports.Last), mutated, func() bool {
-			return widenedPortAllowed(want, i, j, view.localNets)
+			return widenedPortAllowed(want, i, j, view.LocalNets)
 		})
 
 		break
@@ -564,7 +565,7 @@ func goldenExpand(t *testing.T, tally *goldenTally, key string, want, today []ta
 
 		capped, self, peers := capifyRules(rules, nm)
 
-		return capped, expandCapSources(capped, keptApart(rules), newNetmapCaps(self, peers).holders)
+		return capped, expandCapSources(capped, keptApart(rules), policymodel.NewNetmapCaps(self, peers).Holders)
 	}
 
 	if _, got := roundTrip(today); !cmp.Equal(today, got, inOrderOpts...) {
@@ -761,7 +762,7 @@ func goldenMergeOrder(tally *goldenTally, key string, gn goldenNode, today []tai
 	opts := append(cmpOptions(), cmpopts.EquateEmpty())
 	sameAsToday := cmp.Equal(today, perNode, inOrderOpts...)
 
-	alike := sameAsToday || probeFilters(want, perNode, clientViewFromNetmap(gn.netmap)).equivalent()
+	alike := sameAsToday || policymodel.Compare(want, perNode, policymodel.ViewFromNetmap(gn.netmap)).Equivalent()
 	globalOK := cmp.Diff(want, today, opts...) == ""
 	perNodeOK := cmp.Diff(want, perNode, opts...) == ""
 

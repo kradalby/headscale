@@ -25,13 +25,13 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/graph"
+	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
-	"tailscale.com/types/ipproto"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
 	"tailscale.com/wgengine/filter"
@@ -132,7 +132,7 @@ func (cm *capModel) netmapOf(id types.NodeID) *netmap.NetworkMap {
 // capProbe is what holding one node's capability form to its address form
 // found.
 type capProbe struct {
-	report probeReport
+	report policymodel.Report
 	// crossFamilyICMP counts the verdicts on packets whose ICMP protocol
 	// is the other family's, which capability form refuses where address
 	// form accepts: decided as malformed, failing closed.
@@ -149,30 +149,26 @@ func (p capProbe) equivalent() bool { return len(p.other) == 0 }
 // address form, through the client's filter over the netmap nm it is
 // rendered: local nets from its own node, caps from every node.
 func probeCapForm(ip, capForm []tailcfg.FilterRule, nm *netmap.NetworkMap) capProbe {
-	view := clientViewFromNetmap(nm)
+	view := policymodel.ViewFromNetmap(nm)
 
 	var out capProbe
 
-	out.report = probeFilters(ip, capForm, view)
+	out.report = policymodel.Compare(ip, capForm, view)
 
-	for _, p := range out.report.parse {
+	crossed, rest := out.report.SplitCrossFamilyICMP()
+	out.crossFamilyICMP = crossed
+
+	for _, p := range rest.Parse {
 		out.other = append(out.other, "unparseable "+p)
 	}
 
-	for _, d := range out.report.verdicts {
-		crossed := d.probe.proto == ipproto.ICMPv4 && d.probe.src.Is6() || d.probe.proto == ipproto.ICMPv6 && d.probe.src.Is4()
-		if crossed && d.ref == filter.Accept && d.cand == filter.Drop {
-			out.crossFamilyICMP++
-
-			continue
-		}
-
-		out.other = append(out.other, fmt.Sprintf("%s: address form %v, capability form %v", d.probe, d.ref, d.cand))
+	for _, d := range rest.Verdicts {
+		out.other = append(out.other, fmt.Sprintf("%s: address form %v, capability form %v", d.Probe, d.Ref, d.Cand))
 	}
 
-	for _, d := range out.report.caps {
+	for _, d := range rest.Caps {
 		out.other = append(out.other, fmt.Sprintf("caps %s -> %s: address form %s, capability form %s",
-			d.src, d.dst, peerCapsString(d.ref), peerCapsString(d.cand)))
+			d.Src, d.Dst, policymodel.PeerCapsString(d.Ref), policymodel.PeerCapsString(d.Cand)))
 	}
 
 	return out
@@ -381,7 +377,7 @@ func (cm *capModel) reach(t *testing.T, id types.NodeID, p capProbe, reach capRe
 	reach["cross-family ICMP refused"] += p.crossFamilyICMP
 
 	if p.chunked != nil {
-		reach["chunk probes"] += p.chunked.report.probes
+		reach["chunk probes"] += p.chunked.report.Probes
 
 		if p.chunked.reordered {
 			reach["chunks assembled in another order"]++
@@ -631,12 +627,12 @@ func probeChunked(t *testing.T, rules []tailcfg.FilterRule, nm *netmap.NetworkMa
 	assembled := held.Rules()
 
 	out := chunkProbe{
-		report:    probeFilters(rules, assembled, clientViewFromNetmap(nm)),
+		report:    policymodel.Compare(rules, assembled, policymodel.ViewFromNetmap(nm)),
 		chunks:    chunks,
 		reordered: !reflect.DeepEqual(assembled, rules) && len(rules) > 0,
 	}
 
-	if !out.report.equivalent() {
+	if !out.report.Equivalent() {
 		out.other = append(out.other, out.report.String())
 	}
 
@@ -659,7 +655,7 @@ func (cm *capModel) checkCapForm(t *testing.T, id types.NodeID, saas []tailcfg.F
 	require.NoError(t, err)
 
 	c.nm = cm.netmapOf(id)
-	nc := newNetmapCaps(c.nm.SelfNode, c.nm.Peers)
+	nc := policymodel.NewNetmapCaps(c.nm.SelfNode, c.nm.Peers)
 
 	x, err := cm.cap.expansion()
 	require.NoError(t, err)
@@ -681,7 +677,7 @@ func (cm *capModel) checkCapForm(t *testing.T, id types.NodeID, saas []tailcfg.F
 		// the compile merges: capability form keeps each grant's rules
 		// apart. No via rule is cut in capability form, so no merge
 		// class is needed.
-		expanded := expandFilter(capFilter{rules: c.capForm}, nc.holders, reasonAddressMode)
+		expanded := expandFilter(capFilter{rules: c.capForm}, nc.Holders, reasonAddressMode)
 		c.diffIP = cmp.Diff(ruleMultiset(c.ip), ruleMultiset(expanded))
 
 		if saas != nil {
@@ -821,14 +817,14 @@ func goldenCapNode(t *testing.T, tally *goldenCapTally, cm *capModel, key string
 		g.chunks += c.chunked.chunks.Len()
 		g.capChunks += capChunks
 		g.deduplicated += len(c.capForm) - chunked
-		g.chunkProbes += c.chunked.report.probes
+		g.chunkProbes += c.chunked.report.Probes
 
 		if c.chunked.reordered {
 			g.reordered++
 		}
 
 		g.filters++
-		g.probes += c.own.report.probes + c.saas.report.probes
+		g.probes += c.own.report.Probes + c.saas.report.Probes
 		g.crossFamily += c.own.crossFamilyICMP
 		g.forms[form]++
 		g.stamped += stamps
@@ -1097,15 +1093,15 @@ func (f sensitivityFixture) probe(t *testing.T) capProbe {
 		return probeCapForm(ip, capForm, nm)
 	}
 
-	view := clientViewFromNetmap(nm)
-	view.hasCap = nil
+	view := policymodel.ViewFromNetmap(nm)
+	view.HasCap = nil
 
-	rep := probeFilters(ip, capForm, view)
+	rep := policymodel.Compare(ip, capForm, view)
 
 	var p capProbe
 
 	p.report = rep
-	if !rep.equivalent() {
+	if !rep.Equivalent() {
 		p.other = append(p.other, rep.String())
 	}
 
@@ -1137,7 +1133,7 @@ func TestFallbackSensitivity(t *testing.T) { //nolint:paralleltest // switches f
 
 			p := f.probe(t)
 			require.Falsef(t, p.equivalent(), "with %s off, its fixture is still enforced alike", r)
-			t.Logf("fixture: %d of %d probes and %d capability lookups differ", len(p.report.verdicts), p.report.probes, len(p.report.caps))
+			t.Logf("fixture: %d of %d probes and %d capability lookups differ", len(p.report.Verdicts), p.report.Probes, len(p.report.Caps))
 
 			if goldens {
 				t.Logf("goldens: %s", sensitivityOnGoldens(t))
@@ -1256,10 +1252,10 @@ func TestStampNotionsUnderSharedAddresses(t *testing.T) { //nolint:paralleltest 
 		p := f.probe(t)
 		require.False(t, p.equivalent())
 
-		for _, d := range p.report.verdicts {
-			require.Equalf(t, canaryAlice, d.probe.src, "only the shared address differs: %v", d.probe)
-			require.Equal(t, filter.Accept, d.ref)
-			require.Equal(t, filter.Drop, d.cand, "narrower, never wider")
+		for _, d := range p.report.Verdicts {
+			require.Equalf(t, canaryAlice, d.Probe.Src, "only the shared address differs: %v", d.Probe)
+			require.Equal(t, filter.Accept, d.Ref)
+			require.Equal(t, filter.Drop, d.Cand, "narrower, never wider")
 		}
 	})
 
@@ -1283,8 +1279,8 @@ func TestStampNotionsUnderSharedAddresses(t *testing.T) { //nolint:paralleltest 
 		}
 
 		p := probeCapForm(ip, capForm, nm)
-		require.True(t, slices.ContainsFunc(p.report.verdicts, func(d verdictDiff) bool {
-			return d.probe.src == db1v6 && d.ref == filter.Drop && d.cand == filter.Accept
+		require.True(t, slices.ContainsFunc(p.report.Verdicts, func(d policymodel.VerdictDiff) bool {
+			return d.Probe.Src == db1v6 && d.Ref == filter.Drop && d.Cand == filter.Accept
 		}), "db1 admitted from its own address: %s", p.report)
 	})
 }
@@ -1368,8 +1364,8 @@ func TestAgreesWithAddressFormCatchesMissingStamp(t *testing.T) {
 	require.NoError(t, err)
 
 	nm := cm.netmapOf(id)
-	nc := newNetmapCaps(nm.SelfNode, nm.Peers)
-	require.NoError(t, AgreesWithAddressForm(capForm, ip, nc.holders))
+	nc := policymodel.NewNetmapCaps(nm.SelfNode, nm.Peers)
+	require.NoError(t, AgreesWithAddressForm(capForm, ip, nc.Holders))
 
 	// Two nodes holding one address: address form lists it once per node.
 	twice := slices.Clone(ip)
@@ -1377,15 +1373,15 @@ func TestAgreesWithAddressFormCatchesMissingStamp(t *testing.T) {
 	require.GreaterOrEqual(t, i, 0, "test sanity: web1 receives address rules")
 	twice[i].SrcIPs = append(slices.Clone(twice[i].SrcIPs), twice[i].SrcIPs[0])
 	twice[i].DstPorts = append(slices.Clone(twice[i].DstPorts), twice[i].DstPorts[0])
-	require.NoError(t, AgreesWithAddressForm(capForm, twice, nc.holders), "an address listed twice")
+	require.NoError(t, AgreesWithAddressForm(capForm, twice, nc.Holders), "an address listed twice")
 
 	withoutBob := func(c nodecap.Cap) []netip.Addr {
-		return slices.DeleteFunc(nc.holders(c), func(a netip.Addr) bool { return a == canaryBob || a.String() == "fd7a:115c:a1e0::2" })
+		return slices.DeleteFunc(nc.Holders(c), func(a netip.Addr) bool { return a == canaryBob || a.String() == "fd7a:115c:a1e0::2" })
 	}
 	require.ErrorIs(t, AgreesWithAddressForm(capForm, ip, withoutBob), errCapForm, "bob unstamped")
 
 	withDB := func(c nodecap.Cap) []netip.Addr {
-		return append(nc.holders(c), netip.MustParseAddr("100.64.0.20"))
+		return append(nc.Holders(c), netip.MustParseAddr("100.64.0.20"))
 	}
 	require.ErrorIs(t, AgreesWithAddressForm(capForm, ip, withDB), errCapForm, "db1 stamped")
 }

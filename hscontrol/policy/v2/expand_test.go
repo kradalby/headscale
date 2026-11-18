@@ -137,7 +137,7 @@ func TestExpandCapSourcesMatchesCompile(t *testing.T) {
 			want, err := pm.FilterForNode(findNodeByGivenName(nodes, tc.receiver).View())
 			require.NoError(t, err)
 
-			got := expandCapSources(tc.capForm, nil, nc.holders)
+			got := expandCapSources(tc.capForm, nil, nc.Holders)
 			if diff := cmp.Diff(want, got, inOrderOpts...); diff != "" {
 				t.Errorf("expanded cap form differs from the compile (-compile +expanded):\n%s", diff)
 			}
@@ -232,7 +232,7 @@ func TestExpandCapSources(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := expandCapSources(tc.rules, tc.classes, nc.holders)
+			got := expandCapSources(tc.rules, tc.classes, nc.Holders)
 			if diff := cmp.Diff(tc.want, got, inOrderOpts...); diff != "" {
 				t.Errorf("(-want +got):\n%s", diff)
 			}
@@ -266,7 +266,7 @@ func TestExpandCompareBlindToClientQuirks(t *testing.T) {
 			t.Parallel()
 
 			_, nc := exampleView(t, tc.nodes, tc.receiver)
-			same := cmp.Equal(tc.ref, expandCapSources(tc.cand, nil, nc.holders), inOrderOpts...)
+			same := cmp.Equal(tc.ref, expandCapSources(tc.cand, nil, nc.Holders), inOrderOpts...)
 
 			if same != want {
 				t.Errorf("expanded candidate equals reference = %t, want %t", same, want)

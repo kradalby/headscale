@@ -22,6 +22,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/juanfont/headscale/hscontrol/graph"
+	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
 	"github.com/juanfont/headscale/hscontrol/policy/policyutil"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
@@ -393,7 +394,7 @@ func goldenExpansion(t *testing.T, tally *expandTally, id string, src []byte, us
 			// Sources and keys from the netmap's holders alone.
 			cut := x.capFilterFor(node.View(), nil)
 			cut.srcs, cut.keys = nil, nil
-			viaNetmap := expandFilter(cut, netmapHolders(capture.Netmap, nodes, roles, x.table).holders, reasonAddressMode)
+			viaNetmap := expandFilter(cut, netmapHolders(capture.Netmap, nodes, roles, x.table).Holders, reasonAddressMode)
 			same := reflect.DeepEqual(got, viaNetmap)
 			announces := capture.Netmap.SelfNode.Hostinfo().RoutableIPs().Len() > 0
 
@@ -475,7 +476,7 @@ func goldenExpansion(t *testing.T, tally *expandTally, id string, src []byte, us
 // netmapHolders stamps the nodes of a captured netmap with the caps of
 // the selectors the topology node with their addresses holds, as a
 // cap-form render would, and reads holders back from them.
-func netmapHolders(nm *netmap.NetworkMap, nodes types.Nodes, roles Roles, table *SelectorTable) netmapCaps {
+func netmapHolders(nm *netmap.NetworkMap, nodes types.Nodes, roles Roles, table *SelectorTable) policymodel.NetmapCaps {
 	byAddr := map[netip.Addr]*types.Node{}
 
 	for _, n := range nodes {
@@ -515,7 +516,7 @@ func netmapHolders(nm *netmap.NetworkMap, nodes types.Nodes, roles Roles, table 
 		peers = append(peers, stamp(p))
 	}
 
-	return newNetmapCaps(stamp(nm.SelfNode), peers)
+	return policymodel.NewNetmapCaps(stamp(nm.SelfNode), peers)
 }
 
 // goldenExpansionSequence replays a step capture as the world runs it:

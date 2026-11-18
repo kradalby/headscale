@@ -16,6 +16,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
 	"go4.org/netipx"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
@@ -66,7 +67,7 @@ func canaryFilter(t *testing.T, rules []tailcfg.FilterRule, localNets ...string)
 }
 
 func runIn(f *filter.Filter, proto ipproto.Proto, src, dst netip.Addr, port uint16) filter.Response {
-	return f.RunIn(probePacket(probe{proto: proto, src: src, dst: dst, port: port}), 0)
+	return f.RunIn(policymodel.Probe{Proto: proto, Src: src, Dst: dst, Port: port}.Packet(), 0)
 }
 
 // TestCanaryICMPIgnoresDstsForCaps pins that an ICMP echo is accepted on
@@ -295,7 +296,7 @@ func TestCanaryCapLookupOwnAddressesOnly(t *testing.T) {
 
 // TestCanaryLocalNetsFromAnnouncedRoutes pins how the client builds its
 // local nets, the destinations it handles at all, against the harness's
-// [clientLocalNets]: its own addresses, every route it advertises whether
+// [policymodel.LocalNets]: its own addresses, every route it advertises whether
 // approved or not, 0.0.0.0 and :: as an app connector, and service IPs.
 // The local-nets guard of reasonLocalNets keys on these; a mismatch means
 // either the client or the harness model moved. The model keeps the host
@@ -365,7 +366,7 @@ func TestCanaryLocalNetsFromAnnouncedRoutes(t *testing.T) {
 				AppConnector:    ipn.AppConnectorPrefs{Advertise: tc.connector},
 			})
 
-			local := clientLocalNets(self.Addresses, advertised, tc.connector, serviceIPs)
+			local := policymodel.LocalNets(self.Addresses, advertised, tc.connector, serviceIPs)
 			ms, _ := filter.MatchesFromFilterRules(rules)
 			model := filter.New(ms, nil, local, nil, nil, logger.Discard)
 
@@ -377,7 +378,7 @@ func TestCanaryLocalNetsFromAnnouncedRoutes(t *testing.T) {
 				netip.MustParseAddr("100.64.0.11"), netip.MustParseAddr("fd7a:115c:a1e0::b"),
 			})
 			for _, p := range local.Prefixes() {
-				points = append(points, prefixEdges(p)...)
+				points = append(points, policymodel.PrefixEdges(p)...)
 			}
 
 			for _, dst := range points {

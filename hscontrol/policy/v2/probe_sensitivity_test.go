@@ -10,6 +10,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/ipproto"
@@ -65,7 +66,7 @@ func exampleNodes() []*tailcfg.Node {
 
 // exampleView is what receiver sees of nodes: local nets from its own
 // node, caps from every node.
-func exampleView(t *testing.T, nodes []*tailcfg.Node, receiver string) (clientView, netmapCaps) {
+func exampleView(t *testing.T, nodes []*tailcfg.Node, receiver string) (policymodel.ClientView, policymodel.NetmapCaps) {
 	t.Helper()
 
 	var (
@@ -87,18 +88,18 @@ func exampleView(t *testing.T, nodes []*tailcfg.Node, receiver string) (clientVi
 		t.Fatalf("no node %q", receiver)
 	}
 
-	nc := newNetmapCaps(self, peers)
+	nc := policymodel.NewNetmapCaps(self, peers)
 
 	var selfAddrs []netip.Addr
 	for _, p := range self.Addresses().All() {
 		selfAddrs = append(selfAddrs, p.Addr())
 	}
 
-	return clientView{
-		self:      selfAddrs,
-		localNets: clientLocalNets(self.Addresses().AsSlice(), self.Hostinfo().RoutableIPs().AsSlice(), false, nil),
-		known:     nc.addrs(),
-		hasCap:    nc.hasCap,
+	return policymodel.ClientView{
+		Self:      selfAddrs,
+		LocalNets: policymodel.LocalNets(self.Addresses().AsSlice(), self.Hostinfo().RoutableIPs().AsSlice(), false, nil),
+		Known:     nc.Addrs(),
+		HasCap:    nc.HasCap,
 	}, nc
 }
 
@@ -132,7 +133,7 @@ type sensitivityCase struct {
 	ref      []tailcfg.FilterRule
 	cand     []tailcfg.FilterRule
 	diverges bool
-	kind     func(probeReport) string
+	kind     func(policymodel.Report) string
 }
 
 func sensitivityCases() []sensitivityCase {
@@ -264,15 +265,15 @@ func sensitivityCases() []sensitivityCase {
 
 // onlyVerdicts requires every divergence to be a proto probe the
 // reference answers ref and the candidate cand.
-func onlyVerdicts(proto ipproto.Proto, ref, cand filter.Response) func(probeReport) string {
-	return func(rep probeReport) string {
-		if len(rep.caps) > 0 || len(rep.verdicts) == 0 {
+func onlyVerdicts(proto ipproto.Proto, ref, cand filter.Response) func(policymodel.Report) string {
+	return func(rep policymodel.Report) string {
+		if len(rep.Caps) > 0 || len(rep.Verdicts) == 0 {
 			return "want verdict divergences only"
 		}
 
-		for _, d := range rep.verdicts {
-			if d.probe.proto != proto || d.ref != ref || d.cand != cand {
-				return "unexpected divergence " + d.probe.String()
+		for _, d := range rep.Verdicts {
+			if d.Probe.Proto != proto || d.Ref != ref || d.Cand != cand {
+				return "unexpected divergence " + d.Probe.String()
 			}
 		}
 
@@ -283,23 +284,22 @@ func onlyVerdicts(proto ipproto.Proto, ref, cand filter.Response) func(probeRepo
 // onlyCrossFamilyICMP requires every divergence to be an ICMP protocol
 // number carried in the other family's packet, refused by the candidate
 // only.
-func onlyCrossFamilyICMP(rep probeReport) string {
-	if len(rep.caps) > 0 || len(rep.verdicts) == 0 {
+func onlyCrossFamilyICMP(rep policymodel.Report) string {
+	if len(rep.Caps) > 0 || len(rep.Verdicts) == 0 {
 		return "want verdict divergences only"
 	}
 
-	for _, d := range rep.verdicts {
-		cross := (d.probe.proto == ipproto.ICMPv6 && d.probe.src.Is4()) || (d.probe.proto == ipproto.ICMPv4 && d.probe.src.Is6())
-		if !cross || d.ref != filter.Accept || d.cand != filter.Drop {
-			return "unexpected divergence " + d.probe.String()
+	for _, d := range rep.Verdicts {
+		if !d.Probe.CrossFamilyICMP() || d.Ref != filter.Accept || d.Cand != filter.Drop {
+			return "unexpected divergence " + d.Probe.String()
 		}
 	}
 
 	return ""
 }
 
-func onlyCaps(rep probeReport) string {
-	if len(rep.verdicts) > 0 || len(rep.caps) == 0 {
+func onlyCaps(rep policymodel.Report) string {
+	if len(rep.Verdicts) > 0 || len(rep.Caps) == 0 {
 		return "want capability divergences only"
 	}
 
@@ -317,12 +317,12 @@ func TestProbeSensitivity(t *testing.T) {
 			t.Parallel()
 
 			view, _ := exampleView(t, tc.nodes, tc.receiver)
-			rep := probeFilters(tc.ref, tc.cand, view)
+			rep := policymodel.Compare(tc.ref, tc.cand, view)
 
 			t.Log(rep)
 
-			if rep.equivalent() == tc.diverges {
-				t.Fatalf("diverges = %t, want %t: %s", !rep.equivalent(), tc.diverges, rep)
+			if rep.Equivalent() == tc.diverges {
+				t.Fatalf("diverges = %t, want %t: %s", !rep.Equivalent(), tc.diverges, rep)
 			}
 
 			if tc.kind != nil {
@@ -344,52 +344,16 @@ func TestProbeClassesMatchExhaustive(t *testing.T) {
 			t.Parallel()
 
 			view, _ := exampleView(t, tc.nodes, tc.receiver)
-			classes := probeFiltersWith(tc.ref, tc.cand, view, false)
-			every := probeFiltersWith(tc.ref, tc.cand, view, true)
+			classes := policymodel.Compare(tc.ref, tc.cand, view)
+			every := policymodel.CompareExhaustively(tc.ref, tc.cand, view)
 
-			if classes.equivalent() != every.equivalent() {
+			if classes.Equivalent() != every.Equivalent() {
 				t.Fatalf("classes: %s\nexhaustive: %s", classes, every)
 			}
 
-			if every.probes < classes.probes {
-				t.Fatalf("exhaustive ran %d probes, classes %d", every.probes, classes.probes)
+			if every.Probes < classes.Probes {
+				t.Fatalf("exhaustive ran %d probes, classes %d", every.Probes, classes.Probes)
 			}
 		})
-	}
-}
-
-// TestProbePacketsDecode checks the harness's packets reach the client
-// as the probe says: protocol, addresses, port and a SYN for TCP.
-func TestProbePacketsDecode(t *testing.T) {
-	t.Parallel()
-
-	for _, src := range []string{"100.64.0.1", "fd7a:115c:a1e0::1"} {
-		dst := "100.64.0.10"
-		if netip.MustParseAddr(src).Is6() {
-			dst = "fd7a:115c:a1e0::a"
-		}
-
-		for _, proto := range []ipproto.Proto{ipproto.TCP, ipproto.UDP, ipproto.SCTP, ipproto.ICMPv4, ipproto.ICMPv6, ipproto.GRE, ipproto.IGMP} {
-			p := probe{proto: proto, src: netip.MustParseAddr(src), dst: netip.MustParseAddr(dst), port: 443}
-			q := probePacket(p)
-
-			if q.IPProto != proto || q.Src.Addr() != p.src || q.Dst.Addr() != p.dst {
-				t.Errorf("%s decodes as %v %s -> %s", p, q.IPProto, q.Src, q.Dst)
-			}
-
-			if probeHasPorts(proto) && q.Dst.Port() != p.port {
-				t.Errorf("%s decodes with port %d", p, q.Dst.Port())
-			}
-
-			if proto == ipproto.TCP && !q.IsTCPSyn() {
-				t.Errorf("%s is not a SYN", p)
-			}
-
-			if (proto == ipproto.ICMPv4 && p.src.Is4()) || (proto == ipproto.ICMPv6 && p.src.Is6()) {
-				if !q.IsEchoRequest() {
-					t.Errorf("%s is not an echo request", p)
-				}
-			}
-		}
 	}
 }

@@ -6,8 +6,13 @@
 // and the client's defaults. A probe is a real packet, decoded and run
 // through [filter.Filter.RunIn] as inbound traffic is, so ICMP, TCP SYN,
 // UDP and other protocols each reach the matcher the client uses for them.
+//
+// It shares no code with headscale's policy packages: the verdicts are the
+// client's, and the view of what the client knows is built here, the way
+// ipnlocal builds it. The client canaries in policy/v2 pin that view
+// against a real client backend.
 
-package v2
+package policymodel
 
 import (
 	"encoding/json"
@@ -29,23 +34,23 @@ import (
 	"tailscale.com/wgengine/filter"
 )
 
-// clientView is what a receiving client knows when it filters an inbound
+// ClientView is what a receiving client knows when it filters an inbound
 // packet. It is an input so a caller can vary what the client sees.
-type clientView struct {
-	// self holds the receiver's own addresses.
-	self []netip.Addr
+type ClientView struct {
+	// Self holds the receiver's own addresses.
+	Self []netip.Addr
 
-	// localNets holds every destination the client handles; see
-	// [clientLocalNets].
-	localNets *netipx.IPSet
+	// LocalNets holds every destination the client handles; see
+	// [LocalNets].
+	LocalNets *netipx.IPSet
 
-	// known holds the addresses the client can tie to a node: its own and
+	// Known holds the addresses the client can tie to a node: its own and
 	// its peers'.
-	known []netip.Addr
+	Known []netip.Addr
 
-	// hasCap answers whether a source address holds a capability; nil
+	// HasCap answers whether a source address holds a capability; nil
 	// holds none.
-	hasCap filter.CapTestFunc
+	HasCap filter.CapTestFunc
 }
 
 // clientDefaultRouteExclusions mirrors what the client cuts from an
@@ -63,11 +68,11 @@ var clientDefaultRouteExclusions = []netip.Prefix{
 	tsaddr.TailscaleULARange(),
 }
 
-// clientLocalNets returns the destinations a client handles, built as
+// LocalNets returns the destinations a client handles, built as
 // updateFilterLocked in ipnlocal builds them: its own addresses, its
 // service IPs, every route it advertises whether approved or not, and
 // 0.0.0.0 and :: when it is an app connector.
-func clientLocalNets(own, advertised []netip.Prefix, appConnector bool, serviceIPs []netip.Addr) *netipx.IPSet {
+func LocalNets(own, advertised []netip.Prefix, appConnector bool, serviceIPs []netip.Addr) *netipx.IPSet {
 	var b netipx.IPSetBuilder
 
 	for _, p := range own {
@@ -107,16 +112,18 @@ func clientLocalNets(own, advertised []netip.Prefix, appConnector bool, serviceI
 	return s
 }
 
-// netmapCaps answers capability questions about a rendered netmap as the
+// NetmapCaps answers capability questions about a rendered netmap as the
 // receiving client does: an address names the node, self or peer, that
 // has it among its own single addresses, and that node's CapMap answers.
-type netmapCaps struct {
+type NetmapCaps struct {
 	byAddr map[netip.Addr]tailcfg.NodeView
 	nodes  []tailcfg.NodeView
 }
 
-func newNetmapCaps(self tailcfg.NodeView, peers []tailcfg.NodeView) netmapCaps {
-	nc := netmapCaps{byAddr: map[netip.Addr]tailcfg.NodeView{}}
+// NewNetmapCaps indexes self and peers as the client does: a later node
+// holding an address replaces an earlier one.
+func NewNetmapCaps(self tailcfg.NodeView, peers []tailcfg.NodeView) NetmapCaps {
+	nc := NetmapCaps{byAddr: map[netip.Addr]tailcfg.NodeView{}}
 
 	if self.Valid() {
 		nc.nodes = append(nc.nodes, self)
@@ -135,15 +142,15 @@ func newNetmapCaps(self tailcfg.NodeView, peers []tailcfg.NodeView) netmapCaps {
 	return nc
 }
 
-// hasCap is the client's srcIPHasCapForFilter.
-func (nc netmapCaps) hasCap(src netip.Addr, c nodecap.Cap) bool {
+// HasCap is the client's srcIPHasCapForFilter.
+func (nc NetmapCaps) HasCap(src netip.Addr, c nodecap.Cap) bool {
 	n, ok := nc.byAddr[src]
 
 	return ok && c != "" && !n.UnsignedPeerAPIOnly() && n.HasCap(c)
 }
 
-// holders lists the own addresses of the nodes hasCap admits for c.
-func (nc netmapCaps) holders(c nodecap.Cap) []netip.Addr {
+// Holders lists the own addresses of the nodes HasCap admits for c.
+func (nc NetmapCaps) Holders(c nodecap.Cap) []netip.Addr {
 	var out []netip.Addr
 
 	for _, n := range nc.nodes {
@@ -161,15 +168,16 @@ func (nc netmapCaps) holders(c nodecap.Cap) []netip.Addr {
 	return out
 }
 
-func (nc netmapCaps) addrs() []netip.Addr {
+// Addrs is every address the netmap ties to a node, sorted.
+func (nc NetmapCaps) Addrs() []netip.Addr {
 	return slices.SortedFunc(maps.Keys(nc.byAddr), netip.Addr.Compare)
 }
 
-// clientViewFromNetmap is what the client holding nm sees: local nets from
-// its self node, caps and known addresses from its self node and peers.
-func clientViewFromNetmap(nm *netmap.NetworkMap) clientView {
+// ViewFromNetmap is what the client holding nm sees: local nets from its
+// self node, caps and known addresses from its self node and peers.
+func ViewFromNetmap(nm *netmap.NetworkMap) ClientView {
 	self := nm.SelfNode
-	nc := newNetmapCaps(self, nm.Peers)
+	nc := NewNetmapCaps(self, nm.Peers)
 
 	var (
 		own, advertised []netip.Prefix
@@ -197,61 +205,66 @@ func clientViewFromNetmap(nm *netmap.NetworkMap) clientView {
 		}
 	}
 
-	return clientView{
-		self:      selfAddrs,
-		localNets: clientLocalNets(own, advertised, appConnector, serviceIPs),
-		known:     nc.addrs(),
-		hasCap:    nc.hasCap,
+	return ClientView{
+		Self:      selfAddrs,
+		LocalNets: LocalNets(own, advertised, appConnector, serviceIPs),
+		Known:     nc.Addrs(),
+		HasCap:    nc.HasCap,
 	}
 }
 
-// probe is one packet a peer sends the receiver.
-type probe struct {
-	proto    ipproto.Proto
-	src, dst netip.Addr
-	port     uint16
+// Probe is one packet a peer sends the receiver.
+type Probe struct {
+	Proto    ipproto.Proto
+	Src, Dst netip.Addr
+	Port     uint16
 }
 
-func (p probe) String() string {
-	if probeHasPorts(p.proto) {
-		return fmt.Sprintf("%v %s -> %s", p.proto, p.src, netip.AddrPortFrom(p.dst, p.port))
+func (p Probe) String() string {
+	if HasPorts(p.Proto) {
+		return fmt.Sprintf("%v %s -> %s", p.Proto, p.Src, netip.AddrPortFrom(p.Dst, p.Port))
 	}
 
-	return fmt.Sprintf("%v %s -> %s", p.proto, p.src, p.dst)
+	return fmt.Sprintf("%v %s -> %s", p.Proto, p.Src, p.Dst)
 }
 
-// probeHasPorts reports whether the client reads a destination port for
-// proto.
-func probeHasPorts(proto ipproto.Proto) bool {
+// CrossFamilyICMP reports whether p carries the other family's ICMP
+// protocol number, which the client decodes as an unknown protocol.
+func (p Probe) CrossFamilyICMP() bool {
+	return p.Proto == ipproto.ICMPv4 && p.Src.Is6() || p.Proto == ipproto.ICMPv6 && p.Src.Is4()
+}
+
+// HasPorts reports whether the client reads a destination port for proto.
+func HasPorts(proto ipproto.Proto) bool {
 	return proto == ipproto.TCP || proto == ipproto.UDP || proto == ipproto.SCTP
 }
 
-// probePacket returns p as the client decodes it off the wire: an echo
-// request for ICMP of the packet's family, a SYN for TCP, and for anything
-// else a transport header the client reads by protocol.
-func probePacket(p probe) *packet.Parsed {
+// Packet returns p as the client decodes it off the wire: an echo request
+// for ICMP of the packet's family, a SYN for TCP, and for anything else a
+// transport header the client reads by protocol.
+func (p Probe) Packet() *packet.Parsed {
 	var b []byte
 
 	switch {
-	case p.proto == ipproto.ICMPv4 && p.src.Is4():
-		b = packet.Generate(packet.ICMP4Header{Src: p.src, Dst: p.dst, Type: packet.ICMP4EchoRequest}, make([]byte, 8))
-	case p.proto == ipproto.ICMPv6 && p.src.Is6():
-		b = packet.Generate(packet.ICMP6Header{Src: p.src, Dst: p.dst, Type: packet.ICMP6EchoRequest}, make([]byte, 8))
+	case p.Proto == ipproto.ICMPv4 && p.Src.Is4():
+		b = packet.Generate(packet.ICMP4Header{Src: p.Src, Dst: p.Dst, Type: packet.ICMP4EchoRequest}, make([]byte, 8))
+	case p.Proto == ipproto.ICMPv6 && p.Src.Is6():
+		b = packet.Generate(packet.ICMP6Header{Src: p.Src, Dst: p.Dst, Type: packet.ICMP6EchoRequest}, make([]byte, 8))
 	default:
 		// A UDP header read as TCP has its flags in the payload's sixth
 		// byte; the IP header is rewritten with the probe's protocol.
 		payload := make([]byte, 12)
 		payload[5] = byte(packet.TCPSyn)
 
-		if p.src.Is4() {
-			h := packet.UDP4Header{Src: p.src, Dst: p.dst, SrcPort: 40000, DstPort: p.port}
+		if p.Src.Is4() {
+			h := packet.UDP4Header{Src: p.Src, Dst: p.Dst, SrcPort: 40000, DstPort: p.Port}
 			b = packet.Generate(h, payload)
-			h.IPProto = p.proto
+			h.IPProto = p.Proto
 			_ = h.IP4Header.Marshal(b)
 		} else {
-			h := packet.UDP6Header{Src: p.src, Dst: p.dst, SrcPort: 40000, DstPort: p.port}
+			h := packet.UDP6Header{Src: p.Src, Dst: p.Dst, SrcPort: 40000, DstPort: p.Port}
 			b = packet.Generate(h, payload)
-			h.IPProto = p.proto
+			h.IPProto = p.Proto
 			_ = h.IP6Header.Marshal(b)
 		}
 	}
@@ -262,69 +275,96 @@ func probePacket(p probe) *packet.Parsed {
 	return q
 }
 
-// verdictDiff is a probe the two rule sets answer differently.
-type verdictDiff struct {
-	probe     probe
-	ref, cand filter.Response
+// VerdictDiff is a probe the two rule sets answer differently.
+type VerdictDiff struct {
+	Probe     Probe
+	Ref, Cand filter.Response
 }
 
-// capsDiff is a source and destination the two rule sets grant different
+// CapsDiff is a source and destination the two rule sets grant different
 // app capabilities.
-type capsDiff struct {
-	src, dst  netip.Addr
-	ref, cand tailcfg.PeerCapMap
+type CapsDiff struct {
+	Src, Dst  netip.Addr
+	Ref, Cand tailcfg.PeerCapMap
 }
 
-// probeReport is the outcome of [probeFilters].
-type probeReport struct {
-	probes, capPairs int
+// Report is the outcome of [Compare].
+type Report struct {
+	Probes, CapPairs int
 
-	parse    []string
-	verdicts []verdictDiff
-	caps     []capsDiff
+	Parse    []string
+	Verdicts []VerdictDiff
+	Caps     []CapsDiff
 }
 
-func (r probeReport) equivalent() bool {
-	return len(r.parse) == 0 && len(r.verdicts) == 0 && len(r.caps) == 0
+// Equivalent reports whether the client enforces both rule sets alike.
+func (r Report) Equivalent() bool {
+	return len(r.Parse) == 0 && len(r.Verdicts) == 0 && len(r.Caps) == 0
 }
 
-// probeReportLines caps how many differences a report lists.
-const probeReportLines = 20
+// SplitCrossFamilyICMP takes out the one divergence capability form is
+// allowed: a packet whose ICMP protocol number is the other family's,
+// which the reference accepts and the candidate drops, since the client
+// matches it by address only. It returns how many there were and the
+// report without them, so a caller can require the rest to be empty and
+// still see the count grow.
+func (r Report) SplitCrossFamilyICMP() (int, Report) {
+	rest := r
+	rest.Verdicts = nil
 
-func (r probeReport) String() string {
+	n := 0
+
+	for _, d := range r.Verdicts {
+		if d.Probe.CrossFamilyICMP() && d.Ref == filter.Accept && d.Cand == filter.Drop {
+			n++
+
+			continue
+		}
+
+		rest.Verdicts = append(rest.Verdicts, d)
+	}
+
+	return n, rest
+}
+
+// reportLines caps how many differences a report lists.
+const reportLines = 20
+
+func (r Report) String() string {
 	var sb strings.Builder
 
 	fmt.Fprintf(&sb, "%d of %d probes and %d of %d capability lookups differ",
-		len(r.verdicts), r.probes, len(r.caps), r.capPairs)
+		len(r.Verdicts), r.Probes, len(r.Caps), r.CapPairs)
 
-	for _, p := range r.parse {
+	for _, p := range r.Parse {
 		fmt.Fprintf(&sb, "\n  unparseable %s", p)
 	}
 
-	for i, d := range r.verdicts {
-		if i == probeReportLines {
-			fmt.Fprintf(&sb, "\n  ... %d more", len(r.verdicts)-i)
+	for i, d := range r.Verdicts {
+		if i == reportLines {
+			fmt.Fprintf(&sb, "\n  ... %d more", len(r.Verdicts)-i)
 
 			break
 		}
 
-		fmt.Fprintf(&sb, "\n  %s: reference %v, candidate %v", d.probe, d.ref, d.cand)
+		fmt.Fprintf(&sb, "\n  %s: reference %v, candidate %v", d.Probe, d.Ref, d.Cand)
 	}
 
-	for i, d := range r.caps {
-		if i == probeReportLines {
-			fmt.Fprintf(&sb, "\n  ... %d more", len(r.caps)-i)
+	for i, d := range r.Caps {
+		if i == reportLines {
+			fmt.Fprintf(&sb, "\n  ... %d more", len(r.Caps)-i)
 
 			break
 		}
 
-		fmt.Fprintf(&sb, "\n  caps %s -> %s: reference %s, candidate %s", d.src, d.dst, peerCapsString(d.ref), peerCapsString(d.cand))
+		fmt.Fprintf(&sb, "\n  caps %s -> %s: reference %s, candidate %s", d.Src, d.Dst, PeerCapsString(d.Ref), PeerCapsString(d.Cand))
 	}
 
 	return sb.String()
 }
 
-func peerCapsString(m tailcfg.PeerCapMap) string {
+// PeerCapsString is m as JSON, for messages.
+func PeerCapsString(m tailcfg.PeerCapMap) string {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return "unmarshalable: " + err.Error()
@@ -333,30 +373,34 @@ func peerCapsString(m tailcfg.PeerCapMap) string {
 	return string(b)
 }
 
-// probeFilters builds ref and cand for the client view and reports every
-// probe where they differ: the verdict on a new inbound flow, or the app
+// Compare builds ref and cand for the client view and reports every probe
+// where they differ: the verdict on a new inbound flow, or the app
 // capabilities a source holds towards a destination.
-func probeFilters(ref, cand []tailcfg.FilterRule, view clientView) probeReport {
-	return probeFiltersWith(ref, cand, view, false)
+func Compare(ref, cand []tailcfg.FilterRule, view ClientView) Report {
+	return compare(ref, cand, view, false)
 }
 
-// probeFiltersWith is [probeFilters]; exhaustive probes every point the
-// rules give, instead of one point per class the client cannot tell apart.
-func probeFiltersWith(ref, cand []tailcfg.FilterRule, view clientView, exhaustive bool) probeReport {
-	var rep probeReport
+// CompareExhaustively is [Compare] probing every point the rules give,
+// instead of one point per class the client cannot tell apart.
+func CompareExhaustively(ref, cand []tailcfg.FilterRule, view ClientView) Report {
+	return compare(ref, cand, view, true)
+}
+
+func compare(ref, cand []tailcfg.FilterRule, view ClientView, exhaustive bool) Report {
+	var rep Report
 
 	refM, err := filter.MatchesFromFilterRules(ref)
 	if err != nil {
-		rep.parse = append(rep.parse, "reference: "+err.Error())
+		rep.Parse = append(rep.Parse, "reference: "+err.Error())
 	}
 
 	candM, err := filter.MatchesFromFilterRules(cand)
 	if err != nil {
-		rep.parse = append(rep.parse, "candidate: "+err.Error())
+		rep.Parse = append(rep.Parse, "candidate: "+err.Error())
 	}
 
-	refF := filter.New(refM, view.hasCap, view.localNets, nil, nil, logger.Discard)
-	candF := filter.New(candM, view.hasCap, view.localNets, nil, nil, logger.Discard)
+	refF := filter.New(refM, view.HasCap, view.LocalNets, nil, nil, logger.Discard)
+	candF := filter.New(candM, view.HasCap, view.LocalNets, nil, nil, logger.Discard)
 
 	space := newProbeSpace(slices.Concat(refM, candM), view, exhaustive)
 
@@ -366,28 +410,28 @@ func probeFiltersWith(ref, cand []tailcfg.FilterRule, view clientView, exhaustiv
 				continue
 			}
 
-			rep.capPairs++
+			rep.CapPairs++
 
 			refCaps, candCaps := refF.CapsWithValues(src, dst), candF.CapsWithValues(src, dst)
-			if !samePeerCaps(refCaps, candCaps) {
-				rep.caps = append(rep.caps, capsDiff{src: src, dst: dst, ref: refCaps, cand: candCaps})
+			if !SamePeerCaps(refCaps, candCaps) {
+				rep.Caps = append(rep.Caps, CapsDiff{Src: src, Dst: dst, Ref: refCaps, Cand: candCaps})
 			}
 
 			for _, proto := range space.protos {
 				ports := []uint16{0}
-				if probeHasPorts(proto) {
+				if HasPorts(proto) {
 					ports = space.ports
 				}
 
 				for _, port := range ports {
-					p := probe{proto: proto, src: src, dst: dst, port: port}
-					q := probePacket(p)
+					p := Probe{Proto: proto, Src: src, Dst: dst, Port: port}
+					q := p.Packet()
 
-					rep.probes++
+					rep.Probes++
 
 					r, c := refF.RunIn(q, 0), candF.RunIn(q, 0)
 					if r != c {
-						rep.verdicts = append(rep.verdicts, verdictDiff{probe: p, ref: r, cand: c})
+						rep.Verdicts = append(rep.Verdicts, VerdictDiff{Probe: p, Ref: r, Cand: c})
 					}
 				}
 			}
@@ -397,10 +441,10 @@ func probeFiltersWith(ref, cand []tailcfg.FilterRule, view clientView, exhaustiv
 	return rep
 }
 
-// samePeerCaps compares app capabilities as an application reads them:
+// SamePeerCaps compares app capabilities as an application reads them:
 // the same capabilities, each with the same values in the same order,
 // values compared as JSON.
-func samePeerCaps(a, b tailcfg.PeerCapMap) bool {
+func SamePeerCaps(a, b tailcfg.PeerCapMap) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -461,7 +505,7 @@ var probePortless = []ipproto.Proto{ipproto.GRE, 50, 51, 89, 103}
 // caps it has, a destination by the destination, capability and local
 // prefixes holding it and the pre-filter's special cases, a port by the
 // port ranges holding it.
-func newProbeSpace(ms []filter.Match, view clientView, exhaustive bool) probeSpace {
+func newProbeSpace(ms []filter.Match, view ClientView, exhaustive bool) probeSpace {
 	var (
 		srcAtoms, dstAtoms []netip.Prefix
 		caps               []nodecap.Cap
@@ -484,8 +528,8 @@ func newProbeSpace(ms []filter.Match, view clientView, exhaustive bool) probeSpa
 		}
 	}
 
-	if view.localNets != nil {
-		dstAtoms = append(dstAtoms, view.localNets.Prefixes()...)
+	if view.LocalNets != nil {
+		dstAtoms = append(dstAtoms, view.LocalNets.Prefixes()...)
 	}
 
 	srcAtoms = uniquePrefixes(srcAtoms)
@@ -515,22 +559,22 @@ func newProbeSpace(ms []filter.Match, view clientView, exhaustive bool) probeSpa
 	slices.Sort(protos)
 	protos = slices.Compact(protos)
 
-	srcPoints := slices.Concat(view.self, view.known, probeOutsiders)
-	for _, a := range slices.Concat(view.self, view.known) {
+	srcPoints := slices.Concat(view.Self, view.Known, probeOutsiders)
+	for _, a := range slices.Concat(view.Self, view.Known) {
 		srcPoints = append(srcPoints, a.Prev(), a.Next())
 	}
 
 	for _, p := range srcAtoms {
-		srcPoints = append(srcPoints, prefixEdges(p)...)
+		srcPoints = append(srcPoints, PrefixEdges(p)...)
 	}
 
-	dstPoints := slices.Concat(view.self, probeOutsiders)
-	for _, a := range view.self {
+	dstPoints := slices.Concat(view.Self, probeOutsiders)
+	for _, a := range view.Self {
 		dstPoints = append(dstPoints, a.Prev(), a.Next())
 	}
 
 	for _, p := range dstAtoms {
-		dstPoints = append(dstPoints, prefixEdges(p)...)
+		dstPoints = append(dstPoints, PrefixEdges(p)...)
 	}
 
 	portPoints := make([]int, 0, 2+4*len(portAtoms))
@@ -550,7 +594,7 @@ func newProbeSpace(ms []filter.Match, view clientView, exhaustive bool) probeSpa
 		}
 
 		for _, c := range caps {
-			sb.WriteByte(bit(view.hasCap != nil && view.hasCap(a, c)))
+			sb.WriteByte(bit(view.HasCap != nil && view.HasCap(a, c)))
 		}
 
 		return sb.String()
@@ -633,8 +677,24 @@ func representatives(points []netip.Addr, sig func(netip.Addr) string, exhaustiv
 	return out
 }
 
-// prefixEdges is p's first and last address and the address beyond each.
-func prefixEdges(p netip.Prefix) []netip.Addr {
+// uniquePrefixes is in without repeats, in first-seen order.
+func uniquePrefixes(in []netip.Prefix) []netip.Prefix {
+	seen := make(map[netip.Prefix]bool, len(in))
+	out := in[:0:0]
+
+	for _, p := range in {
+		if !seen[p] {
+			seen[p] = true
+
+			out = append(out, p)
+		}
+	}
+
+	return out
+}
+
+// PrefixEdges is p's first and last address and the address beyond each.
+func PrefixEdges(p netip.Prefix) []netip.Addr {
 	first := p.Masked().Addr()
 	last := netipx.PrefixLastIP(p)
 
