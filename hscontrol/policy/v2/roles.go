@@ -405,6 +405,21 @@ func (p Postings) Changed(old Postings) ([]Role, bool) {
 	return graph.Changes(old.byRole.Groups, p.byRole.Groups), false
 }
 
+// edited returns the roles whose lists the edits from old to p touched,
+// possibly with lists changed back, without comparing them; as
+// [Postings.Changed] when old is outside p's edit log.
+func (p Postings) edited(old Postings) []Role {
+	if old.table == p.table {
+		if roles, ok := p.byRole.Groups.ChangedSince(old.byRole.Groups); ok {
+			return roles
+		}
+	}
+
+	roles, _ := p.Changed(old)
+
+	return roles
+}
+
 // Update returns the postings of roles, moving from p only the nodes
 // whose role set changed. A new table starts over: its selector IDs mean
 // other selectors.

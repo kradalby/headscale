@@ -298,14 +298,29 @@ type Expansion struct {
 	node   func(types.NodeID) (types.NodeView, bool)
 	routes []string
 
-	// resolved holds what each identity selector resolves to: its members'
-	// addresses, written as the compile writes a node alias.
-	resolved []ResolvedAddresses
-	grants   []grantExpansion
-	// first holds, by merge key, the position of the first rule with that
-	// key in the rule list every node's filter is cut from.
-	first  map[string]int64
-	owners []uint
+	// The address part is built as it is read: resolved holds what each
+	// identity selector resolves to, its members' addresses written as the
+	// compile writes a node alias; grants each grant's expansion; first,
+	// by merge key, the position of the first rule with that key in the
+	// rule list every node's filter is cut from. Address form reads all of
+	// it. Capability form and routing read a selector or a grant only
+	// where a fallback writes it as addresses, so a membership change
+	// nobody reads in address form builds none of it.
+	resOnce   []sync.Once
+	resolved  []ResolvedAddresses
+	grantOnce []sync.Once
+	grants    []grantExpansion
+	firstOnce sync.Once
+	first     map[string]int64
+	// owners are the users with a node, read by exit nodes' self rules
+	// and the census only: listing them walks every role.
+	ownersOnce sync.Once
+	owners     []uint
+
+	// share gives the addresses nodes share, which capability form reads:
+	// the filters the expansion serves work it out from the ones they
+	// follow. Without, it is found from list.
+	share func() *sharing
 
 	mu   sync.Mutex
 	self map[selfKey]*ownRules
@@ -397,45 +412,104 @@ func NewExpansion(t *Templates, posts Postings, routes []string, node func(types
 
 	x := &Expansion{
 		t: t, table: t.table(), posts: posts, node: node, routes: routes,
-		resolved: make([]ResolvedAddresses, t.table().Len()),
-		grants:   make([]grantExpansion, len(t.grants)),
-		first:    map[string]int64{},
-		self:     map[selfKey]*ownRules{},
-	}
-
-	for _, s := range x.table.sels {
-		if s.Kind.HoldsNodes() {
-			x.resolved[s.ID] = x.members(posts.Nodes(SelectorRole(s.ID)))
-		}
-	}
-
-	for g, gt := range t.grants {
-		if gt.none {
-			continue
-		}
-
-		x.grants[g] = x.expandGrant(gt)
-
-		if gt.kind == grantSelf && x.owners == nil {
-			x.owners = []uint{}
-
-			for r := range posts.All() {
-				if uid, ok := r.Owner(); ok {
-					x.owners = append(x.owners, uid)
-				}
-			}
-
-			slices.Sort(x.owners)
-		}
-
-		for i, key := range x.grants[g].keys {
-			if _, seen := x.first[key]; key != "" && !seen {
-				x.first[key] = rulePos(g, 0, i)
-			}
-		}
+		resOnce:   make([]sync.Once, t.table().Len()),
+		resolved:  make([]ResolvedAddresses, t.table().Len()),
+		grantOnce: make([]sync.Once, len(t.grants)),
+		grants:    make([]grantExpansion, len(t.grants)),
+		self:      map[selfKey]*ownRules{},
 	}
 
 	return x, nil
+}
+
+// ownerIDs returns the users with a node, sorted, listed once.
+func (x *Expansion) ownerIDs() []uint {
+	x.ownersOnce.Do(func() {
+		for r := range x.posts.All() {
+			if uid, ok := r.Owner(); ok {
+				x.owners = append(x.owners, uid)
+			}
+		}
+
+		slices.Sort(x.owners)
+	})
+
+	return x.owners
+}
+
+// res returns what identity selector id resolves to, built once.
+func (x *Expansion) res(id SelectorID) ResolvedAddresses {
+	x.resOnce[id].Do(func() {
+		ids := x.posts.Nodes(SelectorRole(id))
+
+		resolutionsBuilt.Add(1)
+		membersExpanded.Add(uint64(len(ids)))
+
+		x.resolved[id] = x.members(ids)
+	})
+
+	return x.resolved[id]
+}
+
+// grant returns grant g's expansion, built once.
+func (x *Expansion) grant(g int) *grantExpansion {
+	x.grantOnce[g].Do(func() {
+		if gt := x.t.grants[g]; !gt.none {
+			x.grants[g] = x.expandGrant(gt)
+		}
+	})
+
+	return &x.grants[g]
+}
+
+// positions returns, by merge key, where the first rule with that key sits
+// in the rule list every node's filter is cut from: every grant's
+// expansion.
+func (x *Expansion) positions() map[string]int64 {
+	x.firstOnce.Do(func() {
+		first := map[string]int64{}
+
+		for g := range x.t.grants {
+			for i, key := range x.grant(g).keys {
+				if _, seen := first[key]; key != "" && !seen {
+					first[key] = rulePos(g, 0, i)
+				}
+			}
+		}
+
+		x.first = first
+	})
+
+	return x.first
+}
+
+// srcIDs returns the sources of grant g that resolve to any set, in policy
+// order, as its expansion lists them, without expanding it.
+func (x *Expansion) srcIDs(g int) []SelectorID {
+	var out []SelectorID
+
+	for _, id := range x.t.grants[g].srcs {
+		if x.table.Selector(id).Kind.HoldsNodes() || x.t.literals[id].res != nil {
+			out = append(out, id)
+		}
+	}
+
+	return out
+}
+
+// resolutionsBuilt and membersExpanded count the selector resolutions
+// served filters built and the members those listed: work that follows a
+// selector's size, not a change.
+var (
+	resolutionsBuilt atomic.Uint64
+	membersExpanded  atomic.Uint64
+)
+
+// ServedWorkForTest returns, for tests outside the package, the selector
+// resolutions served filters built, the members those listed, and the
+// times every node's addresses were sorted, in that order.
+func ServedWorkForTest() (uint64, uint64, uint64) {
+	return resolutionsBuilt.Load(), membersExpanded.Load(), sharingScans.Load()
 }
 
 // rulePos numbers a rule in the list a filter is cut from: by grant, then
@@ -463,7 +537,7 @@ func (x *Expansion) members(ids []types.NodeID) ResolvedAddresses {
 // one, nothing for autogroup:self.
 func (x *Expansion) resolve(id SelectorID) (ResolvedAddresses, error) {
 	if x.table.Selector(id).Kind.HoldsNodes() {
-		return x.resolved[id], nil
+		return x.res(id), nil
 	}
 
 	l := x.t.literals[id]
@@ -493,7 +567,7 @@ func (x *Expansion) holders(c nodecap.Cap) []netip.Addr {
 		return nil
 	}
 
-	return slices.Collect(x.resolved[s.ID].Iter())
+	return slices.Collect(x.res(s.ID).Iter())
 }
 
 func (x *Expansion) expandGrant(gt *GrantTemplate) grantExpansion {
@@ -686,7 +760,7 @@ func (x *Expansion) Filter() []tailcfg.FilterRule {
 			continue
 		}
 
-		ge := &x.grants[g]
+		ge := x.grant(g)
 
 		for i, ipr := range gt.ip {
 			if ge.keys[i] == "" {
@@ -749,7 +823,7 @@ func (x *Expansion) allDstPorts(gt *GrantTemplate, ports []tailcfg.PortRange) []
 		case s.Kind == SelectorWildcard:
 			add("*")
 		case s.Kind.HoldsNodes():
-			for _, ip := range x.resolved[id].Strings() {
+			for _, ip := range x.res(id).Strings() {
 				add(ip)
 			}
 		default:
@@ -810,9 +884,21 @@ type Filters struct {
 	// fresh is [Filters.Fresh], once asked for.
 	fresh atomic.Pointer[Filters]
 
+	// shared is which selectors and owners nodes share an address across,
+	// in capability mode: carried from the filters these follow when no
+	// node that moved holds an address another node holds, else found from
+	// the list when first read.
+	shared atomic.Pointer[sharing]
+
+	// census is [Filters.Census] less the receivers, counted once: from
+	// censusFrom when set, else from every owner. counted is its count,
+	// for the filters that follow, once done. censusFrom is set when f is
+	// built and never after.
 	censusOnce sync.Once
 	census     FallbackCensus
 	censusErr  error
+	censusFrom *censusBase
+	counted    atomic.Pointer[censusCount]
 }
 
 // cutFilters are filters cut for some nodes, carried from one Filters to
@@ -860,6 +946,15 @@ func FollowFiltersFor(mode SourceMode, prev *Filters, t *Templates, posts Postin
 	f := NewFiltersFor(mode, t, posts, approvals, nodes)
 	f.sides, f.hasSides = sides, true
 
+	if mode == CapabilitySources && prev != nil && prev.hasSides && prev.sides.from != nil && sides.from != nil &&
+		prev.t.table() == t.table() {
+		// What moved since prev: the nodes whose facts or roles did.
+		moved := slices.Concat(graph.Changes(prev.sides.from, sides.from), graph.Changes(prev.posts.byRole.In, posts.byRole.In))
+
+		f.followSharing(prev, moved)
+		f.followCensus(prev, moved)
+	}
+
 	if prev != nil {
 		from := prev
 
@@ -905,11 +1000,51 @@ func (f *Filters) expansion() (*Expansion, error) {
 
 		f.x, f.err = NewExpansion(f.t, f.posts, f.routes, f.node)
 		if f.x != nil {
-			f.x.list = f.nodes
+			f.x.list, f.x.share = f.nodes, f.sharing
 		}
 	})
 
 	return f.x, f.err
+}
+
+// followSharing gives f prev's addresses shared, unless a node whose
+// facts or roles moved holds an address another node holds at either end,
+// which is the only way what nodes share, or whose roles they cross, can
+// move. Such a node leaves f to find them from the list when first read.
+func (f *Filters) followSharing(prev *Filters, moved []types.NodeID) {
+	sh := prev.shared.Load()
+	if sh == nil {
+		return
+	}
+
+	for _, id := range moved {
+		for _, end := range [2]*Filters{prev, f} {
+			n, ok := end.node(id)
+			if !ok {
+				continue
+			}
+
+			for _, ip := range n.IPs() {
+				if ids, _ := end.sides.byAddr.Groups.Get(ip); len(ids) > 1 {
+					return
+				}
+			}
+		}
+	}
+
+	f.shared.Store(sh)
+}
+
+// sharing returns which selectors and owners nodes share an address
+// across, found from the list unless carried over.
+func (f *Filters) sharing() *sharing {
+	if sh := f.shared.Load(); sh != nil {
+		return sh
+	}
+
+	f.shared.CompareAndSwap(nil, findSharing(f.nodes, f.posts, f.t.table().Len()))
+
+	return f.shared.Load()
 }
 
 // node looks id up in the sorted node list.
@@ -960,7 +1095,7 @@ func (f *Filters) ForNode(id types.NodeID, facts ReceiverFacts) ([]tailcfg.Filte
 	}
 
 	if from := f.from.Load(); from != nil {
-		f.Changed(from)
+		f.changeFrom(from)
 	}
 
 	if rules, ok := f.carried[form].Load().Get(id); ok {
@@ -1019,71 +1154,180 @@ func (f *Filters) Global() ([]tailcfg.FilterRule, error) {
 	return f.global, nil
 }
 
-// filterChange is what [Filters.Changed] found. compared reports that
-// every node's filter was compared, so the filters followed hold a cut of
-// every node they did not name.
+// filterChange is what [Filters.Changed] found. ids are named in either
+// form; addr names more in address form only. compared reports that every
+// node's filter was compared, so the filters followed hold a cut of every
+// node they did not name.
 type filterChange struct {
 	ids      []types.NodeID
+	addr     addressReceivers
 	all      bool
 	compared bool
 }
 
-// Changed returns, sorted, the nodes whose filter can differ between old
-// and f, or all when it cannot tell: the nodes whose own facts moved; the
-// receivers of every rule whose sources, merge key or capability moved; the
-// nodes whose addresses, or routes, hold an address a destination gained or
-// lost; the owners whose autogroup:self rules moved, by membership or by
-// address; the receivers of every rule merged at a position that moved; the
-// via routers of a via grant that moved; and, when any rule moved, every
-// exit node and subnet router. Across a change of which selectors or grants
-// there are, or without the sides [FollowFilters] gives, it compares every
-// node's filter instead. The change from the filters f follows is worked
-// out once.
+// addressReceivers are the receivers of the grants whose rules moved only
+// where a receiver is sent their sources as addresses: a receiver sent
+// them as capabilities reads none of what moved. They are the holders of
+// those grants' destination atoms at either end, kept as the shared lists
+// the sides hold, so the change names them without copying or walking
+// them.
+type addressReceivers struct {
+	holders [][]types.NodeID
+	// owners, when set, are both ends' postings: every owner node of
+	// either is named too.
+	owners []Postings
+}
+
+// empty reports whether no receiver is named in address form only.
+func (a addressReceivers) empty() bool { return len(a.holders) == 0 && len(a.owners) == 0 }
+
+// has reports whether node id receives one of the grants a names, at
+// either end.
+func (a addressReceivers) has(id types.NodeID) bool {
+	return slices.ContainsFunc(a.holders, func(ids []types.NodeID) bool {
+		_, found := slices.BinarySearch(ids, id)
+
+		return found
+	}) || slices.ContainsFunc(a.owners, func(p Postings) bool {
+		rs, _ := p.byRole.In.Get(id)
+		for r := range rs.All() {
+			if _, ok := r.Owner(); ok {
+				return true
+			}
+		}
+
+		return false
+	})
+}
+
+// lists returns every list of nodes a names.
+func (a addressReceivers) lists() [][]types.NodeID {
+	out := slices.Clone(a.holders)
+
+	for _, p := range a.owners {
+		for role, ids := range p.All() {
+			if _, ok := role.Owner(); ok {
+				out = append(out, ids)
+			}
+		}
+	}
+
+	return out
+}
+
+// Changed returns, sorted, the nodes whose filter, in either form, can
+// differ between old and f, or all when it cannot tell: the nodes whose
+// own facts moved; the receivers of every rule whose sources, merge key or
+// capability moved; the nodes whose addresses, or routes, hold an address a
+// destination gained or lost; the owners whose autogroup:self rules moved,
+// by membership or by address; the receivers of every rule merged at a
+// position that moved; the via routers of a via grant that moved; and,
+// when any rule moved, every exit node and subnet router. Across a change
+// of which selectors or grants there are, or without the sides
+// [FollowFilters] gives, it compares every node's filter instead. The
+// change from the filters f follows is worked out once. It lists every
+// receiver of a rule whose sources only address form reads moved: routing
+// asks [Filters.ChangedFor], which names those only where they are sent
+// addresses.
 func (f *Filters) Changed(old *Filters) ([]types.NodeID, bool) {
+	c, ok := f.changeFrom(old)
+	if !ok || c.all || c.addr.empty() {
+		return slices.Clip(c.ids), c.all || !ok
+	}
+
+	ids := slices.Concat(append([][]types.NodeID{c.ids}, c.addr.lists()...)...)
+	slices.Sort(ids)
+
+	return slices.Compact(ids), false
+}
+
+// ChangedFor returns, sorted, the nodes whose filter in the form recv's
+// facts send it can differ between old and f, or all: what [Filters.Changed]
+// names, less the receivers sent capabilities for a rule only address form
+// reads, found through recv's nodes not sent capabilities rather than every
+// receiver. A node whose facts moved between the two is not named here:
+// it is served its other form, and the caller names it.
+func (f *Filters) ChangedFor(old *Filters, recv Receivers) ([]types.NodeID, bool) {
+	c, ok := f.changeFrom(old)
+	if !ok || c.all {
+		return slices.Clip(c.ids), true
+	}
+
+	return c.namedFor(f.mode, recv), false
+}
+
+// namedFor returns, sorted, the nodes c names for receivers whose facts
+// recv holds, each in the form those send it.
+//
+// The change is the filters', shared by every caller, which may append to
+// what it is given: a slice of it comes clipped, so an append copies.
+func (c filterChange) namedFor(mode SourceMode, recv Receivers) []types.NodeID {
+	if c.addr.empty() {
+		return slices.Clip(c.ids)
+	}
+
+	ids := slices.Clone(c.ids)
+
+	for _, id := range recv.addressForm {
+		if receiverForm(mode, recv.Of(id)) != reasonNone && c.addr.has(id) {
+			ids = append(ids, id)
+		}
+	}
+
+	slices.Sort(ids)
+
+	return slices.Compact(ids)
+}
+
+// changeFrom returns the change from old to f; false when there is no old
+// to compare with, which routing takes as every node. The change from the
+// filters f follows is worked out once, and decides what f carries over.
+func (f *Filters) changeFrom(old *Filters) (filterChange, bool) {
 	switch {
 	case old == f:
-		return nil, false
+		return filterChange{}, true
 	case old == nil:
-		return nil, true
+		return filterChange{}, false
 	case old.id == f.prevID:
 		f.changeOnce.Do(func() {
 			f.change = changedFilters(old, f)
 			if !f.change.all && !f.change.compared {
 				for form := range f.carried {
-					f.carried[form].Store(carryOver(old, filterForm(form), f.change.ids))
+					f.carried[form].Store(carryOver(old, filterForm(form), f.change))
 				}
 			}
 
 			f.from.Store(nil)
 		})
 
-		return f.change.ids, f.change.all
+		return f.change, true
 	}
 
-	c := changedFilters(old, f)
-
-	return c.ids, c.all
+	return changedFilters(old, f), true
 }
 
-// carryOver returns what old carried and cut in form, less the nodes
-// moved, sorted: an edit costs the cuts kept and the carried filters
-// dropped.
-func carryOver(old *Filters, form filterForm, moved []types.NodeID) *cutFilters {
+// carryOver returns what old carried and cut in form, less what c names in
+// that form, sorted: an edit costs the cuts kept and the carried filters
+// dropped, and the address form ones a rule only address form reads
+// reaches.
+func carryOver(old *Filters, form filterForm, c filterChange) *cutFilters {
 	base := old.carried[form].Load()
 	if base == nil {
 		base = graph.NewMap[types.NodeID](sameCut, nil)
 	}
 
-	isMoved := func(id types.NodeID) bool {
-		_, found := slices.BinarySearch(moved, id)
+	addr := form == formAddress && !c.addr.empty()
 
-		return found
+	moved := func(id types.NodeID) bool {
+		_, found := slices.BinarySearch(c.ids, id)
+
+		return found || addr && c.addr.has(id)
 	}
 
 	e := base.Edit()
 
 	old.byNode[form].Range(func(id types.NodeID, rules []tailcfg.FilterRule) bool {
-		if !isMoved(id) {
+		if !moved(id) {
 			e.Set(id, rules)
 		}
 
@@ -1091,8 +1335,16 @@ func carryOver(old *Filters, form filterForm, moved []types.NodeID) *cutFilters 
 	})
 
 	if base.Len() > 0 {
-		for _, id := range moved {
+		for _, id := range c.ids {
 			e.Delete(id)
+		}
+
+		if addr {
+			for id := range base.All() {
+				if c.addr.has(id) {
+					e.Delete(id)
+				}
+			}
 		}
 	}
 
@@ -1112,24 +1364,32 @@ type filterRoute struct {
 	delta map[SelectorID][]netip.Addr
 	lits  map[SelectorID]bool
 	// touched is set once a rule moved: every exit node carries it, and
-	// every subnet router is named unless narrow. narrow, when set, gives
-	// each receiver's facts at the old end (0) and the new (1).
+	// every subnet router is named unless narrow.
 	touched bool
-	narrow  func(end int, id types.NodeID) ReceiverFacts
+	narrow  bool
 	// caps is set in capability mode, where a receiver sent capabilities
-	// reads each grant's sources in capability form, not their addresses.
+	// reads each grant's sources in capability form, not their addresses;
+	// addr then collects the grants whose receivers are named in address
+	// form only.
 	caps bool
+	addr map[int]struct{}
+	// addrLists are more receivers named in address form only: owner
+	// nodes whose self rules moved only there.
+	addrLists [][]types.NodeID
+	// cands are, in capability mode, the moved nodes and those whose
+	// roles moved; moved2 is set once a grant's sources or destinations
+	// resolve otherwise, owners once that reaches a self grant.
+	cands          []types.NodeID
+	moved2, owners bool
 }
 
-func changedFilters(o, n *Filters) filterChange { return routeFilters(o, n, nil) }
+func changedFilters(o, n *Filters) filterChange { return routeFilters(o, n, false) }
 
-// routeFilters is [Filters.Changed]'s diff. Narrow, given every receiver's
-// facts, leaves out the subnet routers no moved rule reaches by its
-// destinations, and the receivers a grant's address sources cannot reach:
-// what routing would name were the cover and address indexes trusted and
-// receivers sent capabilities left alone, which a test holds to a fresh
-// comparison.
-func routeFilters(o, n *Filters, narrow func(end int, id types.NodeID) ReceiverFacts) filterChange {
+// routeFilters is [Filters.Changed]'s diff. Narrow leaves out the subnet
+// routers no moved rule reaches by its destinations: what routing would
+// name were the cover and address indexes trusted, which a test holds to a
+// fresh comparison.
+func routeFilters(o, n *Filters, narrow bool) filterChange {
 	all := filterChange{all: true}
 
 	xo, err := o.expansion()
@@ -1149,14 +1409,31 @@ func routeFilters(o, n *Filters, narrow func(end int, id types.NodeID) ReceiverF
 	}
 
 	r := &filterRoute{o: o, n: n, xo: xo, xn: xn, out: map[types.NodeID]struct{}{}, narrow: narrow, caps: n.mode == CapabilitySources}
-	r.movedNodes()
-	r.resolutions()
 
-	for g := range n.t.grants {
-		r.grant(g)
+	if r.caps && o.sides.from != nil && n.sides.from != nil {
+		// Capability form reads addresses only where a fallback writes
+		// them, so what moved is read off the nodes and roles that did,
+		// never every selector's members: neither end's address part is
+		// built here.
+		r.candidates()
+		r.deltas()
+		r.literals()
+
+		for g := range n.t.grants {
+			r.grantDelta(g)
+		}
+
+		r.anchorsDelta()
+	} else {
+		r.movedNodes()
+		r.resolutions()
+
+		for g := range n.t.grants {
+			r.grant(g)
+		}
+
+		r.anchors()
 	}
-
-	r.anchors()
 
 	if r.touched {
 		r.holders(atomExit)
@@ -1165,12 +1442,54 @@ func routeFilters(o, n *Filters, narrow func(end int, id types.NodeID) ReceiverF
 		// cover and address indexes; a stale one admits traffic into its
 		// subnets, so a moved rule recuts every router rather than trust
 		// them.
-		if r.narrow == nil {
+		if !r.narrow {
 			r.routers()
 		}
 	}
 
-	return namesAll(slices.Sorted(maps.Keys(r.out)), n.nodes)
+	c := namesAll(slices.Sorted(maps.Keys(r.out)), n.nodes)
+	if !c.all && (len(r.addr) > 0 || len(r.addrLists) > 0 || r.owners) {
+		c.addr = r.addressReceivers()
+	}
+
+	return c
+}
+
+// addressReceivers describes the receivers named in address form only: the
+// holders of the destination atoms of grants named so at each end, and the
+// owner nodes self rules named.
+func (r *filterRoute) addressReceivers() addressReceivers {
+	var a addressReceivers
+
+	for _, ids := range r.addrLists {
+		if len(ids) > 0 {
+			a.holders = append(a.holders, ids)
+		}
+	}
+
+	if r.owners {
+		a.owners = []Postings{r.o.posts, r.n.posts}
+	}
+
+	for _, s := range r.sides() {
+		var atoms []Role
+
+		for _, g := range slices.Sorted(maps.Keys(r.addr)) {
+			gs := &s.plan.grants[g]
+			atoms = append(atoms, gs.portDst...)
+			atoms = append(atoms, gs.capDst...)
+		}
+
+		slices.SortFunc(atoms, compareRoles)
+
+		for _, at := range slices.Compact(atoms) {
+			if ids := s.Holders(at); len(ids) > 0 {
+				a.holders = append(a.holders, ids)
+			}
+		}
+	}
+
+	return a
 }
 
 // namesAll returns ids as a change, all when they name every node of list:
@@ -1328,7 +1647,7 @@ func (r *filterRoute) resolutions() {
 			continue
 		}
 
-		if d := addressDelta(r.xo.resolved[s.ID], r.xn.resolved[s.ID]); len(d) > 0 {
+		if d := addressDelta(r.xo.res(s.ID), r.xn.res(s.ID)); len(d) > 0 {
 			r.delta[s.ID] = d
 		}
 	}
@@ -1344,6 +1663,222 @@ func (r *filterRoute) resolutions() {
 			r.lits[s.ID] = true
 		}
 	}
+}
+
+// candidates finds the nodes that joined, left, or changed a fact the
+// policy reads, off the node maps' edit logs, and with them the nodes
+// whose roles moved without: whose addresses can enter or leave a
+// resolution.
+func (r *filterRoute) candidates() {
+	for _, id := range graph.Changes(r.o.sides.from, r.n.sides.from) {
+		was, wasOK := r.o.node(id)
+		is, isOK := r.n.node(id)
+
+		if wasOK != isOK || wasOK && was != is && was.HasPolicyChange(is) {
+			r.moved = append(r.moved, id)
+		}
+	}
+
+	routedNodes.Add(uint64(len(r.moved)))
+	r.add(r.moved...)
+
+	r.cands = slices.Concat(r.moved, graph.Changes(r.o.posts.byRole.In, r.n.posts.byRole.In))
+	slices.Sort(r.cands)
+	r.cands = slices.Compact(r.cands)
+}
+
+// routedNodes counts the nodes routing in capability mode found moved:
+// what it visits of the node list.
+var routedNodes atomic.Uint64
+
+// deltas records, by identity selector, the addresses its resolution
+// gained or lost, as [addressDelta] of the two ends' resolutions finds
+// them: an address can move only with a candidate holding it, and is in a
+// resolution when one of its holders is a member.
+func (r *filterRoute) deltas() {
+	r.delta = map[SelectorID][]netip.Addr{}
+
+	ends := [2]*Filters{r.o, r.n}
+
+	in := func(end int, ip netip.Addr, sel SelectorID) bool {
+		ids, _ := r.sides()[end].byAddr.Groups.Get(ip)
+
+		return slices.ContainsFunc(ids, func(id types.NodeID) bool {
+			rs, _ := ends[end].posts.byRole.In.Get(id)
+
+			return rs.Has(SelectorRole(sel))
+		})
+	}
+
+	seen := map[SelectorID]map[netip.Addr]bool{}
+
+	for _, id := range r.cands {
+		var (
+			sels  []SelectorID
+			addrs []netip.Addr
+		)
+
+		for _, f := range ends {
+			rs, _ := f.posts.byRole.In.Get(id)
+			for role := range rs.All() {
+				if sel, ok := role.Selector(); ok && r.n.t.table().Selector(sel).Kind.HoldsNodes() {
+					sels = append(sels, sel)
+				}
+			}
+
+			if n, ok := f.node(id); ok {
+				addrs = append(addrs, n.IPs()...)
+			}
+		}
+
+		for _, sel := range sels {
+			if seen[sel] == nil {
+				seen[sel] = map[netip.Addr]bool{}
+			}
+
+			for _, ip := range addrs {
+				if seen[sel][ip] {
+					continue
+				}
+
+				seen[sel][ip] = true
+
+				if in(0, ip, sel) != in(1, ip, sel) {
+					r.delta[sel] = append(r.delta[sel], ip)
+				}
+			}
+		}
+	}
+}
+
+// literals records the address selectors whose literal a document edit
+// moved.
+func (r *filterRoute) literals() {
+	if r.o.t == r.n.t {
+		return
+	}
+
+	r.lits = map[SelectorID]bool{}
+
+	for _, s := range r.n.t.table().sels {
+		if !s.Kind.HoldsNodes() && !reflect.DeepEqual(r.o.t.literals[s.ID], r.n.t.literals[s.ID]) {
+			r.lits[s.ID] = true
+		}
+	}
+}
+
+// moves reports whether what selectors ids resolve to can differ at the
+// two ends; wildcard adds the approved subnet routes a * names.
+func (r *filterRoute) moves(ids []SelectorID, wildcard bool) bool {
+	if wildcard && !slices.Equal(r.o.routes, r.n.routes) {
+		return true
+	}
+
+	return slices.ContainsFunc(ids, func(id SelectorID) bool { return len(r.delta[id]) > 0 || r.lits[id] })
+}
+
+// grantDelta is [filterRoute.grant] for capability mode, where what moved
+// of a grant's sources and destinations is read off the deltas, not off
+// the two ends' expansions: a grant whose sources or destinations resolve
+// otherwise reaches its receivers sent addresses, and the others when its
+// capability form sources moved.
+func (r *filterRoute) grantDelta(g int) {
+	gto, gtn := r.o.t.grants[g], r.n.t.grants[g]
+	if gto.none && gtn.none {
+		return
+	}
+
+	tmpl := gto != gtn
+	srcMoved := r.moves(gto.srcs, gto.wildcard) || r.moves(gtn.srcs, gtn.wildcard)
+	dstMoved := r.moves(gto.dsts, gto.dstWildcard) || r.moves(gtn.dsts, gtn.dstWildcard)
+
+	if gto.kind == grantVia || gtn.kind == grantVia {
+		if tmpl || srcMoved || dstMoved {
+			r.viaRouters(gto, gtn)
+		}
+
+		if !tmpl || gto.kind == grantVia && gtn.kind == grantVia {
+			return
+		}
+	}
+
+	capMoved := !slices.Equal(r.xo.capForms().grants[g].srcs, r.xn.capForms().grants[g].srcs)
+
+	switch {
+	case tmpl || capMoved:
+		r.touched, r.moved2 = true, true
+		r.receivers(g, false)
+	case srcMoved || dstMoved:
+		r.touched, r.moved2 = true, true
+		r.receivers(g, true)
+	}
+
+	// Companions run from the destinations to the sources, which receive
+	// them.
+	if tmpl || srcMoved || dstMoved {
+		for _, s := range r.sides() {
+			if gs := &s.plan.grants[g]; gs.comp {
+				r.touched = true
+
+				for _, a := range gs.compDst {
+					r.add(s.Holders(a)...)
+				}
+			}
+		}
+	}
+
+	r.destinations(gtn.dsts)
+
+	if gto.kind == grantSelf || gtn.kind == grantSelf {
+		r.self(g, gtn, tmpl || slices.ContainsFunc(gtn.srcs, func(id SelectorID) bool { return r.lits[id] }))
+	}
+}
+
+// viaRouters adds the via routers of a via grant whose rules can have
+// moved: every node carrying one of its tags at either end.
+func (r *filterRoute) viaRouters(gto, gtn *GrantTemplate) {
+	r.touched = true
+
+	for _, gt := range [2]*GrantTemplate{gto, gtn} {
+		for _, tag := range gt.via {
+			if s, ok := r.n.t.table().Lookup(string(tag)); ok {
+				r.add(r.o.posts.Nodes(SelectorRole(s.ID))...)
+				r.add(r.n.posts.Nodes(SelectorRole(s.ID))...)
+			}
+		}
+	}
+}
+
+// anchorsDelta is [filterRoute.anchors] for capability mode. Merge
+// positions are address form's alone, and telling which moved means
+// writing every merge key; so once any grant's sources or destinations
+// resolve otherwise, every grant's receivers, and every owner's nodes,
+// are named in address form only.
+func (r *filterRoute) anchorsDelta() {
+	if !r.moved2 {
+		return
+	}
+
+	for g := range r.n.t.grants {
+		for _, gt := range [2]*GrantTemplate{r.o.t.grants[g], r.n.t.grants[g]} {
+			if !gt.none && gt.kind != grantVia && len(gt.ip) > 0 {
+				r.addressOnly(g)
+			}
+
+			if !gt.none && gt.kind == grantSelf {
+				r.owners = true
+			}
+		}
+	}
+}
+
+// addressOnly names grant g's receivers in address form only.
+func (r *filterRoute) addressOnly(g int) {
+	if r.addr == nil {
+		r.addr = map[int]struct{}{}
+	}
+
+	r.addr[g] = struct{}{}
 }
 
 // addressDelta returns the addresses in only one of a and b.
@@ -1393,32 +1928,31 @@ func (r *filterRoute) addresses(addrs []netip.Addr) {
 
 // receivers adds the nodes a rule of grant g every node shares can reach,
 // at either end: those on its destination side. When only what address
-// form reads moved, narrow leaves out the receivers sent every source of
-// the grant as a capability at both ends, whose filters read none of it.
+// form reads moved, a receiver sent the grant's sources as capabilities
+// reads none of it: in capability mode the grant's receivers are then
+// named in address form only, unless a rule of it is written as addresses
+// whatever the receiver.
 func (r *filterRoute) receivers(g int, addressOnly bool) {
+	if addressOnly && r.caps && !r.addressPair(g) {
+		r.addressOnly(g)
+
+		return
+	}
+
 	for _, s := range r.sides() {
 		gs := &s.plan.grants[g]
 
 		for _, a := range slices.Concat(gs.portDst, gs.capDst) {
-			for _, id := range s.Holders(a) {
-				if r.narrow == nil || !addressOnly || r.addressPair(g, id) {
-					r.add(id)
-				}
-			}
+			r.add(s.Holders(a)...)
 		}
 	}
 }
 
-// addressPair reports whether receiver id is sent some source of grant g's
-// rules as addresses at either end, so whom they resolve to reaches it.
-func (r *filterRoute) addressPair(g int, id types.NodeID) bool {
-	for end, f := range [2]*Filters{r.o, r.n} {
-		if addressPair(f.mode, r.narrow(end, id), f.t.grants[g]) {
-			return true
-		}
-	}
-
-	return false
+// addressPair reports whether a receiver sent capabilities is sent some
+// source of grant g's rules as addresses at either end, so whom they
+// resolve to reaches it.
+func (r *filterRoute) addressPair(g int) bool {
+	return addressPair(r.o.t.grants[g]) || addressPair(r.n.t.grants[g])
 }
 
 // grant adds whom what moved of grant g reaches.
@@ -1428,7 +1962,7 @@ func (r *filterRoute) grant(g int) {
 		return
 	}
 
-	geo, gen := &r.xo.grants[g], &r.xn.grants[g]
+	geo, gen := r.xo.grant(g), r.xn.grant(g)
 	tmpl := gto != gtn
 
 	if gto.kind == grantVia || gtn.kind == grantVia {
@@ -1470,7 +2004,7 @@ func (r *filterRoute) grant(g int) {
 	r.destinations(gtn.dsts)
 
 	if gto.kind == grantSelf || gtn.kind == grantSelf {
-		r.self(gtn, tmpl || slices.ContainsFunc(gtn.srcs, func(id SelectorID) bool { return r.lits[id] }))
+		r.self(g, gtn, tmpl || slices.ContainsFunc(gtn.srcs, func(id SelectorID) bool { return r.lits[id] }))
 	}
 }
 
@@ -1518,13 +2052,16 @@ func sameSourceSets(a, b *grantExpansion) bool {
 	})
 }
 
-// self adds the nodes of every owner whose autogroup:self rules of grant gt
-// can have moved: all of them when all, else those whose nodes moved, and
-// those a source names, by address, otherwise than it did. A self rule
-// lists every node of its owner, and a source names an owner's node by its
-// addresses: a node sharing an address with one that moved moves its
-// owner's rules.
-func (r *filterRoute) self(gt *GrantTemplate, all bool) {
+// self adds the nodes of every owner whose autogroup:self rules of grant g,
+// gt at the new end, can have moved: all of them when all, else those whose
+// nodes moved, and those a source names, by address, otherwise than it
+// did. A self rule lists every node of its owner, and a source names an
+// owner's node by its addresses: a node sharing an address with one that
+// moved moves its owner's rules. In capability mode an owner whose rules
+// go as its capability at both ends, naming the same sources, is named in
+// address form only: its capability rule reads none of its nodes but the
+// receiver.
+func (r *filterRoute) self(g int, gt *GrantTemplate, all bool) {
 	owners := map[uint]struct{}{}
 
 	if all {
@@ -1537,6 +2074,12 @@ func (r *filterRoute) self(gt *GrantTemplate, all bool) {
 		}
 	} else {
 		moved, _ := r.n.posts.Changed(r.o.posts)
+		if r.caps {
+			// The owner roles among the lists edited: comparing every edited
+			// list, a member list among them, would cost its length.
+			moved = r.n.posts.edited(r.o.posts)
+		}
+
 		for _, role := range moved {
 			if uid, ok := role.Owner(); ok {
 				owners[uid] = struct{}{}
@@ -1577,7 +2120,43 @@ func (r *filterRoute) self(gt *GrantTemplate, all bool) {
 	}
 
 	r.touched = true
-	r.ownerNodes(owners)
+
+	if !r.caps || all {
+		r.ownerNodes(owners)
+
+		return
+	}
+
+	for uid := range owners {
+		if r.selfAddressOnly(g, uid) {
+			r.addrLists = append(r.addrLists, r.o.posts.Nodes(OwnerRole(uid)), r.n.posts.Nodes(OwnerRole(uid)))
+
+			continue
+		}
+
+		r.ownerNodes(map[uint]struct{}{uid: {}})
+	}
+}
+
+// selfAddressOnly reports whether owner uid's rules of self grant g go as
+// its capability at both ends with the same sources naming its nodes, so
+// that only their address form can have moved.
+func (r *filterRoute) selfAddressOnly(g int, uid uint) bool {
+	var named [2][]selfNaming
+
+	for end, x := range [2]*Expansion{r.xo, r.xn} {
+		gt := x.t.grants[g]
+		if gt.none || gt.kind != grantSelf {
+			return false
+		}
+
+		named[end] = x.selfNamed(g, uid)
+		if !x.selfCapabilityOnly(g, uid, named[end]) {
+			return false
+		}
+	}
+
+	return slices.Equal(named[0], named[1]) && slices.Equal(r.xo.srcIDs(g), r.xn.srcIDs(g))
 }
 
 // ownersOf adds to owners the users node id is an owner node of, at either
@@ -1607,14 +2186,16 @@ func (r *filterRoute) ownerNodes(owners map[uint]struct{}) {
 func (r *filterRoute) anchors() {
 	keys := map[string]struct{}{}
 
-	for k, p := range r.xn.first {
-		if q, ok := r.xo.first[k]; !ok || q != p {
+	was, is := r.xo.positions(), r.xn.positions()
+
+	for k, p := range is {
+		if q, ok := was[k]; !ok || q != p {
 			keys[k] = struct{}{}
 		}
 	}
 
-	for k := range r.xo.first {
-		if _, ok := r.xn.first[k]; !ok {
+	for k := range was {
+		if _, ok := is[k]; !ok {
 			keys[k] = struct{}{}
 		}
 	}
@@ -1637,7 +2218,7 @@ func (r *filterRoute) anchors() {
 	}
 
 	for g := range r.n.t.grants {
-		geo, gen := &r.xo.grants[g], &r.xn.grants[g]
+		geo, gen := r.xo.grant(g), r.xn.grant(g)
 		if !hit(geo) && !hit(gen) {
 			continue
 		}
@@ -1884,7 +2465,7 @@ func (x *Expansion) capFilterFor(n types.NodeView, st *FilterShapes) capFilter {
 			continue
 		}
 
-		ge := &x.grants[g]
+		ge := x.grant(g)
 
 		switch gt.kind {
 		case grantRegular:
@@ -1910,13 +2491,13 @@ func (x *Expansion) cutShared(c *cut, g int, gt *GrantTemplate, ge *grantExpansi
 			continue
 		}
 
-		dsts := x.dstPorts(gt, ipr.ports, c.rc)
+		dsts := x.dstPorts(gt, ipr.ports, c.rc, false)
 		if len(dsts) == 0 {
 			continue
 		}
 
 		c.emit(tailcfg.FilterRule{SrcIPs: ge.capSrcs, DstPorts: dsts, IPProto: ipr.proto}, "", key, ge.srcStrs,
-			x.first[key], rulePos(g, 0, i), shapeShared)
+			x.positions()[key], rulePos(g, 0, i), shapeShared)
 	}
 
 	next := len(gt.ip)
@@ -1985,8 +2566,12 @@ func (x *Expansion) capGrantRules(gt *GrantTemplate, ge *grantExpansion, rc rece
 }
 
 // dstPorts returns the destinations of a rule of gt over ports that reach
-// rc, in the compile's order: by destination, address, then port.
-func (x *Expansion) dstPorts(gt *GrantTemplate, ports []tailcfg.PortRange, rc receiver) []tailcfg.NetPortRange {
+// rc, in the compile's order: by destination, address, then port. byRole
+// tells a receiver without routes inside an identity destination by its
+// membership where no node outside the destination holds a member's
+// address, which then decides it alike, so capability form need not
+// resolve the destination.
+func (x *Expansion) dstPorts(gt *GrantTemplate, ports []tailcfg.PortRange, rc receiver, byRole bool) []tailcfg.NetPortRange {
 	var out []tailcfg.NetPortRange
 
 	add := func(ip string) {
@@ -2004,7 +2589,17 @@ func (x *Expansion) dstPorts(gt *GrantTemplate, ports []tailcfg.PortRange, rc re
 				add("*")
 			}
 		case s.Kind.HoldsNodes():
-			res := x.resolved[id]
+			if !rc.routed && byRole && !x.capForms().shared[id] {
+				if rs, _ := x.posts.byRole.In.Get(rc.n.ID()); rs.Has(SelectorRole(id)) {
+					for _, ip := range rc.ips {
+						add(ip.String())
+					}
+				}
+
+				continue
+			}
+
+			res := x.res(id)
 
 			if !rc.routed {
 				// Only its own addresses can reach a node without routes.
@@ -2042,7 +2637,7 @@ func (x *Expansion) cutSelf(c *cut, g int) {
 
 	switch n := c.rc.n; {
 	case n.IsExitNode():
-		uids = x.owners
+		uids = x.ownerIDs()
 	case nodeHasUserIdentity(n):
 		uids = []uint{n.User().ID()}
 	}
@@ -2066,7 +2661,7 @@ func (x *Expansion) cutSelf(c *cut, g int) {
 			}
 
 			anchor := pos
-			if first, ok := x.first[o.key]; ok && o.key != "" {
+			if first, ok := x.positions()[o.key]; ok && o.key != "" {
 				anchor = min(anchor, first)
 			}
 
@@ -2129,7 +2724,7 @@ func (x *Expansion) selfRules(g int, uid uint) *ownRules {
 		return rules
 	}
 
-	rules := x.buildSelfRules(x.t.grants[g], &x.grants[g], uid)
+	rules := x.buildSelfRules(x.t.grants[g], x.grant(g), uid)
 	x.self[k] = rules
 
 	return rules
@@ -2396,18 +2991,18 @@ func (x *Expansion) capFormFor(n types.NodeView, log *formLog) []tailcfg.FilterR
 			continue
 		}
 
-		ge, gc := &x.grants[g], &ci.grants[g]
+		gc := &ci.grants[g]
 		rules = rules[:0]
 
 		for _, ipr := range gt.ip {
-			dsts := x.dstPorts(gt, ipr.ports, rc)
+			dsts := x.dstPorts(gt, ipr.ports, rc, true)
 			if len(dsts) == 0 {
 				continue
 			}
 
 			if why := ruleForm(false, ipr.proto); why != reasonNone {
 				// As address form writes it: not at all without sources.
-				if len(ge.srcStrs) > 0 {
+				if ge := x.grant(g); len(ge.srcStrs) > 0 {
 					rules = append(rules, formRule{
 						rule:    tailcfg.FilterRule{SrcIPs: addressSources(why, ge.srcStrs), DstPorts: dsts, IPProto: ipr.proto},
 						reasons: []ipReason{why},
@@ -2428,10 +3023,17 @@ func (x *Expansion) capFormFor(n types.NodeView, log *formLog) []tailcfg.FilterR
 			rules = append(rules, formRule{rule: tailcfg.FilterRule{SrcIPs: gc.srcs, DstPorts: dsts, IPProto: ipr.proto}, reasons: gc.reasons})
 		}
 
-		for _, cr := range x.capGrantRules(gt, ge, rc) {
-			fs := gc.app
+		var crs []capGrantRule
+		if gt.app != nil {
+			crs = x.capGrantRules(gt, x.grant(g), rc)
+		}
+
+		for _, cr := range crs {
+			app, comp := ci.appForms(x, g)
+
+			fs := app
 			if cr.shape == shapeCompanion {
-				fs = gc.comp
+				fs = comp
 			}
 
 			for _, why := range fs.reasons {
@@ -2467,12 +3069,12 @@ type formRule struct {
 // app capability's.
 func (x *Expansion) capFormSelf(rules []formRule, g int, gt *GrantTemplate, rc receiver) []formRule {
 	uid := rc.n.User().ID()
-	own := x.selfRules(g, uid)
-	ge := &x.grants[g]
+	named := x.selfNamed(g, uid)
+	srcs := x.srcIDs(g)
 
 	// An address form rule of the owner's, cut for rc.
 	byAddress := func(match func(ownRule) bool, why ipReason) {
-		for _, o := range own.rules {
+		for _, o := range x.selfRules(g, uid).rules {
 			if !match(o) {
 				continue
 			}
@@ -2489,14 +3091,14 @@ func (x *Expansion) capFormSelf(rules []formRule, g int, gt *GrantTemplate, rc r
 			continue
 		}
 
-		for k, src := range ge.srcIDs {
+		for k, src := range srcs {
 			// A source naming none of the owner's nodes gives no rule in
 			// either form.
-			if own.named[k] == namedNone {
+			if named[k] == namedNone {
 				continue
 			}
 
-			why := x.selfForm(ipr.proto, src, uid, own.named[k] == namedAll)
+			why := x.selfForm(ipr.proto, src, uid, named[k] == namedAll)
 			if why != reasonNone {
 				byAddress(func(o ownRule) bool { return o.ip == ip && o.src == src }, why)
 
@@ -2523,10 +3125,14 @@ func (x *Expansion) capFormSelf(rules []formRule, g int, gt *GrantTemplate, rc r
 
 	// The app capability rule and its companions run from and to every
 	// node of the owner's a source names.
+	if gt.app == nil {
+		return rules
+	}
+
 	app := ruleForm(true, nil)
-	for k, src := range ge.srcIDs {
-		if app == reasonNone && own.named[k] != namedNone {
-			app = x.selfForm(nil, src, uid, own.named[k] == namedAll)
+	for k, src := range srcs {
+		if app == reasonNone && named[k] != namedNone {
+			app = x.selfForm(nil, src, uid, named[k] == namedAll)
 		}
 	}
 
@@ -2536,7 +3142,7 @@ func (x *Expansion) capFormSelf(rules []formRule, g int, gt *GrantTemplate, rc r
 		return rules
 	}
 
-	for _, o := range own.rules {
+	for _, o := range x.selfRules(g, uid).rules {
 		if rule, ok := cutOwn(o, rc); o.ip < 0 && ok {
 			rule.SrcIPs = []string{capSourcePrefix + string(ownerCap(uid))}
 			rules = append(rules, formRule{rule: rule})

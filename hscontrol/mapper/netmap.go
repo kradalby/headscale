@@ -654,22 +654,67 @@ func (r *renderer) peerCandidates(snap *state.Snapshot, class *peerMap, view []t
 		return graph.Changes(r.lastClass, class)
 	}
 
-	var candidates []tailcfg.NodeID
+	ids := append(touched, snap.CapsChangedSince(r.lastCaps)...)
+	moved := r.classes.viewDelta(old, view)
 
-	for _, id := range append(touched, snap.CapsChangedSince(r.lastCaps)...) {
+	// One slice of the session's own, sized once: the caller sorts and
+	// extends it, and the delta is shared.
+	n := len(moved)
+
+	for _, id := range ids {
+		if inView(old, id) || inView(view, id) {
+			n++
+		}
+	}
+
+	candidates := make([]tailcfg.NodeID, 0, n)
+
+	for _, id := range ids {
 		if inView(old, id) || inView(view, id) {
 			candidates = append(candidates, id.NodeID())
 		}
 	}
 
-	// Both views are sorted; walk their symmetric difference without map reads.
-	for i, j := 0, 0; i < len(old) || j < len(view); {
+	return append(candidates, moved...)
+}
+
+// viewDelta returns the nodes in exactly one of views a and b. Views are
+// immutable and shared by every node of a class, so the sessions moving
+// between the same two views walk them once between them, not once each:
+// under a mesh every viewer of a joiner moves between the same two.
+func (cm *classMaps) viewDelta(a, b []types.NodeID) []tailcfg.NodeID {
+	key := viewPair{from: keyOf(a), to: keyOf(b)}
+
+	cm.dmu.Lock()
+
+	e, ok := cm.deltas[key]
+	if !ok {
+		if cm.deltas == nil {
+			cm.deltas = make(map[viewPair]*viewDeltaEntry)
+		}
+
+		e = &viewDeltaEntry{}
+		cm.deltas[key] = e
+	}
+
+	cm.dmu.Unlock()
+
+	e.once.Do(func() { e.d = symmetricDifference(a, b) })
+
+	return e.d
+}
+
+// symmetricDifference walks two sorted views without map reads.
+func symmetricDifference(a, b []types.NodeID) []tailcfg.NodeID {
+	var out []tailcfg.NodeID
+
+	for i, j := 0, 0; i < len(a) || j < len(b); {
 		switch {
-		case j == len(view) || i < len(old) && old[i] < view[j]:
-			candidates = append(candidates, old[i].NodeID())
+		case j == len(b) || i < len(a) && a[i] < b[j]:
+			out = append(out, a[i].NodeID())
 			i++
-		case i == len(old) || view[j] < old[i]:
-			candidates = append(candidates, view[j].NodeID())
+		case i == len(a) || b[j] < a[i]:
+			out = append(out, b[j].NodeID())
 			j++
 		default:
 			i++
@@ -677,7 +722,24 @@ func (r *renderer) peerCandidates(snap *state.Snapshot, class *peerMap, view []t
 		}
 	}
 
-	return candidates
+	return out
+}
+
+// viewPair names a move between two views; viewDeltaEntry is its delta,
+// walked once.
+type viewPair struct{ from, to classKey }
+
+type viewDeltaEntry struct {
+	once sync.Once
+	d    []tailcfg.NodeID
+}
+
+func keyOf(v []types.NodeID) classKey {
+	if len(v) == 0 {
+		return classKey{}
+	}
+
+	return classKey{view: &v[0], n: len(v)}
 }
 
 func (nm *netMap) recordPeerChanges(base *netMap, candidates []tailcfg.NodeID, self tailcfg.NodeID) {
@@ -795,6 +857,11 @@ type classMaps struct {
 	m  map[classKey]*classEntry
 	// pruned is the peer-classes revision maps were last pruned against.
 	pruned uint64
+
+	// deltas are the view moves sessions walked since the peer classes
+	// last changed; their keys pin the views they name.
+	dmu    sync.Mutex
+	deltas map[viewPair]*viewDeltaEntry
 }
 
 // classEntry is one class's latest map; mu serialises its update, so
@@ -1057,6 +1124,12 @@ func (cm *classMaps) prune(snap *state.Snapshot) {
 	} else {
 		return
 	}
+
+	// Moves into views of older classes are walked again if anyone still
+	// makes one.
+	cm.dmu.Lock()
+	clear(cm.deltas)
+	cm.dmu.Unlock()
 
 	current := map[*types.NodeID]struct{}{}
 

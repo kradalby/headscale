@@ -2955,11 +2955,11 @@ func (s *Snapshot) SelfRoutes(node types.NodeView) []netip.Prefix { return node.
 // sessions an update can reach.
 type Change struct {
 	// Global is set when the change can reach any map: the DERP map or the
-	// extra DNS records changed; commits coalesced over a move of what a
-	// map renders besides the nodes (see [Snapshot.Since]), or past the
-	// node log; or a delta below names every node or cannot be worked out
-	// (the filters fail to expand, or the compile cannot tell whose SSH
-	// policy moved).
+	// extra DNS records changed; commits coalesced past the node log; or a
+	// delta below names every node or cannot be worked out (the filters
+	// fail to expand, or the compile cannot tell whose SSH policy moved).
+	// Across coalesced commits the deltas compare the two ends: a session
+	// that rendered a snapshot in between is the reader's to wake.
 	Global bool
 	// Resync means the node edit history was exceeded; consumers must
 	// check retained node state against the current snapshot.
@@ -3008,19 +3008,13 @@ func (s *Snapshot) Since(old *Snapshot) Change {
 		c.Nodes, complete = s.NodesTouchedSince(old.NodesVersion())
 		c.Resync = !complete
 
-		// The node log names nodes changed and changed back, but the
-		// deltas below compare only old and s. A session may have rendered
-		// a snapshot in between, holding a filter, a peer or a route both
-		// ends lack, and only that session can tell; so when what a map
-		// renders besides the nodes moved across coalesced commits, wake
-		// everyone. That is only coalesced commits that moved one, and a
-		// woken session renders from the snapshot and sends just its diff,
-		// so one the change never concerned costs a render and sends
-		// nothing. Scoping this needs each commit's derived delta kept and
-		// unioned.
-		c.Global = c.Global || c.Resync || s.FiltersRev() != old.FiltersRev() || s.PeersRev() != old.PeersRev() ||
-			s.PrimariesRev() != old.PrimariesRev() || s.SidesRev() != old.SidesRev() ||
-			s.RouteRulesRev() != old.RouteRulesRev() || s.CapsRev() != old.CapsRev() || s.sshMoved(old)
+		// The node log names nodes changed and changed back; every delta
+		// below compares the two ends directly, which is exact for a
+		// session holding old's render. One that rendered a snapshot in
+		// between can hold what neither end has: the hub wakes those
+		// itself, as it knows which sessions rendered since it last
+		// routed.
+		c.Global = c.Global || c.Resync
 		if c.Global {
 			return c
 		}
@@ -3029,7 +3023,23 @@ func (s *Snapshot) Since(old *Snapshot) Change {
 	}
 
 	if s.FiltersRev() != old.FiltersRev() {
-		filters, all := s.s.Get(s.w.filters).Changed(old.s.Get(old.w.filters))
+		cur, was := s.s.Get(s.w.filters), old.s.Get(old.w.filters)
+
+		// In capability mode a rule whose sources only address form reads
+		// moved reaches the nodes served address form alone: the form a
+		// read serves comes from the same facts, so a node sent
+		// capabilities at both ends reads none of it.
+		var (
+			filters []types.NodeID
+			all     bool
+		)
+
+		if s.w.capSources {
+			filters, all = cur.ChangedFor(was, s.s.Get(s.w.receivers))
+		} else {
+			filters, all = cur.Changed(was)
+		}
+
 		if all {
 			c.Global = true
 		}
@@ -3038,8 +3048,7 @@ func (s *Snapshot) Since(old *Snapshot) Change {
 	}
 
 	// A node whose facts moved is served its filter's other form, which
-	// concerns it alone. Across coalesced commits the node log names it,
-	// and a change of the policy's caps escalates above.
+	// concerns it alone; the two ends' facts are compared directly.
 	if s.w.capSources && graph.ChangedAt(s.s, s.w.receivers) != graph.ChangedAt(old.s, old.w.receivers) {
 		c.Filters = append(c.Filters, s.s.Get(s.w.receivers).ChangedSince(old.s.Get(old.w.receivers))...)
 	}

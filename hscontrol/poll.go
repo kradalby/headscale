@@ -40,6 +40,10 @@ const (
 	// timeout, about 3 KB/s once the transport's buffers are full, is
 	// taken as stalled too.
 	writeStallTimeout = 5 * time.Second
+
+	// renderErrorEvery is how often a session whose render keeps failing
+	// logs it; the failures between are counted in the next line.
+	renderErrorEvery = time.Minute
 )
 
 // errMapSessionStopped is a write refused because the session was stopped;
@@ -379,6 +383,13 @@ func (m *mapSession) serveLongPoll() {
 
 	var lastUpdate time.Time
 
+	// A render that keeps failing is retried at every commit the hub
+	// routes; its error is logged once per renderErrorEvery.
+	var (
+		renderErrorAt time.Time
+		renderErrors  int
+	)
+
 	for {
 		select {
 		case <-m.cancelCh:
@@ -414,7 +425,12 @@ func (m *mapSession) serveLongPoll() {
 			}
 
 			if err != nil {
-				m.log.Error().Caller().Err(err).Msg("rendering map update")
+				renderErrors++
+
+				if time.Since(renderErrorAt) >= renderErrorEvery {
+					m.log.Error().Caller().Err(err).Int("failures", renderErrors).Msg("rendering map update")
+					renderErrorAt, renderErrors = time.Now(), 0
+				}
 
 				continue
 			}

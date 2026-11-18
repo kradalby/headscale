@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1434,4 +1436,250 @@ func TestWorldReceiverFlipCostFollowsNode(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestWorldNarrowRoutingFollowsEachFallback flips each reason a source is
+// sent as addresses on and off around membership changes, and holds
+// routing to fresh cuts at every commit: a receiver whose served filter
+// moved is named; every filter served, cut or carried in either form,
+// equals a fresh cut; and, in capability mode, a receiver sent
+// capabilities at both ends whose filter did not move is not named, which
+// is the narrowing. The receiver's address form is cut before a flip and
+// carried across commits it is sent capabilities in, then read again.
+func TestWorldNarrowRoutingFollowsEachFallback(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "")
+
+	users := []types.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
+
+	const receiver = types.NodeID(1)
+
+	policy := func(grant, extra string) string {
+		return `{"groups": {"group:eng": ["alice@"]}, "tagOwners": {"tag:web": ["alice@"]}` + extra +
+			`, "grants": [{"src": ["group:eng"], "dst": ["tag:web"], "ip": ["tcp:443"]}` + grant + `]}`
+	}
+
+	hostinfoOf := func(id types.NodeID, fn func(*tailcfg.Hostinfo)) func(*world) {
+		return func(w *world) {
+			_, ok := w.UpdateNode(id, func(n *types.Node) {
+				n.Hostinfo = n.Hostinfo.Clone()
+				fn(n.Hostinfo)
+			})
+			require.True(t, ok)
+		}
+	}
+
+	hostinfo := func(fn func(*tailcfg.Hostinfo)) func(*world) { return hostinfoOf(receiver, fn) }
+
+	const self = `{"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]}]}`
+
+	moveAddress := func(id types.NodeID, ip string) func(*world) {
+		return func(w *world) {
+			_, ok := w.UpdateNode(id, func(n *types.Node) { n.IPv4 = new(netip.MustParseAddr(ip)) })
+			require.True(t, ok)
+		}
+	}
+
+	setPolicy := func(src string) func(*world) {
+		return func(w *world) {
+			_, err := w.SetPolicy([]byte(src), noCheck)
+			require.NoError(t, err)
+		}
+	}
+
+	route := netip.MustParsePrefix("10.1.0.0/24")
+
+	cases := []struct {
+		name   string
+		policy string
+		// into and out move the fallback onto the pair and off it; nil
+		// where the rule itself is the fallback.
+		into, out func(*world)
+		// owner is the receiver, an owner node of alice's, for self rules.
+		owner bool
+	}{
+		{
+			name: "self/local-nets", policy: self, owner: true,
+			into: hostinfoOf(2, func(hi *tailcfg.Hostinfo) { hi.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.9.0.0/24")} }),
+			out:  hostinfoOf(2, func(hi *tailcfg.Hostinfo) { hi.RoutableIPs = nil }),
+		},
+		{
+			// bob's node takes the address of alice's: her self rules go
+			// as addresses while another user's node holds one of hers.
+			name: "self/shared-address", policy: self, owner: true,
+			into: moveAddress(5, "100.64.0.1"),
+			out:  moveAddress(5, "100.64.0.5"),
+		},
+		{
+			name: "client",
+			into: hostinfo(func(hi *tailcfg.Hostinfo) { hi.GoVersion, hi.App = "", "tailscale-rs" }),
+			out:  hostinfo(func(hi *tailcfg.Hostinfo) { hi.GoVersion, hi.App = "go1.27.3", "" }),
+		},
+		{
+			name: "local-nets/announces",
+			into: hostinfo(func(hi *tailcfg.Hostinfo) { hi.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.9.0.0/24")} }),
+			out:  hostinfo(func(hi *tailcfg.Hostinfo) { hi.RoutableIPs = nil }),
+		},
+		{
+			name: "local-nets/app-connector",
+			into: hostinfo(func(hi *tailcfg.Hostinfo) { hi.AppConnector.Set(true) }),
+			out:  hostinfo(func(hi *tailcfg.Hostinfo) { hi.AppConnector.Set(false) }),
+		},
+		{
+			name:   "local-nets/service-host",
+			policy: policy("", ""),
+			into:   setPolicy(policy("", `, "nodeAttrs": [{"target": ["tag:web"], "attr": ["service-host"]}]`)),
+			out:    setPolicy(policy("", "")),
+		},
+		{
+			name:   "cap-grant",
+			policy: policy(`, {"src": ["group:eng"], "dst": ["tag:web"], "app": {"example.com/cap/admin": [{}]}}`, ""),
+		},
+		{
+			name:   "portless",
+			policy: policy(`, {"src": ["group:eng"], "dst": ["tag:web"], "ip": ["gre:*"]}`, ""),
+		},
+		{
+			name:   "literal",
+			policy: policy(`, {"src": ["*"], "dst": ["tag:web"], "ip": ["tcp:80"]}`, ""),
+			into: func(w *world) {
+				_, ok := w.UpdateNode(2, func(n *types.Node) {
+					n.Hostinfo = n.Hostinfo.Clone()
+					n.Hostinfo.RoutableIPs, n.ApprovedRoutes = []netip.Prefix{route}, []netip.Prefix{route}
+				})
+				require.True(t, ok)
+			},
+			out: func(w *world) {
+				_, ok := w.UpdateNode(2, func(n *types.Node) { n.ApprovedRoutes = nil })
+				require.True(t, ok)
+			},
+		},
+		{
+			// bob's node takes alice's address: group:eng is sent as
+			// addresses while a non-member holds a member's.
+			name: "shared-address",
+			into: moveAddress(5, "100.64.0.1"),
+			out:  moveAddress(5, "100.64.0.5"),
+		},
+	}
+
+	for _, capSources := range []bool{false, true} {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("capability=%t/%s", capSources, tc.name), func(t *testing.T) {
+				t.Setenv(TestCapabilitySourcesEnv, strconv.FormatBool(capSources))
+
+				src := tc.policy
+				if src == "" {
+					src = policy("", "")
+				}
+
+				w, err := newWorldMode(types.Nodes{
+					capWorldNode(receiver, nil, "100.64.0.10", "tag:web"),
+					capWorldNode(2, &users[0], "100.64.0.1"),
+					capWorldNode(5, &users[1], "100.64.0.5"),
+				}, users, []byte(src), types.DNSView{}, capSources)
+				require.NoError(t, err)
+
+				// Every node read, as its session would, so filters are
+				// cut and carried.
+				readAll := func(snap *Snapshot) {
+					for _, n := range snap.ListNodes().All() {
+						_, err := snap.FilterForNode(n.ID())
+						require.NoError(t, err)
+					}
+				}
+
+				before := w.snapshot()
+				readAll(before)
+
+				narrowed := 0
+
+				watched := receiver
+				if tc.owner {
+					watched = 2
+				}
+
+				step := func(label string, write func(*world)) {
+					t.Helper()
+
+					write(w)
+
+					after := w.snapshot()
+					change := after.Since(before)
+					freshOld, freshNew := before.Uncached(), after.Uncached()
+
+					ids := map[types.NodeID]bool{}
+					for _, n := range slices.Concat(before.ListNodes().AsSlice(), after.ListNodes().AsSlice()) {
+						ids[n.ID()] = true
+					}
+
+					for id := range ids {
+						was, errWas := freshOld.FilterForNode(id)
+						is, errIs := freshNew.FilterForNode(id)
+						moved := (errWas == nil) != (errIs == nil) || !reflect.DeepEqual(was, is)
+						named := change.Global || slices.Contains(change.Filters, id)
+
+						if moved {
+							require.Truef(t, named, "%s: node %d's filter moved from %v to %v and routing leaves it out", label, id, was, is)
+						}
+
+						if errIs != nil {
+							continue
+						}
+
+						served, err := after.FilterForNode(id)
+						require.NoError(t, err)
+						require.Equalf(t, is, served, "%s: node %d is served a filter other than a fresh cut", label, id)
+
+						capBoth := capSources && capabilityForm(before.ReceiverFacts(id)) && capabilityForm(after.ReceiverFacts(id))
+						if id == watched && capBoth && !moved && !change.Global {
+							require.Falsef(t, named, "%s: the receiver is sent capabilities at both ends, its filter did not move, and routing names it", label)
+
+							narrowed++
+						}
+					}
+
+					readAll(after)
+
+					before = after
+				}
+
+				join := func(id types.NodeID, ip string) func(*world) {
+					return func(w *world) { w.PutNode(*capWorldNode(id, &users[0], ip)) }
+				}
+
+				step("join a member", join(3, "100.64.0.3"))
+
+				if tc.into != nil {
+					step("into the fallback", tc.into)
+				}
+
+				step("join a member in the fallback", join(4, "100.64.0.4"))
+
+				if tc.out != nil {
+					step("out of the fallback", tc.out)
+				}
+
+				step("a member leaves", func(w *world) { w.DeleteNode(3) })
+				step("join a member again", join(6, "100.64.0.6"))
+
+				if tc.into != nil {
+					// The address form cut before is read again: what it
+					// was carried across the joins above must be current.
+					step("into the fallback again", tc.into)
+					step("join a member in the fallback again", join(7, "100.64.0.7"))
+				}
+
+				if capSources && tc.into != nil {
+					require.Positive(t, narrowed, "the receiver was left out of a membership change it reads nothing of")
+				}
+			})
+		}
+	}
+}
+
+// capabilityForm reports whether a receiver with facts f is sent
+// capability sources: written here from the receiver rule, not read from
+// the code it checks.
+func capabilityForm(f policyv2.ReceiverFacts) bool {
+	return f.Client && !f.Announces && !f.AppConnector && !f.ServiceHost
 }

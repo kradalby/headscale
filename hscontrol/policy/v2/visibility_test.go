@@ -1346,10 +1346,30 @@ func (g sideGen) policy() []byte {
 		grants = append(grants, fmt.Sprintf(`{"src": %s, "dst": %s, %s}`, quoted(src), quoted(dst), strings.Join(parts, ", ")))
 	}
 
+	if g.r.IntN(4) == 0 {
+		// A rule whose sources can be one owner's nodes, before self rules
+		// over two protocols: that owner's self rule over its protocol
+		// merges at its key, which comes and goes with tag:e's nodes and
+		// moves with the source's members.
+		grants = append([]string{
+			fmt.Sprintf(`{"src": [%q], "dst": ["tag:e"], "ip": ["tcp:22"]}`, g.pick("alice@", "bob@", "group:g")),
+			`{"src": ["autogroup:member"], "dst": ["autogroup:self"], "ip": ["udp:80"]}`,
+			`{"src": ["autogroup:member"], "dst": ["autogroup:self"], "ip": ["tcp:443"]}`,
+		}, grants...)
+	}
+
+	// Service hosts add their service IPs to their local nets, so they are
+	// sent addresses in capability mode.
+	attrs := ""
+	if g.r.IntN(4) == 0 {
+		attrs = fmt.Sprintf(`, "nodeAttrs": [{"target": %s, "attr": ["service-host"]}]`,
+			quoted(g.some(2, "tag:a", "tag:e", "alice@", "bob@", "autogroup:member")))
+	}
+
 	return fmt.Appendf(nil, `{"groups": {"group:g": ["alice@", "carol@example.com"]},
 	"tagOwners": {"tag:a": [], "tag:r": ["alice@"], "tag:e": []},
 	"hosts": {"hnet": "10.0.0.0/24", "hpub": "8.8.8.0/24"},
-	"acls": [%s], "grants": [%s]}`, strings.Join(rules, ",\n\t\t"), strings.Join(grants, ",\n\t\t"))
+	"acls": [%s], "grants": [%s]%s}`, strings.Join(rules, ",\n\t\t"), strings.Join(grants, ",\n\t\t"), attrs)
 }
 
 // addrs are the addresses nodes draw from: few, so they share them.

@@ -1198,7 +1198,7 @@ func TestFallbackCensus(t *testing.T) {
 // TestAgreesWithAddressFormCatchesMissingStamp pins the runtime audit's
 // check: capability form expanded through the holders must say what
 // address form says, so a member left unstamped, or a non-member stamped,
-// is reported.
+// is reported, and an address listed twice is not.
 func TestAgreesWithAddressFormCatchesMissingStamp(t *testing.T) {
 	t.Parallel()
 
@@ -1214,6 +1214,14 @@ func TestAgreesWithAddressFormCatchesMissingStamp(t *testing.T) {
 	nm := cm.netmapOf(id)
 	nc := newNetmapCaps(nm.SelfNode, nm.Peers)
 	require.NoError(t, AgreesWithAddressForm(capForm, ip, nc.holders))
+
+	// Two nodes holding one address: address form lists it once per node.
+	twice := slices.Clone(ip)
+	i := slices.IndexFunc(twice, func(r tailcfg.FilterRule) bool { return len(r.SrcIPs) > 0 && len(r.DstPorts) > 0 })
+	require.GreaterOrEqual(t, i, 0, "test sanity: web1 receives address rules")
+	twice[i].SrcIPs = append(slices.Clone(twice[i].SrcIPs), twice[i].SrcIPs[0])
+	twice[i].DstPorts = append(slices.Clone(twice[i].DstPorts), twice[i].DstPorts[0])
+	require.NoError(t, AgreesWithAddressForm(capForm, twice, nc.holders), "an address listed twice")
 
 	withoutBob := func(c nodecap.Cap) []netip.Addr {
 		return slices.DeleteFunc(nc.holders(c), func(a netip.Addr) bool { return a == canaryBob || a.String() == "fd7a:115c:a1e0::2" })

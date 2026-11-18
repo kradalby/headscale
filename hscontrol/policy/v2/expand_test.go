@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -503,6 +505,10 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 		{stream: 2}, {public: true, stream: 3}, {caps: true, stream: 12}, {caps: true, sparse: true, stream: 13},
 	}
 
+	// The shapes only address-form naming reaches, over both capability
+	// variants.
+	addressOnly := map[string]int{}
+
 	for _, v := range variants {
 		public := v.public
 
@@ -578,15 +584,7 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 						continue
 					}
 
-					// As Since routes them: what the filters say moved, and
-					// the nodes whose facts moved, served their other form.
-					ids, all := next.Changed(prev)
-					flipped := nextRecv.ChangedSince(prevRecv)
-					ids = slices.Compact(slices.Sorted(slices.Values(slices.Concat(ids, flipped))))
-					narrow := routeFilters(prev, next, func(end int, id types.NodeID) ReceiverFacts {
-						return [2]Receivers{prevRecv, nextRecv}[end].Of(id)
-					})
-					narrow.ids = slices.Compact(slices.Sorted(slices.Values(slices.Concat(narrow.ids, flipped))))
+					ids, all, narrow := routedAsSince(prev, next, prevRecv, nextRecv)
 
 					fail := func(format string, args ...any) {
 						t.Helper()
@@ -596,7 +594,10 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 
 					freshOld, freshNew := prev.Uncached(), next.Uncached()
 
-					capRoutingReach(v.caps, prevRecv, nextRecv, ids, all, narrow, m.list, reach)
+					every, _ := next.Changed(prev)
+					capRoutingReach(v.caps, prevRecv, nextRecv, ids, all, every, m.list, reach)
+
+					raw := capabilityStep(t, v.caps, g, prev, next, nextRecv, reach, fail)
 
 					for _, n := range slices.Concat(was, m.list) {
 						before, errBefore := freshOld.ForNode(n.ID, prevRecv.Of(n.ID))
@@ -614,6 +615,8 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 							if _, ok := slices.BinarySearch(narrow.ids, n.ID); !narrow.all && !ok {
 								fail("node %d's filter moved from %v to %v, and routing without routers wholesale (%v) leaves it out", n.ID, before, after, narrow.ids)
 							}
+
+							addressOnlyReach(raw, n.ID, prevRecv.Of(n.ID), nextRecv.Of(n.ID), reach)
 
 							named++
 						} else if !listed {
@@ -673,15 +676,66 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 				"edit: swap", "edit: src", "edit: dst", "edit: ports", "edit: proto", "edit: app", "edit: via", "edit: host", "edit: group",
 			}
 			if v.caps {
-				kinds = append(kinds, "receiver form flipped", "capability pairs left out by narrow routing")
+				kinds = append(kinds, "receiver form flipped", "capability receivers left out by routing", "census counted from an earlier one")
 			}
+
+			addKinds(addressOnly, reach, addressOnlyKinds)
 
 			for _, kind := range kinds {
 				assert.Positive(t, reach[kind], "%s reached", kind)
 			}
 		})
 	}
+
+	requireReached(t, addressOnly, addressOnlyKinds)
 }
+
+// addKinds adds reach's counts of kinds to into.
+func addKinds(into, reach map[string]int, kinds []string) {
+	for _, kind := range kinds {
+		into[kind] += reach[kind]
+	}
+}
+
+// requireReached requires every kind reached, but in a short run.
+func requireReached(t *testing.T, reach map[string]int, kinds []string) {
+	t.Helper()
+
+	if testing.Short() {
+		return
+	}
+
+	for _, kind := range kinds {
+		assert.Positive(t, reach[kind], "%s reached", kind)
+	}
+}
+
+// capabilityStep, in capability mode, returns routing's change from prev
+// to next without the routers wholesale, and, now and then, reads next's
+// census as a metrics scrape does: counted from the last one, across
+// commits nobody read, it must be the one counted afresh, or it fails.
+func capabilityStep(t *testing.T, caps bool, g sideGen, prev, next *Filters, recv Receivers, reach map[string]int,
+	fail func(string, ...any),
+) filterChange {
+	t.Helper()
+
+	if !caps {
+		return filterChange{}
+	}
+
+	raw := routeFilters(prev, next, true)
+
+	if g.r.IntN(3) == 0 {
+		if msg := scrapeAgrees(t, next, recv, reach); msg != "" {
+			fail("%s", msg)
+		}
+	}
+
+	return raw
+}
+
+// addressOnlyKinds are what [addressOnlyReach] counts.
+var addressOnlyKinds = []string{"owner named for a moved merge key alone", "service host named in address form alone"}
 
 // modelReceivers is every node's facts in m's current state, none unless
 // caps.
@@ -693,16 +747,90 @@ func modelReceivers(caps bool, m *sideModel) Receivers {
 	return capReceivers(m.nodes, m.pm.NodeCapMaps())
 }
 
+// routedAsSince returns what Since names from prev to next: what the
+// filters say moved for each node in the form its facts send it, and the
+// nodes whose facts moved, served their other form; and the same without
+// subnet routers named wholesale.
+func routedAsSince(prev, next *Filters, prevRecv, nextRecv Receivers) ([]types.NodeID, bool, filterChange) {
+	var (
+		ids []types.NodeID
+		all bool
+	)
+
+	if next.Mode() == CapabilitySources {
+		ids, all = next.ChangedFor(prev, nextRecv)
+	} else {
+		ids, all = next.Changed(prev)
+	}
+
+	flipped := nextRecv.ChangedSince(prevRecv)
+	ids = slices.Compact(slices.Sorted(slices.Values(slices.Concat(ids, flipped))))
+	narrow := routeFilters(prev, next, true)
+	narrow.ids = slices.Compact(slices.Sorted(slices.Values(slices.Concat(narrow.namedFor(next.Mode(), nextRecv), flipped))))
+
+	return ids, all, narrow
+}
+
+// scrapeAgrees reads f's census as a metrics scrape does and returns how it
+// differs from one counted afresh, or nothing.
+func scrapeAgrees(t *testing.T, f *Filters, recv Receivers, reach map[string]int) string {
+	t.Helper()
+
+	if f.censusFrom != nil {
+		reach["census counted from an earlier one"]++
+	}
+
+	got, err := f.Census(recv)
+	require.NoError(t, err)
+
+	want, err := f.Uncached().Census(recv)
+	require.NoError(t, err)
+
+	if got != want {
+		return fmt.Sprintf("the census is %+v, counted afresh %+v", got, want)
+	}
+
+	return ""
+}
+
+// addressOnlyReach counts the moved filters routing names only in address
+// form, by the shapes that only that names: an owner whose self rules
+// merged at a key that moved, and a service host, sent addresses for its
+// local nets alone.
+func addressOnlyReach(c filterChange, id types.NodeID, was, is ReceiverFacts, reach map[string]int) {
+	if _, ok := slices.BinarySearch(c.ids, id); c.all || ok || !c.addr.has(id) {
+		return
+	}
+
+	held := slices.ContainsFunc(c.addr.holders, func(ids []types.NodeID) bool {
+		_, ok := slices.BinarySearch(ids, id)
+
+		return ok
+	})
+	if !held {
+		reach["owner named for a moved merge key alone"]++
+	}
+
+	host := ReceiverFacts{Client: true, ServiceHost: true}
+	if was == host && is == host {
+		reach["service host named in address form alone"]++
+	}
+}
+
 // capRoutingReach counts, in capability mode, the receivers whose form
-// flipped between prev and next, and the steps where narrow routing left
-// out pairs sent capabilities that Changed names.
-func capRoutingReach(caps bool, prev, next Receivers, ids []types.NodeID, all bool, narrow filterChange, list types.Nodes, reach map[string]int) {
+// flipped between prev and next, and the steps where routing left out
+// receivers sent capabilities that a change naming every form names.
+func capRoutingReach(caps bool, prev, next Receivers, ids []types.NodeID, all bool, every []types.NodeID, list types.Nodes, reach map[string]int) {
 	if !caps {
 		return
 	}
 
-	if !all && !narrow.all && len(narrow.ids) < len(ids) {
-		reach["capability pairs left out by narrow routing"]++
+	for _, id := range every {
+		if _, found := slices.BinarySearch(ids, id); !all && !found {
+			reach["capability receivers left out by routing"]++
+
+			break
+		}
 	}
 
 	for _, n := range list {
@@ -1154,6 +1282,117 @@ func TestFiltersChangedFollowsSelfRuleMergeKeys(t *testing.T) {
 	assert.Equal(t, []uint16{80, 443}, ports(is), "alice's node is served the reordered filter, not a carried one")
 }
 
+// TestFiltersChangeIsNotSharedWithCallers pins that the change the filters
+// keep comes to each caller clipped: Since appends to it, and the hub and
+// the sessions' renders ask for it at once, so an append into its spare
+// room would write where another caller reads.
+func TestFiltersChangeIsNotSharedWithCallers(t *testing.T) {
+	// bob's node is no rule's: a join of alice's names some nodes, not all.
+	alice, bob := &sideUsers[0], &sideUsers[1]
+	nodes := types.Nodes{
+		sideNode(1, alice, "100.64.0.1", "", nil), sideNode(2, alice, "100.64.0.2", "", nil),
+		sideNode(9, bob, "100.64.0.9", "", nil),
+	}
+
+	pm, err := NewPolicyManager([]byte(`{"acls": [{"action": "accept", "src": ["alice@"], "dst": ["alice@:*"]}]}`), sideUsers, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	m := newSideModel(t, pm, sideUsers, nodes)
+	us := NewUserSets(nil, m.t.sel, sideUsers)
+	shared := 0
+
+	for i, mode := range []SourceMode{AddressSources, CapabilitySources} {
+		prev := FollowFiltersFor(mode, nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+
+		id := types.NodeID(3 + i) //nolint:gosec // small
+		joined := append(slices.Clone(m.list), sideNode(id, alice, fmt.Sprintf("100.64.0.%d", id), "", nil))
+		slices.SortFunc(joined, func(a, b *types.Node) int { return int(a.ID) - int(b.ID) }) //nolint:gosec // small
+		m.step(t, us, joined)
+
+		next := FollowFiltersFor(mode, prev, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+
+		recv := modelReceivers(mode == CapabilitySources, m)
+
+		for name, ask := range map[string]func() []types.NodeID{
+			"Changed":    func() []types.NodeID { ids, _ := next.Changed(prev); return ids },
+			"ChangedFor": func() []types.NodeID { ids, _ := next.ChangedFor(prev, recv); return ids },
+		} {
+			a, b := ask(), ask()
+			require.NotEmpty(t, a, "test sanity: the join moves filters")
+
+			// Two callers handed one array: neither may have room past
+			// its end.
+			if &a[0] == &b[0] {
+				assert.Equal(t, len(a), cap(a), "%s in mode %d: a shared change has no room to append into", name, mode)
+
+				shared++
+			}
+		}
+	}
+
+	require.Positive(t, shared, "test sanity: the change is shared between callers")
+}
+
+// TestFiltersChangedNamesOwnersAtMovedMergeKeys pins, in capability mode,
+// that an owner sent addresses whose only rules are its own self rules is
+// named when one of them was merged at another rule's key and that key
+// moved: alice's 443 self rule sits where group:g's rule does, before her
+// 80 self rule, until bob joins group:g. She receives no other grant, so
+// nothing but the merge positions names her, and in capability mode
+// routing does not work them out.
+func TestFiltersChangedNamesOwnersAtMovedMergeKeys(t *testing.T) {
+	doc := func(members string) []byte {
+		return fmt.Appendf(nil, `{"groups": {"group:g": [%s]},
+		"tagOwners": {"tag:x": []},
+		"grants": [{"src": ["group:g"], "dst": ["tag:x"], "ip": ["tcp:22"]},
+			{"src": ["autogroup:member"], "dst": ["autogroup:self"], "ip": ["udp:80"]},
+			{"src": ["autogroup:member"], "dst": ["autogroup:self"], "ip": ["tcp:443"]}]}`, members)
+	}
+	alice, bob := &sideUsers[0], &sideUsers[1]
+
+	// Every node reports no client: sent addresses in capability mode.
+	nodes := types.Nodes{
+		sideNode(1, alice, "100.64.0.1", "", nil),
+		sideNode(2, bob, "100.64.0.2", "", nil),
+		sideNode(3, nil, "100.64.0.3", "", []string{"tag:x"}),
+	}
+
+	pm, err := NewPolicyManager(doc(`"alice@"`), sideUsers, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	m := newSideModel(t, pm, sideUsers, nodes)
+	us := NewUserSets(nil, m.t.sel, sideUsers)
+	recv := capReceivers(m.nodes, nil)
+	require.Equal(t, "client", receiverForm(CapabilitySources, recv.Of(1)).String(), "test sanity: alice's node is sent addresses")
+
+	prev := FollowFiltersFor(CapabilitySources, nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+
+	ports := func(rules []tailcfg.FilterRule) []uint16 {
+		out := make([]uint16, 0, len(rules))
+		for _, r := range rules {
+			out = append(out, r.DstPorts[0].Ports.First)
+		}
+
+		return out
+	}
+
+	was, err := prev.ForNode(1, recv.Of(1))
+	require.NoError(t, err)
+	require.Equal(t, []uint16{443, 80}, ports(was), "test sanity: the 443 self rule sits where group:g's rule does")
+
+	_, ok := m.edit(t, us, doc(`"alice@", "bob@"`))
+	require.True(t, ok)
+
+	next := FollowFiltersFor(CapabilitySources, prev, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+	ids, all := next.ChangedFor(prev, recv)
+	require.False(t, all)
+	assert.Contains(t, ids, types.NodeID(1), "the self rule's merged position moved")
+
+	is, err := next.ForNode(1, recv.Of(1))
+	require.NoError(t, err)
+	assert.Equal(t, []uint16{80, 443}, ports(is), "alice's node is served the reordered filter, not a carried one")
+}
+
 // TestFiltersChangedFollowsSelfNamedNodes pins that a self rule's sources
 // are the owner's nodes a source names by address: b1, holding alice's
 // address, is bob's only named node, and the source of the rule b2 gets.
@@ -1319,4 +1558,395 @@ func TestSSHPolicyAfreshFillsNoCache(t *testing.T) {
 	cached, err := pm.SSHPolicy("https://headscale.test", nodes[1].View())
 	require.NoError(t, err)
 	assert.Equal(t, afresh, cached, "the same policy either way")
+}
+
+// joinWork is what the served pipeline did for one join or leave:
+// allocations and bytes, and its own counters.
+type joinWork struct {
+	allocs, bytes                             uint64
+	cuts, resolutions, members, sorts, routed uint64
+	copied                                    uint64
+	named, viewers                            int
+}
+
+// measureChurn registers joins, or deletes nodes it joined, under
+// capability mode in a tailnet of n nodes whose subject has the same
+// viewers at any size, and returns the mean work of one through every cell
+// the served path keeps for filters and peers, routing, and the reads of
+// the sessions it wakes: the named receivers' filters, and the viewers',
+// who render the subject.
+func measureChurn(t *testing.T, n int, leave bool, routers int) joinWork {
+	t.Helper()
+
+	const pol = `{"groups": {"group:small": ["small@"]}, "tagOwners": {"tag:server": ["small@"]},
+		"acls": [{"action": "accept", "src": ["group:small"], "dst": ["group:small:*"]},
+		         {"action": "accept", "src": ["autogroup:member"], "dst": ["tag:server:22"]}]}`
+
+	users := make(types.Users, 0, 11)
+	users = append(users, types.User{Name: "small"})
+	users[0].ID = 1
+
+	for i := range 10 {
+		users = append(users, types.User{Name: fmt.Sprintf("bulk%d", i)})
+		users[len(users)-1].ID = uint(i + 2) //nolint:gosec // small
+	}
+
+	official := func(n *types.Node) *types.Node {
+		n.Hostinfo = &tailcfg.Hostinfo{GoVersion: "go1.27.3", IPNVersion: "1.94.1"}
+
+		return n
+	}
+
+	addr := func(i int) (string, string) {
+		return fmt.Sprintf("100.%d.%d.%d", 64+i/65536, i/256%256, i%256), fmt.Sprintf("fd7a:115c:a1e0::%x", i)
+	}
+
+	nodes := make(types.Nodes, 0, n)
+
+	for i := range n {
+		v4, v6 := addr(i + 1)
+		id := types.NodeID(i + 1) //nolint:gosec // bounded
+
+		switch {
+		case i < 10:
+			nodes = append(nodes, official(sideNode(id, nil, v4, v6, []string{"tag:server"})))
+		case i < 15:
+			nodes = append(nodes, official(sideNode(id, &users[0], v4, v6, nil)))
+		case i < 15+routers:
+			// A subnet router: sent addresses, and recut at every rule
+			// change.
+			r := official(sideNode(id, &users[1+i%10], v4, v6, nil))
+			r.Hostinfo.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}
+			r.ApprovedRoutes = r.Hostinfo.RoutableIPs
+			nodes = append(nodes, r)
+		default:
+			nodes = append(nodes, official(sideNode(id, &users[1+i%10], v4, v6, nil)))
+		}
+	}
+
+	pm, err := NewPolicyManager([]byte(pol), users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	m := newSideModel(t, pm, users, nodes)
+	us := NewUserSets(nil, m.t.sel, users)
+	caps := graph.NewMap(func(a, b tailcfg.NodeCapMap) bool { return a.Equal(b) }, map[types.NodeID]tailcfg.NodeCapMap{})
+	recv := Receivers{}.Update(m.nodes, caps)
+	f := FollowFiltersFor(CapabilitySources, nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+
+	// Every session has read its filter, as after a first map each.
+	for _, nd := range m.list {
+		_, err := f.ForNode(nd.ID, recv.Of(nd.ID))
+		require.NoError(t, err)
+	}
+
+	read := func() [5]uint64 {
+		return [5]uint64{FilterCuts(), resolutionsBuilt.Load(), membersExpanded.Load(), sharingScans.Load(), routedNodes.Load()}
+	}
+
+	// copied counts the entries the pipeline's group lists copied, each a
+	// sorted slice an edit copies whole.
+	var copied uint64
+
+	// commit moves the pipeline to list, the policy's node list, which is
+	// the world's to keep outside it (the compile reads it too), with the
+	// node subject set or deleted; returns whom routing named and the
+	// subject's viewers, before a leave and after a join, each having
+	// read its filter.
+	commit := func(subject *types.Node, list types.Nodes, del bool) (int, int) {
+		viewers := m.peers.View(subject.ID)
+		posts, sides, peers := m.posts, m.sides, m.peers
+
+		e := m.nodes.Edit()
+		if del {
+			e.Delete(subject.ID)
+		} else {
+			e.Set(subject.ID, subject)
+		}
+
+		m.nodes, m.list = e.Done(), list
+		m.roles = m.roles.Update(us, m.nodes, nil)
+		m.posts = m.posts.Update(m.roles)
+		m.appr = m.appr.Update(m.nodes)
+		m.sides = UpdateSides(m.sides, m.t, m.roles, m.posts, m.appr, m.nodes)
+		m.peers = RolePeers(m.peers, m.sides)
+		m.via = UpdateViaPlans(m.via, m.sides)
+		recv = recv.Update(m.nodes, caps)
+
+		copied += groupCopies(posts.byRole.Groups, m.posts.byRole.Groups) + groupCopies(sides.held.Groups, m.sides.held.Groups) +
+			groupCopies(sides.byAddr.Groups, m.sides.byAddr.Groups) + groupCopies(peers.keyed.members.Groups, m.peers.keyed.members.Groups)
+
+		next := FollowFiltersFor(CapabilitySources, f, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+
+		named, all := next.ChangedFor(f, recv)
+		require.False(t, all)
+
+		if !del {
+			viewers = m.peers.View(subject.ID)
+		}
+
+		for _, id := range slices.Concat(named, viewers) {
+			if _, listed := next.node(id); listed {
+				_, err := next.ForNode(id, recv.Of(id))
+				require.NoError(t, err)
+			}
+		}
+
+		f = next
+
+		return len(named), len(viewers)
+	}
+
+	// The first commit carries every filter the sessions cut at the
+	// filters before: what reading them all cost, once. Measured are the
+	// commits in the steady state after it.
+	const rounds = 5
+
+	var w joinWork
+
+	for j := range rounds + 1 {
+		v4, v6 := addr(n + j + 1)
+		subject := official(sideNode(types.NodeID(n+j+1), &users[0], v4, v6, nil)) //nolint:gosec // bounded
+		joined := append(slices.Clone(m.list), subject)
+
+		if leave {
+			commit(subject, joined, false)
+		}
+
+		list := joined
+		if leave {
+			list = slices.Clone(m.list[:len(m.list)-1])
+		}
+
+		runtime.GC()
+
+		var before, after runtime.MemStats
+
+		runtime.ReadMemStats(&before)
+
+		was, wasCopied := read(), copied
+		named, viewers := commit(subject, list, leave)
+
+		runtime.ReadMemStats(&after)
+
+		is := read()
+
+		if j == 0 {
+			continue
+		}
+
+		w.allocs += after.Mallocs - before.Mallocs
+		w.bytes += after.TotalAlloc - before.TotalAlloc
+		w.cuts += is[0] - was[0]
+		w.resolutions += is[1] - was[1]
+		w.members += is[2] - was[2]
+		w.sorts += is[3] - was[3]
+		w.routed += is[4] - was[4]
+		w.copied += copied - wasCopied
+		w.named, w.viewers = named, viewers
+	}
+
+	for _, v := range []*uint64{&w.allocs, &w.bytes, &w.cuts, &w.resolutions, &w.members, &w.sorts, &w.routed, &w.copied} {
+		*v /= rounds
+	}
+
+	return w
+}
+
+// TestJoinWorkWithRouters is [TestJoinWorkFollowsChange] with a subnet
+// router: by D7 it is recut at every rule change, and its client builds
+// its local nets from its routes, so it is cut in address form, which
+// resolves every selector and the merge positions of every grant. So one
+// join costs a router what the tailnet is: the members those resolutions
+// list grow with it, and the bytes. The other work is the join's own.
+func TestJoinWorkWithRouters(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a 10,000 node tailnet")
+	}
+
+	small, large := measureChurn(t, 100, false, 1), measureChurn(t, 10_000, false, 1)
+
+	t.Logf("at 100: %+v", small)
+	t.Logf("at 10000: %+v", large)
+
+	for _, w := range []joinWork{small, large} {
+		assert.Equal(t, uint64(2), w.cuts, "the subject's filter and the router's are cut")
+		assert.Zero(t, w.sorts, "no node's addresses are sorted")
+	}
+
+	assert.Equal(t, small.resolutions, large.resolutions, "the router's cut resolves every selector, at any size")
+	assert.Greater(t, large.members, 50*small.members, "the members those list are the tailnet")
+}
+
+// TestCensusAfterJoinCostsWhatMoved pins that a metrics scrape landing
+// after a join, before any routing or read of the new filters, counts the
+// census from the one scraped before: no owner's self rules but the
+// joiner's are counted again, no node's addresses are sorted and no
+// selector resolved, and the scrape allocates alike at 100 and at 10,000
+// nodes.
+func TestCensusAfterJoinCostsWhatMoved(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a 10,000 node tailnet")
+	}
+
+	type censusWork struct{ allocs, owners, sorts, resolutions uint64 }
+
+	measure := func(n int) censusWork {
+		const pol = `{"groups": {"group:small": ["small@"]},
+			"grants": [{"src": ["autogroup:member"], "dst": ["autogroup:self"], "ip": ["*"]},
+			           {"src": ["group:small"], "dst": ["group:small"], "ip": ["tcp:22"]}]}`
+
+		users := make(types.Users, 0, 11)
+		users = append(users, types.User{Name: "small"})
+		users[0].ID = 1
+
+		for i := range 10 {
+			users = append(users, types.User{Name: fmt.Sprintf("bulk%d", i)})
+			users[len(users)-1].ID = uint(i + 2) //nolint:gosec // small
+		}
+
+		addr := func(i int) (string, string) {
+			return fmt.Sprintf("100.%d.%d.%d", 64+i/65536, i/256%256, i%256), fmt.Sprintf("fd7a:115c:a1e0::%x", i)
+		}
+
+		node := func(i int, u *types.User) *types.Node {
+			v4, v6 := addr(i)
+			nd := sideNode(types.NodeID(i), u, v4, v6, nil) //nolint:gosec // bounded
+			nd.Hostinfo = &tailcfg.Hostinfo{GoVersion: "go1.27.3", IPNVersion: "1.94.1"}
+
+			return nd
+		}
+
+		nodes := make(types.Nodes, 0, n)
+		for i := range n {
+			nodes = append(nodes, node(i+1, &users[i%len(users)]))
+		}
+
+		pm, err := NewPolicyManager([]byte(pol), users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		m := newSideModel(t, pm, users, nodes)
+		us := NewUserSets(nil, m.t.sel, users)
+		caps := graph.NewMap(func(a, b tailcfg.NodeCapMap) bool { return a.Equal(b) }, map[types.NodeID]tailcfg.NodeCapMap{})
+		recv := Receivers{}.Update(m.nodes, caps)
+		f := FollowFiltersFor(CapabilitySources, nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+
+		_, err = f.Census(recv)
+		require.NoError(t, err)
+
+		const rounds = 5
+
+		var w censusWork
+
+		for j := range rounds {
+			subject := node(n+j+1, &users[0])
+
+			e := m.nodes.Edit()
+			e.Set(subject.ID, subject)
+			m.nodes, m.list = e.Done(), append(slices.Clone(m.list), subject)
+			m.roles = m.roles.Update(us, m.nodes, nil)
+			m.posts = m.posts.Update(m.roles)
+			m.appr = m.appr.Update(m.nodes)
+			m.sides = UpdateSides(m.sides, m.t, m.roles, m.posts, m.appr, m.nodes)
+			recv = recv.Update(m.nodes, caps)
+			f = FollowFiltersFor(CapabilitySources, f, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+
+			counts := [3]uint64{ownerCounts.Load(), sharingScans.Load(), resolutionsBuilt.Load()}
+
+			runtime.GC()
+
+			var before, after runtime.MemStats
+
+			runtime.ReadMemStats(&before)
+
+			got, err := f.Census(recv)
+
+			runtime.ReadMemStats(&after)
+			require.NoError(t, err)
+
+			w.allocs += after.Mallocs - before.Mallocs
+			w.owners += ownerCounts.Load() - counts[0]
+			w.sorts += sharingScans.Load() - counts[1]
+			w.resolutions += resolutionsBuilt.Load() - counts[2]
+
+			want, err := f.Uncached().Census(recv)
+			require.NoError(t, err)
+			require.Equal(t, want, got, "the census counted from the last is the one counted afresh")
+		}
+
+		w.allocs /= rounds
+
+		return w
+	}
+
+	small, large := measure(100), measure(10_000)
+	t.Logf("at 100: %+v; at 10000: %+v", small, large)
+
+	for _, w := range []censusWork{small, large} {
+		assert.Zero(t, w.owners, "no census counts every owner")
+		assert.Zero(t, w.sorts, "no node's addresses are sorted")
+		assert.Zero(t, w.resolutions, "no selector is resolved")
+	}
+
+	assert.LessOrEqual(t, float64(large.allocs), 1.2*float64(small.allocs)+16, "a scrape allocates what moved")
+}
+
+// groupCopies returns the entries the edits from a to b copied: each group
+// list is a sorted slice, so an edit copies the whole list.
+func groupCopies[G comparable](a, b *graph.Map[G, []types.NodeID]) uint64 {
+	var n uint64
+
+	for _, g := range graph.Changes(a, b) {
+		was, _ := a.Get(g)
+		is, _ := b.Get(g)
+		n += uint64(max(len(was), len(is)))
+	}
+
+	return n
+}
+
+// TestJoinWorkFollowsChange is the churn invariant on work (plan check
+// H): in capability mode one join, or one leave, under a policy whose
+// subject has the same viewers at any size costs the served pipeline the
+// same at 100 and at 10,000 nodes. It names the subject alone, cuts its
+// filter alone (a leaver's is not cut), builds no selector's resolution and
+// sorts no node's addresses; its allocations do not grow with the tailnet.
+// Its bytes do, by what the posting and holder lists the subject enters or
+// leaves copy: each is a sorted slice, copied on edit.
+func TestJoinWorkFollowsChange(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a 10,000 node tailnet")
+	}
+
+	for _, leave := range []bool{false, true} {
+		t.Run(fmt.Sprintf("leave=%t", leave), func(t *testing.T) {
+			small, large := measureChurn(t, 100, leave, 0), measureChurn(t, 10_000, leave, 0)
+
+			t.Logf("at 100: %+v", small)
+			t.Logf("at 10000: %+v", large)
+
+			cuts := uint64(1)
+			if leave {
+				cuts = 0
+			}
+
+			for _, w := range []joinWork{small, large} {
+				assert.Equal(t, cuts, w.cuts, "the subject's filter alone is cut")
+				assert.Equal(t, 1, w.named, "routing names the subject alone")
+				assert.Equal(t, uint64(1), w.routed, "routing visits the subject alone")
+				assert.Zero(t, w.resolutions, "no selector's members are expanded")
+				assert.Zero(t, w.members)
+				assert.Zero(t, w.sorts, "no node's addresses are sorted")
+			}
+
+			assert.Equal(t, small.viewers, large.viewers, "test sanity: the subject has the same viewers at both sizes")
+			assert.LessOrEqual(t, float64(large.allocs), 1.1*float64(small.allocs), "allocations do not grow with the tailnet")
+
+			// What grows is the lists the subject enters or leaves:
+			// autogroup:member's posting, its holders and the views built
+			// from them.
+			growth := float64(large.bytes) - float64(small.bytes)
+			copies := 8 * float64(large.copied-small.copied)
+			assert.InDelta(t, copies, growth, 0.15*copies+64<<10, "bytes grow by the group lists copied, %d and %d entries", small.copied, large.copied)
+		})
+	}
 }

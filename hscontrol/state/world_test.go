@@ -2361,7 +2361,12 @@ func TestWorldViaElectionHistory(t *testing.T) {
 	w.UpdateNode(4, func(n *types.Node) { n.IsOnline = new(false) })
 	second := w.snapshot()
 	require.Equal(t, []types.NodeID{3, 6}, second.s.Get(w.primaries).via.ChangedNodes(before.s.Get(w.primaries).via))
-	require.True(t, second.Since(before).Global, "coalesced transitions wake viewers of intermediate winners")
+	// Compared end to end: the intermediate winner flipped itself, so the
+	// node log names it and its viewers are woken through it; a session
+	// that rendered the snapshot between is the hub's to wake again.
+	change := second.Since(before)
+	require.False(t, change.Global, "coalesced commits are compared end to end")
+	require.Subset(t, change.Nodes, []types.NodeID{3, 4}, "the intermediate winner is named")
 
 	for i := range 601 {
 		w.update(func(e *nodeEdit) {
@@ -2385,7 +2390,7 @@ func TestWorldViaElectionHistory(t *testing.T) {
 	w.UpdateNode(6, func(n *types.Node) { n.IsOnline = new(false) })
 	returned := w.snapshot()
 	require.Empty(t, returned.s.Get(w.primaries).via.ChangedNodes(before.s.Get(w.primaries).via))
-	require.True(t, returned.Since(before).Global, "changed-back winners still invalidate skipped snapshots")
+	require.True(t, returned.Since(before).Global, "commits past the node log are global")
 
 	_, err := w.SetPolicy([]byte(`{"grants":[]}`), func(s *Snapshot) error { return s.PolicyErr() })
 	require.NoError(t, err)

@@ -196,7 +196,7 @@ func hasOwnRules(x *Expansion, n types.NodeView) bool {
 		case gt.kind == grantSelf:
 			x.cutSelf(c, g)
 		case gt.kind == grantVia:
-			x.cutVia(c, g, gt, &x.grants[g])
+			x.cutVia(c, g, gt, x.grant(g))
 		}
 	}
 

@@ -14,12 +14,15 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/util/zstdframe"
@@ -640,6 +643,60 @@ func benchChurn(b *testing.B, kind, shape string, n int) {
 	b.ReportMetric(per(cr.commits), "commits/op")
 }
 
+// BenchmarkCoalescedChurn is [BenchmarkScalingWrites]' churn kinds with a
+// second commit the hub routes with each write: an endpoint write of a node
+// apart from the subjects, as commits coalesce under load.
+// HEADSCALE_SCALE_NODES sets the size.
+func BenchmarkCoalescedChurn(b *testing.B) {
+	n := 1000
+
+	if v, ok := os.LookupEnv("HEADSCALE_SCALE_NODES"); ok {
+		var err error
+
+		n, err = strconv.Atoi(v)
+		require.NoError(b, err)
+	}
+
+	for _, kind := range []string{"join", "leave", "tag"} {
+		for _, shape := range []string{"mesh", "group-all", "users", "selectors", "routers"} {
+			w := churnWrites[kind]
+			if !w.applies(churnShapes[shape]) {
+				continue
+			}
+
+			b.Run(fmt.Sprintf("%s/%s/nodes=%d", kind, shape, n), func(b *testing.B) {
+				s, streams := scalingTailnet(b, n, shape)
+				cr := newChurnRun(b, s, streams, shape)
+
+				var i int
+
+				for b.Loop() {
+					w.write(cr, b, i)
+					scalingEndpoint(b, s, cr.streams[(i*37+11)%len(cr.streams)].nodeID, i)
+					cr.deliver(b)
+
+					if w.restore != nil {
+						b.StopTimer()
+						w.restore(cr, b, i)
+						b.StartTimer()
+					}
+
+					i++
+				}
+
+				per := func(v int) float64 { return float64(v) / float64(i) }
+				b.ReportMetric(per(cr.woken), "woken/op")
+				b.ReportMetric(per(cr.updates), "updates/op")
+				b.ReportMetric(per(cr.rendered), "peer-renders/op")
+				b.ReportMetric(per(cr.filterBytes), "filter-bytes/op")
+				b.ReportMetric(per(cr.filterSends), "filter-sends/op")
+				b.ReportMetric(per(cr.restBytes), "rest-bytes/op")
+				b.ReportMetric(per(cr.commits), "commits/op")
+			})
+		}
+	}
+}
+
 // BenchmarkEndpointAfterChurn measures an endpoint write right after a
 // join or a tag change and its restore: the served filters are cached per
 // commit that moves a policy fact, so every session the churn did not wake
@@ -780,6 +837,399 @@ func TestScalingWriteWorkChurn(t *testing.T) {
 				assert.Equal(t, limit, got, "sessions woken, updated, peers rendered, others sent a filter")
 			})
 		}
+	}
+}
+
+// TestScalingWriteWorkChurnCapability is [TestScalingWriteWorkChurn] in
+// capability mode, adding the work routing makes on the way: the filters
+// cut, and the expansions built. A receiver sent capabilities reads no
+// membership but its own, so a join, leave or retag cuts the subjects'
+// filters and those of receivers still sent addresses, and wakes a session
+// only for what it renders: the subject as a peer.
+func TestScalingWriteWorkChurnCapability(t *testing.T) {
+	t.Setenv(state.TestCapabilitySourcesEnv, "true")
+	// The audit cuts filters of its own, which the counts would include.
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "false")
+
+	const n, writes = 100, 4
+
+	// Sessions woken, sent an update, peers rendered, others sent a
+	// packet filter, filters cut, selector resolutions built, members those
+	// listed, address sorts, over the writes.
+	//
+	// Woken = updated: a join or retag renders the subject for its viewers,
+	// a leave drops it, and a group edit restamps editedUser's nodes for
+	// each of their viewers; nobody else is woken. The filters sent and cut
+	// are the receivers still sent addresses whose filter moved: the subnet
+	// routers (20) under routers, the via routers (10) under via, the
+	// retagged subject itself, and editedUser's nodes entering or leaving a
+	// rule's destinations under selectors. Only cutting an address form
+	// resolves selectors: the routers' two (members, group:eng; via: members
+	// and the via tag). Nothing sorts every node's addresses.
+	ceilings := map[string][8]int{
+		"group/group-all": {400, 400, 3960, 0, 0, 0, 0, 0},
+		"group/routers":   {400, 400, 3168, 80, 80, 8, 496, 0},
+		"group/selectors": {400, 400, 3168, 0, 32, 0, 0, 0},
+		"join/allow-all":  {400, 400, 400, 0, 0, 0, 0, 0},
+		"join/group-all":  {400, 400, 400, 0, 0, 0, 0, 0},
+		"join/mesh":       {400, 400, 400, 0, 0, 0, 0, 0},
+		"join/routers":    {400, 400, 400, 80, 80, 8, 488, 0},
+		"join/selectors":  {308, 308, 308, 0, 0, 0, 0, 0},
+		"join/self":       {40, 40, 40, 0, 0, 0, 0, 0},
+		"join/tags":       {40, 40, 40, 0, 0, 0, 0, 0},
+		"join/users":      {40, 40, 40, 0, 0, 0, 0, 0},
+		"join/via":        {400, 400, 400, 40, 40, 8, 404, 0},
+		"leave/allow-all": {396, 396, 0, 0, 0, 0, 0, 0},
+		"leave/group-all": {396, 396, 0, 0, 0, 0, 0, 0},
+		"leave/mesh":      {396, 396, 0, 0, 0, 0, 0, 0},
+		"leave/routers":   {396, 396, 0, 80, 80, 8, 472, 0},
+		"leave/selectors": {304, 304, 0, 0, 0, 0, 0, 0},
+		"leave/self":      {36, 36, 0, 0, 0, 0, 0, 0},
+		"leave/tags":      {40, 40, 0, 0, 0, 0, 0, 0},
+		"leave/users":     {36, 36, 0, 0, 0, 0, 0, 0},
+		"leave/via":       {396, 396, 0, 40, 40, 8, 396, 0},
+		"tag/group-all":   {400, 400, 196, 0, 4, 0, 0, 0},
+		"tag/mesh":        {400, 400, 0, 0, 4, 0, 0, 0},
+		"tag/routers":     {400, 400, 0, 80, 84, 8, 472, 0},
+		"tag/selectors":   {308, 308, 120, 0, 4, 0, 0, 0},
+		"tag/tags":        {80, 80, 72, 0, 4, 0, 0, 0},
+		"tag/via":         {400, 400, 416, 40, 44, 8, 400, 0},
+	}
+
+	for _, kind := range slices.Sorted(maps.Keys(churnWrites)) {
+		for _, shape := range slices.Sorted(maps.Keys(scalingPolicies)) {
+			w := churnWrites[kind]
+			if !w.applies(churnShapes[shape]) {
+				continue
+			}
+
+			t.Run(kind+"/"+shape, func(t *testing.T) {
+				s, streams := scalingTailnet(t, n, shape)
+				cr := newChurnRun(t, s, streams, shape)
+
+				var work [4]uint64
+
+				for i := range writes {
+					w.write(cr, t, i)
+
+					before := capWork()
+
+					cr.deliver(t)
+
+					for k, v := range capWork() {
+						work[k] += v - before[k]
+					}
+
+					if w.restore != nil {
+						w.restore(cr, t, i)
+					}
+				}
+
+				cr.requireSettled(t, kind)
+
+				got := [8]int{cr.woken, cr.updates, cr.rendered, cr.filterSends, int(work[0]), int(work[1]), int(work[2]), int(work[3])} //nolint:gosec // small
+				limit, ok := ceilings[kind+"/"+shape]
+				require.True(t, ok, "no ceiling for %s/%s", kind, shape)
+				assert.Equal(t, limit, got, "sessions woken, updated, peers rendered, others sent a filter, filters cut, resolutions built, members listed, address sorts")
+			})
+		}
+	}
+}
+
+// TestChurnInvariantsCapability is plan check H on the wire: in capability
+// mode a join, leave or retag sends no packet filter to a node other than
+// the one written unless that node is sent its filter as addresses, and
+// wakes no session that has nothing to send but the subnet routers and
+// exit nodes every rule change recuts (decision D7). Every shape, alone
+// and with two writes coalesced into one routing.
+func TestChurnInvariantsCapability(t *testing.T) {
+	t.Setenv(state.TestCapabilitySourcesEnv, "true")
+
+	const n, writes = 40, 3
+
+	for _, kind := range []string{"join", "leave", "tag"} {
+		for _, shape := range slices.Sorted(maps.Keys(scalingPolicies)) {
+			w := churnWrites[kind]
+			if !w.applies(churnShapes[shape]) {
+				continue
+			}
+
+			for _, coalesce := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/coalesced=%t", kind, shape, coalesce), func(t *testing.T) {
+					s, streams := scalingTailnet(t, n, shape)
+					cr := newChurnRun(t, s, streams, shape)
+
+					var addressSends, idle int
+
+					cr.observe = func(snap *state.Snapshot, id types.NodeID, out []*tailcfg.MapResponse) {
+						nv, ok := snap.GetNode(id)
+						d7 := ok && (len(nv.SubnetRoutes()) > 0 || nv.IsExitNode())
+
+						if len(out) == 0 && !d7 {
+							idle++
+						}
+
+						if _, subject := cr.subjects[id]; subject {
+							return
+						}
+
+						for _, resp := range out {
+							if resp.PacketFilters == nil {
+								continue
+							}
+
+							if capabilityForm(snap.ReceiverFacts(id)) {
+								t.Errorf("node %d, sent capabilities, was sent a packet filter", id)
+							}
+
+							addressSends++
+						}
+					}
+
+					for i := range writes {
+						w.write(cr, t, i)
+
+						if coalesce {
+							// A second commit the hub routes with the first:
+							// an endpoint write of a node apart from the
+							// subjects, whose viewers have its endpoint to
+							// render.
+							scalingEndpoint(t, s, cr.streams[(i*37+11)%len(cr.streams)].nodeID, i)
+						}
+
+						cr.deliver(t)
+
+						if w.restore != nil {
+							w.restore(cr, t, i)
+						}
+					}
+
+					cr.requireSettled(t, kind)
+
+					assert.Zero(t, idle, "sessions woken with nothing to send, beyond the routers and exits every rule change recuts")
+					t.Logf("filters sent to nodes sent addresses %d, commits %d", addressSends, cr.commits)
+				})
+			}
+		}
+	}
+}
+
+// joinStages is what one join, or one leave, cost each stage between the
+// write and the sessions it woke: the commit with every cell it moved,
+// Since, Route, and the renders of the sessions woken, with a joiner's
+// first map.
+type joinStages struct {
+	allocs, bytes [numStages]uint64
+	ns            [numStages]int64
+	woken         int
+}
+
+const (
+	stageCommit = iota
+	stageSince
+	stageRoute
+	stageRender
+	numStages
+)
+
+var stageNames = [numStages]string{"commit", "Since", "Route", "render"}
+
+// selfTailnet is n nodes in users of ten, official clients, under a policy
+// that lets each user's nodes reach one another: a node's viewers are its
+// user's nodes at any size.
+func selfTailnet(tb testing.TB, n int) (*types.Config, *state.State) {
+	tb.Helper()
+
+	p4 := netip.MustParsePrefix("100.64.0.0/10")
+	p6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+	cfg := &types.Config{
+		Database: types.DatabaseConfig{
+			Type:   types.DatabaseSqlite,
+			Sqlite: types.SqliteConfig{Path: tb.TempDir() + "/h.db"},
+		},
+
+		ServerURL: "https://headscale.test",
+		Policy:    types.PolicyConfig{Mode: types.PolicyModeDB}, Prefixes: types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential}, DNSConfig: types.DNSConfig{BaseDomain: "headscale.test"},
+	}
+
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(tb, err)
+	require.NoError(tb, database.DB.Exec("PRAGMA synchronous = OFF").Error)
+
+	for _, u := range database.CreateUsersForTest(n/10, "u") {
+		database.CreateRegisteredNodesForTest(u, 10, u.Name)
+	}
+
+	require.NoError(tb, database.Close())
+
+	s, err := state.NewState(cfg)
+	require.NoError(tb, err)
+	tb.Cleanup(func() { _ = s.Close() })
+
+	_, err = s.SetPolicy([]byte(`{"grants":[{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["*"]}]}`))
+	require.NoError(tb, err)
+
+	return cfg, s
+}
+
+// measureJoinStages joins a node to the first user of a [selfTailnet] of
+// n nodes and deletes it again, rounds times after a warm-up, and returns
+// the mean cost of each stage of a join and of a leave: the same viewers
+// at any n, so a stage that grows with n grows with the tailnet.
+func measureJoinStages(t *testing.T, n int) (joinStages, joinStages) {
+	t.Helper()
+
+	cfg, s := selfTailnet(t, n)
+	hub := NewHub()
+
+	first := s.ListNodes().At(0)
+	owner, err := s.GetUserByID(types.UserID(first.User().ID()))
+	require.NoError(t, err)
+
+	streams := map[types.NodeID]*Stream{}
+
+	for _, nv := range s.ListNodes().All() {
+		if nv.User().ID() != owner.ID {
+			continue
+		}
+
+		st := NewStream(cfg, hub, nv.ID(), capVer)
+		_, err := st.Initial(s.Snapshot())
+		require.NoError(t, err)
+		st.Delivered()
+
+		streams[nv.ID()] = st
+	}
+
+	const warm, rounds = 2, 5
+
+	var join, leave joinStages
+
+	last := s.Snapshot()
+
+	// write measures one write through every stage into into, after a
+	// warm-up; joiner, when set, opens its session.
+	write := func(into *joinStages, measured bool, commit func(), joiner types.NodeID) {
+		var at [numStages + 1]runtime.MemStats
+
+		var times [numStages + 1]time.Time
+
+		mark := func(i int) {
+			runtime.ReadMemStats(&at[i])
+			times[i] = time.Now()
+		}
+
+		runtime.GC()
+		mark(0)
+
+		commit()
+		mark(1)
+
+		snap := s.Snapshot()
+		change := snap.Since(last)
+
+		mark(2)
+
+		all, wake := Route(last, snap, change)
+
+		mark(3)
+
+		require.False(t, all, "a join or leave wakes its viewers, not everyone")
+
+		for id := range wake {
+			if st := streams[id]; st != nil {
+				_, err := st.Update(snap)
+				require.NoError(t, err)
+				st.Delivered()
+			}
+		}
+
+		if joiner != 0 {
+			st := NewStream(cfg, hub, joiner, capVer)
+			_, err := st.Initial(snap)
+			require.NoError(t, err)
+			st.Delivered()
+		}
+
+		mark(4)
+
+		last = snap
+
+		if !measured {
+			return
+		}
+
+		for i := range numStages {
+			into.allocs[i] += at[i+1].Mallocs - at[i].Mallocs
+			into.bytes[i] += at[i+1].TotalAlloc - at[i].TotalAlloc
+			into.ns[i] += times[i+1].Sub(times[i]).Nanoseconds()
+		}
+
+		into.woken = len(wake)
+	}
+
+	for i := range warm + rounds {
+		node := s.CreateRegisteredNodeForTest(owner, fmt.Sprintf("joiner-%d", i))
+		node.User = owner
+
+		write(&join, i >= warm, func() { s.PutNodeInStoreForTest(*node) }, node.ID)
+		write(&leave, i >= warm, func() { s.DeleteNodeFromStoreForTest(node.ID) }, 0)
+	}
+
+	for _, w := range []*joinStages{&join, &leave} {
+		for i := range numStages {
+			w.allocs[i] /= rounds
+			w.bytes[i] /= rounds
+			w.ns[i] /= rounds
+		}
+	}
+
+	return join, leave
+}
+
+// TestJoinCostPerStage measures one join and one leave in capability mode
+// at 100 and at 10,000 nodes with the same viewers, from the write through
+// the commit, Since, Route and the renders of the sessions woken, and pins
+// per stage what stays and what grows. Since and Route stay; the renders
+// stay but for the peer classes' prune, which visits every class when the
+// peers move. The commit grows: the compile, which still runs for SSH and
+// node capabilities, resolves autogroup:member again at every membership
+// change (at 10,000 nodes ≈ 10 MB, 25,000 allocations of the commit's 10.8
+// MB, 25,800), and the posting and side lists the subject enters and the
+// sorted node list are slices copied whole (≈ 340 KB).
+func TestJoinCostPerStage(t *testing.T) {
+	if testing.Short() || util.RaceEnabled {
+		t.Skip("builds a 10,000 node tailnet")
+	}
+
+	t.Setenv(state.TestCapabilitySourcesEnv, "true")
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "false")
+
+	smallJoin, smallLeave := measureJoinStages(t, 100)
+	largeJoin, largeLeave := measureJoinStages(t, 10_000)
+
+	for _, c := range []struct {
+		name         string
+		small, large joinStages
+	}{{"join", smallJoin, largeJoin}, {"leave", smallLeave, largeLeave}} {
+		t.Logf("%s: woken %d at 100, %d at 10000", c.name, c.small.woken, c.large.woken)
+
+		for i := range numStages {
+			t.Logf("%s %-7s allocs %6d -> %6d  bytes %9d -> %9d  time %9d -> %9d ns", c.name, stageNames[i],
+				c.small.allocs[i], c.large.allocs[i], c.small.bytes[i], c.large.bytes[i], c.small.ns[i], c.large.ns[i])
+		}
+
+		assert.Equal(t, c.small.woken, c.large.woken, "test sanity: the same viewers at both sizes")
+
+		for _, i := range []int{stageSince, stageRoute} {
+			assert.LessOrEqual(t, c.large.allocs[i], c.small.allocs[i]+2, "%s %s allocates what moved", c.name, stageNames[i])
+			assert.LessOrEqual(t, c.large.bytes[i], c.small.bytes[i]+1<<10, "%s %s", c.name, stageNames[i])
+		}
+
+		assert.LessOrEqual(t, float64(c.large.allocs[stageRender]), 1.25*float64(c.small.allocs[stageRender]), "%s renders allocate the viewers'", c.name)
+		assert.LessOrEqual(t, c.large.bytes[stageRender], c.small.bytes[stageRender]+320<<10, "%s renders: the class prune", c.name)
+		assert.LessOrEqual(t, c.large.allocs[stageCommit], uint64(30_000), "%s commit: the compile", c.name)
+		assert.LessOrEqual(t, c.large.bytes[stageCommit], uint64(13<<20), "%s commit: the compile and the lists", c.name)
 	}
 }
 
