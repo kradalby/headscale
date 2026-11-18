@@ -367,10 +367,15 @@ func (r Receivers) Update(nodes *NodeMap, caps *graph.Map[types.NodeID, tailcfg.
 		next.facts = graph.NewMap[types.NodeID](sameFacts, nil)
 	}
 
+	// A node whose node and capabilities both changed is in both lists;
+	// visited twice, the census would count it twice.
 	changed := slices.Concat(graph.Changes(r.nodes, nodes), graph.Changes(r.caps, caps))
 	if len(changed) == 0 {
 		return next
 	}
+
+	slices.Sort(changed)
+	changed = slices.Compact(changed)
 
 	e := next.facts.Edit()
 	addr := next.addressForm

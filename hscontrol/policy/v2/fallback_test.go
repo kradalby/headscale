@@ -1173,6 +1173,46 @@ func TestStampNotionsUnderSharedAddresses(t *testing.T) { //nolint:paralleltest 
 	})
 }
 
+// TestCensusCountsEachReceiverOnce counts receivers whose node and
+// capabilities change in one update, as every node holding a nodeAttrs
+// capability does when the world is built or when it joins: each once.
+func TestCensusCountsEachReceiverOnce(t *testing.T) {
+	t.Parallel()
+
+	policy := strings.TrimSuffix(strings.TrimSpace(examplePolicy), "}") +
+		`,"nodeAttrs":[{"target":["*"],"attr":["randomize-client-port"]}]}`
+	cm := exampleModel(t, policy)
+	require.NotEmpty(t, cm.caps[cm.list[0].ID], "test sanity: the nodes hold a capability")
+
+	total := func(r Receivers) int {
+		c, err := cm.cap.Census(r)
+		require.NoError(t, err)
+
+		receivers, _ := c.Labelled()
+
+		n := 0
+		for _, k := range receivers {
+			n += k
+		}
+
+		return n
+	}
+
+	require.Equal(t, len(cm.list), total(cm.receivers), "every node counted once at build")
+
+	// One node's node and capabilities change together.
+	next := cm.nodes.Edit()
+	n := cm.list[0].Clone()
+	n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{netip.MustParsePrefix("10.9.0.0/24")}}
+	next.Set(n.ID, n)
+
+	caps := maps.Clone(cm.caps)
+	caps[n.ID] = tailcfg.NodeCapMap{"randomize-client-port": nil, "custom:moved": nil}
+
+	moved := cm.receivers.Update(next.Done(), graph.NewMap(func(a, b tailcfg.NodeCapMap) bool { return a.Equal(b) }, caps))
+	require.Equal(t, len(cm.list), total(moved), "every node counted once after an update")
+}
+
 // TestFallbackCensus pins what the census counts on the worked example:
 // the router sent addresses for its routes, the others capabilities; the
 // rule with a host source counted as literal, the others as capability.
