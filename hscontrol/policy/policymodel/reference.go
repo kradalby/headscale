@@ -283,7 +283,7 @@ func (n RefNode) tagged() bool { return len(n.Tags) > 0 }
 func (n RefNode) ServedRoutes() []netip.Prefix { return n.routes() }
 
 // owner is the user whose devices autogroup:self and the user's own
-// selectors name n among, or zero.
+// selectors name n among, or zero: a tagged device belongs to its tags.
 func (n RefNode) owner() uint {
 	if n.tagged() {
 		return 0
@@ -305,12 +305,17 @@ func (n RefNode) routes() []netip.Prefix {
 	return out
 }
 
-// subnets are n's routes but its exit routes.
-func (n RefNode) subnets() []netip.Prefix {
-	return slices.DeleteFunc(n.routes(), isExitRoute)
+func (n RefNode) subnets() []netip.Prefix { return slices.DeleteFunc(n.routes(), isExitRoute) }
+
+func (n RefNode) exitRoutes() []netip.Prefix {
+	return slices.DeleteFunc(n.routes(), func(p netip.Prefix) bool { return !isExitRoute(p) })
 }
 
-func (n RefNode) exit() bool { return slices.ContainsFunc(n.routes(), isExitRoute) }
+func (n RefNode) exit() bool { return len(n.exitRoutes()) > 0 }
+
+func (n RefNode) hasTag(tags []string) bool {
+	return slices.ContainsFunc(tags, func(t string) bool { return slices.Contains(n.Tags, t) })
+}
 
 func isExitRoute(p netip.Prefix) bool { return p.Bits() == 0 }
 
@@ -326,8 +331,9 @@ var (
 		setOf(netip.MustParsePrefix("100.64.0.0/10"), netip.MustParsePrefix("fd7a:115c:a1e0::/48")),
 		setOf(netip.MustParsePrefix("100.115.92.0/23")))
 
-	// internet is autogroup:internet: public IPv4, which leaves out the
-	// private, shared and link-local ranges, and global unicast IPv6.
+	// internet is the internet an exit node serves autogroup:internet for:
+	// public IPv4, which leaves out the private, shared and link-local
+	// ranges, and global unicast IPv6.
 	internet = setMinus(
 		setOf(netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("2000::/3")),
 		setOf(netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("172.16.0.0/12"),
@@ -348,43 +354,94 @@ type Ref struct {
 
 // Contested is a clause of the reference that headscale is seen to
 // disagree with: reported to the maintainer, not encoded. Either no
-// capture decides, or one decides for the reference and headscale is
-// believed wrong. A property asks for the reference without such a clause
-// only to tell a difference that is exactly that clause from any other.
-type Contested uint8
+// capture or document decides it, and the reference takes the plain
+// reading; or one decides for the reference and headscale is believed
+// wrong. Leaving a clause out restates headscale's behaviour in that
+// clause's scope alone; a property asks for it only to tell a difference
+// that is exactly that clause from any other.
+type Contested uint16
 
 const (
 	// OthersSelf: an autogroup:self rule's sides are addresses like any
-	// other rule's: a node holding or routing one of the user's devices'
-	// addresses is on them, takes the rule for what it routes, sees the
-	// other side and gets routes by it. Headscale applies a user's self
-	// rules only with one of the user's devices at one end: it sends them
-	// to those devices and to exit nodes, gives routes by a viewer's own
-	// user's, and links two nodes only when one is the user's.
+	// other rule's: a node routing one of the user's devices' addresses is
+	// on them, takes the rule for what it routes, sees the other side and
+	// gets routes by it. Headscale applies a user's self rules only with
+	// one of the user's devices at one end: it sends them to those devices
+	// and to exit nodes, gives routes by a viewer's own user's, and links
+	// two nodes only when one is the user's. Fails closed.
 	OthersSelf Contested = 1 << iota
-	// ViaDestinations: a via grant reaches what its via routers route of
-	// its destinations, * being everything. Headscale writes each
-	// destination as it stands at a via router with a route overlapping
-	// it, so the router takes it for its own address too, and reads * as
-	// the tailnet's ranges.
-	ViaDestinations
+	// StarApprovedRoutes: * as a source adds the routes nodes serve.
+	// Headscale adds every approved route, served or not. Fails open.
+	StarApprovedRoutes
+	// InternetAtSubnetRouters: autogroup:internet is the internet through
+	// exit nodes. Headscale reads it as an address set like any other, so a
+	// subnet router serving a public prefix takes it, is on its side, and
+	// its route is given by it. Fails open.
+	InternetAtSubnetRouters
+	// ViaOwnAddress: a via grant reaches what its via routers route.
+	// Headscale writes each destination prefix whole at a via router with a
+	// route overlapping it, so the router also takes it for its own
+	// address. Fails open.
+	ViaOwnAddress
+	// ViaReach: a via grant reaches every route its via routers serve, *
+	// being everything, exit routes included. Headscale reaches subnet
+	// routes only, exits only for autogroup:internet, and reads * as the
+	// tailnet's ranges. Fails closed.
+	ViaReach
+	// ViaRouterAddress: a via router routing a via grant's destination is
+	// on its destinations' side whether or not it has an address.
+	// Headscale shows only one that has, so the grant's sources do not see
+	// an address-less one (a database-only node). Fails closed.
+	ViaRouterAddress
+	// ViaSelf: a via grant to autogroup:self reaches each user's devices
+	// through the via routers routing their addresses. Headscale gives it
+	// no rule. Fails closed.
+	ViaSelf
 	// ExitDestinationRoutes: an exit node serving an internet-reaching
-	// rule is on its destinations' side for route access too, and gets
-	// the routes overlapping its sources, so that hosts behind a subnet
-	// router can use it. Captured: routes-b18 gives the exit node those
-	// routes. Headscale gives it none (believed wrong).
+	// rule, through via or not, is on its destinations' side for route
+	// access too, and gets the routes overlapping its sources, so that
+	// hosts behind a subnet router can use it. Captured: routes-b18 gives
+	// the exit node those routes. Headscale gives it none (believed
+	// wrong). Fails closed.
 	ExitDestinationRoutes
 	// AppWildcard: * in an app grant is everything as a destination, as
 	// it is for the grant's ports: a viewer among its sources gets subnet
 	// routes by it as by an app grant to the subnet (captured, via golden
 	// v84), and a companion to * reaches the internet, so exit nodes see
 	// its sources. Headscale reads * as the tailnet's ranges for app
-	// capabilities, both ways.
+	// capabilities, both ways. Fails closed.
 	AppWildcard
-
-	// AllContested is every contested clause.
-	AllContested = OthersSelf | ViaDestinations | ExitDestinationRoutes | AppWildcard
 )
+
+// ContestedClauses is every contested clause, in the order a property
+// tries them.
+var ContestedClauses = []Contested{
+	OthersSelf, StarApprovedRoutes, InternetAtSubnetRouters,
+	ViaOwnAddress, ViaReach, ViaRouterAddress, ViaSelf, ExitDestinationRoutes, AppWildcard,
+}
+
+// FailsOpen reports whether headscale's side of c admits what the
+// reference refuses.
+func (c Contested) FailsOpen() bool {
+	return c&(StarApprovedRoutes|InternetAtSubnetRouters|ViaOwnAddress) != 0
+}
+
+func (c Contested) String() string {
+	names := []string{
+		"others' self rules", "* adds approved routes", "internet at subnet routers",
+		"via own address", "via reach", "via router without address", "via to self", "exit routes as destination", "* as app destination",
+	}
+
+	var parts []string
+
+	for i, k := range ContestedClauses {
+		if c&k != 0 {
+			parts = append(parts, names[i])
+		}
+	}
+
+	return strings.Join(parts, " + ")
+}
 
 // Without returns r with the contested clauses c left out.
 func (r *Ref) Without(c Contested) *Ref { return newRef(r.doc, r.users, r.nodes, c) }
@@ -393,21 +450,23 @@ func (r *Ref) Without(c Contested) *Ref { return newRef(r.doc, r.users, r.nodes,
 // autogroup:self part for one owner, or a companion of either.
 type refRule struct {
 	src, dst *netipx.IPSet
-	// internet: a via grant's destinations include autogroup:internet,
-	// which only its exit nodes serve.
+	// internet: autogroup:internet is among the destinations, which exit
+	// nodes serve.
 	internet bool
 	ip       []IPSpec
 	app      tailcfg.PeerCapMap
-	// via restricts the rule to routers holding one of these tags.
-	via []string
+	// via restricts the rule to routers holding one of these tags;
+	// viaTerms are its destinations one term at a time.
+	via      []string
+	viaTerms []*netipx.IPSet
 	// owner is the user an autogroup:self part is for.
 	owner uint
 }
 
 // companions are the app capabilities that imply a capability the other
 // way: the destinations are granted the companion by the sources.
-// Quirk: the hosted service writes these rules, captured in the grant
-// goldens for drive and relay.
+// Quirk: the hosted service writes these rules (grant goldens k11, b3,
+// f4 for drive; relay in the via goldens).
 var companions = []struct{ of, companion peercap.Cap }{
 	{"tailscale.com/cap/drive", "tailscale.com/cap/drive-sharer"},
 	{"tailscale.com/cap/relay", "tailscale.com/cap/relay-target"},
@@ -459,77 +518,108 @@ func newRef(doc Doc, users []User, nodes []RefNode, without Contested) *Ref {
 		self, inet := false, false
 
 		for _, t := range d.Dst {
-			switch {
-			case t == "autogroup:self":
+			switch t {
+			case "autogroup:self":
 				self = true
-			case t == internetSel && len(d.Via) > 0:
+			case internetSel:
+				// autogroup:internet is the internet through exit nodes
+				// (docs/ref/policy.md).
 				inet = true
 			default:
 				dsts = append(dsts, t)
 			}
 		}
 
-		base := refRule{src: r.addrs(d.Src, true), dst: r.addrs(dsts, false), internet: inet, ip: d.IP, app: d.App, via: d.Via}
+		if inet && len(d.Via) == 0 && without&InternetAtSubnetRouters != 0 {
+			dsts, inet = append(slices.Clone(dsts), internetSel), false
+		}
+
+		base := refRule{src: r.srcAddrs(d.Src), dst: r.addrs(dsts, false), internet: inet, ip: d.IP, app: d.App}
 
 		if len(d.Via) > 0 {
 			// Quirk: via restricts a grant's ip part only; its app part
-			// reaches and shows what a grant without via would (the via
-			// goldens v80-v91: every router of the destination, via tag or
-			// not, sees the sources of an app grant through via).
-			via, app := base, base
-			via.app, app.ip, app.via = nil, nil, nil
+			// reaches and shows what a grant without via would (via goldens
+			// v80-v91: every router of the destination, via tag or not, sees
+			// the sources of an app grant through via).
+			via := base
+			via.app, via.via = nil, d.Via
 
-			if without&ViaDestinations != 0 {
+			if without&ViaReach != 0 {
 				via.dst = r.starAsTailnet(dsts)
 			}
 
-			r.rules = append(r.rules, via)
-			base = app
+			for _, t := range dsts {
+				if without&ViaReach != 0 && t == "*" {
+					via.viaTerms = append(via.viaTerms, tailnetRanges)
+
+					continue
+				}
+
+				via.viaTerms = append(via.viaTerms, r.addrs([]string{t}, false))
+			}
+
+			r.add(via, nil, nil)
+
+			if self && without&ViaSelf == 0 {
+				r.addSelf(via)
+			}
+
+			base.ip = nil
 		}
 
 		if without&AppWildcard != 0 && len(d.App) > 0 {
 			app := base
 			app.ip, app.dst = nil, r.starAsTailnet(dsts)
 			base.app = nil
-			r.add(app, r.addrs(dsts, true), r.starAsTailnet(d.Src))
+			r.add(app, r.srcAddrs(dsts), r.starAsTailnet(d.Src))
 		}
 
 		if len(dsts) > 0 || inet {
-			r.add(base, r.addrs(dsts, true), r.addrs(d.Src, false))
+			r.add(base, r.srcAddrs(dsts), r.addrs(d.Src, false))
 		}
 
-		if !self || len(d.Via) > 0 {
-			continue
-		}
-
-		// autogroup:self: for each user, from the user's devices the
-		// sources name to all of the user's devices. Quirk: a source names
-		// a device when it holds one of the device's addresses, and the
-		// device is then a source by every address it has (sameUserSources
-		// in the compile; captured in the self goldens, which hold no
-		// device with only one address in a source).
-		for _, u := range r.owners() {
-			var devices, named []RefNode
-
-			for _, n := range nodes {
-				if n.owner() == u {
-					devices = append(devices, n)
-
-					if slices.ContainsFunc(n.Addrs, base.src.Contains) {
-						named = append(named, n)
-					}
-				}
-			}
-
-			if len(named) > 0 {
-				self := base
-				self.src, self.dst, self.internet, self.owner = addrsOf(named), addrsOf(devices), false, u
-				r.add(self, self.dst, self.src)
-			}
+		if self {
+			r.addSelf(base)
 		}
 	}
 
 	return r
+}
+
+// addSelf adds rl's autogroup:self part: for each user, from the
+// addresses rl's sources name among the user's devices to all of the
+// user's devices. autogroup:self is "devices where the same user is
+// authenticated on both the source and destination", tagged devices
+// excluded (docs/ref/policy.md).
+func (r *Ref) addSelf(rl refRule) {
+	for _, u := range r.owners() {
+		var devices []RefNode
+
+		for _, n := range r.nodes {
+			if n.owner() == u {
+				devices = append(devices, n)
+			}
+		}
+
+		var b netipx.IPSetBuilder
+
+		b.AddSet(rl.src)
+		b.Intersect(addrsOf(devices))
+
+		named, _ := b.IPSet()
+		if len(named.Prefixes()) == 0 {
+			continue
+		}
+
+		self := rl
+		self.src, self.dst, self.internet, self.owner = named, addrsOf(devices), false, u
+
+		if len(rl.via) > 0 {
+			self.viaTerms = []*netipx.IPSet{self.dst}
+		}
+
+		r.add(self, self.dst, self.src)
+	}
 }
 
 // starAsTailnet is what terms name as destinations, reading * as the
@@ -589,7 +679,8 @@ func identity(sel string) bool {
 
 // member reports whether n is a member of the identity selector sel.
 // Users and groups name untagged devices by their owner; tags name the
-// devices tagged with them.
+// devices tagged with them; autogroup:member is every untagged device and
+// autogroup:tagged every tagged one (docs/ref/policy.md, Autogroups).
 func (r *Ref) member(n RefNode, sel string) bool {
 	switch {
 	case sel == "autogroup:member":
@@ -607,18 +698,19 @@ func (r *Ref) member(n RefNode, sel string) bool {
 	return false
 }
 
-// usersOf resolves a user token. A domain names every user whose e-mail
-// is in it. Quirk: a token names the one user whose e-mail it is, or
-// failing that the one user whose name it is less a trailing "@"; two
-// users at either step name nobody (headscale's, issue #3513; the users
-// goldens).
+// usersOf resolves a user token as docs/ref/oidc.md ("Reference a user
+// in the policy") says: the value is the token less the one "@" appended
+// to a value that has none; it names the user with that provider
+// identifier, failing that the one user with that e-mail, failing that
+// the one user with that name; two at either of the last steps name
+// nobody. A domain names every user whose e-mail is in it, domains
+// compared without case (the users goldens hold one).
 func (r *Ref) usersOf(tok string) []uint {
 	if domain, ok := strings.CutPrefix(tok, "user:*@"); ok {
 		var out []uint
 
 		for _, u := range r.users {
-			i := strings.LastIndex(u.Email, "@")
-			if i >= 0 && strings.EqualFold(u.Email[i+1:], domain) {
+			if _, d, ok := strings.Cut(u.Email, "@"); ok && strings.EqualFold(d, domain) {
 				out = append(out, u.ID)
 			}
 		}
@@ -626,16 +718,22 @@ func (r *Ref) usersOf(tok string) []uint {
 		return out
 	}
 
-	name := strings.TrimSuffix(tok, "@")
-	if name == "" {
+	value := strings.TrimSuffix(tok, "@")
+	if value == "" {
 		return nil
+	}
+
+	for _, u := range r.users {
+		if u.Provider != "" && u.Provider == value {
+			return []uint{u.ID}
+		}
 	}
 
 	for _, field := range []func(User) string{func(u User) string { return u.Email }, func(u User) string { return u.Name }} {
 		var hits []uint
 
 		for _, u := range r.users {
-			if field(u) == name {
+			if field(u) == value {
 				hits = append(hits, u.ID)
 			}
 		}
@@ -652,6 +750,34 @@ func (r *Ref) usersOf(tok string) []uint {
 	return nil
 }
 
+// srcAddrs is what terms name as sources. Quirk: * as a source adds
+// every route a node serves (acl and grant goldens, e.g. grant-a1's
+// 10.33.0.0/16).
+func (r *Ref) srcAddrs(terms []string) *netipx.IPSet {
+	if !slices.Contains(terms, "*") {
+		return r.addrs(terms, true)
+	}
+
+	var b netipx.IPSetBuilder
+
+	b.AddSet(r.addrs(terms, true))
+
+	for _, n := range r.nodes {
+		routes := n.subnets()
+		if r.without&StarApprovedRoutes != 0 {
+			routes = slices.DeleteFunc(slices.Clone(n.Approved), isExitRoute)
+		}
+
+		for _, p := range routes {
+			b.AddPrefix(p)
+		}
+	}
+
+	s, _ := b.IPSet()
+
+	return s
+}
+
 // addrs is what terms name as addresses, as sources or as destinations.
 func (r *Ref) addrs(terms []string, asSrc bool) *netipx.IPSet {
 	var b netipx.IPSetBuilder
@@ -659,17 +785,7 @@ func (r *Ref) addrs(terms []string, asSrc bool) *netipx.IPSet {
 	for _, t := range terms {
 		switch {
 		case t == "*" && asSrc:
-			// Quirk: * as a source is the tailnet's ranges and every
-			// approved subnet route, announced or not (the acl goldens).
 			b.AddSet(tailnetRanges)
-
-			for _, n := range r.nodes {
-				for _, p := range n.Approved {
-					if !isExitRoute(p) {
-						b.AddPrefix(p)
-					}
-				}
-			}
 		case t == "*", t == "autogroup:danger-all":
 			b.AddSet(everything)
 		case t == internetSel:
@@ -702,7 +818,9 @@ func (r *Ref) addrs(terms []string, asSrc bool) *netipx.IPSet {
 	return s
 }
 
-// served is what n takes packets for: its own addresses and its routes.
+// served is what n takes packets for: its own addresses and its routes,
+// an exit node's default routes whole (the client cuts its private
+// ranges itself; the exit-node goldens agree).
 func (n RefNode) served() *netipx.IPSet {
 	var b netipx.IPSetBuilder
 
@@ -719,45 +837,51 @@ func (n RefNode) served() *netipx.IPSet {
 	return s
 }
 
-// dstsAt is the part of rl's destinations that n takes packets for.
-// A via rule reaches only the routers holding a via tag, for their
-// routes, and autogroup:internet through via only exit nodes.
+// dstsAt is the part of rl's destinations that n takes packets for:
+// autogroup:internet at an exit node; for a via rule, only at a router
+// holding a via tag, and only what it routes.
 func (r *Ref) dstsAt(rl refRule, n RefNode) *netipx.IPSet {
 	var b netipx.IPSetBuilder
 
-	if len(rl.via) > 0 {
-		if !slices.ContainsFunc(rl.via, func(t string) bool { return slices.Contains(n.Tags, t) }) {
-			return &netipx.IPSet{}
+	switch {
+	case len(rl.via) == 0:
+		b.AddSet(n.served())
+		b.Intersect(rl.dst)
+	case !n.hasTag(rl.via):
+		return &netipx.IPSet{}
+	default:
+		routed := n.routes()
+		if r.without&ViaReach != 0 {
+			routed = n.subnets()
 		}
 
-		for _, p := range n.subnets() {
+		for _, p := range routed {
 			b.AddPrefix(p)
 		}
 
-		if r.without&ViaDestinations != 0 {
-			b = netipx.IPSetBuilder{}
+		b.Intersect(rl.dst)
 
-			for _, p := range rl.dst.Prefixes() {
-				if slices.ContainsFunc(n.subnets(), p.Overlaps) {
-					b.AddPrefix(p)
+		if r.without&ViaOwnAddress != 0 {
+			for _, term := range rl.viaTerms {
+				for _, p := range term.Prefixes() {
+					if slices.ContainsFunc(n.subnets(), p.Overlaps) {
+						var own netipx.IPSetBuilder
+
+						own.AddPrefix(p)
+						own.Intersect(addrsOf([]RefNode{n}))
+						s, _ := own.IPSet()
+						b.AddSet(s)
+					}
 				}
 			}
-
-			b.Intersect(n.served())
 		}
-	} else {
-		b.AddSet(n.served())
 	}
-
-	b.Intersect(rl.dst)
 
 	if rl.internet {
 		var exits netipx.IPSetBuilder
 
-		for _, p := range n.routes() {
-			if isExitRoute(p) {
-				exits.AddPrefix(p)
-			}
+		for _, p := range n.exitRoutes() {
+			exits.AddPrefix(p)
 		}
 
 		exits.Intersect(internet)
@@ -770,12 +894,6 @@ func (r *Ref) dstsAt(rl refRule, n RefNode) *netipx.IPSet {
 	return s
 }
 
-// ownSelf reports whether rl counts at n with [OthersSelf] left out: it
-// is no autogroup:self rule, or one for n's own user.
-func (r *Ref) ownSelf(rl refRule, n RefNode) bool {
-	return r.without&OthersSelf == 0 || rl.owner == 0 || rl.owner == n.owner()
-}
-
 func (r *Ref) node(id types.NodeID) (RefNode, bool) {
 	i := slices.IndexFunc(r.nodes, func(n RefNode) bool { return n.ID == id })
 	if i < 0 {
@@ -783,6 +901,42 @@ func (r *Ref) node(id types.NodeID) (RefNode, bool) {
 	}
 
 	return r.nodes[i], true
+}
+
+// What the reference leaves out of its domain: configurations headscale
+// does not hand out, where its behaviour follows from how the code is
+// built rather than from what a policy means. A property skips and counts
+// them.
+const (
+	// OutsideAddress: a node holds an address outside the tailnet's
+	// ranges. * then means one thing for ports, another for app
+	// capabilities, and a third as an autogroup:self source.
+	OutsideAddress = "a node holds an address outside the tailnet"
+	// SharedAddress: two nodes hold one address. Which node a packet for
+	// it reaches is not the policy's to say, and no capture holds one.
+	SharedAddress = "two nodes share an address"
+)
+
+// OutOfDomain returns why the reference does not speak for this world, or
+// "" when it does.
+func (r *Ref) OutOfDomain() string {
+	seen := map[netip.Addr]bool{}
+
+	for _, n := range r.nodes {
+		for _, a := range n.Addrs {
+			if !tailnetRanges.Contains(a) {
+				return OutsideAddress
+			}
+
+			if seen[a] {
+				return SharedAddress
+			}
+
+			seen[a] = true
+		}
+	}
+
+	return ""
 }
 
 // Serves reports whether node id takes packets for a: one of its own
@@ -793,52 +947,11 @@ func (r *Ref) Serves(id types.NodeID, a netip.Addr) bool {
 	return ok && n.served().Contains(a)
 }
 
-// What the reference leaves out of its domain: configurations headscale
-// does not support, where its behaviour follows from how the code is
-// built rather than from what a policy means. A property skips and counts
-// them.
-const (
-	// OutsideAddress: a node holds an address outside the tailnet's
-	// ranges, which headscale does not hand out. * then means one thing
-	// for ports, another for app capabilities, and a third as an
-	// autogroup:self source.
-	OutsideAddress = "a node holds an address outside the tailnet"
-	// SharedAddress: the receiver holds an address another node holds,
-	// which headscale never hands out twice. Which node a packet for the
-	// address reaches is not the policy's to say, and a destination granted
-	// per device counts the address once per device holding it.
-	SharedAddress = "the receiver shares an address"
-)
-
-// OutOfDomain returns why the reference does not speak for this world, or
-// "" when it does.
-func (r *Ref) OutOfDomain() string {
-	for _, n := range r.nodes {
-		if slices.ContainsFunc(n.Addrs, func(a netip.Addr) bool { return !tailnetRanges.Contains(a) }) {
-			return OutsideAddress
-		}
-	}
-
-	return ""
-}
-
-// ReceiverOutOfDomain returns why the reference does not speak for what
-// node id accepts, or the routes it is given as a viewer, or "" when it
-// does.
-func (r *Ref) ReceiverOutOfDomain(id types.NodeID) string {
-	if why := r.OutOfDomain(); why != "" {
-		return why
-	}
-
+// Served is every address node id takes packets for.
+func (r *Ref) Served(id types.NodeID) *netipx.IPSet {
 	n, _ := r.node(id)
 
-	if slices.ContainsFunc(r.nodes, func(m RefNode) bool {
-		return m.ID != id && slices.ContainsFunc(m.Addrs, func(a netip.Addr) bool { return slices.Contains(n.Addrs, a) })
-	}) {
-		return SharedAddress
-	}
-
-	return ""
+	return n.served()
 }
 
 // Rules are the rules node id must enforce, in document order: for each
@@ -877,9 +990,9 @@ func (r *Ref) Rules(id types.NodeID) []tailcfg.FilterRule {
 		}
 
 		// Quirk: app capabilities are granted at a node's own addresses,
-		// never at addresses it routes, subnet or exit (the grant goldens
-		// with * as destination at subnet routers; the via goldens v84-v104
-		// with a subnet or a public prefix as destination).
+		// never at addresses it routes, subnet or exit (grant goldens a1,
+		// a3, c1-c6, k11-k25 with * at subnet routers; via goldens v84-v104
+		// with a subnet or a public prefix).
 		var own netipx.IPSetBuilder
 
 		for _, a := range n.Addrs {
@@ -896,12 +1009,20 @@ func (r *Ref) Rules(id types.NodeID) []tailcfg.FilterRule {
 	return out
 }
 
+// ownSelf reports whether rl counts at n with [OthersSelf] left out: it
+// is no autogroup:self rule, or one for n's own user.
+func (r *Ref) ownSelf(rl refRule, n RefNode) bool {
+	return r.without&OthersSelf == 0 || rl.owner == 0 || rl.owner == n.owner()
+}
+
 // Peers are the nodes node id is shown, in ID order. A node sees another
 // when a rule has one on its sources' side and the other on its
-// destinations' side, either way round; and every device of its own user.
+// destinations' side, either way round (the goldens' peer lists); and
+// every device of its own user (ACL goldens: a user's two devices with no
+// rule between them see each other).
 // Quirk: an exit node also sees, one way, the sources of an app grant
-// whose destinations reach the internet (captured: the grant goldens hold
-// such pairs, where the sources do not see the exit node).
+// whose destinations reach the internet (grant goldens: the sources do
+// not see the exit node).
 func (r *Ref) Peers(id types.NodeID) []types.NodeID {
 	n, ok := r.node(id)
 	if !ok {
@@ -929,11 +1050,11 @@ func (r *Ref) sees(n, m RefNode) bool {
 			continue
 		}
 
-		if rl.links(n, m) || rl.links(m, n) {
+		if r.links(rl, n, m) || r.links(rl, m, n) {
 			return true
 		}
 
-		if len(rl.app) > 0 && n.exit() && rl.reachesInternet() && on(m, rl.src) {
+		if r.oneWay(rl, n, m) {
 			return true
 		}
 	}
@@ -941,11 +1062,16 @@ func (r *Ref) sees(n, m RefNode) bool {
 	return false
 }
 
+// oneWay reports whether exit node n sees m only as a source of rl, an
+// app grant reaching the internet.
+func (r *Ref) oneWay(rl refRule, n, m RefNode) bool {
+	return len(rl.app) > 0 && len(rl.via) == 0 && n.exit() && rl.reachesInternet() && on(m, rl.src)
+}
+
 // on reports whether n is on the side of a rule whose addresses are s: it
-// holds one of them, or one of its subnet routes overlaps them. Quirk: a
-// router whose route covers a node's address is on that node's side, and
-// so is a node sharing its address (the goldens hold routers over
-// tailnet addresses).
+// holds one of them, or one of its subnet routes overlaps them, as a
+// router takes packets for what it routes (goldens: routers of a
+// destination prefix see its sources).
 func on(n RefNode, s *netipx.IPSet) bool {
 	return slices.ContainsFunc(n.Addrs, s.Contains) || slices.ContainsFunc(n.subnets(), s.OverlapsPrefix)
 }
@@ -954,25 +1080,35 @@ func (rl refRule) reachesInternet() bool { return rl.internet || rl.dst.Overlaps
 
 // onDst reports whether n is on rl's destinations' side: by address or
 // route, or as an exit node when a port rule's destinations reach the
-// internet. A via rule's destination side is its via routers that have
-// an address.
-func (rl refRule) onDst(n RefNode) bool {
-	if len(rl.via) > 0 {
-		return len(n.Addrs) > 0 && slices.ContainsFunc(rl.via, func(t string) bool { return slices.Contains(n.Tags, t) }) &&
-			(slices.ContainsFunc(n.subnets(), rl.dst.OverlapsPrefix) || rl.internet && n.exit())
+// internet (issue_3212 goldens b17, b18). A via rule's destination side is
+// its via routers routing a destination.
+func (r *Ref) onDst(rl refRule, n RefNode) bool {
+	if len(rl.via) == 0 {
+		return on(n, rl.dst) || len(rl.ip) > 0 && n.exit() && rl.reachesInternet()
 	}
 
-	return on(n, rl.dst) || len(rl.ip) > 0 && n.exit() && rl.reachesInternet()
+	if !n.hasTag(rl.via) || r.without&ViaRouterAddress != 0 && len(n.Addrs) == 0 {
+		return false
+	}
+
+	routed := n.routes()
+	if r.without&ViaReach != 0 {
+		routed = n.subnets()
+	}
+
+	return slices.ContainsFunc(routed, rl.dst.OverlapsPrefix) || rl.internet && n.exit()
 }
 
-func (rl refRule) links(src, dst RefNode) bool { return on(src, rl.src) && rl.onDst(dst) }
+func (r *Ref) links(rl refRule, src, dst RefNode) bool { return on(src, rl.src) && r.onDst(rl, dst) }
 
 // Routes are the routes of peer that viewer is given, in the peer's
 // order: an exit route when the viewer may send packets to the internet,
-// as a source of a port rule reaching it (an app grant does not: the via
-// golden v104); a subnet route when the viewer is on one side of a rule and
-// the route overlaps the other. Via grants are not read: they grant
-// routes through steering, which the reference does not model.
+// as a source of a port rule reaching it (an app grant does not: via
+// golden v104); a subnet route when the viewer is on one side of a rule
+// and the route overlaps the other (routes goldens; an exit node is a
+// destination of an internet-reaching rule, routes-b18). A via grant
+// gives routes to its via routers as destinations; what it gives its
+// sources is steering, which the reference does not model ([Ref.Steered]).
 func (r *Ref) Routes(viewer, peer types.NodeID) []netip.Prefix {
 	v, ok := r.node(viewer)
 	p, okp := r.node(peer)
@@ -985,20 +1121,27 @@ func (r *Ref) Routes(viewer, peer types.NodeID) []netip.Prefix {
 
 	for _, q := range p.routes() {
 		keep := slices.ContainsFunc(r.rules, func(rl refRule) bool {
-			if len(rl.via) > 0 || !r.ownSelf(rl, v) {
+			if !r.ownSelf(rl, v) {
 				return false
 			}
 
+			via := len(rl.via) > 0
+
 			if isExitRoute(q) {
-				return on(v, rl.src) && len(rl.ip) > 0 && rl.reachesInternet()
+				return !via && on(v, rl.src) && len(rl.ip) > 0 && rl.reachesInternet()
 			}
 
-			dstSide := rl.onDst(v)
-			if r.without&ExitDestinationRoutes != 0 {
+			dstSide := r.onDst(rl, v)
+
+			switch {
+			case r.without&ExitDestinationRoutes == 0:
+			case via:
+				dstSide = v.hasTag(rl.via) && slices.ContainsFunc(v.subnets(), rl.dst.OverlapsPrefix)
+			default:
 				dstSide = on(v, rl.dst)
 			}
 
-			return on(v, rl.src) && rl.dst.OverlapsPrefix(q) || dstSide && rl.src.OverlapsPrefix(q)
+			return !via && on(v, rl.src) && rl.dst.OverlapsPrefix(q) || dstSide && rl.src.OverlapsPrefix(q)
 		})
 		if keep {
 			out = append(out, q)
@@ -1006,6 +1149,20 @@ func (r *Ref) Routes(viewer, peer types.NodeID) []netip.Prefix {
 	}
 
 	return out
+}
+
+// Steered reports whether the routes viewer is given of peer are via
+// steering's to decide: viewer is a source of a via grant one of peer's
+// routes reaches.
+func (r *Ref) Steered(viewer, peer types.NodeID) bool {
+	v, _ := r.node(viewer)
+	p, _ := r.node(peer)
+
+	return slices.ContainsFunc(r.rules, func(rl refRule) bool {
+		return len(rl.via) > 0 && on(v, rl.src) && slices.ContainsFunc(p.routes(), func(q netip.Prefix) bool {
+			return rl.dst.OverlapsPrefix(q) || rl.internet && (isExitRoute(q) || internet.OverlapsPrefix(q))
+		})
+	})
 }
 
 // HasVia reports whether a rule is a via grant.
@@ -1025,7 +1182,7 @@ const StampPrefix = "https://headscale.net/cap/src/"
 // client can match by capability has sources, destinations, no via, and
 // an ip entry whose protocols the client checks capabilities for; app
 // capabilities alone are not, since the client does not look them up by
-// capability.
+// capability. This is capability mode's design, which no capture holds.
 func (r *Ref) Stamps(id types.NodeID) []string {
 	n, ok := r.node(id)
 	if !ok {
@@ -1086,7 +1243,6 @@ func (r *Ref) Netmap(id types.NodeID) (tailcfg.NodeView, []tailcfg.NodeView) {
 	}
 
 	n, _ := r.node(id)
-
 	ids := r.Peers(id)
 	peers := make([]tailcfg.NodeView, 0, len(ids))
 
