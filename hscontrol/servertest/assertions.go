@@ -33,8 +33,11 @@ func AssertMeshComplete(tb testing.TB, clients []*TestClient) {
 	}
 }
 
-// AssertSymmetricVisibility checks that peer visibility is symmetric:
-// if client A sees client B, then client B must also see client A.
+// AssertSymmetricVisibility checks that if client A sees client B, client
+// B sees client A. Visibility is symmetric only under policies without
+// one-way rules: an exit node sees every source of a capability grant whose
+// destination reaches the internet, which does not see it. Use it with
+// policies that have none.
 func AssertSymmetricVisibility(tb testing.TB, clients []*TestClient) {
 	tb.Helper()
 

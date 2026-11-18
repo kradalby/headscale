@@ -1311,6 +1311,33 @@ func (c *PeerClasses) View(id types.NodeID) []types.NodeID {
 	return nil
 }
 
+// Readers returns the nodes whose view holds id, as lists whose union they
+// are; lists are shared and must not be modified. Views are not symmetric:
+// an exit node sees every source of a capability grant whose destination
+// reaches the internet, which does not see it. So the nodes a change of id
+// reaches are these, not id's own view.
+func (c *PeerClasses) Readers(id types.NodeID) [][]types.NodeID {
+	if c == nil {
+		return nil
+	}
+
+	if c.keyed != nil {
+		return c.keyed.readers(id)
+	}
+
+	var out []types.NodeID
+
+	for n, i := range c.classOf {
+		if _, ok := slices.BinarySearch(c.views[i], id); ok {
+			out = append(out, n)
+		}
+	}
+
+	slices.Sort(out)
+
+	return [][]types.NodeID{out}
+}
+
 // Views returns every class's view. They are shared and must not be
 // modified.
 func (c *PeerClasses) Views() [][]types.NodeID {

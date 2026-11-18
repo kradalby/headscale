@@ -1509,6 +1509,10 @@ func TestRouteLeavesNoSessionStale(t *testing.T) {
 					}
 				}
 
+				if hasOneWayView(snap) {
+					reach.oneWay++
+				}
+
 				requireNoStaleSession(t, step, cfg, snap, sessions, pending)
 
 				if nodeInsideRoute(snap) {
@@ -1549,6 +1553,7 @@ func TestRouteLeavesNoSessionStale(t *testing.T) {
 	require.NotZero(t, reach.inside, "a node inside another node's route at some step")
 	require.NotZero(t, reach.retargeted, "a rule's source or destination moved to another selector")
 	require.NotZero(t, reach.regrouped, "a group's members moved by a document edit")
+	require.NotZero(t, reach.oneWay, "a node saw one that did not see it")
 }
 
 // nodeInsideRoute reports whether a node's address is inside another
@@ -1562,6 +1567,20 @@ func nodeInsideRoute(snap *state.Snapshot) bool {
 				if n.ID() != router.ID() && slices.ContainsFunc(n.IPs(), p.Contains) {
 					return true
 				}
+			}
+		}
+	}
+
+	return false
+}
+
+// hasOneWayView reports whether a node of snap sees one that does not see
+// it.
+func hasOneWayView(snap *state.Snapshot) bool {
+	for _, n := range snap.ListNodes().All() {
+		for _, p := range snap.PeerView(n.ID()) {
+			if _, ok := slices.BinarySearch(snap.PeerView(p), n.ID()); p != n.ID() && !ok {
+				return true
 			}
 		}
 	}
@@ -1726,6 +1745,8 @@ type oracleReach struct {
 	// retargeted and regrouped the document edits that moved a rule's
 	// source or destination to another selector, or a group's members.
 	inside, retargeted, regrouped int
+	// oneWay counts steps where a node sees one that does not see it.
+	oneWay int
 }
 
 // oraclePolicies are the documents the random writes switch between.
@@ -1771,6 +1792,13 @@ var oraclePolicies = []string{
 	`{"hosts":{"lan":"10.0.0.0/24","h1":"100.64.0.1/32"},
 	  "acls":[{"action":"accept","src":["u2@"],"dst":["lan:*","h1:22"]},
 	          {"action":"accept","src":["u1@"],"dst":["u1@:*"]}]}`,
+	// An exit node sees the sources of a capability grant whose destination
+	// reaches the internet, which do not see it: a write of a source must
+	// reach the exit node.
+	`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
+	  "autoApprovers":{"exitNode":["u1@","tag:a","tag:b"]},
+	  "grants":[{"src":["u2@"],"dst":["8.8.8.0/24"],"app":{"example.com/cap/x":[{}]}},
+	            {"src":["u1@"],"dst":["u1@"],"ip":["*"]}]}`,
 }
 
 // newOracleRun builds the random writes' tailnet: a node of u1 and u2 in
@@ -3171,9 +3199,9 @@ func BenchmarkRouteCoalescedWrites(b *testing.B) {
 }
 
 // TestRouteWalksEachViewOnce changes many nodes of one class: Route must
-// walk the class's shared view once, not once per changed node. The work
-// tests count woken sessions and renders, which a repeated walk of the
-// same view does not change.
+// walk each shared holder list that reads them once, not once per changed
+// node. The work tests count woken sessions and renders, which a repeated
+// walk of the same list does not change.
 func TestRouteWalksEachViewOnce(t *testing.T) {
 	s, _ := scalingTailnet(t, 100, "allow-all")
 	old := s.Snapshot()
@@ -3189,7 +3217,16 @@ func TestRouteWalksEachViewOnce(t *testing.T) {
 	}
 
 	cur := s.Snapshot()
-	assert.Len(t, reachedViews(old, cur, changed), 1, "allow-all has one class")
+
+	walked := 0
+	for _, v := range reachedViews(old, cur, changed) {
+		walked += len(v)
+	}
+
+	// Under allow-all the lists are those of the atoms every node holds
+	// and the changed nodes' owners' own; once per changed node is 20 times
+	// that.
+	assert.LessOrEqual(t, walked, 3*nodes.Len(), "each list walked once")
 
 	all, wake := Route(old, cur, cur.Since(old))
 	assert.False(t, all)
@@ -8629,6 +8666,45 @@ func serve(t *testing.T, s *state.State, id types.NodeID, routes ...netip.Prefix
 	require.NoError(t, err)
 
 	s.Connect(id)
+}
+
+// TestRouteWakesTheNodesThatSeeAChangedNode pins that a write of a node
+// wakes the nodes that see it, which visibility does not make the nodes it
+// sees: an exit node sees every source of a capability grant whose
+// destination reaches the internet, to host the service, and the source
+// does not see the exit node. An endpoint write of the source must reach
+// the exit node's session.
+func TestRouteWakesTheNodesThatSeeAChangedNode(t *testing.T) {
+	for _, capSources := range []bool{false, true} {
+		t.Run(fmt.Sprintf("capability=%t", capSources), func(t *testing.T) {
+			t.Setenv(state.TestCapabilitySourcesEnv, strconv.FormatBool(capSources))
+
+			cfg, s, ids := streamTestState(t, `{"grants":[{"src":["u2@"],"dst":["8.8.8.0/24"],"app":{"example.com/cap/x":[{}]}}]}`)
+			exit, src := ids[0], ids[2]
+
+			serve(t, s, exit, netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"))
+
+			before := s.Snapshot()
+			require.Contains(t, before.PeerView(exit), src, "test sanity: the exit node sees the grant's source")
+			require.NotContains(t, before.PeerView(src), exit, "test sanity: the source does not see the exit node")
+
+			st := NewStream(cfg, NewHub(), exit, capVer)
+			_, err := st.Initial(before)
+			require.NoError(t, err)
+			st.Delivered()
+
+			scalingEndpoint(t, s, src, 1)
+
+			after := s.Snapshot()
+			all, wake := Route(before, after, after.Since(before))
+			require.False(t, all)
+			assert.Contains(t, wake, exit, "the exit node sees the written node")
+
+			out, err := freshDiff(cfg, after.Uncached(), exit, capVer, st.sent, &versionCache{})
+			require.NoError(t, err)
+			require.NotEmpty(t, out, "test sanity: the exit node's map moved with the write")
+		})
+	}
 }
 
 // TestRouteWakesViewerOfRouterWhoseCoverMovedByPolicy moves a node into a

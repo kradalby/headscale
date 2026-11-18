@@ -2319,6 +2319,28 @@ func unionSorted(lists [][]types.NodeID) []types.NodeID {
 	return slices.Clip(slices.Compact(out))
 }
 
+// readers returns the holders of every atom whose holders see one of id's
+// atoms: a view is the union of its atoms' views, each the holders of the
+// atoms they link to, so these are exactly the nodes whose view holds id.
+func (kc *keyedClasses) readers(id types.NodeID) [][]types.NodeID {
+	rs, ok := kc.sides.sets.Get(id)
+	if !ok {
+		return nil
+	}
+
+	var out [][]types.NodeID
+
+	for l := range rs.All() {
+		for _, r := range kc.adj.readersOf(l) {
+			if h := kc.sides.Holders(r); len(h) > 0 {
+				out = append(out, h)
+			}
+		}
+	}
+
+	return out
+}
+
 // view returns id's view.
 func (kc *keyedClasses) view(id types.NodeID) []types.NodeID {
 	v, _ := kc.viewOf(id)

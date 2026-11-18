@@ -2638,6 +2638,12 @@ func (s *Snapshot) PeerView(id types.NodeID) []types.NodeID {
 	return s.s.Get(s.w.peers).View(id)
 }
 
+// PeerReaders returns the nodes whose view holds id, as lists whose union
+// they are; see [policyv2.PeerClasses.Readers]. Views are not symmetric.
+func (s *Snapshot) PeerReaders(id types.NodeID) [][]types.NodeID {
+	return s.s.Get(s.w.peers).Readers(id)
+}
+
 // PeerViews returns every distinct view; see [Snapshot.PeerView].
 func (s *Snapshot) PeerViews() [][]types.NodeID { return s.s.Get(s.w.peers).Views() }
 

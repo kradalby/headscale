@@ -681,16 +681,19 @@ func (h *Hub) advance(snap *state.Snapshot) {
 //     or its policy capabilities changed, its packet filter or SSH policy
 //     can have changed, or its side set or side facts did, which the
 //     routes every peer offers it read;
-//   - a node's peers before and after, when it changed, its primary
-//     routes moved, its capabilities changed, or it serves a route whose
-//     cover moved, which the routes it offers them read;
-//   - the peers of every node serving routes, when what every route reads
-//     moved.
+//   - the nodes that see a node before and after, when it changed, its
+//     primary routes moved, its capabilities changed, or it serves a route
+//     whose cover moved, which the routes it offers them read;
+//   - the nodes that see any node serving routes, when what every route
+//     reads moved.
 //
-// Peer visibility is symmetric, so a node's peers are the nodes that see
-// it. An online flip needs no check of the node's role (router, relay,
-// via): a peer's map reads the node's online state only through the
-// node's own entry and the primaries, and both wake the peer.
+// Peer visibility is not symmetric: an exit node sees every source of a
+// capability grant whose destination reaches the internet, which does not
+// see it. So the nodes a change reaches are the node's readers
+// ([state.Snapshot.PeerReaders]), not its own view. An online flip needs no
+// check of the node's role (router, relay, via): a peer's map reads the
+// node's online state only through the node's own entry and the primaries,
+// and both wake the peer.
 func Route(old, cur *state.Snapshot, c state.Change) (bool, map[types.NodeID]struct{}) {
 	if old == nil || c.Global {
 		return true, nil
@@ -733,9 +736,9 @@ func Route(old, cur *state.Snapshot, c state.Change) (bool, map[types.NodeID]str
 	return false, wake
 }
 
-// reachedViews returns the distinct peer views, before and after, of the
-// nodes in ids. Nodes of a class share one view, so a change of many nodes
-// walks each view once rather than once per node.
+// reachedViews returns, as distinct lists, the nodes that see a node of ids
+// before and after. The lists are shared holder lists, so a change of many
+// nodes walks each once rather than once per node.
 func reachedViews(old, cur *state.Snapshot, ids ...[]types.NodeID) [][]types.NodeID {
 	type viewKey struct {
 		first *types.NodeID
@@ -748,7 +751,7 @@ func reachedViews(old, cur *state.Snapshot, ids ...[]types.NodeID) [][]types.Nod
 
 	for _, group := range ids {
 		for _, id := range group {
-			for _, v := range [2][]types.NodeID{old.PeerView(id), cur.PeerView(id)} {
+			for _, v := range slices.Concat(old.PeerReaders(id), cur.PeerReaders(id)) {
 				if len(v) == 0 {
 					continue
 				}
