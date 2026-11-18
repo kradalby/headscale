@@ -890,9 +890,25 @@ func (pm *PolicyManager) HasSSH() bool {
 func (pm *PolicyManager) sshChangedNodes(prev *PolicyManager) ([]types.NodeID, bool) {
 	// SSH prepares on first use: until a session has asked prev, there is
 	// nothing to compare, and one may still render from it.
+	//
+	// TODO(kradalby): overwake/since-ssh-unprepared: that all wakes every
+	// session; fixing it takes preparing prev's rules here, at the cost of
+	// the preparation sessions would have made. No upstream reference:
+	// headscale's own SSH routing.
 	if (len(pm.pol.SSHs) > 0 || prev.pol != nil && len(prev.pol.SSHs) > 0) && prev.sshPreps.Size() == 0 {
 		return nil, true
 	}
+
+	// TODO(kradalby): overwake/ssh-changed-nodes: every node in the
+	// destinations of a rule that prepared differently is named, with the
+	// owners' nodes for autogroup:self and the sources with localpart
+	// users, though most of their SSH policies do not move (a member
+	// joining an SSH rule's source group names every destination whose
+	// policy lists principals by user). Safe: a wake and an SSH policy
+	// resent unchanged. Fixing it takes comparing each named node's
+	// prepared policy at both ends. Tolerated by the ssh class of
+	// ruleClass in TestSessionsFollowGeneratedScenarios. SSH:
+	// https://tailscale.com/docs/features/tailscale-ssh.
 
 	var (
 		ranges []netipx.IPRange
@@ -1196,6 +1212,8 @@ var compileIDs atomic.Uint64
 //
 // TODO(capsrc/compile): change routing reads the served cells, not this;
 // it goes with the compile's filter.
+// TODO(kradalby): capsrc/compile: no upstream reference: the compile is
+// headscale's own.
 func (pm *PolicyManager) SameForPeers(prev *PolicyManager) bool {
 	return pm != nil && prev != nil &&
 		!pm.needsPerNodeFilter && !prev.needsPerNodeFilter &&

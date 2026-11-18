@@ -1392,6 +1392,13 @@ func changedFilters(o, n *Filters) filterChange { return routeFilters(o, n, fals
 func routeFilters(o, n *Filters, narrow bool) filterChange {
 	all := filterChange{all: true}
 
+	// TODO(kradalby): overwake/since-expansion-failed: templates that do not
+	// expand name every node, which Snapshot.Since turns into waking every
+	// session; only a template naming an alias its table lacks fails here,
+	// which a table describing the document never holds. Name nothing past
+	// the failure instead once that is shown unreachable. Tolerated by
+	// TestSinceSoundOverAnyPair (global changes are not judged). No upstream
+	// reference: headscale's own templates.
 	xo, err := o.expansion()
 	if err != nil {
 		return all
@@ -1442,6 +1449,21 @@ func routeFilters(o, n *Filters, narrow bool) filterChange {
 		// cover and address indexes; a stale one admits traffic into its
 		// subnets, so a moved rule recuts every router rather than trust
 		// them.
+		//
+		// TODO(kradalby): overwake/routers-wholesale: every exit node and
+		// subnet router is named, recut and woken whenever any rule moved,
+		// though most rules reach none of them (a join into a group a rule to
+		// one tag names). Kept wholesale by decision, so a router's filter
+		// never depends on incremental indexes only the debug audit checks:
+		// a stale router filter admits traffic into a subnet. The narrow set
+		// beside it (narrow, holders and destinations without routers) is
+		// held sound by TestFiltersChangedSoundPreciseAndCarried and
+		// TestFiltersChangedCoversEveryMovedFilter; switching to it needs a
+		// production-path check of the indexes. Tolerated by
+		// addressOnlyMeasure in TestFiltersChangedSoundPreciseAndCarried and
+		// by the routers TestSessionsFollowGeneratedScenarios leaves out of
+		// its join law. Subnet routers: docs/ref/routes.md. No upstream
+		// reference: the decision is headscale's.
 		if !r.narrow {
 			r.routers()
 		}
@@ -1520,6 +1542,18 @@ func compareFilters(o, n *Filters) filterChange {
 		was, held := o.held(id)
 		nv, listed := n.node(id)
 
+		// TODO(kradalby): overwake/compare-filters: across a document edit
+		// that changes which selectors or grants there are, every node the
+		// old filters hold a filter of is recut and compared, and every node
+		// they hold none of is named; when they hold none at all, every node
+		// is named and Snapshot.Since wakes everyone
+		// (overwake/since-filters-unheld). Accepted: document edits are rare
+		// and the cuts are what the next renders read. Fixing it takes
+		// matching grants across tables by content rather than position, on
+		// stable selector identities, so routeFilters can diff them. The
+		// precision clause of TestFiltersChangedSoundPreciseAndCarried skips
+		// document edits for it. No upstream reference: headscale's own
+		// change routing.
 		if !held || !listed {
 			ids = append(ids, id)
 
@@ -1635,6 +1669,9 @@ func (r *filterRoute) movedNodes() {
 		}
 	}
 
+	// TODO(kradalby): overwake/policy-facts-moved: address mode's
+	// counterpart of filterRoute.candidates; same over-name, same fix. No
+	// upstream reference: headscale's own change routing.
 	r.add(r.moved...)
 }
 
@@ -1680,6 +1717,16 @@ func (r *filterRoute) candidates() {
 	}
 
 	routedNodes.Add(uint64(len(r.moved)))
+
+	// TODO(kradalby): overwake/policy-facts-moved: a node whose policy facts
+	// moved is named and recut whether or not its own filter reads what
+	// moved (an approval of a route it does not announce, a retag between
+	// tags no rule tells apart). Safe: it costs a recut; the node's own
+	// session is woken for its node change anyway. Fixing it takes naming it
+	// only through the grants and destinations that read the facts that
+	// moved. Tolerated by unmovedNamed ("policy facts moved") in
+	// TestFiltersChangedSoundPreciseAndCarried. No upstream reference:
+	// headscale's own change routing.
 	r.add(r.moved...)
 
 	r.cands = slices.Concat(r.moved, graph.Changes(r.o.posts.byRole.In, r.n.posts.byRole.In))
@@ -1809,12 +1856,43 @@ func (r *filterRoute) grantDelta(g int) {
 		r.touched, r.moved2 = true, true
 		r.receivers(g, false)
 	case srcMoved || dstMoved:
+		// TODO(kradalby): overwake/address-pair-destinations: when only the
+		// destinations moved, a grant with an app capability or a portless
+		// rule (addressPair) names every receiver in every form, though
+		// such a rule reads only the receiver's own addresses of its
+		// destinations, which filterRoute.destinations names already (a node
+		// leaving the destination of a GRE rule from *). Safe: a wake and a
+		// recut that send nothing. Fixing it takes calling receivers only
+		// when the sources moved, keeping the companions below for moved
+		// destinations. The address form is forced by the client: app
+		// capabilities are granted by address (Filter.CapsWithValues,
+		// https://github.com/tailscale/tailscale/blob/f7c1b8e52600c1926623b29c91972a5ea1364d2f/wgengine/filter/filter.go) and a portless protocol is matched
+		// by address (matches.matchProtoAndIPsOnlyIfAllPorts,
+		// https://github.com/tailscale/tailscale/blob/f7c1b8e52600c1926623b29c91972a5ea1364d2f/wgengine/filter/match.go); tracking
+		// https://github.com/tailscale/tailscale/issues/12542. Tolerated by overNamed
+		// ("address-pair grant receiver") in
+		// TestFiltersChangedSoundPreciseAndCarried and by the
+		// app-or-portless class of ruleClass in
+		// TestSessionsFollowGeneratedScenarios.
 		r.touched, r.moved2 = true, true
 		r.receivers(g, true)
 	}
 
 	// Companions run from the destinations to the sources, which receive
 	// them.
+	//
+	// TODO(kradalby): overwake/companion-receivers: a companion rule's
+	// receivers (the grant's sources) are named whenever the grant's sources
+	// move, though a companion rule reads only the destinations' addresses
+	// and the receiver's own (a node joining the sources of a relay grant
+	// names every other source). Safe: a wake and a recut that send nothing.
+	// Fixing it takes naming them on destination moves only, and the source
+	// that moved as a subject. Companions:
+	// https://tailscale.com/docs/features/taildrive and
+	// https://tailscale.com/docs/features/peer-relay. Tolerated by overNamed
+	// ("companion receiver") in TestFiltersChangedSoundPreciseAndCarried and
+	// by the app-or-portless class of ruleClass in
+	// TestSessionsFollowGeneratedScenarios.
 	if tmpl || srcMoved || dstMoved {
 		for _, s := range r.sides() {
 			if gs := &s.plan.grants[g]; gs.comp {
@@ -1837,6 +1915,17 @@ func (r *filterRoute) grantDelta(g int) {
 // viaRouters adds the via routers of a via grant whose rules can have
 // moved: every node carrying one of its tags at either end.
 func (r *filterRoute) viaRouters(gto, gtn *GrantTemplate) {
+	// TODO(kradalby): overwake/via-tag-holders: every holder of a via grant's
+	// tags is named, though only one serving a route the grant's
+	// destinations overlap, or an exit route, is cut a via rule (cutVia);
+	// a holder serving none, or one sent capability form, holds nothing of
+	// the grant (a member joining the sources names a tagged node with no
+	// routes). Safe: a wake and a recut that send nothing. Fixing it takes
+	// naming the tag holders that serve such a route, at either end. Via:
+	// https://tailscale.com/docs/reference/syntax/grants. Tolerated by
+	// overNamed ("via tag holder") in
+	// TestFiltersChangedSoundPreciseAndCarried and by the via class of
+	// ruleClass in TestSessionsFollowGeneratedScenarios.
 	r.touched = true
 
 	for _, gt := range [2]*GrantTemplate{gto, gtn} {
@@ -1858,6 +1947,18 @@ func (r *filterRoute) anchorsDelta() {
 	if !r.moved2 {
 		return
 	}
+
+	// TODO(kradalby): overwake/address-form-only: once any grant's sources or
+	// destinations resolve otherwise, every grant's receivers and every owner
+	// are named in address form, though a merge position moves only where a
+	// merge key was gained or lost before a rule; with receivers(addressOnly)
+	// it names every address-form receiver of a grant whose address form
+	// alone moved. Safe: it reaches only nodes sent addresses (routers,
+	// unknown clients, local nets), each recut and woken. Fixing it takes the
+	// merge positions, which need every merge key: only worth it where
+	// address-form receivers are many. Tolerated by addressOnlyMeasure in
+	// TestFiltersChangedSoundPreciseAndCarried. No upstream reference:
+	// address form's merge order is headscale's own.
 
 	for g := range r.n.t.grants {
 		for _, gt := range [2]*GrantTemplate{r.o.t.grants[g], r.n.t.grants[g]} {
@@ -1983,6 +2084,12 @@ func (r *filterRoute) grant(g int) {
 		r.receivers(g, false)
 	case !slices.Equal(geo.srcStrs, gen.srcStrs) || !slices.Equal(geo.capSrcs, gen.capSrcs) ||
 		!slices.Equal(geo.keys, gen.keys) || geo.capGrant != gen.capGrant:
+		// TODO(kradalby): overwake/address-mode-grant-receivers: inherent in
+		// address mode: every receiver of a grant whose sources moved is
+		// named, as address form writes the sources' addresses into every
+		// receiver's filter; capability form is the fix. The companions below
+		// share overwake/companion-receivers. No upstream reference: the
+		// address form is headscale's opt-out.
 		r.touched = true
 		r.receivers(g, true)
 	}
@@ -2032,6 +2139,15 @@ func (r *filterRoute) via(gto, gtn *GrantTemplate, geo, gen *grantExpansion) {
 // holding, or routing over, an address a destination gained or lost, and
 // those inside a literal that moved.
 func (r *filterRoute) destinations(dsts []SelectorID) {
+	// TODO(kradalby): overwake/delta-address-holders: the nodes holding, or
+	// routing over, an address a destination gained or lost are named per
+	// destination, though a node moving between two destinations of one rule
+	// reaches the rule alike (a user renamed so that another destination of
+	// the rule names it). Safe: a recut, and the holder is a subject of the
+	// change. Fixing it takes comparing the receiver's reach of each rule at
+	// both ends. Tolerated by unmovedNamed ("holds an address a destination
+	// gained or lost") in TestFiltersChangedSoundPreciseAndCarried. No
+	// upstream reference: headscale's own change routing.
 	for _, id := range dsts {
 		if d := r.delta[id]; len(d) > 0 {
 			r.touched = true
@@ -2103,6 +2219,19 @@ func (r *filterRoute) self(g int, gt *GrantTemplate, all bool) {
 
 		// An owner whose node began or stopped sharing an address with a
 		// node not theirs is sent its rules in the other form.
+		//
+		// TODO(kradalby): overwake/owner-sharing-flip: such an owner's nodes
+		// are named in every form, though the flip moves only the rules a
+		// shared address sends as addresses (an owner node sharing an
+		// address with another user's node that joins or leaves). Safe: a
+		// recut. Fixing it takes naming them in the form whose self rules the
+		// flip moves. The flip exists because the client asks one node per
+		// address (LocalBackend.srcIPHasCapForFilter,
+		// https://github.com/tailscale/tailscale/blob/f7c1b8e52600c1926623b29c91972a5ea1364d2f/ipn/ipnlocal/local.go); tracking
+		// https://github.com/tailscale/tailscale/issues/12542. Tolerated by unmovedNamed ("owner
+		// sharing flipped") in TestFiltersChangedSoundPreciseAndCarried and by
+		// the shared-address class of ruleClass in
+		// TestSessionsFollowGeneratedScenarios.
 		if r.caps {
 			was, is := r.xo.capForms().ownerShared, r.xn.capForms().ownerShared
 			for _, m := range [2]map[uint]bool{was, is} {
@@ -2121,6 +2250,19 @@ func (r *filterRoute) self(g int, gt *GrantTemplate, all bool) {
 
 	r.touched = true
 
+	// TODO(kradalby): overwake/self-owners-every-form: an owner's nodes are
+	// named in every form unless its self rules go as its capability at both
+	// ends naming its nodes alike (selfAddressOnly); a self rule from a
+	// source that is no identity, an app self grant (selfCapabilityOnly
+	// declines every one), or a source whose naming moved without moving
+	// the capability rule names them all (an owner node joining under
+	// `* -> autogroup:self:22`). Safe: a recut and a wake. Fixing it takes
+	// telling, per owner and form, whether the cut self rules moved. Self:
+	// https://tailscale.com/docs/reference/targets-and-selectors#autogroupself.
+	// Tolerated by unmovedNamed ("self owner whose rules are not
+	// capability-only alike at both ends") in
+	// TestFiltersChangedSoundPreciseAndCarried and by the self class of
+	// ruleClass in TestSessionsFollowGeneratedScenarios.
 	if !r.caps || all {
 		r.ownerNodes(owners)
 

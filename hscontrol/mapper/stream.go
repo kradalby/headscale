@@ -514,6 +514,15 @@ type renderShard struct {
 	// routing has gone past. They hold what they held before, which no
 	// routing describes, so the next routing wakes them whatever it names:
 	// only a new snapshot can render otherwise.
+	//
+	// TODO(kradalby): overwake/failed-render-rewake: a session whose render
+	// keeps failing is woken and renders again at every routing, whatever
+	// the routing names, until a render succeeds (a node whose own stored
+	// data fails to render). Safe: it costs a render per routing and keeps
+	// the session converging once it can. Fixing it takes waking it only
+	// when the routing's change reaches what failed, or backing off. No
+	// test bounds it: the hub properties hold convergence only. No upstream
+	// reference: headscale's own hub.
 	failed []types.NodeID
 }
 
@@ -668,6 +677,14 @@ func (sh *renderShard) between(l *renderLog, out []types.NodeID, weigh []renderD
 
 	kept := sh.done[:0]
 
+	// TODO(kradalby): overwake/render-log-stale-entries: every render a
+	// session ended since the last routing is weighed, also one older than
+	// a later render of the same session, which can wake it again for a
+	// change its later render already holds (a session woken twice between
+	// two routings). Safe: a render that sends nothing. Fixing it takes
+	// keeping each session's latest render only. No test bounds it: the
+	// hub properties hold convergence only. No upstream reference:
+	// headscale's own hub.
 	for _, d := range sh.done {
 		switch rev := d.snap.Rev(); {
 		case rev > to.Rev():
@@ -1019,6 +1036,16 @@ func Route(old, cur *state.Snapshot, c state.Change) (bool, map[types.NodeID]str
 
 	// A node whose change no map renders wakes nobody; its health reaches
 	// the election, and so Primaries, on its own.
+	//
+	// TODO(kradalby): overwake/announce-readers: SameRender reads the node's
+	// own render and its peer render as one, so a change only its own map
+	// shows (the routes it announces, which no peer render carries) wakes
+	// every node that sees it for nothing. Safe: wakes that send nothing.
+	// Fixing it takes telling the node's own render from its peer render
+	// here: the node itself for the first, its viewers for the second.
+	// Tolerated by the woken-with-nothing-to-send ceiling of
+	// TestSessionsFollowGeneratedScenarios. No upstream reference: the
+	// render split is headscale's.
 	nodes := slices.DeleteFunc(slices.Clone(c.Nodes), func(id types.NodeID) bool {
 		was, wasOK := old.GetNode(id)
 		is, isOK := cur.GetNode(id)
@@ -1033,6 +1060,15 @@ func Route(old, cur *state.Snapshot, c state.Change) (bool, map[types.NodeID]str
 	add(c.Caps)
 	add(c.RouteViewers)
 
+	// TODO(kradalby): overwake/stamp-viewers, overwake/routers-cover,
+	// overwake/all-routers: every node that sees a node of Caps, Routers, or,
+	// with AllRouters, any routed node, is woken whole, whether or not what
+	// it is sent of that node moved; see those keys at their sources
+	// (PeerCapMap, Sides.RoutersMovedSince, Snapshot.Since). Readers woken
+	// so are a large part of the sessions woken for nothing between
+	// neighbouring commits, which the ceiling of
+	// TestSessionsFollowGeneratedScenarios pins. No upstream reference:
+	// headscale's own routing.
 	viewed := [][]types.NodeID{nodes, c.Primaries, c.Caps, c.Routers}
 
 	if c.AllRouters {

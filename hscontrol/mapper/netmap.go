@@ -785,6 +785,12 @@ func (r *renderer) routedCandidates(snap *state.Snapshot, self types.NodeView, k
 		// The rules or the viewer's own side can move any router's routes
 		// for this viewer: route access and via steering read its side set
 		// and facts, which nothing else here follows.
+		//
+		// TODO(kradalby): overwake/route-viewers, overwake/all-routers: so
+		// every routed peer is rendered again for a viewer whose side set or
+		// facts moved, or after any rule edit, though few of their routes
+		// move; the routing side of both is at Sides.ViewersMovedSince and
+		// Snapshot.Since. No upstream reference: headscale's own renderer.
 		r.routedPrimaries = nil
 
 		for _, id := range snap.RoutedNodes() {

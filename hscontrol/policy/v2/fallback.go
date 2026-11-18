@@ -80,6 +80,15 @@ const (
 	reasonAddressMode
 
 	// TODO(capsrc/client): lift when every client headscale serves applies peers' node caps to cap: sources; canary TestTailscaleRustCapabilitySources
+	// TODO(kradalby): capsrc/client: tailscale-rs hands its packet filter no
+	// node capabilities; upstream: `TODO(npry): wire in nodecaps` in
+	// Dataplane.process_inbound,
+	// https://github.com/tailscale/tailscale-rs/blob/f9157a9938c8a33be31ef5146b310c30229321a9/ts_dataplane/src/lib.rs.
+	// The Tailscale client matches capability sources since
+	// https://github.com/tailscale/tailscale/pull/12543 and passes them to its
+	// filter since https://github.com/tailscale/tailscale/pull/14067, whose
+	// release is the floor officialClient checks; tracking
+	// https://github.com/tailscale/tailscale/issues/12542.
 	//
 	// reasonClient: the receiving node's client is not known to apply
 	// capability sources. tailscale-rs parses them but looks no caps up,
@@ -87,6 +96,18 @@ const (
 	reasonClient
 
 	// TODO(capsrc/local-nets): lift when the client checks a rule's destinations for capability sources on ICMP; canary TestCanaryICMPIgnoresDstsForCaps
+	// TODO(kradalby): capsrc/local-nets: on ICMP the client accepts any
+	// source holding a capability any rule names, without the rule's
+	// destinations (matches.matchIPsOnly,
+	// https://github.com/tailscale/tailscale/blob/f7c1b8e52600c1926623b29c91972a5ea1364d2f/wgengine/filter/match.go),
+	// so only a node whose local nets are its own addresses is safe; local
+	// nets come from the node's own preferences: advertised routes, app
+	// connector, service IPs (LocalBackend.updateFilterLocked,
+	// https://github.com/tailscale/tailscale/blob/f7c1b8e52600c1926623b29c91972a5ea1364d2f/ipn/ipnlocal/local.go).
+	// Tracking https://github.com/tailscale/tailscale/issues/12542. Lifting this also
+	// sends via routers capability form, which capFormFor and the stamp
+	// table cut no via rule for: they must first (TestFormShortcutsAgreeWithSourceForm
+	// counts the premise breaking with this reason off).
 	//
 	// reasonLocalNets: the receiver handles more than its own addresses:
 	// it announces routes (approved or not), is an app connector, or hosts
@@ -95,12 +116,23 @@ const (
 	reasonLocalNets
 
 	// TODO(capsrc/cap-grant): lift when CapsWithValues honours SrcCaps; canary TestCanaryCapsWithValuesIgnoresSrcCaps
+	// TODO(kradalby): capsrc/cap-grant: the client grants app capabilities by
+	// a rule's addresses only (Filter.CapsWithValues, and capMatchesFunc,
+	// which keeps a capability rule's addresses alone, both in
+	// https://github.com/tailscale/tailscale/blob/f7c1b8e52600c1926623b29c91972a5ea1364d2f/wgengine/filter/filter.go).
+	// Tracking https://github.com/tailscale/tailscale/issues/12542; app capabilities:
+	// https://tailscale.com/docs/features/access-control/grants.
 	//
 	// reasonCapGrant: the rule grants app capabilities, which the client
 	// grants by address only.
 	reasonCapGrant
 
 	// TODO(capsrc/portless): lift when the client's path for protocols without ports honours SrcCaps; canary TestCanaryPortlessIgnoresSrcCaps
+	// TODO(kradalby): capsrc/portless: the client matches a protocol without
+	// ports by address only (matches.matchProtoAndIPsOnlyIfAllPorts,
+	// https://github.com/tailscale/tailscale/blob/f7c1b8e52600c1926623b29c91972a5ea1364d2f/wgengine/filter/match.go,
+	// reached from Filter.runIn4 and Filter.runIn6 in filter.go). Tracking
+	// https://github.com/tailscale/tailscale/issues/12542.
 	//
 	// reasonPortless: the rule names a protocol other than TCP, UDP, SCTP
 	// and ICMP, which the client matches by address only.
@@ -111,6 +143,17 @@ const (
 	reasonLiteral
 
 	// TODO(capsrc/shared-address): lift when the client checks every node holding a source address; canary TestCanaryCapLookupOneNodePerAddress
+	// TODO(kradalby): capsrc/shared-address: the client asks the one node its
+	// netmap indexed last for an address (LocalBackend.srcIPHasCapForFilter,
+	// https://github.com/tailscale/tailscale/blob/f7c1b8e52600c1926623b29c91972a5ea1364d2f/ipn/ipnlocal/local.go,
+	// through nodeBackend.NodeByAddr and updateNodeByAddrLocked in
+	// node_backend.go), and a delta removal drops the address without
+	// pointing it at its other holder (nodeBackend.UpdateNetmapDelta, same
+	// file); upstream, on srcIPHasCapForFilter: `TODO(bradfitz): optimize
+	// this later if/when it matters.` and `TODO(nickkhyl): move this into
+	// [nodeBackend] along with [LocalBackend.updateFilterLocked].` Tracking
+	// https://github.com/tailscale/tailscale/issues/12542; the lookup refuses unsigned peers
+	// since https://github.com/tailscale/tailscale/pull/20513.
 	//
 	// reasonSharedAddress: a node outside the selector holds an address
 	// of one of its members, or, for an autogroup:self rule, a node not
@@ -927,6 +970,16 @@ func (x *Expansion) selectorForms(ids []SelectorID, capGrant, wildcard bool, ci 
 // nodes but the receiver.
 func (x *Expansion) selfCapabilityOnly(g int, uid uint, named []selfNaming) bool {
 	gt := x.t.grants[g]
+
+	// TODO(kradalby): overwake/self-owners-every-form: an app self grant is
+	// declined outright, though capFormSelf cuts its rules as the owner's
+	// capability when no fallback applies to them, so routing names its
+	// owners in every form. Fixing it takes asking ruleForm and selfForm of
+	// the app rule as capFormSelf does. Tolerated by
+	// TestFormShortcutsAgreeWithSourceForm ("selfCapabilityOnly declines an
+	// app self grant") and unmovedNamed in
+	// TestFiltersChangedSoundPreciseAndCarried. No upstream reference:
+	// headscale's own routing shortcut.
 	if gt.app != nil {
 		return false
 	}

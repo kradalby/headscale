@@ -770,6 +770,15 @@ func (s Sides) RoutersMovedSince(c RouteCover) []types.NodeID {
 		return nil
 	}
 
+	// TODO(kradalby): overwake/routers-cover: a router whose route's cover
+	// gained or lost an atom is named, and every viewer of it woken and its
+	// routes rendered again, though route access reads only the atoms a
+	// rule's other side names (a node joining a subnet under a policy whose
+	// rules never mention what it brings). Safe: a wake and a render that
+	// send nothing. Fixing it takes keeping, per route, only the atoms route
+	// access reads. TestSinceSoundOverAnyPair counts it ("Routers named, no
+	// route moved"). No upstream reference: headscale's own route access.
+
 	var out []types.NodeID
 
 	for _, p := range graph.Changes(c.m, s.cover) {
@@ -840,6 +849,18 @@ func (s Sides) ViewersMovedSince(old Sides) []types.NodeID {
 	if s.sidesState == nil || old.sidesState == nil || s.sidesState == old.sidesState {
 		return nil
 	}
+
+	// TODO(kradalby): overwake/route-viewers: a node whose side set moved is
+	// woken, and every routed peer rendered again for it, though a side set
+	// moving rarely moves a route a peer offers it (a member joining a group
+	// no rule reaching a route names). Safe: a wake and a render that send
+	// nothing; it is most of the sessions woken for nothing between
+	// neighbouring commits. Fixing it takes comparing the side atoms route
+	// access reads, or route access itself, for the viewer. Counted by
+	// TestSinceSoundOverAnyPair ("RouteViewers named, no route moved") and
+	// by the woken-with-nothing-to-send ceiling of
+	// TestSessionsFollowGeneratedScenarios. No upstream reference:
+	// headscale's own route access.
 
 	out := graph.Changes(old.sets, s.sets)
 

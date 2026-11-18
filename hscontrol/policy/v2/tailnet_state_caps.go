@@ -36,6 +36,18 @@ func PeerCapMap(peer types.NodeView, peerSelfCaps tailcfg.NodeCapMap, stamped bo
 	// a viewer's filter names them, and the viewer looks them up on the peer.
 	//
 	// TODO(capsrc/trim): lift when per-viewer trimming is worth giving up renders shared across viewers; every viewer sees every selector a peer is in
+	// TODO(kradalby): capsrc/trim, overwake/stamp-viewers: so a stamp that
+	// comes or goes wakes every viewer of the restamped node and sends each
+	// the node's whole CapMap, whether or not any of the viewer's rules
+	// names the stamp (a group edit restamps its users' nodes for the whole
+	// tailnet); the client applies a CapMap patch by rebuilding its netmap,
+	// a CapMap change being no NodeMutation (NodeMutationsFromPatch,
+	// https://github.com/tailscale/tailscale/blob/f7c1b8e52600c1926623b29c91972a5ea1364d2f/types/netmap/nodemut.go;
+	// the delta work under https://github.com/tailscale/tailscale/issues/12542). Mapper.Route
+	// wakes them through Change.Caps. Fixing it takes rendering each peer
+	// per viewer with the stamps the viewer's own rules name, giving up the
+	// renders shared across viewers. No test tolerates it: the stamps are
+	// what TestStampsFollowReference and TestWorldMatchesScratchWorld hold.
 	for c := range peerSelfCaps {
 		if stamped && IsSourceCap(string(c)) {
 			mak.Set(&out, c, nil)

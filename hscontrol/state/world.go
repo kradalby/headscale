@@ -549,6 +549,9 @@ func newWorldMode(nodes types.Nodes, users []types.User, polSrc []byte, dns type
 	//
 	// TODO(capsrc/compile): which document is in force is the compile's
 	// verdict; it moves here when the compile's filter and peers go.
+	// TODO(kradalby): capsrc/compile: no upstream reference: the compile is
+	// headscale's own and goes once nothing but the document in force reads
+	// it (SSH, node attributes, tag owners, auto-approvers and DERP still do).
 	w.selectors = graph.NewDerived(g, "selectors", graph.Same[*policyv2.Selectors],
 		func(s *graph.Snapshot, prev *policyv2.Selectors) *policyv2.Selectors {
 			pm, _ := s.Get(w.policy).pm.(*policyv2.PolicyManager)
@@ -3005,6 +3008,24 @@ func (s *Snapshot) Since(old *Snapshot) Change {
 	if s.Rev() > old.Rev()+1 {
 		var complete bool
 
+		// TODO(kradalby): overwake/since-coalesced-nodes: across coalesced
+		// commits Nodes holds every node written between, also one written
+		// back to what it was, whose viewers holding old's render have
+		// nothing to receive (a node going offline and online again between
+		// two routings). It predates the render log, which now wakes the
+		// sessions that rendered in between; dropping such nodes takes
+		// confirming nothing else leans on them. Counted by
+		// TestSinceSoundOverAnyPair ("Nodes named across coalesced commits,
+		// render unchanged").
+		//
+		// TODO(kradalby): overwake/since-node-log: past the node log's reach
+		// (more commits between the two snapshots than it holds) the change
+		// is Resync and Global: every session renders afresh. Safe; bounded by
+		// the log. Fixing it takes diffing the two node maps when the log
+		// cannot say. Not judged by TestSinceSoundOverAnyPair (a global change
+		// answers everything).
+		//
+		// No upstream reference for either: headscale's own change routing.
 		c.Nodes, complete = s.NodesTouchedSince(old.NodesVersion())
 		c.Resync = !complete
 
@@ -3040,6 +3061,13 @@ func (s *Snapshot) Since(old *Snapshot) Change {
 			filters, all = cur.Changed(was)
 		}
 
+		// TODO(kradalby): overwake/since-filters-unheld,
+		// overwake/since-expansion-failed: the filters say all when they
+		// name every node, which is exact, but also when the old filters
+		// hold nothing to compare across a document edit (compareFilters)
+		// or the templates do not expand (routeFilters): every session is
+		// woken then. Not judged by TestSinceSoundOverAnyPair. No upstream
+		// reference: headscale's own change routing.
 		if all {
 			c.Global = true
 		}
@@ -3057,6 +3085,13 @@ func (s *Snapshot) Since(old *Snapshot) Change {
 		next, _ := s.Policy().(*policyv2.PolicyManager)
 		last, _ := old.Policy().(*policyv2.PolicyManager)
 
+		// TODO(kradalby): overwake/since-ssh-unprepared: the compile says all
+		// when no session has asked the last compile's SSH policy, so a
+		// document edit or join under SSH rules wakes everyone; and it names
+		// nodes whose SSH policy did not move (overwake/ssh-changed-nodes,
+		// at PolicyManager.sshChangedNodes). SSH is the compile's to route
+		// until it moves to the served cells. No upstream reference:
+		// headscale's own change routing.
 		ssh, all := next.SSHChangedNodes(last)
 		if all {
 			c.Global = true
@@ -3097,6 +3132,14 @@ func (s *Snapshot) Since(old *Snapshot) Change {
 		c.Routers = sides.RoutersMovedSince(was.RouteCover())
 	}
 
+	// TODO(kradalby): overwake/all-routers: any document edit that changes
+	// the rules route access or via steering reads by content wakes every
+	// router's viewers and renders every routed peer again for every viewer
+	// (a port edit on a rule between two users with no routes). Safe: wakes
+	// and renders that send nothing. Fixing it takes naming the routers
+	// whose routes a moved rule can reach. Counted by
+	// TestSinceSoundOverAnyPair ("AllRouters set, no route moved"). No
+	// upstream reference: headscale's own route access.
 	c.AllRouters = s.RouteRulesRev() != old.RouteRulesRev()
 
 	return c
