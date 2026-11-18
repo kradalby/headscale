@@ -2,7 +2,9 @@ package policymodel
 
 import (
 	"net/netip"
+	"reflect"
 	"slices"
+	"strconv"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"pgregory.net/rapid"
@@ -11,32 +13,53 @@ import (
 // Every draw is shaped so that shrinking it towards zero gives the plain
 // case: the first alternative, false flags, the smallest counts, a node
 // on its own addresses. A rare shape sits behind a [chance], which is
-// false at zero, so a minimised case shows only the coincidences the
-// failure needs.
+// false at zero, and both sides of a chance make the same draws, so that
+// lowering it is all rapid needs to take the rare shape out. Lists are
+// rapid lists of whole elements, which the shrinker deletes one by one.
+//
+// What is drawn is what headscale's own writes produce, with two
+// exceptions it reaches only through its database: addresses outside the
+// tailnet, shared between nodes, missing, or changed after registration.
+// They stay, rarely, because headscale's code handles them.
 
-// Policies draws a policy headscale accepts: at least one rule.
+// Policies draws a policy: at least one rule, or rarely none, allowing
+// everything.
 func Policies() *rapid.Generator[Policy] { return policies }
 
 // Topologies draws users and nodes: at least one of each, the first user
 // always alice.
 func Topologies() *rapid.Generator[Topology] { return topologies }
 
-// Worlds draws a policy and a topology, independently: the vocabulary is
-// small enough that they name each other often.
+// Worlds draws a policy and a topology, as headscale holds them once its
+// users are created, its policy is written and its nodes registered: the
+// policy names no token two users answer to and defines every tag a node
+// carries, and registration auto-approved what nodes announce.
 func Worlds() *rapid.Generator[World] { return worlds }
 
 // Scenarios draws a world and up to maxSteps steps from it, fewer on
 // average. Each step is drawn against the world the earlier ones produce,
-// so every edit is valid where it lands, and the policy stays one
-// headscale accepts.
+// so every edit is a write headscale accepts where it lands.
 func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 	return rapid.Custom(func(t *rapid.T) Scenario {
 		s := Scenario{Start: worlds.Draw(t, "start")}
 		w := s.Start
 
+		// One in eight starts with a node's form flipping, its address
+		// moving and its form flipping back, unread until the end: the
+		// carried-filter sequence no run of single draws reaches.
+		script := chance(t, 8, "flip-script")
+		who := rapid.IntRange(0, 15).Draw(t, "flipper")
+
+		if script {
+			for _, st := range flipScript(w, who) {
+				w = w.Apply(st.Edits...)
+				s.Steps = append(s.Steps, st)
+			}
+		}
+
 		step := rapid.Custom(func(t *rapid.T) Step {
 			st := Steps(w).Draw(t, "step")
-			w = w.Apply(st...)
+			w = w.Apply(st.Edits...)
 
 			return st
 		})
@@ -44,7 +67,7 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 		// Steps come in runs of a few: rapid's lists average five
 		// elements, and each step and each run is a group the shrinker
 		// can delete whole.
-		runs := rapid.SliceOfN(rapid.SliceOfN(step, 1, 5), 0, (maxSteps+2)/3).Draw(t, "steps")
+		runs := rapid.SliceOfN(rapid.SliceOfN(step, 1, 5), 0, (maxSteps+1)/2).Draw(t, "steps")
 		for _, run := range runs {
 			s.Steps = append(s.Steps, run...)
 		}
@@ -57,12 +80,58 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 	})
 }
 
+// flipScript is three steps on an eligible node of w: its client stops
+// being official, its address moves, its client is official again, and
+// then it reads.
+func flipScript(w World, who int) []Step {
+	v := NewView(w)
+
+	var eligible []Node
+
+	for _, n := range w.Topology.Nodes {
+		if v.Eligible(n) {
+			eligible = append(eligible, n)
+		}
+	}
+
+	if len(eligible) == 0 {
+		return nil
+	}
+
+	n := eligible[who%len(eligible)]
+
+	to := movedAddr(4, uint64(n.ID))
+	if n.V4 == to {
+		to = ownAddr(4, uint64(n.ID))
+	}
+
+	return []Step{
+		{Edits: []Edit{SetClient{n.ID, Unknown}}},
+		{Edits: []Edit{SetAddr{n.ID, 4, to}}},
+		{Edits: []Edit{SetClient{n.ID, Official}}, Reads: []types.NodeID{n.ID}},
+	}
+}
+
 // Steps draws one step valid against w, for a state machine that takes
 // its steps as it goes: one edit mostly; sometimes several committed
-// together, a node deleted and another registered with its address or
-// ID, or a route announced and approved in one write.
+// together, a node deleted and another registered at its address, or a
+// route announced and approved in one go; then which sessions read.
 func Steps(w World) *rapid.Generator[Step] {
-	return rapid.Custom(func(t *rapid.T) Step { return drawStep(t, w) })
+	return rapid.Custom(func(t *rapid.T) Step {
+		st := Step{Edits: drawEdits(t, w)}
+		next := w.Apply(st.Edits...)
+
+		all := chance(t, 4, "all-read")
+		some := rapid.SliceOfN(rapid.IntRange(0, 15), 0, 2).Draw(t, "reads")
+
+		for i, n := range next.Topology.Nodes {
+			if all || slices.ContainsFunc(some, func(r int) bool { return r%len(next.Topology.Nodes) == i }) {
+				st.Reads = append(st.Reads, n.ID)
+			}
+		}
+
+		return st
+	})
 }
 
 var (
@@ -73,9 +142,159 @@ var (
 		return canonTopology(drawTopology(t))
 	})
 	worlds = rapid.Custom(func(t *rapid.T) World {
-		return World{Policy: policies.Draw(t, "policy"), Topology: topologies.Draw(t, "topology")}
+		w := World{Policy: policies.Draw(t, "policy"), Topology: topologies.Draw(t, "topology")}
+
+		// Shapes a policy and a topology make only together, each in one
+		// world in eight to twelve: a tag a rule's destination names whose nodes
+		// lose their addresses; an own rule that reaches nothing on its
+		// receiver yet places a merged rule; an app grant to public space
+		// that exits see one way.
+		hide := chance(t, 12, "hidden-tag")
+		anchor := chance(t, 8, "own-anchor")
+		oneWay := chance(t, 8, "one-way-world")
+		who := rapid.IntRange(0, 15).Draw(t, "who")
+
+		if hide {
+			hideTag(&w, who)
+		}
+
+		if anchor {
+			ownAnchor(&w, who)
+		}
+
+		if oneWay {
+			oneWayWorld(&w, who)
+		}
+
+		return settle(w)
 	})
 )
+
+// ownAnchor puts in front of w's ACLs a self rule and a shared rule of one
+// key, alice's to port 22, with a rule of another key between, and makes
+// a node of w alice's router of 10.0.0.0/24 without addresses: its own
+// self rule reaches nothing on it, yet places where the shared rule,
+// which reaches its route, merges.
+func ownAnchor(w *World, who int) {
+	alice := Sel{Kind: SelUser}
+	ssh := slices.Index(Ports, "22")
+	rules := []Rule{
+		{Src: []Sel{alice}, Dst: []Dest{{Sel: Sel{Kind: SelSelf}, Ports: ssh}}},
+		{Src: []Sel{{Kind: SelAll}}, Dst: []Dest{{Sel: Sel{Kind: SelAll}}}},
+		{Src: []Sel{alice}, Dst: []Dest{{Sel: Sel{Kind: SelPrefix}, Ports: ssh}}},
+	}
+	w.Policy.ACLs, w.Policy.AllowAll = append(rules, w.Policy.ACLs...), false
+
+	nodes := w.Topology.Nodes
+	if len(nodes) < 2 {
+		return
+	}
+
+	// The rules' sources: an alice node with its addresses.
+	a := &nodes[0]
+	a.User, a.Tags = 1, nil
+
+	if len(a.Addrs()) == 0 {
+		a.V4, a.V6 = ownAddr(4, uint64(a.ID)), ownAddr(6, uint64(a.ID))
+	}
+
+	n := &nodes[1+who%(len(nodes)-1)]
+	n.User, n.Tags, n.V4, n.V6 = 1, nil, netip.Addr{}, netip.Addr{}
+	n.Announced, n.Approved = []int{0}, []int{0}
+}
+
+// oneWayWorld leaves w one rule, alice's app grant to public space, and
+// makes a node of w an exit: the exit sees alice's nodes, which do not see
+// it.
+func oneWayWorld(w *World, who int) {
+	w.Policy.ACLs, w.Policy.AllowAll = nil, false
+	w.Policy.Grants = []Rule{{Src: []Sel{{Kind: SelUser}}, Dst: []Dest{{Sel: Sel{Kind: SelPrefix, I: publicPrefix}}}, App: []App{{}}}}
+
+	if nodes := w.Topology.Nodes; len(nodes) > 0 {
+		// Not alice's: her own nodes see each other both ways.
+		n := &nodes[who%len(nodes)]
+		if n.User == 1 {
+			n.Tags, n.User = []int{0}, 0
+		}
+
+		n.Announced, n.Approved = addRoutes(n.Announced, []int{exit4, exit6}), addRoutes(n.Approved, []int{exit4, exit6})
+	}
+}
+
+// hideTag takes the addresses of every node carrying a tag a rule's
+// destination names, tagging one first if none carries it.
+func hideTag(w *World, who int) {
+	tag := -1
+
+	for _, r := range slices.Concat(w.Policy.ACLs, w.Policy.Grants) {
+		for _, d := range r.Dst {
+			if d.Sel.Kind == SelTag && tag < 0 {
+				tag = d.Sel.I
+			}
+		}
+	}
+
+	nodes := w.Topology.Nodes
+	if tag < 0 || len(nodes) == 0 {
+		return
+	}
+
+	if !slices.ContainsFunc(nodes, func(n Node) bool { return slices.Contains(n.Tags, tag) }) {
+		n := &nodes[who%len(nodes)]
+		n.Tags, n.User = []int{tag}, 0
+	}
+
+	for i := range nodes {
+		if slices.Contains(nodes[i].Tags, tag) {
+			nodes[i].V4, nodes[i].V6 = netip.Addr{}, netip.Addr{}
+		}
+	}
+}
+
+// settle makes w a world headscale can hold: its policy accepted for its
+// users, every tag a node carries defined, every node registered with what
+// it announces auto-approved.
+func settle(w World) World {
+	v := NewView(w)
+	w.Policy = w.Policy.mapRefs(func(r int) int { return unambiguous(v, r) })
+
+	for _, n := range w.Topology.Nodes {
+		for _, tag := range n.Tags {
+			if !w.Policy.DefinesTag(tag) {
+				w.Policy.Defined[tag] = true
+			}
+		}
+	}
+
+	// Registration approved what the auto-approvers approve of what each
+	// node announces; an admin approved the rest.
+	v = NewView(w)
+
+	for i, n := range w.Topology.Nodes {
+		for _, r := range n.Announced {
+			if v.Approvable(n, r) {
+				w.Topology.Nodes[i].Approved = addRoutes(w.Topology.Nodes[i].Approved, []int{r})
+				w.Topology.Nodes[i].AutoApproved = addRoutes(w.Topology.Nodes[i].AutoApproved, []int{r})
+			}
+		}
+	}
+
+	canon(&w)
+
+	return w
+}
+
+// unambiguous is ref if it names at most one user in v, else the next
+// token that does: the domain and the provider identifier always do.
+func unambiguous(v *View, ref int) int {
+	for i := range UserRefs {
+		if r := (ref + i) % len(UserRefs); !v.Ambiguous(r) {
+			return r
+		}
+	}
+
+	return ref
+}
 
 // chance is true about once in k draws, and false when shrunk.
 func chance(t *rapid.T, k int, label string) bool {
@@ -85,6 +304,13 @@ func chance(t *rapid.T, k int, label string) bool {
 func index(t *rapid.T, n int, label string) int { return rapid.IntRange(0, n-1).Draw(t, label) }
 
 func pick[E any](t *rapid.T, from []E, label string) E { return from[index(t, len(from), label)] }
+
+// pickAny picks from a list whose length the world decides, with a draw
+// that does not: what it reads stays aligned when shrinking changes the
+// list.
+func pickAny[E any](t *rapid.T, from []E, label string) E {
+	return from[rapid.IntRange(0, 15).Draw(t, label)%len(from)]
+}
 
 // other is an index into n items that is not i.
 func other(t *rapid.T, n, i int, label string) int { return (i + 1 + index(t, n-1, label)) % n }
@@ -126,24 +352,50 @@ func drawSel(t *rapid.T, kinds []SelKind) Sel {
 	return s
 }
 
+// as is s turned into one of kinds, keeping its index where it can, for a
+// rule whose shape narrows what a selector drawn for the general case may
+// be.
+func as(s Sel, kinds []SelKind) Sel {
+	if slices.Contains(kinds, s.Kind) {
+		return s
+	}
+
+	switch {
+	case s.Kind == SelInternet && slices.Contains(kinds, SelPrefix):
+		return Sel{Kind: SelPrefix, I: publicPrefix}
+	case s.Kind == SelAll && slices.Contains(kinds, SelMember):
+		return Sel{Kind: SelMember}
+	case slices.Contains(kinds, SelUser):
+		return Sel{Kind: SelUser, I: s.I % len(UserRefs)}
+	}
+
+	return Sel{Kind: kinds[0], I: s.I % numTags}
+}
+
+func asAll(sels []Sel, kinds []SelKind) []Sel {
+	out := make([]Sel, len(sels))
+	for i, s := range sels {
+		out[i] = as(s, kinds)
+	}
+
+	return out
+}
+
 var (
 	srcs         = rapid.SliceOfN(selGen(srcKinds), 1, 3)
-	selfSrcsACL  = rapid.SliceOfN(selGen(selfSrcACL), 1, 2)
-	selfSrcsGr   = rapid.SliceOfN(selGen(selfSrcGrant), 1, 2)
 	dsts         = rapid.SliceOfN(selGen(dstKinds), 1, 3)
-	appDsts      = rapid.SliceOfN(selGen(appDstKinds), 1, 3)
 	targets      = rapid.SliceOfN(selGen(targetKinds), 1, 2)
 	owners       = rapid.SliceOfN(selGen(ownerKinds), 1, 2)
 	sshSrcs      = rapid.SliceOfN(selGen(sshSrcKinds), 1, 2)
 	sshDsts      = rapid.SliceOfN(selGen(sshDstKinds), 1, 2)
-	sshTagDsts   = rapid.SliceOfN(selGen(sshTaggedDst), 1, 2)
 	sshLogins    = rapid.SliceOfN(rapid.IntRange(0, len(SSHUsers)-1), 1, 2)
 	attrLists    = rapid.SliceOfN(rapid.IntRange(0, len(Attrs)-1), 1, 2)
 	sshRuleLists = rapid.SliceOfN(rapid.Custom(drawSSH), 1, 2)
 	attrRules    = rapid.SliceOfN(rapid.Custom(func(t *rapid.T) NodeAttr {
 		return NodeAttr{Targets: targets.Draw(t, "target"), Attrs: attrLists.Draw(t, "attr")}
 	}), 1, 2)
-	ips = rapid.SliceOfN(rapid.Custom(drawIP), 1, 2)
+	ips       = rapid.SliceOfN(rapid.Custom(drawIP), 1, 2)
+	portDraws = rapid.SliceOfN(rapid.Custom(drawPorts), 3, 3)
 )
 
 func drawPolicy(t *rapid.T) Policy {
@@ -154,19 +406,26 @@ func drawPolicy(t *rapid.T) Policy {
 	}
 
 	for i := range numTags {
-		if chance(t, 3, "owned") {
-			p.TagOwners[i] = owners.Draw(t, "owners")
+		owned := chance(t, 3, "owned")
+		os := owners.Draw(t, "owners")
+
+		if owned {
+			p.TagOwners[i] = os
 		}
+
+		p.Defined[i] = chance(t, 3, "defined")
 	}
 
 	for h := range numHosts {
-		if chance(t, 6, "host-moved") {
-			p.Hosts[h] = 1 + index(t, numRulePrefixes-1, "shift")
+		moved := chance(t, 6, "host-moved")
+		shift := 1 + index(t, numRulePrefixes-1, "shift")
+
+		if moved {
+			p.Hosts[h] = shift
 		}
 	}
 
-	// Lists are drawn as rapid lists, each element seeing those before
-	// it, so the shrinker deletes an element whole.
+	// Each rule sees those before it, so it can take one's sources.
 	rapid.SliceOfN(rapid.Custom(func(t *rapid.T) bool {
 		grant := chance(t, 2, "grant")
 		r := drawRule(t, grant, p)
@@ -179,12 +438,16 @@ func drawPolicy(t *rapid.T) Policy {
 
 	// A capability to public space: the grant that makes exit nodes see
 	// its sources one way.
-	if chance(t, 8, "one-way") {
-		p.Grants = append(p.Grants, Rule{
-			Src: []Sel{drawSel(t, []SelKind{SelMember, SelUser, SelGroup, SelTag})},
-			Dst: []Dest{{Sel: Sel{Kind: SelPrefix, I: 4}}},
-			App: drawApps(t),
-		})
+	oneWay := chance(t, 8, "one-way")
+	src := drawSel(t, []SelKind{SelMember, SelUser, SelGroup, SelTag})
+	apps := drawApps(t)
+
+	if oneWay {
+		p.Grants = append(p.Grants, Rule{Src: []Sel{src}, Dst: []Dest{{Sel: Sel{Kind: SelPrefix, I: publicPrefix}}}, App: apps})
+	}
+
+	if chance(t, 12, "allow-all") {
+		p.ACLs, p.Grants, p.AllowAll = nil, nil, true
 	}
 
 	if chance(t, 3, "ssh") {
@@ -197,6 +460,21 @@ func drawPolicy(t *rapid.T) Policy {
 
 	if chance(t, 4, "autoApprovers") {
 		p.AutoApprovers = drawAutoApprovers(t)
+	}
+
+	// Approvers alice's nodes hold, for the routes and exits they draw
+	// most: so that auto-approval comes up.
+	if chance(t, 6, "approvers-aligned") {
+		alice := Sel{Kind: SelUser}
+
+		i := slices.IndexFunc(p.AutoApprovers.Routes, func(ra RouteApproval) bool { return ra.Route == 1 })
+		if i < 0 {
+			p.AutoApprovers.Routes = append(p.AutoApprovers.Routes, RouteApproval{Route: 1})
+			i = len(p.AutoApprovers.Routes) - 1
+		}
+
+		p.AutoApprovers.Routes[i].By = append(p.AutoApprovers.Routes[i].By, alice)
+		p.AutoApprovers.Exit = append(p.AutoApprovers.Exit, alice)
 	}
 
 	return p
@@ -214,80 +492,84 @@ func drawMembers(t *rapid.T) []int {
 	return out
 }
 
-// drawRule draws an ACL or a grant to add to p. One in four takes the
-// sources of a rule p has, so that two rules share a merge key.
+// drawRule draws an ACL or a grant to add to p. Every rule draws general
+// sources and destinations, protocols and capabilities, then takes what
+// its shape allows of them: a self rule, an app grant, one taking the
+// sources of a rule p has so that they share a merge key.
 func drawRule(t *rapid.T, grant bool, p Policy) Rule {
-	var r Rule
-
 	self := chance(t, 4, "self")
 	app := grant && chance(t, 4, "app")
+	same := chance(t, 3, "same-sources")
+	from := rapid.IntRange(0, 15).Draw(t, "from")
+	src := srcs.Draw(t, "src")
+	dst := dsts.Draw(t, "dst")
+	more := chance(t, 4, "more-dst")
+	public := chance(t, 4, "public-dst")
+	proto := chance(t, 3, "proto")
+	protoIdx := 1 + index(t, len(Protos)-1, "proto")
+	ports := portDraws.Draw(t, "ports")
+	apps := drawApps(t)
+	ipList := ips.Draw(t, "ip")
+	appAndIP := chance(t, 3, "app-and-ip")
+	via := chance(t, 4, "via")
+	viaTag := index(t, numTags, "via-tag")
 
 	selfSrc := selfSrcACL
 	if grant {
 		selfSrc = selfSrcGrant
 	}
 
-	copied := false
+	kinds := dstKinds
+	if app {
+		kinds = appDstKinds
+	}
 
-	if refs := p.Refs(); len(refs) > 0 && chance(t, 4, "same-sources") {
-		ref := pick(t, refs, "from")
-		if from := p.Rule(ref); !self || kindsAll(from.Src, selfSrc) {
-			r.Src, copied = slices.Clone(from.Src), true
-			if !grant && !ref.Grant {
-				r.Proto = from.Proto
-			}
+	var r Rule
+
+	// Self rules take single-user sources most: those are what an
+	// owner's narrowed sources can share a merge key with.
+	if refs := p.Refs(); same && len(refs) > 0 {
+		ref := refs[from%len(refs)]
+		r.Src = slices.Clone(p.Rule(ref).Src)
+
+		if !grant && !ref.Grant {
+			r.Proto = p.Rule(ref).Proto
+			proto = false
 		}
+	} else {
+		r.Src = src
+	}
+
+	if self {
+		r.Src = asAll(r.Src, selfSrc)
 	}
 
 	switch {
-	case copied:
-	case self && grant:
-		r.Src = selfSrcsGr.Draw(t, "src")
 	case self:
-		r.Src = selfSrcsACL.Draw(t, "src")
+		r.Dst = []Dest{{Sel: Sel{Kind: SelSelf}}}
+		if more {
+			r.Dst = append(r.Dst, Dest{Sel: as(dst[0], kinds)})
+		}
 	default:
-		r.Src = srcs.Draw(t, "src")
-	}
-
-	var ds []Sel
-
-	switch {
-	case self:
-		ds = []Sel{{Kind: SelSelf}}
-		if chance(t, 4, "more-dst") {
-			kinds := dstKinds
-			if app {
-				kinds = appDstKinds
-			}
-
-			ds = append(ds, drawSel(t, kinds))
+		for _, d := range asAll(dst, kinds) {
+			r.Dst = append(r.Dst, Dest{Sel: d})
 		}
-	case app:
-		ds = appDsts.Draw(t, "dst")
 
 		// Capabilities to public space make exit nodes see their
 		// sources one way.
-		if chance(t, 4, "public-dst") {
-			ds = append(ds, Sel{Kind: SelPrefix, I: 4})
+		if app && public {
+			r.Dst = append(r.Dst, Dest{Sel: Sel{Kind: SelPrefix, I: publicPrefix}})
 		}
-	default:
-		ds = dsts.Draw(t, "dst")
-	}
-
-	for _, d := range ds {
-		r.Dst = append(r.Dst, Dest{Sel: d})
 	}
 
 	if !grant {
-		if !copied && chance(t, 3, "proto") {
-			r.Proto = 1 + index(t, len(Protos)-1, "proto")
+		if proto {
+			r.Proto = protoIdx
 		}
 
 		if r.Proto < portedProtos {
 			for i := range r.Dst {
-				if chance(t, 2, "ports") {
-					r.Dst[i].Ports = 1 + index(t, len(Ports)-1, "ports")
-				}
+				r.Dst[i].Ports = ports[i%len(ports)]
 			}
 		}
 
@@ -295,16 +577,16 @@ func drawRule(t *rapid.T, grant bool, p Policy) Rule {
 	}
 
 	if app {
-		r.App = drawApps(t)
-		if chance(t, 3, "app-and-ip") {
-			r.IP = ips.Draw(t, "ip")
+		r.App = apps
+		if appAndIP {
+			r.IP = ipList
 		}
 	} else {
-		r.IP = ips.Draw(t, "ip")
+		r.IP = ipList
 	}
 
-	if !self && len(r.IP) > 0 && chance(t, 4, "via") {
-		r.Via = []int{index(t, numTags, "via")}
+	if !self && len(r.IP) > 0 && via {
+		r.Via = []int{viaTag}
 	}
 
 	return r
@@ -314,15 +596,32 @@ func kindsAll(sels []Sel, kinds []SelKind) bool {
 	return !slices.ContainsFunc(sels, func(s Sel) bool { return !slices.Contains(kinds, s.Kind) })
 }
 
+// drawPorts draws an ACL destination's ports: any, mostly.
+func drawPorts(t *rapid.T) int {
+	set := chance(t, 2, "ports")
+	ports := 1 + index(t, len(Ports)-1, "ports")
+
+	if set {
+		return ports
+	}
+
+	return 0
+}
+
 func drawIP(t *rapid.T) IP {
 	var ip IP
 
-	if chance(t, 3, "proto") {
-		ip.Proto = 1 + index(t, len(Protos)-1, "proto")
+	proto := chance(t, 3, "proto")
+	protoIdx := 1 + index(t, len(Protos)-1, "proto")
+	set := chance(t, 2, "ports")
+	ports := 1 + index(t, grantPorts-1, "ports")
+
+	if proto {
+		ip.Proto = protoIdx
 	}
 
-	if ip.Proto < portedProtos && chance(t, 2, "ports") {
-		ip.Ports = 1 + index(t, grantPorts-1, "ports")
+	if ip.Proto < portedProtos && set {
+		ip.Ports = ports
 	}
 
 	return ip
@@ -332,8 +631,11 @@ func drawApps(t *rapid.T) []App {
 	first := index(t, len(Apps), "cap")
 	out := []App{{Cap: first, Value: index(t, len(AppValues), "value")}}
 
-	if chance(t, 4, "second-cap") {
-		out = append(out, App{Cap: other(t, len(Apps), first, "cap"), Value: index(t, len(AppValues), "value")})
+	second := chance(t, 4, "second-cap")
+	cap2, value2 := other(t, len(Apps), first, "cap"), index(t, len(AppValues), "value")
+
+	if second {
+		out = append(out, App{Cap: cap2, Value: value2})
 	}
 
 	return out
@@ -345,23 +647,23 @@ func drawApps(t *rapid.T) []App {
 func drawSSH(t *rapid.T) SSHRule {
 	var r SSHRule
 
-	if chance(t, 6, "to-user") {
-		u := Sel{Kind: SelUser, I: index(t, refUsers, "user")}
-		r.Src, r.Dst = []Sel{u}, []Sel{u}
-	} else {
-		r.Src = sshSrcs.Draw(t, "src")
-		if slices.ContainsFunc(r.Src, func(s Sel) bool { return s.Kind == SelTag || s.Kind == SelTagged }) {
-			r.Dst = sshTagDsts.Draw(t, "dst")
-			r.Users = sshLogins.Draw(t, "users")
-
-			return r
-		}
-
-		r.Dst = sshDsts.Draw(t, "dst")
-	}
-
-	r.Check = chance(t, 4, "check")
+	toUser := chance(t, 6, "to-user")
+	u := Sel{Kind: SelUser, I: index(t, refUsers, "user")}
+	src := sshSrcs.Draw(t, "src")
+	dst := sshDsts.Draw(t, "dst")
+	check := chance(t, 4, "check")
 	r.Users = sshLogins.Draw(t, "users")
+
+	tagged := slices.ContainsFunc(src, func(s Sel) bool { return s.Kind == SelTag || s.Kind == SelTagged })
+
+	switch {
+	case toUser:
+		r.Src, r.Dst, r.Check = []Sel{u}, []Sel{u}, check
+	case tagged:
+		r.Src, r.Dst = src, asAll(dst, sshTaggedDst)
+	default:
+		r.Src, r.Dst, r.Check = src, dst, check
+	}
 
 	return r
 }
@@ -369,17 +671,23 @@ func drawSSH(t *rapid.T) SSHRule {
 func drawAutoApprovers(t *rapid.T) AutoApprovers {
 	var aa AutoApprovers
 
-	if chance(t, 2, "routes") {
-		first := index(t, numRulePrefixes, "route")
-		aa.Routes = []RouteApproval{{Route: first, By: owners.Draw(t, "by")}}
+	routes := chance(t, 2, "routes")
+	first := index(t, numRulePrefixes, "route")
+	by := owners.Draw(t, "by")
+	second := chance(t, 4, "second-route")
+	route2, by2 := other(t, numRulePrefixes, first, "route"), owners.Draw(t, "by")
+	exit := chance(t, 2, "exit")
+	exitBy := owners.Draw(t, "exit")
 
-		if chance(t, 4, "second-route") {
-			aa.Routes = append(aa.Routes, RouteApproval{Route: other(t, numRulePrefixes, first, "route"), By: owners.Draw(t, "by")})
+	if routes {
+		aa.Routes = []RouteApproval{{Route: first, By: by}}
+		if second {
+			aa.Routes = append(aa.Routes, RouteApproval{Route: route2, By: by2})
 		}
 	}
 
-	if len(aa.Routes) == 0 || chance(t, 2, "exit") {
-		aa.Exit = owners.Draw(t, "exit")
+	if !routes || exit {
+		aa.Exit = exitBy
 	}
 
 	return aa
@@ -393,12 +701,21 @@ func drawTopology(t *rapid.T) Topology {
 
 	rapid.SliceOfN(rapid.Custom(func(t *rapid.T) User {
 		u := defaultUsers[len(users)]
-		if len(users) > 0 && chance(t, 8, "same-name") {
-			u.Name = pick(t, users, "as").Name
+
+		// Only an OIDC user shares a name with another user.
+		same := chance(t, 8, "same-name")
+		as := rapid.IntRange(0, 15).Draw(t, "as")
+		email := chance(t, 8, "email")
+		e := pick(t, userEmails, "email")
+
+		if same && len(users) > 0 {
+			if o := users[as%len(users)]; u.OIDC() || o.OIDC() {
+				u.Name = o.Name
+			}
 		}
 
-		if chance(t, 8, "email") {
-			u.Email = pick(t, userEmails, "email")
+		if email {
+			u.Email = e
 		}
 
 		users = append(users, u)
@@ -406,8 +723,13 @@ func drawTopology(t *rapid.T) Topology {
 		return u
 	}), 1, len(defaultUsers)).Draw(t, "users")
 
+	// A world holds addresses outside the tailnet, or shared, rarely and
+	// then several; most worlds are what headscale hands out.
+	outside := chance(t, 8, "outside-world")
+	shared := chance(t, 8, "shared-world")
+
 	rapid.SliceOfN(rapid.Custom(func(t *rapid.T) Node {
-		n := drawNode(t, types.NodeID(len(nodes)+1), users, nodes) //nolint:gosec // small
+		n := drawNode(t, types.NodeID(len(nodes)+1), users, nodes, allTags, outside, shared) //nolint:gosec // small
 		nodes = append(nodes, n)
 
 		return n
@@ -416,31 +738,48 @@ func drawTopology(t *rapid.T) Topology {
 	n := len(nodes)
 
 	// Exit nodes come up as often as the shapes pairing them need.
-	if chance(t, 5, "exit") {
-		x := &nodes[index(t, n, "exit-node")]
-		rs := []int{exit4, exit6}
+	exit := chance(t, 5, "exit")
+	x := index(t, n, "exit-node")
+	oneFamily := chance(t, 4, "one-family")
+	family := index(t, 2, "family")
 
-		if chance(t, 4, "one-family") {
-			rs = []int{pick(t, rs, "family")}
+	if exit {
+		rs := []int{exit4, exit6}
+		if oneFamily {
+			rs = rs[family : family+1]
 		}
 
-		x.Announced, x.Approved = addRoutes(x.Announced, rs), addRoutes(x.Approved, rs)
+		nodes[x].Announced, nodes[x].Approved = addRoutes(nodes[x].Announced, rs), addRoutes(nodes[x].Approved, rs)
 	}
 
-	return Topology{Users: users, Nodes: nodes, NextID: types.NodeID(n + 1)} //nolint:gosec // small
+	// A route that begins where 10.0.0.0/24, a frequent destination, ends.
+	touch := chance(t, 6, "touching-route")
+	y := index(t, n, "toucher")
+
+	if touch {
+		nodes[y].Announced, nodes[y].Approved = addRoutes(nodes[y].Announced, []int{touching}), addRoutes(nodes[y].Approved, []int{touching})
+	}
+
+	return Topology{Users: users, Nodes: nodes, NextID: types.NodeID(n + 1), NextUserID: uint(len(users) + 1)} //nolint:gosec // small
 }
 
-// drawNode draws node id joining others.
-func drawNode(t *rapid.T, id types.NodeID, users []User, others []Node) Node {
+var allTags = []int{0, 1, 2}
+
+// drawNode draws node id joining others: owned by a user, or by tags from
+// tags. With outside or shared, its addresses may be outside the tailnet
+// or another node's; registration never hands those out.
+func drawNode(t *rapid.T, id types.NodeID, users []User, others []Node, tags []int, outside, shared bool) Node {
 	n := Node{ID: id}
 
-	if len(users) == 0 || chance(t, 5, "tagged") {
-		n.Tags = drawTags(t)
-		if len(users) > 0 && chance(t, 3, "carries-user") {
-			n.User = pick(t, users, "user").ID
-		}
-	} else {
-		n.User = pick(t, users, "owner").ID
+	tagged := chance(t, 5, "tagged")
+	ts := drawTags(t, tags)
+	owner := rapid.IntRange(0, 15).Draw(t, "owner")
+
+	switch {
+	case len(tags) > 0 && (tagged || len(users) == 0):
+		n.Tags = ts
+	case len(users) > 0:
+		n.User = users[owner%len(users)].ID
 	}
 
 	// A tagged node goes without addresses more often, so that a tag all
@@ -450,17 +789,26 @@ func drawNode(t *rapid.T, id types.NodeID, users []User, others []Node) Node {
 		unaddressed = 6
 	}
 
-	if !chance(t, unaddressed, "unaddressed") {
-		n.V4 = drawAddr(t, 4, id, others)
-		n.V6 = drawAddr(t, 6, id, others)
+	none := chance(t, unaddressed, "unaddressed")
+	v4 := drawAddr(t, 4, id, others, outside, shared)
+	v6 := drawAddr(t, 6, id, others, outside, shared)
+
+	if !none {
+		n.V4, n.V6 = v4, v6
 	}
 
 	if chance(t, 3, "routes") {
-		drawRoutes(t, &n)
+		for _, rt := range routeLists.Draw(t, "routes") {
+			n.Announced = addRoutes(n.Announced, rt.announce)
+			n.Approved = addRoutes(n.Approved, rt.approve)
+		}
 	}
 
-	if chance(t, 6, "client") {
-		n.Client = Client(1 + index(t, numClients-1, "client")) //nolint:gosec // a few clients
+	client := chance(t, 6, "client")
+	c := Client(1 + index(t, numClients-1, "client")) //nolint:gosec // a few clients
+
+	if client {
+		n.Client = c
 	}
 
 	n.Expired = chance(t, 10, "expired")
@@ -469,44 +817,48 @@ func drawNode(t *rapid.T, id types.NodeID, users []User, others []Node) Node {
 	return n
 }
 
-func drawTags(t *rapid.T) []int {
-	first := index(t, numTags, "tag")
-	tags := []int{first}
+// drawTags draws one or two tags from tags.
+func drawTags(t *rapid.T, tags []int) []int {
+	first := rapid.IntRange(0, 15).Draw(t, "tag")
+	second := chance(t, 4, "second-tag")
+	next := rapid.IntRange(0, 15).Draw(t, "tag")
 
-	if chance(t, 4, "second-tag") {
-		tags = append(tags, other(t, numTags, first, "tag"))
-		slices.Sort(tags)
+	if len(tags) == 0 {
+		return nil
 	}
 
-	return tags
+	out := []int{tags[first%len(tags)]}
+	if o := tags[next%len(tags)]; second && o != out[0] {
+		out = append(out, o)
+		slices.Sort(out)
+	}
+
+	return out
 }
 
-// drawAddr draws node id's address in family: its own, or rarely none,
-// another node's, or one outside the tailnet.
-func drawAddr(t *rapid.T, family int, id types.NodeID, others []Node) netip.Addr {
-	if chance(t, 8, "no-addr") {
+// drawAddr draws node id's address in family: its own, or rarely none;
+// in a world that has them, another node's, or one outside the tailnet.
+func drawAddr(t *rapid.T, family int, id types.NodeID, others []Node, outside, shared bool) netip.Addr {
+	none := chance(t, 8, "no-addr")
+	share := chance(t, 2, "shared")
+	of := rapid.IntRange(0, 15).Draw(t, "of")
+	away := chance(t, 2, "outside")
+	where := rapid.IntRange(0, 15).Draw(t, "where")
+
+	held := heldAddrs(family, others, netip.Addr{})
+
+	switch {
+	case none:
 		return netip.Addr{}
-	}
+	case shared && share && len(held) > 0:
+		return held[of%len(held)]
+	case outside && away:
+		pool := outsideAddrs(family, uint64(id))
 
-	if chance(t, 6, "shared") {
-		if held := heldAddrs(family, others, netip.Addr{}); len(held) > 0 {
-			return pick(t, held, "of")
-		}
-	}
-
-	if chance(t, 12, "outside") {
-		return pick(t, outsidePool(family), "outside")
+		return pool[where%len(pool)]
 	}
 
 	return ownAddr(family, uint64(id))
-}
-
-func outsidePool(family int) []netip.Addr {
-	if family == 4 {
-		return outsideV4
-	}
-
-	return outsideV6
 }
 
 // heldAddrs is the addresses nodes hold in family, but not.
@@ -529,82 +881,133 @@ const routeChoices = numRulePrefixes + 1
 // drawRouteChoice draws routes to announce or approve together.
 func drawRouteChoice(t *rapid.T) []int {
 	c := index(t, routeChoices, "route")
-	if c < numRulePrefixes {
-		return []int{c}
-	}
+	oneFamily := chance(t, 4, "one-family")
+	family := index(t, 2, "family")
 
-	if chance(t, 4, "one-family") {
-		return []int{pick(t, []int{exit4, exit6}, "family")}
+	switch {
+	case c < numRulePrefixes:
+		return []int{c}
+	case oneFamily:
+		return []int{exit4 + family}
 	}
 
 	return []int{exit4, exit6}
 }
 
-func drawRoutes(t *rapid.T, n *Node) {
-	for range rapid.IntRange(1, 2).Draw(t, "routes") {
-		rs := drawRouteChoice(t)
+// routeEntry is routes a node announces, has approved, or both.
+type routeEntry struct{ announce, approve []int }
 
-		switch {
-		case chance(t, 4, "unapproved"):
-			n.Announced = addRoutes(n.Announced, rs)
-		case chance(t, 5, "unannounced"):
-			n.Approved = addRoutes(n.Approved, rs)
-		default:
-			n.Announced = addRoutes(n.Announced, rs)
-			n.Approved = addRoutes(n.Approved, rs)
-		}
-	}
-}
-
-func drawStep(t *rapid.T, w World) Step {
-	nodes := w.Topology.Nodes
+var routeLists = rapid.SliceOfN(rapid.Custom(func(t *rapid.T) routeEntry {
+	rs := drawRouteChoice(t)
+	unapproved := chance(t, 4, "unapproved")
+	unannounced := chance(t, 5, "unannounced")
 
 	switch {
-	case len(nodes) > 0 && chance(t, 12, "reuse"):
-		return drawReuse(t, w)
-	case len(nodes) > 0 && chance(t, 12, "announce-approve"):
-		return drawAnnounceApprove(t, w)
-	case chance(t, 5, "several"):
-		var st Step
-
-		for range rapid.IntRange(2, 3).Draw(t, "edits") {
-			e := drawEdit(t, w)
-			st = append(st, e)
-			w = w.Apply(e)
-		}
-
-		return st
+	case unapproved:
+		return routeEntry{announce: rs}
+	case unannounced:
+		return routeEntry{approve: rs}
 	}
 
-	return Step{drawEdit(t, w)}
+	return routeEntry{announce: rs, approve: rs}
+}), 1, 2)
+
+func drawEdits(t *rapid.T, w World) []Edit {
+	nodes := w.Topology.Nodes
+
+	var auto []Node
+
+	for _, n := range nodes {
+		if len(n.AutoApproved) > 0 {
+			auto = append(auto, n)
+		}
+	}
+
+	// The gates are drawn whatever the world, so that a step reads the
+	// same draws after the shrinker deletes a node an earlier step made.
+	reuse := chance(t, 12, "reuse")
+	announce := chance(t, 12, "announce-approve")
+	withdraw := chance(t, 12, "withdraw-auto")
+
+	switch {
+	case len(nodes) > 0 && reuse:
+		return drawReuse(t, w)
+	case len(nodes) > 0 && announce:
+		return drawAnnounceApprove(t, w)
+	case len(auto) > 0 && withdraw:
+		n := pickAny(t, auto, "withdrawer")
+
+		return []Edit{Withdraw{n.ID, drawHeld(t, n.AutoApproved)}}
+	}
+
+	// The gate sets only how long the list may grow: one edit or the
+	// whole list stays aligned when the shrinker lowers it or deletes an
+	// edit, which a list of at least two would not let it.
+	most := 1
+	if chance(t, 3, "several") {
+		most = 3
+	}
+
+	cur := w
+
+	return rapid.SliceOfN(rapid.Custom(func(t *rapid.T) Edit {
+		e := drawEdit(t, cur)
+		cur = cur.Apply(e)
+
+		return e
+	}), 1, most).Draw(t, "edits")
 }
 
-func drawReuse(t *rapid.T, w World) Step {
-	nodes := w.Topology.Nodes
-	x := pick(t, nodes, "leaves")
-	rest := slices.DeleteFunc(slices.Clone(nodes), func(n Node) bool { return n.ID == x.ID })
+// drawReuse deletes a node and registers another, which the address
+// allocator hands the freed address.
+func drawReuse(t *rapid.T, w World) []Edit {
+	x := pick(t, w.Topology.Nodes, "leaves")
+	rest := slices.DeleteFunc(slices.Clone(w.Topology.Nodes), func(n Node) bool { return n.ID == x.ID })
 
-	id := w.Topology.nextID()
-	if len(x.Addrs()) == 0 || chance(t, 3, "same-id") {
-		id = x.ID
+	v6 := chance(t, 3, "v6")
+	n, ok := drawJoiner(t, w, rest)
+
+	if !ok {
+		return []Edit{Leave{x.ID}}
 	}
 
-	n := drawNode(t, id, w.Topology.Users, rest)
+	// The step is for the freed address. Whatever else the newcomer held
+	// the shrinker could not split from it, and a plain Join draws anyway.
+	n.Announced, n.Client, n.Offline = nil, Official, false
 
 	switch {
 	case len(x.Addrs()) == 0:
-	case !x.V6.IsValid() || x.V4.IsValid() && !chance(t, 3, "v6"):
+	case !x.V6.IsValid() || x.V4.IsValid() && !v6:
 		n.V4 = x.V4
 	default:
 		n.V6 = x.V6
 	}
 
-	return Step{Leave{x.ID}, Join{n}}
+	return []Edit{Leave{x.ID}, Join{n}}
+}
+
+// drawJoiner draws a node registering into w: a user's, with its own
+// fresh addresses, or tagged with tags the policy defines, which leaves
+// it without a user; nothing approved but what auto-approval approves.
+// False when nobody could register it.
+func drawJoiner(t *rapid.T, w World, others []Node) (Node, bool) {
+	var defined []int
+
+	for i := range numTags {
+		if w.Policy.DefinesTag(i) {
+			defined = append(defined, i)
+		}
+	}
+
+	n := drawNode(t, w.Topology.nextID(), w.Topology.Users, others, defined, false, false)
+	n.Approved, n.AutoApproved, n.Expired = nil, nil, false
+
+	return n, len(w.Topology.Users) > 0 || len(defined) > 0
 }
 
 // drawAnnounceApprove announces and approves, on one node, mostly a route
 // another node already serves.
-func drawAnnounceApprove(t *rapid.T, w World) Step {
+func drawAnnounceApprove(t *rapid.T, w World) []Edit {
 	n := pick(t, w.Topology.Nodes, "node")
 
 	var served []int
@@ -624,25 +1027,28 @@ func drawAnnounceApprove(t *rapid.T, w World) Step {
 	slices.Sort(served)
 
 	rs := drawRouteChoice(t)
-	if len(served) > 0 && !chance(t, 4, "unserved") {
-		rs = []int{pick(t, served, "served")}
+	unserved := chance(t, 4, "unserved")
+	s := rapid.IntRange(0, 15).Draw(t, "served")
+
+	if len(served) > 0 && !unserved {
+		rs = []int{served[s%len(served)]}
 	}
 
-	var st Step
+	var edits []Edit
 
 	if ann := dropRoutes(rs, n.Announced); len(ann) > 0 {
-		st = append(st, Announce{n.ID, ann})
+		edits = append(edits, Announce{n.ID, ann})
 	}
 
-	if app := dropRoutes(rs, n.Approved); len(app) > 0 {
-		st = append(st, Approve{n.ID, app})
+	if app := dropRoutes(rs, w.Apply(edits...).mustNode(n.ID).Approved); len(app) > 0 {
+		edits = append(edits, Approve{n.ID, app})
 	}
 
-	if len(st) == 0 {
-		return Step{drawEdit(t, w)}
+	if len(edits) == 0 {
+		return []Edit{drawEdit(t, w)}
 	}
 
-	return st
+	return edits
 }
 
 func drawEdit(t *rapid.T, w World) Edit {
@@ -661,7 +1067,6 @@ const (
 	editJoin = iota
 	editLeave
 	editRetag
-	editOwner
 	editAnnounce
 	editApprove
 	editWithdraw
@@ -676,13 +1081,19 @@ const (
 
 func drawNodeEdit(t *rapid.T, w World) Edit {
 	tp := w.Topology
-	if len(tp.Nodes) == 0 {
-		return Join{drawNode(t, tp.nextID(), tp.Users, tp.Nodes)}
-	}
 
 	kind := index(t, numNodeEdits, "node-edit")
+	if len(tp.Nodes) == 0 {
+		kind = editJoin
+	}
+
 	if kind == editJoin {
-		return Join{drawNode(t, tp.nextID(), tp.Users, tp.Nodes)}
+		n, ok := drawJoiner(t, w, tp.Nodes)
+		if !ok {
+			return drawUserEdit(t, w)
+		}
+
+		return Join{n}
 	}
 
 	if kind == editSwap && len(tp.Nodes) >= 2 {
@@ -692,39 +1103,23 @@ func drawNodeEdit(t *rapid.T, w World) Edit {
 		return SwapAddrs{min(tp.Nodes[a].ID, tp.Nodes[b].ID), max(tp.Nodes[a].ID, tp.Nodes[b].ID), drawFamily(t)}
 	}
 
-	n := pick(t, tp.Nodes, "node")
+	// Newest first: the simplest draw keeps naming the node a join made
+	// when the shrinker deletes a node before it.
+	n := tp.Nodes[len(tp.Nodes)-1-index(t, len(tp.Nodes), "node")]
 
 	switch kind {
 	case editLeave:
 		return Leave{n.ID}
 	case editRetag:
-		if n.Tagged() && len(tp.Users) > 0 && chance(t, 2, "untag") {
-			u := n.User
-			if u == 0 {
-				u = pick(t, tp.Users, "owner").ID
-			}
-
-			return Retag{n.ID, nil, u}
-		}
-
-		return Retag{n.ID, drawTags(t), n.User}
-	case editOwner:
-		var ids []uint
-
-		for _, u := range tp.Users {
-			if u.ID != n.User {
-				ids = append(ids, u.ID)
-			}
-		}
-
-		if n.Tagged() && n.User != 0 {
-			ids = append(ids, 0)
-		}
-
-		if len(ids) > 0 {
-			return SetOwner{n.ID, pick(t, ids, "user")}
+		if e, ok := drawRetag(t, w, n); ok {
+			return e
 		}
 	case editAnnounce, editWithdraw:
+		// Mostly what the auto-approvers approved, when there is any.
+		if kind == editWithdraw && len(n.AutoApproved) > 0 && !chance(t, 3, "manual") {
+			return Withdraw{n.ID, drawHeld(t, n.AutoApproved)}
+		}
+
 		if kind == editWithdraw && len(n.Announced) > 0 {
 			return Withdraw{n.ID, drawHeld(t, n.Announced)}
 		}
@@ -760,6 +1155,30 @@ func drawNodeEdit(t *rapid.T, w World) Edit {
 	return SetClient{n.ID, Client(other(t, numClients, int(n.Client), "client"))} //nolint:gosec // a few clients
 }
 
+// drawRetag tags n with tags the policy defines, as an admin does; or,
+// for a tagged node, mostly, logs it in as a user, which untags it.
+func drawRetag(t *rapid.T, w World, n Node) (Edit, bool) {
+	var defined []int
+
+	for i := range numTags {
+		if w.Policy.DefinesTag(i) {
+			defined = append(defined, i)
+		}
+	}
+
+	untag := chance(t, 2, "untag")
+	tags := drawTags(t, defined)
+
+	switch {
+	case n.Tagged() && untag && len(w.Topology.Users) > 0:
+		return Retag{n.ID, nil, pickAny(t, w.Topology.Users, "login").ID}, true
+	case len(tags) > 0:
+		return Retag{n.ID, tags, 0}, true
+	}
+
+	return nil, false
+}
+
 func drawFamily(t *rapid.T) int {
 	if rapid.Bool().Draw(t, "v6") {
 		return 6
@@ -784,84 +1203,153 @@ func drawHeld(t *rapid.T, held []int) []int {
 }
 
 // drawSetAddr moves n in one family: back to its own address, to none,
-// to a tailnet address nobody owns, outside the tailnet, or onto an
-// address another node holds.
+// to a tailnet address nobody owns; rarely outside the tailnet, or onto
+// an address another node holds.
 func drawSetAddr(t *rapid.T, n Node, nodes []Node) Edit {
 	family := drawFamily(t)
 	cur := n.Addr(family)
 
+	rare := chance(t, 6, "out-of-domain")
+
 	to := []netip.Addr{ownAddr(family, uint64(n.ID)), {}, movedAddr(family, uint64(n.ID))}
-	to = append(to, outsidePool(family)...)
-	to = append(to, heldAddrs(family, nodes, cur)...)
+	if rare {
+		to = append(to, outsideAddrs(family, uint64(n.ID))...)
+		to = append(to, heldAddrs(family, nodes, cur)...)
+	}
+
 	to = slices.DeleteFunc(to, func(a netip.Addr) bool { return a == cur })
 
-	return SetAddr{n.ID, family, pick(t, to, "to")}
+	return SetAddr{n.ID, family, pickAny(t, to, "to")}
 }
 
 func drawUserEdit(t *rapid.T, w World) Edit {
 	users := w.Topology.Users
 
 	kind := index(t, 4, "user-edit")
-	if len(users) == 0 {
-		kind = 0
+	u := User{}
+
+	if len(users) > 0 {
+		u = pickAny(t, users, "user")
 	}
 
-	switch kind {
-	case 1:
-		u := pick(t, users, "user")
-		names := slices.DeleteFunc(slices.Clone(userNames), func(n string) bool { return n == u.Name })
+	switch {
+	case kind == 1 && len(users) > 0:
+		if names := renames(users, u); len(names) > 0 {
+			return RenameUser{u.ID, pickAny(t, names, "name")}
+		}
+	case kind == 2 && len(users) > 0:
+		var oidc []User
 
-		return RenameUser{u.ID, pick(t, names, "name")}
-	case 2:
-		u := pick(t, users, "user")
-		emails := slices.DeleteFunc(slices.Clone(userEmails), func(e string) bool { return e == u.Email })
+		for _, o := range users {
+			if o.OIDC() {
+				oidc = append(oidc, o)
+			}
+		}
 
-		return SetEmail{u.ID, pick(t, emails, "email")}
-	case 3:
+		if len(oidc) > 0 {
+			o := pickAny(t, oidc, "oidc")
+			emails := slices.DeleteFunc(slices.Clone(userEmails), func(e string) bool { return e == o.Email })
+
+			return SetEmail{o.ID, pickAny(t, emails, "email")}
+		}
+	case kind == 3:
 		var free []uint
 
-		for _, u := range users {
-			if !slices.ContainsFunc(w.Topology.Nodes, func(n Node) bool { return n.User == u.ID }) {
-				free = append(free, u.ID)
+		for _, o := range users {
+			if !slices.ContainsFunc(w.Topology.Nodes, func(n Node) bool { return n.User == o.ID }) {
+				free = append(free, o.ID)
 			}
 		}
 
 		if len(free) > 0 {
-			return DeleteUser{pick(t, free, "user")}
+			return DeleteUser{pickAny(t, free, "user")}
 		}
 	}
 
-	var id uint
-	for _, u := range users {
-		id = max(id, u.ID)
+	id := w.Topology.nextUserID()
+	oidc := chance(t, 2, "oidc")
+	name, email := pick(t, userNames, "name"), pick(t, userEmails, "email")
+	nu := User{ID: id, Name: name, Email: email}
+
+	if oidc || slices.ContainsFunc(users, func(o User) bool { return !o.OIDC() && o.Name == name }) {
+		nu.Provider = providerPrefix + strconv.FormatUint(uint64(id), 10)
 	}
 
-	return AddUser{User{ID: id + 1, Name: pick(t, userNames, "name"), Email: pick(t, userEmails, "email")}}
+	return AddUser{nu}
 }
 
-// The policy edits drawPolicyEdit picks from; the first seven keep the
-// selector set when they can.
+// renames is what u can be renamed to: for an API user, a name no other
+// API user has; for an OIDC user, whatever the provider says.
+func renames(users []User, u User) []string {
+	return slices.DeleteFunc(slices.Clone(userNames), func(n string) bool {
+		return n == u.Name || !u.OIDC() && slices.ContainsFunc(users, func(o User) bool { return !o.OIDC() && o.ID != u.ID && o.Name == n })
+	})
+}
+
+// The policy edits drawPolicyEdit picks from: half the time one that
+// changes a rule in place, else one of the rest.
 const (
-	editPorts = iota
+	editSel = iota
+	editPorts
 	editProto
-	editSwapRules
-	editSel
+	editIP
+	editVia
+	editAddSel
+	editRemoveSel
+	editApp
+	numRuleEdits
+
+	editSwapRules = iota - 1
 	editGroup
 	editHost
 	editTagOwners
 	editAddRule
 	editRemoveRule
+	editAllowAll
 	editSSH
 	editNodeAttrs
 	editAutoApprovers
 	numPolicyEdits
 )
 
+// drawPolicyEdit draws a policy write headscale accepts. While the
+// document holds a token users have since made ambiguous, the only one
+// is replacing it; otherwise a token a draw makes ambiguous is moved to
+// the next one that is not.
 func drawPolicyEdit(t *rapid.T, w World) Edit {
+	v := NewView(w)
+
+	if amb := v.AmbiguousRefs(); len(amb) > 0 {
+		e := ReplaceUserRefs{From: amb}
+		for range amb {
+			e.To = append(e.To, unambiguous(v, rapid.IntRange(0, len(UserRefs)-1).Draw(t, "to")))
+		}
+
+		return e
+	}
+
+	return remapRefs(drawPolicyEditKind(t, w), func(r int) int { return unambiguous(v, r) })
+}
+
+func drawPolicyEditKind(t *rapid.T, w World) Edit {
 	p := w.Policy
 	refs := p.Refs()
 
-	kind := index(t, numPolicyEdits, "policy-edit")
+	var grants []RuleRef
+
+	for _, ref := range refs {
+		if ref.Grant {
+			grants = append(grants, ref)
+		}
+	}
+
+	inPlace := chance(t, 2, "rule-edit")
+	kind := numRuleEdits + index(t, numPolicyEdits-numRuleEdits, "policy-edit")
+	ruleKind := index(t, numRuleEdits, "rule-edit-kind")
+
+	if inPlace {
+		kind = ruleKind
+	}
 
 	switch kind {
 	case editPorts:
@@ -873,21 +1361,8 @@ func drawPolicyEdit(t *rapid.T, w World) Edit {
 			return e
 		}
 	case editSwapRules:
-		var lists []bool
-
-		for _, grant := range []bool{false, true} {
-			if len(p.List(grant)) >= 2 {
-				lists = append(lists, grant)
-			}
-		}
-
-		if len(lists) > 0 {
-			grant := pick(t, lists, "list")
-			n := len(p.List(grant))
-			i := index(t, n, "i")
-			j := other(t, n, i, "j")
-
-			return SwapRules{grant, min(i, j), max(i, j)}
+		if e, ok := drawSwapRules(t, p); ok {
+			return e
 		}
 	case editSel:
 		if len(refs) > 0 {
@@ -896,33 +1371,39 @@ func drawPolicyEdit(t *rapid.T, w World) Edit {
 	case editGroup:
 		return SetGroup{index(t, numGroups, "group"), drawMembers(t)}
 	case editHost:
-		// Mostly a host the policy names.
-		h := index(t, numHosts, "host")
-		if named := p.referenced().hosts; !chance(t, 4, "unnamed") {
-			var hs []int
-
-			for i, ok := range named {
-				if ok {
-					hs = append(hs, i)
-				}
-			}
-
-			if len(hs) > 0 {
-				h = pick(t, hs, "named")
-			}
-		}
-
-		return SetHost{h, other(t, numRulePrefixes, p.Hosts[h], "shift")}
+		return drawSetHost(t, p)
 	case editTagOwners:
 		e := SetTagOwners{Tag: index(t, numTags, "tag")}
-		if !chance(t, 3, "no-owners") {
-			e.Owners = owners.Draw(t, "owners")
+		none := chance(t, 3, "no-owners")
+		os := owners.Draw(t, "owners")
+		e.Defined = chance(t, 2, "defined")
+
+		if !none {
+			e.Owners = os
 		}
 
 		return e
+	case editIP, editApp, editVia:
+		if len(grants) > 0 {
+			if e, ok := drawGrantPart(t, p, pick(t, grants, "grant"), kind); ok {
+				return e
+			}
+		}
+	case editAddSel:
+		if len(refs) > 0 {
+			return drawAddSel(t, p, pick(t, refs, "rule"))
+		}
+	case editRemoveSel:
+		if e, ok := drawRemoveSel(t, p); ok {
+			return e
+		}
 	case editRemoveRule:
 		if len(refs) > 0 {
 			return RemoveRule{pick(t, refs, "rule")}
+		}
+	case editAllowAll:
+		if !p.AllowAll {
+			return AllowAll{}
 		}
 	case editSSH:
 		if chance(t, 4, "none") {
@@ -931,7 +1412,8 @@ func drawPolicyEdit(t *rapid.T, w World) Edit {
 
 		return SetSSH{sshRuleLists.Draw(t, "ssh")}
 	case editNodeAttrs:
-		if chance(t, 4, "none") {
+		// Without its service hosts, mostly, when it has any.
+		if chance(t, 4, "none") || len(NewView(w).ServiceHosts()) > 0 && chance(t, 2, "drop-service") {
 			return SetNodeAttrs{}
 		}
 
@@ -947,6 +1429,104 @@ func drawPolicyEdit(t *rapid.T, w World) Edit {
 	grant := chance(t, 2, "grant")
 
 	return AddRule{RuleRef{grant, rapid.IntRange(0, len(p.List(grant))).Draw(t, "at")}, drawRule(t, grant, p)}
+}
+
+// remapRefs returns e with every user token in what it writes passed
+// through to.
+func remapRefs(e Edit, to func(int) int) Edit {
+	if g, ok := e.(SetGroup); ok {
+		members := make([]int, len(g.Members))
+		for i, m := range g.Members {
+			members[i] = to(m)
+		}
+
+		g.Members = members
+
+		return g
+	}
+
+	v := reflect.New(reflect.TypeOf(e)).Elem()
+	v.Set(reflect.ValueOf(e))
+	remapValue(v, to)
+
+	out, _ := v.Interface().(Edit)
+
+	return out
+}
+
+var selType = reflect.TypeFor[Sel]()
+
+func remapValue(v reflect.Value, to func(int) int) {
+	switch {
+	case v.Type() == selType:
+		if s, _ := v.Interface().(Sel); s.Kind == SelUser {
+			v.Set(reflect.ValueOf(Sel{Kind: SelUser, I: to(s.I)}))
+		}
+	case v.Kind() == reflect.Struct:
+		for i := range v.NumField() {
+			if v.Type().Field(i).IsExported() {
+				remapValue(v.Field(i), to)
+			}
+		}
+	case v.Kind() == reflect.Slice:
+		if v.IsNil() {
+			return
+		}
+
+		c := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		reflect.Copy(c, v)
+		v.Set(c)
+
+		for i := range v.Len() {
+			remapValue(v.Index(i), to)
+		}
+	case v.Kind() == reflect.Array:
+		for i := range v.Len() {
+			remapValue(v.Index(i), to)
+		}
+	}
+}
+
+func drawSwapRules(t *rapid.T, p Policy) (Edit, bool) {
+	var lists []bool
+
+	for _, grant := range []bool{false, true} {
+		if len(p.List(grant)) >= 2 {
+			lists = append(lists, grant)
+		}
+	}
+
+	if len(lists) == 0 {
+		return nil, false
+	}
+
+	grant := pick(t, lists, "list")
+	n := len(p.List(grant))
+	i := index(t, n, "i")
+	j := other(t, n, i, "j")
+
+	return SwapRules{grant, min(i, j), max(i, j)}, true
+}
+
+// drawSetHost moves mostly a host the policy names.
+func drawSetHost(t *rapid.T, p Policy) Edit {
+	h := index(t, numHosts, "host")
+	unnamed := chance(t, 4, "unnamed")
+	n := rapid.IntRange(0, 15).Draw(t, "named")
+
+	var hs []int
+
+	for i, ok := range p.referenced().hosts {
+		if ok {
+			hs = append(hs, i)
+		}
+	}
+
+	if !unnamed && len(hs) > 0 {
+		h = hs[n%len(hs)]
+	}
+
+	return SetHost{h, other(t, numRulePrefixes, p.Hosts[h], "shift")}
 }
 
 func drawSetPorts(t *rapid.T, p Policy) (Edit, bool) {
@@ -1010,16 +1590,86 @@ func drawSetProto(t *rapid.T, p Policy) (Edit, bool) {
 		n = portedProtos
 	}
 
-	if n == 1 {
-		return nil, false
-	}
-
 	proto := index(t, n-1, "proto")
 	if proto >= cur {
 		proto++
 	}
 
 	return SetProto{ref, at, proto}, true
+}
+
+// drawGrantPart replaces a grant's ip list, its app capabilities, or its
+// via tags, keeping it a grant headscale accepts.
+func drawGrantPart(t *rapid.T, p Policy, ref RuleRef, kind int) (Edit, bool) {
+	r := p.Rule(ref)
+	internet := slices.ContainsFunc(r.Dst, func(d Dest) bool { return d.Sel.Kind == SelInternet })
+
+	switch kind {
+	case editIP:
+		none := chance(t, 4, "no-ip")
+		ip := ips.Draw(t, "ip")
+
+		if none && len(r.App) > 0 && len(r.Via) == 0 {
+			return SetIP{ref, nil}, true
+		}
+
+		return SetIP{ref, ip}, true
+	case editApp:
+		none := chance(t, 4, "no-app")
+		apps := drawApps(t)
+
+		switch {
+		case none && len(r.IP) > 0:
+			return SetApp{ref, nil}, true
+		case internet:
+			return nil, false
+		}
+
+		return SetApp{ref, apps}, true
+	}
+
+	if len(r.IP) == 0 || r.selfRule() {
+		return nil, false
+	}
+
+	none := chance(t, 3, "no-via")
+	tags := drawTags(t, allTags)
+
+	if none {
+		return SetVia{ref, nil}, true
+	}
+
+	return SetVia{ref, tags}, true
+}
+
+// selKinds is what rule r takes at a source, or at a destination.
+func selKinds(r Rule, grant, dst bool) []SelKind {
+	switch {
+	case dst && len(r.App) > 0:
+		return appDstKinds
+	case dst:
+		return dstKinds
+	case r.selfRule() && grant:
+		return selfSrcGrant
+	case r.selfRule():
+		return selfSrcACL
+	}
+
+	return srcKinds
+}
+
+// drawNewSel draws a selector for kinds: half the time one the policy
+// names elsewhere.
+func drawNewSel(t *rapid.T, p Policy, kinds []SelKind) Sel {
+	named := chance(t, 2, "named")
+	n := rapid.IntRange(0, 15).Draw(t, "sel")
+	fresh := drawSel(t, kinds)
+
+	if cands := slices.DeleteFunc(p.Selectors(), func(s Sel) bool { return !slices.Contains(kinds, s.Kind) }); named && len(cands) > 0 {
+		return cands[n%len(cands)]
+	}
+
+	return fresh
 }
 
 // drawSetSel replaces one selector of rule ref: half the time with one
@@ -1038,40 +1688,62 @@ func drawSetSel(t *rapid.T, p Policy, ref RuleRef) Edit {
 
 	dst := len(dstAt) > 0 && rapid.Bool().Draw(t, "dst")
 
-	var (
-		at    int
-		kinds []SelKind
-	)
-
-	switch {
-	case dst:
+	at := index(t, len(r.Src), "at")
+	if dst {
 		at = pick(t, dstAt, "at")
+	}
 
-		kinds = dstKinds
-		if len(r.App) > 0 {
-			kinds = appDstKinds
+	return SetSel{ref, dst, at, drawNewSel(t, p, selKinds(r, ref.Grant, dst))}
+}
+
+// drawAddSel adds a source or a non-self destination to rule ref.
+func drawAddSel(t *rapid.T, p Policy, ref RuleRef) Edit {
+	r := p.Rule(ref)
+	dst := rapid.Bool().Draw(t, "dst")
+
+	n := len(r.Src)
+	if dst {
+		n = len(r.Dst)
+	}
+
+	at := rapid.IntRange(0, n).Draw(t, "at")
+	sel := drawNewSel(t, p, selKinds(r, ref.Grant, dst))
+	ports := drawPorts(t)
+
+	if !dst || ref.Grant || r.Proto >= portedProtos {
+		ports = 0
+	}
+
+	return AddSel{ref, dst, at, sel, ports}
+}
+
+// drawRemoveSel removes a source or a non-self destination from a rule
+// that keeps one.
+func drawRemoveSel(t *rapid.T, p Policy) (Edit, bool) {
+	var places []RemoveSel
+
+	for _, ref := range p.Refs() {
+		r := p.Rule(ref)
+		if len(r.Src) > 1 {
+			for i := range r.Src {
+				places = append(places, RemoveSel{ref, false, i})
+			}
 		}
-	default:
-		at = index(t, len(r.Src), "at")
 
-		kinds = srcKinds
-
-		switch {
-		case r.selfRule() && ref.Grant:
-			kinds = selfSrcGrant
-		case r.selfRule():
-			kinds = selfSrcACL
+		if len(r.Dst) > 1 {
+			for i, d := range r.Dst {
+				if d.Sel.Kind != SelSelf {
+					places = append(places, RemoveSel{ref, true, i})
+				}
+			}
 		}
 	}
 
-	if chance(t, 2, "named") {
-		named := slices.DeleteFunc(p.Selectors(), func(s Sel) bool { return !slices.Contains(kinds, s.Kind) })
-		if len(named) > 0 {
-			return SetSel{ref, dst, at, pick(t, named, "sel")}
-		}
+	if len(places) == 0 {
+		return nil, false
 	}
 
-	return SetSel{ref, dst, at, drawSel(t, kinds)}
+	return pick(t, places, "place"), true
 }
 
 func canonPolicy(p Policy) Policy {

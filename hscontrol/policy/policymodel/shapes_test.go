@@ -7,8 +7,12 @@ import (
 	"testing"
 )
 
-// coverageSamples is how many drawn cases the coverage test classifies.
-const coverageSamples = 500
+// coverageSamples is how many drawn cases the coverage test classifies,
+// at coverageSteps, the step count builders run.
+const (
+	coverageSamples = 1000
+	coverageSteps   = 10
+)
 
 // TestCoverage classifies drawn cases and fails when a required shape
 // falls below its floor: a generator that stops reaching a shape fails
@@ -17,7 +21,7 @@ func TestCoverage(t *testing.T) {
 	t.Parallel()
 
 	worlds, scenarios := map[string]int{}, map[string]int{}
-	gen := Scenarios(30)
+	gen := Scenarios(coverageSteps)
 
 	for i := range coverageSamples {
 		for _, name := range Classify(Scenario{Start: Worlds().Example(i)}, Required) {
@@ -41,12 +45,7 @@ func TestCoverage(t *testing.T) {
 
 		fmt.Fprintf(&table, "%-36s %8s %10d %6.0f  %s\n", sh.Name, w, scenarios[sh.Name], sh.Min*coverageSamples, sh.Why)
 
-		floor := int(sh.Min * coverageSamples)
-		if sh.World != nil && worlds[sh.Name] < floor {
-			t.Errorf("%s in %d of %d worlds, floor %d", sh.Name, worlds[sh.Name], coverageSamples, floor)
-		}
-
-		if scenarios[sh.Name] < floor {
+		if floor := int(sh.Min * coverageSamples); scenarios[sh.Name] < floor {
 			t.Errorf("%s in %d of %d scenarios, floor %d", sh.Name, scenarios[sh.Name], coverageSamples, floor)
 		}
 	}

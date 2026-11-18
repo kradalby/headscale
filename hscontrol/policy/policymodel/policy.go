@@ -15,11 +15,19 @@ type Policy struct {
 	Groups [numGroups][]int
 	// TagOwners holds each tag's owners: users, groups and tags.
 	TagOwners [numTags][]Sel
+	// Defined holds the tags tagOwners defines whether or not anything
+	// names them; a tag is also defined when the document names it or it
+	// has owners. Only a defined tag can be put on a node.
+	Defined [numTags]bool
 	// Hosts holds how far each host is moved from its default prefix
 	// (hostDefault), among the rule prefixes; zero is the default.
 	Hosts [numHosts]int
 
 	ACLs, Grants []Rule
+	// AllowAll, with no rule at all, leaves both rule sections out of the
+	// document, which allows everything; without it no rule is an empty
+	// acls list, which allows nothing.
+	AllowAll bool
 
 	SSH           []SSHRule
 	NodeAttrs     []NodeAttr
@@ -84,6 +92,11 @@ type RouteApproval struct {
 	By    []Sel
 }
 
+// DefinesTag reports whether p's tagOwners defines tag i.
+func (p Policy) DefinesTag(i int) bool {
+	return p.Defined[i] || len(p.TagOwners[i]) > 0 || p.referenced().tags[i]
+}
+
 // HostPrefix is the prefix host h names in p.
 func (p Policy) HostPrefix(h int) int {
 	return (hostDefault[h] + p.Hosts[h]) % numRulePrefixes
@@ -144,9 +157,13 @@ func (r Rule) selfRule() bool {
 
 // Selectors returns every selector the rules, via lists and ssh rules
 // name, once each, in order of first appearance: what a selector table
-// would hold.
+// would hold. A document allowing everything names *.
 func (p Policy) Selectors() []Sel {
 	var out []Sel
+
+	if p.AllowAll {
+		out = append(out, Sel{Kind: SelAll})
+	}
 
 	add := func(s Sel) {
 		if !slices.Contains(out, s) {
@@ -175,6 +192,110 @@ func (p Policy) Selectors() []Sel {
 	}
 
 	return out
+}
+
+// userRefs returns the user tokens p's document holds anywhere, once
+// each: what a policy write checks for ambiguity.
+func (p Policy) userRefs() []int {
+	var out []int
+
+	add := func(sels ...Sel) {
+		for _, s := range sels {
+			if s.Kind == SelUser && !slices.Contains(out, s.I) {
+				out = append(out, s.I)
+			}
+		}
+	}
+
+	for _, g := range p.Groups {
+		for _, m := range g {
+			add(Sel{Kind: SelUser, I: m})
+		}
+	}
+
+	for _, owners := range p.TagOwners {
+		add(owners...)
+	}
+
+	for _, ra := range p.AutoApprovers.Routes {
+		add(ra.By...)
+	}
+
+	add(p.AutoApprovers.Exit...)
+
+	for _, r := range slices.Concat(p.ACLs, p.Grants) {
+		add(r.Src...)
+
+		for _, d := range r.Dst {
+			add(d.Sel)
+		}
+	}
+
+	for _, r := range p.SSH {
+		add(r.Src...)
+		add(r.Dst...)
+	}
+
+	for _, a := range p.NodeAttrs {
+		add(a.Targets...)
+	}
+
+	slices.Sort(out)
+
+	return out
+}
+
+// mapRefs returns p with every user token ref replaced by to(ref).
+func (p Policy) mapRefs(to func(int) int) Policy {
+	w := World{Policy: p}
+	c := w.clone().Policy
+
+	sels := func(ss []Sel) {
+		for i := range ss {
+			if ss[i].Kind == SelUser {
+				ss[i].I = to(ss[i].I)
+			}
+		}
+	}
+
+	for g := range c.Groups {
+		for i, m := range c.Groups[g] {
+			c.Groups[g][i] = to(m)
+		}
+	}
+
+	for i := range c.TagOwners {
+		sels(c.TagOwners[i])
+	}
+
+	for i := range c.AutoApprovers.Routes {
+		sels(c.AutoApprovers.Routes[i].By)
+	}
+
+	sels(c.AutoApprovers.Exit)
+
+	for _, rs := range [][]Rule{c.ACLs, c.Grants} {
+		for i := range rs {
+			sels(rs[i].Src)
+
+			for j := range rs[i].Dst {
+				if rs[i].Dst[j].Sel.Kind == SelUser {
+					rs[i].Dst[j].Sel.I = to(rs[i].Dst[j].Sel.I)
+				}
+			}
+		}
+	}
+
+	for i := range c.SSH {
+		sels(c.SSH[i].Src)
+		sels(c.SSH[i].Dst)
+	}
+
+	for i := range c.NodeAttrs {
+		sels(c.NodeAttrs[i].Targets)
+	}
+
+	return c
 }
 
 // names is which groups, tags and hosts a policy names.
@@ -237,7 +358,7 @@ func (p Policy) referenced() names {
 
 // HuJSON writes p as the document headscale parses, one rule to a line.
 // It defines every group, tag and host p refers to, and no others unless
-// they have members or owners.
+// they have members or owners or p defines them.
 func (p Policy) HuJSON() []byte {
 	ns := p.referenced()
 
@@ -263,7 +384,7 @@ func (p Policy) HuJSON() []byte {
 	var ts []member
 
 	for i := range numTags {
-		if ns.tags[i] || len(p.TagOwners[i]) > 0 {
+		if ns.tags[i] || len(p.TagOwners[i]) > 0 || p.Defined[i] {
 			ts = append(ts, member{Tags[i], strs(selStrings(p.TagOwners[i]))})
 		}
 	}
@@ -294,9 +415,7 @@ func (p Policy) HuJSON() []byte {
 		grants[i] = r.json(true)
 	}
 
-	// No rule at all is written as an empty acls list: without one,
-	// headscale would allow everything.
-	if len(acls) > 0 || len(grants) == 0 {
+	if len(acls) > 0 || len(grants) == 0 && !p.AllowAll {
 		sections = append(sections, member{"acls", lines(acls)})
 	}
 

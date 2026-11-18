@@ -21,22 +21,31 @@ type Topology struct {
 	Users []User
 	Nodes []Node
 
-	// NextID is the ID the next join takes unless it reuses one on
-	// purpose: IDs are not reused otherwise, as in production.
-	NextID types.NodeID
+	// NextID and NextUserID are the IDs the next node and the next user
+	// take. Neither is ever handed out twice: both columns autoincrement.
+	NextID     types.NodeID
+	NextUserID uint
 }
 
 // User is a user as a policy's tokens resolve it.
 type User struct {
 	ID          uint
 	Name, Email string
+	// Provider is the provider identifier of a user who logged in through
+	// OIDC, and "" for one created through the API. API users' names are
+	// unique among themselves; OIDC users' names and e-mails are whatever
+	// the identity provider says.
+	Provider string
 }
+
+// OIDC reports whether u logged in through an identity provider.
+func (u User) OIDC() bool { return u.Provider != "" }
 
 // Node is a node as the policy and its client see it.
 type Node struct {
 	ID types.NodeID
-	// User is the owner of an untagged node, and the user a tagged node
-	// still carries, or zero for none.
+	// User owns an untagged node; a tagged node has none, as headscale
+	// clears it on every path that tags a node.
 	User uint
 	// Tags holds indices into Tags; a node with tags is owned by them.
 	Tags []int
@@ -45,8 +54,10 @@ type Node struct {
 	V4, V6 netip.Addr
 
 	// Announced and Approved hold indices into Prefixes, sorted: what the
-	// node advertises and what is approved for it, apart.
-	Announced, Approved []int
+	// node advertises and what is approved for it, apart. AutoApproved
+	// holds the approved routes the policy's auto-approvers approved,
+	// which go again when the node withdraws them.
+	Announced, Approved, AutoApproved []int
 
 	Client           Client
 	Expired, Offline bool
@@ -148,6 +159,16 @@ func (t Topology) nextID() types.NodeID {
 	return max(next, 1)
 }
 
+// nextUserID is the ID the next user takes.
+func (t Topology) nextUserID() uint {
+	next := t.NextUserID
+	if len(t.Users) > 0 {
+		next = max(next, t.Users[len(t.Users)-1].ID+1)
+	}
+
+	return max(next, 1)
+}
+
 // officialHostinfo is what a current Tailscale client reports of itself:
 // built with Go, a release headscale serves.
 func officialHostinfo(hi *tailcfg.Hostinfo) {
@@ -166,6 +187,11 @@ func (t Topology) Build() (types.Users, types.Nodes) {
 	for i, u := range t.Users {
 		users[i] = types.User{Name: u.Name, Email: u.Email}
 		users[i].ID = u.ID
+
+		if u.OIDC() {
+			users[i].Provider = "oidc"
+			users[i].ProviderIdentifier.String, users[i].ProviderIdentifier.Valid = u.Provider, true
+		}
 	}
 
 	nodes := make(types.Nodes, len(t.Nodes))
@@ -219,6 +245,10 @@ func (n Node) build(users types.Users) *types.Node {
 		tn.ApprovedRoutes = append(tn.ApprovedRoutes, Prefixes[r])
 	}
 
+	for _, r := range n.AutoApproved {
+		tn.AutoApprovedRoutes = append(tn.AutoApprovedRoutes, Prefixes[r])
+	}
+
 	switch n.Client {
 	case Official:
 		officialHostinfo(tn.Hostinfo)
@@ -252,6 +282,10 @@ func (u User) String() string {
 		s += " <" + u.Email + ">"
 	}
 
+	if u.OIDC() {
+		s += " oidc=" + u.Provider
+	}
+
 	return s
 }
 
@@ -269,10 +303,6 @@ func (n Node) String() string {
 		}
 
 		fmt.Fprintf(&b, " tags=[%s]", strings.Join(tags, " "))
-
-		if n.User != 0 {
-			fmt.Fprintf(&b, " user=u%d", n.User)
-		}
 	} else {
 		fmt.Fprintf(&b, " u%d", n.User)
 	}
@@ -293,6 +323,10 @@ func (n Node) String() string {
 
 	if len(n.Approved) > 0 {
 		fmt.Fprintf(&b, " approved=[%s]", strings.Join(routeStrings(n.Approved), " "))
+	}
+
+	if len(n.AutoApproved) > 0 {
+		fmt.Fprintf(&b, " auto=[%s]", strings.Join(routeStrings(n.AutoApproved), " "))
 	}
 
 	if n.Client != Official {

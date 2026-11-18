@@ -40,21 +40,33 @@ import (
 
 // UserRefs are the user tokens a policy names: by name, by e-mail and by
 // e-mail domain. Which user each resolves to depends on the topology.
+//
+// A token naming a user by provider identifier, as headscale's OIDC
+// documentation allows (providerPrefix + "3@"), belongs here once the
+// reference resolves provider identifiers.
 var UserRefs = []string{"alice@", "bob@example.com", "carol@example.org", "dave@", "user:*@example.com"}
 
-// refUsers counts the UserRefs naming one user; the rest name a domain.
+// refUsers counts the UserRefs naming at most one user by name or e-mail;
+// the domain comes after.
 const refUsers = 4
 
-// defaultUsers is the identity of user i+1 before any draw changes it.
+// providerPrefix is the identity provider's issuer: an OIDC user's
+// identifier is it followed by the user's ID, so identifiers are unique.
+const providerPrefix = "https://idp.example.com/"
+
+// defaultUsers is the identity of user i+1 before any draw changes it:
+// two users created through the API, two who logged in through OIDC.
 var defaultUsers = []User{
 	{ID: 1, Name: "alice"},
 	{ID: 2, Name: "bob", Email: "bob@example.com"},
-	{ID: 3, Name: "carol", Email: "carol@example.org"},
-	{ID: 4, Name: "dave", Email: "dave@example.com"},
+	{ID: 3, Name: "carol", Email: "carol@example.org", Provider: providerPrefix + "3"},
+	{ID: 4, Name: "dave", Email: "dave@example.com", Provider: providerPrefix + "4"},
 }
 
-// userNames and userEmails are what users are renamed to. A name another
-// user holds makes a token naming it ambiguous, which names nobody.
+// userNames and userEmails are what users are named and renamed. Users
+// created through the API have names no other such user has; OIDC users
+// take theirs from the identity provider, and may share one, which makes
+// a token naming it ambiguous: it names nobody.
 var (
 	userNames  = []string{"erin", "alice", "bob", "carol", "dave"}
 	userEmails = []string{"", "erin@example.com", "bob@example.com", "carol@example.org", "dave@example.com", "alice@example.org"}
@@ -76,8 +88,8 @@ const (
 
 // Prefixes serve rules, hosts, routes and auto-approvers. They cover node
 // addresses (100.64.0.0/30 holds n1-n3, the /120 every node's own IPv6),
-// overlap each other, reach public space, and end in the two halves of an
-// exit route.
+// overlap each other, touch (10.0.1.0/24 begins where 10.0.0.0/24 ends),
+// reach public space, and end in the two halves of an exit route.
 var Prefixes = []netip.Prefix{
 	netip.MustParsePrefix("10.0.0.0/24"),
 	netip.MustParsePrefix("10.0.0.0/16"),
@@ -86,6 +98,7 @@ var Prefixes = []netip.Prefix{
 	netip.MustParsePrefix("8.8.8.0/24"),
 	netip.MustParsePrefix("fd7a:115c:a1e0::/120"),
 	netip.MustParsePrefix("fd00:1::/64"),
+	netip.MustParsePrefix("10.0.1.0/24"),
 	netip.MustParsePrefix("0.0.0.0/0"),
 	netip.MustParsePrefix("::/0"),
 }
@@ -93,8 +106,10 @@ var Prefixes = []netip.Prefix{
 const (
 	// numRulePrefixes is how many Prefixes a rule or host may name: a grant
 	// cannot name a default route, and a rule says autogroup:internet.
-	numRulePrefixes = 7
-	exit4, exit6    = 7, 8
+	numRulePrefixes = 8
+	exit4, exit6    = 8, 9
+	publicPrefix    = 4
+	touching        = 7
 )
 
 // hostDefault is the prefix each host names before a draw moves it:
@@ -133,11 +148,21 @@ const attrServiceHost = 2
 // are distinct unless a draw says otherwise; moved addresses are tailnet
 // addresses no node owns; outside addresses are not the tailnet's.
 var (
-	outsideV4 = []netip.Addr{netip.MustParseAddr("8.8.8.1"), netip.MustParseAddr("10.0.0.5")}
-	outsideV6 = []netip.Addr{netip.MustParseAddr("2606:4700::1")}
 	tailnetV4 = netip.MustParsePrefix("100.64.0.0/10")
 	tailnetV6 = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
 )
+
+// outsideAddrs are node id's addresses outside the tailnet in family: in
+// public space and, for IPv4, inside the 10.0.0.0/24 subnet. They are its
+// own, so two nodes outside the tailnet share an address only when a draw
+// says so.
+func outsideAddrs(family int, id uint64) []netip.Addr {
+	if family == 4 {
+		return []netip.Addr{netip.AddrFrom4([4]byte{8, 8, 8, byte(id)}), netip.AddrFrom4([4]byte{10, 0, 0, byte(4 + id)})} //nolint:gosec // the low byte of the ID
+	}
+
+	return []netip.Addr{netip.AddrFrom16([16]byte{0x26, 0x06, 0x47, 0x00, 14: byte(id >> 8), 15: byte(id)})} //nolint:gosec // as above
+}
 
 func ownAddr(family int, id uint64) netip.Addr {
 	if family == 4 {

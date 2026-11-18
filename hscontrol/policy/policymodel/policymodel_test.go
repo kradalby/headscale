@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -19,20 +20,26 @@ import (
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/types"
+	"go4.org/netipx"
 	"pgregory.net/rapid"
+	"tailscale.com/tailcfg"
 )
 
 const modulePath = "github.com/juanfont/headscale/"
 
-// TestImports keeps the package independent of what its properties check:
-// it imports, of headscale, only hscontrol/types. And it stays out of the
-// binary: no file outside tests imports it.
+// TestImports keeps the package independent of what its properties check.
+// Of headscale it imports only hscontrol/types; nothing it reaches
+// through any chain of imports is the compile, the world or the mapper;
+// and its own code calls no method of headscale's node and user types,
+// several of which evaluate access through the policy matchers. And it
+// stays out of the binary: no file outside tests imports it.
 func TestImports(t *testing.T) {
 	t.Parallel()
 
 	allowed := []string{modulePath + "hscontrol/types", "tailscale.com/", "go4.org/", "pgregory.net/rapid"}
+	own := importsOf(t, ".", false)
 
-	for path, imports := range importsOf(t, ".", false) {
+	for path, imports := range own {
 		for _, imp := range imports {
 			std := !strings.Contains(strings.Split(imp, "/")[0], ".")
 			if !std && !slices.ContainsFunc(allowed, func(a string) bool { return imp == a || strings.HasPrefix(imp, a) && strings.HasSuffix(a, "/") }) {
@@ -41,12 +48,24 @@ func TestImports(t *testing.T) {
 		}
 	}
 
-	self := modulePath + "hscontrol/policy/policymodel"
+	forbidden := []string{"hscontrol/policy", "hscontrol/policy/v2", "hscontrol/state", "hscontrol/mapper"}
+	for pkg, via := range internalClosure(t, own) {
+		if slices.Contains(forbidden, pkg) {
+			t.Errorf("the package reaches %s through %s", pkg, via)
+		}
+	}
+
+	for _, call := range typesMethodCalls(t) {
+		t.Errorf("%s calls a method of headscale's node or user types; read their fields", call)
+	}
+
+	self, _ := filepath.Abs(".")
 
 	for _, dir := range []string{"../..", "../../../cmd"} {
 		for path, imports := range importsOf(t, dir, true) {
-			if !strings.Contains(path, "policymodel") && slices.Contains(imports, self) {
-				t.Errorf("%s imports %s; only tests may", path, self)
+			abs, _ := filepath.Abs(filepath.Dir(path))
+			if abs != self && slices.Contains(imports, modulePath+"hscontrol/policy/policymodel") {
+				t.Errorf("%s imports policymodel; only tests may", path)
 			}
 		}
 	}
@@ -95,13 +114,107 @@ func importsOf(t *testing.T, dir string, deep bool) map[string][]string {
 	return out
 }
 
+// internalClosure returns every headscale package the files reach through
+// their imports, each with the chain that reaches it.
+func internalClosure(t *testing.T, files map[string][]string) map[string]string {
+	t.Helper()
+
+	reached := map[string]string{}
+
+	var visit func(pkg, via string)
+
+	visit = func(pkg, via string) {
+		if _, ok := reached[pkg]; ok {
+			return
+		}
+
+		reached[pkg] = via
+
+		for _, imports := range importsOf(t, filepath.Join("../../..", pkg), false) {
+			for _, imp := range imports {
+				if next, ok := strings.CutPrefix(imp, modulePath); ok {
+					visit(next, via+" -> "+next)
+				}
+			}
+		}
+	}
+
+	for _, path := range slices.Sorted(maps.Keys(files)) {
+		for _, imp := range files[path] {
+			if pkg, ok := strings.CutPrefix(imp, modulePath); ok {
+				visit(pkg, filepath.Base(path)+" -> "+pkg)
+			}
+		}
+	}
+
+	return reached
+}
+
+// typesMethodCalls returns the calls in the package's own files to a
+// method only headscale's node and user types have: their names, less
+// those the client's views and this package's own types also have.
+func typesMethodCalls(t *testing.T) []string {
+	t.Helper()
+
+	methods := func(vs ...any) map[string]bool {
+		out := map[string]bool{}
+
+		for _, v := range vs {
+			typ := reflect.TypeOf(v)
+			for m := range typ.Methods() {
+				out[m.Name] = true
+			}
+		}
+
+		return out
+	}
+
+	theirs := methods(&types.Node{}, types.NodeView{}, &types.User{}, types.UserView{}, types.Nodes{}, types.Users{})
+	shared := methods(tailcfg.NodeView{}, tailcfg.HostinfoView{}, &tailcfg.Node{}, tailcfg.NodeCapMap{}, tailcfg.PeerCapMap{},
+		netip.Addr{}, netip.Prefix{}, &netipx.IPSet{}, &netipx.IPSetBuilder{})
+
+	fset := token.NewFileSet()
+	files, _ := filepath.Glob("*.go")
+
+	var calls []string
+
+	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, d := range f.Decls {
+			if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv != nil {
+				shared[fd.Name.Name] = true
+			}
+		}
+
+		ast.Inspect(f, func(n ast.Node) bool {
+			if c, ok := n.(*ast.CallExpr); ok {
+				if sel, ok := c.Fun.(*ast.SelectorExpr); ok && theirs[sel.Sel.Name] && !shared[sel.Sel.Name] {
+					calls = append(calls, fmt.Sprintf("%s: %s", fset.Position(c.Pos()), sel.Sel.Name))
+				}
+			}
+
+			return true
+		})
+	}
+
+	return calls
+}
+
 // TestGeneratorsAreDeterministic: the same seed draws the same case, and
 // building it twice gives the same document and nodes. Anything reading
 // the clock or a map's order would break both, and with them shrinking.
 func TestGeneratorsAreDeterministic(t *testing.T) {
 	t.Parallel()
 
-	gen := Scenarios(30)
+	gen := Scenarios(10)
 
 	for i := range 200 {
 		a, b := gen.Example(i), gen.Example(i)
@@ -134,15 +247,16 @@ func TestSimplestDrawIsPlain(t *testing.T) {
 	var got Scenario
 
 	rapid.MakeFuzz(func(t *rapid.T) {
-		got = Scenarios(30).Draw(t, "scenario")
+		got = Scenarios(10).Draw(t, "scenario")
 	})(t, make([]byte, 1<<12))
 
 	want := Scenario{Start: World{
 		Policy: Policy{ACLs: []Rule{{Src: []Sel{{Kind: SelAll}}, Dst: []Dest{{Sel: Sel{Kind: SelAll}}}}}},
 		Topology: Topology{
-			Users:  []User{{ID: 1, Name: "alice"}},
-			Nodes:  []Node{{ID: 1, User: 1, V4: ownAddr(4, 1), V6: ownAddr(6, 1)}},
-			NextID: 2,
+			Users:      []User{{ID: 1, Name: "alice"}},
+			Nodes:      []Node{{ID: 1, User: 1, V4: ownAddr(4, 1), V6: ownAddr(6, 1)}},
+			NextID:     2,
+			NextUserID: 2,
 		},
 	}}
 
@@ -165,11 +279,11 @@ type policyDoc struct {
 	Groups    map[string][]string `json:"groups"`
 	TagOwners map[string][]string `json:"tagOwners"`
 	Hosts     map[string]string   `json:"hosts"`
-	ACLs      []struct {
+	ACLs      *[]struct {
 		Action, Proto string
 		Src, Dst      []string
 	} `json:"acls"`
-	Grants []struct {
+	Grants *[]struct {
 		Src, Dst, IP, Via []string
 		App               map[string][]json.RawMessage
 	} `json:"grants"`
@@ -180,7 +294,8 @@ type policyDoc struct {
 }
 
 // TestHuJSONSaysWhatThePlanSays reads the document back as plain JSON: it
-// has the plan's rules, in order, and defines every name they use.
+// has the plan's rules, in order, no rule section when it allows
+// everything, and defines every name it uses.
 func TestHuJSONSaysWhatThePlanSays(t *testing.T) {
 	t.Parallel()
 
@@ -194,11 +309,16 @@ func TestHuJSONSaysWhatThePlanSays(t *testing.T) {
 			t.Fatalf("not JSON: %v\n%s", err, p.HuJSON())
 		}
 
-		if len(doc.ACLs) != len(p.ACLs) || len(doc.Grants) != len(p.Grants) || len(doc.SSH) != len(p.SSH) || len(doc.NodeAttrs) != len(p.NodeAttrs) {
-			t.Fatalf("the document has %d acls, %d grants, %d ssh and %d nodeAttrs rules", len(doc.ACLs), len(doc.Grants), len(doc.SSH), len(doc.NodeAttrs))
+		if p.AllowAll != (doc.ACLs == nil && doc.Grants == nil) {
+			t.Fatalf("allow-all %t, but the document has acls %t, grants %t", p.AllowAll, doc.ACLs != nil, doc.Grants != nil)
 		}
 
-		names := slices.Concat(docACLs(t, p, doc), docGrants(t, p, doc))
+		acls, grants := derefDoc(doc.ACLs), derefDoc(doc.Grants)
+		if len(acls) != len(p.ACLs) || len(grants) != len(p.Grants) || len(doc.SSH) != len(p.SSH) || len(doc.NodeAttrs) != len(p.NodeAttrs) {
+			t.Fatalf("the document has %d acls, %d grants, %d ssh and %d nodeAttrs rules", len(acls), len(grants), len(doc.SSH), len(doc.NodeAttrs))
+		}
+
+		names := slices.Concat(docACLs(t, p, acls), docGrants(t, p, grants))
 		for _, a := range doc.NodeAttrs {
 			names = append(names, a.Target...)
 		}
@@ -221,15 +341,33 @@ func TestHuJSONSaysWhatThePlanSays(t *testing.T) {
 				t.Fatalf("%s is not defined", n)
 			}
 		}
+
+		for i := range numTags {
+			if _, ok := doc.TagOwners[Tags[i]]; ok != p.DefinesTag(i) {
+				t.Fatalf("%s defined %t in the document, %t in the plan", Tags[i], ok, p.DefinesTag(i))
+			}
+		}
 	})
 }
 
+func derefDoc[E any](s *[]E) []E {
+	if s == nil {
+		return nil
+	}
+
+	return *s
+}
+
 // docACLs holds the document's acls to p's and returns the names they use.
-func docACLs(t *rapid.T, p Policy, doc policyDoc) []string {
+func docACLs(t *rapid.T, p Policy, acls []struct {
+	Action, Proto string
+	Src, Dst      []string
+},
+) []string {
 	var names []string
 
 	for i, r := range p.ACLs {
-		d := doc.ACLs[i]
+		d := acls[i]
 		if d.Action != "accept" || d.Proto != Protos[r.Proto] || !slices.Equal(d.Src, selStrings(r.Src)) || len(d.Dst) != len(r.Dst) {
 			t.Fatalf("acls[%d] is %+v", i, d)
 		}
@@ -250,11 +388,15 @@ func docACLs(t *rapid.T, p Policy, doc policyDoc) []string {
 
 // docGrants holds the document's grants to p's and returns the names they
 // use.
-func docGrants(t *rapid.T, p Policy, doc policyDoc) []string {
+func docGrants(t *rapid.T, p Policy, grants []struct {
+	Src, Dst, IP, Via []string
+	App               map[string][]json.RawMessage
+},
+) []string {
 	var names []string
 
 	for i, r := range p.Grants {
-		d := doc.Grants[i]
+		d := grants[i]
 
 		ips := make([]string, len(r.IP))
 		for j, ip := range r.IP {
@@ -277,24 +419,41 @@ func docGrants(t *rapid.T, p Policy, doc policyDoc) []string {
 	return names
 }
 
-// TestEditUndo applies each step and then the step that undoes it: the
-// plan must come back, but for the next ID, which is never handed out
-// twice.
+// TestEditUndo applies each step and then the step that undoes it. Where
+// headscale has an inverse, the plan must come back, but for the ID
+// counters; where Undo says there is none, an edit of the step has none
+// (a deletion, a replacement onto a token already held), or what stays
+// different is approvals, which no write puts back once auto-approval or
+// an admin moved them, or the document, which a policy write refuses
+// once users made a token in it ambiguous.
 func TestEditUndo(t *testing.T) {
 	t.Parallel()
 
 	rapid.Check(t, func(t *rapid.T) {
-		s := Scenarios(30).Draw(t, "scenario")
+		s := Scenarios(10).Draw(t, "scenario")
 
 		w := s.Start
 		for i, st := range s.Steps {
-			next := w.Apply(st...)
+			next := w.Apply(st.Edits...)
 
-			back := next.Apply(Undo(w, st)...)
-			back.Topology.NextID = w.Topology.NextID
+			inv, ok := Undo(w, st)
+			back := next.Apply(inv.Edits...)
+			back.Topology.NextID, back.Topology.NextUserID = w.Topology.NextID, w.Topology.NextUserID
 
-			if !reflect.DeepEqual(back, w) {
-				t.Fatalf("step %d (%s) undone by %s gives\n%#v\nnot\n%#v", i+1, st, Undo(w, st), back, w)
+			// An edit headscale has no inverse for: a deletion, or a
+			// replacement onto a token the document held already.
+			noInverse, cur := false, w
+			for _, e := range st.Edits {
+				_, has := e.undo(cur)
+				noInverse = noInverse || !has
+				cur = cur.Apply(e)
+			}
+
+			switch {
+			case ok && !reflect.DeepEqual(back, w):
+				t.Fatalf("step %d (%s) undone by %s gives\n%#v\nnot\n%#v", i+1, st, inv, back, w)
+			case !ok && !noInverse && !onlyApprovalsDiffer(back, w) && len(NewView(back).AmbiguousRefs()) == 0:
+				t.Fatalf("step %d (%s): Undo says no write takes it back, yet more than approvals differ after %s:\n%#v\nnot\n%#v", i+1, st, inv, back, w)
 			}
 
 			w = next
@@ -302,18 +461,34 @@ func TestEditUndo(t *testing.T) {
 	})
 }
 
+// onlyApprovalsDiffer reports whether a and b differ in nodes' approvals
+// alone.
+func onlyApprovalsDiffer(a, b World) bool {
+	strip := func(w World) World {
+		c := w.clone()
+		for i := range c.Topology.Nodes {
+			c.Topology.Nodes[i].Approved, c.Topology.Nodes[i].AutoApproved = nil, nil
+		}
+
+		return c
+	}
+
+	return reflect.DeepEqual(strip(a), strip(b))
+}
+
 // TestEditsChangeWhatTheySay applies each edit alone and holds what moved
-// to its name: one node's one field, the users, or one part of the
-// policy. A property can then tell which input a failure needed.
+// to its name, and to what headscale changes with it: auto-approval when
+// routes, tags or a registration change. A property can then tell which
+// input a failure needed.
 func TestEditsChangeWhatTheySay(t *testing.T) {
 	t.Parallel()
 
 	rapid.Check(t, func(t *rapid.T) {
-		s := Scenarios(30).Draw(t, "scenario")
+		s := Scenarios(10).Draw(t, "scenario")
 
 		w := s.Start
 		for _, st := range s.Steps {
-			for _, e := range st {
+			for _, e := range st.Edits {
 				next := w.Apply(e)
 
 				got, want := touched(w, next), mayTouch(w, e)
@@ -323,26 +498,170 @@ func TestEditsChangeWhatTheySay(t *testing.T) {
 					}
 				}
 
-				err := checkTopology(next.Topology)
-				if err != nil {
-					t.Fatalf("after %s: %v", e, err)
-				}
-
 				w = next
 			}
 		}
 	})
 }
 
+// TestWorldsAreReachable holds every world a scenario passes through, and
+// every write it makes, to what headscale's own writes allow: a tagged
+// node has no user and was tagged with tags the policy defined; an
+// untagged node's user exists; API users' names are unique among them,
+// provider identifiers unique; no ID is handed out twice; a registered
+// node has nothing approved but what auto-approval approved; an
+// auto-approval is of a route still announced; a policy write holds no
+// token two users answer to, nor does the start.
+func TestWorldsAreReachable(t *testing.T) {
+	t.Parallel()
+
+	rapid.Check(t, func(t *rapid.T) {
+		s := Scenarios(10).Draw(t, "scenario")
+
+		err := checkReachable(s.Start)
+		if err == nil && len(NewView(s.Start).AmbiguousRefs()) > 0 {
+			err = fmt.Errorf("%w: the start's policy holds an ambiguous token", errUnreachable)
+		}
+
+		if err != nil {
+			t.Fatalf("the start: %v", err)
+		}
+
+		w := s.Start
+		for i, st := range s.Steps {
+			cur := w
+
+			for _, e := range st.Edits {
+				err := checkWrite(cur, e)
+				if err != nil {
+					t.Fatalf("step %d (%s): %s: %v", i+1, st, e, err)
+				}
+
+				cur = cur.Apply(e)
+			}
+
+			if err := checkReachable(cur); err != nil { //nolint:noinlineerr
+				t.Fatalf("after step %d (%s): %v", i+1, st, err)
+			}
+
+			for _, id := range st.Reads {
+				if _, ok := cur.Topology.Node(id); !ok {
+					t.Fatalf("step %d: n%d reads, but is not there", i+1, id)
+				}
+			}
+
+			w = cur
+		}
+	})
+}
+
+var errUnreachable = errors.New("not something headscale's writes produce")
+
+func checkReachable(w World) error {
+	tp := w.Topology
+
+	if !slices.IsSortedFunc(tp.Users, func(a, b User) int { return cmp.Compare(a.ID, b.ID) }) {
+		return fmt.Errorf("%w: users out of order: %v", errUnreachable, tp.Users)
+	}
+
+	for i, u := range tp.Users {
+		if u.ID >= tp.NextUserID {
+			return fmt.Errorf("%w: u%d at or past the next user ID %d", errUnreachable, u.ID, tp.NextUserID)
+		}
+
+		for _, o := range tp.Users[i+1:] {
+			if !u.OIDC() && !o.OIDC() && u.Name == o.Name || u.OIDC() && u.Provider == o.Provider {
+				return fmt.Errorf("%w: u%d and u%d collide: %v %v", errUnreachable, u.ID, o.ID, u, o)
+			}
+		}
+	}
+
+	for i, n := range tp.Nodes {
+		if i > 0 && tp.Nodes[i-1].ID >= n.ID {
+			return fmt.Errorf("%w: nodes out of order at n%d", errUnreachable, n.ID)
+		}
+
+		if n.ID >= tp.NextID {
+			return fmt.Errorf("%w: n%d at or past the next ID %d", errUnreachable, n.ID, tp.NextID)
+		}
+
+		_, ok := tp.User(n.User)
+
+		switch {
+		case n.Tagged() && n.User != 0:
+			return fmt.Errorf("%w: tagged n%d has user u%d", errUnreachable, n.ID, n.User)
+		case !n.Tagged() && !ok:
+			return fmt.Errorf("%w: n%d belongs to u%d, who does not exist", errUnreachable, n.ID, n.User)
+		}
+
+		for _, rs := range [][]int{n.Tags, n.Announced, n.Approved, n.AutoApproved} {
+			if !slices.IsSorted(rs) || len(slices.Compact(slices.Clone(rs))) != len(rs) {
+				return fmt.Errorf("%w: n%d has an unsorted list %v", errUnreachable, n.ID, rs)
+			}
+		}
+
+		if len(dropRoutes(n.AutoApproved, keepRoutes(n.Approved, n.Announced))) > 0 {
+			return fmt.Errorf("%w: n%d keeps an auto-approval of a route it does not announce and serve: %v", errUnreachable, n.ID, n)
+		}
+	}
+
+	return nil
+}
+
+// checkWrite holds e, written to w, to what headscale accepts.
+func checkWrite(w World, e Edit) error {
+	next := w.Apply(e)
+
+	defined := func(tags []int) bool {
+		return !slices.ContainsFunc(tags, func(t int) bool { return !w.Policy.DefinesTag(t) })
+	}
+
+	switch e := e.(type) {
+	case Join:
+		switch {
+		case e.Node.ID < w.Topology.nextID():
+			return fmt.Errorf("%w: registered under an ID handed out before", errUnreachable)
+		case !defined(e.Node.Tags):
+			return fmt.Errorf("%w: registered with tags the policy does not define", errUnreachable)
+		case len(e.Node.Approved) > 0 || e.Node.Expired:
+			return fmt.Errorf("%w: registered with approvals or expired", errUnreachable)
+		case !e.Node.Tagged() && func() bool { _, ok := w.Topology.User(e.Node.User); return !ok }():
+			return fmt.Errorf("%w: registered for a user who does not exist", errUnreachable)
+		}
+	case Retag:
+		if len(e.Tags) > 0 && !defined(e.Tags) {
+			return fmt.Errorf("%w: tagged with tags the policy does not define", errUnreachable)
+		}
+	case AddUser:
+		if e.User.ID < w.Topology.nextUserID() {
+			return fmt.Errorf("%w: created under an ID handed out before", errUnreachable)
+		}
+	case DeleteUser:
+		if slices.ContainsFunc(w.Topology.Nodes, func(n Node) bool { return n.User == e.ID }) {
+			return fmt.Errorf("%w: deleted a user who owns a node", errUnreachable)
+		}
+	case SetEmail:
+		if u, _ := w.Topology.User(e.ID); !u.OIDC() {
+			return fmt.Errorf("%w: an API user's e-mail changed", errUnreachable)
+		}
+	}
+
+	if !reflect.DeepEqual(w.Policy, next.Policy) && len(NewView(next).AmbiguousRefs()) > 0 {
+		return fmt.Errorf("%w: a policy write holding a token several users answer to", errUnreachable)
+	}
+
+	return nil
+}
+
 // TestCommitTellsWhatChanged replays each step's Change on a mirror of
 // the nodes: deleting what it removes and writing what it names must give
-// the next world's nodes, a node re-registered under its ID must be both
-// removed and written, and the users and policy flags must be exact.
+// the next world's nodes, a node whose user changed must be written, and
+// the users and policy flags must be exact.
 func TestCommitTellsWhatChanged(t *testing.T) {
 	t.Parallel()
 
 	rapid.Check(t, func(t *rapid.T) {
-		s := Scenarios(30).Draw(t, "scenario")
+		s := Scenarios(10).Draw(t, "scenario")
 
 		mirror := map[types.NodeID]Node{}
 		for _, n := range s.Start.Topology.Nodes {
@@ -365,10 +684,12 @@ func TestCommitTellsWhatChanged(t *testing.T) {
 				t.Fatalf("step %d (%s): %+v leaves the nodes\n%v\nnot\n%v", i+1, st, c, got, next.Topology.Nodes)
 			}
 
-			for j, e := range st {
-				if l, ok := e.(Leave); ok && slices.ContainsFunc(st[j+1:], func(o Edit) bool { jn, ok := o.(Join); return ok && jn.Node.ID == l.ID }) &&
-					(!slices.Contains(c.Removed, l.ID) || !slices.Contains(c.Nodes, l.ID)) {
-					t.Fatalf("step %d (%s): n%d registered again is not both removed and written: %+v", i+1, st, l.ID, c)
+			for _, n := range next.Topology.Nodes {
+				u0, _ := w.Topology.User(n.User)
+				u1, _ := next.Topology.User(n.User)
+
+				if u0 != u1 && !slices.Contains(c.Nodes, n.ID) {
+					t.Fatalf("step %d (%s): n%d's user changed, and it is not written: %+v", i+1, st, n.ID, c)
 				}
 			}
 
@@ -422,7 +743,7 @@ func touched(before, after World) []string {
 	}
 
 	for i := range numTags {
-		if !slices.Equal(bp.TagOwners[i], ap.TagOwners[i]) {
+		if !slices.Equal(bp.TagOwners[i], ap.TagOwners[i]) || bp.Defined[i] != ap.Defined[i] {
 			out = append(out, "tagOwners "+Tags[i])
 		}
 	}
@@ -431,6 +752,10 @@ func touched(before, after World) []string {
 		if bp.Hosts[i] != ap.Hosts[i] {
 			out = append(out, Hosts[i])
 		}
+	}
+
+	if bp.AllowAll != ap.AllowAll {
+		out = append(out, "allow-all")
 	}
 
 	for _, grant := range []bool{false, true} {
@@ -464,8 +789,8 @@ func touched(before, after World) []string {
 	return out
 }
 
-// mayTouch is what e's name says it changes, as touched writes it.
-func mayTouch(w World, e Edit) []string {
+// nodeTouch is mayTouch for an edit of one node, nil for any other.
+func nodeTouch(e Edit) []string {
 	node := func(id types.NodeID, fields ...string) []string {
 		out := make([]string, len(fields))
 		for i, f := range fields {
@@ -483,30 +808,57 @@ func mayTouch(w World, e Edit) []string {
 	case Leave:
 		return node(e.ID, "left")
 	case Retag:
-		return node(e.ID, "Tags", "User")
-	case SetOwner:
-		return node(e.ID, "User")
+		return node(e.ID, "Tags", "User", "Approved", "AutoApproved")
 	case SetAddr:
 		return node(e.ID, family(e.Family))
 	case SwapAddrs:
 		return slices.Concat(node(e.A, family(e.Family)), node(e.B, family(e.Family)))
-	case Announce, Withdraw:
-		return node(nodeOf(e), "Announced")
-	case Approve, Unapprove:
-		return node(nodeOf(e), "Approved")
+	case Announce:
+		return node(e.ID, "Announced", "Approved", "AutoApproved")
+	case Withdraw:
+		return node(e.ID, "Announced", "Approved", "AutoApproved")
+	case Approve:
+		return node(e.ID, "Approved", "AutoApproved")
+	case Unapprove:
+		return node(e.ID, "Approved", "AutoApproved")
 	case SetClient:
 		return node(e.ID, "Client")
 	case SetExpired:
 		return node(e.ID, "Expired")
 	case SetOnline:
 		return node(e.ID, "Offline")
+	}
+
+	return nil
+}
+
+// mayTouch is what e's name says it changes, and what headscale changes
+// with it, as touched writes it.
+func mayTouch(w World, e Edit) []string {
+	if out := nodeTouch(e); out != nil {
+		return out
+	}
+
+	whole := []string{"acls list", "grants list", "allow-all"}
+
+	switch e := e.(type) {
 	case AddUser, DeleteUser, RenameUser, SetEmail:
 		return []string{"users"}
 	case SetPorts:
 		return []string{e.Rule.String()}
 	case SetProto:
 		return []string{e.Rule.String()}
+	case SetIP:
+		return []string{e.Rule.String()}
+	case SetApp:
+		return []string{e.Rule.String()}
+	case SetVia:
+		return []string{e.Rule.String()}
 	case SetSel:
+		return []string{e.Rule.String()}
+	case AddSel:
+		return []string{e.Rule.String()}
+	case RemoveSel:
 		return []string{e.Rule.String()}
 	case SwapRules:
 		return []string{RuleRef{e.Grant, e.I}.String(), RuleRef{e.Grant, e.J}.String()}
@@ -517,9 +869,13 @@ func mayTouch(w World, e Edit) []string {
 	case SetTagOwners:
 		return []string{"tagOwners " + Tags[e.Tag]}
 	case AddRule:
-		return []string{listName(e.Ref.Grant) + " list"}
+		return []string{listName(e.Ref.Grant) + " list", "allow-all"}
 	case RemoveRule:
 		return []string{listName(e.Ref.Grant) + " list"}
+	case AllowAll, SetRules:
+		return whole
+	case ReplaceUserRefs:
+		return everyPart(w)
 	case SetSSH:
 		return []string{"ssh"}
 	case SetNodeAttrs:
@@ -528,7 +884,22 @@ func mayTouch(w World, e Edit) []string {
 		return []string{"autoApprovers"}
 	}
 
-	panic(fmt.Sprintf("no rule for %T in %v", e, w.Topology.NextID))
+	panic(fmt.Sprintf("no rule for %T", e))
+}
+
+// everyPart is every part of w's policy a token can be in.
+func everyPart(w World) []string {
+	out := slices.Concat(Groups, []string{"ssh", "nodeAttrs", "autoApprovers"})
+
+	for _, t := range Tags {
+		out = append(out, "tagOwners "+t)
+	}
+
+	for _, ref := range w.Policy.Refs() {
+		out = append(out, ref.String())
+	}
+
+	return out
 }
 
 func listName(grant bool) string {
@@ -539,66 +910,19 @@ func listName(grant bool) string {
 	return "acls"
 }
 
-func nodeOf(e Edit) types.NodeID {
-	switch e := e.(type) {
-	case Announce:
-		return e.ID
-	case Withdraw:
-		return e.ID
-	case Approve:
-		return e.ID
-	case Unapprove:
-		return e.ID
-	}
-
-	return 0
-}
-
-// checkTopology holds what production holds of users and nodes: one ID
-// each, an untagged node owned by a user who exists, a tagged node
-// carrying none or one who does, route lists sorted, IDs below NextID.
-var errTopology = errors.New("not a topology production holds")
-
-func checkTopology(tp Topology) error {
-	if !slices.IsSortedFunc(tp.Users, func(a, b User) int { return int(a.ID) - int(b.ID) }) { //nolint:gosec // small
-		return fmt.Errorf("%w: users out of order: %v", errTopology, tp.Users)
-	}
-
-	for i, n := range tp.Nodes {
-		if i > 0 && tp.Nodes[i-1].ID >= n.ID {
-			return fmt.Errorf("%w: nodes out of order at n%d", errTopology, n.ID)
-		}
-
-		if n.ID >= tp.NextID {
-			return fmt.Errorf("%w: n%d at or past the next ID %d", errTopology, n.ID, tp.NextID)
-		}
-
-		_, ok := tp.User(n.User)
-
-		switch {
-		case !n.Tagged() && !ok:
-			return fmt.Errorf("%w: n%d belongs to u%d, who does not exist", errTopology, n.ID, n.User)
-		case n.Tagged() && n.User != 0 && !ok:
-			return fmt.Errorf("%w: n%d carries u%d, who does not exist", errTopology, n.ID, n.User)
-		}
-
-		for _, rs := range [][]int{n.Tags, n.Announced, n.Approved} {
-			if !slices.IsSorted(rs) || len(slices.Compact(slices.Clone(rs))) != len(rs) {
-				return fmt.Errorf("%w: n%d has an unsorted list %v", errTopology, n.ID, rs)
-			}
-		}
-	}
-
-	return nil
-}
-
-// TestShrinksToSmallCases runs two properties that fail on purpose and
-// requires rapid to minimise each to a case a person can read. The output
-// of the second is what a builder's failing property prints.
+// TestShrinksToSmallCases runs properties that fail on purpose and
+// requires rapid to minimise each to a case a person can read, with
+// nothing in it the failure does not need. The last is what a builder's
+// failing property prints. RAPID_SEED picks another seed.
 func TestShrinksToSmallCases(t *testing.T) {
-	// Fail files go nowhere, and the seed is fixed so the minimised case
-	// is the same on every run. Flags are process-wide: not parallel.
-	for name, value := range map[string]string{"rapid.nofailfile": "true", "rapid.seed": "1"} {
+	// Fail files go nowhere, and the seed is fixed unless one is given.
+	// Flags are process-wide: not parallel.
+	settings := map[string]string{"rapid.nofailfile": "true"}
+	if flag.Lookup("rapid.seed").Value.String() == "0" {
+		settings["rapid.seed"] = "1"
+	}
+
+	for name, value := range settings {
 		old := flag.Lookup(name).Value.String()
 
 		err := flag.Set(name, value)
@@ -609,36 +933,80 @@ func TestShrinksToSmallCases(t *testing.T) {
 		t.Cleanup(func() { _ = flag.Set(name, old) })
 	}
 
-	t.Run("a tag on a shared address", func(t *testing.T) {
-		var last World
+	worldCase := func(name string, fails func(*View) string, needs ...string) {
+		t.Run(name, func(t *testing.T) {
+			var last World
 
-		out := failing(t, func(t *rapid.T) {
-			w := Worlds().Draw(t, "world")
-			last = w
+			out := failing(t, func(t *rapid.T) {
+				w := Worlds().Draw(t, "world")
+				last = w
 
-			v := NewView(w)
-			for _, r := range slices.Concat(w.Policy.ACLs, w.Policy.Grants) {
-				for _, s := range r.Src {
-					for _, n := range v.MembersOf(s) {
-						if s.Kind == SelTag && slices.ContainsFunc(n.Addrs(), func(a netip.Addr) bool { return v.heldByOther(n, a) }) {
-							t.Fatalf("%s names n%d, which shares an address", s, n.ID)
-						}
-					}
+				if why := fails(NewView(w)); why != "" {
+					t.Fatal(why)
 				}
+			})
+
+			if left := leftovers(Scenario{Start: last}, needs); len(left) > 0 {
+				t.Errorf("minimised with leftovers %v:\n%s", left, out)
 			}
 		})
+	}
 
-		rules := len(last.Policy.ACLs) + len(last.Policy.Grants)
-		if len(last.Topology.Nodes) > 3 || rules > 2 {
-			t.Errorf("minimised to %d nodes and %d rules:\n%s", len(last.Topology.Nodes), rules, out)
+	worldCase("a shared address", func(v *View) string {
+		if v.sharedAddr() {
+			return "two nodes share an address"
 		}
-	})
 
-	t.Run("a system that loses retags after an address change", func(t *testing.T) {
+		return ""
+	}, "node", "shared", "shared")
+
+	worldCase("a served route covering a node", func(v *View) string {
+		for _, r := range v.nodes {
+			for _, rt := range served(r) {
+				if rt < numRulePrefixes && v.anyNode(func(n Node) bool { return n.ID != r.ID && slices.ContainsFunc(n.Addrs(), Prefixes[rt].Contains) }) {
+					return fmt.Sprintf("n%d serves %s, which holds another node's address", r.ID, Prefixes[rt])
+				}
+			}
+		}
+
+		return ""
+	}, "node", "route")
+
+	t.Run("a policy edit moving a rule's source", func(t *testing.T) {
 		var last Scenario
 
 		out := failing(t, func(t *rapid.T) {
-			s := Scenarios(15).Draw(t, "scenario")
+			s := Scenarios(10).Draw(t, "scenario")
+			last = s
+
+			w := s.Start
+			for i, st := range s.Steps {
+				next := w.Apply(st.Edits...)
+				for _, e := range edits[SetSel](st) {
+					if !e.Dst && ruleChanged(NewView(w), NewView(next), e.Rule) {
+						t.Fatalf("step %d moves %s's source", i+1, e.Rule)
+					}
+				}
+
+				w = next
+			}
+		})
+
+		// A move needs a selector other than *, before it or after: in
+		// the start, or added by a step of its own.
+		left := leftovers(last, []string{"step", "edit", "policy"})
+		added := len(last.Steps) > 0 && len(edits[AddRule](last.Steps[0]))+len(edits[SetSel](last.Steps[0])) > 0
+
+		if len(left) > 0 && (!added || len(leftovers(last, []string{"step", "step", "edit", "edit"})) > 0) {
+			t.Errorf("minimised with leftovers %v:\n%s", left, out)
+		}
+	})
+
+	t.Run("a system that loses retags after a node goes offline", func(t *testing.T) {
+		var last Scenario
+
+		out := failing(t, func(t *rapid.T) {
+			s := Scenarios(10).Draw(t, "scenario")
 			last = s
 
 			sys := newToySystem(s.Start)
@@ -660,13 +1028,90 @@ func TestShrinksToSmallCases(t *testing.T) {
 
 		edits := 0
 		for _, st := range last.Steps {
-			edits += len(st)
+			edits += len(st.Edits)
 		}
 
-		if len(last.Start.Topology.Nodes) > 2 || edits > 3 {
+		if len(last.Start.Topology.Nodes) > 2 || edits > 2 {
 			t.Errorf("minimised to %d nodes and %d edits:\n%s", len(last.Start.Topology.Nodes), edits, out)
 		}
 	})
+}
+
+// leftovers lists what s holds beyond the plain case: one user, one node
+// on its own addresses, the single allow rule, no step; less what needs,
+// a multiset of the same words, says the failure needs.
+func leftovers(s Scenario, needs []string) []string {
+	var got []string
+
+	w := s.Start
+	plain := Policy{ACLs: []Rule{{Src: []Sel{{Kind: SelAll}}, Dst: []Dest{{Sel: Sel{Kind: SelAll}}}}}}
+
+	if !reflect.DeepEqual(canonPolicy(w.Policy), plain) {
+		got = append(got, "policy")
+	}
+
+	for range max(0, len(w.Topology.Users)-1) {
+		got = append(got, "user")
+	}
+
+	for _, u := range w.Topology.Users {
+		if int(u.ID) > len(defaultUsers) || u != defaultUsers[u.ID-1] {
+			got = append(got, "user identity")
+		}
+	}
+
+	for range max(0, len(w.Topology.Nodes)-1) {
+		got = append(got, "node")
+	}
+
+	v := NewView(w)
+
+	for _, n := range w.Topology.Nodes {
+		plainNode := Node{ID: n.ID, User: n.User, V4: ownAddr(4, uint64(n.ID)), V6: ownAddr(6, uint64(n.ID))}
+
+		switch {
+		case slices.ContainsFunc(n.Addrs(), Outside):
+			got = append(got, "outside")
+		case slices.ContainsFunc(n.Addrs(), func(a netip.Addr) bool { return v.heldByOther(n, a) }):
+			got = append(got, "shared")
+		case len(n.Addrs()) == 1:
+			got = append(got, "single-family")
+		case n.V4 != plainNode.V4 || n.V6 != plainNode.V6:
+			got = append(got, "address")
+		}
+
+		if n.Tagged() {
+			got = append(got, "tag")
+		}
+
+		if len(n.Announced) > 0 || len(n.Approved) > 0 {
+			got = append(got, "route")
+		}
+
+		if n.Client != Official || n.Expired || n.Offline {
+			got = append(got, "client state")
+		}
+	}
+
+	for _, st := range s.Steps {
+		got = append(got, "step")
+
+		for range st.Edits {
+			got = append(got, "edit")
+		}
+
+		if len(st.Reads) > 0 {
+			got = append(got, "read")
+		}
+	}
+
+	for _, n := range needs {
+		if i := slices.Index(got, n); i >= 0 {
+			got = slices.Delete(got, i, i+1)
+		}
+	}
+
+	return got
 }
 
 func tagNames(tags []int) []string {
@@ -678,19 +1123,18 @@ func tagNames(tags []int) []string {
 	return out
 }
 
-// toySystem follows a world's node tags from what [World.Commit] reports, and
-// stops following a node's tags once its address has moved: the bug the
+// toySystem follows a world's node tags from what [World.Commit] reports,
+// and stops following a node's tags once it has gone offline: the bug the
 // property above finds.
 type toySystem struct {
-	tags  map[types.NodeID][]int
-	addrs map[types.NodeID][2]netip.Addr
-	moved map[types.NodeID]bool
+	tags map[types.NodeID][]int
+	lost map[types.NodeID]bool
 }
 
 func newToySystem(w World) *toySystem {
-	s := &toySystem{tags: map[types.NodeID][]int{}, addrs: map[types.NodeID][2]netip.Addr{}, moved: map[types.NodeID]bool{}}
+	s := &toySystem{tags: map[types.NodeID][]int{}, lost: map[types.NodeID]bool{}}
 	for _, n := range w.Topology.Nodes {
-		s.tags[n.ID], s.addrs[n.ID] = n.Tags, [2]netip.Addr{n.V4, n.V6}
+		s.tags[n.ID], s.lost[n.ID] = n.Tags, n.Offline
 	}
 
 	return s
@@ -699,19 +1143,13 @@ func newToySystem(w World) *toySystem {
 func (s *toySystem) commit(c Change, w World) {
 	for _, id := range c.Removed {
 		delete(s.tags, id)
-		delete(s.addrs, id)
 	}
 
 	for _, id := range c.Nodes {
 		n, _ := w.Topology.Node(id)
+		s.lost[id] = s.lost[id] || n.Offline
 
-		if old, ok := s.addrs[id]; ok && old != [2]netip.Addr{n.V4, n.V6} {
-			s.moved[id] = true
-		}
-
-		s.addrs[id] = [2]netip.Addr{n.V4, n.V6}
-
-		if !s.moved[id] {
+		if !s.lost[id] {
 			s.tags[id] = n.Tags
 		}
 	}
