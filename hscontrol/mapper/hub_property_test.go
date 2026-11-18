@@ -411,7 +411,7 @@ func runHubMachine(t *rapid.T, reach *hubPropertyReach, audit bool) {
 	mixed := pbtChance(t, 4, "mixed-versions")
 
 	m := &hubMachine{t: t, mixed: mixed, reach: reach, audit: audit, audited: RouteAuditFailures()}
-	m.p = newPBTWorld(t, world, nil)
+	m.p = newPBTWorld(t, world)
 	m.h = NewHub()
 	m.w = newSteppedWatcher(t, m.h, m.p.s)
 	m.p.committed = m.w.committed
@@ -624,9 +624,17 @@ func (m *hubMachine) commit(t *rapid.T) {
 // flash has some of the sessions woken take the latest snapshot now, and
 // some of those end their render before the write is taken back: the
 // newest snapshot the hub saw is then one the reversal undoes, which a
-// first map ending later renders.
+// first map ending later renders. Renders in flight since before may end
+// in between too, so a first map handed an older snapshot renders that
+// newest one before the reversal commits.
 func (m *hubMachine) flash(t *rapid.T) {
-	var took []*hubSess
+	var took, inFlight []*hubSess
+
+	for _, s := range m.sess {
+		if s.took != nil {
+			inFlight = append(inFlight, s)
+		}
+	}
 
 	for _, s := range slices.Clone(m.sess) {
 		if !s.ended.Load() && s.took == nil && (s.first || len(s.sess.wakes) > 0) && rapid.Bool().Draw(t, "takes") {
@@ -635,7 +643,7 @@ func (m *hubMachine) flash(t *rapid.T) {
 		}
 	}
 
-	for _, s := range took {
+	for _, s := range slices.Concat(took, inFlight) {
 		if s.took != nil && shardFree(s.shard(m.h)) && rapid.Bool().Draw(t, "ends") {
 			m.finish(s, true)
 		}
@@ -1169,7 +1177,7 @@ func stressConverges(t *testing.T, seed, run uint64, writes int, audit bool) str
 		world = policymodel.Worlds().Example(h.next())
 	}
 
-	h.p = newPBTWorld(t, world, nil)
+	h.p = newPBTWorld(t, world)
 
 	h.hub = NewHub()
 	t.Cleanup(h.hub.Close)

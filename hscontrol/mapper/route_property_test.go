@@ -43,7 +43,7 @@ type pbtWorld struct {
 	committed func(before uint64)
 }
 
-func newPBTWorld(t pbtT, w policymodel.World, committed func(uint64)) *pbtWorld {
+func newPBTWorld(t pbtT, w policymodel.World, configure ...func(*types.Config)) *pbtWorld {
 	t.Helper()
 
 	p4 := netip.MustParsePrefix("100.64.0.0/10")
@@ -59,6 +59,10 @@ func newPBTWorld(t pbtT, w policymodel.World, committed func(uint64)) *pbtWorld 
 		DNSConfig: types.DNSConfig{BaseDomain: "headscale.test"},
 	}
 
+	for _, c := range configure {
+		c(cfg)
+	}
+
 	s, err := state.NewState(cfg)
 	if err != nil {
 		t.Fatalf("state: %v", err)
@@ -72,7 +76,6 @@ func newPBTWorld(t pbtT, w policymodel.World, committed func(uint64)) *pbtWorld 
 
 	p := &pbtWorld{t: t, cfg: cfg, s: s}
 	p.write(w)
-	p.committed = committed
 
 	return p
 }
@@ -367,7 +370,7 @@ func playScenario(t *rapid.T, reach *scenarioReach) {
 		sess: map[types.NodeID]*scenarioSess{}, fresh: map[freshKey]*netMap{}, routes: map[[2]uint64]routeAnswer{},
 	}
 
-	r.p = newPBTWorld(t, s.Start, nil)
+	r.p = newPBTWorld(t, s.Start)
 	r.h = NewHub()
 	r.w = newSteppedWatcher(t, r.h, r.p.s)
 	r.p.committed = r.committed
