@@ -1,0 +1,709 @@
+package mapper
+
+import (
+	"fmt"
+	"maps"
+	"net/netip"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/juanfont/headscale/hscontrol/capver"
+	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
+	"github.com/juanfont/headscale/hscontrol/state"
+	"github.com/juanfont/headscale/hscontrol/types"
+	"gorm.io/gorm"
+	"pgregory.net/rapid"
+	"tailscale.com/envknob"
+	"tailscale.com/tailcfg"
+)
+
+// pbtT is what the world driver needs of a test: a *testing.T or a
+// *rapid.T, so a property's failures stay rapid's to shrink.
+type pbtT interface {
+	Helper()
+	Fatalf(format string, args ...any)
+	Logf(format string, args ...any)
+	Cleanup(f func())
+}
+
+// pbtWorld is a State written from a policymodel world, one State call
+// per write: users through the State's user API, the policy through
+// SetPolicy, nodes straight into the world, since the model's addresses
+// include ones only the database can hold. Each call commits at most
+// once, and committed, when set, hears of every call.
+type pbtWorld struct {
+	t   pbtT
+	cfg *types.Config
+	s   *state.State
+	w   policymodel.World
+
+	committed func(before uint64)
+}
+
+func newPBTWorld(t pbtT, w policymodel.World, committed func(uint64)) *pbtWorld {
+	t.Helper()
+
+	p4 := netip.MustParsePrefix("100.64.0.0/10")
+	p6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+	cfg := &types.Config{
+		Database: types.DatabaseConfig{
+			Type:   types.DatabaseSqlite,
+			Sqlite: types.SqliteConfig{Path: ":memory:"},
+		},
+		ServerURL: "https://headscale.test",
+		Policy:    types.PolicyConfig{Mode: types.PolicyModeDB},
+		Prefixes:  types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential},
+		DNSConfig: types.DNSConfig{BaseDomain: "headscale.test"},
+	}
+
+	s, err := state.NewState(cfg)
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	s.SetDERPMap(&tailcfg.DERPMap{
+		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
+	})
+
+	p := &pbtWorld{t: t, cfg: cfg, s: s}
+	p.write(w)
+	p.committed = committed
+
+	return p
+}
+
+// call runs one State write and tells committed of it.
+func (p *pbtWorld) call(write func()) {
+	before := p.s.Snapshot().Rev()
+
+	write()
+
+	if p.committed != nil {
+		p.committed(before)
+	}
+}
+
+// write brings the State from p.w to w: deleted nodes and users, changed
+// and new users, the policy, then new and changed nodes. A single edit
+// touches one of them; a batch (a world written from scratch, a step taken
+// back) needs that order — a policy can name a user only once the user who
+// would make it ambiguous is gone, and a user can take a name only once
+// its holder let it go — and renames in two passes, through names of
+// their own, since two users of a batch can trade names.
+func (p *pbtWorld) write(w policymodel.World) {
+	p.t.Helper()
+
+	users, nodes := w.Topology.Build()
+
+	for _, n := range p.w.Topology.Nodes {
+		if _, ok := w.Topology.Node(n.ID); !ok {
+			p.call(func() { p.s.DeleteNodeFromStoreForTest(n.ID) })
+		}
+	}
+
+	for _, u := range p.w.Topology.Users {
+		if _, ok := w.Topology.User(u.ID); !ok {
+			p.call(func() {
+				err := p.s.DeleteUser(types.UserID(u.ID))
+				if err != nil {
+					p.t.Fatalf("delete user %d: %v", u.ID, err)
+				}
+			})
+		}
+	}
+
+	var changed, added []types.User
+
+	for _, u := range users {
+		was, ok := p.w.Topology.User(u.ID)
+		now, _ := w.Topology.User(u.ID)
+
+		switch {
+		case !ok:
+			added = append(added, u)
+		case was != now:
+			changed = append(changed, u)
+		}
+	}
+
+	update := func(id uint, set func(*types.User)) {
+		p.call(func() {
+			_, err := p.s.UpdateUser(types.UserID(id), func(cur *types.User) error {
+				set(cur)
+
+				return nil
+			})
+			if err != nil {
+				p.t.Fatalf("update user %d: %v", id, err)
+			}
+		})
+	}
+
+	if len(changed)+len(added) > 1 {
+		for _, u := range changed {
+			if was, _ := p.w.Topology.User(u.ID); was.Name != u.Name {
+				update(u.ID, func(cur *types.User) { cur.Name = fmt.Sprintf("pbt-renaming-%d", u.ID) })
+			}
+		}
+	}
+
+	for _, u := range changed {
+		update(u.ID, func(cur *types.User) {
+			cur.Name, cur.Email, cur.Provider, cur.ProviderIdentifier = u.Name, u.Email, u.Provider, u.ProviderIdentifier
+		})
+	}
+
+	for _, u := range added {
+		u.Model = gorm.Model{ID: u.ID}
+
+		p.call(func() {
+			_, err := p.s.CreateUser(u)
+			if err != nil {
+				p.t.Fatalf("create user %d: %v", u.ID, err)
+			}
+		})
+	}
+
+	if string(w.Policy.HuJSON()) != string(p.w.Policy.HuJSON()) || len(p.w.Topology.Users) == 0 {
+		p.call(func() {
+			_, err := p.s.SetPolicy(w.Policy.HuJSON())
+			if err != nil {
+				p.t.Fatalf("policy: %v", err)
+			}
+		})
+	}
+
+	for i, n := range w.Topology.Nodes {
+		if was, ok := p.w.Topology.Node(n.ID); ok && reflect.DeepEqual(was, n) {
+			continue
+		}
+
+		tn := nodes[i]
+		if tn.UserID != nil {
+			// The user as the State holds it, as registration loads it.
+			u, err := p.s.GetUserByID(types.UserID(*tn.UserID))
+			if err != nil {
+				p.t.Fatalf("node %d's user: %v", n.ID, err)
+			}
+
+			tn.User = u
+		}
+
+		p.call(func() { p.s.PutNodeInStoreForTest(*tn) })
+	}
+
+	p.w = w
+}
+
+// edit commits e, alone.
+func (p *pbtWorld) edit(e policymodel.Edit) { p.write(p.w.Apply(e)) }
+
+// pbtChance is true about once in k draws, and false shrunk.
+func pbtChance(t *rapid.T, k int, label string) bool {
+	return rapid.IntRange(0, k-1).Draw(t, label) == k-1
+}
+
+// scenarioRun plays a policymodel scenario against a State, its hub's
+// watcher routing in step, with a session per node that renders only
+// where the scenario says it reads: the start, then the nodes each step
+// names. A session that does not read keeps what it rendered last, for
+// as many commits as it does not read.
+type scenarioRun struct {
+	t        *rapid.T
+	p        *pbtWorld
+	w        *steppedWatcher
+	h        *Hub
+	coalesce bool
+	mixed    bool
+	sess     map[types.NodeID]*scenarioSess
+	// commits are the snapshot of each commit since the start, the start
+	// first, with the edit that made it.
+	commits []scenarioCommit
+	edit    policymodel.Edit
+
+	fresh  map[freshKey]*netMap
+	routes map[[2]uint64]routeAnswer
+	reach  *scenarioReach
+}
+
+type scenarioCommit struct {
+	snap *state.Snapshot
+	edit policymodel.Edit
+}
+
+type scenarioSess struct {
+	id     types.NodeID
+	st     *Stream
+	capVer tailcfg.CapabilityVersion
+	client *modelClient
+	reads  []sessionRead
+}
+
+// sessionRead is a session's render of snap, and what it then held.
+type sessionRead struct {
+	snap *state.Snapshot
+	held *netMap
+}
+
+type freshKey struct {
+	rev uint64
+	id  types.NodeID
+	cv  tailcfg.CapabilityVersion
+}
+
+type routeAnswer struct {
+	all  bool
+	wake map[types.NodeID]struct{}
+}
+
+// scenarioReach counts what the scenarios reached and what Route did with
+// it: pairs judged, sessions they had to wake, and, between neighbouring
+// commits, sessions woken that then had nothing to send, by the edit that
+// made the commit and whom the change named.
+type scenarioReach struct {
+	pairs, stale, pairsBetween, staleBetween int
+	reads, lagged                            int
+	woken, idle                              map[string]int
+	// joinWoken counts, by [ruleClass], the receivers a join in capability
+	// mode wakes that are served capability form and recut by no D7 rule;
+	// joinNamed those of them it names in Filters; joinIdle those of them
+	// whose filter and SSH policy stayed.
+	joinWoken, joinNamed, joinIdle map[string]int
+}
+
+// TestSessionsFollowGeneratedScenarios plays generated scenarios
+// (policymodel's: arbitrary policies, topologies and steps, edits one
+// commit each, now and then a node's endpoint moving after a step)
+// against a State, a hub whose watcher routes after every
+// commit or once per step, and a session per node rendering where the
+// scenario's steps read. It holds two properties.
+//
+// Route is sound (P10.1): for every session, every snapshot X it rendered
+// and every later commit C, if what a fresh render of C would send the
+// session holding X's render is not nothing, Route(X, C, C.Since(X))
+// wakes it. X before C's neighbour is the coalesced routing's pair, and X
+// strictly between a routing's ends is what the render log asks: every
+// pair is one the hub asks. It judges by rendering afresh, with caches of
+// its own and filters cut afresh; it shares render and diff with what it
+// judges (they are held to the client below), not routing.
+//
+// Sessions that lag converge (L11): at every read, the session's render,
+// made with the hub's shared caches after any number of commits it did not
+// read, equals a fresh render, and the responses it returned, applied in
+// order to what its client held since its first map, give a fresh
+// session's client.
+//
+// Over-waking is allowed and counted, not judged: a session woken between
+// neighbouring commits whose fresh renders are equal sends nothing. One
+// part is a law: in capability mode, under a policy whose rules routing
+// narrows (see [ruleClass]), a join names in Filters no receiver served
+// capability form at both ends, other than the joiner and the exit nodes
+// and subnet routers D7 recuts, whose filter and SSH policy stayed.
+func TestSessionsFollowGeneratedScenarios(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "false")
+
+	for _, capSources := range []bool{false, true} {
+		t.Run(fmt.Sprintf("capability=%t", capSources), func(t *testing.T) {
+			t.Setenv(state.TestCapabilitySourcesEnv, strconv.FormatBool(capSources))
+
+			reach := &scenarioReach{woken: map[string]int{}, idle: map[string]int{}, joinWoken: map[string]int{}, joinNamed: map[string]int{}, joinIdle: map[string]int{}}
+
+			rapid.Check(t, func(t *rapid.T) { playScenario(t, reach) })
+
+			t.Logf("pairs judged %d (%d needed a wake), of them strictly coalesced %d (%d); reads %d, after unread commits %d",
+				reach.pairs, reach.stale, reach.pairsBetween, reach.staleBetween, reach.reads, reach.lagged)
+
+			byField, idleByField := map[string]int{}, map[string]int{}
+
+			for _, kind := range slices.Sorted(maps.Keys(reach.woken)) {
+				t.Logf("woken between neighbouring commits, %s: %d, of them with nothing to send %d", kind, reach.woken[kind], reach.idle[kind])
+
+				field := kind[strings.LastIndex(kind, " ")+1:]
+				byField[field] += reach.woken[kind]
+				idleByField[field] += reach.idle[kind]
+			}
+
+			for _, field := range slices.Sorted(maps.Keys(byField)) {
+				t.Logf("woken by %s: %d, with nothing to send %d", field, byField[field], idleByField[field])
+			}
+
+			t.Logf("joins: capability-form receivers woken, by rule class %v; of them named in Filters %v; of those, filter and SSH policy unmoved %v",
+				reach.joinWoken, reach.joinNamed, reach.joinIdle)
+
+			// Not a law, a ceiling: what share of the sessions woken between
+			// neighbouring commits have nothing to send, well above what a
+			// deep run measures in either mode, so a routing that starts
+			// waking far more than it reaches shows.
+			woken, idle := 0, 0
+			for kind, n := range reach.woken {
+				woken, idle = woken+n, idle+reach.idle[kind]
+			}
+
+			t.Logf("woken between neighbouring commits %d, with nothing to send %d", woken, idle)
+
+			if !testing.Short() && idle*100 > woken*40 {
+				t.Errorf("%d of %d sessions woken between neighbouring commits had nothing to send", idle, woken)
+			}
+
+			if !testing.Short() && reach.staleBetween == 0 {
+				t.Errorf("no coalesced pair needed a wake")
+			}
+		})
+	}
+}
+
+func playScenario(t *rapid.T, reach *scenarioReach) {
+	s := policymodel.Scenarios(10).Draw(t, "scenario")
+	coalesce := pbtChance(t, 3, "coalesce")
+	mixed := pbtChance(t, 4, "mixed-versions")
+
+	r := &scenarioRun{
+		t: t, coalesce: coalesce, mixed: mixed, reach: reach,
+		sess: map[types.NodeID]*scenarioSess{}, fresh: map[freshKey]*netMap{}, routes: map[[2]uint64]routeAnswer{},
+	}
+
+	r.p = newPBTWorld(t, s.Start, nil)
+	r.h = NewHub()
+	r.w = newSteppedWatcher(t, r.h, r.p.s)
+	r.p.committed = r.committed
+
+	start := r.p.s.Snapshot()
+	r.commits = append(r.commits, scenarioCommit{snap: start})
+
+	for _, n := range start.ListNodes().All() {
+		r.read(n.ID())
+	}
+
+	for i, st := range s.Steps {
+		// Now and then a node's endpoint moves too: the write production
+		// sees most, which names the node and the nodes that see it.
+		touch := pbtChance(t, 3, "endpoint")
+		who := rapid.IntRange(0, 15).Draw(t, "who")
+
+		for _, e := range st.Edits {
+			r.edit = e
+			r.p.edit(e)
+		}
+
+		if nodes := r.p.s.Snapshot().ListNodes(); touch && nodes.Len() > 0 {
+			n := nodes.At(who % nodes.Len()).AsStruct()
+			n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(i+1))} //nolint:gosec // small
+			r.edit = nil
+			r.p.call(func() { r.p.s.PutNodeInStoreForTest(*n) })
+		}
+
+		r.w.settle()
+
+		for _, id := range st.Reads {
+			r.read(id)
+		}
+
+		t.Logf("step %d done at r%d", i+1, r.p.s.Snapshot().Rev())
+	}
+}
+
+// committed routes, unless routings coalesce a step's commits, and judges
+// the new commit.
+func (r *scenarioRun) committed(before uint64) {
+	r.w.committed(before)
+
+	snap := r.p.s.Snapshot()
+	if snap.Rev() == before {
+		return
+	}
+
+	if !r.coalesce {
+		r.w.settle()
+	}
+
+	r.commits = append(r.commits, scenarioCommit{snap: snap, edit: r.edit})
+
+	for id := range r.sess {
+		if _, ok := snap.GetNode(id); !ok {
+			delete(r.sess, id)
+		}
+	}
+
+	r.judgeRoute(len(r.commits) - 1)
+	r.countWakes(len(r.commits) - 1)
+}
+
+// read has id's session render the latest snapshot, its first map if it
+// has none, and holds the render to a fresh one.
+func (r *scenarioRun) read(id types.NodeID) {
+	t := r.t
+	snap := r.p.s.Snapshot()
+	ss := r.sess[id]
+
+	var (
+		resps []*tailcfg.MapResponse
+		err   error
+	)
+
+	if ss == nil {
+		ss = &scenarioSess{id: id, capVer: capVer}
+		if r.mixed && id%2 == 1 {
+			ss.capVer = capver.MinSupportedCapabilityVersion
+		}
+
+		ss.st = NewStream(r.p.cfg, r.h, id, ss.capVer)
+		ss.st.Attach(r.h.Join(id, func() {}))
+		r.sess[id] = ss
+
+		resps, err = ss.st.Initial(snap)
+		if err == nil {
+			ss.client = newModelClient(resps[0])
+			resps = resps[1:]
+		}
+	} else {
+		resps, err = ss.st.Update(snap)
+	}
+
+	if err != nil {
+		t.Fatalf("n%d renders r%d: %v", id, snap.Rev(), err)
+	}
+
+	ss.st.Delivered()
+
+	for _, resp := range resps {
+		ss.client.apply(resp)
+	}
+
+	r.reach.reads++
+	if n := len(ss.reads); n > 0 && ss.reads[n-1].snap.Rev()+1 < snap.Rev() {
+		r.reach.lagged++
+	}
+
+	ss.reads = append(ss.reads, sessionRead{snap: snap, held: ss.st.sent})
+	t.Logf("n%d reads r%d: %s", id, snap.Rev(), describeResponses(resps))
+
+	requireRenderFresh(t, r.p.cfg, snap, id, ss.capVer, ss.st.sent, ss.client)
+}
+
+// freshAt renders id at snap with caches of its own and filters cut
+// afresh.
+func (r *scenarioRun) freshAt(snap *state.Snapshot, id types.NodeID, cv tailcfg.CapabilityVersion) *netMap {
+	k := freshKey{rev: snap.Rev(), id: id, cv: cv}
+	if nm, ok := r.fresh[k]; ok {
+		return nm
+	}
+
+	vc := &versionCache{}
+	rd := &renderer{cfg: r.p.cfg, nodeID: id, capVer: cv, peerCapVer: peerCapVer(cv), renders: &vc.renders, classes: &vc.classes}
+
+	nm, err := rd.render(snap.Uncached())
+	if err != nil {
+		r.t.Fatalf("n%d: rendering r%d afresh: %v", id, snap.Rev(), err)
+	}
+
+	r.fresh[k] = nm
+
+	return nm
+}
+
+// route is Route over x and c, as the hub and the render log ask it.
+func (r *scenarioRun) route(x, c *state.Snapshot) routeAnswer {
+	k := [2]uint64{x.Rev(), c.Rev()}
+	if a, ok := r.routes[k]; ok {
+		return a
+	}
+
+	all, wake := Route(x, c, c.Since(x))
+	a := routeAnswer{all: all, wake: wake}
+	r.routes[k] = a
+
+	return a
+}
+
+func (a routeAnswer) has(id types.NodeID) bool {
+	_, ok := a.wake[id]
+
+	return a.all || ok
+}
+
+// judgeRoute holds Route to every pair of a snapshot a live session
+// rendered and commit j.
+func (r *scenarioRun) judgeRoute(j int) {
+	c := r.commits[j].snap
+
+	for _, id := range slices.Sorted(maps.Keys(r.sess)) {
+		ss := r.sess[id]
+		fresh := r.freshAt(c, id, ss.capVer)
+
+		for _, rd := range ss.reads {
+			out := diff(rd.held, fresh, nil)
+			between := rd.snap.Rev()+1 < c.Rev()
+
+			r.reach.pairs++
+			if between {
+				r.reach.pairsBetween++
+			}
+
+			if len(out) == 0 {
+				continue
+			}
+
+			r.reach.stale++
+			if between {
+				r.reach.staleBetween++
+			}
+
+			if !r.route(rd.snap, c).has(id) {
+				r.t.Fatalf("route: n%d rendered r%d; a fresh render of r%d would send it %s, and Route(r%d, r%d) does not wake it",
+					id, rd.snap.Rev(), c.Rev(), describeResponses(out), rd.snap.Rev(), c.Rev())
+			}
+		}
+	}
+}
+
+// countWakes counts, between commit j and the one before, the sessions
+// Route wakes and those of them whose fresh renders are equal; and holds
+// joins in capability mode to naming no capability-form receiver in
+// Filters whose filter stayed.
+func (r *scenarioRun) countWakes(j int) {
+	a, c := r.commits[j-1].snap, r.commits[j].snap
+
+	kind := strings.TrimPrefix(fmt.Sprintf("%T", r.commits[j].edit), "policymodel.")
+	if r.commits[j].edit == nil {
+		kind = "Endpoint"
+	}
+
+	ans := r.route(a, c)
+
+	var change state.Change
+	if !ans.all {
+		change = c.Since(a)
+	}
+
+	join, isJoin := r.commits[j].edit.(policymodel.Join)
+
+	for _, n := range c.ListNodes().All() {
+		id := n.ID()
+		if _, ok := a.GetNode(id); !ok || !ans.has(id) {
+			continue
+		}
+
+		before, after := r.freshAt(a, id, capVer), r.freshAt(c, id, capVer)
+		idle := len(diff(before, after, nil)) == 0
+
+		named := "a reader"
+
+		switch {
+		case ans.all:
+			named = "all"
+		case slices.Contains(change.Filters, id):
+			named = "Filters"
+		case slices.Contains(change.PeerSets, id):
+			named = "PeerSets"
+		case slices.Contains(change.Nodes, id):
+			named = "Nodes"
+		case slices.Contains(change.Caps, id):
+			named = "Caps"
+		case slices.Contains(change.Primaries, id):
+			named = "Primaries"
+		case slices.Contains(change.RouteViewers, id):
+			named = "RouteViewers"
+		}
+
+		r.reach.woken[kind+" "+named]++
+		if idle {
+			r.reach.idle[kind+" "+named]++
+		}
+
+		if !isJoin || !c.CapabilitySources() || ans.all || id == join.Node.ID ||
+			!capabilityForm(a.ReceiverFacts(id)) || !capabilityForm(c.ReceiverFacts(id)) || routes(a, id) || routes(c, id) {
+			continue
+		}
+
+		class := ruleClass(r.p.w)
+		if class == "plain" {
+			class = ruleClass(r.p.w.Apply(join))
+		}
+
+		r.reach.joinWoken[class]++
+
+		if !slices.Contains(change.Filters, id) {
+			continue
+		}
+
+		r.reach.joinNamed[class]++
+
+		if !reflect.DeepEqual(before.filter, after.filter) || !reflect.DeepEqual(before.ssh, after.ssh) {
+			continue
+		}
+
+		r.reach.joinIdle[class]++
+
+		if class == "plain" {
+			r.t.Fatalf("route: n%d joined at r%d; n%d, served capability form, is named in Filters, and its filter and SSH policy stayed",
+				join.Node.ID, c.Rev(), id)
+		}
+	}
+}
+
+// ruleClass names what in w routing names receivers in every form for,
+// by decision: SSH, which the compile routes; an app capability or a
+// protocol without ports, whose sources capability form writes as
+// addresses; a via grant, whose tags' holders are named when anything of
+// it moved; a self destination, whose owners are named in every form
+// unless every source goes as their capability; an address two nodes
+// hold, which turns a selector's capability into addresses. "plain" is
+// none of them.
+func ruleClass(w policymodel.World) string {
+	if len(w.Policy.SSH) > 0 {
+		return "ssh"
+	}
+
+	held := map[netip.Addr]bool{}
+
+	for _, n := range w.Topology.Nodes {
+		for _, a := range n.Addrs() {
+			if held[a] {
+				return "shared-address"
+			}
+
+			held[a] = true
+		}
+	}
+
+	portless := func(p int) bool { return slices.Contains([]string{"icmp", "ipv6-icmp", "gre"}, policymodel.Protos[p]) }
+	self := false
+
+	for _, r := range w.Policy.ACLs {
+		if portless(r.Proto) {
+			return "app-or-portless"
+		}
+
+		self = self || slices.ContainsFunc(r.Dst, func(d policymodel.Dest) bool { return d.Sel.Kind == policymodel.SelSelf })
+	}
+
+	for _, g := range w.Policy.Grants {
+		if len(g.App) > 0 || slices.ContainsFunc(g.IP, func(ip policymodel.IP) bool { return portless(ip.Proto) }) {
+			return "app-or-portless"
+		}
+
+		if len(g.Via) > 0 {
+			return "via"
+		}
+
+		self = self || slices.ContainsFunc(g.Dst, func(d policymodel.Dest) bool { return d.Sel.Kind == policymodel.SelSelf })
+	}
+
+	if self {
+		return "self"
+	}
+
+	return "plain"
+}
+
+// routes reports whether id serves an exit or a subnet route in snap.
+func routes(snap *state.Snapshot, id types.NodeID) bool {
+	n, ok := snap.GetNode(id)
+
+	return ok && (n.IsExitNode() || len(n.SubnetRoutes()) > 0)
+}
