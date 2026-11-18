@@ -261,6 +261,10 @@ func (p *sidePlan) atoms(id SelectorID, ctx atomCtx, out []Role) []Role {
 	switch {
 	case s.Kind.HoldsNodes():
 		return append(out, SelectorRole(id))
+	// TODO(kradalby): policy/app-wildcard: * is everything only as a port
+	// destination; as an app destination it is the tailnet's ranges, so it
+	// gives no subnet route and shows no exit node (fails closed). See
+	// policymodel.AppWildcard.
 	case s.Kind == SelectorDangerAll, s.Kind == SelectorWildcard && ctx == ctxPortDst:
 		return append(out, atomAll)
 	case s.Kind == SelectorSelf, s.Kind == SelectorUnresolvable:
@@ -273,6 +277,9 @@ func (p *sidePlan) atoms(id SelectorID, ctx atomCtx, out []Role) []Role {
 	}
 
 	out = append(out, literalRole(id))
+	// TODO(kradalby): policy/star-approved-routes: * as a source takes every
+	// approved route, announced or not (fails open); see
+	// policymodel.StarApprovedRoutes.
 	if s.Kind == SelectorWildcard && ctx == ctxSrc {
 		out = append(out, atomApproved)
 	}
@@ -1912,6 +1919,9 @@ func (s Sides) setOf(id types.NodeID, f *sideFacts) RoleSet {
 		onSrc := false
 
 		for _, g := range f.targets {
+			// TODO(kradalby): policy/via-router-address: an address-less via
+			// router is not shown to the grant's sources (fails closed,
+			// database-only); see policymodel.ViaRouterAddress.
 			if f.addressed() {
 				roles = append(roles, Role{kind: roleViaSeen, value: uint64(g)}) //nolint:gosec // a grant index
 			}
@@ -2454,6 +2464,12 @@ func (kc *keyedClasses) changedSince(old *keyedClasses) []types.NodeID {
 // matchers. An exit route needs a rule from the viewer to the internet; a
 // subnet route a rule with the viewer on one side and the route
 // overlapping the other side's addresses.
+//
+// TODO(kradalby): policy/exit-destination-routes: an exit node serving an
+// internet-reaching rule is no destination here, so it gets none of the
+// subnet routes behind the rule's sources, which the hosted service gives
+// it (capture issue_3212/routes-b18-autogroup-internet-wildcard-src-with-exit-autoapprover; fails closed, believed wrong). See
+// policymodel.ExitDestinationRoutes.
 func (s Sides) RouteAccess(viewer types.NodeID, routes []netip.Prefix) []netip.Prefix {
 	vs, ok := s.sets.Get(viewer)
 	if !ok || len(routes) == 0 {

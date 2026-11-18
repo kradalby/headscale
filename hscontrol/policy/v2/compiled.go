@@ -922,6 +922,10 @@ func viaDstsForNode(
 		// on a router covering more than the operator asked for. The
 		// rule emits the literal dst either way because that is what
 		// the policy authorised.
+		// TODO(kradalby): policy/via-own-address: the literal dst also covers
+		// the router's own address, which a broader dst does not restrict
+		// (fails open); cutVia in expand.go does the same. See
+		// policymodel.ViaOwnAddress.
 		if slices.ContainsFunc(nodeSubnetRoutes, dstPrefix.Overlaps) {
 			viaDstPrefixes = append(viaDstPrefixes, dstPrefix)
 		}
@@ -994,6 +998,8 @@ func compileViaForNode(
 //
 // shortcut: a node with an approved route over the router's address also matches,
 // as for any rule naming a node. Bind the link to the router if that shape matters.
+// TODO(kradalby): policy/via-peer-shortcut: decide whether that shape matters;
+// no capture or property covers it.
 func viaPeerRule(
 	cg *compiledGrant,
 	node types.NodeView,
@@ -1078,6 +1084,9 @@ func (pol *Policy) compileNodeAttrsFrom(
 
 		ips := n.IPs()
 
+		// TODO(kradalby): policy/nodeattrs-by-address: a target naming an
+		// identity grants every holder of its addresses, and nothing to an
+		// address-less member; see View.ServiceHosts in policymodel.
 		for _, t := range targets {
 			if slices.ContainsFunc(ips, t.ips.Contains) {
 				for _, attr := range t.attrs {
@@ -1092,6 +1101,11 @@ func (pol *Policy) compileNodeAttrsFrom(
 	result := make(map[types.NodeID]tailcfg.NodeCapMap, len(prev))
 
 	for _, n := range nodes.All() {
+		// TODO(kradalby): policy/stale-under-shared-address: targets resolve
+		// to addresses, so another holder of n's address moving changes n's
+		// attributes though n did not; reused, they stay stale until a
+		// document edit (database-only: State shares no address). Tolerated,
+		// with what lifts it, by TestPipelineIncrementalMatchesScratch.
 		if old, ok := prevNodes[n.ID()]; ok && prev != nil && old == n {
 			if c, ok := prev[n.ID()]; ok {
 				result[n.ID()] = c

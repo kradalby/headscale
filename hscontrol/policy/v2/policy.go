@@ -2764,6 +2764,12 @@ func (pm *PolicyManager) NodeCanApproveRoute(node types.NodeView, route netip.Pr
 		return false
 	}
 
+	// TODO(kradalby): policy/approvers-by-address: approvers are matched by the
+	// node's addresses, not its identity, so a node sharing an approver's address
+	// gets its routes approved (fails open) and an approver without addresses
+	// approves nothing. Only a hand-edited database gives two nodes one address.
+	// Same mechanism as policy/nodeattrs-by-address; lift by matching on roles.
+
 	// If the route to-be-approved is an exit route, then we need to check
 	// if the node is in allowed to approve it. This is treated differently
 	// than the auto-approvers, as the auto-approvers are not allowed to

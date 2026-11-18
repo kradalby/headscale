@@ -610,6 +610,12 @@ func (x *Expansion) expandGrant(gt *GrantTemplate) grantExpansion {
 
 	switch gt.kind {
 	case grantVia:
+		// TODO(kradalby): policy/via-self: autogroup:self resolves to
+		// nothing here, so a via grant to it gives its routers no rule.
+		// TODO(kradalby): policy/via-reach: * resolves to the tailnet's
+		// ranges here, so a via grant to * reaches no route outside them.
+		// Both fail closed; policymodel.ViaSelf and policymodel.ViaReach
+		// keep the plain readings and say what settles them.
 		for _, id := range gt.dsts {
 			res, err := x.resolve(id)
 			if err == nil && res != nil {
@@ -2669,6 +2675,10 @@ func (x *Expansion) capGrantRules(gt *GrantTemplate, ge *grantExpansion, rc rece
 		grants []tailcfg.CapGrant
 	)
 
+	// TODO(kradalby): policy/app-values-repeated: one CapGrant per
+	// destination entry, so a grant naming the receiver twice ("dst":
+	// ["*", "*"]) gives its values twice (cosmetic). Tolerated, with what
+	// settles it, in verdictClasses.judge (policy/v2/reference_test.go).
 	for _, id := range gt.dsts {
 		res, err := x.resolve(id)
 		if err != nil || res == nil {
@@ -2760,6 +2770,11 @@ func (x *Expansion) dstPorts(gt *GrantTemplate, ports []tailcfg.PortRange, rc re
 				}
 			}
 		default:
+			// TODO(kradalby): policy/unrouted-whole-destination: an entry
+			// is written whole once it reaches the node, so the client also
+			// accepts the rest of it inside a route the node announces
+			// unapproved (fails open, narrow). Tolerated, with what settles
+			// it, in verdictClasses.judge (policy/v2/reference_test.go).
 			for _, e := range x.t.literals[id].entries {
 				if rc.overlaps(e.r) {
 					add(e.str)
@@ -2774,6 +2789,10 @@ func (x *Expansion) dstPorts(gt *GrantTemplate, ports []tailcfg.PortRange, rc re
 // cutSelf cuts grant g's autogroup:self rules for the receiver: its own
 // user's, or, on an exit node, every owner's in user order. A rule that
 // reaches nothing is not cut but keeps its place.
+//
+// TODO(kradalby): policy/others-self: a router of another user's device
+// takes none of that user's self rules for what it routes (fails
+// closed); see policymodel.OthersSelf.
 func (x *Expansion) cutSelf(c *cut, g int) {
 	var uids []uint
 
@@ -3041,6 +3060,12 @@ func (x *Expansion) cutVia(c *cut, g int, gt *GrantTemplate, ge *grantExpansion)
 		return
 	}
 
+	// TODO(kradalby): policy/via-reach: subnet routes only, exits for
+	// autogroup:internet alone (fails closed).
+	// TODO(kradalby): policy/via-own-address: each overlapping destination
+	// is written whole, so a router whose route sits inside a wider
+	// destination also accepts the grant's sources to its own address
+	// (fails open). See policymodel.ViaReach and policymodel.ViaOwnAddress.
 	subnets := rc.n.SubnetRoutes()
 
 	var dsts []literalEntry
