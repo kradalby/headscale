@@ -59,6 +59,7 @@ func TestConfigFields(t *testing.T) {
 		"policy.path",
 		"policy.mode",
 		"policy.capability_sources",
+		"policy.filter_chunks",
 		"log.level",
 		"log.format",
 		"node.expiry",

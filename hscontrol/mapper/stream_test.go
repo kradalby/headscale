@@ -41,6 +41,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
 	"tailscale.com/util/zstdframe"
+	"tailscale.com/version"
 )
 
 const capVer = tailcfg.CurrentCapabilityVersion
@@ -560,6 +561,7 @@ func mustNode(tb testing.TB, s *state.State, id types.NodeID) types.NodeView {
 type modelClient struct {
 	self     *tailcfg.Node
 	peers    map[tailcfg.NodeID]*tailcfg.Node
+	chunks   policyv2.FilterChunks
 	filter   []tailcfg.FilterRule
 	ssh      *tailcfg.SSHPolicy
 	dns      *tailcfg.DNSConfig
@@ -732,8 +734,12 @@ func (c *modelClient) apply(r *tailcfg.MapResponse) {
 		}
 	}
 
-	if f, ok := r.PacketFilters["base"]; ok {
-		c.filter = f
+	// The filter is what the client assembles from the chunks it holds,
+	// whichever way they came: "base" in address mode, named chunks in
+	// capability mode.
+	if r.PacketFilter != nil || r.PacketFilters != nil {
+		c.chunks = c.chunks.ApplyResponse(r)
+		c.filter = c.chunks.Rules()
 	}
 }
 
@@ -757,6 +763,8 @@ func (c *modelClient) sameAs(fresh *modelClient) string {
 		return fmt.Sprintf("peers: have %s, want %s", have, want)
 	case !reflect.DeepEqual(fresh.filter, c.filter):
 		return "filter"
+	case !fresh.chunks.Equal(c.chunks):
+		return fmt.Sprintf("filter chunks: have %v, want %v", c.chunks.Names(), fresh.chunks.Names())
 	case !reflect.DeepEqual(fresh.ssh, c.ssh):
 		return "ssh"
 	case !reflect.DeepEqual(fresh.dns, c.dns):
@@ -1439,7 +1447,16 @@ func TestStreamsConvergeUnderRandomWrites(t *testing.T) {
 func TestStreamsMatchTheCompileUnderRandomWrites(t *testing.T) {
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "false")
 
-	runStreamsConverge(t, oracleCompile).require(t)
+	// Either delivery, the source form as the suite runs it.
+	for _, chunks := range []bool{false, true} {
+		t.Run(fmt.Sprintf("filter_chunks=%t", chunks), func(t *testing.T) {
+			t.Setenv(state.TestFilterChunksEnv, strconv.FormatBool(chunks))
+
+			reach := runStreamsConverge(t, oracleCompile)
+			reach.require(t)
+			require.NotZero(t, reach.retuned, "a rule's port, protocol or app value edited in place at some step")
+		})
+	}
 }
 
 // TestRouteLeavesNoSessionStale holds routing to the snapshot with the
@@ -1878,6 +1895,89 @@ func retarget(r *rand.Rand, pol string) (string, string, bool) {
 	return string(out), key, err == nil
 }
 
+// retune edits one rule of pol in place, a port, a protocol or an app
+// capability's value, so a rule changes while its sources and destinations
+// stay: what a chunk named without that field would miss.
+func retune(r *rand.Rand, pol string) (string, bool) {
+	var doc map[string]any
+	if json.Unmarshal([]byte(pol), &doc) != nil {
+		return "", false
+	}
+
+	var sites []func()
+
+	grants, _ := doc["grants"].([]any)
+	for _, g := range grants {
+		rule, _ := g.(map[string]any)
+
+		ips, _ := rule["ip"].([]any)
+		for i, e := range ips {
+			proto, port, ok := strings.Cut(fmt.Sprint(e), ":")
+			if !ok {
+				continue
+			}
+
+			sites = append(sites, func() {
+				n, err := strconv.Atoi(port)
+				if err != nil || r.IntN(2) == 0 {
+					to := "tcp"
+					if proto == "tcp" {
+						to = "udp"
+					}
+
+					ips[i] = to + ":" + port
+
+					return
+				}
+
+				ips[i] = proto + ":" + strconv.Itoa(n%60000+1)
+			})
+		}
+
+		// One value of a capability's list, the others kept: a name that
+		// read only some of them would miss it.
+		app, _ := rule["app"].(map[string]any)
+		for _, k := range slices.Sorted(maps.Keys(app)) {
+			values, _ := app[k].([]any)
+			for i := range values {
+				sites = append(sites, func() { values[i] = map[string]any{"v": r.IntN(4)} })
+			}
+		}
+	}
+
+	acls, _ := doc["acls"].([]any)
+	for _, a := range acls {
+		rule, _ := a.(map[string]any)
+
+		dsts, _ := rule["dst"].([]any)
+		for i, d := range dsts {
+			ds := fmt.Sprint(d)
+
+			j := strings.LastIndexByte(ds, ':')
+			if j < 0 {
+				continue
+			}
+
+			n, err := strconv.Atoi(ds[j+1:])
+			if err != nil {
+				continue
+			}
+
+			sites = append(sites, func() { dsts[i] = ds[:j+1] + strconv.Itoa(n%60000+1) })
+		}
+	}
+
+	if len(sites) == 0 {
+		return "", false
+	}
+
+	sites[r.IntN(len(sites))]()
+
+	out, err := json.Marshal(doc)
+
+	return string(out), err == nil
+}
+
 // requireNoStaleSession checks every session not waiting on a wake holds
 // what a fresh render of snap gives.
 func requireNoStaleSession(t *testing.T, step int, cfg *types.Config, snap *state.Snapshot, sessions map[types.NodeID]*oracleSession, pending map[types.NodeID]bool) {
@@ -1932,6 +2032,7 @@ func runStreamsConverge(t *testing.T, mode oracleMode) oracleReach {
 			reach.minCapVer += got.minCapVer
 			reach.addressMoved += got.addressMoved
 			reach.inside += got.inside
+			reach.retuned += got.retuned
 		})
 	}
 
@@ -1958,8 +2059,9 @@ type oracleReach struct {
 	via, exit, autoApproved, keysRotated, minCapVer, addressMoved int
 	// inside counts steps with a node inside another node's route;
 	// retargeted and regrouped the document edits that moved a rule's
-	// source or destination to another selector, or a group's members.
-	inside, retargeted, regrouped int
+	// source or destination to another selector, or a group's members;
+	// retuned those that moved a port, a protocol or an app value alone.
+	inside, retargeted, regrouped, retuned int
 	// between counts sessions that rendered a snapshot between two
 	// coalesced commits; betweenStale those of them the routing over
 	// both had to wake again.
@@ -2023,6 +2125,15 @@ var oraclePolicies = []string{
 	  "autoApprovers":{"exitNode":["u1@","tag:a","tag:b"]},
 	  "grants":[{"src":["u2@"],"dst":["8.8.8.0/24"],"app":{"example.com/cap/x":[{}]}},
 	            {"src":["u1@"],"dst":["u1@"],"ip":["*"]}]}`,
+	// Rules alike but for a port, a protocol or an app capability's value,
+	// one capability with two values: each must reach the client apart, and
+	// an edit of that field alone must too.
+	`{"grants":[{"src":["u1@"],"dst":["u2@"],"ip":["tcp:22"]},
+	            {"src":["u1@"],"dst":["u2@"],"ip":["udp:22"]},
+	            {"src":["u1@"],"dst":["u2@"],"ip":["tcp:2222"]},
+	            {"src":["u1@"],"dst":["u2@"],"app":{"example.com/cap/x":[{"v":1},{"v":3}]}},
+	            {"src":["u1@"],"dst":["u2@"],"app":{"example.com/cap/x":[{"v":2}]}},
+	            {"src":["u2@"],"dst":["u1@"],"ip":["tcp:80","udp:80"]}]}`,
 	// Service hosts add their service IPs to their local nets: in
 	// capability mode they are sent addresses, which follow u1's members.
 	`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
@@ -2149,12 +2260,24 @@ func testStreamsConverge(t *testing.T, r *rand.Rand, mode oracleMode) oracleReac
 		return out
 	}
 
+	handed := handedOut{}
+	defer handed.requireUnchanged(t)
+
+	// Clients reporting themselves otherwise, on a stream of their own:
+	// each session's client must end holding what a fresh one is sent
+	// across every change of its delivery.
+	flips := rand.New(rand.NewPCG(11, 13)) //nolint:gosec // deterministic test input
+
 	for step := range 400 {
 		nodes := s.ListNodes()
 		nv := nodes.At(r.IntN(nodes.Len()))
 		id := nv.ID()
 
 		o.write(step, nodes, nv, id)
+
+		if flips.IntN(4) == 0 {
+			moveClient(flips, o)
+		}
 
 		snap := s.Snapshot()
 
@@ -2169,6 +2292,12 @@ func testStreamsConverge(t *testing.T, r *rand.Rand, mode oracleMode) oracleReac
 
 		advanceOracleSessions(t, r, cfg, hub, snap, wake(snap), sessions)
 		requireOracleConverged(t, step, cfg, snap, sessions)
+
+		for _, sess := range sessions {
+			if !sess.down {
+				handed.see(t, step, sess.st.sent.filter)
+			}
+		}
 
 		if mode == oracleCompile {
 			requireSessionsMatchCompile(t, step, snap, sessions)
@@ -2188,6 +2317,75 @@ func testStreamsConverge(t *testing.T, r *rand.Rand, mode oracleMode) oracleReac
 	}
 
 	return reach
+}
+
+// moveClient makes a node's client report itself as Tailscale's current
+// client, tailscale-rs, or a release before the oldest headscale serves:
+// what decides how its filter is delivered, and in capability mode its
+// form.
+func moveClient(r *rand.Rand, o *oracleRun) {
+	nodes := o.s.ListNodes()
+	n := nodes.At(r.IntN(nodes.Len())).AsStruct()
+
+	n.Hostinfo = n.Hostinfo.Clone()
+	if n.Hostinfo == nil {
+		n.Hostinfo = &tailcfg.Hostinfo{}
+	}
+
+	switch r.IntN(3) {
+	case 0:
+		n.Hostinfo.App, n.Hostinfo.GoVersion, n.Hostinfo.IPNVersion = "", runtime.Version(), version.Long()
+	case 1:
+		n.Hostinfo.App = "tailscale-rs"
+	default:
+		n.Hostinfo.IPNVersion = "1.0.0"
+	}
+
+	o.s.PutNodeInStoreForTest(*n)
+}
+
+// handedOut is every filter slice the served path handed a session, as
+// it was encoded then. A session takes a slice handed out again for the
+// same rules (the diff's identity check, [policyv2.FilterChunks.Recut]), so
+// a producer that changed a filter in place after handing it out, or wrote
+// another into its array, would leave a client holding stale chunks for
+// the rest of its session.
+type handedOut map[handedKey][]byte
+
+type handedKey struct {
+	first *tailcfg.FilterRule
+	n     int
+}
+
+// see records rules, failing when the slice was handed out before holding
+// other rules.
+func (h handedOut) see(t *testing.T, step int, rules []tailcfg.FilterRule) {
+	t.Helper()
+
+	if len(rules) == 0 {
+		return
+	}
+
+	enc, err := json.Marshal(rules)
+	require.NoError(t, err)
+
+	k := handedKey{&rules[0], len(rules)}
+	if was, ok := h[k]; ok && !bytes.Equal(was, enc) {
+		t.Fatalf("step %d: a filter handed out holds other rules now:\nthen %s\nnow  %s", step, was, enc)
+	}
+
+	h[k] = enc
+}
+
+// requireUnchanged fails when a filter handed out was changed since.
+func (h handedOut) requireUnchanged(t *testing.T) {
+	t.Helper()
+
+	for k, was := range h {
+		now, err := json.Marshal(unsafe.Slice(k.first, k.n))
+		require.NoError(t, err)
+		require.Equal(t, string(was), string(now), "a filter handed out was changed in place")
+	}
 }
 
 // oracleRun holds what the oracle's writes act on.
@@ -2355,7 +2553,18 @@ func (o *oracleRun) writeOp(op, step int, nodes views.Slice[types.NodeView], nv 
 		o.reach.addressMoved++
 	case 20:
 		// A document edit moving a rule's source or destination to another
-		// selector the document names, or a group's members.
+		// selector the document names, or a group's members; now and then
+		// one moving a rule's port, protocol or app value alone.
+		if r.IntN(3) == 0 {
+			if pol, ok := retune(r, string(s.Snapshot().PolicySource())); ok {
+				if _, err := s.SetPolicy([]byte(pol)); err == nil { //nolint:noinlineerr
+					o.reach.retuned++
+				}
+
+				return
+			}
+		}
+
 		pol, kind, ok := retarget(r, string(s.Snapshot().PolicySource()))
 		if !ok {
 			return
@@ -2427,16 +2636,32 @@ func requireSessionsMatchCompile(t *testing.T, step int, snap *state.Snapshot, s
 
 		switch {
 		case len(filter) == 0 && len(sess.client.filter) == 0:
-		case snap.CapabilitySources():
-			// Capability form must say what the compile says once each
-			// capability is the addresses of the nodes this client holds
-			// with it, itself and its peers, as the client looks them up.
-			err := policyv2.AgreesWithAddressForm(sess.client.filter, filter, sess.client.capHolders)
-			if err != nil {
-				t.Fatalf("step %d: session %d: %v", step, id, err)
+		case !snap.CapabilitySources() && !sess.st.sent.chunked:
+			// The whole filter under "base", as the compile writes it.
+			if !reflect.DeepEqual(filter, sess.client.filter) {
+				t.Fatalf("step %d: session %d holds filter %v, the compile's %v", step, id, sess.client.filter, filter)
 			}
-		case !reflect.DeepEqual(filter, sess.client.filter):
-			t.Fatalf("step %d: session %d holds filter %v, the compile's %v", step, id, sess.client.filter, filter)
+		default:
+			// What the client enforces, from what it assembled (chunks in
+			// key order, or capability sources looked up in its netmap),
+			// must answer as the compile's filter does; nothing of the
+			// chunking or of capability form is on the oracle's side.
+			if d := heldDivergence(sess.client.filter, filter, clientLookup(sess.client), localNets(self), snap.ListNodes()); d != "" {
+				t.Fatalf("step %d: session %d enforces otherwise than the compile: %s\nheld    %v\ncompile %v", step, id, d, sess.client.filter, filter)
+			}
+
+			if snap.CapabilitySources() {
+				// And the filter served says what the compile says once each
+				// capability is the addresses of the nodes this client holds
+				// with it, as rule multisets.
+				served, err := snap.FilterForNode(id)
+				require.NoError(t, err)
+
+				err = policyv2.AgreesWithAddressForm(served, filter, sess.client.capHolders)
+				if err != nil {
+					t.Fatalf("step %d: session %d: %v", step, id, err)
+				}
+			}
 		}
 
 		for pid, tn := range sess.client.peers {
@@ -2780,15 +3005,15 @@ func scalingTailnet(tb testing.TB, n int, shape string) (*state.State, []*Stream
 		}
 	}
 
-	_, err = s.SetPolicy([]byte(scalingPolicies[shape]))
+	_, err = s.SetPolicy([]byte(shapePolicy(shape)))
 	require.NoError(tb, err)
 
 	if shape == "via" {
 		scalingRouters(tb, s)
 	}
 
-	if shape == "routers" {
-		subnetRouters(tb, s)
+	if shape == "routers" || shape == "rules" {
+		subnetRouters(tb, s, shape)
 	}
 
 	hub := NewHub()
@@ -3152,8 +3377,10 @@ type scalingWork struct {
 	// With a sizedEncoder, the JSON bytes sent split into packet filters
 	// sent to sessions other than the subjects', and how many of those
 	// sessions were sent one; packet filters sent to the subjects; and
-	// everything else.
+	// everything else. chunksSent and chunksDeleted count the filter
+	// chunks every session was sent and told to delete.
 	filterBytes, filterSends, selfFilterBytes, restBytes int
+	chunksSent, chunksDeleted                            int
 }
 
 func newScalingRun(s *state.State, streams []*Stream) *scalingRun {
@@ -5667,7 +5894,7 @@ func BenchmarkFirstMap(b *testing.B) {
 // rest-bytes/op the JSON of everything else. HEADSCALE_SCALE_NODES runs one
 // size instead.
 func BenchmarkFirstMapShapes(b *testing.B) {
-	for _, shape := range []string{"mesh", "selectors", "tags"} {
+	for _, shape := range []string{"mesh", "selectors", "tags", "rules"} {
 		for _, n := range benchSizes(b, 1000, 10000) {
 			b.Run(fmt.Sprintf("%s/nodes=%d", shape, n), func(b *testing.B) {
 				benchFirstMap(b, n, shape, newSizedEncoder())

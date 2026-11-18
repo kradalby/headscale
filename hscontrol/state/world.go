@@ -318,9 +318,13 @@ type world struct {
 	// them: the policy's and its stamps. Without, none is registered and
 	// nodes are rendered with the policy's capabilities.
 	capSources bool
-	receivers  graph.Derived[policyv2.Receivers]
-	stamps     graph.Derived[stampsMap]
-	renderCaps graph.Derived[renderCaps]
+	// filterChunks is policy.filter_chunks, fixed for the world's life: the
+	// mapper sends filters as named chunks where the client allows
+	// ([policyv2.FilterDelivery]). It moves no cell.
+	filterChunks bool
+	receivers    graph.Derived[policyv2.Receivers]
+	stamps       graph.Derived[stampsMap]
+	renderCaps   graph.Derived[renderCaps]
 	// holders is, in capability mode, the nodes holding each address,
 	// which a session reads to tell when a client's address index needs a
 	// whole peer list.
@@ -437,21 +441,34 @@ func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DN
 // Production binaries never read it.
 const TestCapabilitySourcesEnv = "HEADSCALE_TEST_CAPABILITY_SOURCES"
 
+// TestFilterChunksEnv is [TestCapabilitySourcesEnv] for
+// policy.filter_chunks: set to a boolean in a test binary's environment, it
+// sends filters as named chunks in every world the test builds with the
+// option off. The two together pick any combination:
+// `make test-options CAPABILITY_SOURCES=true FILTER_CHUNKS=true`.
+const TestFilterChunksEnv = "HEADSCALE_TEST_FILTER_CHUNKS"
+
 // capabilitySourcesForTest reports [TestCapabilitySourcesEnv] in a test
 // binary, and false anywhere else; a value that is no boolean panics.
-func capabilitySourcesForTest() bool {
+func capabilitySourcesForTest() bool { return boolForTest(TestCapabilitySourcesEnv) }
+
+// filterChunksForTest reports [TestFilterChunksEnv] as
+// [capabilitySourcesForTest] reports its own.
+func filterChunksForTest() bool { return boolForTest(TestFilterChunksEnv) }
+
+func boolForTest(env string) bool {
 	if !testing.Testing() {
 		return false
 	}
 
-	v := os.Getenv(TestCapabilitySourcesEnv)
+	v := os.Getenv(env)
 	if v == "" {
 		return false
 	}
 
 	on, err := strconv.ParseBool(v)
 	if err != nil {
-		panic(fmt.Sprintf("%s=%q: %v", TestCapabilitySourcesEnv, v, err))
+		panic(fmt.Sprintf("%s=%q: %v", env, v, err))
 	}
 
 	return on
@@ -461,7 +478,10 @@ func capabilitySourcesForTest() bool {
 // capSources is set (policy.capability_sources).
 func newWorldMode(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DNSView, capSources bool) (*world, error) {
 	g := graph.New()
-	w := &world{g: g, full: make(chan struct{}, 1), beforePolicyCommit: func() {}, capSources: capSources || capabilitySourcesForTest()}
+	w := &world{
+		g: g, full: make(chan struct{}, 1), beforePolicyCommit: func() {},
+		capSources: capSources || capabilitySourcesForTest(), filterChunks: filterChunksForTest(),
+	}
 
 	byID := uniqueGivenNames(nodes)
 
@@ -3246,6 +3266,10 @@ func (s *Snapshot) AddressHolders() AddressHolders {
 // CapabilitySources reports whether s names filter sources by capability.
 func (s *Snapshot) CapabilitySources() bool { return s.w.capSources }
 
+// FilterChunks reports whether filters may go as named chunks
+// (policy.filter_chunks); each session asks [policyv2.FilterDelivery].
+func (s *Snapshot) FilterChunks() bool { return s.w.filterChunks }
+
 // Stamps returns the source capabilities node id holds; none without
 // capability sources.
 func (s *Snapshot) Stamps(id types.NodeID) policyv2.Stamps {
@@ -3429,7 +3453,7 @@ var censusWorld atomic.Pointer[world]
 // addresses and the rules with a source that does, read off the latest
 // snapshot at each scrape; and the filters and rules cut so, as counters.
 type censusCollector struct {
-	receivers, rules, cuts, ruleCuts *prometheus.Desc
+	receivers, rules, cuts, ruleCuts, deliveries *prometheus.Desc
 }
 
 func newCensusCollector() censusCollector {
@@ -3444,11 +3468,14 @@ func newCensusCollector() censusCollector {
 			"Rules of filters sent capability sources, by why a source of theirs is sent as addresses; an autogroup:self rule counts once per owner; capability counts rules with none."),
 		cuts:     desc("policy_address_form_filters_cut_total", "Packet filters cut with every source as addresses, by reason."),
 		ruleCuts: desc("policy_address_form_rules_cut_total", "Rules cut with a source as addresses into filters otherwise sent capabilities, by reason."),
+		deliveries: prometheus.NewDesc(prometheus.BuildFQName(prometheusNamespace, "", "policy_filter_deliveries_total"),
+			"Decisions of how a map session's packet filter is sent, by outcome: chunks, or the whole filter and why; a session decides at its first render and again each time its node's client reports itself otherwise.",
+			[]string{"delivery"}, nil),
 	}
 }
 
 func (c censusCollector) Describe(ch chan<- *prometheus.Desc) {
-	for _, d := range []*prometheus.Desc{c.receivers, c.rules, c.cuts, c.ruleCuts} {
+	for _, d := range []*prometheus.Desc{c.receivers, c.rules, c.cuts, c.ruleCuts, c.deliveries} {
 		ch <- d
 	}
 }
@@ -3461,6 +3488,10 @@ func (c censusCollector) Collect(ch chan<- prometheus.Metric) {
 
 	for reason, n := range rules {
 		ch <- prometheus.MustNewConstMetric(c.ruleCuts, prometheus.CounterValue, float64(n), reason)
+	}
+
+	for delivery, n := range policyv2.FilterDeliveryCounts() {
+		ch <- prometheus.MustNewConstMetric(c.deliveries, prometheus.CounterValue, float64(n), delivery)
 	}
 
 	w := censusWorld.Load()

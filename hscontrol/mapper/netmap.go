@@ -87,9 +87,14 @@ type netMap struct {
 	profiles    *profileMap
 	selfProfile *tailcfg.UserProfile
 	filter      []tailcfg.FilterRule
-	ssh         *tailcfg.SSHPolicy
-	dns         *tailcfg.DNSConfig
-	derpMap     *tailcfg.DERPMap
+	// chunks is filter as the client holds it where chunked is set: the
+	// named chunks it is sent (see [policyv2.FilterChunks]). Otherwise the
+	// filter goes whole under "base" ([policyv2.FilterDelivery] decides).
+	chunks  policyv2.FilterChunks
+	chunked bool
+	ssh     *tailcfg.SSHPolicy
+	dns     *tailcfg.DNSConfig
+	derpMap *tailcfg.DERPMap
 
 	// base is the render this one follows. changed lists the peers added or
 	// rendered again since base and removed the peers gone, so a diff
@@ -171,6 +176,16 @@ type renderer struct {
 	// selfCaps is the policy's immutable map, never the rendered CapMap.
 	selfCaps tailcfg.NodeCapMap
 
+	// chunks are the last filter rendered cut into chunks, so a filter
+	// carried over is not cut again and one cut again builds only the
+	// names that are new.
+	chunks policyv2.FilterChunks
+	// delivery is how the session's filter goes, decided again only when
+	// deliveryKey, what it reads, moves.
+	delivery    policyv2.Delivery
+	deliveryKey deliveryKey
+	decided     bool
+
 	// rendered counts peer renders, for tests that bound per-write work.
 	rendered int
 }
@@ -189,6 +204,25 @@ type renderKey struct {
 type dnsKey struct {
 	self types.NodeView
 	dns  uint64
+}
+
+// deliveryKey is what [policyv2.FilterDelivery] reads: the option and what
+// the node's client reports of itself.
+type deliveryKey struct {
+	chunks                 bool
+	app, goVersion, ipnVer string
+}
+
+// A node may have no Hostinfo: a row stored before it reported one, or one
+// whose stored Hostinfo failed validation at load. It reports no client, as
+// one reporting empty fields does, and [policyv2.FilterDelivery] sends either
+// the whole filter.
+func deliveryKeyOf(chunks bool, hi tailcfg.HostinfoView) deliveryKey {
+	if !hi.Valid() {
+		return deliveryKey{chunks: chunks}
+	}
+
+	return deliveryKey{chunks: chunks, app: hi.App(), goVersion: hi.GoVersion(), ipnVer: hi.IPNVersion()}
 }
 
 // selfKey holds what the node's own entry renders from. dns is there for
@@ -463,15 +497,30 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 		r.dns, r.dnsKey, r.dnsCaps = generateDNSConfig(dns, self, selfCaps), k, selfCaps
 	}
 
+	if k := deliveryKeyOf(snap.FilterChunks(), self.Hostinfo()); !r.decided || k != r.deliveryKey {
+		r.delivery, r.deliveryKey, r.decided = policyv2.FilterDelivery(k.chunks, self.Hostinfo()), k, true
+	}
+
 	nm := &netMap{
 		at:      snap.Time(),
 		self:    tn,
 		filter:  filter,
+		chunked: r.delivery.Chunked(),
 		ssh:     ssh,
 		dns:     r.dns,
 		derpMap: snap.DERPMap(),
 		base:    r.last,
 		holders: snap.AddressHolders(),
+	}
+
+	// Nothing past the cut fails today (renderPeers drops a peer it cannot
+	// render instead of failing), so a render that cuts the filter is sent.
+	// Were that to change, a failed render would still advance nothing: what
+	// the client holds is [Stream]'s sent, set from a render that succeeded,
+	// and r.chunks is a cache of the cut.
+	if nm.chunked {
+		nm.chunks = r.chunks.Recut(filter)
+		r.chunks = nm.chunks
 	}
 
 	err = r.renderPeers(snap, self, capMaps, nm)

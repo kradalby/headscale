@@ -163,6 +163,18 @@ func WithCapabilitySources() Option {
 // headscale a suite starts with [WithCapabilitySources].
 const capabilitySourcesEnv = "HEADSCALE_INTEGRATION_CAPABILITY_SOURCES"
 
+// WithFilterChunks sends packet filters as named chunks
+// (policy.filter_chunks).
+func WithFilterChunks() Option {
+	return func(hsic *HeadscaleInContainer) {
+		hsic.env["HEADSCALE_POLICY_FILTER_CHUNKS"] = "true"
+	}
+}
+
+// filterChunksEnv, a boolean that `hi` passes through, runs every
+// headscale a suite starts with [WithFilterChunks].
+const filterChunksEnv = "HEADSCALE_INTEGRATION_FILTER_CHUNKS"
+
 // WithPort sets the port on where to run Headscale.
 func WithPort(port int) Option {
 	return func(hsic *HeadscaleInContainer) {
@@ -363,14 +375,19 @@ func New(
 		policyMode:       types.PolicyModeFile,
 	}
 
-	if v := os.Getenv(capabilitySourcesEnv); v != "" {
+	for env, opt := range map[string]Option{capabilitySourcesEnv: WithCapabilitySources(), filterChunksEnv: WithFilterChunks()} {
+		v := os.Getenv(env)
+		if v == "" {
+			continue
+		}
+
 		on, err := strconv.ParseBool(v)
 		if err != nil {
-			return nil, fmt.Errorf("%s=%q: %w", capabilitySourcesEnv, v, err)
+			return nil, fmt.Errorf("%s=%q: %w", env, v, err)
 		}
 
 		if on {
-			WithCapabilitySources()(hsic)
+			opt(hsic)
 		}
 	}
 

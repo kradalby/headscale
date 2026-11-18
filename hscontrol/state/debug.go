@@ -299,6 +299,10 @@ type DebugCapabilitySourcesInfo struct {
 	Rules     map[string]int    `json:"rules"`
 	CutTotals map[string]uint64 `json:"filters_cut_in_address_form"`
 	RuleTotal map[string]uint64 `json:"rules_cut_with_address_sources"`
+	// FilterChunks is policy.filter_chunks, Deliveries the sessions'
+	// filter deliveries decided since the process started, by delivery.
+	FilterChunks bool              `json:"filter_chunks"`
+	Deliveries   map[string]uint64 `json:"filter_deliveries"`
 }
 
 // DebugCapabilitySources reports, from one [Snapshot], what the fallbacks
@@ -314,6 +318,7 @@ func (s *State) DebugCapabilitySources() (DebugCapabilitySourcesInfo, error) {
 	info := DebugCapabilitySourcesInfo{Enabled: snap.CapabilitySources()}
 	info.Receivers, info.Rules = census.Labelled()
 	info.CutTotals, info.RuleTotal = policyv2.AddressFormCounts()
+	info.FilterChunks, info.Deliveries = snap.FilterChunks(), policyv2.FilterDeliveryCounts()
 
 	return info, nil
 }

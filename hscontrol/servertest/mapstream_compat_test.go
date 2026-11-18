@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/mapper"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/servertest"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
@@ -953,7 +954,10 @@ func freshNetmapDifference(srv *servertest.TestServer, id types.NodeID, got *net
 		}
 	}
 
-	if !slices.EqualFunc(want.PacketFilters["base"], got.PacketFilterRules.AsSlice(), func(a, b tailcfg.FilterRule) bool { return reflect.DeepEqual(a, b) }) {
+	// What a client assembles from the fresh map's filter: the whole
+	// filter under "base", or every chunk in key order with filter chunks.
+	wantFilter := policyv2.FilterChunks{}.ApplyResponse(&want).Rules()
+	if !slices.EqualFunc(wantFilter, got.PacketFilterRules.AsSlice(), func(a, b tailcfg.FilterRule) bool { return reflect.DeepEqual(a, b) }) {
 		return "packet filter differs"
 	}
 
@@ -1447,10 +1451,8 @@ func visibilityChecks(t *testing.T, r *stepReplay, step testcapture.Step, before
 
 		// Which nodes are sent a frame is SaaS's address form: in capability
 		// form a router's own filter changes form as it announces routes,
-		// and a membership move patches stamps instead of filters. These
-		// clients take delta updates, whose netmap does not follow every
-		// filter (a fresh map is no oracle for it), so capability form
-		// compares removals and peers only.
+		// and a membership move patches stamps instead of filters, so
+		// capability form compares removals and peers only.
 		var presence []stepCheck
 		if !r.srv.State().Snapshot().CapabilitySources() {
 			presence = append(presence, stepCheck{x + "/presence", saasPresence(step.Frames[x], slices.Contains(subjects, x)), func() string {

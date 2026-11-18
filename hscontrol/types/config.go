@@ -896,6 +896,20 @@ type PolicyConfig struct {
 	// at startup only. In either mode a policy naming a capability under
 	// `https://headscale.net/cap/src/` is refused, a stored one at startup.
 	CapabilitySources bool `koanf:"capability_sources"`
+
+	// FilterChunks sends each node's packet filter as named chunks, so a
+	// change sends what changed instead of the whole filter: a chunk per
+	// rule, but one chunk for every app capability rule, sent whole again
+	// when any of them changes, since their order is what an application
+	// reads. Only Tailscale's own client is sent chunks; any other,
+	// tailscale-rs among them, is sent the whole filter. Independent of
+	// `policy.capability_sources`. Read at startup only. Every map session
+	// starts by clearing what the client held, so this can be turned on and
+	// off between restarts. Tailscale's client holds chunks per map session,
+	// so even a rollback to a headscale release that sends no such clear
+	// leaves none behind; only a client reporting itself as Tailscale's
+	// while keeping chunks across sessions could hold stale ones.
+	FilterChunks bool `koanf:"filter_chunks"`
 }
 
 func (p *PolicyConfig) IsEmpty() bool {

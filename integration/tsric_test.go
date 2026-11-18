@@ -380,3 +380,131 @@ func TestTailscaleRustCapabilitySources(t *testing.T) {
 		assert.Contains(c, result, "tailscale-rs")
 	}, 120*time.Second, 2*time.Second, "tailscale-rs admits the user1@ source sent to it as addresses")
 }
+
+// TestTailscaleRustFilterChunks is the canary of the delivery fallback
+// (TODO(capsrc/chunk-client)): with named chunks on, the tailscale-rs node,
+// which keeps chunks for its runtime's life rather than per map session,
+// must be sent its whole filter under "base" and so follow every policy
+// edit, while the official client beside it is sent chunks. It checks the
+// fallback is in force through traffic; the tailscale-rs behaviour it rests
+// on is read from its source, not driven here.
+func TestTailscaleRustFilterChunks(t *testing.T) {
+	IntegrationSkip(t)
+
+	scenario, err := NewScenario(ScenarioSpec{NodesPerUser: 1, Users: []string{"user1"}})
+	require.NoError(t, err)
+
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	allow := func(port uint16) *policyv2.Policy {
+		return &policyv2.Policy{ACLs: []policyv2.ACL{{
+			Action:       "accept",
+			Sources:      []policyv2.Alias{usernamep("user1@")},
+			Destinations: []policyv2.AliasWithPorts{aliasWithPorts(usernamep("user1@"), tailcfg.PortRange{First: port, Last: port})},
+		}}}
+	}
+
+	err = scenario.CreateHeadscaleEnv(
+		[]tsic.Option{},
+		hsic.WithTestName("tsrschunks"),
+		hsic.WithACLPolicy(allow(80)),
+		hsic.WithFilterChunks(),
+		// As in TestTailscaleRustAxum: tailscale-rs trusts neither the
+		// embedded DERP's certificate nor headscale's.
+		hsic.WithPublicDERP(),
+		hsic.WithoutTLS(),
+	)
+	requireNoErrHeadscaleEnv(t, err)
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	allClients, err := scenario.ListTailscaleClients()
+	requireNoErrListClients(t, err)
+	require.Len(t, allClients, 1)
+
+	probe := allClients[0]
+
+	users, err := headscale.ListUsers()
+	require.NoError(t, err)
+
+	var userID uint64
+
+	for _, u := range users {
+		if u.Name == "user1" {
+			userID = mustParseID(u.Id)
+		}
+	}
+
+	require.NotZero(t, userID)
+
+	pak, err := headscale.CreateAuthKey(userID, false, true)
+	require.NoError(t, err)
+
+	network := scenario.Networks()[0]
+
+	tsrs, err := tsric.New(scenario.Pool(),
+		tsric.WithNetwork(network),
+		tsric.WithHeadscaleURL(headscale.GetEndpoint()),
+		tsric.WithAuthKey(pak.Key),
+		tsric.WithExtraHosts([]string{headscale.GetHostname() + ":" + headscale.GetIPInNetwork(network)}),
+	)
+	require.NoError(t, err)
+
+	defer func() {
+		_, _, err := tsrs.Shutdown()
+		if err != nil {
+			t.Logf("shutting down tailscale-rs: %s", err)
+		}
+	}()
+
+	var rustIPv4 string
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		nodes, err := headscale.ListNodes()
+		assert.NoError(c, err)
+
+		for _, n := range nodes {
+			if strings.HasPrefix(n.GivenName, "tsrs-") && len(n.IpAddresses) > 0 {
+				rustIPv4 = n.IpAddresses[0]
+			}
+		}
+
+		assert.NotEmpty(c, rustIPv4, "tailscale-rs registers")
+	}, 120*time.Second, 2*time.Second)
+
+	require.NotEmpty(t, rustIPv4)
+
+	reaches := func(want bool, why string) {
+		t.Helper()
+
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			result, err := probe.Curl(fmt.Sprintf("http://%s/index.html", rustIPv4))
+			if want {
+				assert.NoError(c, err)
+				assert.Contains(c, result, "tailscale-rs")
+			} else {
+				assert.Error(c, err)
+			}
+		}, 120*time.Second, 2*time.Second, why)
+	}
+
+	reaches(true, "tailscale-rs admits port 80")
+
+	// Each edit replaces the rule: a client holding chunks it should no
+	// longer hold would keep admitting port 80.
+	for _, step := range []struct {
+		port uint16
+		want bool
+		why  string
+	}{
+		{81, false, "port 80 revoked"},
+		{80, true, "port 80 granted again"},
+		{81, false, "port 80 revoked again"},
+	} {
+		err := headscale.SetPolicy(allow(step.port))
+		require.NoError(t, err)
+
+		reaches(step.want, step.why)
+	}
+}

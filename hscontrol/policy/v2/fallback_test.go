@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
@@ -138,6 +139,8 @@ type capProbe struct {
 	crossFamilyICMP int
 	// other holds every other difference.
 	other []string
+	// chunked is the receiver's filter held to its chunks, where checked.
+	chunked *chunkProbe
 }
 
 func (p capProbe) equivalent() bool { return len(p.other) == 0 }
@@ -193,6 +196,14 @@ func (cm *capModel) requireCapEquivalent(t *testing.T, id types.NodeID, where ..
 		t.Fatalf("%v: node %d enforces its capability form otherwise than its address form:\n  %s\naddress form    %v\ncapability form %v\nnetmap:\n%s",
 			where, id, strings.Join(p.other, "\n  "), ip, capForm, describeNetmap(nm))
 	}
+
+	c := probeChunked(t, capForm, nm)
+	if !c.equivalent() {
+		t.Fatalf("%v: node %d enforces the chunks it is sent otherwise than its filter as one list:\n  %s\nfilter %v\nchunks %v",
+			where, id, strings.Join(c.other, "\n  "), capForm, c.chunks.Names())
+	}
+
+	p.chunked = &c
 
 	return p
 }
@@ -369,6 +380,14 @@ func (cm *capModel) reach(t *testing.T, id types.NodeID, p capProbe, reach capRe
 	reach["receivers: "+log.layout.String()]++
 	reach["cross-family ICMP refused"] += p.crossFamilyICMP
 
+	if p.chunked != nil {
+		reach["chunk probes"] += p.chunked.report.probes
+
+		if p.chunked.reordered {
+			reach["chunks assembled in another order"]++
+		}
+	}
+
 	if f := cm.receivers.Of(id); f.AppConnector {
 		reach["app connectors"]++
 	}
@@ -409,6 +428,7 @@ func (r capReach) require(t *testing.T) {
 		"rules with capabilities", "owner capabilities",
 		"rules: cap-grant", "rules: literal", "rules: shared-address",
 		"cross-family ICMP refused", "rules: portless", "app connectors", "exit nodes", "subnet routers",
+		"chunk probes", "chunks assembled in another order",
 	}
 
 	for _, k := range want {
@@ -447,6 +467,10 @@ type goldenCapTally struct {
 	mu sync.Mutex
 
 	files, loads, filters, saasCompared, probes, crossFamily int
+	// chunked counts the filters held to the chunks they are sent as:
+	// chunks, CapGrant chunks, filters whose assembly is in another order
+	// than the list's, rules a chunk holds for two, and probes.
+	chunks, capChunks, reordered, deduplicated, chunkProbes int
 	// forms counts captured filters by form: fully capability, partly,
 	// or fully address with the reason.
 	forms   map[string]int
@@ -481,6 +505,8 @@ func TestGoldenCapForm(t *testing.T) {
 	t.Cleanup(func() {
 		t.Logf("capture files %d, policy loads %d, captured filters %d (%d against SaaS, %d probes, %d cross-family ICMP refusals), %d stamps on rendered nodes",
 			tally.files, tally.loads, tally.filters, tally.saasCompared, tally.probes, tally.crossFamily, tally.stamped)
+		t.Logf("chunks: %d filters as %d chunks (%d CapGrant chunks), %d assembled in another order, %d rules sent twice held once, %d probes against one list",
+			tally.filters, tally.chunks, tally.capChunks, tally.reordered, tally.deduplicated, tally.chunkProbes)
 		t.Logf("filters by form: %v", tally.forms)
 		t.Logf("rules sent addresses in otherwise capability-form filters, by reason: %v", tally.reasons)
 		slices.Sort(tally.listed)
@@ -547,6 +573,9 @@ type capCheck struct {
 	// check B's.
 	diffIP, diffSaaS string
 	own, saas        capProbe
+	// chunked holds the filter the client assembles from the chunks it
+	// is sent to the filter as one list.
+	chunked chunkProbe
 }
 
 func (c capCheck) failures() []string {
@@ -563,10 +592,52 @@ func (c capCheck) failures() []string {
 	for _, p := range []struct {
 		what string
 		p    capProbe
-	}{{"B against address form", c.own}, {"B against SaaS", c.saas}} {
+	}{{"B against address form", c.own}, {"B against SaaS", c.saas}, {"chunks against one list", c.chunked.capProbe}} {
 		if !p.p.equivalent() {
 			out = append(out, p.what+":\n  "+strings.Join(p.p.other, "\n  "))
 		}
+	}
+
+	return out
+}
+
+// chunkProbe is what holding the filter a client assembles from a
+// filter's chunks to the filter as one list found.
+type chunkProbe struct {
+	capProbe
+
+	chunks FilterChunks
+	// reordered is set when the assembled filter is not the list's order.
+	reordered bool
+}
+
+// probeChunked holds the filter a client assembles from the chunks of
+// rules, sent as a stream's first response to a client holding chunks of
+// another session, to rules sent as one list, through the client's filter
+// over nm: every verdict and every capability value, in order.
+func probeChunked(t *testing.T, rules []tailcfg.FilterRule, nm *netmap.NetworkMap) chunkProbe {
+	t.Helper()
+
+	chunks := ChunkFilter(rules)
+
+	stale := FilterChunks{}.Apply(map[string][]tailcfg.FilterRule{
+		chunkBase: rules,
+		"r/stale": {{SrcIPs: []string{"*"}, DstPorts: []tailcfg.NetPortRange{{IP: "*", Ports: tailcfg.PortRangeAny}}}},
+	})
+
+	held := stale.Apply(chunks.Reset())
+	require.True(t, held.Equal(chunks), "the first response leaves the client holding exactly the filter's chunks")
+
+	assembled := held.Rules()
+
+	out := chunkProbe{
+		report:    probeFilters(rules, assembled, clientViewFromNetmap(nm)),
+		chunks:    chunks,
+		reordered: !reflect.DeepEqual(assembled, rules) && len(rules) > 0,
+	}
+
+	if !out.report.equivalent() {
+		out.other = append(out.other, out.report.String())
 	}
 
 	return out
@@ -623,6 +694,8 @@ func (cm *capModel) checkCapForm(t *testing.T, id types.NodeID, saas []tailcfg.F
 	if saas != nil {
 		c.saas = probeCapForm(saas, c.capForm, c.nm)
 	}
+
+	c.chunked = probeChunked(t, c.capForm, c.nm)
 
 	return c
 }
@@ -733,7 +806,27 @@ func goldenCapNode(t *testing.T, tally *goldenCapTally, cm *capModel, key string
 		stamps += p.CapMap().Len()
 	}
 
+	capChunks, chunked := 0, 0
+
+	for _, n := range c.chunked.chunks.Names() {
+		rules, _ := c.chunked.chunks.Chunk(n)
+		chunked += len(rules)
+
+		if strings.HasPrefix(n, capChunkPrefix) {
+			capChunks++
+		}
+	}
+
 	tally.add(func(g *goldenCapTally) {
+		g.chunks += c.chunked.chunks.Len()
+		g.capChunks += capChunks
+		g.deduplicated += len(c.capForm) - chunked
+		g.chunkProbes += c.chunked.report.probes
+
+		if c.chunked.reordered {
+			g.reordered++
+		}
+
 		g.filters++
 		g.probes += c.own.report.probes + c.saas.report.probes
 		g.crossFamily += c.own.crossFamilyICMP
@@ -770,16 +863,36 @@ func TestFallbackReasonsComplete(t *testing.T) {
 	}
 
 	tests := testFuncs(t)
-	labels := map[string]bool{}
+	labels, delivered := map[string]bool{}, map[string]bool{}
 
 	require.Equal(t, "capability", reasonNone.String())
+	require.Equal(t, "chunks", Delivery{deliveryChunks}.String())
 
-	for r := reasonNone + 1; r < numReasons; r++ {
-		d := reasonDocs[r]
+	// The source reasons, then the delivery reasons: one table each, every
+	// row held to the same rules.
+	docs := slices.Collect(func(yield func(reasonDoc) bool) {
+		for r := reasonNone + 1; r < numReasons; r++ {
+			if !yield(reasonDocs[r]) {
+				return
+			}
+		}
 
-		require.Regexpf(t, `^[a-z][a-z-]*$`, d.label, "reason %d has a metric label", r)
-		require.Falsef(t, labels[d.label], "label %q is unique", d.label)
-		labels[d.label] = true
+		for d := deliveryChunks + 1; d < numDeliveries; d++ {
+			if !yield(deliveryDocs[d]) {
+				return
+			}
+		}
+	})
+
+	for i, d := range docs {
+		require.Regexpf(t, `^[a-z][a-z-]*$`, d.label, "reason %d has a metric label", i)
+		require.Falsef(t, labels[d.label] || delivered[d.label], "label %q is unique", d.label)
+
+		if i < int(numReasons)-1 {
+			labels[d.label] = true
+		} else {
+			delivered[d.label] = true
+		}
 
 		require.NotEmptyf(t, d.scope, "%s has a scope", d.label)
 		require.NotEmptyf(t, d.lift, "%s says when it lifts", d.label)
@@ -803,6 +916,9 @@ func TestFallbackReasonsComplete(t *testing.T) {
 
 	require.Empty(t, todos, "every capsrc TODO in fallback.go is a reason's")
 	require.Equal(t, slices.Sorted(maps.Keys(labels)), slices.Sorted(slices.Values(FallbackReasons())), "metric labels")
+
+	delivered["chunks"] = true
+	require.Equal(t, slices.Sorted(maps.Keys(delivered)), slices.Sorted(maps.Keys(FilterDeliveryCounts())), "delivery metric labels")
 }
 
 // testFuncs returns the names of the package's test functions and of the
@@ -1272,6 +1388,58 @@ func TestAgreesWithAddressFormCatchesMissingStamp(t *testing.T) {
 		return append(nc.holders(c), netip.MustParseAddr("100.64.0.20"))
 	}
 	require.ErrorIs(t, AgreesWithAddressForm(capForm, ip, withDB), errCapForm, "db1 stamped")
+}
+
+// TestFilterDeliveryByClient holds the per-client decision: named chunks go
+// only to Tailscale's own client at or past the oldest release headscale
+// serves; a release before it, a Go client reporting no Tailscale release,
+// a client not built with Go, tailscale-rs, and a node with no Hostinfo
+// are sent the whole filter; with the option off, every session is.
+func TestFilterDeliveryByClient(t *testing.T) {
+	t.Parallel()
+
+	major, minor, ok := releaseOf(capver.TailscaleVersion(capver.MinSupportedCapabilityVersion))
+	require.True(t, ok, "test sanity: the floor is a release")
+	require.Positive(t, minor, "test sanity: a release before the floor shares its major")
+
+	client := func(goVersion, ipnVersion, app string) *tailcfg.Hostinfo {
+		return &tailcfg.Hostinfo{GoVersion: goVersion, IPNVersion: ipnVersion, App: app}
+	}
+
+	floor := fmt.Sprintf("%d.%d.0-t0123456789ab-g0123456789ab", major, minor)
+	below := fmt.Sprintf("%d.%d.9-t0123456789ab-g0123456789ab", major, minor-1)
+	next := fmt.Sprintf("%d.%d.0", major+1, 0)
+
+	for _, tt := range []struct {
+		name string
+		hi   *tailcfg.Hostinfo
+		want string
+	}{
+		{"a current release", officialHostinfo(nil), "chunks"},
+		{"the oldest release served", client("go1.27.3", floor, ""), "chunks"},
+		{"a later major", client("go1.27.3", next, ""), "chunks"},
+		{"a release before the oldest served", client("go1.27.3", below, ""), "chunk-client"},
+		{"a Go client reporting no release", client("go1.27.3", "", ""), "chunk-client"},
+		{"a Go client reporting something else", client("go1.27.3", "devel", ""), "chunk-client"},
+		{"not built with Go", client("", floor, ""), "chunk-client"},
+		{"a Go version not starting with go", client("gccgo", floor, ""), "chunk-client"},
+		{"tailscale-rs", client("go1.27.3", floor, "tailscale-rs (tsrs-1)"), "chunk-client"},
+		{"no Hostinfo", nil, "chunk-client"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			hi := (&types.Node{Hostinfo: tt.hi}).View().Hostinfo()
+
+			got := FilterDelivery(true, hi)
+			require.Equal(t, tt.want, got.String())
+			require.Equal(t, tt.want == "chunks", got.Chunked())
+
+			off := FilterDelivery(false, hi)
+			require.Equal(t, "chunks-off", off.String(), "with the option off every session is sent the whole filter")
+			require.False(t, off.Chunked())
+		})
+	}
 }
 
 // TestReceiverFormFollowsFacts pins each fact that sends a receiver's whole

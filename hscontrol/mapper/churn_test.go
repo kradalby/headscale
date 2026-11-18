@@ -90,6 +90,58 @@ func selectorsPolicy(edited bool) string {
 			{"action":"accept","src":["u1@","u8@"],"dst":["tag:ci:*"]}]}`
 }
 
+// rulesPolicy is a policy of a few dozen rules over the routers shape's
+// tailnet: per user k, group:g<k> reaches every subnet and user k+1's nodes,
+// and u<k>@ reaches the routers, each on a port of its own, so a router is
+// sent a rule per user and a join moves two of them. group:eng is edited
+// by the group write; rule moves the port of group:g3's rule, which
+// reaches the routers and u4's nodes.
+func rulesPolicy(group, rule bool) string {
+	port := 1003
+	if rule {
+		port = 1103
+	}
+
+	groups := make([]string, 0, 11)
+	groups = append(groups, engGroup(group))
+
+	acls := make([]string, 0, 32)
+	acls = append(acls,
+		`{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}`,
+		`{"action":"accept","src":["group:eng"],"dst":["tag:server:*"]}`)
+
+	for k := range 10 {
+		groups = append(groups, fmt.Sprintf(`"group:g%d":["u%d@"]`, k, k))
+
+		subnet := fmt.Sprintf(`"10.0.0.0/8:%d"`, 1000+k)
+		if k == 3 {
+			subnet = fmt.Sprintf(`"10.0.0.0/8:%d","u4@:%d"`, port, port)
+		}
+
+		acls = append(acls,
+			fmt.Sprintf(`{"action":"accept","src":["group:g%d"],"dst":[%s]}`, k, subnet),
+			fmt.Sprintf(`{"action":"accept","src":["group:g%d"],"dst":["u%d@:%d"]}`, k, (k+1)%10, 2000+k),
+			fmt.Sprintf(`{"action":"accept","src":["u%d@"],"dst":["tag:router:%d"]}`, k, 3000+k))
+	}
+
+	return `{"groups":{` + strings.Join(groups, ",") + `},
+		"tagOwners":{"tag:router":["u0@"],"tag:server":["u0@"]},
+		"acls":[` + strings.Join(acls, ",") + `]}`
+}
+
+// benchShapes are policy shapes only the chunk benchmark runs: the pinned
+// work tables list every shape of scalingPolicies.
+var benchShapes = map[string]string{"rules": rulesPolicy(false, false)}
+
+// shapePolicy returns a shape's policy, as setup leaves it.
+func shapePolicy(shape string) string {
+	if p, ok := scalingPolicies[shape]; ok {
+		return p
+	}
+
+	return benchShapes[shape]
+}
+
 // shapeFixture tags the nodes the routers and selectors shapes' policies
 // name, in the database before the state loads it: tagging a loaded
 // tailnet one node at a time recompiles the policy for each.
@@ -103,7 +155,7 @@ func shapeFixture(tb testing.TB, database *db.HSDatabase, shape string, nodes []
 	var tag func(i int, node *types.Node) bool
 
 	switch shape {
-	case "routers":
+	case "routers", "rules":
 		tag = func(i int, node *types.Node) bool {
 			if i%5 != 0 {
 				return false
@@ -151,8 +203,20 @@ func shapeFixture(tb testing.TB, database *db.HSDatabase, shape string, nodes []
 // subnetRouters brings the routers shape's routers online, so each is its
 // subnet's primary, and checks the shape: a member of group:eng sees a
 // router, through its subnet, and a member outside the group does not.
-func subnetRouters(tb testing.TB, s *state.State) {
+// The rules shape's members all reach the routers: it brings them online
+// and checks nothing.
+func subnetRouters(tb testing.TB, s *state.State, shape string) {
 	tb.Helper()
+
+	if shape == "rules" {
+		for _, nv := range s.ListNodes().All() {
+			if nv.IsTagged() {
+				s.Connect(nv.ID())
+			}
+		}
+
+		return
+	}
 
 	owners := userNames(tb, s)
 
@@ -207,6 +271,9 @@ type churnShape struct {
 	// policy returns the shape's policy, with editedUser in group:eng when
 	// edited; nil when the shape names no group.
 	policy func(edited bool) string
+	// rule returns the shape's policy with one rule's port moved when
+	// edited; nil when no write edits a rule.
+	rule func(edited bool) string
 }
 
 func member(nv types.NodeView, _ string) bool { return !nv.IsTagged() }
@@ -240,6 +307,11 @@ var churnShapes = map[string]churnShape{
 	"group-all": {subject: engMember, retag: retagTo("tag:server"), policy: groupAllPolicy},
 	"routers":   {subject: engMember, retag: retagTo("tag:server"), policy: routersPolicy},
 	"selectors": {subject: member, retag: retagTo("tag:server"), policy: selectorsPolicy},
+	"rules": {
+		subject: member, retag: retagTo("tag:server"),
+		policy: func(edited bool) string { return rulesPolicy(edited, false) },
+		rule:   func(edited bool) string { return rulesPolicy(false, edited) },
+	},
 }
 
 // churnWrite is a write that moves a node into or out of what the policy
@@ -254,6 +326,13 @@ type churnWrite struct {
 	// write starts from the tailnet setup built; the benchmark stops its
 	// timer for it. Nil when writes alternate instead.
 	restore func(cr *churnRun, tb testing.TB, i int)
+}
+
+// chunkWrites are writes only the chunk benchmark runs, apart from
+// churnWrites for the same reason as benchShapes.
+var chunkWrites = map[string]churnWrite{
+	// rule moves one rule's port through the API's policy update.
+	"rule": {applies: func(cs churnShape) bool { return cs.rule != nil }, write: (*churnRun).rule},
 }
 
 var churnWrites = map[string]churnWrite{
@@ -300,8 +379,10 @@ type churnRun struct {
 	}
 
 	// policies are the group write's documents, as setup leaves the
-	// policy and edited; moved are editedUser's nodes.
+	// policy and edited; moved are editedUser's nodes. rules are the rule
+	// write's.
 	policies [2][]byte
+	rules    [2][]byte
 	moved    []types.NodeID
 }
 
@@ -376,8 +457,13 @@ func newChurnRun(tb testing.TB, s *state.State, streams []*Stream, shape string)
 
 	if cr.shape.policy != nil {
 		cr.policies = [2][]byte{[]byte(cr.shape.policy(false)), []byte(cr.shape.policy(true))}
-		require.Equal(tb, scalingPolicies[shape], string(cr.policies[0]), "setup leaves the unedited policy")
+		require.Equal(tb, shapePolicy(shape), string(cr.policies[0]), "setup leaves the unedited policy")
 		require.NotEmpty(tb, cr.moved, "the group write moves nodes")
+	}
+
+	if cr.shape.rule != nil {
+		cr.rules = [2][]byte{[]byte(cr.shape.rule(false)), []byte(cr.shape.rule(true))}
+		require.Equal(tb, shapePolicy(shape), string(cr.rules[0]), "setup leaves the unedited policy")
 	}
 
 	cr.freshKeys()
@@ -551,6 +637,19 @@ func (cr *churnRun) group(tb testing.TB, i int) {
 	cr.changed(cr.moved...)
 }
 
+// rule moves the port of one rule of the shape's policy, and back, in
+// turn, through the API's policy update. It changes no node.
+func (cr *churnRun) rule(tb testing.TB, i int) {
+	tb.Helper()
+
+	_, err := cr.s.UpdatePolicy(tb.Context(), cr.rules[(i+1)%2])
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	cr.changed()
+}
+
 // requireSettled is [scalingRun.requireSettled] for churn: every write
 // changes something some session sees.
 func (cr *churnRun) requireSettled(tb testing.TB, kind string) {
@@ -602,17 +701,31 @@ func (sc *scalingRun) account(id types.NodeID, resp *tailcfg.MapResponse) bool {
 		sc.filterSends++
 	}
 
+	for name, rules := range resp.PacketFilters {
+		switch {
+		case name == "*":
+		case rules == nil:
+			sc.chunksDeleted++
+		default:
+			sc.chunksSent++
+		}
+	}
+
 	return true
 }
 
-// benchChurn runs a churn kind of [BenchmarkScalingWrites]. A write's
-// restore runs with the timer stopped.
+// benchChurn runs a churn kind of [BenchmarkScalingWrites], or of
+// [BenchmarkChunkedWrites]. A write's restore runs with the timer stopped.
 func benchChurn(b *testing.B, kind, shape string, n int) {
 	b.Helper()
 
 	s, streams := scalingTailnet(b, n, shape)
 	cr := newChurnRun(b, s, streams, shape)
-	w := churnWrites[kind]
+
+	w, ok := churnWrites[kind]
+	if !ok {
+		w = chunkWrites[kind]
+	}
 
 	var i int
 
@@ -641,6 +754,24 @@ func benchChurn(b *testing.B, kind, shape string, n int) {
 	b.ReportMetric(per(cr.selfFilterBytes), "self-filter-bytes/op")
 	b.ReportMetric(per(cr.restBytes), "rest-bytes/op")
 	b.ReportMetric(per(cr.commits), "commits/op")
+	b.ReportMetric(per(cr.chunksSent), "chunks-sent/op")
+	b.ReportMetric(per(cr.chunksDeleted), "chunks-deleted/op")
+}
+
+// BenchmarkChunkedWrites measures what named filter chunks change: the
+// churn kinds and a one-rule policy edit under a policy of a few dozen
+// rules with subnet routers, which are sent addresses (see rulesPolicy).
+// chunks-sent/op and chunks-deleted/op count the chunks the woken sessions
+// were sent and told to delete; address mode sends its whole filter as one.
+// HEADSCALE_SCALE_NODES sets the size.
+func BenchmarkChunkedWrites(b *testing.B) {
+	for _, kind := range []string{"join", "leave", "tag", "group", "rule"} {
+		for _, n := range benchSizes(b, 1000) {
+			b.Run(fmt.Sprintf("%s/rules/nodes=%d", kind, n), func(b *testing.B) {
+				benchChurn(b, kind, "rules", n)
+			})
+		}
+	}
 }
 
 // BenchmarkCoalescedChurn is [BenchmarkScalingWrites]' churn kinds with a
@@ -1343,8 +1474,9 @@ func (e *sizedEncoder) encode(resp *tailcfg.MapResponse, compress bool) ([]byte,
 // poll loop does, and that the filter bytes it counts are the encoding of
 // PacketFilters, on the maps of a churning tailnet.
 func TestSizedEncoderMatchesMarshal(t *testing.T) {
-	// Pinned to address form: it needs writes that send filters, which capability form spares the receivers it reaches.
+	// Pinned to address form: it needs writes that send filters, which capability form spares the receivers it reaches; and to the whole filter, which it reads as "base".
 	t.Setenv(state.TestCapabilitySourcesEnv, "false")
+	t.Setenv(state.TestFilterChunksEnv, "false")
 
 	s, streams := scalingTailnet(t, 40, "selectors")
 	e := newSizedEncoder()

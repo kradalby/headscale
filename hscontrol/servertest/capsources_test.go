@@ -3,24 +3,33 @@ package servertest_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/netip"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/mapper"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/servertest"
+	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go4.org/netipx"
+	"tailscale.com/control/controlclient"
 	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/ipproto"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/persist"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -139,6 +148,8 @@ func TestCapabilitySourcesThroughClient(t *testing.T) {
 			slices.Equal(capRuleSources(nm), []string{"cap:" + capEng, "cap:" + capDev})
 	})
 
+	requireHoldsFresh(t, srv, "stamped", web)
+
 	nm := web.Netmap()
 	require.True(t, admits(t, nm, aIP, 443), "group:eng's member connects")
 	require.True(t, admits(t, nm, devIP, 443), "tag:dev's member connects")
@@ -163,6 +174,8 @@ func TestCapabilitySourcesThroughClient(t *testing.T) {
 		return !ok || !dp.HasCap(capDev)
 	})
 
+	requireHoldsFresh(t, srv, "dev retagged", web)
+
 	nm = web.Netmap()
 	require.False(t, admits(t, nm, devIP, 443), "dev, retagged, is refused")
 	require.True(t, admits(t, nm, aIP, 443))
@@ -177,6 +190,8 @@ func TestCapabilitySourcesThroughClient(t *testing.T) {
 
 		return !ok || !ap.HasCap(capEng)
 	})
+
+	requireHoldsFresh(t, srv, "alice renamed", web)
 
 	require.False(t, admits(t, web.Netmap(), aIP, 443), "alice, no longer in group:eng, is refused")
 
@@ -214,6 +229,8 @@ func TestCapabilitySourcesThroughClient(t *testing.T) {
 			!slices.ContainsFunc(srcs, func(s string) bool { return strings.HasPrefix(s, "cap:") })
 	})
 
+	requireHoldsFresh(t, srv, "announcing", web)
+
 	nm = web.Netmap()
 	require.True(t, admits(t, nm, aIP, 443))
 	require.False(t, admits(t, nm, bIP, 443))
@@ -224,8 +241,7 @@ func TestCapabilitySourcesThroughClient(t *testing.T) {
 		return slices.Equal(capRuleSources(nm), []string{"cap:" + capEng, "cap:" + capDev})
 	})
 
-	webID := findNodeID(t, srv, "web")
-	require.Equal(t, "equal", freshNetmapDifference(srv, webID, web.Netmap()), "the session holds what a fresh one is sent")
+	requireHoldsFresh(t, srv, "capability form again", web)
 }
 
 // TestCapabilitySourcesUnknownClient pins the client fallback: a node
@@ -276,11 +292,30 @@ func TestCapabilitySourcesUnknownClient(t *testing.T) {
 // with. After each step of a script that moves the filter, a peer's stamps,
 // the receiver's own form and the peer set, the engine's filter must admit
 // exactly the peers the policy grants.
+//
+// Each delivery pins its test switch, as [TestFilterDeliveryThroughClient]
+// does.
 func TestCapabilitySourcesThroughLocalBackend(t *testing.T) {
-	t.Parallel()
+	for _, chunks := range []bool{false, true} {
+		t.Run(fmt.Sprintf("filter_chunks=%t", chunks), func(t *testing.T) {
+			t.Setenv(state.TestFilterChunksEnv, strconv.FormatBool(chunks))
+			testCapabilitySourcesThroughLocalBackend(t, chunks)
+		})
+	}
+}
 
-	srv := servertest.NewServer(t, servertest.WithCapabilitySources(), servertest.WithRealListener())
+func testCapabilitySourcesThroughLocalBackend(t *testing.T, chunks bool) {
+	t.Helper()
+
+	opts := []servertest.ServerOption{servertest.WithCapabilitySources(), servertest.WithRealListener()}
+	if chunks {
+		opts = append(opts, servertest.WithFilterChunks())
+	}
+
+	srv := servertest.NewServer(t, opts...)
 	st := srv.State()
+
+	require.Equal(t, chunks, st.Snapshot().FilterChunks(), "test sanity: filter chunks as the subtest says")
 
 	setCapPolicy(t, srv, `{
 		"groups": {"group:eng": ["alice@", "carol@"]},
@@ -361,12 +396,18 @@ func TestCapabilitySourcesThroughLocalBackend(t *testing.T) {
 	}
 
 	// expect waits for web's engine to admit exactly the given peers, each
-	// on port, once form holds of the sources web holds.
+	// on port, once form holds of the sources web holds, and for the
+	// backend to hold what a fresh session is sent, its chunks answering
+	// as the filter served as one list.
 	expect := func(step string, form func([]string) bool, port uint16, admitted ...string) {
 		t.Helper()
 
 		require.EventuallyWithT(t, func(ct *assert.CollectT) {
 			assert.True(ct, form(rulesOf(t)), "%s: filter form", step)
+
+			nm := netmapOf(t)
+			assert.Equal(ct, "equal", freshNetmapDifference(srv, webID, nm), "%s: the backend holds what a fresh session is sent", step)
+			assert.Empty(ct, enforcesServed(t, srv, webID, nm), "%s: the chunks it holds answer as the filter served", step)
 
 			f := web.Sys().Engine.Get().GetFilter()
 
@@ -440,4 +481,334 @@ func TestCapabilitySourcesThroughLocalBackend(t *testing.T) {
 	expect("carol removed", capForm, 8443, "bob")
 
 	require.Equal(t, "equal", freshNetmapDifference(srv, webID, netmapOf(t)), "the backend holds what a fresh session is sent")
+}
+
+// enforcesServed reports how the filter a client assembled from the chunks
+// it holds (nm's rules) answers otherwise than the filter the server
+// serves node id as one list, through the client's own filter: every
+// verdict from every address the netmap and the rules name, to every
+// address the node holds or routes, on every port edge, by TCP, UDP and
+// ICMP, and every app capability's values in order. "" when it does not.
+func enforcesServed(t *testing.T, srv *servertest.TestServer, id types.NodeID, nm *netmap.NetworkMap) string {
+	t.Helper()
+
+	served, err := srv.State().Snapshot().FilterForNode(id)
+	require.NoError(t, err)
+
+	var b netipx.IPSetBuilder
+
+	for _, p := range nm.SelfNode.Addresses().All() {
+		b.AddPrefix(p)
+	}
+
+	for _, p := range nm.SelfNode.Hostinfo().RoutableIPs().All() {
+		b.AddPrefix(p)
+	}
+
+	local, err := b.IPSet()
+	require.NoError(t, err)
+
+	build := func(rules []tailcfg.FilterRule) *filter.Filter {
+		ms, err := filter.MatchesFromFilterRules(rules)
+		require.NoError(t, err)
+
+		return filter.New(ms, servertest.CapLookup(nm), local, nil, nil, logger.Discard)
+	}
+
+	assembled := nm.PacketFilterRules.AsSlice()
+	one, got := build(served), build(assembled)
+
+	srcs := []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")}
+	dsts := []netip.Addr{}
+	ports := []uint16{0, 1, 22, 53, 80, 443, 8080, 65535}
+
+	for _, n := range append([]tailcfg.NodeView{nm.SelfNode}, nm.Peers...) {
+		for _, p := range n.Addresses().All() {
+			srcs = append(srcs, p.Addr())
+		}
+	}
+
+	for _, p := range nm.SelfNode.Addresses().All() {
+		dsts = append(dsts, p.Addr())
+	}
+
+	for _, r := range slices.Concat(served, assembled) {
+		for _, d := range r.DstPorts {
+			ports = append(ports, d.Ports.First, d.Ports.Last, d.Ports.First-1, d.Ports.Last+1)
+
+			p, err := netip.ParsePrefix(d.IP)
+			if err != nil {
+				a, aerr := netip.ParseAddr(d.IP)
+				if aerr != nil {
+					continue
+				}
+
+				p = netip.PrefixFrom(a, a.BitLen())
+			}
+
+			dsts = append(dsts, p.Addr())
+		}
+	}
+
+	slices.SortFunc(srcs, netip.Addr.Compare)
+	slices.SortFunc(dsts, netip.Addr.Compare)
+	slices.Sort(ports)
+
+	for _, src := range slices.Compact(srcs) {
+		for _, dst := range slices.Compact(dsts) {
+			if src.Is4() != dst.Is4() {
+				continue
+			}
+
+			if a, b := one.CapsWithValues(src, dst), got.CapsWithValues(src, dst); !reflect.DeepEqual(a, b) {
+				return fmt.Sprintf("caps %s -> %s: one list %v, chunks %v", src, dst, a, b)
+			}
+
+			icmp := ipproto.ICMPv4
+			if src.Is6() {
+				icmp = ipproto.ICMPv6
+			}
+
+			for _, proto := range []ipproto.Proto{ipproto.TCP, ipproto.UDP, icmp} {
+				for _, port := range slices.Compact(ports) {
+					if a, b := one.Check(src, dst, port, proto), got.Check(src, dst, port, proto); a != b {
+						return fmt.Sprintf("%s %s -> %s:%d: one list %v, chunks %v", proto, src, dst, port, a, b)
+					}
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+// requireHoldsFresh waits for the filter c assembled to be what a fresh
+// session of its node is sent, and holds it to the filter served as one
+// list through c's own filter.
+func requireHoldsFresh(t *testing.T, srv *servertest.TestServer, step string, c *servertest.TestClient) {
+	t.Helper()
+
+	id := findNodeID(t, srv, c.Name)
+
+	require.Eventuallyf(t, func() bool {
+		return freshNetmapDifference(srv, id, c.Netmap()) == "equal"
+	}, 10*time.Second, 20*time.Millisecond, "%s: %s holds what a fresh session is sent: %s", step, c.Name, freshNetmapDifference(srv, id, c.Netmap()))
+
+	require.Emptyf(t, enforcesServed(t, srv, id, c.Netmap()), "%s: %s", step, c.Name)
+}
+
+// TestCanaryClientChunkMerge pins how the control client merges packet
+// filter chunks, as one response's map session applies them: the singular
+// PacketFilter sets "base", "*": null clears everything before the rest
+// applies, a null chunk is deleted, and the chunks are concatenated in key
+// order. policyv2.FilterChunks models it for every check of what a client
+// assembles; across responses, the sessions of
+// TestFilterDeliveryThroughClient pin it.
+func TestCanaryClientChunkMerge(t *testing.T) {
+	t.Parallel()
+
+	rule := func(port uint16) tailcfg.FilterRule {
+		return tailcfg.FilterRule{
+			SrcIPs:   []string{"100.64.0.2"},
+			DstPorts: []tailcfg.NetPortRange{{IP: "100.64.0.1", Ports: tailcfg.PortRange{First: port, Last: port}}},
+		}
+	}
+	a, b, c := rule(1), rule(2), rule(3)
+	pr := (&persist.Persist{PrivateNodeKey: key.NewNode()}).View()
+
+	for _, tt := range []struct {
+		name     string
+		singular []tailcfg.FilterRule
+		chunks   map[string][]tailcfg.FilterRule
+		want     []tailcfg.FilterRule
+	}{
+		{name: "singular is base", singular: []tailcfg.FilterRule{a}, want: []tailcfg.FilterRule{a}},
+		{name: "singular then chunks, in key order", singular: []tailcfg.FilterRule{b}, chunks: map[string][]tailcfg.FilterRule{"a": {a}, "c": {c}}, want: []tailcfg.FilterRule{a, b, c}},
+		{name: "clear drops the singular", singular: []tailcfg.FilterRule{a}, chunks: map[string][]tailcfg.FilterRule{"*": nil, "x": {b}}, want: []tailcfg.FilterRule{b}},
+		{name: "null deletes", singular: []tailcfg.FilterRule{a}, chunks: map[string][]tailcfg.FilterRule{"base": nil, "x": {b}}, want: []tailcfg.FilterRule{b}},
+		{name: "key order, not map order", chunks: map[string][]tailcfg.FilterRule{"r/b": {b}, "c/a": {a, c}, "r/a": {c}}, want: []tailcfg.FilterRule{a, c, c, b}},
+		{name: "clear alone empties", chunks: map[string][]tailcfg.FilterRule{"*": nil}, want: nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			sent := &tailcfg.MapResponse{
+				Node:          &tailcfg.Node{ID: 1, Name: "n.example.", Key: key.NewNode().Public(), Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")}},
+				PacketFilter:  tt.singular,
+				PacketFilters: tt.chunks,
+			}
+
+			// Through the bytes, as the client reads them: the encoder the
+			// server writes with, the decoder the client reads with, a
+			// null chunk decoded as nil.
+			wire, err := mapper.Marshal(sent)
+			require.NoError(t, err)
+
+			resp := &tailcfg.MapResponse{}
+			require.NoError(t, json.Unmarshal(wire, resp))
+
+			for name, rules := range tt.chunks {
+				if rules == nil {
+					require.Contains(t, string(wire), `"`+name+`":null`)
+					require.Contains(t, resp.PacketFilters, name)
+					require.Nil(t, resp.PacketFilters[name])
+				}
+			}
+
+			nm, err := controlclient.NetmapFromMapResponseForDebug(t.Context(), pr, resp)
+			require.NoError(t, err)
+
+			got := nm.PacketFilterRules.AsSlice()
+			require.Equal(t, tt.want, got, "the client")
+			require.Equal(t, got, policyv2.FilterChunks{}.ApplyResponse(resp).Rules(), "the model of it")
+		})
+	}
+}
+
+// TestFilterDeliveryThroughClient is check C for filter delivery, in each
+// combination of policy.capability_sources and policy.filter_chunks: real
+// control clients, one taking filter updates in place as tailscaled does,
+// through policy edits that remove, edit and reorder rules, a receiver
+// flipping to addresses and back, a member leaving an address-form rule,
+// and reconnects. After each, every client holds what a fresh session of
+// its node is sent, and the filter it assembled from what it holds answers
+// as the filter served as one list.
+//
+// Each combination pins both test switches too, so a subtest that says an
+// option is off runs with it off whatever the suite's switches say; so the
+// subtests run one at a time.
+func TestFilterDeliveryThroughClient(t *testing.T) {
+	for _, capSources := range []bool{false, true} {
+		for _, chunks := range []bool{false, true} {
+			t.Run(fmt.Sprintf("capability_sources=%t/filter_chunks=%t", capSources, chunks), func(t *testing.T) {
+				t.Setenv(state.TestCapabilitySourcesEnv, strconv.FormatBool(capSources))
+				t.Setenv(state.TestFilterChunksEnv, strconv.FormatBool(chunks))
+				testFilterDeliveryThroughClient(t, capSources, chunks)
+			})
+		}
+	}
+}
+
+func testFilterDeliveryThroughClient(t *testing.T, capSources, chunks bool) {
+	t.Helper()
+
+	doc := `{"groups":{"group:eng":["alice@"],"group:ops":["bob@"]},
+		"tagOwners":{"tag:web":["ops@"],"tag:idle":["ops@"]},
+		"grants":[
+			{"src":["group:eng"],"dst":["tag:web"],"ip":["tcp:443","udp:53"]},
+			{"src":["group:ops"],"dst":["tag:web"],"ip":["tcp:22"]},
+			{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["tcp:8080"]},
+			{"src":["group:eng"],"dst":["tag:web"],"app":{"example.com/cap/x":[{"v":1},{"v":"second"}]}},
+			{"src":["autogroup:member"],"dst":["tag:web"],"app":{"example.com/cap/x":[{"v":"m"}]}},
+			{"src":["alice@"],"dst":["tag:web"],"app":{"example.com/cap/x":[{"v":"a"}]}},
+			{"src":["group:ops"],"dst":["tag:web"],"app":{"example.com/cap/y":[{"v":2}]}}
+		]}`
+
+	var opts []servertest.ServerOption
+	if capSources {
+		opts = append(opts, servertest.WithCapabilitySources())
+	}
+
+	if chunks {
+		opts = append(opts, servertest.WithFilterChunks())
+	}
+
+	srv := servertest.NewServer(t, opts...)
+	setCapPolicy(t, srv, doc)
+
+	require.Equal(t, capSources, srv.State().Snapshot().CapabilitySources(), "test sanity: capability sources as the subtest says")
+	require.Equal(t, chunks, srv.State().Snapshot().FilterChunks(), "test sanity: filter chunks as the subtest says")
+
+	ops := srv.CreateUser(t, "ops")
+	alice := srv.CreateUser(t, "alice")
+	bob := srv.CreateUser(t, "bob")
+
+	web := servertest.NewClient(t, srv, "web", servertest.WithUser(ops), servertest.WithTags("tag:web"))
+	delta := servertest.NewClient(t, srv, "web-delta", servertest.WithUser(ops), servertest.WithTags("tag:web"), servertest.WithDeltaUpdates())
+	a := servertest.NewClient(t, srv, "alice-laptop", servertest.WithUser(alice))
+	a2 := servertest.NewClient(t, srv, "alice-phone", servertest.WithUser(alice))
+	b := servertest.NewClient(t, srv, "bob-laptop", servertest.WithUser(bob))
+	clients := []*servertest.TestClient{web, delta, a, a2, b}
+
+	holdFresh := func(step string) {
+		t.Helper()
+
+		for _, c := range clients {
+			requireHoldsFresh(t, srv, step, c)
+		}
+	}
+
+	holdFresh("start")
+
+	edit := func(step, old, next string) {
+		t.Helper()
+		require.Contains(t, doc, old)
+		doc = strings.Replace(doc, old, next, 1)
+		setCapPolicy(t, srv, doc)
+		holdFresh(step)
+	}
+
+	edit("rule removed", `{"src":["group:ops"],"dst":["tag:web"],"ip":["tcp:22"]},`+"\n\t\t\t", "")
+	edit("port edited", `"tcp:443"`, `"tcp:8443"`)
+	edit("protocol edited", `"udp:53"`, `"tcp:53"`)
+	edit("capability value edited", `{"v":1}`, `{"v":3}`)
+	edit("a capability's second value edited", `{"v":"second"}`, `{"v":"2nd"}`)
+	// alice's applications on web read example.com/cap/x's values in
+	// policy order, which reordering the grants changes.
+	edit("app rules reordered",
+		`{"src":["group:eng"],"dst":["tag:web"],"app":{"example.com/cap/x":[{"v":3},{"v":"2nd"}]}},
+			{"src":["autogroup:member"],"dst":["tag:web"],"app":{"example.com/cap/x":[{"v":"m"}]}},`,
+		`{"src":["autogroup:member"],"dst":["tag:web"],"app":{"example.com/cap/x":[{"v":"m"}]}},
+			{"src":["group:eng"],"dst":["tag:web"],"app":{"example.com/cap/x":[{"v":3},{"v":"2nd"}]}},`)
+	edit("rules reordered",
+		`{"src":["group:eng"],"dst":["tag:web"],"ip":["tcp:8443","tcp:53"]},
+			{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["tcp:8080"]},`,
+		`{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["tcp:8080"]},
+			{"src":["group:eng"],"dst":["tag:web"],"ip":["tcp:8443","tcp:53"]},`)
+
+	// web announces a route: everything it is sent goes as addresses, and
+	// a member leaving group:eng moves only the rules that name it.
+	announce := func(routes ...netip.Prefix) {
+		t.Helper()
+
+		web.Direct().SetHostinfo(&tailcfg.Hostinfo{
+			BackendLogID: "servertest-web", Hostname: "web", RoutableIPs: routes, GoVersion: "go1.27.3", IPNVersion: "1.94.1",
+		})
+
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		require.NoError(t, web.Direct().SendUpdate(ctx))
+	}
+
+	aIP := ipv4Of(t, a2)
+
+	announce(netip.MustParsePrefix("10.9.0.0/24"))
+	web.WaitForCondition(t, "address form while announcing", 10*time.Second, func(nm *netmap.NetworkMap) bool {
+		return slices.Contains(capRuleSources(nm), aIP.String())
+	})
+	holdFresh("form flipped to addresses")
+
+	_, err := srv.State().SetNodeTags(findNodeID(t, srv, "alice-phone"), []string{"tag:idle"})
+	require.NoError(t, err)
+	web.WaitForCondition(t, "alice-phone left group:eng", 10*time.Second, func(nm *netmap.NetworkMap) bool {
+		return !slices.Contains(capRuleSources(nm), aIP.String())
+	})
+	holdFresh("member of an address-form rule left")
+
+	announce()
+	web.WaitForCondition(t, "the source form again", 10*time.Second, func(nm *netmap.NetworkMap) bool {
+		return capSources == slices.ContainsFunc(capRuleSources(nm), func(s string) bool { return strings.HasPrefix(s, "cap:") })
+	})
+	holdFresh("form flipped back")
+
+	// A reconnect: the Go client starts its new map session holding no
+	// chunk, and the server's first response clears whatever it held.
+	for _, c := range []*servertest.TestClient{web, delta} {
+		c.Reconnect(t)
+	}
+
+	holdFresh("reconnected")
+
+	edit("edit after the reconnect", `"tcp:8080"`, `"tcp:8081"`)
 }

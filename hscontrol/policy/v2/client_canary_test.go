@@ -4,9 +4,9 @@
 // reconsidered; it goes only once every supported client has the change.
 //
 // The chunk merge of the control client (PacketFilter as "base", "*": nil
-// clearing, chunks joined in key order) is not pinned here: it lives in
-// controlclient's unexported map session, reachable only through a control
-// server, so a servertest client has to pin it.
+// clearing, chunks joined in key order), which named filter chunks rest
+// on, is pinned with the control client's map session in servertest:
+// TestCanaryClientChunkMerge.
 
 package v2
 

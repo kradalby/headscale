@@ -57,6 +57,7 @@ type serverConfig struct {
 	certProvider          hsdns.Provider
 	prefixV4              netip.Prefix
 	capSources            bool
+	filterChunks          bool
 }
 
 func defaultServerConfig() *serverConfig {
@@ -72,6 +73,12 @@ func defaultServerConfig() *serverConfig {
 // (policy.capability_sources).
 func WithCapabilitySources() ServerOption {
 	return func(c *serverConfig) { c.capSources = true }
+}
+
+// WithFilterChunks sends packet filters as named chunks
+// (policy.filter_chunks).
+func WithFilterChunks() ServerOption {
+	return func(c *serverConfig) { c.filterChunks = true }
 }
 
 // WithBatchDelay sets how long a map session coalesces a burst of
@@ -169,6 +176,7 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 	cfg.Database.Sqlite.Path = tmpDir + "/headscale_test.db"
 	cfg.Policy.Mode = types.PolicyModeDB
 	cfg.Policy.CapabilitySources = sc.capSources
+	cfg.Policy.FilterChunks = sc.filterChunks
 	cfg.Taildrop.Enabled = sc.taildropEnabled
 	cfg.LogTail.Enabled = sc.logTailEnabled
 	cfg.Tuning.BatchChangeDelay = sc.batchDelay

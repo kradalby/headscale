@@ -1054,6 +1054,21 @@ func Route(old, cur *state.Snapshot, c state.Change) (bool, map[types.NodeID]str
 	})
 
 	add(nodes)
+
+	// How a node is sent its filter reads what its client reports of
+	// itself ([policyv2.FilterDelivery]), which no other map renders: only
+	// the node's own session can move.
+	if cur.FilterChunks() {
+		for _, id := range c.Nodes {
+			was, wasOK := old.GetNode(id)
+			is, isOK := cur.GetNode(id)
+
+			if wasOK && isOK && deliveryKeyOf(true, was.Hostinfo()) != deliveryKeyOf(true, is.Hostinfo()) {
+				wake[id] = struct{}{}
+			}
+		}
+	}
+
 	add(c.Primaries)
 	add(c.PeerSets)
 	add(c.Filters)

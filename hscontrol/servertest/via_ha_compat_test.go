@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/mapper"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/servertest"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
@@ -240,7 +241,7 @@ func runViaHACompat(t *testing.T, c *testcapture.Capture) {
 		fresh, err := mapper.NewStream(srv.State().DebugConfig(), mapper.NewHub(), node.ID(), tailcfg.CurrentCapabilityVersion).Initial(snap)
 		require.NoError(t, err)
 		require.Len(t, fresh, 1)
-		require.Len(t, fresh[0].PacketFilters["base"], 2)
+		require.Len(t, policyv2.FilterChunks{}.ApplyResponse(fresh[0]).Rules(), 2)
 		primary := findNodeID(t, srv, "ha-b1").NodeID()
 		found := false
 

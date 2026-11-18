@@ -20,6 +20,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/juanfont/headscale/hscontrol/mapper"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/oauth2-proxy/mockoidc"
 	"github.com/stretchr/testify/assert"
@@ -1593,7 +1594,8 @@ func TestOIDCCallbackDispatchesUserIdentityChange(t *testing.T) {
 	stream.Delivered()
 
 	initial := frames[0]
-	require.NotEmpty(t, initial.PacketFilters["base"])
+	held := policyv2.FilterChunks{}.ApplyResponse(initial)
+	require.NotEmpty(t, held.Rules())
 
 	capForm := b.app.state.Snapshot().CapabilitySources()
 	if capForm {
@@ -1620,8 +1622,8 @@ func TestOIDCCallbackDispatchesUserIdentityChange(t *testing.T) {
 			stream.Delivered()
 
 			for _, response := range frames {
-				filters, present := response.PacketFilters["base"]
-				if present && len(filters) == 0 {
+				held = held.ApplyResponse(response)
+				if response.PacketFilters != nil && len(held.Rules()) == 0 {
 					return true
 				}
 

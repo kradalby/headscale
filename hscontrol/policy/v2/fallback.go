@@ -495,6 +495,115 @@ func receiverForm(mode SourceMode, f ReceiverFacts) ipReason {
 	return reasonNone
 }
 
+// How a session is sent its filter is decided here too: as named chunks
+// (chunk.go), only to a client known to keep them per map session and to
+// apply "*": null before the rest of a response; any other is sent the
+// whole filter under "base", which every client handles and which a
+// client that loses its chunks recovers from at the next change.
+
+// deliveryReason is why a session is sent its whole filter under "base"
+// instead of named chunks. [FilterDelivery] returns the first that applies.
+type deliveryReason uint8
+
+const (
+	// deliveryChunks: the filter goes as named chunks.
+	deliveryChunks deliveryReason = iota
+
+	// deliveryOff: policy.filter_chunks is off. Permanent: it is the
+	// opt-out.
+	deliveryOff
+
+	// TODO(capsrc/chunk-client): lift when every client headscale serves holds filter chunks per map session and rebuilds them whole when what applies them restarts; canary TestTailscaleRustFilterChunks
+	// TODO(kradalby): capsrc/chunk-client: tailscale-rs keeps its chunks
+	// for the runtime's life, not the map session's (the
+	// PacketfilterUpdater actor in ts_runtime/src/packetfilter.rs outlives
+	// the control stream, and only "*": null clears its state,
+	// apply_update in ts_packetfilter/src/state.rs,
+	// https://github.com/tailscale/tailscale-rs/blob/f9157a9938c8a33be31ef5146b310c30229321a9/ts_runtime/src/packetfilter.rs),
+	// and when that actor panics and is restarted it replays only the last
+	// update onto an empty state: with chunks it holds only what that
+	// update carried until the next map session (fails closed, but an
+	// outage), with the whole filter it recovers at the next change. A
+	// client headscale does not recognise could do either. The Tailscale
+	// client holds chunks per map session (mapSession.namedPacketFilters,
+	// a new mapSession per long poll in Direct.sendMapRequest,
+	// https://github.com/tailscale/tailscale/blob/f7c1b8e52600c1926623b29c91972a5ea1364d2f/control/controlclient/direct.go)
+	// and applies the clear first (mapSession.updateStateFromResponse in
+	// map.go); TestCanaryClientChunkMerge pins it. No upstream issue:
+	// nothing in tailscale-rs is wrong by its own contract, only unsafe
+	// for an incremental sender.
+	//
+	// deliveryClient: the session's client is not known to handle named
+	// chunks: anything but Tailscale's own client.
+	deliveryClient
+
+	numDeliveries
+)
+
+// deliveryDocs are the delivery reasons' rows, as [reasonDocs] are the
+// source reasons'.
+var deliveryDocs = [numDeliveries]reasonDoc{
+	deliveryChunks: {label: "chunks", kind: kindNone, scope: "the filter goes as named chunks"},
+	deliveryOff: {
+		label: "chunks-off", kind: kindPermanent, scope: "every session, whole filter under \"base\"",
+		lift: "never: policy.filter_chunks is the opt-out",
+	},
+	deliveryClient: {
+		label: "chunk-client", kind: kindClient, scope: "every session of a node whose client is not known to handle named chunks",
+		lift:   "every client headscale serves holds filter chunks per map session and rebuilds them whole when what applies them restarts",
+		canary: "TestTailscaleRustFilterChunks",
+	},
+}
+
+// Delivery is how a session is sent its filter: as named chunks, or whole
+// under "base" for a reason.
+type Delivery struct{ why deliveryReason }
+
+// Chunked reports whether the filter goes as named chunks.
+func (d Delivery) Chunked() bool { return d.why == deliveryChunks }
+
+// String returns the delivery's label.
+func (d Delivery) String() string {
+	if d.why < numDeliveries {
+		return deliveryDocs[d.why].label
+	}
+
+	return "unknown"
+}
+
+// deliveries counts [FilterDelivery]'s answers by reason.
+var deliveries [numDeliveries]atomic.Uint64
+
+// FilterDelivery decides how a session of a node whose client reported hi
+// is sent its packet filter, chunks being policy.filter_chunks; it is the
+// only place that does. Each call is counted: a session asks when it
+// starts and when its node's client report changes.
+func FilterDelivery(chunks bool, hi tailcfg.HostinfoView) Delivery {
+	d := Delivery{deliveryChunks}
+
+	switch {
+	case !chunks:
+		d.why = deliveryOff
+	case !officialClient(hi):
+		d.why = deliveryClient
+	}
+
+	deliveries[d.why].Add(1)
+
+	return d
+}
+
+// FilterDeliveryCounts returns, by label, how often [FilterDelivery] chose
+// each delivery since the process started.
+func FilterDeliveryCounts() map[string]uint64 {
+	out := make(map[string]uint64, numDeliveries)
+	for d := range numDeliveries {
+		out[Delivery{d}.String()] = deliveries[d].Load()
+	}
+
+	return out
+}
+
 // srcCapProtocols are the protocols the client matches capability sources
 // for; a rule naming no protocol takes the client's defaults, all among
 // them.
