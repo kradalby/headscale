@@ -424,6 +424,7 @@ Where the access control policy is kept: in a file headscale reads, or in the da
       path: ""
       mode: file
       capability_sources: false
+      filter_chunks: false
     ```
 
 ### `policy.path` { #policy.path data-toc-label="path" }
@@ -512,6 +513,33 @@ Sends a rule's users, groups, tags and autogroups as node capabilities their mem
 
     ```nix
     services.headscale.settings.policy.capability_sources = true;
+    ```
+
+### `policy.filter_chunks` { #policy.filter_chunks data-toc-label="filter_chunks" }
+
+- **Type:** [boolean](#type-boolean)
+- **Default:** `false`
+- **Env:** `HEADSCALE_POLICY_FILTER_CHUNKS`
+
+Sends each node's packet filter as named chunks, so a change sends what changed instead of the whole filter: a chunk per rule, but one chunk for every app capability rule, sent whole again when any of them changes, since their order is what an application reads. Only Tailscale's own client is sent chunks; any other, tailscale-rs among them, is sent the whole filter. Independent of [`policy.capability_sources`](#policy.capability_sources). Read at startup only. Every map session starts by clearing what the client held, so this can be turned on and off between restarts. Tailscale's client holds chunks per map session, so even a rollback to a headscale release that sends no such clear leaves none behind; only a client reporting itself as Tailscale's while keeping chunks across sessions could hold stale ones.
+
+=== "YAML"
+
+    ```yaml
+    policy:
+      filter_chunks: true
+    ```
+
+=== "Environment"
+
+    ```shell
+    export HEADSCALE_POLICY_FILTER_CHUNKS=true
+    ```
+
+=== "NixOS"
+
+    ```nix
+    services.headscale.settings.policy.filter_chunks = true;
     ```
 
 ## `log` { #log data-toc-label="log" }
