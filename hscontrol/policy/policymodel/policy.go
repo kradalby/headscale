@@ -490,7 +490,7 @@ func (r Rule) json(grant bool) string {
 		if len(r.App) > 0 {
 			caps := make([]member, len(r.App))
 			for i, a := range r.App {
-				caps[i] = member{Apps[a.Cap], "[" + AppValues[a.Value] + "]"}
+				caps[i] = member{Apps[a.Cap], "[" + strings.Join(AppValues[a.Value], ", ") + "]"}
 			}
 
 			ms = append(ms, member{"app", object(caps...)})

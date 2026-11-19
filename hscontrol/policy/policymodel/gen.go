@@ -56,6 +56,8 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 		elsewhere := chance(t, 8, "flip-elsewhere")
 		down := chance(t, 4, "primary-down")
 		who := rapid.IntRange(0, anyOf).Draw(t, "flipper")
+		tour := chance(t, 3, "form-tour")
+		stops := tourStops.Draw(t, "tour-stops")
 
 		var scripted []Step
 
@@ -90,6 +92,13 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 
 		if down {
 			for _, st := range primaryDown(w) {
+				w = w.Apply(st.Edits...)
+				s.Steps = append(s.Steps, st)
+			}
+		}
+
+		if tour {
+			for _, st := range formTour(w, who, stops) {
 				w = w.Apply(st.Edits...)
 				s.Steps = append(s.Steps, st)
 			}
@@ -819,9 +828,13 @@ func drawRule(t *rapid.T, grant bool, p Policy) Rule {
 	same := chance(t, 3, "same-sources")
 	from := rapid.IntRange(0, 15).Draw(t, "from")
 	src := srcs.Draw(t, "src")
+	ident := chance(t, 3, "identity-src")
+	idSrc := identitySrcs.Draw(t, "identity-src")
+	mixed := chance(t, 2, "mixed-src")
 	dst := dsts.Draw(t, "dst")
 	more := chance(t, 4, "more-dst")
 	public := chance(t, 4, "public-dst")
+	public6 := chance(t, 2, "public-v6")
 	proto := chance(t, 3, "proto")
 	protoIdx := 1 + index(t, len(Protos)-1, "proto")
 	ports := portDraws.Draw(t, "ports")
@@ -854,7 +867,8 @@ func drawRule(t *rapid.T, grant bool, p Policy) Rule {
 			proto = false
 		}
 	} else {
-		r.Src = src
+		// Self rules keep their sources as drawn: * names owners by range.
+		r.Src = identitySources(ident && !self, mixed, idSrc, src)
 	}
 
 	if self {
@@ -875,7 +889,12 @@ func drawRule(t *rapid.T, grant bool, p Policy) Rule {
 		// Capabilities to public space make exit nodes see their
 		// sources one way.
 		if app && public {
-			r.Dst = append(r.Dst, Dest{Sel: Sel{Kind: SelPrefix, I: publicPrefix}})
+			pub := publicPrefix
+			if public6 {
+				pub = publicPrefix6
+			}
+
+			r.Dst = append(r.Dst, Dest{Sel: Sel{Kind: SelPrefix, I: pub}})
 		}
 	}
 
@@ -1955,12 +1974,16 @@ func drawGrantPart(t *rapid.T, p Policy, ref RuleRef, kind int) (Edit, bool) {
 	case editApp:
 		none := chance(t, 4, "no-app")
 		apps := drawApps(t)
+		tail := chance(t, 3, "values-tail")
 
 		switch {
 		case none && len(r.IP) > 0:
 			return SetApp{ref, nil}, true
 		case internet:
 			return nil, false
+		case tail && slices.ContainsFunc(r.App, func(a App) bool { return a.Value > 0 }):
+			// The same capabilities, values that differ past the first.
+			return SetApp{ref, valuesTail(r.App)}, true
 		}
 
 		return SetApp{ref, apps}, true

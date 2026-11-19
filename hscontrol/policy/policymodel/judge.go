@@ -187,53 +187,55 @@ func (c *Verdicts) CompareAt(ref *Ref, id types.NodeID, got []tailcfg.FilterRule
 }
 
 // sameUpToRepeats reports whether cand grants what ref does, in the same
-// order, with some values repeated more often: the same runs of equal
-// values, none shorter.
+// order, with some runs of values repeated whole: each capability's values
+// in ref split into runs, cand each run one or more times over. A grant
+// whose two destination entries both name the receiver repeats its whole
+// list.
 func sameUpToRepeats(ref, cand tailcfg.PeerCapMap) bool {
 	if len(ref) != len(cand) {
 		return false
 	}
 
-	type run struct {
-		v tailcfg.RawMessage
-		n int
-	}
-
-	runs := func(c peercap.Cap, vs []tailcfg.RawMessage) []run {
-		var out []run
-
-		for _, v := range vs {
-			if len(out) > 0 && SamePeerCaps(tailcfg.PeerCapMap{c: {out[len(out)-1].v}}, tailcfg.PeerCapMap{c: {v}}) {
-				out[len(out)-1].n++
-
-				continue
-			}
-
-			out = append(out, run{v: v, n: 1})
-		}
-
-		return out
-	}
-
 	for c, rv := range ref {
 		cv, ok := cand[c]
-		if !ok {
+		if !ok || !repeatsOf(c, rv, cv) {
 			return false
-		}
-
-		rr, cr := runs(c, rv), runs(c, cv)
-		if len(rr) != len(cr) {
-			return false
-		}
-
-		for i := range rr {
-			if cr[i].n < rr[i].n || !SamePeerCaps(tailcfg.PeerCapMap{c: {rr[i].v}}, tailcfg.PeerCapMap{c: {cr[i].v}}) {
-				return false
-			}
 		}
 	}
 
 	return true
+}
+
+// repeatsOf reports whether cand is ref split into runs, each repeated
+// one or more times.
+func repeatsOf(c peercap.Cap, ref, cand []tailcfg.RawMessage) bool {
+	same := func(a, b tailcfg.RawMessage) bool {
+		return SamePeerCaps(tailcfg.PeerCapMap{c: {a}}, tailcfg.PeerCapMap{c: {b}})
+	}
+
+	// done[i][j]: ref[i:] and cand[j:] match.
+	done := make([][]bool, len(ref)+1)
+	for i := range done {
+		done[i] = make([]bool, len(cand)+1)
+	}
+
+	done[len(ref)][len(cand)] = true
+
+	for i := range slices.Backward(ref) {
+		for j := len(cand) - 1; j >= 0; j-- {
+			for l := 1; i+l <= len(ref) && !done[i][j]; l++ {
+				for k := j; k+l <= len(cand) && slices.EqualFunc(ref[i:i+l], cand[k:k+l], same); k += l {
+					if done[i+l][k+l] {
+						done[i][j] = true
+
+						break
+					}
+				}
+			}
+		}
+	}
+
+	return done[0][0]
 }
 
 // acceptsThrough returns whether rules accept a probe through a

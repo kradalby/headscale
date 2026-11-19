@@ -849,7 +849,7 @@ func (e SetApp) undo(w World) (Edit, bool) { return SetApp{e.Rule, w.Policy.Rule
 func (e SetApp) String() string {
 	caps := make([]string, len(e.App))
 	for i, a := range e.App {
-		caps[i] = Apps[a.Cap] + "=" + AppValues[a.Value]
+		caps[i] = Apps[a.Cap] + "=" + strings.Join(AppValues[a.Value], ",")
 	}
 
 	return fmt.Sprintf("%s app=[%s]", e.Rule, strings.Join(caps, " "))

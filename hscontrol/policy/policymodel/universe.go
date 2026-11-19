@@ -91,7 +91,8 @@ const (
 // Prefixes serve rules, hosts, routes and auto-approvers. They cover node
 // addresses (100.64.0.0/30 holds n1-n3, the /120 every node's own IPv6),
 // overlap each other, touch (10.0.1.0/24 begins where 10.0.0.0/24 ends),
-// reach public space, and end in the two halves of an exit route.
+// reach public space in both families, and end in the two halves of an
+// exit route.
 var Prefixes = []netip.Prefix{
 	netip.MustParsePrefix("10.0.0.0/24"),
 	netip.MustParsePrefix("10.0.0.0/16"),
@@ -101,6 +102,7 @@ var Prefixes = []netip.Prefix{
 	netip.MustParsePrefix("fd7a:115c:a1e0::/120"),
 	netip.MustParsePrefix("fd00:1::/64"),
 	netip.MustParsePrefix("10.0.1.0/24"),
+	netip.MustParsePrefix("2001:4860::/32"),
 	netip.MustParsePrefix("0.0.0.0/0"),
 	netip.MustParsePrefix("::/0"),
 }
@@ -108,10 +110,11 @@ var Prefixes = []netip.Prefix{
 const (
 	// numRulePrefixes is how many Prefixes a rule or host may name: a grant
 	// cannot name a default route, and a rule says autogroup:internet.
-	numRulePrefixes = 8
-	exit4, exit6    = 8, 9
+	numRulePrefixes = 9
+	exit4, exit6    = 9, 10
 	publicPrefix    = 4
 	touching        = 7
+	publicPrefix6   = 8
 )
 
 // hostDefault is the prefix each host names before a draw moves it:
@@ -131,11 +134,15 @@ var Ports = []string{"*", "22", "80-443", "1", "65535", "22,443"}
 const grantPorts = 5
 
 // Apps are app capabilities: plain ones, and two the compile adds
-// companions for.
+// companions for. AppValues are the value lists one is granted: one value,
+// then, from appSingles on, two, as long as each other and alike in the
+// first, so that only what follows the first tells them apart.
 var (
 	Apps      = []string{"example.com/cap/x", "tailscale.com/cap/relay", "tailscale.com/cap/drive", "example.com/cap/y"}
-	AppValues = []string{`{}`, `{"role":"ops"}`}
+	AppValues = [][]string{{`{}`}, {`{"role":"ops"}`}, {`{"role":"ops"}`, `{}`}, {`{"role":"ops"}`, `{"role":"dev"}`}}
 )
+
+const appSingles = 2
 
 // SSHUsers are the logins an SSH rule grants.
 var SSHUsers = []string{"root", "autogroup:nonroot", "localpart:*@example.com", "alice"}

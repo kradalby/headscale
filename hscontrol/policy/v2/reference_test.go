@@ -867,6 +867,7 @@ func TestCapabilityFormFollowsReference(t *testing.T) {
 	t.Logf("with the reference's netmap: %v", &referenced)
 	t.Logf("form: %v", &form)
 	requireJudged(t, "capability form", counts, floorCapForm)
+	requireForm(t, form)
 }
 
 // TestPeersAndRoutesFollowReference holds headscale's peers, after every

@@ -409,7 +409,7 @@ func docGrants(t *rapid.T, p Policy, grants []struct {
 		}
 
 		for _, a := range r.App {
-			if v, ok := d.App[Apps[a.Cap]]; !ok || len(v) != 1 || string(v[0]) != AppValues[a.Value] {
+			if v, ok := d.App[Apps[a.Cap]]; !ok || !slices.EqualFunc(v, AppValues[a.Value], func(x json.RawMessage, y string) bool { return string(x) == y }) {
 				t.Fatalf("grants[%d] app is %v", i, d.App)
 			}
 		}

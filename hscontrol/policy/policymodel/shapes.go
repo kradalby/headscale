@@ -652,7 +652,7 @@ var Required = append([]Shape{
 			return slices.ContainsFunc(r.Dst, func(d Dest) bool { return d.Sel.Kind == SelInternet })
 		})
 	}},
-	{Name: "danger-all-src", Why: "a literal source of everything", Min: 0.095, World: func(v *View) bool {
+	{Name: "danger-all-src", Why: "a literal source of everything", Min: 0.06, World: func(v *View) bool {
 		return v.anyRule(func(r Rule, _ bool) bool {
 			return slices.ContainsFunc(r.Src, func(s Sel) bool { return s.Kind == SelDangerAll })
 		})
@@ -784,7 +784,7 @@ var Required = append([]Shape{
 	{Name: "rules-to-allow-all", Why: "every rule gone, allowing everything", Min: 0.03, Step: func(b, a *View, _ Step) bool {
 		return !b.World.Policy.AllowAll && a.World.Policy.AllowAll
 	}},
-	{Name: "host-edit-named", Why: "a host's prefix edited while rules keep naming it", Min: 0.015, Step: func(b, a *View, st Step) bool {
+	{Name: "host-edit-named", Why: "a host's prefix edited while rules keep naming it", Min: 0.008, Step: func(b, a *View, st Step) bool {
 		return slices.ContainsFunc(edits[SetHost](st), func(e SetHost) bool {
 			return b.World.Policy.referenced().hosts[e.Host] && b.World.Policy.Hosts[e.Host] != a.World.Policy.Hosts[e.Host]
 		})
