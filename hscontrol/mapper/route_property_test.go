@@ -1,6 +1,7 @@
 package mapper
 
 import (
+	"flag"
 	"fmt"
 	"maps"
 	"net/netip"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
@@ -41,6 +43,19 @@ type pbtWorld struct {
 	w   policymodel.World
 
 	committed func(before uint64)
+	// docs counts the policy writes so far.
+	docs int
+
+	// conns holds each node's connections, oldest first, by epoch; runs
+	// counts the runs of connections begun, and elections is the history
+	// the documented election reads, advanced at every commit.
+	conns     map[types.NodeID][]uint64
+	runs      uint64
+	elections *policymodel.Elections
+	// started is when the last run began, as the State stamped it.
+	started time.Time
+	// made counts the writes [pbtWorld.session] made, by kind.
+	made map[string]int
 }
 
 func newPBTWorld(t pbtT, w policymodel.World, configure ...func(*types.Config)) *pbtWorld {
@@ -74,7 +89,7 @@ func newPBTWorld(t pbtT, w policymodel.World, configure ...func(*types.Config)) 
 		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
 	})
 
-	p := &pbtWorld{t: t, cfg: cfg, s: s}
+	p := &pbtWorld{t: t, cfg: cfg, s: s, conns: map[types.NodeID][]uint64{}, elections: policymodel.NewElections(), made: map[string]int{}}
 	p.write(w)
 
 	return p
@@ -86,13 +101,18 @@ func (p *pbtWorld) call(write func()) {
 
 	write()
 
+	if p.s.Snapshot().Rev() != before {
+		p.elect()
+	}
+
 	if p.committed != nil {
 		p.committed(before)
 	}
 }
 
 // write brings the State from p.w to w: deleted nodes and users, changed
-// and new users, the policy, then new and changed nodes. A single edit
+// and new users, the policy, then new and changed nodes (see
+// [pbtWorld.putNode]). A single edit
 // touches one of them; a batch (a world written from scratch, a step taken
 // back) needs that order — a policy can name a user only once the user who
 // would make it ambiguous is gone, and a user can take a name only once
@@ -106,6 +126,7 @@ func (p *pbtWorld) write(w policymodel.World) {
 	for _, n := range p.w.Topology.Nodes {
 		if _, ok := w.Topology.Node(n.ID); !ok {
 			p.call(func() { p.s.DeleteNodeFromStoreForTest(n.ID) })
+			delete(p.conns, n.ID)
 		}
 	}
 
@@ -173,6 +194,7 @@ func (p *pbtWorld) write(w policymodel.World) {
 	}
 
 	if string(w.Policy.HuJSON()) != string(p.w.Policy.HuJSON()) || len(p.w.Topology.Users) == 0 {
+		p.docs++
 		p.call(func() {
 			_, err := p.s.SetPolicy(w.Policy.HuJSON())
 			if err != nil {
@@ -182,7 +204,8 @@ func (p *pbtWorld) write(w policymodel.World) {
 	}
 
 	for i, n := range w.Topology.Nodes {
-		if was, ok := p.w.Topology.Node(n.ID); ok && reflect.DeepEqual(was, n) {
+		was, existed := p.w.Topology.Node(n.ID)
+		if existed && reflect.DeepEqual(was, n) {
 			continue
 		}
 
@@ -197,7 +220,7 @@ func (p *pbtWorld) write(w policymodel.World) {
 			tn.User = u
 		}
 
-		p.call(func() { p.s.PutNodeInStoreForTest(*tn) })
+		p.putNode(was, existed, n, tn)
 	}
 
 	p.w = w
@@ -242,15 +265,22 @@ type scenarioRun struct {
 	// first, with the edit that made it.
 	commits []scenarioCommit
 	edit    policymodel.Edit
+	// kind, when set, names what the next commits are, for want of an edit.
+	kind string
 
 	fresh  map[freshKey]*netMap
 	routes map[[2]uint64]routeAnswer
 	reach  *scenarioReach
+	// docs is the policy writes made by each commit's revision.
+	docs map[uint64]int
+	// dropped is Route's answers with each part taken out, by pair.
+	dropped droppedWakes
 }
 
 type scenarioCommit struct {
 	snap *state.Snapshot
 	edit policymodel.Edit
+	kind string
 }
 
 type scenarioSess struct {
@@ -274,8 +304,9 @@ type freshKey struct {
 }
 
 type routeAnswer struct {
-	all  bool
-	wake map[types.NodeID]struct{}
+	all    bool
+	wake   map[types.NodeID]struct{}
+	change state.Change
 }
 
 // scenarioReach counts what the scenarios reached and what Route did with
@@ -291,15 +322,20 @@ type scenarioReach struct {
 	// joinNamed those of them it names in Filters; joinIdle those of them
 	// whose filter and SSH policy stayed.
 	joinWoken, joinNamed, joinIdle map[string]int
+	wakes                          *wakeTally
+	// writes counts the writes made through production entry points, and
+	// scripts the scripts played, by kind.
+	writes, scripts map[string]int
 }
 
 // TestSessionsFollowGeneratedScenarios plays generated scenarios
 // (policymodel's: arbitrary policies, topologies and steps, edits one
-// commit each, now and then a node's endpoint moving after a step)
-// against a State, a hub whose watcher routes after every
-// commit or once per step, and a session per node rendering where the
-// scenario's steps read; each source mode a subtest, filter_chunks drawn
-// per case. It holds two properties.
+// commit each, now and then a node's endpoint moving after a step or a
+// write through a production entry point, most cases ending with a script
+// that moves one part of what a viewer is sent alone) against a State, a
+// hub whose watcher routes after every commit or once per step, and a
+// session per node rendering where the scenario's steps read; each source
+// mode a subtest, filter_chunks drawn per case. It holds two properties.
 //
 // Route is sound (P10.1): for every session, every snapshot X it rendered
 // and every later commit C, if what a fresh render of C would send the
@@ -322,6 +358,10 @@ type scenarioReach struct {
 // narrows (see [ruleClass]), a join names in Filters no receiver served
 // capability form at both ends, other than the joiner and the exit nodes
 // and subnet routers D7 recuts, whose filter and SSH policy stayed.
+//
+// Routing is judged for every part of a change it reads: each must be what
+// alone wakes some stale pair, or a routing that forgot it would pass (see
+// [requireAlone]).
 func TestSessionsFollowGeneratedScenarios(t *testing.T) {
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "false")
 	t.Setenv(state.TestFilterChunksEnv, "false")
@@ -330,12 +370,17 @@ func TestSessionsFollowGeneratedScenarios(t *testing.T) {
 		t.Run(fmt.Sprintf("capability=%t", capSources), func(t *testing.T) {
 			t.Setenv(state.TestCapabilitySourcesEnv, strconv.FormatBool(capSources))
 
-			reach := &scenarioReach{woken: map[string]int{}, idle: map[string]int{}, joinWoken: map[string]int{}, joinNamed: map[string]int{}, joinIdle: map[string]int{}}
+			reach := &scenarioReach{
+				woken: map[string]int{}, idle: map[string]int{}, joinWoken: map[string]int{}, joinNamed: map[string]int{}, joinIdle: map[string]int{},
+				wakes: newWakeTally(), writes: map[string]int{}, scripts: map[string]int{},
+			}
 
 			rapid.Check(t, func(t *rapid.T) { playScenario(t, reach) })
 
 			t.Logf("pairs judged %d (%d needed a wake), of them strictly coalesced %d (%d); reads %d, after unread commits %d",
 				reach.pairs, reach.stale, reach.pairsBetween, reach.staleBetween, reach.reads, reach.lagged)
+			t.Logf("wakes: %s", reach.wakes)
+			t.Logf("writes through production entry points %v; scripts played %v", reach.writes, reach.scripts)
 
 			byField, idleByField := map[string]int{}, map[string]int{}
 
@@ -377,8 +422,60 @@ func TestSessionsFollowGeneratedScenarios(t *testing.T) {
 			if !testing.Short() && reach.staleBetween == 0 {
 				t.Errorf("no coalesced pair needed a wake")
 			}
+
+			requireAlone(t, reach.wakes, capSources)
 		})
 	}
+}
+
+// requireAlone fails a run in which some part of a change Route reads
+// woke no stale pair alone: a routing that forgot it would leave that
+// session stale with nothing else to cover, and no case would show it. A
+// deep run asks it of every part the mode makes alone, the default run of
+// those it reaches by many. In capability mode a viewer whose routes move
+// by its own membership is restamped too, so RouteViewers stands alone
+// in address mode only.
+func requireAlone(t *testing.T, w *wakeTally, capSources bool) {
+	t.Helper()
+
+	if testing.Short() {
+		return
+	}
+
+	deep := false
+
+	if f := flag.Lookup("rapid.checks"); f != nil {
+		n, err := strconv.Atoi(f.Value.String())
+		deep = err == nil && n >= 1000
+	}
+
+	for _, f := range wakeFields {
+		floor, ok := aloneFloors[f.name]
+		if !ok || f.name == "RouteViewers" && capSources {
+			continue
+		}
+
+		if deep {
+			floor = max(floor, 1)
+		}
+
+		if floor > 0 && w.sole[f.name] < floor {
+			t.Errorf("%d stale pairs were woken by %s alone, want %d at least", w.sole[f.name], f.name, floor)
+		}
+	}
+
+	if w.selective-w.coalesced == 0 || w.coalesced == 0 {
+		t.Errorf("stale pairs woken selectively: %d, of them coalesced %d", w.selective, w.coalesced)
+	}
+}
+
+// aloneFloors are the stale pairs a run of the default length wakes by
+// each part alone at least, far below what runs measure; zero asks it of
+// deep runs only, the rest coming in bursts, a script's case at a time.
+// AllRouters is never asked: every policy write that sets it moves side
+// sets too.
+var aloneFloors = map[string]int{
+	"Nodes": 25, "Primaries": 0, "PeerSets": 0, "Filters": 0, "Caps": 0, "RouteViewers": 0, "Routers": 0,
 }
 
 func playScenario(t *rapid.T, reach *scenarioReach) {
@@ -389,6 +486,7 @@ func playScenario(t *rapid.T, reach *scenarioReach) {
 	r := &scenarioRun{
 		t: t, coalesce: coalesce, mixed: mixed, reach: reach,
 		sess: map[types.NodeID]*scenarioSess{}, fresh: map[freshKey]*netMap{}, routes: map[[2]uint64]routeAnswer{},
+		docs: map[uint64]int{}, dropped: droppedWakes{},
 	}
 
 	r.p = newDrawnWorld(t, s.Start)
@@ -398,6 +496,7 @@ func playScenario(t *rapid.T, reach *scenarioReach) {
 
 	start := r.p.s.Snapshot()
 	r.commits = append(r.commits, scenarioCommit{snap: start})
+	r.docs[start.Rev()] = r.p.docs
 
 	for _, n := range start.ListNodes().All() {
 		r.read(n.ID())
@@ -421,6 +520,19 @@ func playScenario(t *rapid.T, reach *scenarioReach) {
 			r.p.call(func() { r.p.s.PutNodeInStoreForTest(*n) })
 		}
 
+		// Now and then a client, the HA prober or an operator writes too,
+		// through its production entry point.
+		if pbtChance(t, 3, "session-write") {
+			sw := sessionWrites.Draw(t, "session")
+			r.edit, r.kind = nil, "session "+sw.Kind.String()
+
+			if did := r.p.session(sw); did != "" {
+				t.Logf("step %d: %s", i+1, did)
+			}
+
+			r.kind = ""
+		}
+
 		r.w.settle()
 
 		for _, id := range st.Reads {
@@ -428,6 +540,34 @@ func playScenario(t *rapid.T, reach *scenarioReach) {
 		}
 
 		t.Logf("step %d done at r%d", i+1, r.p.s.Snapshot().Rev())
+	}
+
+	defer func() {
+		for k, n := range r.p.made {
+			reach.writes[k] += n
+		}
+	}()
+
+	// One case in two ends with a script moving one part of what a viewer
+	// is sent alone, most of its acts read by every session.
+	if pbtChance(t, 2, "script") {
+		name, acts := drawScript(t, r.p.w)
+		r.edit = nil
+		reach.scripts[name]++
+
+		for _, a := range acts {
+			r.kind = "script " + name
+			t.Logf("%s: %s", name, a.play(r.p))
+			r.kind = ""
+
+			r.w.settle()
+
+			if rapid.IntRange(0, 3).Draw(t, "script-reads") > 0 {
+				for _, n := range r.p.s.Snapshot().ListNodes().All() {
+					r.read(n.ID())
+				}
+			}
+		}
 	}
 }
 
@@ -445,7 +585,8 @@ func (r *scenarioRun) committed(before uint64) {
 		r.w.settle()
 	}
 
-	r.commits = append(r.commits, scenarioCommit{snap: snap, edit: r.edit})
+	r.commits = append(r.commits, scenarioCommit{snap: snap, edit: r.edit, kind: r.kind})
+	r.docs[snap.Rev()] = r.p.docs
 
 	for id := range r.sess {
 		if _, ok := snap.GetNode(id); !ok {
@@ -537,8 +678,9 @@ func (r *scenarioRun) route(x, c *state.Snapshot) routeAnswer {
 		return a
 	}
 
-	all, wake := Route(x, c, c.Since(x))
-	a := routeAnswer{all: all, wake: wake}
+	change := c.Since(x)
+	all, wake := Route(x, c, change)
+	a := routeAnswer{all: all, wake: wake, change: change}
 	r.routes[k] = a
 
 	return a
@@ -577,11 +719,28 @@ func (r *scenarioRun) judgeRoute(j int) {
 				r.reach.staleBetween++
 			}
 
-			if !r.route(rd.snap, c).has(id) {
+			ans := r.route(rd.snap, c)
+			if ans.has(id) {
+				r.reach.wakes.add(r.dropped, rd.snap, c, ans.all, ans.change, id, between, r.docs[rd.snap.Rev()] != r.docs[c.Rev()], r.commitKind(j))
+			}
+
+			if !ans.has(id) {
 				r.t.Fatalf("route: n%d rendered r%d; a fresh render of r%d would send it %s, and Route(r%d, r%d) does not wake it",
 					id, rd.snap.Rev(), c.Rev(), describeResponses(out), rd.snap.Rev(), c.Rev())
 			}
 		}
+	}
+}
+
+// commitKind names what made commit j: its edit, or what wrote it.
+func (r *scenarioRun) commitKind(j int) string {
+	switch c := r.commits[j]; {
+	case c.kind != "":
+		return c.kind
+	case c.edit == nil:
+		return "Endpoint"
+	default:
+		return strings.TrimPrefix(fmt.Sprintf("%T", c.edit), "policymodel.")
 	}
 }
 
@@ -592,10 +751,7 @@ func (r *scenarioRun) judgeRoute(j int) {
 func (r *scenarioRun) countWakes(j int) {
 	a, c := r.commits[j-1].snap, r.commits[j].snap
 
-	kind := strings.TrimPrefix(fmt.Sprintf("%T", r.commits[j].edit), "policymodel.")
-	if r.commits[j].edit == nil {
-		kind = "Endpoint"
-	}
+	kind := r.commitKind(j)
 
 	ans := r.route(a, c)
 

@@ -342,6 +342,14 @@ type hubMachine struct {
 	// a self destination (see [auditLines.judge]).
 	audits              *auditLines
 	shared, apart, self bool
+	// kind names the last commit's write, for what woke renders after it.
+	kind string
+	// script holds the acts of the script in progress (see [drawScript]),
+	// played one commit event at a time.
+	script     []scriptAct
+	scriptName string
+	// dropped is Route's answers with each part taken out, by pair.
+	dropped droppedWakes
 }
 
 // hubPropertyReach counts the windows the schedules reached.
@@ -350,11 +358,13 @@ type hubPropertyReach struct {
 	events                                                                                       map[string]int
 	// known counts the audit lines excused as known false alarms.
 	known map[string]int
+	// wakes counts what woke each render that sent something.
+	wakes *wakeTally
 }
 
 func (r hubPropertyReach) String() string {
-	return fmt.Sprintf("coalesced routings %d, render-log wakes by a routing %d, by a render's end %d, renders ended past a routing %d, ended mid-routing %d, failures retried %d, first maps of a newer snapshot %d; events %v; audit lines excused %v",
-		r.coalesced, r.logWoke, r.endWoke, r.endedPast, r.endedMidRouting, r.retried, r.firstNewer, r.events, r.known)
+	return fmt.Sprintf("coalesced routings %d, render-log wakes by a routing %d, by a render's end %d, renders ended past a routing %d, ended mid-routing %d, failures retried %d, first maps of a newer snapshot %d; events %v; audit lines excused %v; renders that sent something: %s",
+		r.coalesced, r.logWoke, r.endWoke, r.endedPast, r.endedMidRouting, r.retried, r.firstNewer, r.events, r.known, r.wakes)
 }
 
 // TestHubSessionsConvergeUnderDrawnSchedules drives the real hub — its
@@ -362,13 +372,16 @@ func (r hubPropertyReach) String() string {
 // draws, one event at a time, so every interleaving replays and shrinks.
 //
 // It draws a world from policymodel and filter_chunks, then events: a
-// commit (a policymodel step, its edits one commit each, or a node's
-// endpoint write, which names only it and its readers); the watcher moving to its next point (load,
-// after a session's shard, routed); a session taking its wake and the
-// latest snapshot; a session ending its render, which may fail (a failure
-// no snapshot explains, as Update's error path ends it); a node's session
-// admitted, its first map rendered later; a session leaving or
-// reconnecting. Sessions end renders only where their shard's lock is
+// commit (a policymodel step, its edits one commit each; a node's
+// endpoint write, which names only it and its readers; a write a client,
+// the HA prober or an operator makes through its production entry point;
+// a script's next move, its setup played when it is drawn); the watcher
+// moving to its next point (load, after a session's shard, routed); a
+// session taking its wake and the latest snapshot; a session ending its
+// render, which may fail (a failure no snapshot explains, as Update's
+// error path ends it); a node's session admitted, its first map rendered
+// later; a session leaving or reconnecting; a node with a session opening
+// another, as a reconnect that overlaps its old stream does. Sessions end renders only where their shard's lock is
 // free; at the point a render's end decides, if its shard's lock were free
 // there (it is not), the watcher could finish a routing.
 //
@@ -402,7 +415,7 @@ func TestHubSessionsConvergeUnderDrawnSchedules(t *testing.T) {
 			envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", strconv.FormatBool(mode.audit))
 			t.Setenv(state.TestCapabilitySourcesEnv, strconv.FormatBool(mode.capSources))
 
-			reach := hubPropertyReach{events: map[string]int{}, known: map[string]int{}}
+			reach := hubPropertyReach{events: map[string]int{}, known: map[string]int{}, wakes: newWakeTally()}
 
 			var audits *auditLines
 			if mode.audit {
@@ -416,7 +429,7 @@ func TestHubSessionsConvergeUnderDrawnSchedules(t *testing.T) {
 			if !testing.Short() && !mode.audit {
 				for name, n := range map[string]int{
 					"coalesced": reach.coalesced, "render-log wakes": reach.logWoke + reach.endWoke, "endedPast": reach.endedPast,
-					"endedMidRouting": reach.endedMidRouting, "retried": reach.retried,
+					"endedMidRouting": reach.endedMidRouting, "retried": reach.retried, "second sessions": reach.events["second session"],
 				} {
 					if n == 0 {
 						t.Errorf("no schedule reached %s", name)
@@ -434,7 +447,7 @@ func runHubMachine(t *rapid.T, reach *hubPropertyReach, audits *auditLines) {
 	world := policymodel.Worlds().Draw(t, "world")
 	mixed := pbtChance(t, 4, "mixed-versions")
 
-	m := &hubMachine{t: t, mixed: mixed, reach: reach, audit: audits != nil, audited: RouteAuditFailures(), audits: audits}
+	m := &hubMachine{t: t, mixed: mixed, reach: reach, audit: audits != nil, audited: RouteAuditFailures(), audits: audits, dropped: droppedWakes{}}
 	m.p = newDrawnWorld(t, world)
 	m.saw()
 	m.h = NewHub()
@@ -485,6 +498,10 @@ func runHubMachine(t *rapid.T, reach *hubPropertyReach, audits *auditLines) {
 	})
 
 	m.settle()
+
+	for k, n := range m.p.made {
+		m.reach.events["write "+k] += n
+	}
 
 	if slices.ContainsFunc(m.sess, func(s *hubSess) bool { return !s.ok }) {
 		// A failure no snapshot explains is retried at the next routing,
@@ -628,14 +645,53 @@ func (m *hubMachine) commit(t *rapid.T) {
 	step := !pbtChance(t, 3, "endpoint")
 	flash := pbtChance(t, 2, "flash")
 	transient := pbtChance(t, 3, "transient")
+	scripted := pbtChance(t, 2, "script-act")
+	session := pbtChance(t, 4, "session-write")
 	nodes := m.p.s.Snapshot().ListNodes()
 	before := m.p.s.Snapshot().Rev()
 
 	switch {
+	case scripted && len(m.script) > 0:
+		// A script's next act, so its steps can fall between routings or
+		// inside one, and its viewer read before or after; one the writes
+		// since made a refused write ends the script.
+		a := m.script[0]
+		m.script = m.script[1:]
+
+		if !a.accepted(m.p.w) {
+			t.Logf("script %s ends: its next write is refused now", m.scriptName)
+			m.script = nil
+
+			return
+		}
+
+		m.kind = "script " + m.scriptName
+		t.Logf("commit r%d→r%d: %s: %s", before, m.p.s.Snapshot().Rev(), m.scriptName, a.play(m.p))
+		m.undo = nil
+	case scripted && pbtChance(t, 4, "script"):
+		// The script's setup at once, its moves an event each.
+		m.scriptName, m.script = drawScript(t, m.p.w)
+		m.kind = "script " + m.scriptName
+		m.reach.events["script "+m.scriptName]++
+		t.Logf("script %s, %d acts", m.scriptName, len(m.script))
+
+		for len(m.script) > 0 && !m.script[0].key {
+			t.Logf("commit r%d: %s: %s", m.p.s.Snapshot().Rev(), m.scriptName, m.script[0].play(m.p))
+			m.script = m.script[1:]
+		}
+
+		m.undo = nil
+	case session:
+		sw := sessionWrites.Draw(t, "session")
+		m.kind = "session " + sw.Kind.String()
+		t.Logf("commit r%d→r%d: %s", before, m.p.s.Snapshot().Rev(), m.p.session(sw))
+		m.undo = nil
 	case undo && m.undo != nil:
+		m.kind = "undo"
 		m.undo()
 		m.undo = nil
 	case transient && nodes.Len() > 0 && len(m.p.w.Topology.Users) > 0:
+		m.kind = "transient"
 		n := transientNode(m.p.w, nodes.At(rapid.IntRange(0, nodes.Len()-1).Draw(t, "like")).ID())
 		m.p.edit(policymodel.Join{Node: n})
 		t.Logf("commit r%d→r%d: join %s", before, m.p.s.Snapshot().Rev(), n)
@@ -649,6 +705,7 @@ func (m *hubMachine) commit(t *rapid.T) {
 	case step || nodes.Len() == 0:
 		from := m.p.w
 		st := policymodel.Step(stepsOf(from).Draw(t, "step"))
+		m.kind = "step"
 
 		for _, e := range st.Edits {
 			m.p.edit(e)
@@ -674,6 +731,7 @@ func (m *hubMachine) commit(t *rapid.T) {
 		id := nodes.At(rapid.IntRange(0, nodes.Len()-1).Draw(t, "node")).ID()
 		nv, _ := m.p.s.Snapshot().GetNode(id)
 		was := nv.Endpoints().AsSlice()
+		m.kind = "endpoint"
 
 		m.touchNode(id)
 
@@ -908,6 +966,12 @@ func (m *hubMachine) finish(s *hubSess, ok bool) {
 		m.reach.retried++
 	}
 
+	if !s.first && s.ok && len(resps) > 0 {
+		c := at.Since(s.last)
+		all, _ := Route(s.last, at, c)
+		m.reach.wakes.add(m.dropped, s.last, at, all, c, s.id, s.last.Rev()+1 < at.Rev(), false, m.kind)
+	}
+
 	s.first, s.last, s.ok = false, at, true
 	t.Logf("%s renders r%d: %s", s, at.Rev(), describeResponses(resps))
 
@@ -937,6 +1001,16 @@ func (m *hubMachine) session(t *rapid.T) {
 		}
 	}
 
+	// A node with a live session can open another, as a reconnect that
+	// overlaps its old stream does; past the hub's bound, the oldest ends.
+	var second []types.NodeID
+
+	for _, n := range m.p.s.Snapshot().ListNodes().All() {
+		if c := countSessions(m.sess, n.ID()); c > 0 && c <= maxConcurrentMapSessionsPerNode {
+			second = append(second, n.ID())
+		}
+	}
+
 	kinds := []string{}
 	if len(free) > 0 {
 		kinds = append(kinds, "admit")
@@ -944,6 +1018,10 @@ func (m *hubMachine) session(t *rapid.T) {
 
 	if len(idle) > 0 {
 		kinds = append(kinds, "reconnect", "leave")
+	}
+
+	if len(second) > 0 {
+		kinds = append(kinds, "second")
 	}
 
 	if len(kinds) == 0 {
@@ -962,7 +1040,26 @@ func (m *hubMachine) session(t *rapid.T) {
 		s := idle[rapid.IntRange(0, len(idle)-1).Draw(t, "session")]
 		t.Logf("%s leaves", s)
 		m.drop(s)
+	case "second":
+		id := second[rapid.IntRange(0, len(second)-1).Draw(t, "node")]
+		t.Logf("n%d opens a second session", id)
+		m.admit(id)
+
+		m.reach.events["second session"]++
 	}
+}
+
+// countSessions counts the sessions of id in sess the hub has not ended.
+func countSessions(sess []*hubSess, id types.NodeID) int {
+	n := 0
+
+	for _, s := range sess {
+		if s.id == id && !s.ended.Load() {
+			n++
+		}
+	}
+
+	return n
 }
 
 // check holds, whenever no routing is part way, every session that is
@@ -1489,6 +1586,10 @@ func (h *stressRun) write(undo func()) func() {
 		if inv, ok := policymodel.Undo(from, st); ok {
 			next = func() { p.write(p.w.Apply(inv.Edits...)) }
 		}
+	case r.IntN(4) == 0:
+		// A client, the HA prober or an operator writes through its
+		// production entry point, racing the renders.
+		p.session(sessionWrite{Kind: sessionKind(r.IntN(int(numSessionKinds))), Who: r.IntN(16), Value: r.IntN(3)}) //nolint:gosec // small
 	default:
 		nv := nodes.At(r.IntN(nodes.Len()))
 		n := nv.AsStruct()

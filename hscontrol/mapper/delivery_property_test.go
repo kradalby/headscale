@@ -508,10 +508,11 @@ func chunkedFor(on bool, c policymodel.Client) bool {
 // stepPlan is what happens to sessions at the end of a step, drawn once
 // and played in every world: which lag (leave their wake for a later
 // step), whose write fails (and after how many responses), which come
-// back only at the next step, which reconnect cleanly.
+// back only at the next step, which reconnect cleanly, which reconnect
+// before their old session ends (it lives on through the next step).
 type stepPlan struct {
-	lag, fail, later, reconnect []int
-	failAt                      int
+	lag, fail, later, reconnect, overlap []int
+	failAt                               int
 }
 
 var stepPlans = rapid.Custom(func(t *rapid.T) stepPlan {
@@ -519,7 +520,7 @@ var stepPlans = rapid.Custom(func(t *rapid.T) stepPlan {
 
 	return stepPlan{
 		lag: pick("lag"), fail: pick("fail"), later: pick("later"), reconnect: pick("reconnect"),
-		failAt: rapid.IntRange(0, 2).Draw(t, "fail-at"),
+		failAt: rapid.IntRange(0, 2).Draw(t, "fail-at"), overlap: pick("overlap"),
 	}
 })
 
@@ -572,14 +573,26 @@ func (cr *chunkRegistry) see(name string, rules []tailcfg.FilterRule) string {
 type deliveryReach struct {
 	compared, lagged, failed, reconnected, flips, clears, added, deleted, wholeSent int
 	churnJudged, crossFamily, combosCompared, keptCleared                           int
+	overlapped, indexed                                                             int
+	// laggedFlips counts lagged renders across a delivery flip, and
+	// laggedForms across a flip of the form the node is served.
+	laggedFlips, laggedForms int
+	// writes counts the writes made through production entry points, and
+	// scripts the scripts played, by kind, in one world of each case.
+	writes, scripts map[string]int
+	// wakes counts what woke each render that sent something.
+	wakes *wakeTally
 }
 
 func (r deliveryReach) String() string {
 	return fmt.Sprintf("sessions held to a fresh one %d, lagged renders %d, failed writes %d, reconnects %d, delivery flips %d, "+
 		"clears %d, chunks added %d and deleted %d, whole filters sent %d, membership-churn receivers judged %d, "+
-		"nodes held across the four combinations %d (cross-family ICMP refused %d), kept chunks cleared %d",
+		"nodes held across the four combinations %d (cross-family ICMP refused %d), kept chunks cleared %d, overlapping reconnects %d, "+
+		"address indexes held %d, lagged renders across a delivery flip %d and across a form flip %d; writes through production entry points %v, "+
+		"scripts %v; renders that sent something: %s",
 		r.compared, r.lagged, r.failed, r.reconnected, r.flips, r.clears, r.added, r.deleted, r.wholeSent,
-		r.churnJudged, r.combosCompared, r.crossFamily, r.keptCleared)
+		r.churnJudged, r.combosCompared, r.crossFamily, r.keptCleared, r.overlapped, r.indexed, r.laggedFlips, r.laggedForms,
+		r.writes, r.scripts, r.wakes)
 }
 
 // deliveryJudge is one part of what [TestDeliveryConvergesThroughTheClient]
@@ -606,10 +619,14 @@ const (
 	// judgeReference: what a client holds is what the reference gives its
 	// node (see [deliveryRun.holdToReference]).
 	judgeReference
+	// judgeIndex: the client's index of nodes by address, kept across
+	// responses as tailscaled keeps it, indexes every address its netmap
+	// holds (see [addrIndex]).
+	judgeIndex
 	numJudges
 )
 
-var judgeNames = [numJudges]string{"client", "model", "wire", "churn", "kept", "combos", "reference"}
+var judgeNames = [numJudges]string{"client", "model", "wire", "churn", "kept", "combos", "reference", "index"}
 
 func (j deliveryJudge) String() string { return judgeNames[j] }
 
@@ -653,9 +670,15 @@ type deliverySess struct {
 	// rev that render's revision.
 	chunked bool
 	rev     uint64
-	ended   atomic.Bool
+	// last is the snapshot it last rendered.
+	last  *state.Snapshot
+	ended atomic.Bool
 	// skipped is set while it leaves a wake for a later step.
 	skipped bool
+	// index is the client's index of nodes by address; superseded the
+	// step a newer session of the node opened beside it.
+	index      addrIndex
+	superseded int
 	// judged is the netmap last held to a fresh first map, and that map.
 	judged struct {
 		nm   *netmap.NetworkMap
@@ -674,6 +697,10 @@ type deliveryWorld struct {
 	coalesce bool
 	mixed    bool
 	sess     map[types.NodeID]*deliverySess
+	// old holds the sessions a reconnect overlapped, which still render
+	// for a step; steps counts the steps played.
+	old   map[types.NodeID]*deliverySess
+	steps int
 	// down holds the nodes whose session a failed write ended, until they
 	// reconnect.
 	down map[types.NodeID]bool
@@ -689,12 +716,17 @@ type deliveryWorld struct {
 	// shared is whether any commit had two nodes share an address: a
 	// write of several nodes commits them one at a time.
 	shared bool
+	// kind names the step being delivered, for what woke its renders.
+	kind string
+	// dropped is Route's answers with each part taken out, by pair.
+	dropped droppedWakes
 }
 
 func newDeliveryWorld(t *rapid.T, r *deliveryRun, c deliveryCombo, w policymodel.World, coalesce, mixed bool, names *chunkRegistry) *deliveryWorld {
 	dw := &deliveryWorld{
 		t: t, combo: c, coalesce: coalesce, mixed: mixed, names: names, probes: r.probes, judges: &r.judges, reach: &r.reach,
-		sess: map[types.NodeID]*deliverySess{}, down: map[types.NodeID]bool{}, kept: map[types.NodeID]policyv2.FilterChunks{},
+		dropped: droppedWakes{},
+		sess:    map[types.NodeID]*deliverySess{}, old: map[types.NodeID]*deliverySess{}, down: map[types.NodeID]bool{}, kept: map[types.NodeID]policyv2.FilterChunks{},
 	}
 
 	dw.p = newPBTWorld(t, w, func(cfg *types.Config) {
@@ -771,7 +803,7 @@ func (dw *deliveryWorld) admit(id types.NodeID) {
 	dw.checkWire(s, resps, true)
 	dw.write(s, resps)
 	s.st.Delivered()
-	s.rev = snap.Rev()
+	s.rev, s.last = snap.Rev(), snap
 
 	if k := dw.kept[id]; !k.Equal(s.held) {
 		dw.failf(judgeKept, "n%d reconnected: a client keeping chunks across sessions holds %v, a new session %v", id, k.Names(), s.held.Names())
@@ -888,7 +920,9 @@ func (dw *deliveryWorld) write(s *deliverySess, resps []*tailcfg.MapResponse) {
 	for i, r := range resps {
 		dw.kept[s.id] = dw.kept[s.id].ApplyResponse(r)
 		s.held = s.held.ApplyResponse(r)
+		before := s.client.nm
 		nm := s.client.apply(dw.t, r)
+		s.index = s.index.apply(before, nm, r)
 
 		if have, model := ruleList(nm.PacketFilterRules.AsSlice()), ruleList(s.held.Rules()); have != model {
 			dw.failf(judgeModel, "n%d response %d: the client assembled %s, the model of it %s", s.id, i, have, model)
@@ -973,6 +1007,14 @@ func (dw *deliveryWorld) render(s *deliverySess, fail bool, failAt int) {
 	if s.skipped {
 		dw.reach.lagged++
 		s.skipped = false
+
+		if chunkedFor(dw.combo.chunks, dw.client(s.id)) != s.chunked {
+			dw.reach.laggedFlips++
+		}
+
+		if s.last != nil && capabilityForm(s.last.ReceiverFacts(s.id)) != capabilityForm(snap.ReceiverFacts(s.id)) {
+			dw.reach.laggedForms++
+		}
 	}
 
 	dw.checkWire(s, resps, false)
@@ -990,20 +1032,41 @@ func (dw *deliveryWorld) render(s *deliverySess, fail bool, failAt int) {
 
 	dw.write(s, resps)
 	s.st.Delivered()
-	s.rev = snap.Rev()
+	dw.wokeFor(s, snap, resps)
+	s.rev, s.last = snap.Rev(), snap
 	dw.logf("n%d renders r%d: %s", s.id, snap.Rev(), describeResponses(resps))
+}
+
+// wokeFor counts what woke s for a render of snap that sent resps.
+func (dw *deliveryWorld) wokeFor(s *deliverySess, snap *state.Snapshot, resps []*tailcfg.MapResponse) {
+	if len(resps) == 0 || s.last == nil {
+		return
+	}
+
+	c := snap.Since(s.last)
+	all, _ := Route(s.last, snap, c)
+	dw.reach.wakes.add(dw.dropped, s.last, snap, all, c, s.id, s.last.Rev()+1 < snap.Rev(), false, dw.kind)
 }
 
 func (dw *deliveryWorld) drop(s *deliverySess) {
 	dw.h.Leave(s.sess)
 	s.client.close()
-	delete(dw.sess, s.id)
+
+	if dw.sess[s.id] == s {
+		delete(dw.sess, s.id)
+	}
+
+	if dw.old[s.id] == s {
+		delete(dw.old, s.id)
+	}
 }
 
 // step commits st's edits, a commit each, and maybe a node's endpoint,
 // set or cleared; the watcher routes after each commit, or once at the
 // end when commits coalesce.
-func (dw *deliveryWorld) step(st policymodel.Step, touch, clearEndpoint bool, who, i int) {
+func (dw *deliveryWorld) step(st policymodel.Step, touch, clearEndpoint bool, who, i int, writes ...func(*pbtWorld) string) {
+	dw.steps++
+
 	for _, e := range st.Edits {
 		dw.p.edit(e)
 	}
@@ -1037,12 +1100,20 @@ func (dw *deliveryWorld) step(st policymodel.Step, touch, clearEndpoint bool, wh
 		dw.p.call(func() { dw.p.s.PutNodeInStoreForTest(*n) })
 	}
 
+	for _, w := range writes {
+		if did := w(dw.p); did != "" {
+			dw.logf("%s", did)
+		}
+	}
+
 	dw.w.settle()
 
-	for _, id := range slices.Sorted(maps.Keys(dw.sess)) {
-		if s := dw.sess[id]; s.ended.Load() {
-			dw.logf("n%d's session ended by the hub", id)
-			dw.drop(s)
+	for _, set := range []map[types.NodeID]*deliverySess{dw.sess, dw.old} {
+		for _, id := range slices.Sorted(maps.Keys(set)) {
+			if s := set[id]; s.ended.Load() {
+				dw.logf("n%d's session ended by the hub", id)
+				dw.drop(s)
+			}
 		}
 	}
 
@@ -1057,11 +1128,28 @@ func (dw *deliveryWorld) step(st policymodel.Step, touch, clearEndpoint bool, wh
 // says, until nothing is pending but the lagging sessions' wakes; and
 // opens sessions for nodes that have none, but those down until later.
 func (dw *deliveryWorld) deliver(plan stepPlan, ids []types.NodeID) {
+	// A session a reconnect overlapped two steps back ends now: it was
+	// woken and judged beside the newer one for a whole step.
+	for _, id := range slices.Sorted(maps.Keys(dw.old)) {
+		if s := dw.old[id]; s.superseded < dw.steps-1 {
+			dw.logf("n%d's overlapped session ends", id)
+			dw.drop(s)
+		}
+	}
+
 	for _, id := range ids {
 		if s := dw.sess[id]; s != nil && plan.names(plan.reconnect, ids, id) {
 			dw.logf("n%d reconnects", id)
 			dw.drop(s)
 			dw.reach.reconnected++
+		}
+
+		if s := dw.sess[id]; s != nil && dw.old[id] == nil && plan.names(plan.overlap, ids, id) {
+			dw.logf("n%d reconnects before its session ends", id)
+			s.superseded = dw.steps
+			dw.old[id] = s
+			delete(dw.sess, id)
+			dw.reach.overlapped++
 		}
 
 		if dw.down[id] && !plan.names(plan.later, ids, id) {
@@ -1077,6 +1165,12 @@ func (dw *deliveryWorld) deliver(plan stepPlan, ids []types.NodeID) {
 
 		for _, id := range ids {
 			s := dw.sess[id]
+
+			if o := dw.old[id]; o != nil && len(o.sess.wakes) > 0 {
+				dw.render(o, false, 0)
+
+				progress = true
+			}
 
 			switch {
 			case s == nil && !dw.down[id]:
@@ -1107,20 +1201,42 @@ func (dw *deliveryWorld) deliver(plan stepPlan, ids []types.NodeID) {
 // latest snapshot, through the client: what its client assembled equals
 // what a fresh session's client does, the chunks it holds are those a
 // fresh session names, and the filter it assembled answers as the filter
-// served, in one list.
+// served, in one list. A session a reconnect overlapped is held alike; the
+// newest session of each node is what it returns. In capability mode, the
+// client's index of nodes by address must hold every address its netmap
+// does.
 func (dw *deliveryWorld) fresh(at string) map[types.NodeID]*netmap.NetworkMap {
 	snap := dw.p.s.Snapshot().Uncached()
 	out := map[types.NodeID]*netmap.NetworkMap{}
 
-	for _, id := range slices.Sorted(maps.Keys(dw.sess)) {
-		s := dw.sess[id]
+	var all []*deliverySess
+
+	for _, set := range []map[types.NodeID]*deliverySess{dw.sess, dw.old} {
+		for _, id := range slices.Sorted(maps.Keys(set)) {
+			all = append(all, set[id])
+		}
+	}
+
+	for _, s := range all {
+		id := s.id
 		if len(s.sess.wakes) > 0 {
 			continue
 		}
 
 		fresh := newFreshSession(dw.t, dw.p.cfg, snap, id, s.capVer)
 		have := s.client.nm
-		out[id] = have
+
+		if dw.sess[id] == s {
+			out[id] = have
+		}
+
+		if dw.combo.capSources {
+			dw.reach.indexed++
+
+			if a, holder, ok := s.index.forgotten(have); ok {
+				dw.failf(judgeIndex, "%s: n%d's client, last rendered r%d, indexes nobody at %s, which n%d holds", at, id, s.rev, a, holder)
+			}
+		}
 
 		// The client is a function of what it read: the same netmap held
 		// against the same first map was judged already.
@@ -1258,6 +1374,10 @@ type referenceTally struct {
 	steered, unjudgedRoutes, primaries          int
 	contestedPeers, contestedRoutes             map[policymodel.Contested]int
 	skipped                                     map[string]int
+
+	// byHistory counts the routes only the election history decides:
+	// unjudged without it, judged with it.
+	byHistory int
 }
 
 func (rt *referenceTally) skip(why string) {
@@ -1269,9 +1389,9 @@ func (rt *referenceTally) skip(why string) {
 }
 
 func (rt *referenceTally) String() string {
-	return fmt.Sprintf("reference: clients judged %d, filters compared %d, peer sets %d, route pairs %d (steered pairs judged %d, routes left unjudged %d), "+
-		"self primaries %d, SSH policies %d; skipped %v; peers contested %v, routes contested %v; filters: %v",
-		rt.clients, rt.filters, rt.peerSets, rt.routePairs, rt.steered, rt.unjudgedRoutes, rt.primaries, rt.ssh, rt.skipped,
+	return fmt.Sprintf("reference: clients judged %d, filters compared %d, peer sets %d, route pairs %d (steered pairs judged %d, routes left unjudged %d, "+
+		"decided by the election history %d), self primaries %d, SSH policies %d; skipped %v; peers contested %v, routes contested %v; filters: %v",
+		rt.clients, rt.filters, rt.peerSets, rt.routePairs, rt.steered, rt.unjudgedRoutes, rt.byHistory, rt.primaries, rt.ssh, rt.skipped,
 		rt.contestedPeers, rt.contestedRoutes, &rt.verdicts)
 }
 
@@ -1281,7 +1401,7 @@ func (rt *referenceTally) require(t *testing.T) {
 
 	for name, n := range map[string]int{
 		"filters": rt.filters, "peer sets": rt.peerSets, "route pairs": rt.routePairs, "steered route pairs": rt.steered,
-		"self primaries": rt.primaries, "SSH policies": rt.ssh,
+		"self primaries": rt.primaries, "SSH policies": rt.ssh, "routes the election history decides": rt.byHistory,
 	} {
 		if n == 0 {
 			t.Errorf("reference: no case held %s to the reference", name)
@@ -1307,8 +1427,11 @@ func (r *deliveryRun) holdToReference(t *rapid.T, at string, worlds []*deliveryW
 		return
 	}
 
+	// Elections read the history the State was driven through: when each
+	// node connected, the prober's marks, who held each route last.
 	w := worlds[0].p.w
-	ref := policymodel.RefOf(w)
+	plain := policymodel.RefOf(w)
+	ref := plain.WithElections(worlds[0].p.elections)
 
 	if why := ref.OutOfDomain(); why != "" {
 		r.ref.skip(why)
@@ -1353,28 +1476,30 @@ func (r *deliveryRun) holdToReference(t *rapid.T, at string, worlds []*deliveryW
 	for i, dw := range worlds {
 		for _, id := range slices.Sorted(maps.Keys(held[i])) {
 			r.ref.clients++
-			dw.holdClient(t, at, ref, world, key, id, held[i][id], fresh, &r.ref)
+			dw.holdClient(t, at, ref, plain, world, key, id, held[i][id], fresh, &r.ref)
 		}
 	}
 }
 
 // heldClient is one client held to the reference: node id's, holding nm.
 type heldClient struct {
-	dw   *deliveryWorld
-	at   string
-	ref  *policymodel.Ref
-	id   types.NodeID
-	nm   *netmap.NetworkMap
-	rt   *referenceTally
-	fail func(format string, args ...any)
+	dw  *deliveryWorld
+	at  string
+	ref *policymodel.Ref
+	// plain is ref without the election history.
+	plain *policymodel.Ref
+	id    types.NodeID
+	nm    *netmap.NetworkMap
+	rt    *referenceTally
+	fail  func(format string, args ...any)
 }
 
 // holdClient holds node id's client, holding nm, to ref; see
 // [deliveryRun.holdToReference].
-func (dw *deliveryWorld) holdClient(t *rapid.T, at string, ref *policymodel.Ref, world, key string, id types.NodeID, nm *netmap.NetworkMap,
+func (dw *deliveryWorld) holdClient(t *rapid.T, at string, ref, plain *policymodel.Ref, world, key string, id types.NodeID, nm *netmap.NetworkMap,
 	fresh *policyv2.PolicyManager, rt *referenceTally,
 ) {
-	c := heldClient{dw: dw, at: at, ref: ref, id: id, nm: nm, rt: rt}
+	c := heldClient{dw: dw, at: at, ref: ref, plain: plain, id: id, nm: nm, rt: rt}
 	c.fail = func(format string, args ...any) {
 		dw.failf(judgeReference, "%s: n%d: "+format, append([]any{at, id}, args...)...)
 	}
@@ -1439,6 +1564,10 @@ func (c heldClient) routes() {
 		want, unjudged := c.ref.ServedRoutes(c.id, pid)
 		judged := policymodel.Judged(routes, unjudged)
 		c.rt.unjudgedRoutes += len(unjudged)
+
+		if _, without := c.plain.ServedRoutes(c.id, pid); len(without) > len(unjudged) {
+			c.rt.byHistory += len(without) - len(unjudged)
+		}
 
 		if c.ref.Steered(c.id, pid) && len(judged)+len(want) > 0 {
 			c.rt.steered++
@@ -1578,7 +1707,9 @@ func refView(n policymodel.Node, w policymodel.World, nm *netmap.NetworkMap) pol
 }
 
 // enforced is what of a netmap no delivery option may move: the node and
-// its peers without the stamps capability mode adds, SSH and DNS.
+// its peers without the stamps capability mode adds, SSH and DNS. When a
+// node last disconnected is each world's own clock's, so LastSeen is left
+// out.
 func enforced(nm *netmap.NetworkMap) string {
 	strip := func(n tailcfg.NodeView) string {
 		if !n.Valid() {
@@ -1586,6 +1717,7 @@ func enforced(nm *netmap.NetworkMap) string {
 		}
 
 		c := n.AsStruct()
+		c.LastSeen = nil
 		maps.DeleteFunc(c.CapMap, func(k nodecap.Cap, _ []tailcfg.RawMessage) bool {
 			return strings.HasPrefix(string(k), policymodel.StampPrefix)
 		})
@@ -1665,78 +1797,12 @@ func churnNode(t *rapid.T, w policymodel.World, k int) (policymodel.Node, bool) 
 // drawn scenario reaches.
 const churnIDs = 1000
 
-// routeViewScript is steps from w that move a viewer's side set and
-// nothing else the renderer keys its routed peers by: a router of tag:a
-// serving 10.0.0.0/24 that every member sees, a node of a user one token
-// names alone, and group:a, which alone reaches the route, taking that
-// token in and letting it go again. No drawn step lines these up. Nothing
-// when no policy write would be accepted.
-func routeViewScript(w policymodel.World) []policymodel.Step {
-	v := policymodel.NewView(w)
-
-	// A user added since the document was written can make a token it
-	// holds name two users: a policy write is refused then.
-	if len(v.AmbiguousRefs()) > 0 {
-		return nil
-	}
-
-	ref := -1
-
-	for i := range policymodel.UserRefs {
-		if users := v.RefUsers(i); len(users) == 1 && !v.Ambiguous(i) {
-			ref = i
-
-			break
-		}
-	}
-
-	if ref < 0 {
-		return nil
-	}
-
-	owner := v.RefUsers(ref)[0]
-
-	router := transientNode(w, 0)
-	router.User, router.Tags, router.Announced = 0, []int{0}, []int{0}
-
-	member := policymodel.Rule{Src: []policymodel.Sel{{Kind: policymodel.SelMember}}, Dst: []policymodel.Dest{{Sel: policymodel.Sel{Kind: policymodel.SelTag}}}}
-	routed := policymodel.Rule{Src: []policymodel.Sel{{Kind: policymodel.SelGroup}}, Dst: []policymodel.Dest{{Sel: policymodel.Sel{Kind: policymodel.SelPrefix}}}}
-	n := len(w.Policy.ACLs)
-
-	steps := []policymodel.Step{
-		{Edits: []policymodel.Edit{policymodel.SetTagOwners{Tag: 0, Owners: w.Policy.TagOwners[0], Defined: true}}},
-		{Edits: []policymodel.Edit{
-			policymodel.AddRule{Ref: policymodel.RuleRef{I: n}, Rule: member},
-			policymodel.AddRule{Ref: policymodel.RuleRef{I: n + 1}, Rule: routed},
-		}},
-		{Edits: []policymodel.Edit{policymodel.Join{Node: router}}},
-	}
-
-	for _, st := range steps {
-		w = w.Apply(st.Edits...)
-	}
-
-	if r, _ := w.Topology.Node(router.ID); !slices.Contains(r.Approved, 0) {
-		steps = append(steps, policymodel.Step{Edits: []policymodel.Edit{policymodel.Approve{ID: router.ID, Routes: []int{0}}}})
-		w = w.Apply(steps[len(steps)-1].Edits...)
-	}
-
-	viewer := transientNode(w, 0)
-	viewer.User = owner
-	group := w.Policy.Groups[0]
-
-	return append(steps,
-		policymodel.Step{Edits: []policymodel.Edit{policymodel.Join{Node: viewer}}},
-		policymodel.Step{Edits: []policymodel.Edit{policymodel.SetGroup{Group: 0, Members: append(slices.DeleteFunc(slices.Clone(group), func(m int) bool { return m == ref }), ref)}}},
-		policymodel.Step{Edits: []policymodel.Edit{policymodel.SetGroup{Group: 0, Members: group}}},
-	)
-}
-
 // TestDeliveryConvergesThroughTheClient plays generated scenarios
 // (policymodel's: any policy, topology and steps; now and then an
-// endpoint set or cleared after a step, or a node joining and then
-// leaving; one case in eight ending with a viewer's group membership
-// moving the routes it reaches) against four States at once, one
+// endpoint set or cleared after a step, a write a client, the HA prober
+// or an operator makes through its production entry point, or a node
+// joining and then leaving; one case in two ending with a script moving
+// one part of what a viewer is sent alone) against four States at once, one
 // per combination of policy.capability_sources and policy.filter_chunks,
 // each with its hub routing in step, a session per node and, behind each
 // session, the Tailscale client's own map session reading every response
@@ -1744,7 +1810,8 @@ func routeViewScript(w policymodel.World) []policymodel.Step {
 // each step's end, drawn once for all four, sessions render what they were
 // woken for, some lag to a later step, some writes fail after some of
 // their responses (the session ends; it reconnects now or at the next
-// step), some sessions reconnect cleanly. It holds:
+// step), some sessions reconnect cleanly, some before their old session
+// ends, which lives on beside the new one for a step. It holds:
 //
 // Convergence, through the client: after every step, every session with
 // no wake pending holds, as its client assembled it, what a fresh
@@ -1790,7 +1857,10 @@ func TestDeliveryConvergesThroughTheClient(t *testing.T) {
 	t.Setenv(state.TestCapabilitySourcesEnv, "false")
 	t.Setenv(state.TestFilterChunksEnv, "false")
 
-	r := &deliveryRun{probes: probeCache{}, judges: deliveryJudges(t), steps: 5}
+	r := &deliveryRun{
+		probes: probeCache{}, judges: deliveryJudges(t), steps: 5,
+		reach: deliveryReach{wakes: newWakeTally(), writes: map[string]int{}, scripts: map[string]int{}},
+	}
 
 	// Scenarios lengthen with -rapid.steps (RAPID_STEPS), five steps at
 	// its default. Under the race detector one step each: it sees the
@@ -1826,6 +1896,7 @@ func TestDeliveryConvergesThroughTheClient(t *testing.T) {
 	floors := map[string]int{
 		"lagged renders": reach.lagged, "failed writes": reach.failed, "reconnects": reach.reconnected,
 		"delivery flips": reach.flips, "chunks deleted": reach.deleted,
+		"overlapping reconnects": reach.overlapped, "address indexes held": reach.indexed,
 	}
 
 	// A run of the default length now and then judges no membership churn;
@@ -1898,12 +1969,20 @@ func playDelivery(t *rapid.T, r *deliveryRun) {
 	judge("start")
 
 	n := 0
-	play := func(st policymodel.Step) {
+	play := func(kind string, st policymodel.Step, writes ...func(*pbtWorld) string) {
 		n++
 		plan := stepPlans.Draw(t, "plan")
 		touch := pbtChance(t, 3, "endpoint")
 		clearEndpoint := pbtChance(t, 4, "clear-endpoint")
 		who := rapid.IntRange(0, 15).Draw(t, "who")
+
+		// Now and then a client, the HA prober or an operator writes too,
+		// through its production entry point.
+		if pbtChance(t, 3, "session-write") {
+			sw := sessionWrites.Draw(t, "session")
+
+			writes = append(writes, func(p *pbtWorld) string { return p.session(sw) })
+		}
 
 		before := worlds[0].p.w
 		subjects, churn := membershipChurn(before, st)
@@ -1919,7 +1998,8 @@ func playDelivery(t *rapid.T, r *deliveryRun) {
 				current[j][id] = len(s.sess.wakes) == 0
 			}
 
-			dw.step(st, touch, clearEndpoint, who, n)
+			dw.kind = kind
+			dw.step(st, touch, clearEndpoint, who, n, writes...)
 		}
 
 		t.Logf("step %d: %s", n, policymodel.Step{Edits: st.Edits})
@@ -1938,7 +2018,7 @@ func playDelivery(t *rapid.T, r *deliveryRun) {
 	churned := 0
 
 	for _, st := range s.Steps {
-		play(st)
+		play("step", st)
 
 		// Now and then a node joins and then leaves, each alone: membership
 		// moving and nothing else, which few drawn steps are.
@@ -1946,17 +2026,42 @@ func playDelivery(t *rapid.T, r *deliveryRun) {
 			if n, ok := churnNode(t, worlds[0].p.w, churned); ok {
 				churned++
 
-				play(policymodel.Step{Edits: []policymodel.Edit{policymodel.Join{Node: n}}})
-				play(policymodel.Step{Edits: []policymodel.Edit{policymodel.Leave{ID: n.ID}}})
+				play("churn", policymodel.Step{Edits: []policymodel.Edit{policymodel.Join{Node: n}}})
+				play("churn", policymodel.Step{Edits: []policymodel.Edit{policymodel.Leave{ID: n.ID}}})
 			}
 		}
 	}
 
-	// One in eight ends with a viewer's group membership moving the routes
-	// it reaches, and nothing else its routed peers are keyed by.
-	if pbtChance(t, 8, "route-view") {
-		for _, st := range routeViewScript(worlds[0].p.w) {
-			play(st)
+	// One case in two ends with a script moving one part of what a viewer
+	// is sent alone ([drawScript]).
+	defer func() {
+		for k, n := range worlds[0].p.made {
+			r.reach.writes[k] += n
+		}
+	}()
+
+	if pbtChance(t, 2, "script") {
+		name, acts := drawScript(t, worlds[0].p.w)
+		r.reach.scripts[name]++
+
+		// Its setup is one step, each of its moves a step of its own.
+		var setup policymodel.Step
+
+		for len(acts) > 0 && !acts[0].key {
+			setup.Edits = append(setup.Edits, acts[0].step.Edits...)
+			acts = acts[1:]
+		}
+
+		play("script "+name, setup)
+
+		for _, a := range acts {
+			if a.step != nil {
+				play("script "+name, *a.step)
+
+				continue
+			}
+
+			play("script "+name, policymodel.Step{}, func(p *pbtWorld) string { return p.sessionTo(a.node, a.kind, 0) })
 		}
 	}
 
@@ -2003,7 +2108,8 @@ func (dw *deliveryWorld) judgeChurn(start *state.Snapshot, current, subjects map
 		dw.checkWire(s, resps, false)
 		dw.write(s, resps)
 		s.st.Delivered()
-		s.rev = end.Rev()
+		dw.wokeFor(s, end, resps)
+		s.rev, s.last = end.Rev(), end
 		dw.logf("n%d renders r%d: %s", id, end.Rev(), describeResponses(resps))
 	}
 
