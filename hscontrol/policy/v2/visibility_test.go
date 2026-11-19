@@ -2,6 +2,7 @@ package v2
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
@@ -1513,11 +1514,13 @@ func describeNodes(nodes types.Nodes) string {
 // across a step that keeps the route rules, every viewer whose node, side
 // set and facts are the same is given the same routes by every router whose
 // node and routes' cover are the same, as routing assumes in waking none of
-// them. It returns how many pairs it held.
-func requireRouteRulesSame(t *testing.T, was, is Sides, wasList, isList types.Nodes, via *ViaPlan, where ...any) int {
+// them. Each state's rules carry its own via plan, as the route-rules cell
+// builds them: the plan is what follows a via grant's destinations. It
+// returns how many pairs it held.
+func requireRouteRulesSame(t *testing.T, was, is Sides, wasList, isList types.Nodes, wasVia, isVia *ViaPlan, where ...any) int {
 	t.Helper()
 
-	if !is.RouteRules(via).Same(was.RouteRules(via)) {
+	if !is.RouteRules(isVia).Same(was.RouteRules(wasVia)) {
 		return 0
 	}
 
@@ -1556,6 +1559,80 @@ func requireRouteRulesSame(t *testing.T, was, is Sides, wasList, isList types.No
 	}
 
 	return held
+}
+
+// TestRouteRulesCarryViaDestinations pins that route rules follow a via
+// grant's destinations through the via plan alone: a tag:a member joining
+// inside via router 1's route gives 1 router 2's routes, while no side set,
+// viewer fact, route cover or side rule moves.
+func TestRouteRulesCarryViaDestinations(t *testing.T) {
+	pol := []byte(`{"tagOwners": {"tag:a": [], "tag:r": []},
+	"grants": [{"src": ["tag:r"], "dst": ["tag:a"], "via": ["tag:r"], "ip": ["tcp:22"]}]}`)
+	tagA := []string{"tag:a"}
+
+	for _, tt := range []struct {
+		name   string
+		nodes  types.Nodes
+		join   *types.Node
+		routes []netip.Prefix
+	}{
+		{
+			// A public address in the router's route gives it the internet
+			// through the grant, so the exit node's routes; no via scope
+			// moves either.
+			name: "public-destination-reaches-internet",
+			nodes: types.Nodes{
+				// 10.0.0.0/7 holds private 10/8 and public 11/8.
+				sideNode(1, nil, "100.64.0.1", "", []string{"tag:r"}, "10.0.0.0/7"),
+				sideNode(2, &sideUsers[0], "100.64.0.2", "", nil, "0.0.0.0/0", "::/0"),
+				// Inside the route already, so the joiner brings it no atom;
+				// public by its IPv6, so tag:a's public selector stays.
+				sideNode(3, nil, "10.0.0.6", "2606:4700::1", tagA),
+			},
+			join:   sideNode(4, nil, "11.0.0.9", "", tagA),
+			routes: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
+		},
+		{
+			// Tailnet addresses only: the joiner's address becomes a
+			// destination inside router 2's route, whose cover already
+			// holds tag:a through node 5.
+			name: "tailnet-destination-inside-served-route",
+			nodes: types.Nodes{
+				sideNode(1, nil, "100.64.0.9", "", []string{"tag:r"}, "100.64.0.0/31", "100.64.0.4/31"),
+				sideNode(2, &sideUsers[0], "100.64.0.10", "", nil, "100.64.0.4/30"),
+				sideNode(3, nil, "100.64.0.1", "", tagA),
+				sideNode(5, nil, "100.64.0.6", "", tagA),
+			},
+			join:   sideNode(4, nil, "100.64.0.4", "", tagA),
+			routes: []netip.Prefix{netip.MustParsePrefix("100.64.0.4/30")},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			pm, err := NewPolicyManager(pol, sideUsers, tt.nodes.ViewSlice())
+			require.NoError(t, err)
+
+			m := newSideModel(t, pm, sideUsers, tt.nodes)
+			_, err = m.audit()
+			require.NoError(t, err)
+
+			next := append(slices.Clone(tt.nodes), tt.join)
+			slices.SortFunc(next, func(a, b *types.Node) int { return cmp.Compare(a.ID, b.ID) })
+
+			was, wasList, wasVia := m.sides, m.list, m.via.Plan
+			m.step(t, NewUserSets(nil, m.t.sel, sideUsers), next)
+			_, err = m.audit()
+			require.NoError(t, err)
+
+			require.Empty(t, was.RouteAccess(1, tt.routes))
+			require.Equal(t, tt.routes, m.sides.RouteAccess(1, tt.routes), "the compile's meaning, as the audit holds")
+			require.NotContains(t, m.sides.ViewersMovedSince(was), types.NodeID(1))
+			require.NotContains(t, m.sides.RoutersMovedSince(was.RouteCover()), types.NodeID(2))
+			require.True(t, m.sides.RouteRules(nil).Same(was.RouteRules(nil)), "test sanity: only the via plan moved")
+			require.False(t, m.sides.RouteRules(m.via.Plan).Same(was.RouteRules(wasVia)))
+
+			requireRouteRulesSame(t, was, m.sides, wasList, m.list, wasVia, m.via.Plan)
+		})
+	}
 }
 
 // TestSidesRandomDifferential draws compilable policies and topologies at
@@ -1636,9 +1713,9 @@ func TestSidesRandomDifferential(t *testing.T) {
 
 				for step := range 4 {
 					if step > 0 {
-						was, wasList := m.sides, m.list
+						was, wasList, wasVia := m.sides, m.list, m.via.Plan
 						m.step(t, us, g.step(m.list))
-						keptPairs += requireRouteRulesSame(t, was, m.sides, wasList, m.list, m.via.Plan,
+						keptPairs += requireRouteRulesSame(t, was, m.sides, wasList, m.list, wasVia, m.via.Plan,
 							"seed", seed, "public", public, "round", round, "step", step)
 					}
 
