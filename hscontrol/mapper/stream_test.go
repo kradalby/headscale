@@ -2701,12 +2701,28 @@ func servesExit(sessions map[types.NodeID]*oracleSession) bool {
 	return false
 }
 
+// compiledPolicy returns snap's policy compile, whose address compile the
+// tests hold what is served to.
+func compiledPolicy(tb testing.TB, snap *state.Snapshot) *policyv2.PolicyManager {
+	tb.Helper()
+
+	pm, ok := snap.Policy().(*policyv2.PolicyManager)
+	require.True(tb, ok, "test sanity: a v2 policy")
+
+	return pm
+}
+
 // servesVia reports whether any node gets a route through a via grant.
 func servesVia(snap *state.Snapshot) bool {
+	pm, ok := snap.Policy().(*policyv2.PolicyManager)
+	if !ok {
+		return false
+	}
+
 	nodes := snap.ListNodes()
 	for _, viewer := range nodes.All() {
 		for _, peer := range nodes.All() {
-			if len(snap.Policy().ViaRoutesForPeer(viewer, peer).Include) > 0 {
+			if len(pm.ViaRoutesForPeer(viewer, peer).Include) > 0 {
 				return true
 			}
 		}
@@ -2946,7 +2962,7 @@ func scalingRouters(tb testing.TB, s *state.State) {
 
 	// And it is the via grant that serves it, not HA primaries under a
 	// plain grant.
-	via := snap.Policy().ViaRoutesForPeer(viewer, mustNode(tb, s, router.ID()))
+	via := compiledPolicy(tb, snap).ViaRoutesForPeer(viewer, mustNode(tb, s, router.ID()))
 	require.Contains(tb, via.Include, subnet, "the via grant steers the subnet")
 	require.NotContains(tb, via.UsePrimary, subnet, "a plain grant covers the subnet")
 }
@@ -4354,7 +4370,7 @@ func viaSourceCheck(
 
 			routerView, ok := live.GetNode(id)
 			if assert.True(t, ok) {
-				via := live.Policy().ViaRoutesForPeer(v, routerView)
+				via := compiledPolicy(t, live).ViaRoutesForPeer(v, routerView)
 				assert.Empty(t, via.Include, "a viewer outside the source steers no route to the router")
 				assert.Empty(t, via.Exclude, "a viewer outside the source steers nothing away from the router either")
 			}

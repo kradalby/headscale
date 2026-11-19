@@ -195,7 +195,25 @@ func (pol *Policy) compileGrants(
 	users types.Users,
 	nodes views.Slice[types.NodeView],
 ) []compiledGrant {
-	compiled, _ := pol.compileGrantsFrom(nil, nil, users, nodes)
+	if pol == nil || (pol.ACLs == nil && pol.Grants == nil) {
+		return nil
+	}
+
+	grants := pol.allGrants()
+	compiled := make([]compiledGrant, 0, len(grants))
+	srcs := sourceCache{}
+
+	for _, grant := range grants {
+		cg, err := pol.compileOneGrant(grant, users, nodes, srcs)
+		if err != nil {
+			log.Trace().Err(err).Msg("compiling grant")
+		}
+
+		if cg != nil {
+			cg.ruleKeys = ruleKeys(cg.rules)
+			compiled = append(compiled, *cg)
+		}
+	}
 
 	return compiled
 }
@@ -1122,69 +1140,15 @@ func (pol *Policy) compileNodeAttrsFrom(
 	return result, nil
 }
 
-type compiledGrantResult struct {
-	cg *compiledGrant
-}
-
-// compileGrantsFrom compiles every grant, reusing prev, the results of a
-// compile of the same policy and users, for each grant the change since
-// cannot reach. prev and change are nil for a compile from scratch.
-func (pol *Policy) compileGrantsFrom(
-	prev []compiledGrantResult,
-	change *nodeChange,
-	users types.Users,
-	nodes views.Slice[types.NodeView],
-) ([]compiledGrant, []compiledGrantResult) {
-	if pol == nil || (pol.ACLs == nil && pol.Grants == nil) {
-		return nil, nil
-	}
-
-	grants := pol.allGrants()
-
-	if len(prev) != len(grants) {
-		prev, change = nil, nil
-	}
-
-	results := make([]compiledGrantResult, len(grants))
-	compiled := make([]compiledGrant, 0, len(grants))
-	srcs := sourceCache{}
-
-	for i, grant := range grants {
-		if change != nil && !change.reaches(grant) {
-			results[i] = prev[i]
-		} else {
-			cg, err := pol.compileOneGrant(grant, users, nodes, srcs)
-			if err != nil {
-				log.Trace().Err(err).Msg("compiling grant")
-			}
-
-			if cg != nil {
-				cg.ruleKeys = ruleKeys(cg.rules)
-			}
-
-			results[i] = compiledGrantResult{cg: cg}
-		}
-
-		if results[i].cg != nil {
-			compiled = append(compiled, *results[i].cg)
-		}
-	}
-
-	return compiled, results
-}
-
 // nodeChange summarises what changed in the nodes between two compiles,
-// as grant compilation reads them: which tags and users gained or lost a
-// node or one of its addresses or routes, whether an untagged node
+// as alias resolution and SSH read them: which tags and users gained or
+// lost a node or one of its addresses or routes, whether an untagged node
 // changed, and whether approved routes changed.
 type nodeChange struct {
 	tags     map[Tag]struct{}
 	users    map[uint]struct{}
 	routes   bool // a node's approved routes changed
 	untagged bool // an untagged node, an autogroup:member, changed
-	// addrs are the changed nodes' addresses, before and after: a self
-	// source names nodes by address, so a node sharing one moves too.
-	addrs map[netip.Addr]struct{}
 
 	// Current identities of changed owners, populated by indexUsers.
 	userNames map[string]struct{}
@@ -1233,15 +1197,11 @@ func (c *nodeChange) movesSSH(rule SSH) bool {
 }
 
 func diffNodes(prev map[types.NodeID]types.NodeView, nodes views.Slice[types.NodeView]) *nodeChange {
-	c := &nodeChange{tags: map[Tag]struct{}{}, users: map[uint]struct{}{}, addrs: map[netip.Addr]struct{}{}}
+	c := &nodeChange{tags: map[Tag]struct{}{}, users: map[uint]struct{}{}}
 
 	note := func(n types.NodeView) {
 		for _, t := range n.Tags().All() {
 			c.tags[Tag(t)] = struct{}{}
-		}
-
-		for _, ip := range n.IPs() {
-			c.addrs[ip] = struct{}{}
 		}
 
 		// By UserID, not User: a node can carry one without the other,
@@ -1294,19 +1254,6 @@ func diffNodes(prev map[types.NodeID]types.NodeView, nodes views.Slice[types.Nod
 	}
 
 	return c
-}
-
-// reaches reports whether the change can alter grant's compile: one of
-// its aliases resolves differently, see [nodeChange.moves], or a via tag
-// gained or lost a node.
-func (c *nodeChange) reaches(grant Grant) bool {
-	for _, t := range grant.Via {
-		if _, ok := c.tags[t]; ok {
-			return true
-		}
-	}
-
-	return slices.ContainsFunc(slices.Concat(grant.Sources, grant.Destinations), c.moves)
 }
 
 // moves reports whether the change can alter what a resolves to: a tag or

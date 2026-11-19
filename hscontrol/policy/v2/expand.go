@@ -3486,8 +3486,8 @@ func AuditFilters(a FilterAudit) (FilterReport, error) {
 		rep.Rules += len(got)
 	}
 
-	if got := x.Filter(); !reflect.DeepEqual(oracle.filter, got) {
-		return rep, fmt.Errorf("%w: global filter:\ncompile  %v\nexpanded %v", errFilterAudit, oracle.filter, got)
+	if want, _ := oracle.Filter(); !reflect.DeepEqual(want, x.Filter()) {
+		return rep, fmt.Errorf("%w: global filter:\ncompile  %v\nexpanded %v", errFilterAudit, want, x.Filter())
 	}
 
 	rep.Shapes.SelfByAddress = x.byAddress

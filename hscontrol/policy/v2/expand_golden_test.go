@@ -97,9 +97,9 @@ func requireExpandsLikeCompile(t *testing.T, x *Expansion, pm *PolicyManager, no
 		rules += len(got)
 	}
 
-	if got := x.Filter(); !reflect.DeepEqual(pm.filter, got) {
+	if got := x.Filter(); !reflect.DeepEqual(pm.addresses().filter, got) {
 		require.Failf(t, "expanded global filter differs from the compile's", "%s:\n%s",
-			fmt.Sprint(msgAndArgs...), cmp.Diff(pm.filter, got, inOrderOpts...))
+			fmt.Sprint(msgAndArgs...), cmp.Diff(pm.addresses().filter, got, inOrderOpts...))
 	}
 
 	// Filters look nodes up in a list sorted by ID, as the world keeps it.

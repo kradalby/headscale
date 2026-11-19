@@ -3089,7 +3089,7 @@ func (w *ViaWinners) Primary(key string, prefix netip.Prefix) types.NodeID {
 // ElectVia elects plan's scopes from previous: only touched prefixes while
 // the plan is the one previous was elected from; otherwise every scope
 // whose prefix is touched or whose candidates moved, and the winners of
-// scopes the plan dropped go. elect is as in [PolicyManager.ElectViaRoutes].
+// scopes the plan dropped go. elect is as in [PolicyManager.ElectViaAfresh].
 func ElectVia(previous *ViaWinners, plan *ViaPlan, touched map[netip.Prefix]struct{}, elect func(views.Slice[types.NodeID], types.NodeID) (types.NodeID, bool)) *ViaWinners {
 	var winners *graph.Map[viaKey, types.NodeID]
 	if previous != nil {
@@ -3345,7 +3345,7 @@ func (r *SidesReport) Add(o SidesReport) {
 
 // AuditSides checks a's sides, classes and via plan against builds from
 // scratch, and against the compile: every node's peers equal
-// [PolicyManager.BuildPeerMap]'s and a fresh [PolicyManager.BuildPeerClasses]'s;
+// [PolicyManager.BuildPeerMap]'s;
 // for every viewer and every route a node announces or approves, route
 // access equals [types.NodeView.CanAccessRoutes] with the viewer's
 // matchers; for every viewer and peer, via steering equals
@@ -3453,7 +3453,6 @@ func sameSides(got, want Sides) error {
 
 func auditPeerPairs(a SidesAudit, oracle *PolicyManager, rep *SidesReport) error {
 	byMap := oracle.BuildPeerMap(a.List)
-	byClasses := oracle.BuildPeerClasses(a.List, nil)
 
 	for _, n := range a.List.All() {
 		got := a.Peers.Peers(n.ID())
@@ -3463,10 +3462,6 @@ func auditPeerPairs(a SidesAudit, oracle *PolicyManager, rep *SidesReport) error
 
 		if !slices.Equal(got, want) && (len(got) > 0 || len(want) > 0) {
 			return fmt.Errorf("%w: peers of node %d: %v, the compile's pair scan %v", errSidesAudit, n.ID(), got, want)
-		}
-
-		if c := byClasses.Peers(n.ID()); !slices.Equal(got, c) && (len(got) > 0 || len(c) > 0) {
-			return fmt.Errorf("%w: peers of node %d: %v, the compile's classes %v", errSidesAudit, n.ID(), got, c)
 		}
 
 		rep.Nodes++

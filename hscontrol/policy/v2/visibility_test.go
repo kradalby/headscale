@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
@@ -16,6 +17,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/views"
 )
@@ -731,8 +733,8 @@ func TestElectViaIncremental(t *testing.T) {
 	require.Equal(t, inc.Primary(viaTags([]Tag{"tag:r"}), route), types.NodeID(6))
 }
 
-// BenchmarkRolePeersBuild builds every class from scratch, keyed by side
-// set, against today's [PolicyManager.BuildPeerClasses].
+// BenchmarkRolePeersBuild builds every side set and every class keyed by
+// side set from scratch.
 func BenchmarkRolePeersBuild(b *testing.B) {
 	for _, shape := range []string{"mesh", "pairs", "tag-pairs", "dense", "self"} {
 		for _, n := range []int{1000, 2000} {
@@ -769,7 +771,7 @@ func BenchmarkRolePeersBuild(b *testing.B) {
 				appr := SubnetApprovals{}.Update(all)
 				tmpl := BuildTemplates(nil, sel)
 
-				for _, phase := range []string{"today", "sides", "classes"} {
+				for _, phase := range []string{"sides", "classes"} {
 					b.Run(phase, func(b *testing.B) {
 						b.ReportAllocs()
 
@@ -779,8 +781,6 @@ func BenchmarkRolePeersBuild(b *testing.B) {
 
 						for b.Loop() {
 							switch phase {
-							case "today":
-								built = pm.BuildPeerClasses(nodes.ViewSlice(), nil)
 							case "sides":
 								s = buildSides(tmpl.sidePlan(), roles, posts, appr, all)
 							case "classes":
@@ -1722,5 +1722,45 @@ func TestSidesRandomDifferential(t *testing.T) {
 				assert.Positive(t, n, "shape %q reached", name)
 			}
 		})
+	}
+}
+
+// TestPeersDistinguishCapabilityFromIP: an app-only grant to an internet
+// range lists the client on the exit node but not the exit node on the
+// client, while the same grant with ip links both; the classes must follow
+// document edits between the two.
+func TestPeersDistinguishCapabilityFromIP(t *testing.T) {
+	users := types.Users{{ID: 1, Name: "alice"}}
+	client := sideNode(1, &users[0], "100.64.0.1", "fd7a:115c:a1e0::1", nil)
+	exit := sideNode(2, nil, "100.64.0.2", "fd7a:115c:a1e0::2", []string{"tag:exit"})
+	exit.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{tsaddr.AllIPv4()}}
+	exit.ApprovedRoutes = []netip.Prefix{tsaddr.AllIPv4()}
+	nodes := types.Nodes{client, exit}
+
+	ip := []byte(`{"tagOwners":{"tag:exit":[]},"grants":[{"src":["alice@"],"dst":["8.8.8.0/24"],"ip":["*"]}]}`)
+	app := []byte(`{"tagOwners":{"tag:exit":[]},"grants":[{"src":["alice@"],"dst":["8.8.8.0/24"],"app":{"example.com/cap/test":[{}]}}]}`)
+
+	pm, err := NewPolicyManager(ip, users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	m := newSideModel(t, pm, users, nodes)
+	us := NewUserSets(nil, m.t.sel, users)
+
+	for i, src := range [][]byte{app, ip, app} {
+		var ok bool
+
+		us, ok = m.edit(t, us, src)
+		require.True(t, ok, "edit %d accepted", i)
+
+		_, err := m.audit()
+		require.NoError(t, err, "edit %d", i)
+
+		if bytes.Equal(src, app) {
+			require.Empty(t, m.peers.Peers(client.ID), "edit %d: the client does not see the exit node", i)
+		} else {
+			require.Equal(t, []types.NodeID{exit.ID}, m.peers.Peers(client.ID), "edit %d", i)
+		}
+
+		require.Equal(t, []types.NodeID{client.ID}, m.peers.Peers(exit.ID), "edit %d: the exit node lists the client", i)
 	}
 }

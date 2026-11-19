@@ -362,11 +362,8 @@ type world struct {
 	// of the peers' routes, for change routing.
 	routeRules graph.Derived[policyv2.RouteRules]
 
-	// compiledPeers are the compile's peer classes, built incrementally
-	// as they were when they served and checked against a fresh build;
-	// nothing reads them. membershipAudit, filterAudit and sidesAudit are
-	// the audits. All are set, with auditing, only under the policy audit.
-	compiledPeers   graph.Derived[*policyv2.PeerClasses]
+	// membershipAudit, filterAudit and sidesAudit are the audits, set,
+	// with auditing, only under the policy audit.
 	membershipAudit graph.Derived[membershipAudit]
 	filterAudit     graph.Derived[filterAudit]
 	sidesAudit      graph.Derived[sidesAudit]
@@ -563,15 +560,10 @@ func newWorldMode(nodes types.Nodes, users []types.User, polSrc []byte, dns type
 	})
 
 	// From the compile in force, not the document: a compile that fails
-	// keeps serving the last good policy, and membership must describe the
-	// policy served. A recompile of the same document reuses its parse, so
-	// node writes reach no further than here.
-	//
-	// TODO(capsrc/compile): which document is in force is the compile's
-	// verdict; it moves here when the compile's filter and peers go.
-	// TODO(kradalby): capsrc/compile: no upstream reference: the compile is
-	// headscale's own and goes once nothing but the document in force reads
-	// it (SSH, node attributes, tag owners, auto-approvers and DERP still do).
+	// keeps serving the last good policy, for SSH, node attributes, tag
+	// owners, auto-approvers and DERP too, and membership must describe the
+	// policy served, so one verdict decides for all. A recompile of the same
+	// document reuses its parse, so node writes reach no further than here.
 	w.selectors = graph.NewDerived(g, "selectors", graph.Same[*policyv2.Selectors],
 		func(s *graph.Snapshot, prev *policyv2.Selectors) *policyv2.Selectors {
 			pm, _ := s.Get(w.policy).pm.(*policyv2.PolicyManager)
@@ -663,7 +655,6 @@ func newWorldMode(nodes types.Nodes, users []types.User, polSrc []byte, dns type
 	// running server therefore starts the compile audits only.
 	if policyAudit() {
 		w.auditing = true
-		w.compiledPeers = graph.NewDerived(g, "compiled-peers", (*policyv2.PeerClasses).Same, w.derivePeers)
 		w.membershipAudit = graph.NewDerived(g, "membership-audit",
 			func(membershipAudit, membershipAudit) bool { return true }, w.auditMembership)
 		w.filterAudit = graph.NewDerived(g, "filter-audit", func(filterAudit, filterAudit) bool { return true }, w.auditFilters)
@@ -1128,7 +1119,7 @@ var (
 // steering by the compile's own scopes, elected afresh.
 func (w *world) auditRoleRoutes(snap *Snapshot, pm *policyv2.PolicyManager, list views.Slice[types.NodeView]) error {
 	nodes := snap.nodes()
-	compiled, _ := pm.ElectViaRoutes(nil, nil, func(candidates views.Slice[types.NodeID], incumbent types.NodeID) (types.NodeID, bool) {
+	compiled := pm.ElectViaAfresh(nil, func(candidates views.Slice[types.NodeID], incumbent types.NodeID) (types.NodeID, bool) {
 		return electViaPrimary(nodes, candidates, incumbent)
 	})
 
@@ -1170,7 +1161,7 @@ func (s *Snapshot) CompiledRoutesForPeer(viewer, peer types.NodeView) ([]netip.P
 	}
 
 	nodes := s.nodes()
-	via, _ := pm.ElectViaRoutes(nil, nil, func(candidates views.Slice[types.NodeID], incumbent types.NodeID) (types.NodeID, bool) {
+	via := pm.ElectViaAfresh(nil, func(candidates views.Slice[types.NodeID], incumbent types.NodeID) (types.NodeID, bool) {
 		return electViaPrimary(nodes, candidates, incumbent)
 	})
 
@@ -1238,34 +1229,6 @@ func (s *Snapshot) ViaElectionAudited() bool {
 	a := s.s.Get(s.w.sidesAudit)
 
 	return a.electRev != 0 && a.primaries == s.s.Get(s.w.primaries).gen && a.elected == s.s.Get(s.w.viaPlan).Plan
-}
-
-// derivePeers is the peers cell: the peer classes of the compiled policy
-// over the policy's nodes, built from prev.
-func (w *world) derivePeers(s *graph.Snapshot, prev *policyv2.PeerClasses) *policyv2.PeerClasses {
-	pm := s.Get(w.policy).pm
-	if pm == nil {
-		return prev
-	}
-
-	nodes := s.Get(w.policyNodes).list
-	next := pm.BuildPeerClasses(nodes, prev)
-
-	// Classes built from prev reuse its per-node sides, a path no
-	// compile from scratch takes.
-	if pmv2, ok := pm.(*policyv2.PolicyManager); ok && prev != nil && policyAudit() {
-		err := pmv2.AuditPeers(next, nodes)
-		if err != nil {
-			policyAuditFailures.Add(1)
-			log.Error().Err(err).Msg("policy audit")
-		}
-	}
-
-	// Views that did not change keep their identity, so sessions
-	// and shared peer maps keyed on them carry over.
-	next.Reuse(prev)
-
-	return next
 }
 
 // updateIndex returns the index of nodes, moving only the nodes changed

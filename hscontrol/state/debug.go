@@ -394,7 +394,7 @@ func (s *State) PolicyDebugString() string {
 
 	pm, ok := snap.Policy().(*policyv2.PolicyManager)
 	if !ok {
-		return snap.Policy().DebugString()
+		return "no policy compiled"
 	}
 
 	rules, _, err := snap.Filter()

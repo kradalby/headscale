@@ -801,8 +801,8 @@ func unmergedRulesForNode(pm *PolicyManager, node types.NodeView) ([]tailcfg.Fil
 		keys  []string
 	)
 
-	for i := range pm.compiledGrants {
-		cg := &pm.compiledGrants[i]
+	for i := range pm.addresses().compiledGrants {
+		cg := &pm.addresses().compiledGrants[i]
 		rules = append(rules, cg.rules...)
 		keys = append(keys, cg.ruleKeys...)
 

@@ -18,7 +18,6 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/graph"
-	"github.com/juanfont/headscale/hscontrol/policy"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
@@ -701,7 +700,7 @@ func checkPeersMatchFullBuild(t fatalfer, snap *Snapshot) {
 
 	nodes := snap.ListNodes()
 
-	fresh, err := policy.NewPolicyManager(snap.PolicySource(), snap.Users(), nodes)
+	fresh, err := policyv2.NewPolicyManager(snap.PolicySource(), snap.Users(), nodes)
 	if err != nil {
 		t.Fatalf("fresh policy: %v", err)
 	}
@@ -1409,7 +1408,7 @@ func TestPolicyCachesSurviveStaleView(t *testing.T) {
 		mutate func(n *types.Node)
 		// probe reports a property of node 1's policy artefact that the
 		// write flips from !want to want.
-		probe func(pm policy.PolicyManager, view types.NodeView) (bool, error)
+		probe func(pm *policyv2.PolicyManager, view types.NodeView) (bool, error)
 		want  bool
 	}{
 		{
@@ -1418,7 +1417,7 @@ func TestPolicyCachesSurviveStaleView(t *testing.T) {
 				n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{subnet}}
 				n.ApprovedRoutes = []netip.Prefix{subnet}
 			},
-			probe: func(pm policy.PolicyManager, view types.NodeView) (bool, error) {
+			probe: func(pm *policyv2.PolicyManager, view types.NodeView) (bool, error) {
 				rules, err := pm.FilterForNode(view)
 				if err != nil {
 					return false, err
@@ -1444,7 +1443,7 @@ func TestPolicyCachesSurviveStaleView(t *testing.T) {
 				n.Tags = []string{"tag:srv"}
 				n.UserID, n.User = nil, nil
 			},
-			probe: func(pm policy.PolicyManager, view types.NodeView) (bool, error) {
+			probe: func(pm *policyv2.PolicyManager, view types.NodeView) (bool, error) {
 				sshPol, err := pm.SSHPolicy("", view)
 				if err != nil {
 					return false, err
@@ -1477,14 +1476,18 @@ func TestPolicyCachesSurviveStaleView(t *testing.T) {
 			before, ok := w.snapshot().GetNode(1)
 			require.True(t, ok)
 
-			got, err := tt.probe(w.snapshot().Policy(), before)
+			pm, ok := w.snapshot().Policy().(*policyv2.PolicyManager)
+			require.True(t, ok, "test sanity: a v2 policy")
+
+			got, err := tt.probe(pm, before)
 			require.NoError(t, err)
 			require.NotEqual(t, tt.want, got, "precondition: the write must flip the probed artefact")
 
 			after, ok := w.UpdateNode(1, tt.mutate)
 			require.True(t, ok)
 
-			pm := w.snapshot().Policy()
+			pm, ok = w.snapshot().Policy().(*policyv2.PolicyManager)
+			require.True(t, ok, "test sanity: a v2 policy")
 
 			_, err = tt.probe(pm, before)
 			require.NoError(t, err)
@@ -4285,7 +4288,10 @@ func TestDuplicateUserNameKeepsNodeChangesCompiling(t *testing.T) {
 		t.Helper()
 
 		nv, _ := w.snapshot().GetNode(3)
-		rules, err := w.snapshot().Policy().FilterForNode(nv)
+		pm, ok := w.snapshot().Policy().(*policyv2.PolicyManager)
+		require.True(t, ok, "test sanity: a v2 policy")
+
+		rules, err := pm.FilterForNode(nv)
 		require.NoError(t, err)
 
 		return slices.ContainsFunc(rules, func(r tailcfg.FilterRule) bool {

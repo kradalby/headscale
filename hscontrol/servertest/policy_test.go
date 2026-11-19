@@ -2,6 +2,7 @@ package servertest_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,12 +12,14 @@ import (
 	"testing"
 	"time"
 
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/servertest"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go4.org/netipx"
+	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
@@ -574,4 +577,106 @@ func livePolicy(t *testing.T, srv *servertest.TestServer, handler http.Handler, 
 	out.Body, out.ETag = rec.Body.String(), rec.Header().Get("ETag")
 
 	return out
+}
+
+// TestServingBuildsNoAddressCompile drives a server through what serves
+// clients, with the policy audit off as production runs it: joins, a route
+// announced and approved, policy edits naming groups, tags, autogroup:self,
+// a via grant, an app grant and SSH with localpart users, a retag, and the
+// debug pages. None of it may build the policy's address compile: only the
+// audit and tests read that oracle, and a page or a render reaching it
+// would compile the whole policy afresh. Not parallel, so no other test's
+// oracle reads count.
+func TestServingBuildsNoAddressCompile(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "false")
+
+	before := policyv2.AddressCompiles()
+
+	srv := servertest.NewServer(t)
+	alice := srv.CreateUser(t, "alice")
+	bob := srv.CreateUser(t, "bob")
+
+	setCapPolicy(t, srv, `{
+		"groups": {"group:eng": ["alice@"]},
+		"tagOwners": {"tag:r": ["alice@"], "tag:web": ["alice@"]},
+		"grants": [
+			{"src": ["group:eng"], "dst": ["tag:web"], "ip": ["tcp:443"]},
+			{"src": ["autogroup:member"], "dst": ["autogroup:self"], "ip": ["*"]},
+			{"src": ["bob@"], "dst": ["10.33.0.0/24"], "ip": ["*"], "via": ["tag:r"]},
+			{"src": ["autogroup:member"], "dst": ["tag:r"], "app": {"tailscale.com/cap/relay": [{}]}}
+		],
+		"ssh": [
+			{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self"], "users": ["localpart:*@example.com", "root"]},
+			{"action": "check", "src": ["group:eng"], "dst": ["tag:web"], "users": ["root"]}
+		],
+		"nodeAttrs": [{"target": ["tag:web"], "attr": ["custom:x"]}]
+	}`)
+
+	a1 := servertest.NewClient(t, srv, "alice-1", servertest.WithUser(alice))
+	a2 := servertest.NewClient(t, srv, "alice-2", servertest.WithUser(alice))
+	b := servertest.NewClient(t, srv, "bob-1", servertest.WithUser(bob))
+	web := servertest.NewClient(t, srv, "web", servertest.WithUser(alice), servertest.WithTags("tag:web"))
+	router := servertest.NewClient(t, srv, "router", servertest.WithUser(alice), servertest.WithTags("tag:r"))
+
+	for _, c := range []*servertest.TestClient{a1, a2, b, web, router} {
+		c.WaitForPeers(t, 1, 10*time.Second)
+	}
+
+	route := netip.MustParsePrefix("10.33.0.0/24")
+	router.Direct().SetHostinfo(&tailcfg.Hostinfo{
+		BackendLogID: "servertest-router", Hostname: "router", RoutableIPs: []netip.Prefix{route}, GoVersion: "go1.27.3", IPNVersion: "1.94.1",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, router.Direct().SendUpdate(ctx))
+
+	routerID := types.NodeID(router.Netmap().SelfNode.ID()) //nolint:gosec // node IDs are small
+
+	require.Eventually(t, func() bool {
+		_, err := srv.State().SetApprovedRoutes(routerID, []netip.Prefix{route})
+
+		return err == nil
+	}, 10*time.Second, 50*time.Millisecond)
+
+	b.WaitForCondition(t, "the via route", 10*time.Second, func(nm *netmap.NetworkMap) bool {
+		p, ok := peerNamed(nm, "router")
+
+		return ok && p.PrimaryRoutes().Len() > 0
+	})
+
+	setCapPolicy(t, srv, `{
+		"groups": {"group:eng": ["alice@", "bob@"]},
+		"tagOwners": {"tag:r": ["alice@"], "tag:web": ["alice@"]},
+		"grants": [
+			{"src": ["group:eng"], "dst": ["tag:web"], "ip": ["tcp:8443"]},
+			{"src": ["autogroup:member"], "dst": ["autogroup:self"], "ip": ["*"]},
+			{"src": ["bob@", "tag:web"], "dst": ["10.33.0.0/24"], "ip": ["*"], "via": ["tag:r"]}
+		],
+		"ssh": [{"action": "accept", "src": ["group:eng"], "dst": ["tag:web"], "users": ["localpart:*@example.com"]}]
+	}`)
+
+	webID := types.NodeID(web.Netmap().SelfNode.ID()) //nolint:gosec // node IDs are small
+	_, err := srv.State().SetNodeTags(webID, []string{"tag:r"})
+	require.NoError(t, err)
+
+	// The app grant that showed the router to alice is gone.
+	a1.WaitForCondition(t, "the edited policy", 10*time.Second, func(nm *netmap.NetworkMap) bool {
+		_, ok := peerNamed(nm, "router")
+
+		return !ok
+	})
+
+	st := srv.State()
+	_ = st.PolicyDebugString()
+	_ = st.DebugSSHPolicies()
+	_ = st.DebugOverviewJSON()
+	_ = st.DebugRoutes()
+	_, err = st.DebugFilter()
+	require.NoError(t, err)
+	_, err = st.DebugCapabilitySources()
+	require.NoError(t, err)
+
+	require.Equal(t, before, policyv2.AddressCompiles(), "serving built the policy's address compile")
 }

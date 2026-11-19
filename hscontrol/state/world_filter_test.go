@@ -706,9 +706,12 @@ func TestWorldFilterFollowsMembershipUnderRefusedPolicy(t *testing.T) {
 	node1, ok := s.GetNode(1)
 	require.True(t, ok)
 
-	served, err := s.Policy().FilterForNode(node1)
+	pm, ok := s.Policy().(*policyv2.PolicyManager)
+	require.True(t, ok, "test sanity: a v2 policy")
+
+	compiled, err := pm.FilterForNode(node1)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"100.64.0.1"}, served[0].SrcIPs, "the served filter is frozen at the last good compile's nodes")
+	assert.Equal(t, []string{"100.64.0.1"}, compiled[0].SrcIPs, "the compile in force is frozen at its own nodes")
 
 	rep := requireFilters(t, s)
 	assert.True(t, rep.Fresh, "audited against the last good document compiled afresh")
@@ -813,7 +816,10 @@ func TestWorldServesMembershipUnderRefusedPolicy(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"100.64.0.1", "100.64.0.2"}, served[0].SrcIPs, "the served filter follows the join under the last good policy")
 
-	frozen, err := joined.Policy().FilterForNode(node1)
+	pm, ok := joined.Policy().(*policyv2.PolicyManager)
+	require.True(t, ok, "test sanity: a v2 policy")
+
+	frozen, err := pm.FilterForNode(node1)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"100.64.0.1"}, frozen[0].SrcIPs, "the compile is frozen, and routing does not read it")
 

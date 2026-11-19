@@ -456,7 +456,7 @@ func TestFiltersServeTheirOwnNodes(t *testing.T) {
 
 	global, err := f.Global()
 	require.NoError(t, err)
-	assert.Equal(t, pm.filter, global)
+	assert.Equal(t, pm.addresses().filter, global)
 }
 
 // TestFiltersChangedCoversEveryMovedFilter holds [Filters.Changed] to the
@@ -1948,5 +1948,72 @@ func TestJoinWorkFollowsChange(t *testing.T) {
 			copies := 8 * float64(large.copied-small.copied)
 			assert.InDelta(t, copies, growth, 0.15*copies+64<<10, "bytes grow by the group lists copied, %d and %d entries", small.copied, large.copied)
 		})
+	}
+}
+
+// TestFiltersFollowSelfMergeAnchors: a tag:a node joining moves where
+// alice's self rule merges on node 2 (a rule whose sources are all of one
+// owner's addresses gains a source). The change must name node 2 and serve
+// it the fresh filter, in either form, and the address form must be the
+// address compile's.
+func TestFiltersFollowSelfMergeAnchors(t *testing.T) {
+	pol := []byte(`{
+		"tagOwners": {"tag:a": []},
+		"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]}],
+		"grants": [
+			{"src": ["alice@", "tag:a"], "dst": ["100.64.0.0/30"], "ip": ["*"]},
+			{"src": ["autogroup:member"], "dst": ["autogroup:self"], "app": {"example.com/cap/x": [{}]}}
+		]
+	}`)
+	users := sideUsers
+	nodes := types.Nodes{
+		sideNode(1, &users[0], "100.64.0.1", "", nil),
+		sideNode(2, &users[0], "100.64.0.5", "", nil),
+		sideNode(3, &users[1], "100.64.0.6", "", nil),
+	}
+
+	for _, mode := range []SourceMode{AddressSources, CapabilitySources} {
+		pm, err := NewPolicyManager(pol, users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		m := newSideModel(t, pm, users, nodes)
+		us := NewUserSets(nil, m.t.sel, users)
+		recv := capReceivers(m.nodes, nil)
+
+		prev := FollowFiltersFor(mode, nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+		for _, n := range nodes {
+			_, err := prev.ForNode(n.ID, recv.Of(n.ID))
+			require.NoError(t, err)
+		}
+
+		next := append(slices.Clone(nodes), sideNode(4, nil, "100.64.0.7", "", []string{"tag:a"}))
+		m.step(t, us, next)
+		recv = capReceivers(m.nodes, nil)
+
+		f := FollowFiltersFor(mode, prev, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+		ids, all := f.ChangedFor(prev, recv)
+		fresh := FollowFiltersFor(mode, nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+
+		for _, n := range next {
+			got, err := f.ForNode(n.ID, recv.Of(n.ID))
+			require.NoError(t, err)
+
+			want, err := fresh.ForNode(n.ID, recv.Of(n.ID))
+			require.NoError(t, err)
+			require.Equal(t, want, got, "mode %v node %d", mode, n.ID)
+
+			if old, _ := prev.ForNode(n.ID, recv.Of(n.ID)); !all && n.ID != 4 && !slices.Contains(ids, n.ID) {
+				require.Equal(t, old, got, "mode %v node %d moved unnamed (named %v)", mode, n.ID, ids)
+			}
+
+			wantAddr, err := m.pm.FilterForNode(n.View())
+			require.NoError(t, err)
+
+			gotAddr, err := f.AddressForm(n.ID)
+			require.NoError(t, err)
+			require.Equal(t, wantAddr, gotAddr, "mode %v: address form of node %d against the address compile", mode, n.ID)
+		}
+
+		require.True(t, all || slices.Contains(ids, 2), "mode %v: node 2's self rule moved, named %v", mode, ids)
 	}
 }
