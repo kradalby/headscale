@@ -22,6 +22,15 @@ import (
 	"tailscale.com/tailcfg/nodecap"
 )
 
+// pinSources returns the options of a world whose capability sources a test
+// pins: filter chunks follow their switch, and the default, as everywhere.
+func pinSources(capSources bool) worldOptions {
+	o := optionsOf(types.PolicyConfig{})
+	o.capSources = capSources
+
+	return o
+}
+
 func (s *Snapshot) templates() *policyv2.Templates      { return s.s.Get(s.w.templates) }
 func (s *Snapshot) approvals() policyv2.SubnetApprovals { return s.s.Get(s.w.approvals) }
 
@@ -1090,7 +1099,7 @@ func TestWorldStampsFollowMembership(t *testing.T) {
 		return types.Nodes{capWorldNode(1, nil, "100.64.0.10", "tag:web"), capWorldNode(2, &users[0], "100.64.0.1"), capWorldNode(3, &users[1], "100.64.0.2")}
 	}
 
-	off, err := newWorldMode(nodes(), users, []byte(capGroupPolicy), types.DNSView{}, false)
+	off, err := newWorldMode(nodes(), users, []byte(capGroupPolicy), types.DNSView{}, pinSources(false))
 	require.NoError(t, err)
 
 	if !off.capSources {
@@ -1098,7 +1107,7 @@ func TestWorldStampsFollowMembership(t *testing.T) {
 		require.NotContains(t, off.snapshot().NodeCaps(2), nodecap.Cap(eng))
 	}
 
-	w, err := newWorldMode(nodes(), users, []byte(capGroupPolicy), types.DNSView{}, true)
+	w, err := newWorldMode(nodes(), users, []byte(capGroupPolicy), types.DNSView{}, pinSources(true))
 	require.NoError(t, err)
 
 	snap := w.snapshot()
@@ -1145,12 +1154,13 @@ func TestWorldStampsFollowMembership(t *testing.T) {
 // what its client is, no policy facts, flip the form of its filter, are
 // routed to it and are not served stale from the carried cache: announcing
 // a route it is not approved for sends it addresses, as does reporting
+
 // another client; undoing either sends it capabilities again.
 func TestWorldReceiverFactsFlipFilterForm(t *testing.T) {
 	users := []types.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
 
 	w, err := newWorldMode(types.Nodes{capWorldNode(1, nil, "100.64.0.10", "tag:web"), capWorldNode(2, &users[0], "100.64.0.1")},
-		users, []byte(capGroupPolicy), types.DNSView{}, true)
+		users, []byte(capGroupPolicy), types.DNSView{}, pinSources(true))
 	require.NoError(t, err)
 
 	sources := func() []string {
@@ -1201,7 +1211,7 @@ func TestWorldAddressModeDoesNoNewWork(t *testing.T) {
 	users := []types.User{{ID: 1, Name: "alice"}}
 
 	w, err := newWorldMode(types.Nodes{capWorldNode(1, nil, "100.64.0.10", "tag:web"), capWorldNode(2, &users[0], "100.64.0.1")},
-		users, []byte(capGroupPolicy), types.DNSView{}, false)
+		users, []byte(capGroupPolicy), types.DNSView{}, pinSources(false))
 	require.NoError(t, err)
 
 	snap := w.snapshot()
@@ -1226,7 +1236,7 @@ func TestWorldCarriedFormAfterFlip(t *testing.T) {
 	users := []types.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
 
 	w, err := newWorldMode(types.Nodes{capWorldNode(1, nil, "100.64.0.10", "tag:web"), capWorldNode(2, &users[0], "100.64.0.1")},
-		users, []byte(capGroupPolicy), types.DNSView{}, true)
+		users, []byte(capGroupPolicy), types.DNSView{}, pinSources(true))
 	require.NoError(t, err)
 
 	sources := func() []string {
@@ -1293,7 +1303,7 @@ func TestWorldStampsFollowRetag(t *testing.T) {
 		capWorldNode(1, nil, "100.64.0.10", "tag:web"),
 		capWorldNode(2, &users[0], "100.64.0.1"),
 		capWorldNode(3, nil, "100.64.0.3", "tag:dev"),
-	}, users, []byte(pol), types.DNSView{}, true)
+	}, users, []byte(pol), types.DNSView{}, pinSources(true))
 	require.NoError(t, err)
 
 	require.Equal(t, policyv2.Stamps{dev}, w.snapshot().Stamps(3))
@@ -1342,7 +1352,7 @@ func BenchmarkWorldReceiverFlip(b *testing.B) {
 					nodes[i] = capWorldNode(types.NodeID(i+1), alice, netip.AddrFrom4([4]byte{100, 64, byte(i >> 8), byte(i)}).String())
 				}
 
-				w, err := newWorldMode(nodes, []types.User{*alice}, []byte(mesh), types.DNSView{}, capSources)
+				w, err := newWorldMode(nodes, []types.User{*alice}, []byte(mesh), types.DNSView{}, pinSources(capSources))
 				require.NoError(b, err)
 
 				for _, nd := range nodes {
@@ -1401,7 +1411,7 @@ func TestWorldReceiverFlipCostFollowsNode(t *testing.T) {
 				nodes[i] = capWorldNode(types.NodeID(i+1), alice, netip.AddrFrom4([4]byte{100, 64, byte(i >> 8), byte(i)}).String())
 			}
 
-			w, err := newWorldMode(nodes, []types.User{*alice}, []byte(mesh), types.DNSView{}, true)
+			w, err := newWorldMode(nodes, []types.User{*alice}, []byte(mesh), types.DNSView{}, pinSources(true))
 			require.NoError(t, err)
 
 			for _, nd := range nodes {
@@ -1582,7 +1592,7 @@ func TestWorldNarrowRoutingFollowsEachFallback(t *testing.T) {
 					capWorldNode(receiver, nil, "100.64.0.10", "tag:web"),
 					capWorldNode(2, &users[0], "100.64.0.1"),
 					capWorldNode(5, &users[1], "100.64.0.5"),
-				}, users, []byte(src), types.DNSView{}, capSources)
+				}, users, []byte(src), types.DNSView{}, pinSources(capSources))
 				require.NoError(t, err)
 
 				// Every node read, as its session would, so filters are

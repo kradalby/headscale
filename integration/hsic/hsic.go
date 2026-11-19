@@ -152,28 +152,30 @@ func WithConfigEnv(configEnv map[string]string) Option {
 }
 
 // WithCapabilitySources names filter sources by node capability
-// (policy.capability_sources).
+// (policy.capability_sources), whatever [capabilitySourcesEnv] says.
 func WithCapabilitySources() Option {
-	return func(hsic *HeadscaleInContainer) {
-		hsic.env["HEADSCALE_POLICY_CAPABILITY_SOURCES"] = "true"
-	}
+	return withPolicyOption("HEADSCALE_POLICY_CAPABILITY_SOURCES", true)
 }
 
-// capabilitySourcesEnv, a boolean that `hi` passes through, runs every
-// headscale a suite starts with [WithCapabilitySources].
+// capabilitySourcesEnv, a boolean that `hi` passes through, sets
+// policy.capability_sources for every headscale a suite starts; unset,
+// headscale's default holds.
 const capabilitySourcesEnv = "HEADSCALE_INTEGRATION_CAPABILITY_SOURCES"
 
 // WithFilterChunks sends packet filters as named chunks
-// (policy.filter_chunks).
+// (policy.filter_chunks), whatever [filterChunksEnv] says.
 func WithFilterChunks() Option {
-	return func(hsic *HeadscaleInContainer) {
-		hsic.env["HEADSCALE_POLICY_FILTER_CHUNKS"] = "true"
-	}
+	return withPolicyOption("HEADSCALE_POLICY_FILTER_CHUNKS", true)
 }
 
-// filterChunksEnv, a boolean that `hi` passes through, runs every
-// headscale a suite starts with [WithFilterChunks].
+// filterChunksEnv is [capabilitySourcesEnv] for policy.filter_chunks.
 const filterChunksEnv = "HEADSCALE_INTEGRATION_FILTER_CHUNKS"
+
+func withPolicyOption(env string, on bool) Option {
+	return func(hsic *HeadscaleInContainer) {
+		hsic.env[env] = strconv.FormatBool(on)
+	}
+}
 
 // WithPort sets the port on where to run Headscale.
 func WithPort(port int) Option {
@@ -375,7 +377,10 @@ func New(
 		policyMode:       types.PolicyModeFile,
 	}
 
-	for env, opt := range map[string]Option{capabilitySourcesEnv: WithCapabilitySources(), filterChunksEnv: WithFilterChunks()} {
+	for env, key := range map[string]string{
+		capabilitySourcesEnv: "HEADSCALE_POLICY_CAPABILITY_SOURCES",
+		filterChunksEnv:      "HEADSCALE_POLICY_FILTER_CHUNKS",
+	} {
 		v := os.Getenv(env)
 		if v == "" {
 			continue
@@ -386,9 +391,7 @@ func New(
 			return nil, fmt.Errorf("%s=%q: %w", env, v, err)
 		}
 
-		if on {
-			opt(hsic)
-		}
+		withPolicyOption(key, on)(hsic)
 	}
 
 	for _, opt := range opts {

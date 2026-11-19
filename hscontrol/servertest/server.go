@@ -70,13 +70,16 @@ func defaultServerConfig() *serverConfig {
 }
 
 // WithCapabilitySources names filter sources by node capability
-// (policy.capability_sources).
+// (policy.capability_sources) whatever the test switch says. Without it
+// the option follows [state.TestCapabilitySourcesEnv], or the production
+// default; a test pins it off through that switch.
 func WithCapabilitySources() ServerOption {
 	return func(c *serverConfig) { c.capSources = true }
 }
 
 // WithFilterChunks sends packet filters as named chunks
-// (policy.filter_chunks).
+// (policy.filter_chunks) whatever the test switch says, as
+// [WithCapabilitySources] does for its option.
 func WithFilterChunks() ServerOption {
 	return func(c *serverConfig) { c.filterChunks = true }
 }

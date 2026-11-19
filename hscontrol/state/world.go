@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/config"
 	"github.com/juanfont/headscale/hscontrol/derp"
 	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/policy"
@@ -423,44 +424,57 @@ type compiledPolicy struct {
 	err error
 }
 
-// newWorld builds the graph and publishes its first snapshot, naming
-// filter sources by address (unless a test binary asks otherwise, see
-// [capabilitySourcesForTest]). It fails when the policy does not compile
-// against users and nodes.
+// newWorld builds the graph and publishes its first snapshot with the
+// options a configuration that sets none gets (see [optionsOf]). It fails
+// when the policy does not compile against users and nodes.
 func newWorld(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DNSView) (*world, error) {
-	return newWorldMode(nodes, users, polSrc, dns, false)
+	return newWorldMode(nodes, users, polSrc, dns, optionsOf(types.PolicyConfig{}))
+}
+
+// worldOptions are the policy options a world is built with, fixed for its
+// life.
+type worldOptions struct {
+	capSources   bool // policy.capability_sources
+	filterChunks bool // policy.filter_chunks
 }
 
 // TestCapabilitySourcesEnv, set to a boolean in a test binary's
-// environment, names filter sources by capability in every world the
-// test builds with policy.capability_sources off, so a suite runs in either
-// mode: `make test-capability-sources`. Tests needing one mode set it.
+// environment, decides policy.capability_sources in every world built from
+// a configuration that leaves the option off (NewState, newWorld); unset,
+// such a world takes the production default. With [TestFilterChunksEnv] it picks
+// any combination for the tests that pin neither:
+// `make test-options CAPABILITY_SOURCES=false FILTER_CHUNKS=true`.
 // Production binaries never read it.
 const TestCapabilitySourcesEnv = "HEADSCALE_TEST_CAPABILITY_SOURCES"
 
 // TestFilterChunksEnv is [TestCapabilitySourcesEnv] for
-// policy.filter_chunks: set to a boolean in a test binary's environment, it
-// sends filters as named chunks in every world the test builds with the
-// option off. The two together pick any combination:
-// `make test-options CAPABILITY_SOURCES=true FILTER_CHUNKS=true`.
+// policy.filter_chunks.
 const TestFilterChunksEnv = "HEADSCALE_TEST_FILTER_CHUNKS"
 
-// capabilitySourcesForTest reports [TestCapabilitySourcesEnv] in a test
-// binary, and false anywhere else; a value that is no boolean panics.
-func capabilitySourcesForTest() bool { return boolForTest(TestCapabilitySourcesEnv) }
-
-// filterChunksForTest reports [TestFilterChunksEnv] as
-// [capabilitySourcesForTest] reports its own.
-func filterChunksForTest() bool { return boolForTest(TestFilterChunksEnv) }
-
-func boolForTest(env string) bool {
+// optionsOf returns the options cfg sets. In a test binary an option cfg
+// leaves off follows its switch, or the production default while the
+// switch is unset: a configuration literal leaves both off, and tests
+// should run what production runs. So a test pins an option on through
+// its configuration or its switch, and off only through its switch.
+func optionsOf(cfg types.PolicyConfig) worldOptions {
+	o := worldOptions{capSources: cfg.CapabilitySources, filterChunks: cfg.FilterChunks}
 	if !testing.Testing() {
-		return false
+		return o
 	}
 
+	def := config.Default().Policy
+	o.capSources = o.capSources || switchForTest(TestCapabilitySourcesEnv, def.CapabilitySources)
+	o.filterChunks = o.filterChunks || switchForTest(TestFilterChunksEnv, def.FilterChunks)
+
+	return o
+}
+
+// switchForTest reports the boolean env holds, or def when it is unset; a
+// value that is no boolean panics.
+func switchForTest(env string, def bool) bool {
 	v := os.Getenv(env)
 	if v == "" {
-		return false
+		return def
 	}
 
 	on, err := strconv.ParseBool(v)
@@ -471,13 +485,12 @@ func boolForTest(env string) bool {
 	return on
 }
 
-// newWorldMode is [newWorld] naming filter sources by capability when
-// capSources is set (policy.capability_sources).
-func newWorldMode(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DNSView, capSources bool) (*world, error) {
+// newWorldMode is [newWorld] with the options o, as given.
+func newWorldMode(nodes types.Nodes, users []types.User, polSrc []byte, dns types.DNSView, o worldOptions) (*world, error) {
 	g := graph.New()
 	w := &world{
 		g: g, full: make(chan struct{}, 1), beforePolicyCommit: func() {},
-		capSources: capSources || capabilitySourcesForTest(), filterChunks: filterChunksForTest(),
+		capSources: o.capSources, filterChunks: o.filterChunks,
 	}
 
 	byID := uniqueGivenNames(nodes)

@@ -47,19 +47,14 @@ test: check-deps $(GO_SOURCES) go.mod go.sum
 	@echo "Running Go tests..."
 	CGO_ENABLED=1 go test -race ./...
 
-# The suite with filter sources named by capability (policy.capability_sources)
-# wherever a test does not pin the mode. The mapper alone runs past go test's
-# default 10-minute timeout with HEADSCALE_DEBUG_POLICY_AUDIT=1.
-.PHONY: test-capability-sources
-test-capability-sources: check-deps $(GO_SOURCES) go.mod go.sum
-	@echo "Running Go tests with capability sources..."
-	HEADSCALE_TEST_CAPABILITY_SOURCES=true go test -timeout 60m ./...
-
 # The suite under any combination of policy.capability_sources and
-# policy.filter_chunks, wherever a test does not pin them, e.g.
-#   make test-options CAPABILITY_SOURCES=true FILTER_CHUNKS=true
-CAPABILITY_SOURCES ?= false
-FILTER_CHUNKS ?= false
+# policy.filter_chunks, wherever a test does not pin them; both are on by
+# default, as in production, e.g.
+#   make test-options CAPABILITY_SOURCES=false FILTER_CHUNKS=true
+# The mapper alone runs past go test's default 10-minute timeout with
+# HEADSCALE_DEBUG_POLICY_AUDIT=1.
+CAPABILITY_SOURCES ?= true
+FILTER_CHUNKS ?= true
 
 .PHONY: test-options
 test-options: check-deps $(GO_SOURCES) go.mod go.sum
