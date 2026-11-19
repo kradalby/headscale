@@ -9469,19 +9469,16 @@ func TestHubRouteAudit(t *testing.T) {
 
 	// Integration runs fail on the line the audit logs, so it is what is
 	// checked, and kept out of this test's output.
-	var logged syncBuffer
-
-	was := log.Logger
-	log.Logger = zerolog.New(&logged)
-
-	t.Cleanup(func() { log.Logger = was })
+	logged := tapLog(t)
 
 	sessions[ids[0]].sent.Store(&sentRecord{nm: stale, rev: s.Snapshot().Rev(), cfg: cfg, capVer: capVer})
 
 	scalingEndpoint(t, s, ids[2], 3)
 	require.Eventually(t, func() bool { return RouteAuditFailures() > failures }, 5*time.Second, time.Millisecond,
 		"a session holding a map without n1b's endpoint is stale")
-	assert.Contains(t, logged.String(), "policy audit: route")
+	// The audit counts the failure before it logs it.
+	require.Eventually(t, func() bool { return strings.Contains(logged(), "policy audit: route") },
+		5*time.Second, time.Millisecond, "the failure is logged")
 }
 
 // TestHubRouteAuditCoversCoalescedCommits audits a change routed across
@@ -10770,24 +10767,57 @@ func (h *hubRun) settled(step int) {
 	}
 }
 
-// syncBuffer is a buffer the hub's watcher writes to while a test reads.
-type syncBuffer struct {
+// logSink is where the package's tests log. A test that reads the hub's
+// lines taps it: swapping the global logger would race with the hub's
+// watcher, which logs from its own goroutine.
+var logSink = &tapWriter{}
+
+func TestMain(m *testing.M) {
+	log.Logger = zerolog.New(logSink).With().Timestamp().Logger()
+
+	m.Run()
+}
+
+// tapWriter writes to stderr, or to the buffer a test taps it with.
+type tapWriter struct {
 	mu  sync.Mutex
-	buf bytes.Buffer
+	tap *bytes.Buffer
 }
 
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+func (w *tapWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
-	return b.buf.Write(p)
+	if w.tap != nil {
+		return w.tap.Write(p)
+	}
+
+	return os.Stderr.Write(p)
 }
 
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+// tapLog keeps what is logged until the test ends out of its output and
+// returns a reader of it.
+func tapLog(t *testing.T) func() string {
+	t.Helper()
 
-	return b.buf.String()
+	var buf bytes.Buffer
+
+	logSink.mu.Lock()
+	logSink.tap = &buf
+	logSink.mu.Unlock()
+
+	t.Cleanup(func() {
+		logSink.mu.Lock()
+		logSink.tap = nil
+		logSink.mu.Unlock()
+	})
+
+	return func() string {
+		logSink.mu.Lock()
+		defer logSink.mu.Unlock()
+
+		return buf.String()
+	}
 }
 
 // routerOf makes id a tag:r router serving route, online.
