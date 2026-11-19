@@ -389,11 +389,12 @@ var (
 		oneWay := chance(t, 8, "one-way-world")
 		via := chance(t, 5, "via-routers")
 		down := chance(t, 2, "via-router-down")
+		cover := chance(t, 2, "via-router-covered")
 		fan := chance(t, mergeFans, "merge-fan")
 		who := rapid.IntRange(0, anyOf).Draw(t, "who")
 
 		if via {
-			viaRouters(&w, who, down)
+			viaRouters(&w, who, down, cover)
 		}
 
 		if hide {
@@ -533,9 +534,13 @@ func ownedTag(p Policy) int {
 // routers of that tag serving that route, so the via election has a
 // choice; when down, the lower ID of them is one drawn offline. Nothing
 // else gives alice the route, so steering alone decides who carries it.
-// A world of fewer than three nodes is left as it is: nodes added here
-// would be ones the shrinker cannot take away.
-func viaRouters(w *World, who int, down bool) {
+// When covered, the first router also serves a route over alice's node,
+// which puts it on its own grant's sources, and a node not alice's a
+// route over the router: what headscale links with a covered via router,
+// which drawn routes meet only among the first few nodes. A world of
+// fewer than three nodes is left as it is: nodes added here would be
+// ones the shrinker cannot take away.
+func viaRouters(w *World, who int, down, covered bool) {
 	t := &w.Topology
 
 	tag := ownedTag(w.Policy)
@@ -574,6 +579,38 @@ func viaRouters(w *World, who int, down bool) {
 		r.Announced, r.Approved = addRoutes(r.Announced, []int{0}), addRoutes(r.Approved, []int{0})
 		addressed(r)
 	}
+
+	r := &nodes[first]
+	for i := range nodes {
+		c := &nodes[i]
+		if !covered || i == 0 || i == first || i == second || c.User == 1 && !c.Tagged() {
+			continue
+		}
+
+		if src, ok := coverOf(*a); ok {
+			r.Announced, r.Approved = addRoutes(r.Announced, []int{src}), addRoutes(r.Approved, []int{src})
+		}
+
+		if over, ok := coverOf(*r); ok {
+			c.Announced, c.Approved = addRoutes(c.Announced, []int{over}), addRoutes(c.Approved, []int{over})
+		}
+
+		break
+	}
+}
+
+// coverOf is the narrowest prefix a rule or route may name that holds one
+// of n's addresses.
+func coverOf(n Node) (int, bool) {
+	best := -1
+
+	for i, p := range Prefixes[:numRulePrefixes] {
+		if slices.ContainsFunc(n.Addrs(), p.Contains) && (best < 0 || p.Bits() > Prefixes[best].Bits()) {
+			best = i
+		}
+	}
+
+	return best, best >= 0
 }
 
 // hideTag takes the addresses of every node carrying a tag a rule's
