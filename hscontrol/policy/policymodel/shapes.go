@@ -511,16 +511,16 @@ func readAt(steps []Step, i int, id types.NodeID) bool {
 // for each shape its properties need. Floors sit at about half of what the
 // generators reach at the step count builders run, so they catch a
 // generator that stops reaching a shape, not noise.
-var Required = []Shape{
+var Required = append([]Shape{
 	// Topology.
 	{Name: "unaddressed", Why: "a node no address set holds (database only)", Min: 0.15, World: func(v *View) bool {
 		return v.anyNode(func(n Node) bool { return len(n.Addrs()) == 0 })
 	}},
-	{Name: "shared-address", Why: "the client asks one node per address (database only)", Min: 0.035, World: (*View).sharedAddr},
+	{Name: "shared-address", Why: "the client asks one node per address (database only)", Min: 0.02, World: (*View).sharedAddr},
 	{Name: "single-family", Why: "rules that reach a node in one family only", Min: 0.3, World: func(v *View) bool {
 		return v.anyNode(func(n Node) bool { return len(n.Addrs()) == 1 })
 	}},
-	{Name: "outside-address", Why: "addresses * and the tailnet ranges do not cover (database only)", Min: 0.05, World: (*View).outsideAddr},
+	{Name: "outside-address", Why: "addresses * and the tailnet ranges do not cover (database only)", Min: 0.02, World: (*View).outsideAddr},
 	{Name: "user-without-nodes", Why: "a user a token names who owns nothing", Min: 0.3, World: func(v *View) bool {
 		return slices.ContainsFunc(v.users, func(u User) bool {
 			return !v.anyNode(func(n Node) bool { return n.User == u.ID })
@@ -704,7 +704,7 @@ var Required = []Shape{
 			})
 		})
 	}},
-	{Name: "self-from-star-outside-owner", Why: "* as a self source names owners by range", Min: 0.004, World: func(v *View) bool {
+	{Name: "self-from-star-outside-owner", Why: "* as a self source names owners by range", Min: 0.001, World: func(v *View) bool {
 		star := slices.ContainsFunc(v.World.Policy.ACLs, func(r Rule) bool {
 			return r.selfRule() && slices.ContainsFunc(r.Src, func(s Sel) bool { return s.Kind == SelAll })
 		})
@@ -720,8 +720,8 @@ var Required = []Shape{
 			})
 		})
 	}},
-	{Name: "outside-address-exit", Why: "exit visibility with addresses outside the tailnet", Min: 0.015, World: func(v *View) bool { return v.outsideAddr() && v.exitPresent() }},
-	{Name: "shared-address-cap-receiver", Why: "sharing decides capability form for eligible receivers", Min: 0.03, World: func(v *View) bool {
+	{Name: "outside-address-exit", Why: "exit visibility with addresses outside the tailnet", Min: 0.008, World: func(v *View) bool { return v.outsideAddr() && v.exitPresent() }},
+	{Name: "shared-address-cap-receiver", Why: "sharing decides capability form for eligible receivers", Min: 0.02, World: func(v *View) bool {
 		return v.sharedAddr() && v.anyNode(v.Eligible)
 	}},
 	{Name: "cap-to-internet-with-exit", Why: "the inputs of one-way visibility: a member's app grant to public space, and an exit", Min: 0.015, World: func(v *View) bool {
@@ -730,12 +730,12 @@ var Required = []Shape{
 				slices.ContainsFunc(r.Dst, func(d Dest) bool { return v.reachesInternet(d.Sel) })
 		})
 	}},
-	{Name: "via-star-outside-viewer", Why: "a viewer outside the tailnet under a * via source", Min: 0.004, World: func(v *View) bool {
+	{Name: "via-star-outside-viewer", Why: "a viewer outside the tailnet under a * via source", Min: 0.001, World: func(v *View) bool {
 		return v.outsideAddr() && slices.ContainsFunc(v.World.Policy.Grants, func(r Rule) bool {
 			return len(r.Via) > 0 && slices.ContainsFunc(r.Src, func(s Sel) bool { return s.Kind == SelAll })
 		})
 	}},
-	{Name: "companion-outside", Why: "companion rules with addresses outside the tailnet", Min: 0.01, World: func(v *View) bool {
+	{Name: "companion-outside", Why: "companion rules with addresses outside the tailnet", Min: 0.004, World: func(v *View) bool {
 		return v.outsideAddr() && v.anyRule(func(r Rule, _ bool) bool {
 			return slices.ContainsFunc(r.App, func(a App) bool { return strings.HasPrefix(Apps[a.Cap], "tailscale.com/") })
 		})
@@ -789,7 +789,7 @@ var Required = []Shape{
 			return b.World.Policy.referenced().hosts[e.Host] && b.World.Policy.Hosts[e.Host] != a.World.Policy.Hosts[e.Host]
 		})
 	}},
-	{Name: "service-host-flip-by-policy", Why: "a receiver fact flipped by the policy alone", Min: 0.006, Step: func(b, a *View, st Step) bool {
+	{Name: "service-host-flip-by-policy", Why: "a receiver fact flipped by the policy alone", Min: 0.004, Step: func(b, a *View, st Step) bool {
 		return onlyPolicy(st) && !slices.Equal(b.ServiceHosts(), a.ServiceHosts())
 	}},
 	{Name: "user-refs-replaced", Why: "the write that fixes a token users made ambiguous", Min: 0.03, Step: func(_, _ *View, st Step) bool {
@@ -831,7 +831,7 @@ var Required = []Shape{
 	{Name: "address-lost-v6", Why: "a node loses its IPv6 address", Min: 0.025, Step: func(b, a *View, _ Step) bool { return addrMoves(b, a, 6, lost) }},
 	{Name: "address-moved-v4", Why: "a node moves to another IPv4 address", Min: 0.07, Step: func(b, a *View, _ Step) bool { return addrMoves(b, a, 4, moved) }},
 	{Name: "address-moved-v6", Why: "a node moves to another IPv6 address", Min: 0.03, Step: func(b, a *View, _ Step) bool { return addrMoves(b, a, 6, moved) }},
-	{Name: "address-onto-shared", Why: "a node moving onto an address another holds (database only)", Min: 0.002, Step: func(b, a *View, _ Step) bool {
+	{Name: "address-onto-shared", Why: "a node moving onto an address another holds (database only)", Min: 0.001, Step: func(b, a *View, _ Step) bool {
 		for _, n := range a.nodes {
 			o, ok := b.World.Topology.Node(n.ID)
 			if !ok {
@@ -906,7 +906,7 @@ var Required = []Shape{
 	{Name: "long-unread", Why: "a session reads after three commits it did not", Min: 0.1, Seq: longUnread},
 	{Name: "flip-move-flip-back", Why: "a filter carried across a form flip, a move and a flip back", Min: 0.04, Seq: flipMoveFlipBack},
 	{Name: "flip-source-moves-flip-back", Why: "an address form carried across a flip, a source moving only it sees, and a flip back", Min: 0.01, Seq: flipSourceMovesFlipBack},
-}
+}, scaleShapes...)
 
 // longUnread reports whether some node's session reads after three or
 // more steps it did not read.

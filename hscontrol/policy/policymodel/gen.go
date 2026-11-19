@@ -36,9 +36,10 @@ func Topologies() *rapid.Generator[Topology] { return topologies }
 // carries, and registration auto-approved what nodes announce.
 func Worlds() *rapid.Generator[World] { return worlds }
 
-// Scenarios draws a world and up to maxSteps steps from it, fewer on
-// average. Each step is drawn against the world the earlier ones produce,
-// so every edit is a write headscale accepts where it lands.
+// Scenarios draws a world and steps from it: up to maxSteps, and in one
+// scenario in longScenarios up to longScenarioTimes as many; rarely none.
+// Each step is drawn against the world the earlier ones produce, so every
+// edit is a write headscale accepts where it lands.
 func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 	return rapid.Custom(func(t *rapid.T) Scenario {
 		s := Scenario{Start: worlds.Draw(t, "start")}
@@ -50,11 +51,11 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 		// address moving and its form flipping back, unread until the
 		// end; and the same with a source of its rules moving instead.
 		move := chance(t, 2, "anchor-move")
-		chain := chance(t, 2, "share-chain")
+		chain := chance(t, shareChains, "share-chain")
 		script := chance(t, 8, "flip-script")
 		elsewhere := chance(t, 8, "flip-elsewhere")
 		down := chance(t, 4, "primary-down")
-		who := rapid.IntRange(0, 15).Draw(t, "flipper")
+		who := rapid.IntRange(0, anyOf).Draw(t, "flipper")
 
 		var scripted []Step
 
@@ -94,23 +95,27 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 			}
 		}
 
-		step := rapid.Custom(func(t *rapid.T) Step {
-			st := Steps(w).Draw(t, "step")
-			w = w.Apply(st.Edits...)
+		bounds, total := stepRuns(t, maxSteps)
 
-			return st
+		// Steps come in runs of a few, each run keeping to a focus, and
+		// each step and each run is a group the shrinker can delete whole.
+		run := rapid.Custom(func(t *rapid.T) []Step {
+			f := drawFocus(t)
+
+			return rapid.SliceOfN(rapid.Custom(func(t *rapid.T) Step {
+				st := drawStep(t, w, f)
+				w = w.Apply(st.Edits...)
+
+				return st
+			}), 1, bounds.each).Draw(t, "run")
 		})
 
-		// Steps come in runs of a few: rapid's lists average five
-		// elements, and each step and each run is a group the shrinker
-		// can delete whole.
-		runs := rapid.SliceOfN(rapid.SliceOfN(step, 1, 5), 0, (maxSteps+1)/2).Draw(t, "steps")
-		for _, run := range runs {
-			s.Steps = append(s.Steps, run...)
+		for _, r := range rapid.SliceOfN(run, bounds.least, bounds.most).Draw(t, "steps") {
+			s.Steps = append(s.Steps, r...)
 		}
 
-		if len(s.Steps) > maxSteps {
-			s.Steps = s.Steps[:maxSteps]
+		if len(s.Steps) > total {
+			s.Steps = s.Steps[:total]
 		}
 
 		return s
@@ -283,17 +288,16 @@ func anchorMove(w World) []Step {
 	return []Step{st}
 }
 
-// shareChain, in a world that shares addresses already, has a node of the
-// second user hold one address of a node of alice's and the other of a
-// third node, and puts alice's self rule in front of the ACLs, whose
-// source names the node by the address it shares with hers. The step
-// deletes her node, which unnames it, and every session reads: the
-// node's side facts move though nothing wrote it, and the third node's
-// sides with them. w as it was, and no step, in a world sharing no
-// address, with fewer than three nodes or two users, or where two users
+// shareChain has a node of the second user hold one address of a node of
+// alice's and the other of a third node (database only), and puts alice's
+// self rule in front of the ACLs, whose source names the node by the
+// address it shares with hers. The step deletes her node, which unnames
+// it, and every session reads: the node's side facts move though nothing
+// wrote it, and the third node's sides with them. w as it was, and no
+// step, with fewer than three nodes or two users, or where two users
 // answer to alice@.
 func shareChain(w World, who int) (World, []Step) {
-	if v := NewView(w); len(w.Topology.Nodes) < 3 || len(w.Topology.Users) < 2 || !v.sharedAddr() || v.Ambiguous(0) {
+	if v := NewView(w); len(w.Topology.Nodes) < 3 || len(w.Topology.Users) < 2 || v.Ambiguous(0) {
 		return w, nil
 	}
 
@@ -338,16 +342,7 @@ func shareChain(w World, who int) (World, []Step) {
 func Steps(w World) *rapid.Generator[Step] {
 	return rapid.Custom(func(t *rapid.T) Step {
 		st := Step{Edits: drawEdits(t, w)}
-		next := w.Apply(st.Edits...)
-
-		all := chance(t, 4, "all-read")
-		some := rapid.SliceOfN(rapid.IntRange(0, 15), 0, 2).Draw(t, "reads")
-
-		for i, n := range next.Topology.Nodes {
-			if all || slices.ContainsFunc(some, func(r int) bool { return r%len(next.Topology.Nodes) == i }) {
-				st.Reads = append(st.Reads, n.ID)
-			}
-		}
+		st.Reads = drawReads(t, w.Apply(st.Edits...))
 
 		return st
 	})
@@ -371,12 +366,12 @@ var (
 		// its receiver does not get. The last goes in last, as the one
 		// before it takes every ACL away.
 		hide := chance(t, 12, "hidden-tag")
-		merge := chance(t, 16, "merge-anchor")
+		merge := chance(t, 14, "merge-anchor")
 		anchor := chance(t, 8, "own-anchor")
 		oneWay := chance(t, 8, "one-way-world")
-		via := chance(t, 8, "via-routers")
+		via := chance(t, 5, "via-routers")
 		down := chance(t, 2, "via-router-down")
-		who := rapid.IntRange(0, 15).Draw(t, "who")
+		who := rapid.IntRange(0, anyOf).Draw(t, "who")
 
 		if via {
 			viaRouters(&w, who, down)
@@ -499,16 +494,16 @@ func oneWayWorld(w *World, who int) {
 // and makes two nodes of w tag:a routers serving that route, so the via
 // election has a choice; the lower ID of them is offline when down.
 // Nothing else gives alice the route, so steering alone decides who
-// carries it.
+// carries it. A world of fewer than three nodes is left as it is: nodes
+// added here would be ones the shrinker cannot take away.
 func viaRouters(w *World, who int, down bool) {
+	t := &w.Topology
+	if len(t.Nodes) < 3 {
+		return
+	}
+
 	w.Policy.ACLs, w.Policy.AllowAll = nil, false
 	w.Policy.Grants = []Rule{{Src: []Sel{{Kind: SelUser}}, Dst: []Dest{{Sel: Sel{Kind: SelPrefix}}}, IP: []IP{{}}, Via: []int{0}}}
-
-	t := &w.Topology
-	for len(t.Nodes) < 3 {
-		id := t.nextID()
-		t.Nodes, t.NextID = append(t.Nodes, Node{ID: id, User: t.Users[0].ID}), id+1
-	}
 
 	nodes := t.Nodes
 	addressed := func(n *Node) {
@@ -623,7 +618,7 @@ func pick[E any](t *rapid.T, from []E, label string) E { return from[index(t, le
 // that does not: what it reads stays aligned when shrinking changes the
 // list.
 func pickAny[E any](t *rapid.T, from []E, label string) E {
-	return from[rapid.IntRange(0, 15).Draw(t, label)%len(from)]
+	return from[rapid.IntRange(0, anyOf).Draw(t, label)%len(from)]
 }
 
 // other is an index into n items that is not i.
@@ -715,6 +710,8 @@ var (
 func drawPolicy(t *rapid.T) Policy {
 	var p Policy
 
+	rules := ruleRuns(t)
+
 	for g := range numGroups {
 		p.Groups[g] = drawMembers(t)
 	}
@@ -740,7 +737,7 @@ func drawPolicy(t *rapid.T) Policy {
 	}
 
 	// Each rule sees those before it, so it can take one's sources.
-	rapid.SliceOfN(rapid.Custom(func(t *rapid.T) bool {
+	runsOf(t, rapid.Custom(func(t *rapid.T) bool {
 		grant := chance(t, 2, "grant")
 		r := drawRule(t, grant, p)
 
@@ -748,7 +745,7 @@ func drawPolicy(t *rapid.T) Policy {
 		*l = append(*l, r)
 
 		return grant
-	}), 1, 4).Draw(t, "rules")
+	}), rules, "rules")
 
 	// A capability to public space: the grant that makes exit nodes see
 	// its sources one way.
@@ -1013,17 +1010,23 @@ func drawTopology(t *rapid.T) Topology {
 		nodes []Node
 	)
 
-	rapid.SliceOfN(rapid.Custom(func(t *rapid.T) User {
-		u := defaultUsers[len(users)]
+	sz := drawTopologySize(t)
 
-		// Only an OIDC user shares a name with another user.
+	rapid.SliceOfN(rapid.Custom(func(t *rapid.T) User {
+		u := identities[len(users)]
+
+		// Only an OIDC user shares a name with another user, and API
+		// users' names stay unique among them.
 		same := chance(t, 8, "same-name")
-		as := rapid.IntRange(0, 15).Draw(t, "as")
+		as := rapid.IntRange(0, anyOf).Draw(t, "as")
 		email := chance(t, 8, "email")
 		e := pick(t, userEmails, "email")
 
 		if same && len(users) > 0 {
-			if o := users[as%len(users)]; u.OIDC() || o.OIDC() {
+			o := users[as%len(users)]
+			taken := slices.ContainsFunc(users, func(x User) bool { return !x.OIDC() && x.Name == o.Name })
+
+			if u.OIDC() || o.OIDC() && !taken {
 				u.Name = o.Name
 			}
 		}
@@ -1035,19 +1038,21 @@ func drawTopology(t *rapid.T) Topology {
 		users = append(users, u)
 
 		return u
-	}), 1, len(defaultUsers)).Draw(t, "users")
+	}), 1, sz.users).Draw(t, "users")
 
 	// A world holds addresses outside the tailnet, or shared, rarely and
-	// then several; most worlds are what headscale hands out.
-	outside := chance(t, 8, "outside-world")
-	shared := chance(t, 8, "shared-world")
+	// then several; most worlds are what headscale hands out. A large one
+	// never: a reference property skips it whole.
+	outside := chance(t, outsideWorlds, "outside-world") && !sz.large
+	shared := chance(t, sharedWorlds, "shared-world") && !sz.large
 
-	rapid.SliceOfN(rapid.Custom(func(t *rapid.T) Node {
+	// Nodes come in runs, so that a large topology grows to dozens.
+	runsOf(t, rapid.Custom(func(t *rapid.T) Node {
 		n := drawNode(t, types.NodeID(len(nodes)+1), users, nodes, allTags, outside, shared) //nolint:gosec // small
 		nodes = append(nodes, n)
 
 		return n
-	}), 1, 8).Draw(t, "nodes")
+	}), sz.nodes, "nodes")
 
 	n := len(nodes)
 
@@ -1087,7 +1092,7 @@ func drawNode(t *rapid.T, id types.NodeID, users []User, others []Node, tags []i
 
 	tagged := chance(t, 5, "tagged")
 	ts := drawTags(t, tags)
-	owner := rapid.IntRange(0, 15).Draw(t, "owner")
+	owner := rapid.IntRange(0, anyOf).Draw(t, "owner")
 
 	switch {
 	case len(tags) > 0 && (tagged || len(users) == 0):
@@ -1155,7 +1160,7 @@ func drawTags(t *rapid.T, tags []int) []int {
 func drawAddr(t *rapid.T, family int, id types.NodeID, others []Node, outside, shared bool) netip.Addr {
 	none := chance(t, 8, "no-addr")
 	share := chance(t, 2, "shared")
-	of := rapid.IntRange(0, 15).Draw(t, "of")
+	of := rapid.IntRange(0, anyOf).Draw(t, "of")
 	away := chance(t, 2, "outside")
 	where := rapid.IntRange(0, 15).Draw(t, "where")
 
@@ -1421,6 +1426,13 @@ func drawNodeEdit(t *rapid.T, w World) Edit {
 	// when the shrinker deletes a node before it.
 	n := tp.Nodes[len(tp.Nodes)-1-index(t, len(tp.Nodes), "node")]
 
+	return drawNodeEditOn(t, w, kind, n)
+}
+
+// drawNodeEditOn draws an edit of kind, other than a join, of node n of w.
+func drawNodeEditOn(t *rapid.T, w World, kind int, n Node) Edit {
+	tp := w.Topology
+
 	switch kind {
 	case editLeave:
 		return Leave{n.ID}
@@ -1523,7 +1535,7 @@ func drawSetAddr(t *rapid.T, n Node, nodes []Node) Edit {
 	family := drawFamily(t)
 	cur := n.Addr(family)
 
-	rare := chance(t, 6, "out-of-domain")
+	rare := chance(t, strayAddrs, "out-of-domain")
 
 	to := []netip.Addr{ownAddr(family, uint64(n.ID)), {}, movedAddr(family, uint64(n.ID))}
 	if rare {
@@ -1537,14 +1549,20 @@ func drawSetAddr(t *rapid.T, n Node, nodes []Node) Edit {
 }
 
 func drawUserEdit(t *rapid.T, w World) Edit {
-	users := w.Topology.Users
-
 	kind := index(t, 4, "user-edit")
 	u := User{}
 
-	if len(users) > 0 {
+	if users := w.Topology.Users; len(users) > 0 {
 		u = pickAny(t, users, "user")
 	}
+
+	return drawUserEditOn(t, w, kind, u)
+}
+
+// drawUserEditOn draws a user edit of kind: one of user u of w, or a new
+// user.
+func drawUserEditOn(t *rapid.T, w World, kind int, u User) Edit {
+	users := w.Topology.Users
 
 	switch {
 	case kind == 1 && len(users) > 0:
@@ -1667,11 +1685,11 @@ func drawPolicyEditKind(t *rapid.T, w World) Edit {
 
 	switch kind {
 	case editPorts:
-		if e, ok := drawSetPorts(t, p); ok {
+		if e, ok := drawSetPorts(t, p, refs); ok {
 			return e
 		}
 	case editProto:
-		if e, ok := drawSetProto(t, p); ok {
+		if e, ok := drawSetProto(t, p, refs); ok {
 			return e
 		}
 	case editSwapRules:
@@ -1708,7 +1726,7 @@ func drawPolicyEditKind(t *rapid.T, w World) Edit {
 			return drawAddSel(t, p, pick(t, refs, "rule"))
 		}
 	case editRemoveSel:
-		if e, ok := drawRemoveSel(t, p); ok {
+		if e, ok := drawRemoveSel(t, p, refs); ok {
 			return e
 		}
 	case editRemoveRule:
@@ -1843,7 +1861,7 @@ func drawSetHost(t *rapid.T, p Policy) Edit {
 	return SetHost{h, other(t, numRulePrefixes, p.Hosts[h], "shift")}
 }
 
-func drawSetPorts(t *rapid.T, p Policy) (Edit, bool) {
+func drawSetPorts(t *rapid.T, p Policy, refs []RuleRef) (Edit, bool) {
 	type place struct {
 		ref RuleRef
 		at  int
@@ -1851,7 +1869,7 @@ func drawSetPorts(t *rapid.T, p Policy) (Edit, bool) {
 
 	var places []place
 
-	for _, ref := range p.Refs() {
+	for _, ref := range refs {
 		r := p.Rule(ref)
 		if ref.Grant {
 			for i, ip := range r.IP {
@@ -1883,9 +1901,9 @@ func drawSetPorts(t *rapid.T, p Policy) (Edit, bool) {
 	return SetPorts{pl.ref, pl.at, other(t, n, cur, "ports")}, true
 }
 
-// drawSetProto changes a protocol to one the ports allow.
-func drawSetProto(t *rapid.T, p Policy) (Edit, bool) {
-	refs := slices.DeleteFunc(p.Refs(), func(ref RuleRef) bool { return ref.Grant && len(p.Rule(ref).IP) == 0 })
+// drawSetProto changes a protocol to one the ports allow, in one of refs.
+func drawSetProto(t *rapid.T, p Policy, refs []RuleRef) (Edit, bool) {
+	refs = slices.DeleteFunc(slices.Clone(refs), func(ref RuleRef) bool { return ref.Grant && len(p.Rule(ref).IP) == 0 })
 	if len(refs) == 0 {
 		return nil, false
 	}
@@ -2031,12 +2049,12 @@ func drawAddSel(t *rapid.T, p Policy, ref RuleRef) Edit {
 	return AddSel{ref, dst, at, sel, ports}
 }
 
-// drawRemoveSel removes a source or a non-self destination from a rule
-// that keeps one.
-func drawRemoveSel(t *rapid.T, p Policy) (Edit, bool) {
+// drawRemoveSel removes a source or a non-self destination from one of
+// refs that keeps one.
+func drawRemoveSel(t *rapid.T, p Policy, refs []RuleRef) (Edit, bool) {
 	var places []RemoveSel
 
-	for _, ref := range p.Refs() {
+	for _, ref := range refs {
 		r := p.Rule(ref)
 		if len(r.Src) > 1 {
 			for i := range r.Src {

@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"go4.org/netipx"
 	"pgregory.net/rapid"
 	"tailscale.com/tailcfg"
@@ -967,10 +968,19 @@ func listName(grant bool) string {
 // nothing in it the failure does not need. The last is what a builder's
 // failing property prints. RAPID_SEED picks another seed.
 func TestShrinksToSmallCases(t *testing.T) {
+	// The race detector slows the shrinker past its time budget, which
+	// leaves cases half shrunk; shrinking runs on one goroutine and gains
+	// nothing from it.
+	if util.RaceEnabled {
+		t.Skip("shrinking runs out of its time budget under the race detector")
+	}
+
 	// Fail files go nowhere, and the seed is fixed, whatever seed the
 	// properties are given: shrinking reaches the smallest case from some
-	// seeds, not all. Flags are process-wide: not parallel.
-	settings := map[string]string{"rapid.nofailfile": "true", "rapid.seed": "2"}
+	// seeds, not all. Database-only shapes are rare, so a property may
+	// need more than the default checks to fail. Flags are process-wide:
+	// not parallel.
+	settings := map[string]string{"rapid.nofailfile": "true", "rapid.seed": "3", "rapid.checks": "1000"}
 
 	for name, value := range settings {
 		old := flag.Lookup(name).Value.String()
