@@ -205,11 +205,15 @@ At boot, failing stored policy tests log a warning and do not prevent startup.
 `HEADSCALE_DEBUG_POLICY_AUDIT=1` holds what clients are sent against the policy compiled from scratch in address form:
 every served packet filter, peer list, route and `via` election. With capability sources, each served filter must allow
 what the address form allows once each capability is read as the addresses of the nodes the receiver is sent holding it:
-itself and its peers. The parts of the policy compile that still serve clients (SSH policies, node attributes, tag owners
-and auto-approvers) are held, compiled incrementally, against a compile from scratch. The map hub also renders afresh the
-sessions a change did not wake and logs any whose map would differ. Mismatches log `policy audit`; integration tests
-treat them as failures. The audit does not revalidate policy tests, or check DNS rendering, network writes or client
-state. It scans every pair of nodes, which is quadratic, so it can add substantial cost on large tailnets.
+itself and its peers. That assumes the client honours every capability it is sent; of which nodes are sent addresses
+instead, the audit checks only that a node announcing routes, acting as an app connector or hosting a service IP is sent
+no capability source. The other fallbacks (clients other than Tailscale's, app capability rules, other protocols) are
+held by the unit tests and the client canaries, not by the audit. The parts of the policy compile that still serve
+clients (SSH policies, node attributes, tag owners and auto-approvers) are held, compiled incrementally, against a
+compile from scratch. The map hub also renders afresh the sessions a change did not wake and logs any whose map would
+differ. Mismatches log `policy audit`; integration tests treat them as failures. The audit does not revalidate policy
+tests, or check DNS rendering, network writes or client state. It scans every pair of nodes, which is quadratic, so it
+can add substantial cost on large tailnets.
 
 ### Offline peer-history memory
 

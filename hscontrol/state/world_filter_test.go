@@ -1154,6 +1154,42 @@ func TestWorldStampsFollowMembership(t *testing.T) {
 // what its client is, no policy facts, flip the form of its filter, are
 // routed to it and are not served stale from the carried cache: announcing
 // a route it is not approved for sends it addresses, as does reporting
+// TestServedAuditHoldsWideLocalNetsToAddresses: the audit of a served
+// filter refuses a capability source on a node that announces a route, is
+// an app connector or hosts a service IP, from the node itself and not
+// fallback.go's decision, and leaves a node handling its own addresses
+// alone; the filters served to both pass it.
+func TestServedAuditHoldsWideLocalNetsToAddresses(t *testing.T) {
+	users := []types.User{{ID: 1, Name: "alice"}}
+	pol := `{"groups": {"group:eng": ["alice@"]},
+		"tagOwners": {"tag:web": ["alice@"], "tag:svc": ["alice@"]},
+		"nodeAttrs": [{"target": ["tag:svc"], "attr": ["service-host"]}],
+		"grants": [{"src": ["group:eng"], "dst": ["tag:web", "tag:svc"], "ip": ["tcp:443"]}]}`
+
+	router := capWorldNode(1, nil, "100.64.0.10", "tag:web")
+	router.Hostinfo.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.9.0.0/24")}
+	connector := capWorldNode(3, nil, "100.64.0.11", "tag:web")
+	connector.Hostinfo.AppConnector.Set(true)
+
+	w, err := newWorldMode(types.Nodes{
+		router, capWorldNode(2, &users[0], "100.64.0.1"), connector,
+		capWorldNode(4, nil, "100.64.0.12", "tag:svc"), capWorldNode(5, nil, "100.64.0.13", "tag:web"),
+	}, users, []byte(pol), types.DNSView{}, pinSources(true))
+	require.NoError(t, err)
+
+	s := w.snapshot()
+	sent := []tailcfg.FilterRule{{SrcIPs: []string{"cap:https://headscale.net/cap/src/group:eng"}}}
+
+	for _, id := range []types.NodeID{1, 3, 4} {
+		require.ErrorIs(t, s.auditLocalNetsForm(id, sent), errServedForm, "node %d", id)
+
+		served, err := s.FilterForNode(id)
+		require.NoError(t, err)
+		require.NoError(t, s.auditLocalNetsForm(id, served), "node %d is served addresses", id)
+	}
+
+	require.NoError(t, s.auditLocalNetsForm(5, sent), "a node handling its own addresses may be sent capabilities")
+}
 
 // another client; undoing either sends it capabilities again.
 func TestWorldReceiverFactsFlipFilterForm(t *testing.T) {

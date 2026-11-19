@@ -2698,13 +2698,52 @@ func (s *Snapshot) auditServed(id types.NodeID, served []tailcfg.FilterRule) {
 		}
 	}
 
+	// The check above assumes the client honours every capability it is
+	// sent; which nodes are sent addresses instead is fallback.go's to
+	// decide. Held here from the node itself, apart from that decision,
+	// for the case that is unsafe: a node handling more than its own
+	// addresses accepts ICMP from a capability source whatever the rule's
+	// destinations.
+	if err == nil && s.w.capSources {
+		err = s.auditLocalNetsForm(id, served)
+	}
+
 	if err != nil {
 		policyAuditFailures.Add(1)
 		log.Error().Err(err).Msg("policy audit: filter")
 	}
 }
 
-var errServedFilter = errors.New("served filter differs from one cut afresh")
+// auditLocalNetsForm reports a capability source in served when node id
+// announces routes, approved or not, is an app connector or hosts a service
+// IP.
+func (s *Snapshot) auditLocalNetsForm(id types.NodeID, served []tailcfg.FilterRule) error {
+	n, ok := s.GetNode(id)
+	if !ok {
+		return nil
+	}
+
+	_, serviceHost := s.NodeCaps(id)[nodecap.ServiceHost]
+	hi := n.Hostinfo()
+	wide := serviceHost || hi.Valid() && (hi.RoutableIPs().Len() > 0 || hi.AppConnector().EqualBool(true))
+
+	if !wide {
+		return nil
+	}
+
+	for _, r := range served {
+		if slices.ContainsFunc(r.SrcIPs, func(src string) bool { return strings.HasPrefix(src, "cap:") }) {
+			return fmt.Errorf("%w: node %d at commit %d handles more than its own addresses and was sent %v", errServedForm, id, s.Rev(), r.SrcIPs)
+		}
+	}
+
+	return nil
+}
+
+var (
+	errServedFilter = errors.New("served filter differs from one cut afresh")
+	errServedForm   = errors.New("capability source sent to a node that must be sent addresses")
+)
 
 // holdersFor returns, for a capability, the addresses of the nodes viewer
 // is sent holding it: itself and its peers.
