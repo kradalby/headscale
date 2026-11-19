@@ -33,7 +33,7 @@ var scaleShapes = []Shape{
 				len(slices.DeleteFunc(src, func(n Node) bool { return !slices.ContainsFunc(dst, func(m Node) bool { return m.ID == n.ID }) })) >= wide
 		})
 	}},
-	{Name: "three-rules-one-key", Why: "three rules merging into one at a receiver", Min: 0.004, World: threeRulesOneKey},
+	{Name: "three-rules-one-key", Why: "three rules merging into one at a receiver", Min: 0.035, World: threeRulesOneKey},
 	{Name: "long-policy", Why: "a dozen rules or more", Min: 0.008, World: func(v *View) bool {
 		return len(v.World.Policy.ACLs)+len(v.World.Policy.Grants) >= 12
 	}},

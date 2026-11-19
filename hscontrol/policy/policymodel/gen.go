@@ -362,15 +362,17 @@ var (
 		// world in eight to sixteen: a tag a rule's destination names whose nodes
 		// lose their addresses; an own rule that reaches nothing on its
 		// receiver yet places a merged rule; an app grant to public space
-		// that exits see one way; a merged rule placed by an earlier rule
-		// its receiver does not get. The last goes in last, as the one
-		// before it takes every ACL away.
+		// that exits see one way; three rules merging into one; a merged
+		// rule placed by an earlier rule its receiver does not get. The
+		// last two go in last, as the one before them takes every ACL
+		// away.
 		hide := chance(t, 12, "hidden-tag")
 		merge := chance(t, 14, "merge-anchor")
 		anchor := chance(t, 8, "own-anchor")
 		oneWay := chance(t, 8, "one-way-world")
 		via := chance(t, 5, "via-routers")
 		down := chance(t, 2, "via-router-down")
+		fan := chance(t, mergeFans, "merge-fan")
 		who := rapid.IntRange(0, anyOf).Draw(t, "who")
 
 		if via {
@@ -387,6 +389,10 @@ var (
 
 		if oneWay {
 			oneWayWorld(&w, who)
+		}
+
+		if fan {
+			mergeFan(&w, who)
 		}
 
 		if merge {

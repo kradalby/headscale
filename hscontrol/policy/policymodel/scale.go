@@ -46,6 +46,10 @@ const (
 	// followUps is one in how many steps works on its run's focus.
 	followUps = 4
 
+	// mergeFans is one world in how many where three rules merge into one
+	// at a receiver.
+	mergeFans = 16
+
 	// shareChains is one scenario in how many that starts with the share
 	// chain script (database only).
 	shareChains = 30
@@ -165,6 +169,27 @@ func stepRuns(t *rapid.T, maxSteps int) (runs, int) {
 	}
 
 	return r, total
+}
+
+// mergeFan puts in front of w's ACLs three rules from the members, to
+// alice's port 22, to every node's ports 80 to 443 and to the members'
+// port 1, and makes a node of w alice's: on it the three merge into one
+// rule.
+func mergeFan(w *World, who int) {
+	members := Sel{Kind: SelMember}
+	ports := func(p string) int { return slices.Index(Ports, p) }
+	w.Policy.ACLs, w.Policy.AllowAll = slices.Concat([]Rule{
+		{Src: []Sel{members}, Dst: []Dest{{Sel: Sel{Kind: SelUser}, Ports: ports("22")}}},
+		{Src: []Sel{members}, Dst: []Dest{{Sel: Sel{Kind: SelAll}, Ports: ports("80-443")}}},
+		{Src: []Sel{members}, Dst: []Dest{{Sel: members, Ports: ports("1")}}},
+	}, w.Policy.ACLs), false
+
+	n := &w.Topology.Nodes[who%len(w.Topology.Nodes)]
+	n.User, n.Tags = 1, nil
+
+	if len(n.Addrs()) == 0 {
+		n.V4, n.V6 = ownAddr(4, uint64(n.ID)), ownAddr(6, uint64(n.ID))
+	}
 }
 
 // focus is what a run of steps keeps working on: the node, the rule and
