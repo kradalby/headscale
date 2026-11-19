@@ -603,10 +603,13 @@ const (
 	judgeKept
 	// judgeCombos: the four combinations enforce alike.
 	judgeCombos
+	// judgeReference: what a client holds is what the reference gives its
+	// node (see [deliveryRun.holdToReference]).
+	judgeReference
 	numJudges
 )
 
-var judgeNames = [numJudges]string{"client", "model", "wire", "churn", "kept", "combos"}
+var judgeNames = [numJudges]string{"client", "model", "wire", "churn", "kept", "combos", "reference"}
 
 func (j deliveryJudge) String() string { return judgeNames[j] }
 
@@ -683,6 +686,9 @@ type deliveryWorld struct {
 	probes probeCache
 	judges *[numJudges]bool
 	reach  *deliveryReach
+	// shared is whether any commit had two nodes share an address: a
+	// write of several nodes commits them one at a time.
+	shared bool
 }
 
 func newDeliveryWorld(t *rapid.T, r *deliveryRun, c deliveryCombo, w policymodel.World, coalesce, mixed bool, names *chunkRegistry) *deliveryWorld {
@@ -703,6 +709,9 @@ func newDeliveryWorld(t *rapid.T, r *deliveryRun, c deliveryCombo, w policymodel
 	dw.w = newSteppedWatcher(t, dw.h, dw.p.s)
 	dw.p.committed = func(before uint64) {
 		dw.w.committed(before)
+
+		shared, _ := heldAddresses(dw.p.s.Snapshot())
+		dw.shared = dw.shared || shared
 
 		if !dw.coalesce && dw.p.s.Snapshot().Rev() != before {
 			dw.w.settle()
@@ -1238,6 +1247,336 @@ func combosAgree(t *rapid.T, at string, r *deliveryRun, worlds []*deliveryWorld,
 	}
 }
 
+// referenceTally is what [deliveryRun.holdToReference] met.
+type referenceTally struct {
+	verdicts policymodel.Verdicts
+	// passed holds the filters held to the reference already, by
+	// everything the comparison reads.
+	passed map[string]bool
+
+	clients, filters, peerSets, routePairs, ssh int
+	steered, unjudgedRoutes, primaries          int
+	contestedPeers, contestedRoutes             map[policymodel.Contested]int
+	skipped                                     map[string]int
+}
+
+func (rt *referenceTally) skip(why string) {
+	if rt.skipped == nil {
+		rt.skipped = map[string]int{}
+	}
+
+	rt.skipped[why]++
+}
+
+func (rt *referenceTally) String() string {
+	return fmt.Sprintf("reference: clients judged %d, filters compared %d, peer sets %d, route pairs %d (steered pairs judged %d, routes left unjudged %d), "+
+		"self primaries %d, SSH policies %d; skipped %v; peers contested %v, routes contested %v; filters: %v",
+		rt.clients, rt.filters, rt.peerSets, rt.routePairs, rt.steered, rt.unjudgedRoutes, rt.primaries, rt.ssh, rt.skipped,
+		rt.contestedPeers, rt.contestedRoutes, &rt.verdicts)
+}
+
+// require fails a run that held nothing of some kind to the reference.
+func (rt *referenceTally) require(t *testing.T) {
+	t.Helper()
+
+	for name, n := range map[string]int{
+		"filters": rt.filters, "peer sets": rt.peerSets, "route pairs": rt.routePairs, "steered route pairs": rt.steered,
+		"self primaries": rt.primaries, "SSH policies": rt.ssh,
+	} {
+		if n == 0 {
+			t.Errorf("reference: no case held %s to the reference", name)
+		}
+	}
+}
+
+// holdToReference holds what the client of every session held to a fresh
+// one holds to the reference, read for the latest world, in each of the
+// four worlds: its peers are the reference's; each peer carries in its
+// AllowedIPs what the reference gives once the routers are elected
+// ([policymodel.Ref.ServedRoutes]), and the node itself is primary for
+// what the election gives it; its packet filter answers as the
+// reference's rules through its own client ([policymodel.Verdicts], the
+// allowances and contested clauses of the reference properties); it and
+// its peers carry the reference's stamps in capability mode and none in
+// address mode; and its SSH policy is a compile from scratch's. Oracle:
+// the reference and the client's filter, and for SSH a compile that
+// inherits nothing. Worlds out of the reference's domain are skipped, as
+// the reference properties skip them.
+func (r *deliveryRun) holdToReference(t *rapid.T, at string, worlds []*deliveryWorld, held []map[types.NodeID]*netmap.NetworkMap, shared bool) {
+	if !r.judges[judgeReference] {
+		return
+	}
+
+	w := worlds[0].p.w
+	ref := policymodel.RefOf(w)
+
+	if why := ref.OutOfDomain(); why != "" {
+		r.ref.skip(why)
+
+		return
+	}
+
+	if r.ref.passed == nil {
+		r.ref.passed = map[string]bool{}
+		r.ref.contestedPeers, r.ref.contestedRoutes = map[policymodel.Contested]int{}, map[policymodel.Contested]int{}
+	}
+
+	// TODO(kradalby): policy/stale-under-shared-address: SSH policies
+	// carried across a commit keep an address another node shared, until a
+	// document edit (TestSSHPolicyForgetsALeaverWhoSharedAnAddress in
+	// state); once a case shared one, its SSH goes unjudged.
+	var fresh *policyv2.PolicyManager
+
+	if !shared {
+		users, err := worlds[0].p.s.ListAllUsers()
+		if err != nil {
+			t.Fatalf("reference: %s: users: %v", at, err)
+		}
+
+		fresh, err = policyv2.NewPolicyManager(w.Policy.HuJSON(), users, worlds[0].p.s.Snapshot().ListNodes())
+		if err != nil {
+			t.Fatalf("reference: %s: the policy compiled from scratch: %v", at, err)
+		}
+	} else {
+		r.ref.skip("SSH after a shared address")
+	}
+
+	// What a client's view reads of the world besides its own node: every
+	// node's addresses, as sources worth probing.
+	var known []netip.Addr
+	for _, n := range w.Topology.Nodes {
+		known = append(known, n.Addrs()...)
+	}
+
+	world, key := jsonOf(w.Topology)+string(w.Policy.HuJSON()), fmt.Sprint(known)
+
+	for i, dw := range worlds {
+		for _, id := range slices.Sorted(maps.Keys(held[i])) {
+			r.ref.clients++
+			dw.holdClient(t, at, ref, world, key, id, held[i][id], fresh, &r.ref)
+		}
+	}
+}
+
+// heldClient is one client held to the reference: node id's, holding nm.
+type heldClient struct {
+	dw   *deliveryWorld
+	at   string
+	ref  *policymodel.Ref
+	id   types.NodeID
+	nm   *netmap.NetworkMap
+	rt   *referenceTally
+	fail func(format string, args ...any)
+}
+
+// holdClient holds node id's client, holding nm, to ref; see
+// [deliveryRun.holdToReference].
+func (dw *deliveryWorld) holdClient(t *rapid.T, at string, ref *policymodel.Ref, world, key string, id types.NodeID, nm *netmap.NetworkMap,
+	fresh *policyv2.PolicyManager, rt *referenceTally,
+) {
+	c := heldClient{dw: dw, at: at, ref: ref, id: id, nm: nm, rt: rt}
+	c.fail = func(format string, args ...any) {
+		dw.failf(judgeReference, "%s: n%d: "+format, append([]any{at, id}, args...)...)
+	}
+
+	c.peers()
+	c.routes()
+	c.filter(world, key)
+	c.stamps()
+
+	if fresh != nil {
+		c.ssh(t, fresh)
+	}
+}
+
+// peers holds the client's peers, and what each carries in its
+// AllowedIPs, to the reference, and the routes the node is primary for to
+// the election.
+func (c heldClient) peers() {
+	got := make([]types.NodeID, 0, len(c.nm.Peers))
+	for _, p := range c.nm.Peers {
+		got = append(got, types.NodeID(p.ID())) //nolint:gosec // small
+	}
+
+	c.rt.peerSets++
+
+	if want := c.ref.Peers(c.id); !slices.Equal(got, want) {
+		k, ok := policymodel.ContestedPeers(c.ref, c.id, got)
+		if !ok {
+			c.fail("its client is shown %v, the reference shows it %v", got, want)
+		}
+
+		c.rt.contestedPeers[k]++
+	}
+
+	self, ok := c.ref.Node(c.id)
+	if !ok {
+		return
+	}
+
+	for _, q := range self.ServedRoutes() {
+		primary, decided := c.ref.Primary(q)
+		if q.Bits() == 0 || !decided {
+			continue
+		}
+
+		c.rt.primaries++
+
+		if want, has := primary == c.id && !policymodel.NamesNode(q), slices.Contains(c.nm.SelfNode.PrimaryRoutes().AsSlice(), q); want != has {
+			c.fail("its client is primary for %s: %t, the election gives it to n%d", q, has, primary)
+		}
+	}
+}
+
+// routes holds what each peer carries in the client's AllowedIPs beyond
+// its addresses to [policymodel.Ref.ServedRoutes].
+func (c heldClient) routes() {
+	for _, p := range c.nm.Peers {
+		pid := types.NodeID(p.ID()) //nolint:gosec // small
+		routes := slices.DeleteFunc(p.AllowedIPs().AsSlice(), func(q netip.Prefix) bool { return slices.Contains(p.Addresses().AsSlice(), q) })
+		slices.SortFunc(routes, netip.Prefix.Compare)
+
+		want, unjudged := c.ref.ServedRoutes(c.id, pid)
+		judged := policymodel.Judged(routes, unjudged)
+		c.rt.unjudgedRoutes += len(unjudged)
+
+		if c.ref.Steered(c.id, pid) && len(judged)+len(want) > 0 {
+			c.rt.steered++
+		}
+
+		if len(routes)+len(want) > 0 {
+			c.rt.routePairs++
+		}
+
+		if !slices.Equal(judged, want) {
+			k, ok := policymodel.ContestedServedRoutes(c.ref, c.id, pid, routes)
+			if !ok {
+				c.fail("its client is given %v of n%d's routes, the reference %v (%v unjudged)", routes, pid, want, unjudged)
+			}
+
+			c.rt.contestedRoutes[k]++
+		}
+	}
+}
+
+// filter holds the client's packet filter to the reference's rules
+// through its own filter. A comparison that holds without a contested
+// clause reads only the reference's rules for the node and what it
+// serves, the view and the filter; one that needs a clause reads the
+// whole world.
+func (c heldClient) filter(world, key string) {
+	n, _ := c.dw.p.w.Topology.Node(c.id)
+	rules := c.nm.PacketFilterRules.AsSlice()
+
+	k := fmt.Sprint(n, c.dw.combo.capSources, c.ref.Served(c.id).Prefixes()) + ruleList(c.ref.Rules(c.id)) + key + ruleList(rules) + clientViewKey(c.nm)
+	if c.rt.passed[k] || c.rt.passed[world+k] {
+		return
+	}
+
+	c.rt.filters++
+
+	contested := 0
+	for _, n := range c.rt.verdicts.Contested {
+		contested += n
+	}
+
+	rep := c.rt.verdicts.CompareAt(c.ref, c.id, rules, refView(n, c.dw.p.w, c.nm), c.dw.combo.capSources)
+	if !rep.Equivalent() {
+		c.fail("its client's filter differs from the reference (reference, candidate headscale): %s\nreference %v\nheadscale %v", rep, c.ref.Rules(c.id), rules)
+	}
+
+	for _, n := range c.rt.verdicts.Contested {
+		contested -= n
+	}
+
+	if contested == 0 {
+		c.rt.passed[k] = true
+	} else {
+		c.rt.passed[world+k] = true
+	}
+}
+
+// stamps holds the stamps the client holds of itself and its peers to the
+// reference's, none in address mode.
+func (c heldClient) stamps() {
+	for _, nv := range append([]tailcfg.NodeView{c.nm.SelfNode}, c.nm.Peers...) {
+		of := types.NodeID(nv.ID()) //nolint:gosec // small
+
+		var has, want []string
+
+		for k := range nv.CapMap().All() {
+			if strings.Contains(string(k), strings.TrimPrefix(policymodel.StampPrefix, "https://")) {
+				has = append(has, string(k))
+			}
+		}
+
+		slices.Sort(has)
+
+		for _, s := range c.ref.Stamps(of) {
+			if c.dw.combo.capSources {
+				want = append(want, policymodel.StampPrefix+s)
+			}
+		}
+
+		if !slices.Equal(has, want) {
+			c.fail("its client holds n%d with stamps %v, the reference stamps it %v", of, has, want)
+		}
+	}
+}
+
+// ssh holds the client's SSH policy to fresh's, a compile from scratch.
+func (c heldClient) ssh(t *rapid.T, fresh *policyv2.PolicyManager) {
+	nv, ok := c.dw.p.s.Snapshot().GetNode(c.id)
+	if !ok {
+		return
+	}
+
+	want, err := fresh.SSHPolicy(c.dw.p.cfg.ServerURL, nv)
+	if err != nil {
+		t.Fatalf("reference: %s: n%d's SSH policy from scratch: %v", c.at, c.id, err)
+	}
+
+	if want == nil {
+		want = &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}}
+	}
+
+	c.rt.ssh++
+
+	if h, w := jsonOf(c.nm.SSHPolicy), jsonOf(want); h != w {
+		c.fail("its client's SSH policy is %s, a compile from scratch gives %s", h, w)
+	}
+}
+
+// refView is what node n's client knows when it filters, holding nm: local
+// nets from what it announces and runs as, every node's addresses as
+// sources worth probing, capabilities from nm, for a client that looks
+// them up.
+func refView(n policymodel.Node, w policymodel.World, nm *netmap.NetworkMap) policymodel.ClientView {
+	own := make([]netip.Prefix, 0, 2)
+	announced := make([]netip.Prefix, 0, len(n.Announced))
+
+	for _, a := range n.Addrs() {
+		own = append(own, netip.PrefixFrom(a, a.BitLen()))
+	}
+
+	for _, r := range n.Announced {
+		announced = append(announced, policymodel.Prefixes[r])
+	}
+
+	v := policymodel.ClientView{Self: n.Addrs(), LocalNets: policymodel.LocalNets(own, announced, n.Client == policymodel.AppConnector, nil)}
+
+	for _, m := range w.Topology.Nodes {
+		v.Known = append(v.Known, m.Addrs()...)
+	}
+
+	if n.Client == policymodel.Official || n.Client == policymodel.AppConnector {
+		caps := policymodel.NewNetmapCaps(nm.SelfNode, nm.Peers)
+		v.HasCap = caps.HasCap
+	}
+
+	return v
+}
+
 // enforced is what of a netmap no delivery option may move: the node and
 // its peers without the stamps capability mode adds, SSH and DNS.
 func enforced(nm *netmap.NetworkMap) string {
@@ -1419,6 +1758,11 @@ func routeViewScript(w policymodel.World) []policymodel.Step {
 // The four combinations agree: what a node's client enforces is the same
 // in all four, but for the one class capability form refuses.
 //
+// What every client holds is right, not merely fresh: its peers, their
+// routes once routers are elected, its packet filter, the stamps it holds
+// and its SSH policy are held to the reference, read for the latest world,
+// in each combination ([deliveryRun.holdToReference]).
+//
 // The chunk scheme, on every response before the client reads it (see
 // [deliveryWorld.checkWire]), and the filter a client assembles from its
 // chunks answers as the filter served in one list. Chunk names are a
@@ -1431,7 +1775,9 @@ func routeViewScript(w policymodel.World) []policymodel.Step {
 //
 // The oracle for convergence is the client's own map session, and for
 // agreement and for the served filter, its packet filter; both share with
-// production only the render of a fresh session and the encoder. The model
+// production only the render of a fresh session and the encoder. For
+// correctness it is the reference and the client's filter, and for SSH a
+// compile from scratch. The model
 // of the client's chunks (policyv2.FilterChunks) is held to the real
 // client after every response, and used alone only where the real client
 // cannot go: chunk names held, and a client keeping them across sessions.
@@ -1465,9 +1811,14 @@ func TestDeliveryConvergesThroughTheClient(t *testing.T) {
 
 	reach := r.reach
 	t.Log(reach)
+	t.Log(&r.ref)
 
 	if testing.Short() {
 		return
+	}
+
+	if r.judges[judgeReference] {
+		r.ref.require(t)
 	}
 
 	for name, n := range map[string]int{
@@ -1487,6 +1838,7 @@ type deliveryRun struct {
 	probes probeCache
 	judges [numJudges]bool
 	steps  int
+	ref    referenceTally
 }
 
 func playDelivery(t *rapid.T, r *deliveryRun) {
@@ -1512,6 +1864,8 @@ func playDelivery(t *rapid.T, r *deliveryRun) {
 
 	agreed := map[[2]*netmap.NetworkMap]bool{}
 
+	shared := false
+
 	judge := func(at string) {
 		held := make([]map[types.NodeID]*netmap.NetworkMap, len(worlds))
 		for i, dw := range worlds {
@@ -1519,6 +1873,9 @@ func playDelivery(t *rapid.T, r *deliveryRun) {
 		}
 
 		combosAgree(t, at, r, worlds, held, agreed)
+
+		shared = shared || slices.ContainsFunc(worlds, func(dw *deliveryWorld) bool { return dw.shared }) || policymodel.SharesAddress(worlds[0].p.w)
+		r.holdToReference(t, at, worlds, held, shared)
 	}
 
 	for _, dw := range worlds {

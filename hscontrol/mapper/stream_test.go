@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"math/rand/v2"
 	"net/netip"
@@ -10303,10 +10304,10 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
-// tapWriter writes to stderr, or to the buffer a test taps it with.
+// tapWriter writes to stderr, or to the writer a test taps it with.
 type tapWriter struct {
 	mu  sync.Mutex
-	tap *bytes.Buffer
+	tap io.Writer
 }
 
 func (w *tapWriter) Write(p []byte) (int, error) {
@@ -10320,15 +10321,13 @@ func (w *tapWriter) Write(p []byte) (int, error) {
 	return os.Stderr.Write(p)
 }
 
-// tapLog keeps what is logged until the test ends out of its output and
-// returns a reader of it.
-func tapLog(t *testing.T) func() string {
+// tapTo sends what is logged until the test ends to w instead of stderr.
+// w is written under the sink's lock.
+func tapTo(t *testing.T, w io.Writer) {
 	t.Helper()
 
-	var buf bytes.Buffer
-
 	logSink.mu.Lock()
-	logSink.tap = &buf
+	logSink.tap = w
 	logSink.mu.Unlock()
 
 	t.Cleanup(func() {
@@ -10336,6 +10335,16 @@ func tapLog(t *testing.T) func() string {
 		logSink.tap = nil
 		logSink.mu.Unlock()
 	})
+}
+
+// tapLog keeps what is logged until the test ends out of its output and
+// returns a reader of it.
+func tapLog(t *testing.T) func() string {
+	t.Helper()
+
+	var buf bytes.Buffer
+
+	tapTo(t, &buf)
 
 	return func() string {
 		logSink.mu.Lock()
