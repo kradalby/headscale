@@ -8,6 +8,8 @@
 package state
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"net/netip"
@@ -22,6 +24,8 @@ import (
 	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
 	"tailscale.com/envknob"
@@ -378,19 +382,25 @@ func readsOf(st policymodel.Step, w policymodel.World) []types.NodeID {
 // both modes, every step one commit (or its users, document and nodes
 // written apart, as drawn), and after every step holds what the world
 // serves to a world built from nothing for the same users, document and
-// nodes (servedDiffers), and its stamps to the reference model
-// (stampsDiffer).
+// nodes (servedDiffers), every node's SSH policy to that world's
+// (sshDiffers), and its stamps to the reference model (stampsDiffer).
+// Under the policy audit, no audit may log anything but its known false
+// alarms ([auditLines.judge]).
 //
 // Oracles: the world from scratch, the same cells (it sees what updating
-// cells, their cut-offs and carried values get wrong); for stamps, the
-// reference, which shares nothing with the world (it sees which set the
-// stamp cell reads).
+// cells, their cut-offs and carried values get wrong) and a compile that
+// inherits nothing; for stamps, the reference, which shares nothing with
+// the world (it sees which set the stamp cell reads).
 func TestWorldMatchesScratchWorld(t *testing.T) {
 	var shapes shapeTally
 
 	known := tally{}
+	audits := watchAudits(t)
 
 	rapid.Check(t, func(t *rapid.T) {
+		// What a failed case logged after its failure is not this case's.
+		audits.take()
+
 		s := policymodel.Scenarios(worldSteps).Draw(t, "scenario")
 		apart := rapid.SliceOfN(rapid.Map(rapid.IntRange(0, 3), func(n int) bool { return n == 3 }), len(s.Steps), len(s.Steps)).Draw(t, "written apart")
 
@@ -404,7 +414,15 @@ func TestWorldMatchesScratchWorld(t *testing.T) {
 				all = append(all, n.ID)
 			}
 
-			if msg := servedDiffers(snap, scratchOf(t, s.Start, capSources), all); msg != "" {
+			w := s.Start
+			shared, sorted := sharesAddress(w), policymodel.MergesApart(w)
+			scr := scratchOf(t, s.Start, capSources)
+
+			if msg := servedDiffers(snap, scr, all); msg != "" {
+				t.Fatalf("capability sources %t, at the start: %s", capSources, msg)
+			}
+
+			if msg := sshDiffers(snap, scr); msg != "" {
 				t.Fatalf("capability sources %t, at the start: %s", capSources, msg)
 			}
 
@@ -412,14 +430,16 @@ func TestWorldMatchesScratchWorld(t *testing.T) {
 				t.Fatalf("capability sources %t, at the start: %s", capSources, msg)
 			}
 
-			w := s.Start
-			shared := sharesAddress(w)
+			if msg := audits.judge(shared, sorted, known); msg != "" {
+				t.Fatalf("capability sources %t, at the start: %s", capSources, msg)
+			}
 
 			for i, st := range s.Steps {
 				next, change := w.Commit(st)
 				snap = m.commit(t, next, change, apart[i])
 				scr := scratchOf(t, next, capSources)
 				shared = shared || sharesAddress(next)
+				sorted = sorted || policymodel.MergesApart(next)
 
 				if policyCapsDiffer(snap, scr) && shared {
 					// Found by the policy/v2 properties on the tree this was
@@ -442,17 +462,162 @@ func TestWorldMatchesScratchWorld(t *testing.T) {
 					t.Fatalf("capability sources %t, after step %d (%s): %s", capSources, i+1, st, msg)
 				}
 
+				if msg := sshDiffers(snap, scr); msg != "" {
+					if shared {
+						// TODO(kradalby): policy/stale-under-shared-address: the
+						// SSH half of the exception above, pinned by
+						// TestSSHPolicyForgetsALeaverWhoSharedAnAddress.
+						known["SSH policies stale under a shared address"]++
+
+						break
+					}
+
+					t.Fatalf("capability sources %t, after step %d (%s): %s", capSources, i+1, st, msg)
+				}
+
 				if msg := stampsDiffer(snap, policymodel.RefOf(next)); msg != "" {
 					t.Fatalf("capability sources %t, after step %d (%s): %s", capSources, i+1, st, msg)
 				}
 
+				if msg := audits.judge(shared, sorted, known); msg != "" {
+					t.Fatalf("capability sources %t, after step %d (%s): %s", capSources, i+1, st, msg)
+				}
+
 				w = next
+			}
+
+			// A step the exceptions above stop at is judged for its other
+			// lines.
+			if msg := audits.judge(shared, sorted, known); msg != "" {
+				t.Fatalf("capability sources %t, at the last step judged: %s", capSources, msg)
 			}
 		}
 	})
 
 	t.Logf("known divergences: %v", known)
 	shapes.log(t, "world matches scratch")
+}
+
+// sshBaseURL is the server URL SSH policies are read for: check actions
+// embed it.
+const sshBaseURL = "https://headscale.test"
+
+// sshDiffers returns how a node's SSH policy, as inc serves it, differs
+// from scr's, a world built from scratch whose compile inherits nothing.
+// Every node reads it, as a session does, so the next commit has entries
+// to carry.
+func sshDiffers(inc, scr *Snapshot) string {
+	for _, n := range scr.ListNodes().All() {
+		ni, ok := inc.GetNode(n.ID())
+		if !ok {
+			continue
+		}
+
+		got, errGot := inc.SSHPolicy(sshBaseURL, ni)
+		want, errWant := scr.SSHPolicy(sshBaseURL, n)
+
+		if (errGot == nil) != (errWant == nil) || !reflect.DeepEqual(got, want) {
+			return fmt.Sprintf("n%d's SSH policy: incremental %s, from scratch %s", n.ID(), sshString(got, errGot), sshString(want, errWant))
+		}
+	}
+
+	return ""
+}
+
+func sshString(p *tailcfg.SSHPolicy, err error) string {
+	if err != nil {
+		return "error " + err.Error()
+	}
+
+	b, err := json.Marshal(p)
+	if err != nil {
+		return "unencodable: " + err.Error()
+	}
+
+	return string(b)
+}
+
+// auditLines collects, while installed, every line the policy audits log,
+// read as the integration runs read them: any line saying "policy audit",
+// whatever counter it moved, if any.
+type auditLines struct {
+	mu    sync.Mutex
+	lines []auditLine
+}
+
+type auditLine struct {
+	Message string `json:"message"`
+	Error   string `json:"error"`
+}
+
+func (a *auditLines) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("policy audit")) {
+		l := auditLine{Message: string(p)}
+		_ = json.Unmarshal(p, &l)
+
+		a.mu.Lock()
+		a.lines = append(a.lines, l)
+		a.mu.Unlock()
+	}
+
+	return os.Stderr.Write(p)
+}
+
+// watchAudits collects the audit lines for the rest of t; nil, collecting
+// nothing, when the policy audit is off.
+func watchAudits(t *testing.T) *auditLines {
+	t.Helper()
+
+	if !PolicyAudit() {
+		return nil
+	}
+
+	a := &auditLines{}
+	was := log.Logger
+	log.Logger = zerolog.New(a)
+
+	t.Cleanup(func() { log.Logger = was })
+
+	return a
+}
+
+// take returns the lines logged since it last returned.
+func (a *auditLines) take() []auditLine {
+	if a == nil {
+		return nil
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	out := a.lines
+	a.lines = nil
+
+	return out
+}
+
+// judge returns the first line logged since the last judge that is no
+// known false alarm, counting those in known: the compile's node
+// attributes and SSH policies once the case shared an address, and the
+// filter audit's merge order once it held a user whose addresses sort
+// apart.
+func (a *auditLines) judge(shared, sorted bool, known tally) string {
+	for _, l := range a.take() {
+		switch {
+		case shared && l.Message == "policy audit" && (strings.Contains(l.Error, "node attributes") || strings.Contains(l.Error, "SSH policy of node")):
+			// TODO(kradalby): policy/stale-under-shared-address: the
+			// exceptions above, as the audit reports them.
+			known["audit: stale under a shared address"]++
+		case sorted && l.Message == "policy audit: filter" && strings.Contains(l.Error, "capability form expands otherwise than address form"):
+			// TODO(kradalby): policy/merge-order: see
+			// policymodel.MergesApart.
+			known["audit: merge order"]++
+		default:
+			return fmt.Sprintf("%s: %s", l.Message, l.Error)
+		}
+	}
+
+	return ""
 }
 
 // policyCapsDiffer reports whether the compile's node capabilities of a
@@ -699,13 +864,18 @@ func filtersNameAll(a, c *Snapshot) bool {
 // field (sinceMisses), so a miss names the field that missed it. Pairs
 // more than one commit apart are what the hub's render log asks. Oracle:
 // the served values at both ends, the world's own accessors; it sees what
-// Since's deltas miss, not what the cells serve.
+// Since's deltas miss, not what the cells serve. Under the policy audit,
+// no audit may log anything but its known false alarms.
 func TestSinceSoundOverAnyPair(t *testing.T) {
 	var shapes shapeTally
 
 	counts := tally{}
+	audits := watchAudits(t)
 
 	rapid.Check(t, func(t *rapid.T) {
+		// What a failed case logged after its failure is not this case's.
+		audits.take()
+
 		s := policymodel.Scenarios(worldSteps).Draw(t, "scenario")
 		apart := rapid.SliceOfN(rapid.Map(rapid.IntRange(0, 3), func(n int) bool { return n == 3 }), len(s.Steps), len(s.Steps)).Draw(t, "written apart")
 
@@ -746,6 +916,15 @@ func TestSinceSoundOverAnyPair(t *testing.T) {
 						t.Fatalf("capability sources %t, from step %d to step %d (%s): %s", capSources, i, j, s.Steps[j-1], msg)
 					}
 				}
+			}
+
+			worlds := s.Worlds()
+
+			shared := slices.ContainsFunc(worlds, sharesAddress)
+			sorted := slices.ContainsFunc(worlds, policymodel.MergesApart)
+
+			if msg := audits.judge(shared, sorted, counts); msg != "" {
+				t.Fatalf("capability sources %t: %s", capSources, msg)
 			}
 		}
 	})
