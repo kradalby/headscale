@@ -82,7 +82,7 @@ make dev
 # Individual targets
 make build           # build the headscale binary
 make test            # go test -race ./...
-make test-capability-sources  # the suite with policy.capability_sources on
+make test-options CAPABILITY_SOURCES=false FILTER_CHUNKS=true  # any combination of the two policy options
 make fmt             # format Go, docs, proto
 make lint            # lint Go, proto
 make generate        # regenerate protobuf code (after changes to proto/)
@@ -170,6 +170,11 @@ headscale/
   `mapper.go` (DNS, profiles, debug dumps). Performance-critical.
 - `policy/` — `policy/v2/` is **the** policy implementation. The
   top-level `policy.go` is thin wrappers. There is no v1 directory.
+  `selector.go`, `roles.go` (membership), `template.go`, `expand.go`
+  (filters), `visibility.go` (peers, route access, via), `fallback.go`
+  (capability or address form), `chunk.go` (named filter chunks); the
+  compile in `policy.go` serves SSH, node attributes, tag owners,
+  auto-approvers and DERP.
 - `config/` — config code outside the `types.Config` struct: the loader
   (`Load`: defaults, file, `HEADSCALE_*` environment; `Default`; `Marshal`;
   the removed-keys table), `Validate` and `Warnings`, the checks behind
@@ -197,12 +202,23 @@ headscale/
   the `State` type, not directly to the database.
 - **The world** (`hscontrol/state/world.go`) holds nodes, users, the
   policy source, the DERP map and an immutable DNS view (`types.DNSView`,
-  frozen settings plus the extra records) as graph inputs, and
-  derives the node index, the compiled policy, peer classes and primary
-  routes from them. A derived cell recomputes only when a cell it read
-  changed. Every read takes one immutable `Snapshot`; node writes go
-  through `world.update`, which commits writes arriving together in one
+  frozen settings plus the extra records) as graph inputs. It derives the
+  node index; the policy compile (`policy`: SSH, node capabilities, tag
+  owners, auto-approvers, DERP, and which document is in force);
+  membership (`selectors`, `user-sets`, `roles`, `postings`); `templates`,
+  `subnet-approvals` and `sides`; and from those what is served:
+  `filters`, `peers`, `via-plan`, `primaries` and `route-rules`, with
+  `receivers`, `stamps`, `render-caps` and `address-holders` when filter
+  sources are named by capability. Packet filters, peers, routes and via
+  never come from the compile. A derived cell recomputes only when a cell
+  it read changed. Every read takes one immutable `Snapshot`; node writes
+  go through `world.update`, which commits writes arriving together in one
   transaction.
+- **Fallbacks**: `hscontrol/policy/v2/fallback.go` alone decides whether a
+  source goes as a capability or as addresses (`sourceForm`) and how a
+  session is sent its filter (`FilterDelivery`). Its `TODO(capsrc/<reason>)`
+  lines are matched byte-exact by `TestFallbackReasonsComplete`: do not
+  reword them.
 - **DNS ownership**: `Config.DNSView` freezes startup DNS settings, including
   MagicDNS reverse routes. Runtime readers of the client-facing DNS config use
   `Snapshot.DNS`; only extra records change after construction. Wire and debug
@@ -246,8 +262,12 @@ tagged (owned by tags) or user-owned (owned by a user namespace), never
 both. This is a load-bearing architectural rule.
 
 - **Use `node.IsTagged()`** (`hscontrol/types/node.go`) to determine
-  ownership, not `node.UserID().Valid()`. A tagged node may still have
-  `UserID` set for "created by" tracking — `IsTagged()` is authoritative.
+  ownership, not `node.UserID().Valid()`. `State` clears `UserID` and
+  `User` whenever a node becomes tagged (registration with tags,
+  `SetTags`, re-authentication), and a 0.29 migration cleared existing
+  rows; who created a tagged node is its auth key's `UserID`. Code must
+  still not read a user off a tagged node: fixtures and hand-built nodes
+  carry both, and `IsTagged()` is authoritative.
 - `IsUserOwned()` returns `!IsTagged()`.
 - Tagged nodes are presented to Tailscale as the special
   `TaggedDevices` user (`hscontrol/types/users.go`, ID `2147455555`).
@@ -384,19 +404,32 @@ a broken one.
   only surface on one backend.
 - **Cost must follow what changed**, not tailnet size: a commit and the
   sessions it wakes are the hot path. Measure before changing `world.go`,
-  `mapper/` or the policy compile: `BenchmarkScalingWrites` and
-  `BenchmarkFirstMap` (`hscontrol/mapper`, `HEADSCALE_SCALE_NODES=10000`
-  for one size), `BenchmarkWorldEndpointWrite` (`hscontrol/state`).
-- **Two source modes**: `make test` runs the suite naming filter sources by
-  address (the default), `make test-capability-sources` by capability
-  (`HEADSCALE_TEST_CAPABILITY_SOURCES=true`, read by test binaries only).
-  A test that needs one mode pins it with
-  `t.Setenv(state.TestCapabilitySourcesEnv, "false")` or builds its server
-  with the config option; it never inherits the mode. With the policy audit
-  on, capability mode needs a `-timeout` well past the default 10 minutes.
-- **Incremental policy compiles** reuse what a node change cannot reach.
-  `HEADSCALE_DEBUG_POLICY_AUDIT=1` (on in integration tests) compiles from
-  scratch as well and logs any difference; a mismatch fails the test.
+  `mapper/` or the policy pipeline: `BenchmarkScalingWrites` and
+  `BenchmarkFirstMapShapes` (`hscontrol/mapper`; `HEADSCALE_SCALE_NODES=10000`
+  runs one size), `BenchmarkFirstMap` (1,000 and 10,000 nodes; pick one
+  with `-bench 'BenchmarkFirstMap$/nodes=1000'`),
+  `BenchmarkWorldEndpointWrite` (`hscontrol/state`).
+- **Policy options in tests**: `policy.capability_sources` and
+  `policy.filter_chunks` are on by default, and test binaries follow:
+  each is on unless its switch, `HEADSCALE_TEST_CAPABILITY_SOURCES` or
+  `HEADSCALE_TEST_FILTER_CHUNKS` (read by test binaries only), is
+  `false`. `make test-options CAPABILITY_SOURCES=… FILTER_CHUNKS=…` runs any
+  of the four combinations. A test that needs a mode pins it: on through
+  its configuration (`cfg.Policy.CapabilitySources = true`,
+  `servertest.WithCapabilitySources()`) or the switch, off only through
+  the switch (`t.Setenv(state.TestCapabilitySourcesEnv, "false")`, so not
+  in a parallel test): a configuration literal leaves both off, which a
+  test binary reads as unpinned. Docker runs take
+  `HEADSCALE_INTEGRATION_CAPABILITY_SOURCES` and
+  `HEADSCALE_INTEGRATION_FILTER_CHUNKS` either way; unset, headscale's
+  default holds. With the policy audit on, the mapper package needs a
+  `-timeout` well past the default 10 minutes.
+- **The policy compile** reuses what a node change cannot reach for what it
+  serves. `HEADSCALE_DEBUG_POLICY_AUDIT=1` (on in integration tests) holds
+  every served filter, peer list, route and via election to the policy
+  compiled from scratch in address form (`PolicyManager.addresses`, built
+  only when read), and what the compile serves to a compile from scratch;
+  a mismatch fails the test.
 - **`.claude/agents/` is deprecated.** Do not create new agent files
   there. Put behavioural guidance in this file and procedural guidance
   in the nearest README.

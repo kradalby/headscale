@@ -11,6 +11,13 @@ nodes](https://tailscale.com/docs/features/exit-nodes) for a tailnet.
   node. Use it to securely access the Internet on an untrusted Wi-Fi or to access online services that expect traffic
   from a specific IP address.
 
+!!! note "Nodes that announce routes are sent addresses"
+
+    A node that announces subnet or exit routes, approved or not, gets its whole packet filter with every source as
+    addresses, even with [capability sources](policy.md#capability-sources) on. When a node starts announcing routes, it
+    accepts ICMP more widely than its policy allows until it installs that filter, normally for one map request round
+    trip. See [ICMP window](policy.md#icmp-window-when-a-node-starts-announcing-routes).
+
 ## Subnet router
 
 The setup of a subnet router requires double opt-in, once from a subnet router and once on the control server to allow

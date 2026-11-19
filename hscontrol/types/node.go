@@ -318,8 +318,9 @@ func (node *Node) IsTagged() bool {
 	return len(node.Tags) > 0
 }
 
-// IsUserOwned returns true if node is owned by a user (not tagged).
-// Tagged nodes may have a UserID for "created by" tracking, but the tag is the owner.
+// IsUserOwned returns true if node is owned by a user (not tagged). State
+// clears a tagged node's user, but a node built by hand can carry both, and
+// the tag is the owner.
 func (node *Node) IsUserOwned() bool {
 	return !node.IsTagged()
 }
