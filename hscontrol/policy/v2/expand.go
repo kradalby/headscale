@@ -1170,12 +1170,14 @@ func (f *Filters) Global() ([]tailcfg.FilterRule, error) {
 }
 
 // filterChange is what [Filters.Changed] found. ids are named in either
-// form; addr names more in address form only. compared reports that every
-// node's filter was compared, so the filters followed hold a cut of every
-// node they did not name.
+// form; addr names more in address form only, capOnly, sorted, more in
+// capability form only. compared reports that every node's filter was
+// compared, so the filters followed hold a cut of every node in each form
+// they did not name it in.
 type filterChange struct {
 	ids      []types.NodeID
 	addr     addressReceivers
+	capOnly  []types.NodeID
 	all      bool
 	compared bool
 }
@@ -1239,18 +1241,19 @@ func (a addressReceivers) lists() [][]types.NodeID {
 // position that moved; the via routers of a via grant that moved; and,
 // when any rule moved, every exit node and subnet router. Across a change
 // of which selectors or grants there are, or without the sides
-// [FollowFilters] gives, it compares every node's filter instead. The
-// change from the filters f follows is worked out once. It lists every
-// receiver of a rule whose sources only address form reads moved: routing
-// asks [Filters.ChangedFor], which names those only where they are sent
-// addresses.
+// [FollowFilters] gives, it compares every node's filter instead, form by
+// form. The change from the filters f follows is worked out once. It lists
+// every receiver of a rule whose sources only address form reads moved,
+// and, across such a change, every node in each form old holds no cut of:
+// routing asks [Filters.ChangedFor], which names each only where it is
+// sent that form.
 func (f *Filters) Changed(old *Filters) ([]types.NodeID, bool) {
 	c, ok := f.changeFrom(old)
-	if !ok || c.all || c.addr.empty() {
+	if !ok || c.all || c.addr.empty() && len(c.capOnly) == 0 {
 		return slices.Clip(c.ids), c.all || !ok
 	}
 
-	ids := slices.Concat(append([][]types.NodeID{c.ids}, c.addr.lists()...)...)
+	ids := slices.Concat(append([][]types.NodeID{c.ids, c.capOnly}, c.addr.lists()...)...)
 	slices.Sort(ids)
 
 	return slices.Compact(ids), false
@@ -1258,10 +1261,11 @@ func (f *Filters) Changed(old *Filters) ([]types.NodeID, bool) {
 
 // ChangedFor returns, sorted, the nodes whose filter in the form recv's
 // facts send it can differ between old and f, or all: what [Filters.Changed]
-// names, less the receivers sent capabilities for a rule only address form
-// reads, found through recv's nodes not sent capabilities rather than every
-// receiver. A node whose facts moved between the two is not named here:
-// it is served its other form, and the caller names it.
+// names, less each node named only in the form recv does not send it; the
+// receivers named in address form only are found through recv's nodes not
+// sent capabilities rather than every receiver. A node whose facts moved
+// between the two is not named here: it is served its other form, and the
+// caller names it.
 func (f *Filters) ChangedFor(old *Filters, recv Receivers) ([]types.NodeID, bool) {
 	c, ok := f.changeFrom(old)
 	if !ok || c.all {
@@ -1277,7 +1281,7 @@ func (f *Filters) ChangedFor(old *Filters, recv Receivers) ([]types.NodeID, bool
 // The change is the filters', shared by every caller, which may append to
 // what it is given: a slice of it comes clipped, so an append copies.
 func (c filterChange) namedFor(mode SourceMode, recv Receivers) []types.NodeID {
-	if c.addr.empty() {
+	if c.addr.empty() && len(c.capOnly) == 0 {
 		return slices.Clip(c.ids)
 	}
 
@@ -1285,6 +1289,12 @@ func (c filterChange) namedFor(mode SourceMode, recv Receivers) []types.NodeID {
 
 	for _, id := range recv.addressForm {
 		if receiverForm(mode, recv.Of(id)) != reasonNone && c.addr.has(id) {
+			ids = append(ids, id)
+		}
+	}
+
+	for _, id := range c.capOnly {
+		if receiverForm(mode, recv.Of(id)) == reasonNone {
 			ids = append(ids, id)
 		}
 	}
@@ -1545,16 +1555,23 @@ func namesAll(ids []types.NodeID, list views.Slice[types.NodeView]) filterChange
 	return filterChange{all: true}
 }
 
-// compareFilters returns the nodes whose filter differs at the two ends:
-// what o holds, cut or carried, against n's cut, which n keeps for the
-// sessions that read it next. A node o holds none for was served none from
-// o, so it is named and cut at neither end. A document edit that changes
-// which selectors or grants there are pays a cut per node o holds.
+// compareFilters returns the nodes whose filter differs at the two ends,
+// form by form: what o holds, cut or carried, against n's cut, which n
+// keeps for the sessions that read it next. A form o holds no cut of may
+// yet be served from o, to a session that took o before this ran, so the
+// node is named in that form: the other form, which a flip of its facts or
+// an earlier comparison can leave held alone, says nothing of it. A
+// document edit that changes which selectors or grants there are pays a
+// cut per form o holds.
 func compareFilters(o, n *Filters) filterChange {
-	var ids []types.NodeID
+	forms := formAddress + 1
+	if n.mode == CapabilitySources {
+		forms = numForms
+	}
+
+	var ids, addrOnly, capOnly []types.NodeID
 
 	for _, id := range listIDs(o.nodes, n.nodes) {
-		was, held := o.held(id)
 		nv, listed := n.node(id)
 
 		// TODO(kradalby): overwake/compare-filters: across a document edit
@@ -1569,49 +1586,64 @@ func compareFilters(o, n *Filters) filterChange {
 		// precision clause of TestFiltersChangedSoundPreciseAndCarried skips
 		// document edits for it. No upstream reference: headscale's own
 		// change routing.
-		if !held || !listed {
+		if !listed {
 			ids = append(ids, id)
 
 			continue
 		}
 
-		for form, rules := range was {
-			is, err := n.cut(nv, form, recutReason(n.mode, form))
-			if err != nil || !reflect.DeepEqual(rules, is) {
-				ids = append(ids, id)
+		var moved [numForms]bool
 
-				break
+		served := moved[:forms]
+		for i := range served {
+			form := filterForm(i) //nolint:gosec // below numForms
+			was, held := o.heldIn(id, form)
+
+			if !held {
+				served[i] = true
+
+				continue
 			}
+
+			is, err := n.cut(nv, form, recutReason(n.mode, form))
+			served[i] = err != nil || !reflect.DeepEqual(was, is)
+		}
+
+		// Address mode serves no capability form, so address form is all.
+		capMoved := moved[formCapability] || forms < numForms
+
+		switch {
+		case moved[formAddress] && capMoved:
+			ids = append(ids, id)
+		case moved[formAddress]:
+			addrOnly = append(addrOnly, id)
+		case moved[formCapability]:
+			capOnly = append(capOnly, id)
 		}
 	}
 
 	c := namesAll(ids, n.nodes)
 	c.compared = true
 
+	if !c.all {
+		if len(addrOnly) > 0 {
+			c.addr.holders = [][]types.NodeID{addrOnly}
+		}
+
+		c.capOnly = capOnly
+	}
+
 	return c
 }
 
-// held returns, by form, the filters f holds for id, cut or carried,
+// heldIn returns the filter f holds for id in form, cut or carried,
 // cutting none.
-func (f *Filters) held(id types.NodeID) (map[filterForm][]tailcfg.FilterRule, bool) {
-	var out map[filterForm][]tailcfg.FilterRule
-
-	for form := range numForms {
-		rules, ok := f.byNode[form].Load(id)
-		if !ok {
-			rules, ok = f.carried[form].Load().Get(id)
-		}
-
-		if ok {
-			if out == nil {
-				out = map[filterForm][]tailcfg.FilterRule{}
-			}
-
-			out[form] = rules
-		}
+func (f *Filters) heldIn(id types.NodeID, form filterForm) ([]tailcfg.FilterRule, bool) {
+	if rules, ok := f.byNode[form].Load(id); ok {
+		return rules, true
 	}
 
-	return out, out != nil
+	return f.carried[form].Load().Get(id)
 }
 
 // listIDs returns, sorted, the IDs in either sorted list.

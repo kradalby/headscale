@@ -1282,6 +1282,129 @@ func TestFiltersChangedFollowsSelfRuleMergeKeys(t *testing.T) {
 	assert.Equal(t, []uint16{80, 443}, ports(is), "alice's node is served the reordered filter, not a carried one")
 }
 
+// TestFiltersComparedInTheFormServed pins, across a document edit that
+// changes the selector table, that each node is compared in the form it is
+// served, not in the form the old filters happen to hold. Node 5 stops
+// being an app connector: the carry keeps its address form alone. Node 4, a
+// via router of tag:r, starts announcing its approved route in one commit
+// with an edit that changes the table: the comparison recuts only the
+// capability form the old filters hold. Each is then served the form it has
+// no cut of, and a session that took those filters reads it from them after
+// routing moved on, so the next edit must name each where only its served
+// form moved: the via grant's literal source, which capability form cuts no
+// via rule for, and a source renamed to a group of the same members, which
+// address form writes alike. Node 6, served the capability form it holds,
+// which no edit reaches, is left out.
+func TestFiltersComparedInTheFormServed(t *testing.T) {
+	doc := func(literal, group, extra string) []byte {
+		return fmt.Appendf(nil, `{"groups": {"group:a": ["bob@"], "group:b": ["bob@"]},
+		"tagOwners": {"tag:r": ["alice@"], "tag:s": [], "tag:x": []},
+		"grants": [{"src": [%q, "autogroup:tagged"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via": ["tag:r"]},
+			{"src": [%q], "dst": ["tag:s"], "ip": ["tcp:22"]},
+			{"src": ["alice@"], "dst": ["alice@"], "ip": ["tcp:80"]}%s]}`, literal, group, extra)
+	}
+	alice, bob := &sideUsers[0], &sideUsers[1]
+
+	// A grant no node receives, whose selector is new to the table.
+	const extra = `, {"src": ["tag:x"], "dst": ["tag:x"], "ip": ["tcp:1"]}`
+
+	nodes := types.Nodes{
+		sideNode(2, bob, "100.64.0.2", "", nil),
+		sideNode(4, nil, "100.64.0.11", "", []string{"tag:r"}, "+10.0.0.0/24"),
+		sideNode(5, nil, "100.64.0.5", "", []string{"tag:s"}),
+		sideNode(6, alice, "100.64.0.6", "", nil),
+	}
+	asOfficial(nodes)
+	nodes[2].Hostinfo.AppConnector.Set(true)
+
+	pm, err := NewPolicyManager(doc("8.8.8.0/29", "group:a", ""), sideUsers, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	m := newSideModel(t, pm, sideUsers, nodes)
+	us := NewUserSets(nil, m.t.sel, sideUsers)
+	recv := modelReceivers(true, m)
+	prev := FollowFiltersFor(CapabilitySources, nil, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+
+	for _, n := range m.list {
+		_, err := prev.ForNode(n.ID, recv.Of(n.ID))
+		require.NoError(t, err)
+	}
+
+	// follow routes the filters of m's state from prev as Since does,
+	// which works out what they carry.
+	follow := func(prev *Filters) (*Filters, Receivers) {
+		t.Helper()
+
+		f := FollowFiltersFor(CapabilitySources, prev, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+		r := modelReceivers(true, m)
+		_, all := f.ChangedFor(prev, r)
+		require.False(t, all)
+
+		return f, r
+	}
+
+	flip := func(id types.NodeID, set func(*tailcfg.Hostinfo)) {
+		t.Helper()
+
+		next := slices.Clone(m.list)
+		i := slices.IndexFunc(next, func(n *types.Node) bool { return n.ID == id })
+		n := *next[i]
+		n.Hostinfo = n.Hostinfo.Clone()
+		set(n.Hostinfo)
+		next[i] = &n
+		m.step(t, us, next)
+	}
+
+	flip(5, func(hi *tailcfg.Hostinfo) { hi.AppConnector.Set(false) })
+
+	carried, _ := follow(prev)
+
+	flip(4, func(hi *tailcfg.Hostinfo) { hi.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")} })
+
+	table := m.t.table()
+
+	us, ok := m.edit(t, us, doc("8.8.8.0/29", "group:a", extra))
+	require.True(t, ok)
+	require.NotSame(t, table, m.t.table(), "test sanity: the edit changes the selector table")
+
+	mid, midRecv := follow(carried)
+	require.ElementsMatch(t, []types.NodeID{4, 5}, midRecv.ChangedSince(recv), "test sanity: both flipped their form")
+
+	for id, served := range map[types.NodeID]filterForm{4: formAddress, 5: formCapability} {
+		_, other := mid.heldIn(id, 1-served)
+		_, own := mid.heldIn(id, served)
+		require.True(t, other && !own, "test sanity: node %d holds only the form it is not served", id)
+	}
+
+	table = m.t.table()
+
+	_, ok = m.edit(t, us, doc("8.8.4.0/29", "group:b", extra))
+	require.True(t, ok)
+	require.NotSame(t, table, m.t.table(), "test sanity: the edit changes the selector table")
+
+	next := FollowFiltersFor(CapabilitySources, mid, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
+	nextRecv := modelReceivers(true, m)
+
+	ids, all := next.ChangedFor(mid, nextRecv)
+	require.False(t, all)
+
+	every, _ := next.Changed(mid)
+
+	for _, id := range []types.NodeID{4, 5} {
+		was, err := mid.ForNode(id, midRecv.Of(id))
+		require.NoError(t, err)
+
+		is, err := next.ForNode(id, nextRecv.Of(id))
+		require.NoError(t, err)
+		require.NotEqual(t, was, is, "test sanity: node %d's served filter moved", id)
+
+		assert.Contains(t, ids, id, "node %d is compared in the form it is served", id)
+		assert.Contains(t, every, id, "Changed names node %d", id)
+	}
+
+	assert.NotContains(t, ids, types.NodeID(6), "a node served the form it holds, unmoved, is not named")
+}
+
 // TestFiltersChangeIsNotSharedWithCallers pins that the change the filters
 // keep comes to each caller clipped: Since appends to it, and the hub and
 // the sessions' renders ask for it at once, so an append into its spare

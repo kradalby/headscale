@@ -9712,6 +9712,153 @@ func TestHubWakesSessionsRenderedBetweenCoalescedCommits(t *testing.T) {
 	hh.settled("reconnected")
 }
 
+// TestHubRoutesALateReadInTheFormServed routes a session that took a
+// snapshot when woken for its own form flip, and cuts its filter from it
+// only after the hub routed the next commit: a document edit that changes
+// which selectors or grants there are. Its node held a cut of its other
+// form alone there, which says nothing of the one it is served. The
+// session must end holding what a fresh render of the edit gives, and the
+// filters must name it themselves, whatever else wakes it. A merge position
+// moved by an inserted grant reorders the address form, which the wire
+// shows only for a whole filter; a member removed from a via grant takes
+// away the access a router's address form gives, and route viewers woken
+// wholesale (overwake/route-viewers) wake its router too.
+func TestHubRoutesALateReadInTheFormServed(t *testing.T) {
+	t.Setenv(state.TestFilterChunksEnv, "false")
+
+	route := netip.MustParsePrefix("10.0.0.0/24")
+
+	viaDoc := func(members, extra string) string {
+		return fmt.Sprintf(`{"groups": {"group:g": [%s]}, "tagOwners": {"tag:r": ["u1@"]},
+		"grants": [{"src": ["u1@"], "dst": ["u1@"], "ip": ["*"]}, {"src": ["u2@"], "dst": ["u2@"], "ip": ["*"]},
+			{"src": ["u2@"], "dst": ["tag:r"], "ip": ["tcp:22"]}%s,
+			{"src": ["group:g"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via": ["tag:r"]}]}`, members, extra)
+	}
+
+	for _, tc := range []struct {
+		name string
+		// router makes the flipping node a tag:r router of route, not yet
+		// announcing it; else it is u1's first node.
+		router bool
+		flip   func(*tailcfg.Hostinfo)
+		// docs are the document at the start, the one committed with the
+		// flip ("" for none) and the edit.
+		docs [3]string
+	}{
+		{
+			name: "merge position",
+			flip: func(hi *tailcfg.Hostinfo) { hi.AppConnector.Set(true) },
+			docs: [3]string{
+				`{"grants": [{"src": ["u1@"], "dst": ["u1@"], "ip": ["tcp:22"]}, {"src": ["u2@"], "dst": ["u1@"], "ip": ["tcp:22"]}]}`,
+				"",
+				`{"grants": [{"src": ["u2@"], "dst": ["u2@"], "ip": ["tcp:22"]},
+					{"src": ["u1@"], "dst": ["u1@"], "ip": ["tcp:22"]}, {"src": ["u2@"], "dst": ["u1@"], "ip": ["tcp:22"]}]}`,
+			},
+		},
+		{
+			name:   "via member removed",
+			router: true,
+			flip:   func(hi *tailcfg.Hostinfo) { hi.RoutableIPs = []netip.Prefix{route} },
+			docs: [3]string{
+				viaDoc(`"u1@", "u2@"`, ""),
+				viaDoc(`"u1@", "u2@"`, `, {"src": ["u1@"], "dst": ["u1@"], "ip": ["tcp:22"]}`),
+				viaDoc(`"u1@"`, ""),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, s, ids := streamTestState(t, tc.docs[0], func(cfg *types.Config) { cfg.Policy.CapabilitySources = true })
+
+			u1, err := s.GetUserByName("u1")
+			require.NoError(t, err)
+
+			hh := &handHub{t: t, cfg: cfg, s: s, h: NewHub(), u1: u1, streams: map[types.NodeID]*Stream{}, sessions: map[types.NodeID]*Session{}}
+
+			official := func(n *types.Node) {
+				n.Hostinfo = &tailcfg.Hostinfo{GoVersion: runtime.Version(), IPNVersion: version.Long()}
+			}
+
+			for _, id := range ids {
+				n, ok := s.GetNodeByID(id)
+				require.True(t, ok)
+
+				nn := n.AsStruct()
+				official(nn)
+				s.PutNodeInStoreForTest(*nn)
+			}
+
+			all, x := ids[:], ids[0]
+
+			if tc.router {
+				router := s.CreateRegisteredNodeForTest(u1, "router")
+				router.Tags = []string{"tag:r"}
+				router.UserID, router.User = nil, nil
+				router.ApprovedRoutes = []netip.Prefix{route}
+				official(router)
+				s.PutNodeInStoreForTest(*router)
+
+				x = router.ID
+				all = append(all, x)
+			}
+
+			for _, id := range all {
+				hh.open(id)
+			}
+
+			// Every session reads the snapshot routed from, as the next
+			// routing compares from it.
+			start := s.Snapshot()
+			hh.route(start, start)
+			hh.settled("start")
+
+			for _, id := range all {
+				hh.render(id, start)
+			}
+
+			n, ok := s.GetNodeByID(x)
+			require.True(t, ok)
+
+			nn := n.AsStruct()
+			nn.Hostinfo = nn.Hostinfo.Clone()
+			tc.flip(nn.Hostinfo)
+			s.PutNodeInStoreForTest(*nn)
+
+			if tc.docs[1] != "" {
+				_, err = s.SetPolicy([]byte(tc.docs[1]))
+				require.NoError(t, err)
+			}
+
+			flipped := s.Snapshot()
+			require.NotEqual(t, start.ReceiverFacts(x), flipped.ReceiverFacts(x), "test sanity: the node's form flips")
+			require.Contains(t, hh.route(start, flipped), x, "test sanity: the flip wakes its session")
+
+			// It takes the wake and the snapshot.
+			<-hh.sessions[x].Wakes()
+
+			_, err = s.SetPolicy([]byte(tc.docs[2]))
+			require.NoError(t, err)
+
+			edited := s.Snapshot()
+			hh.route(flipped, edited)
+
+			// What the routing read, before the late read cuts the form.
+			filters := edited.Since(flipped).Filters
+
+			was, err := flipped.FilterForNode(x)
+			require.NoError(t, err)
+
+			is, err := edited.Uncached().FilterForNode(x)
+			require.NoError(t, err)
+			require.NotEqual(t, was, is, "test sanity: the edit moves the filter it is served")
+
+			assert.Contains(t, filters, x, "the filters name the node whose served form moved")
+
+			hh.render(x, flipped)
+			hh.settled("after the edit")
+		})
+	}
+}
+
 // TestHubSessionsRenderWhatReachesThemUnderChurn routes by hand, so no
 // scheduling decides it: u1's two sessions are woken by two writes that
 // reach them, take the wake and wait out a batch delay, as poll does, while
