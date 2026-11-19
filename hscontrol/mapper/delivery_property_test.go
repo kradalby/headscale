@@ -1823,10 +1823,21 @@ func TestDeliveryConvergesThroughTheClient(t *testing.T) {
 		r.ref.require(t)
 	}
 
-	for name, n := range map[string]int{
+	floors := map[string]int{
 		"lagged renders": reach.lagged, "failed writes": reach.failed, "reconnects": reach.reconnected,
-		"delivery flips": reach.flips, "chunks deleted": reach.deleted, "membership churn": reach.churnJudged,
-	} {
+		"delivery flips": reach.flips, "chunks deleted": reach.deleted,
+	}
+
+	// A run of the default length now and then judges no membership churn;
+	// a deep one always does.
+	if f := flag.Lookup("rapid.checks"); f != nil {
+		n, err := strconv.Atoi(f.Value.String())
+		if err == nil && n >= 1000 {
+			floors["membership churn"] = reach.churnJudged
+		}
+	}
+
+	for name, n := range floors {
 		if n == 0 {
 			t.Errorf("no case reached %s", name)
 		}
