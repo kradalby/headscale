@@ -664,9 +664,9 @@ func TestPipelineIncrementalMatchesScratch(t *testing.T) {
 					// moves them:
 					// with nodeAttrs autogroup:tagged service-host and n1,
 					// n2 sharing an IPv6, retagging n1 leaves n2 without
-					// service-host until a document edit. The debug audit
-					// reports SSH policies stale under such writes too
-					// (that path is not traced). Database-only: State
+					// service-host until a document edit. SSH policies
+					// go stale alike (TestSSHPolicyForgetsALeaverWhoSharedAnAddress
+					// in state). Database-only: State
 					// shares no address. Delete this exception, its
 					// siblings and the address limit of audited in
 					// mapper/hub_property_test.go once the compile

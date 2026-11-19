@@ -175,6 +175,41 @@ func (m *modeRun) soundness(a, b *stage, stages []*stage, ids []types.NodeID, ta
 	return ""
 }
 
+// everyNode returns a node at both a and b whose filter, cut afresh in the
+// form its facts send it at each, moved from a to b and that routing from
+// a to b leaves out, whether or not its session read: routing must not
+// lean on which filters were read to name one.
+func (m *modeRun) everyNode(a, b *stage, tally *changeTally) string {
+	named, flipped, all := m.named(a, b)
+
+	for _, id := range nodeIDsOf(a, b) {
+		_, wasOK := a.cap.node(id)
+		_, isOK := b.cap.node(id)
+
+		if !wasOK || !isOK {
+			continue
+		}
+
+		before, errBefore := m.fresh(a, id, m.facts(a, id))
+		after, errAfter := m.fresh(b, id, m.facts(b, id))
+
+		if sameRules(before, errBefore, after, errAfter) {
+			continue
+		}
+
+		tally.add("node's filter moved")
+
+		if !all && !slices.Contains(named, id) && !slices.Contains(flipped, id) {
+			_, read := m.sess[id]
+
+			return fmt.Sprintf("n%d (a session read: %t) is cut %s, then %s, and routing (%v, facts moved %v) leaves it out",
+				id, read, rulesJSON(before, errBefore), rulesJSON(after, errAfter), named, flipped)
+		}
+	}
+
+	return ""
+}
+
 // factsNamed returns a node whose facts moved from a to b that the
 // receivers' change leaves out.
 func (m *modeRun) factsNamed(a, b *stage) string {
@@ -190,9 +225,10 @@ func (m *modeRun) factsNamed(a, b *stage) string {
 }
 
 // route routes to stages[k] from the stage last routed to, as the hub does:
-// each session not named since it read is held to routing from the stage
-// it holds, the one last routed to or a later one it read (the hub's
-// render log weighs those); then every session routing names is woken.
+// every node is held to that routing, and each session not named since it
+// read to routing from the stage it holds, the one last routed to or a
+// later one it read (the hub's render log weighs those); then every
+// session routing names is woken.
 func (m *modeRun) route(stages []*stage, k int, tally *changeTally) string {
 	from := map[int][]types.NodeID{}
 
@@ -204,6 +240,10 @@ func (m *modeRun) route(stages []*stage, k int, tally *changeTally) string {
 	}
 
 	if msg := m.factsNamed(stages[m.routed], stages[k]); msg != "" {
+		return fmt.Sprintf("from step %d: %s", m.routed, msg)
+	}
+
+	if msg := m.everyNode(stages[m.routed], stages[k], tally); msg != "" {
 		return fmt.Sprintf("from step %d: %s", m.routed, msg)
 	}
 
@@ -395,16 +435,18 @@ func ownerSharingFlipped(a, b *stage, n types.NodeView) bool {
 // in both source modes as the world and the hub do, the hub routing every
 // commit but those it draws coalesced, and holds:
 //
-//   - soundness, by session: when the hub routes, every session that read
-//     and was not named since holds what is cut afresh now, or routing from
-//     the snapshot it holds names it (the one the hub last routed to, or a
-//     later one the session read, which the hub's render log routes from):
-//     Filters.ChangedFor for the form its facts now send it, with the nodes
-//     whose facts moved, as Since names them; Filters.Changed names it
-//     when the form it holds moved; and so does the narrow set routing
-//     would use without naming subnet routers wholesale. A node no
-//     session holds a filter of need not be named: what is named depends
-//     on what was read;
+//   - soundness, by node: when the hub routes, every node whose filter, cut
+//     afresh in the form its facts send it, moved since the stage the hub
+//     last routed to is named by that routing (Filters.ChangedFor, with the
+//     nodes whose facts moved, as Since names them), whatever its session
+//     read;
+//   - soundness, by session: every session that read and was not named
+//     since holds what is cut afresh now, or routing from the snapshot it
+//     holds names it (the one the hub last routed to, or a later one the
+//     session read, which the hub's render log routes from), as above;
+//     Filters.Changed names it when the form it holds moved; and so does
+//     the narrow set routing would use without naming subnet routers
+//     wholesale;
 //   - precision, in capability mode across steps that edit no policy:
 //     routing names no node sent capabilities at both ends whose
 //     capability-form filter did not move, but the exceptions it states

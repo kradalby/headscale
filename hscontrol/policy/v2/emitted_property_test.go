@@ -398,6 +398,13 @@ func hostileViews(sv *served, n policymodel.Node, w policymodel.World, c string)
 			return v
 		}
 
+		// The exact stamp spelling, were it accepted, plants a capability
+		// the node may hold as its own stamp: that one stays.
+		rs, _ := sv.roles.Of(id)
+		if slices.Contains(sv.t.StampsOf(rs), nodecap.Cap(c)) {
+			return v
+		}
+
 		tn := v.AsStruct()
 		delete(tn.CapMap, nodecap.Cap(c))
 
