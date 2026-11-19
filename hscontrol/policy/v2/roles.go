@@ -424,6 +424,14 @@ func (p Postings) edited(old Postings) []Role {
 // whose role set changed. A new table starts over: its selector IDs mean
 // other selectors.
 func (p Postings) Update(roles Roles) Postings {
+	// TODO(kradalby): cost/posting-copies: a node entering or leaving a
+	// role copies that role's sorted list whole, so a join costs the size
+	// of every list it enters (autogroup:member's is the tailnet's); the
+	// sides' holder lists and the peer classes' member lists copy the same
+	// way. Accepted: one copy per list a node moves in, no work per node.
+	// Fixing it takes persistent sets every reader walks instead of a
+	// slice: views, peer classes and the hub's sent views. No upstream
+	// reference: headscale's own graph.
 	prev := p.byRole
 	if p.table != roles.users.table {
 		prev = graph.Grouped[types.NodeID, RoleSet, Role]{}

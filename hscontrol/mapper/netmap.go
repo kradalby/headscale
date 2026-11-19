@@ -518,6 +518,13 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 	// Were that to change, a failed render would still advance nothing: what
 	// the client holds is [Stream]'s sent, set from a render that succeeded,
 	// and r.chunks is a cache of the cut.
+	// TODO(kradalby): cost/chunk-names-per-session: each session names
+	// its own chunks, so every session's first map hashes its whole filter
+	// and a node's sessions each hash a new filter of its. Accepted: about
+	// what comparing the filter costs, once per new filter per session.
+	// Fixing it takes naming chunks where filters are cut and carried, so
+	// sessions share the names with the slice. No upstream reference:
+	// headscale's own delivery.
 	if nm.chunked {
 		nm.chunks = r.chunks.Recut(filter)
 		r.chunks = nm.chunks
@@ -1071,6 +1078,13 @@ func (cm *classMaps) get(
 
 	dns := snap.DNS()
 
+	// TODO(kradalby): cost/class-map-rebuild: a render of a snapshot
+	// older than the class's latest map cannot edit it forward and
+	// rebuilds the map from the whole view, as renders straddling commits
+	// do whenever writes land faster than the batch delay. Accepted: the
+	// map is right either way. Fixing it takes keeping a few recent maps
+	// per class and editing forward from the newest older than the render.
+	// No upstream reference: headscale's own renderer.
 	if cur != nil {
 		if touched, ok := snap.NodesTouchedSince(cur.nodes); ok {
 			e, owners = cur.peers.Edit(), cur.owners.edit()
@@ -1186,6 +1200,12 @@ func (cm *classMaps) prune(snap *state.Snapshot) {
 	clear(cm.deltas)
 	cm.dmu.Unlock()
 
+	// TODO(kradalby): cost/class-prune: every class's view is listed at
+	// every peers change to find the maps it no longer holds, whatever
+	// moved (a join under a self policy lists one class per user).
+	// Accepted: once per peers change, not per render. Fixing it takes
+	// pruning by the keyed views that moved (graph.Changes over the views
+	// Map). No upstream reference: headscale's own renderer.
 	current := map[*types.NodeID]struct{}{}
 
 	for _, v := range snap.PeerViews() {

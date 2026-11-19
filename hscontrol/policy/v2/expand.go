@@ -1117,6 +1117,15 @@ func (f *Filters) ForNode(id types.NodeID, facts ReceiverFacts) ([]tailcfg.Filte
 
 // cut cuts n's filter in form, as address form for why, and caches it.
 func (f *Filters) cut(n types.NodeView, form filterForm, why ipReason) ([]tailcfg.FilterRule, error) {
+	// TODO(kradalby): cost/address-form-recut: an address-form cut resolves
+	// every selector its rules read over all their members, so a receiver
+	// sent addresses (a subnet router or exit node under capsrc/local-nets,
+	// a client other than Tailscale's) that a join names brings work the
+	// size of the tailnet back to that join, which capability form avoids.
+	// Accepted while those fallbacks stand. Fixing it takes resolutions
+	// carried across commits and edited by the postings that moved, or
+	// lifting the fallbacks. No upstream reference: headscale's own
+	// expansion.
 	x, err := f.expansion()
 	if err != nil {
 		return nil, err

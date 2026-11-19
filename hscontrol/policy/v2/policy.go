@@ -352,6 +352,13 @@ func NewPolicyManagerFrom(prev *PolicyManager, b []byte, users []types.User, nod
 	// Order matters, tags might be used in autoapprovers, so we need to ensure
 	// that the map for tag owners is resolved before resolving autoapprovers.
 	// TODO(kradalby): Order might not matter after #2417
+	//
+	// TODO(capsrc/owners): lift when tag owners and auto-approvers are read off the role cells
+	// TODO(kradalby): capsrc/owners: both are resolved to address sets at
+	// every compile, and the compile runs at every policy-fact commit, so
+	// a join costs the size of every owner and approver it resolves; they
+	// also decide by address, not identity (policy/approvers-by-address).
+	// No client dependency: headscale's own compile.
 	tagMap, err := resolveTagOwners(indexed, users, nodes)
 	if err != nil {
 		return nil, fmt.Errorf("resolving tag owners map: %w", err)
