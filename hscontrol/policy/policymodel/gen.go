@@ -90,13 +90,6 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 			}
 		}
 
-		if down {
-			for _, st := range primaryDown(w) {
-				w = w.Apply(st.Edits...)
-				s.Steps = append(s.Steps, st)
-			}
-		}
-
 		if tour {
 			for _, st := range formTour(w, who, stops) {
 				w = w.Apply(st.Edits...)
@@ -125,6 +118,21 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 
 		if len(s.Steps) > total {
 			s.Steps = s.Steps[:total]
+		}
+
+		// A primary goes down last, so that no drawn step after it needs
+		// its offline router: a failure that needs a node gone offline
+		// shrinks to a drawn one, not to the script and the routers it
+		// takes.
+		if down {
+			if pd := primaryDown(s.end()); len(pd) > 0 {
+				if over := len(s.Steps) + len(pd) - total; over > 0 {
+					s.Steps = s.Steps[:max(0, len(s.Steps)-over)]
+					pd = primaryDown(s.end())
+				}
+
+				s.Steps = append(s.Steps, pd...)
+			}
 		}
 
 		return s
@@ -489,36 +497,54 @@ func mergeAnchor(w *World, who int) {
 
 // oneWayWorld leaves w one rule, alice's app grant to public space, and
 // makes a node of w an exit: the exit sees alice's nodes, which do not see
-// it.
+// it. Not alice's, since her own nodes see each other both ways: an
+// alice node is tagged with a tag tagOwners defines, and with none the
+// exit stays alice's.
 func oneWayWorld(w *World, who int) {
 	w.Policy.ACLs, w.Policy.AllowAll = nil, false
 	w.Policy.Grants = []Rule{{Src: []Sel{{Kind: SelUser}}, Dst: []Dest{{Sel: Sel{Kind: SelPrefix, I: publicPrefix}}}, App: []App{{}}}}
 
 	if nodes := w.Topology.Nodes; len(nodes) > 0 {
-		// Not alice's: her own nodes see each other both ways.
 		n := &nodes[who%len(nodes)]
-		if n.User == 1 {
-			n.Tags, n.User = []int{0}, 0
+		if tag := ownedTag(w.Policy); n.User == 1 && tag >= 0 {
+			n.Tags, n.User = []int{tag}, 0
 		}
 
 		n.Announced, n.Approved = addRoutes(n.Announced, []int{exit4, exit6}), addRoutes(n.Approved, []int{exit4, exit6})
 	}
 }
 
-// viaRouters leaves w one rule, alice's grant to 10.0.0.0/24 via tag:a,
-// and makes two nodes of w tag:a routers serving that route, so the via
-// election has a choice; the lower ID of them is offline when down.
-// Nothing else gives alice the route, so steering alone decides who
-// carries it. A world of fewer than three nodes is left as it is: nodes
-// added here would be ones the shrinker cannot take away.
+// ownedTag is the first tag p's tagOwners defines, or -1. Injections tag
+// nodes only with it: a tag they defined themselves would hold up the
+// shrinker, which cannot drop the injection from a failure that needs a
+// tag and nothing else of it.
+func ownedTag(p Policy) int {
+	for i := range numTags {
+		if p.Defined[i] || len(p.TagOwners[i]) > 0 {
+			return i
+		}
+	}
+
+	return -1
+}
+
+// viaRouters leaves w one rule, alice's grant to 10.0.0.0/24 via the
+// first tag w's tagOwners defines ([ownedTag]), and makes two nodes of w
+// routers of that tag serving that route, so the via election has a
+// choice; when down, the lower ID of them is one drawn offline. Nothing
+// else gives alice the route, so steering alone decides who carries it.
+// A world of fewer than three nodes is left as it is: nodes added here
+// would be ones the shrinker cannot take away.
 func viaRouters(w *World, who int, down bool) {
 	t := &w.Topology
-	if len(t.Nodes) < 3 {
+
+	tag := ownedTag(w.Policy)
+	if len(t.Nodes) < 3 || tag < 0 {
 		return
 	}
 
 	w.Policy.ACLs, w.Policy.AllowAll = nil, false
-	w.Policy.Grants = []Rule{{Src: []Sel{{Kind: SelUser}}, Dst: []Dest{{Sel: Sel{Kind: SelPrefix}}}, IP: []IP{{}}, Via: []int{0}}}
+	w.Policy.Grants = []Rule{{Src: []Sel{{Kind: SelUser}}, Dst: []Dest{{Sel: Sel{Kind: SelPrefix}}}, IP: []IP{{}}, Via: []int{tag}}}
 
 	nodes := t.Nodes
 	addressed := func(n *Node) {
@@ -535,14 +561,19 @@ func viaRouters(w *World, who int, down bool) {
 	first := 1 + who%(len(nodes)-1)
 	second := 1 + (first % (len(nodes) - 1))
 
+	// Down makes the lower router a node drawn offline, and none when no
+	// node is: an offline router made here would hold up the shrinker as
+	// a tag would.
+	if i := slices.IndexFunc(nodes[1:len(nodes)-1], func(n Node) bool { return n.Offline }); down && i >= 0 {
+		first, second = 1+i, 2+i
+	}
+
 	for _, i := range []int{first, second} {
 		r := &nodes[i]
-		r.User, r.Tags, r.Offline, r.Expired = 0, []int{0}, false, false
+		r.User, r.Tags, r.Offline, r.Expired = 0, []int{tag}, down && i == first && r.Offline && first < second, false
 		r.Announced, r.Approved = addRoutes(r.Announced, []int{0}), addRoutes(r.Approved, []int{0})
 		addressed(r)
 	}
-
-	nodes[min(first, second)].Offline = down
 }
 
 // hideTag takes the addresses of every node carrying a tag a rule's

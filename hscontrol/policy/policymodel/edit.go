@@ -74,6 +74,16 @@ func (s Scenario) Worlds() []World {
 	return out
 }
 
+// end is the world after s's last step.
+func (s Scenario) end() World {
+	w := s.Start
+	for _, st := range s.Steps {
+		w = w.Apply(st.Edits...)
+	}
+
+	return w
+}
+
 // GoString prints s's start and its steps, numbered from 1.
 func (s Scenario) GoString() string {
 	var b strings.Builder
