@@ -792,11 +792,27 @@ func TestCapabilityFormFollowsReference(t *testing.T) {
 		counts               judgedCounts
 		probes               int
 		rendered, referenced policymodel.Verdicts
+		form                 policymodel.FormJudge
 	)
 
 	rapid.Check(t, func(t *rapid.T) {
+		shared := false
+
 		drive(t, func(step int, sv *served, reads []types.NodeID) {
+			shared = shared || policymodel.SharesAddress(sv.w)
+
 			for _, id := range reads {
+				got, err := sv.cap.ForNode(id, sv.recv.Of(id))
+				if err != nil {
+					t.Fatalf("after step %d n%d: %v", step, id, err)
+				}
+
+				// The form is judged out of the reference's domain too:
+				// it reads no address the domain leaves unsaid.
+				if msg := form.Check(sv.w, sv.ref, id, got, true, shared); msg != "" {
+					t.Fatalf("after step %d n%d's capability-form filter is in the wrong form: %s\nheadscale %v", step, id, msg, got)
+				}
+
 				if why := sv.ref.OutOfDomain(); why != "" {
 					counts.skip(why)
 
@@ -804,11 +820,6 @@ func TestCapabilityFormFollowsReference(t *testing.T) {
 				}
 
 				n, _ := sv.w.Topology.Node(id)
-
-				got, err := sv.cap.ForNode(id, sv.recv.Of(id))
-				if err != nil {
-					t.Fatalf("after step %d n%d: %v", step, id, err)
-				}
 
 				var peers []tailcfg.NodeView
 
@@ -854,6 +865,7 @@ func TestCapabilityFormFollowsReference(t *testing.T) {
 	t.Logf("%d probes", probes)
 	t.Logf("with the rendered netmap: %v", &rendered)
 	t.Logf("with the reference's netmap: %v", &referenced)
+	t.Logf("form: %v", &form)
 	requireJudged(t, "capability form", counts, floorCapForm)
 }
 

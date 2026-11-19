@@ -1366,6 +1366,7 @@ func combosAgree(t *rapid.T, at string, r *deliveryRun, worlds []*deliveryWorld,
 // referenceTally is what [deliveryRun.holdToReference] met.
 type referenceTally struct {
 	verdicts policymodel.Verdicts
+	form     policymodel.FormJudge
 	// passed holds the filters held to the reference already, by
 	// everything the comparison reads.
 	passed map[string]bool
@@ -1390,9 +1391,9 @@ func (rt *referenceTally) skip(why string) {
 
 func (rt *referenceTally) String() string {
 	return fmt.Sprintf("reference: clients judged %d, filters compared %d, peer sets %d, route pairs %d (steered pairs judged %d, routes left unjudged %d, "+
-		"decided by the election history %d), self primaries %d, SSH policies %d; skipped %v; peers contested %v, routes contested %v; filters: %v",
+		"decided by the election history %d), self primaries %d, SSH policies %d; skipped %v; peers contested %v, routes contested %v; filters: %v; form: %v",
 		rt.clients, rt.filters, rt.peerSets, rt.routePairs, rt.steered, rt.unjudgedRoutes, rt.byHistory, rt.primaries, rt.ssh, rt.skipped,
-		rt.contestedPeers, rt.contestedRoutes, &rt.verdicts)
+		rt.contestedPeers, rt.contestedRoutes, &rt.verdicts, &rt.form)
 }
 
 // require fails a run that held nothing of some kind to the reference.
@@ -1402,6 +1403,7 @@ func (rt *referenceTally) require(t *testing.T) {
 	for name, n := range map[string]int{
 		"filters": rt.filters, "peer sets": rt.peerSets, "route pairs": rt.routePairs, "steered route pairs": rt.steered,
 		"self primaries": rt.primaries, "SSH policies": rt.ssh, "routes the election history decides": rt.byHistory,
+		"filters with a cap: source": rt.form.WithCaps,
 	} {
 		if n == 0 {
 			t.Errorf("reference: no case held %s to the reference", name)
@@ -1476,7 +1478,7 @@ func (r *deliveryRun) holdToReference(t *rapid.T, at string, worlds []*deliveryW
 	for i, dw := range worlds {
 		for _, id := range slices.Sorted(maps.Keys(held[i])) {
 			r.ref.clients++
-			dw.holdClient(t, at, ref, plain, world, key, id, held[i][id], fresh, &r.ref)
+			dw.holdClient(t, at, ref, plain, world, key, id, held[i][id], fresh, shared, &r.ref)
 		}
 	}
 }
@@ -1492,14 +1494,17 @@ type heldClient struct {
 	nm    *netmap.NetworkMap
 	rt    *referenceTally
 	fail  func(format string, args ...any)
+	// shared: an address was shared in the case, so node attributes may
+	// be stale (TODO(kradalby): policy/stale-under-shared-address).
+	shared bool
 }
 
 // holdClient holds node id's client, holding nm, to ref; see
 // [deliveryRun.holdToReference].
 func (dw *deliveryWorld) holdClient(t *rapid.T, at string, ref, plain *policymodel.Ref, world, key string, id types.NodeID, nm *netmap.NetworkMap,
-	fresh *policyv2.PolicyManager, rt *referenceTally,
+	fresh *policyv2.PolicyManager, shared bool, rt *referenceTally,
 ) {
-	c := heldClient{dw: dw, at: at, ref: ref, plain: plain, id: id, nm: nm, rt: rt}
+	c := heldClient{dw: dw, at: at, ref: ref, plain: plain, id: id, nm: nm, rt: rt, shared: shared}
 	c.fail = func(format string, args ...any) {
 		dw.failf(judgeReference, "%s: n%d: "+format, append([]any{at, id}, args...)...)
 	}
@@ -1596,6 +1601,10 @@ func (c heldClient) routes() {
 func (c heldClient) filter(world, key string) {
 	n, _ := c.dw.p.w.Topology.Node(c.id)
 	rules := c.nm.PacketFilterRules.AsSlice()
+
+	if msg := c.rt.form.Check(c.dw.p.w, c.ref, c.id, rules, c.dw.combo.capSources, c.shared); msg != "" {
+		c.fail("its client's filter is in the wrong form: %s\nheadscale %v", msg, rules)
+	}
 
 	k := fmt.Sprint(n, c.dw.combo.capSources, c.ref.Served(c.id).Prefixes()) + ruleList(c.ref.Rules(c.id)) + key + ruleList(rules) + clientViewKey(c.nm)
 	if c.rt.passed[k] || c.rt.passed[world+k] {
