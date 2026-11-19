@@ -40,25 +40,16 @@ func (r *Ref) routersOf(q netip.Prefix) []RefNode {
 	return out
 }
 
-// elect is the documented session ordering among candidates: of those
-// online, healthy and unexpired, the one connected longest. Every node of
-// a world here connected at once and none is unhealthy, so that is the
-// lowest ID; false when none is available.
-func elect(candidates []RefNode) (types.NodeID, bool) {
-	for _, n := range candidates {
-		if !n.Unavailable {
-			return n.ID, true
-		}
-	}
-
-	return 0, false
-}
-
 // Primary is the router the tailnet-wide election gives subnet route q,
-// and whether the world alone decides it. With no router available the
-// route stays with the one that served it last while it approves it, or
-// goes to the lowest-ID approving router: history's to say.
-func (r *Ref) Primary(q netip.Prefix) (types.NodeID, bool) { return elect(r.routersOf(q)) }
+// and whether the world decides it. The election is the documented
+// session ordering ([Elections]): a world without a history connected at
+// once and has no prober, so the lowest available ID; with no router
+// available the route stays with the one that served it last while it
+// approves it, or goes to the lowest-ID healthy approving router, which
+// only a history can say.
+func (r *Ref) Primary(q netip.Prefix) (types.NodeID, bool) {
+	return r.elections.primary(r.routersOf(q), q)
+}
 
 // ViaPrimary is the router the election of a via grant with tags gives
 // subnet route q: among routers carrying one of tags that serve q, the
@@ -68,7 +59,7 @@ func (r *Ref) Primary(q netip.Prefix) (types.NodeID, bool) { return elect(r.rout
 func (r *Ref) ViaPrimary(tags []string, q netip.Prefix) (types.NodeID, bool) {
 	candidates := slices.DeleteFunc(r.routersOf(q), func(n RefNode) bool { return !n.hasTag(tags) })
 
-	if id, ok := elect(candidates); ok {
+	if id, ok := r.elections.elect(candidates); ok {
 		return id, true
 	}
 

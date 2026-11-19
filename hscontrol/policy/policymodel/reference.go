@@ -353,6 +353,9 @@ type Ref struct {
 	rules []refRule
 	// without is the contested clauses left out.
 	without Contested
+	// elections is the history elections read, if any (see
+	// [Ref.WithElections]).
+	elections *Elections
 }
 
 // Contested is a clause of the reference that headscale is seen to
@@ -575,7 +578,12 @@ func (c Contested) String() string {
 }
 
 // Without returns r with the contested clauses c left out.
-func (r *Ref) Without(c Contested) *Ref { return newRef(r.doc, r.users, r.nodes, c) }
+func (r *Ref) Without(c Contested) *Ref {
+	out := newRef(r.doc, r.users, r.nodes, c)
+	out.elections = r.elections
+
+	return out
+}
 
 // refRule is one rule resolved to addresses: a grant or ACL entry, its
 // autogroup:self part for one owner, or a companion of either.
