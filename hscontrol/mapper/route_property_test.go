@@ -211,6 +211,20 @@ func pbtChance(t *rapid.T, k int, label string) bool {
 	return rapid.IntRange(0, k-1).Draw(t, label) == k-1
 }
 
+// newDrawnWorld is newPBTWorld with policy.filter_chunks drawn. A
+// configuration can only pin an option on, so its caller pins the suite's
+// switch off ([state.TestFilterChunksEnv]) and each case runs as drawn.
+func newDrawnWorld(t *rapid.T, w policymodel.World) *pbtWorld {
+	chunks := rapid.Bool().Draw(t, "filter-chunks")
+
+	p := newPBTWorld(t, w, func(cfg *types.Config) { cfg.Policy.FilterChunks = chunks })
+	if got := p.s.Snapshot().FilterChunks(); got != chunks {
+		t.Fatalf("test sanity: filter_chunks=%t built a world with %t", chunks, got)
+	}
+
+	return p
+}
+
 // scenarioRun plays a policymodel scenario against a State, its hub's
 // watcher routing in step, with a session per node that renders only
 // where the scenario says it reads: the start, then the nodes each step
@@ -284,7 +298,8 @@ type scenarioReach struct {
 // commit each, now and then a node's endpoint moving after a step)
 // against a State, a hub whose watcher routes after every
 // commit or once per step, and a session per node rendering where the
-// scenario's steps read. It holds two properties.
+// scenario's steps read; each source mode a subtest, filter_chunks drawn
+// per case. It holds two properties.
 //
 // Route is sound (P10.1): for every session, every snapshot X it rendered
 // and every later commit C, if what a fresh render of C would send the
@@ -309,6 +324,7 @@ type scenarioReach struct {
 // and subnet routers D7 recuts, whose filter and SSH policy stayed.
 func TestSessionsFollowGeneratedScenarios(t *testing.T) {
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "false")
+	t.Setenv(state.TestFilterChunksEnv, "false")
 
 	for _, capSources := range []bool{false, true} {
 		t.Run(fmt.Sprintf("capability=%t", capSources), func(t *testing.T) {
@@ -342,6 +358,11 @@ func TestSessionsFollowGeneratedScenarios(t *testing.T) {
 			// neighbouring commits have nothing to send, well above what a
 			// deep run measures in either mode, so a routing that starts
 			// waking far more than it reaches shows.
+			//
+			// TODO(kradalby): overwake/route-viewers,
+			// overwake/announce-readers, overwake/routers-cover,
+			// overwake/all-routers and the Filters keys ruleClass names:
+			// lower the ceiling as each goes.
 			woken, idle := 0, 0
 			for kind, n := range reach.woken {
 				woken, idle = woken+n, idle+reach.idle[kind]
@@ -349,7 +370,7 @@ func TestSessionsFollowGeneratedScenarios(t *testing.T) {
 
 			t.Logf("woken between neighbouring commits %d, with nothing to send %d", woken, idle)
 
-			if !testing.Short() && idle*100 > woken*40 {
+			if !testing.Short() && idle*100 > woken*35 {
 				t.Errorf("%d of %d sessions woken between neighbouring commits had nothing to send", idle, woken)
 			}
 
@@ -370,7 +391,7 @@ func playScenario(t *rapid.T, reach *scenarioReach) {
 		sess: map[types.NodeID]*scenarioSess{}, fresh: map[freshKey]*netMap{}, routes: map[[2]uint64]routeAnswer{},
 	}
 
-	r.p = newPBTWorld(t, s.Start)
+	r.p = newDrawnWorld(t, s.Start)
 	r.h = NewHub()
 	r.w = newSteppedWatcher(t, r.h, r.p.s)
 	r.p.committed = r.committed
@@ -618,6 +639,9 @@ func (r *scenarioRun) countWakes(j int) {
 			r.reach.idle[kind+" "+named]++
 		}
 
+		// TODO(kradalby): overwake/policy-facts-moved,
+		// overwake/routers-wholesale: the joiner and exit nodes and subnet
+		// routers stay out of the law while routing names them wholesale.
 		if !isJoin || !c.CapabilitySources() || ans.all || id == join.Node.ID ||
 			!capabilityForm(a.ReceiverFacts(id)) || !capabilityForm(c.ReceiverFacts(id)) || routes(a, id) || routes(c, id) {
 			continue
@@ -656,8 +680,9 @@ func (r *scenarioRun) countWakes(j int) {
 // it moved; a self destination, whose owners are named in every form
 // unless every source goes as their capability; an address two nodes
 // hold, which turns a selector's capability into addresses. "plain" is
-// none of them.
+// none of them. A class goes, and the law covers it, when its key does.
 func ruleClass(w policymodel.World) string {
+	// TODO(kradalby): overwake/ssh-changed-nodes.
 	if len(w.Policy.SSH) > 0 {
 		return "ssh"
 	}
@@ -666,6 +691,8 @@ func ruleClass(w policymodel.World) string {
 
 	for _, n := range w.Topology.Nodes {
 		for _, a := range n.Addrs() {
+			// TODO(kradalby): overwake/owner-sharing-flip,
+			// overwake/delta-address-holders.
 			if held[a] {
 				return "shared-address"
 			}
@@ -686,10 +713,13 @@ func ruleClass(w policymodel.World) string {
 	}
 
 	for _, g := range w.Policy.Grants {
+		// TODO(kradalby): overwake/address-pair-destinations,
+		// overwake/companion-receivers.
 		if len(g.App) > 0 || slices.ContainsFunc(g.IP, func(ip policymodel.IP) bool { return portless(ip.Proto) }) {
 			return "app-or-portless"
 		}
 
+		// TODO(kradalby): overwake/via-tag-holders.
 		if len(g.Via) > 0 {
 			return "via"
 		}
@@ -697,6 +727,7 @@ func ruleClass(w policymodel.World) string {
 		self = self || slices.ContainsFunc(g.Dst, func(d policymodel.Dest) bool { return d.Sel.Kind == policymodel.SelSelf })
 	}
 
+	// TODO(kradalby): overwake/self-owners-every-form.
 	if self {
 		return "self"
 	}

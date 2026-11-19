@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -349,9 +350,9 @@ func (r hubPropertyReach) String() string {
 // watcher goroutine, the render log and [Route] — through schedules rapid
 // draws, one event at a time, so every interleaving replays and shrinks.
 //
-// It draws a world from policymodel, then events: a commit (a policymodel
-// step, its edits one commit each, or a node's endpoint write, which names
-// only it and its readers); the watcher moving to its next point (load,
+// It draws a world from policymodel and filter_chunks, then events: a
+// commit (a policymodel step, its edits one commit each, or a node's
+// endpoint write, which names only it and its readers); the watcher moving to its next point (load,
 // after a session's shard, routed); a session taking its wake and the
 // latest snapshot; a session ending its render, which may fail (a failure
 // no snapshot explains, as Update's error path ends it); a node's session
@@ -378,6 +379,8 @@ func (r hubPropertyReach) String() string {
 // stress test runs under -race); preemption inside a render or between a
 // render's end and its wake; orderings inside one shard's visit.
 func TestHubSessionsConvergeUnderDrawnSchedules(t *testing.T) {
+	t.Setenv(state.TestFilterChunksEnv, "false")
+
 	for _, mode := range []struct {
 		name              string
 		capSources, audit bool
@@ -411,7 +414,7 @@ func runHubMachine(t *rapid.T, reach *hubPropertyReach, audit bool) {
 	mixed := pbtChance(t, 4, "mixed-versions")
 
 	m := &hubMachine{t: t, mixed: mixed, reach: reach, audit: audit, audited: RouteAuditFailures()}
-	m.p = newPBTWorld(t, world)
+	m.p = newDrawnWorld(t, world)
 	m.h = NewHub()
 	m.w = newSteppedWatcher(t, m.h, m.p.s)
 	m.p.committed = m.w.committed
@@ -1043,6 +1046,9 @@ func requireRenderFresh(t pbtT, cfg *types.Config, snap *state.Snapshot, id type
 // properties are [TestHubSessionsConvergeUnderDrawnSchedules]'s.
 func TestHubSessionsConvergeUnderConcurrency(t *testing.T) {
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "false")
+	// Runs set filter_chunks in turn, and a configuration can only pin an
+	// option on.
+	t.Setenv(state.TestFilterChunksEnv, "false")
 
 	seed := uint64(time.Now().UnixNano()) //nolint:gosec // any seed
 
@@ -1067,7 +1073,7 @@ func TestHubSessionsConvergeUnderConcurrency(t *testing.T) {
 			t.Setenv(state.TestCapabilitySourcesEnv, strconv.FormatBool(capSources))
 
 			for run := range uint64(runs) { //nolint:gosec // small
-				reach.add(stressConverges(t, seed, run, writes, false))
+				reach.add(stressConverges(t, seed, run, writes, false, (seed+run)%2 == 1))
 			}
 		})
 	}
@@ -1076,22 +1082,24 @@ func TestHubSessionsConvergeUnderConcurrency(t *testing.T) {
 	// render log woke again is due to render, no session the route audit
 	// holds to the routing's end is stale, and no other audit objects.
 	// The writes are those the other audits agree on (see [audited]): the
-	// compile's incremental node attributes, SSH policies and filters
-	// differ from its compile from scratch after an address moves or two
-	// rules swap places, and the filter audit's two forms differ for nodes
-	// outside the tailnet's ranges or without addresses.
+	// compile's incremental node attributes and SSH policies differ from
+	// its compile from scratch after an address moves, and the filter
+	// audit's two forms differ for nodes outside the tailnet's ranges or
+	// without addresses.
 	for _, capSources := range []bool{false, true} {
 		t.Run(fmt.Sprintf("audit/capability=%t", capSources), func(t *testing.T) {
 			t.Setenv(state.TestCapabilitySourcesEnv, strconv.FormatBool(capSources))
 			envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
 
-			failures, audited, policy := RouteAuditFailures(), RouteAuditRuns(), state.PolicyAuditFailures()
+			for _, chunks := range []bool{false, true} {
+				failures, audited, policy := RouteAuditFailures(), RouteAuditRuns(), state.PolicyAuditFailures()
 
-			reach.add(stressConverges(t, seed, 100, writes, true))
+				reach.add(stressConverges(t, seed, 100, writes, true, chunks))
 
-			assert.Equal(t, failures, RouteAuditFailures(), "the route audit found no stale session")
-			assert.Equal(t, policy, state.PolicyAuditFailures(), "no other audit line")
-			assert.Greater(t, RouteAuditRuns(), audited, "test sanity: the route audit rendered sessions afresh")
+				assert.Equal(t, failures, RouteAuditFailures(), "filter_chunks=%t: the route audit found no stale session", chunks)
+				assert.Equal(t, policy, state.PolicyAuditFailures(), "filter_chunks=%t: no other audit line", chunks)
+				assert.Greater(t, RouteAuditRuns(), audited, "filter_chunks=%t: test sanity: the route audit rendered sessions afresh", chunks)
+			}
 		})
 	}
 
@@ -1159,7 +1167,7 @@ type stressRun struct {
 	example  int
 }
 
-func stressConverges(t *testing.T, seed, run uint64, writes int, audit bool) stressReach {
+func stressConverges(t *testing.T, seed, run uint64, writes int, audit, chunks bool) stressReach {
 	t.Helper()
 
 	h := &stressRun{
@@ -1173,11 +1181,11 @@ func stressConverges(t *testing.T, seed, run uint64, writes int, audit bool) str
 
 	// A world of a few nodes at least, so several sessions render at once.
 	world := policymodel.Worlds().Example(h.next())
-	for len(world.Topology.Nodes) < 5 || audit && !allocatorAddresses(world) {
+	for len(world.Topology.Nodes) < 5 || audit && (!allocatorAddresses(world) || mergesApart(world)) {
 		world = policymodel.Worlds().Example(h.next())
 	}
 
-	h.p = newPBTWorld(t, world)
+	h.p = newPBTWorld(t, world, func(cfg *types.Config) { cfg.Policy.FilterChunks = chunks })
 
 	h.hub = NewHub()
 	t.Cleanup(h.hub.Close)
@@ -1248,9 +1256,8 @@ func allocatorAddresses(w policymodel.World) bool {
 }
 
 // audited reports whether st, from w, is a write the policy audits agree
-// on: addresses stay the allocator's, and no rule swaps places, after
-// which the compile's incremental filter differs from its compile from
-// scratch.
+// on: addresses stay the allocator's, none moves, and none sorts apart
+// ([mergesApart]).
 //
 // TODO(kradalby): policy/stale-under-shared-address: keeping each
 // address to one node here stands in for the compile's stale attributes
@@ -1260,12 +1267,48 @@ func allocatorAddresses(w policymodel.World) bool {
 func audited(w policymodel.World, st policymodel.Step) bool {
 	for _, e := range st.Edits {
 		switch e.(type) {
-		case policymodel.SetAddr, policymodel.SwapAddrs, policymodel.SwapRules:
+		case policymodel.SetAddr, policymodel.SwapAddrs:
 			return false
 		}
 	}
 
-	return allocatorAddresses(w.Apply(st.Edits...))
+	next := w.Apply(st.Edits...)
+
+	return allocatorAddresses(next) && !mergesApart(next)
+}
+
+// mergesApart reports whether w has a self destination and a user whose
+// nodes' addresses sort otherwise as text than as addresses.
+//
+// TODO(kradalby): policy/merge-order: the compile writes a self rule's
+// sources in address order and every other rule's as text, and merges
+// rules only on equal text, so the filter audit takes two forms that
+// merged one source set's rules apart for a disagreement (see
+// TestServedAuditAgreesWhateverTheMergeOrder in state). Drop this when
+// that test runs unskipped.
+func mergesApart(w policymodel.World) bool {
+	self := func(d policymodel.Dest) bool { return d.Sel.Kind == policymodel.SelSelf }
+
+	if !slices.ContainsFunc(slices.Concat(w.Policy.ACLs, w.Policy.Grants), func(r policymodel.Rule) bool { return slices.ContainsFunc(r.Dst, self) }) {
+		return false
+	}
+
+	byUser := map[uint][]netip.Addr{}
+
+	for _, n := range w.Topology.Nodes {
+		if len(n.Tags) == 0 {
+			byUser[n.User] = append(byUser[n.User], n.Addrs()...)
+		}
+	}
+
+	for _, addrs := range byUser {
+		text := slices.SortedFunc(slices.Values(addrs), func(a, b netip.Addr) int { return strings.Compare(a.String(), b.String()) })
+		if !slices.IsSortedFunc(text, netip.Addr.Compare) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // slowly now and then holds the watcher before it loads a snapshot, so
@@ -1388,8 +1431,7 @@ func (h *stressRun) write(undo func()) func() {
 	var next func()
 
 	switch {
-	case nodes.Len() > 0 && len(p.w.Topology.Users) > 0 && r.IntN(5) == 0:
-		h.straddle()
+	case nodes.Len() > 0 && len(p.w.Topology.Users) > 0 && r.IntN(5) == 0 && h.straddle():
 	case undo != nil && r.IntN(3) == 0:
 		undo()
 
@@ -1441,11 +1483,18 @@ func (h *stressRun) write(undo func()) func() {
 // endpoint write wakes some, the watcher is held once it routed that, a
 // node joins (with a session of its own) and, a moment later, leaves; the
 // routing over both commits names neither, and the sessions that took a
-// snapshot holding the node end their renders before it or after.
-func (h *stressRun) straddle() {
+// snapshot holding the node end their renders before it or after. Under
+// the audit it declines a joiner the audits disagree on, writing nothing.
+func (h *stressRun) straddle() bool {
 	t, r, p := h.t, h.r, h.p
 
 	nodes := p.s.Snapshot().ListNodes()
+
+	joiner := transientNode(p.w, nodes.At(r.IntN(nodes.Len())).ID())
+	if h.audit && mergesApart(p.w.Apply(policymodel.Join{Node: joiner})) {
+		return false
+	}
+
 	nv := nodes.At(r.IntN(nodes.Len()))
 	n := nv.AsStruct()
 	n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.2"), uint16(r.IntN(1<<16)))} //nolint:gosec // any port
@@ -1458,7 +1507,6 @@ func (h *stressRun) straddle() {
 	h.pause.Lock()
 	h.paused.Store(true)
 
-	joiner := transientNode(p.w, nodes.At(r.IntN(nodes.Len())).ID())
 	p.edit(policymodel.Join{Node: joiner})
 	h.follow()
 
@@ -1469,6 +1517,8 @@ func (h *stressRun) straddle() {
 	h.pause.Unlock()
 
 	h.reach.straddled++
+
+	return true
 }
 
 // follow opens a session for every node that has none, and forgets the
