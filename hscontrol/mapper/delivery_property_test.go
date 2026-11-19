@@ -1813,7 +1813,9 @@ func TestDeliveryConvergesThroughTheClient(t *testing.T) {
 	t.Log(reach)
 	t.Log(&r.ref)
 
-	if testing.Short() {
+	// What follows asks what the run reached, which takes scenarios of
+	// full length: under the race detector they are one step.
+	if testing.Short() || util.RaceEnabled {
 		return
 	}
 
