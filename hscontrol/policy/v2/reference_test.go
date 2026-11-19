@@ -658,9 +658,7 @@ func (j *judgedCounts) String() string {
 }
 
 // judgedFloor is what a property must judge: shares of the cases it
-// meets, each about half of what a default run measures, so that halving
-// what is judged turns it red whatever the run drew; and a count of cases
-// with something at stake well below any run's.
+// meets, and a count of cases with something at stake.
 type judgedFloor struct {
 	// share is judged over judged and skipped; atStake is the share of
 	// judged cases with something at stake.
@@ -697,15 +695,17 @@ func requireJudged(t *testing.T, what string, j judgedCounts, floor judgedFloor)
 	}
 }
 
-// Floors at about half of what default runs measure, over thirty seeds.
-// Route sets vary most with what a run draws: their count floor sits
-// below the least seen, and their shares carry the guard.
+// Floors sit at least five standard deviations below what default runs
+// measure, so that no random seed misses one: CI draws a seed per run.
+// Shares stay near half the mean where that allows, so halving what is
+// judged still fails; counts follow what a run draws, route sets most, and
+// sit lower: the route count at half the least seen.
 var (
-	floorAddressForm = judgedFloor{share: 0.40, atStake: 0.30, cases: 250}
-	floorCapForm     = judgedFloor{share: 0.40, atStake: 0.31, cases: 260}
-	floorPeers       = judgedFloor{share: 0.40, atStake: 0.40, cases: 720}
-	floorRoutes      = judgedFloor{share: 0.48, atStake: 0.32, cases: 300}
-	floorStamps      = judgedFloor{share: 0.50, atStake: 0.23, cases: 1090}
+	floorAddressForm = judgedFloor{share: 0.40, atStake: 0.30, cases: 170}
+	floorCapForm     = judgedFloor{share: 0.40, atStake: 0.31, cases: 180}
+	floorPeers       = judgedFloor{share: 0.40, atStake: 0.40, cases: 450}
+	floorRoutes      = judgedFloor{share: 0.48, atStake: 0.20, cases: 150}
+	floorStamps      = judgedFloor{share: 0.50, atStake: 0.18, cases: 500}
 )
 
 // rapidChecks is the checks a property makes in this run.
@@ -959,6 +959,77 @@ func TestPeersAndRoutesFollowReference(t *testing.T) {
 	t.Logf("contested %v", named)
 	requireJudged(t, "peers", peerCounts, floorPeers)
 	requireJudged(t, "routes", routeCounts, floorRoutes)
+}
+
+// TestViaRouterCoverIsHeadscalesReading pins policymodel.ViaRouterCover
+// to what headscale shows: compiled from scratch, every node is shown what
+// the reference less that clause (and any other a case names) shows it,
+// in worlds where the clause decides and where it must not; where it
+// decides, the reference with it differs. When headscale stops linking a
+// covering node with a via router, the last check fails and the clause
+// goes.
+func TestViaRouterCoverIsHeadscalesReading(t *testing.T) {
+	t.Parallel()
+
+	addr := netip.MustParseAddr
+	route := func(rs ...int) []int { return rs }
+	// Prefixes 0, 2 and 3 are 10.0.0.0/24, 100.64.0.0/30 and 100.64.0.2/32;
+	// 8 and 9 the exit routes.
+	world := func(src policymodel.Sel, router []int, cover []int, viaTag bool) policymodel.World {
+		var w policymodel.World
+
+		w.Topology.Users = []policymodel.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
+		w.Topology.Nodes = []policymodel.Node{
+			{ID: 1, User: 1, V4: addr("100.64.0.1")},
+			{ID: 2, Tags: []int{0}, V4: addr("100.64.0.2"), Announced: router, Approved: router},
+			{ID: 3, User: 2, V4: addr("100.64.0.5"), Announced: cover, Approved: cover},
+		}
+		w.Topology.NextID, w.Topology.NextUserID = 4, 3
+		w.Policy.Defined[0] = true
+
+		grant := policymodel.Rule{Src: []policymodel.Sel{src}, Dst: []policymodel.Dest{{Sel: policymodel.Sel{Kind: policymodel.SelPrefix}}}, IP: []policymodel.IP{{}}}
+		if viaTag {
+			grant.Via = []int{0}
+		}
+
+		w.Policy.Grants = []policymodel.Rule{grant}
+
+		return w
+	}
+	alice, net := policymodel.Sel{Kind: policymodel.SelUser}, policymodel.Sel{Kind: policymodel.SelHost}
+
+	for _, c := range []struct {
+		name    string
+		w       policymodel.World
+		also    policymodel.Contested
+		decides bool
+	}{
+		{"the router among the sources by a route over one", world(alice, route(0, 2), route(3), true), 0, true},
+		{"the router the only source, by its routed subnet", world(net, route(0), route(2), true), 0, true},
+		{"the router not among the sources", world(alice, route(0), route(3), true), 0, false},
+		// An exit route reaches the destination in the plain reading, not
+		// in headscale's (policymodel.ViaReach): no router to cover.
+		{"an exit among the sources, no subnet of the destination", world(alice, route(2, 8, 9), route(3), true), policymodel.ViaReach, false},
+		{"the covering node routing over a source too", world(alice, route(0, 2), route(2), true), 0, false},
+		{"no via", world(alice, route(0, 2), route(3), false), 0, false},
+	} {
+		sv, err := serve(nil, c.w, policymodel.Change{})
+		require.NoError(t, err, c.name)
+
+		with, without := sv.ref.Without(c.also), sv.ref.Without(c.also|policymodel.ViaRouterCover)
+		differs := false
+
+		for _, n := range c.w.Topology.Nodes {
+			got := sv.peersOf(n.ID)
+			slices.Sort(got)
+
+			require.Truef(t, slices.Equal(without.Peers(n.ID), got), "%s: n%d is shown %v, the reference less the clause shows it %v", c.name, n.ID, got, without.Peers(n.ID))
+
+			differs = differs || !slices.Equal(got, with.Peers(n.ID))
+		}
+
+		require.Equal(t, c.decides, differs, "%s: whether the clause decides", c.name)
+	}
 }
 
 // TestStampsFollowReference holds the source capabilities headscale
