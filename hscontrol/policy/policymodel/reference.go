@@ -516,22 +516,30 @@ const (
 	// destination. Delete the clause once one reading is chosen: fix
 	// production, or make headscale's reading the reference's own.
 	AppWildcard
-	// ViaRouterCover: a via grant's destination side is its via routers
-	// routing a destination. Headscale writes that side as the routers'
-	// own addresses, so a node with a subnet route over a via router's
-	// address is on it too: it sees the grant's sources, and they see it.
-	// Fails open, for visibility only.
+	// ViaRouterCover: a via grant links its sources with its routers,
+	// nothing else. Headscale links a via router that is itself among the
+	// grant's sources also with every node whose subnet route holds one
+	// of its addresses, both ways, and with no other source: its via peer
+	// rule is the router's own (sources to the router's addresses), and a
+	// pair is linked through a rule one of the two receives, so the
+	// covering node, on that rule's destination side, is linked only with
+	// the router, on its source side. Fails open, for visibility only.
 	//
 	// TODO(kradalby): policy/via-router-cover: fails open, peers only.
-	// With `{"src": ["h-net"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via":
-	// ["tag:a"]}` (h-net 10.0.0.0/24), n2 a tag:a router of 10.0.0.0/24 on
-	// 100.64.0.2 and n1 routing 100.64.0.0/30, n1 and n2 are shown each
-	// other, though n1 is neither a source nor a via router. No capture or
-	// document decides it. The properties in policy/v2/reference_test.go
-	// and the delivery property count it under "via router covered".
-	// Production: viaPeerRule in policy/v2/compiled.go and the via role
-	// of Sides in visibility.go name the router's own addresses. Delete
-	// the clause once that side is the routers alone.
+	// With `alice@ -> 10.0.0.0/24 via tag:a`, n1 alice on 100.64.0.1, n2 a
+	// tag:a router of 10.0.0.0/24 and of 100.64.0.0/30 (so a source, by
+	// a route over n1) on 100.64.0.2, and n3 bob routing 100.64.0.2/32, n2
+	// and n3 are shown each other, though n3 is neither a source nor a via
+	// router; n1 and n3 are not. No capture or document decides it. The
+	// properties in policy/v2/reference_test.go and the delivery property
+	// count it under "via router covered";
+	// TestViaRouterCoverIsHeadscalesReading pins the clause to what
+	// headscale does. Production: viaPeerRule in policy/v2/compiled.go
+	// names the router's addresses, the compile's peer map in policy.go
+	// links a pair through a rule either node receives, and Sides restates
+	// both as roleRouter and roleRouterOnSrc (policy/v2/visibility.go).
+	// Delete the clause once a via router is linked with its grant's
+	// sources alone.
 	ViaRouterCover
 )
 
@@ -582,6 +590,10 @@ type refRule struct {
 	// viaTerms are its destinations one term at a time.
 	via      []string
 	viaTerms []*netipx.IPSet
+	// hsDst is a via rule's destinations as headscale resolves them, *
+	// as the tailnet's ranges: they decide its routers for
+	// [ViaRouterCover].
+	hsDst *netipx.IPSet
 	// owner is the user an autogroup:self part is for.
 	owner uint
 }
@@ -665,7 +677,7 @@ func newRef(doc Doc, users []User, nodes []RefNode, without Contested) *Ref {
 			// v80-v91: every router of the destination, via tag or not, sees
 			// the sources of an app grant through via).
 			via := base
-			via.app, via.via = nil, d.Via
+			via.app, via.via, via.hsDst = nil, d.Via, r.starAsTailnet(dsts)
 
 			if without&ViaReach != 0 {
 				via.dst = r.starAsTailnet(dsts)
@@ -1180,6 +1192,10 @@ func (r *Ref) sees(n, m RefNode) bool {
 		if r.oneWay(rl, n, m) {
 			return true
 		}
+
+		if r.without&ViaRouterCover != 0 && (r.coversSourceRouter(rl, n, m) || r.coversSourceRouter(rl, m, n)) {
+			return true
+		}
 	}
 
 	return false
@@ -1210,13 +1226,24 @@ func (r *Ref) onDst(rl refRule, n RefNode) bool {
 		return on(n, rl.dst) || len(rl.ip) > 0 && n.exit() && rl.reachesInternet()
 	}
 
-	if r.viaRouter(rl, n) {
-		return true
+	return r.viaRouter(rl, n)
+}
+
+// coversSourceRouter reports whether n routes over an address of router,
+// a router of via rule rl as headscale picks them (a via tag, and a subnet
+// route overlapping rl's destinations or an exit route under
+// autogroup:internet) that is among rl's sources: the link
+// [ViaRouterCover] restates.
+func (r *Ref) coversSourceRouter(rl refRule, router, n RefNode) bool {
+	if len(rl.via) == 0 || rl.owner != 0 || !router.hasTag(rl.via) || !on(router, rl.src) {
+		return false
 	}
 
-	return r.without&ViaRouterCover != 0 && slices.ContainsFunc(r.nodes, func(m RefNode) bool {
-		return m.ID != n.ID && r.viaRouter(rl, m) && slices.ContainsFunc(n.subnets(), func(q netip.Prefix) bool { return slices.ContainsFunc(m.Addrs, q.Contains) })
-	})
+	if !slices.ContainsFunc(router.subnets(), rl.hsDst.OverlapsPrefix) && (!rl.internet || !router.exit()) {
+		return false
+	}
+
+	return slices.ContainsFunc(n.subnets(), func(q netip.Prefix) bool { return slices.ContainsFunc(router.Addrs, q.Contains) })
 }
 
 // viaRouter reports whether n is one of via rule rl's routers: it carries

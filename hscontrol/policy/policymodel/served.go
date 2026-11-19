@@ -80,12 +80,14 @@ func (r *Ref) ViaPrimary(tags []string, q netip.Prefix) (types.NodeID, bool) {
 }
 
 // viaRules are the via rules viewer v is a source of that reach route q:
-// its traffic for q is steered.
+// its traffic for q is steered. autogroup:internet reaches exit routes
+// alone, as the internet through exit nodes; [Ref.Steered] also counts a
+// public subnet route under it, since it only says what to leave out.
 func (r *Ref) viaRules(v RefNode, q netip.Prefix) []refRule {
 	var out []refRule
 
 	for _, rl := range r.rules {
-		if len(rl.via) > 0 && on(v, rl.src) && (rl.dst.OverlapsPrefix(q) || rl.internet && (isExitRoute(q) || internet.OverlapsPrefix(q))) {
+		if len(rl.via) > 0 && on(v, rl.src) && (rl.dst.OverlapsPrefix(q) || rl.internet && isExitRoute(q)) {
 			out = append(out, rl)
 		}
 	}

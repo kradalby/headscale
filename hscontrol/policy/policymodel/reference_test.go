@@ -84,7 +84,8 @@ func TestReferenceResolvesUsers(t *testing.T) {
 // as docs/ref/routes.md states them: the lowest-ID available router of a
 // route serves it, history decides when none is, and a via grant's
 // election falls back to its lowest-ID router; a single address inside
-// the node ranges is never served.
+// the node ranges is never served; a via grant to autogroup:internet
+// steers exit routes alone.
 func TestServedRoutesFollowTheElections(t *testing.T) {
 	t.Parallel()
 
@@ -107,6 +108,14 @@ func TestServedRoutesFollowTheElections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	internetVia, err := ParseDoc([]byte(`{"tagOwners": {"tag:a": []}, "grants": [{"src": ["alice@"], "dst": ["autogroup:internet"], "ip": ["*"], "via": ["tag:a"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	public := router(2, false, "tag:a")
+	public.Announced, public.Approved = []netip.Prefix{netip.MustParsePrefix("8.8.8.0/24")}, []netip.Prefix{netip.MustParsePrefix("8.8.8.0/24")}
 
 	for _, c := range []struct {
 		name           string
@@ -138,6 +147,7 @@ func TestServedRoutesFollowTheElections(t *testing.T) {
 			map[types.NodeID][]netip.Prefix{2: {subnet}},
 			nil,
 		},
+		{"via to the internet, a public subnet", internetVia, []RefNode{public}, nil, nil},
 	} {
 		r := NewRef(c.doc, users, append([]RefNode{viewer}, c.routers...))
 
