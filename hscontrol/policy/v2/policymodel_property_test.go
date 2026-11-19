@@ -246,7 +246,7 @@ var productionShapes = []productionShape{
 
 // productionSamples is how many generated scenarios TestProductionShapesReached
 // counts over.
-const productionSamples = 200
+const productionSamples = 400
 
 // TestProductionShapesReached counts, over generated scenarios, the
 // shapes only headscale can name, from its own counters, and fails when
