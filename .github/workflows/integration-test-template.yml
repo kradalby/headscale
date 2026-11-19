@@ -13,6 +13,16 @@ on:
       database_name:
         required: true
         type: string
+      # Set HEADSCALE_INTEGRATION_CAPABILITY_SOURCES and
+      # HEADSCALE_INTEGRATION_FILTER_CHUNKS; empty leaves headscale's default.
+      capability_sources:
+        required: false
+        type: string
+        default: ""
+      filter_chunks:
+        required: false
+        type: string
+        default: ""
 
 jobs:
   test:
@@ -109,6 +119,8 @@ jobs:
           HEADSCALE_INTEGRATION_HEADSCALE_IMAGE: headscale:${{ github.sha }}
           HEADSCALE_INTEGRATION_TAILSCALE_IMAGE: tailscale-head:${{ github.sha }}
           HEADSCALE_INTEGRATION_POSTGRES_IMAGE: ${{ inputs.postgres_flag == '--postgres=1' && format('postgres:{0}', github.sha) || '' }}
+          HEADSCALE_INTEGRATION_CAPABILITY_SOURCES: ${{ inputs.capability_sources }}
+          HEADSCALE_INTEGRATION_FILTER_CHUNKS: ${{ inputs.filter_chunks }}
           # Mirror the docker/login-action secrets into env so the
           # dockertestutil.Credentials resolver picks them up directly
           # (otherwise it falls back to parsing ~/.docker/config.json,

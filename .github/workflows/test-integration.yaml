@@ -397,6 +397,8 @@ jobs:
           - TestTS2021WebSocketGET
           - TestTS2021WASMClientUnderNode
           - TestTailscaleRustAxum
+          - TestTailscaleRustCapabilitySources
+          - TestTailscaleRustFilterChunks
     uses: ./.github/workflows/integration-test-template.yml
     secrets: inherit
     with:
@@ -421,3 +423,41 @@ jobs:
       test: ${{ matrix.test }}
       postgres_flag: "--postgres=1"
       database_name: "postgres"
+  # Both policy options off, the opt-out: the tests whose assertions read
+  # packet filters and peers, which the sqlite job runs with the defaults.
+  address:
+    needs: [build, build-tailscale-released]
+    if: needs.build.outputs.files-changed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - TestACLHostsInNetMapTable
+          - TestACLAllowUser80Dst
+          - TestACLDenyAllPort80
+          - TestACLAllowUserDst
+          - TestACLAllowStarDst
+          - TestACLNamedHostsCanReachBySubnet
+          - TestACLNamedHostsCanReach
+          - TestACLDevice1CanAccessDevice2
+          - TestACLAutogroupMember
+          - TestACLAutogroupTagged
+          - TestACLAutogroupSelf
+          - TestACLPolicyPropagationOverTime
+          - TestACLTagPropagation
+          - TestACLTagPropagationPortSpecific
+          - TestACLGroupWithUnknownUser
+          - TestACLGroupAfterUserDeletion
+          - TestACLGroupDeletionExactReproduction
+          - TestACLDynamicUnknownUserAddition
+          - TestACLDynamicUnknownUserRemoval
+          - TestGrantCapDrive
+          - TestSubnetRouteACL
+    uses: ./.github/workflows/integration-test-template.yml
+    secrets: inherit
+    with:
+      test: ${{ matrix.test }}
+      postgres_flag: "--postgres=0"
+      database_name: "address"
+      capability_sources: "false"
+      filter_chunks: "false"

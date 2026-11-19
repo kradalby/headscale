@@ -228,6 +228,21 @@
             }
           );
 
+          # The packages whose tests read the policy options, with both
+          # switches off: the opt-out (`capability_sources: false`,
+          # `filter_chunks: false`), which every other check, running the
+          # defaults, leaves to the tests that pin it.
+          gotest-address = fc.goTest (
+            common
+            // {
+              name = "headscale-gotest-address";
+              testPackages = "./hscontrol/policy/... ./hscontrol/state/... ./hscontrol/mapper/...";
+              goSkip = [ "TestPostgres" ];
+              testEnv = "export CGO_ENABLED=0 HEADSCALE_TEST_CAPABILITY_SOURCES=false HEADSCALE_TEST_FILTER_CHUNKS=false";
+              testFlags = [ "-timeout=30m" ];
+            }
+          );
+
           # -race needs cgo; release build and dev shell stay CGO-free.
           # Test hscontrol recursively; servertest runs in its own workflow, without -race.
           gorace = fc.goTest (
