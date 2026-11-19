@@ -53,6 +53,7 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 		chain := chance(t, 2, "share-chain")
 		script := chance(t, 8, "flip-script")
 		elsewhere := chance(t, 8, "flip-elsewhere")
+		down := chance(t, 4, "primary-down")
 		who := rapid.IntRange(0, 15).Draw(t, "flipper")
 
 		var scripted []Step
@@ -81,6 +82,13 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 
 		if elsewhere {
 			for _, st := range flipElsewhereScript(w, who+1) {
+				w = w.Apply(st.Edits...)
+				s.Steps = append(s.Steps, st)
+			}
+		}
+
+		if down {
+			for _, st := range primaryDown(w) {
 				w = w.Apply(st.Edits...)
 				s.Steps = append(s.Steps, st)
 			}
@@ -197,6 +205,45 @@ func flipElsewhereScript(w World, who int) []Step {
 			{Edits: []Edit{SetClient{n.ID, Official}}},
 			{Edits: []Edit{Join{joiner}}},
 			{Edits: []Edit{SetClient{n.ID, Unknown}}, Reads: []types.NodeID{n.ID}},
+		}
+	}
+
+	return nil
+}
+
+// primaryDown takes offline the lowest-ID available router of the first
+// route w has two routers for, which every session then reads, and brings
+// it back: the election moves the route and moves it back. None when no
+// route has two routers, one of them available.
+func primaryDown(w World) []Step {
+	byRoute := map[int][]Node{}
+
+	for _, n := range w.Topology.Nodes {
+		for _, r := range served(n) {
+			if r != exit4 && r != exit6 {
+				byRoute[r] = append(byRoute[r], n)
+			}
+		}
+	}
+
+	all := make([]types.NodeID, 0, len(w.Topology.Nodes))
+	for _, n := range w.Topology.Nodes {
+		all = append(all, n.ID)
+	}
+
+	for r := range Prefixes {
+		routers := byRoute[r]
+
+		i := slices.IndexFunc(routers, func(n Node) bool { return !n.Offline && !n.Expired })
+		if len(routers) < 2 || i < 0 {
+			continue
+		}
+
+		id := routers[i].ID
+
+		return []Step{
+			{Edits: []Edit{SetOnline{id, false}}, Reads: all},
+			{Edits: []Edit{SetOnline{id, true}}, Reads: all},
 		}
 	}
 
@@ -327,7 +374,13 @@ var (
 		merge := chance(t, 16, "merge-anchor")
 		anchor := chance(t, 8, "own-anchor")
 		oneWay := chance(t, 8, "one-way-world")
+		via := chance(t, 8, "via-routers")
+		down := chance(t, 2, "via-router-down")
 		who := rapid.IntRange(0, 15).Draw(t, "who")
+
+		if via {
+			viaRouters(&w, who, down)
+		}
 
 		if hide {
 			hideTag(&w, who)
@@ -440,6 +493,46 @@ func oneWayWorld(w *World, who int) {
 
 		n.Announced, n.Approved = addRoutes(n.Announced, []int{exit4, exit6}), addRoutes(n.Approved, []int{exit4, exit6})
 	}
+}
+
+// viaRouters leaves w one rule, alice's grant to 10.0.0.0/24 via tag:a,
+// and makes two nodes of w tag:a routers serving that route, so the via
+// election has a choice; the lower ID of them is offline when down.
+// Nothing else gives alice the route, so steering alone decides who
+// carries it.
+func viaRouters(w *World, who int, down bool) {
+	w.Policy.ACLs, w.Policy.AllowAll = nil, false
+	w.Policy.Grants = []Rule{{Src: []Sel{{Kind: SelUser}}, Dst: []Dest{{Sel: Sel{Kind: SelPrefix}}}, IP: []IP{{}}, Via: []int{0}}}
+
+	t := &w.Topology
+	for len(t.Nodes) < 3 {
+		id := t.nextID()
+		t.Nodes, t.NextID = append(t.Nodes, Node{ID: id, User: t.Users[0].ID}), id+1
+	}
+
+	nodes := t.Nodes
+	addressed := func(n *Node) {
+		if len(n.Addrs()) == 0 {
+			n.V4, n.V6 = ownAddr(4, uint64(n.ID)), ownAddr(6, uint64(n.ID))
+		}
+	}
+
+	// The source: an alice node with its addresses.
+	a := &nodes[0]
+	a.User, a.Tags = 1, nil
+	addressed(a)
+
+	first := 1 + who%(len(nodes)-1)
+	second := 1 + (first % (len(nodes) - 1))
+
+	for _, i := range []int{first, second} {
+		r := &nodes[i]
+		r.User, r.Tags, r.Offline, r.Expired = 0, []int{0}, false, false
+		r.Announced, r.Approved = addRoutes(r.Announced, []int{0}), addRoutes(r.Approved, []int{0})
+		addressed(r)
+	}
+
+	nodes[min(first, second)].Offline = down
 }
 
 // hideTag takes the addresses of every node carrying a tag a rule's

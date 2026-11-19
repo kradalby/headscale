@@ -67,6 +67,20 @@ func (sh Shape) contains(vs []*View, steps []Step) bool {
 	return false
 }
 
+// routersOf is the nodes serving route that carry one of tags, or every
+// node serving it for no tags.
+func (v *View) routersOf(route int, tags []int) []Node {
+	var out []Node
+
+	for _, n := range v.nodes {
+		if slices.Contains(served(n), route) && (len(tags) == 0 || slices.ContainsFunc(tags, func(t int) bool { return slices.Contains(n.Tags, t) })) {
+			out = append(out, n)
+		}
+	}
+
+	return out
+}
+
 // served is n's announced and approved routes.
 func served(n Node) []int {
 	var out []int
@@ -592,6 +606,17 @@ var Required = []Shape{
 		return v.anyRule(func(r Rule, _ bool) bool { return r.selfRule() && len(r.Dst) > 1 })
 	}},
 	{Name: "via-grant", Why: "via steering", Min: 0.09, World: func(v *View) bool { return v.anyRule(func(r Rule, _ bool) bool { return len(r.Via) > 0 }) }},
+	{Name: "via-routers-of-one-route", Why: "the via election choosing between two routers", Min: 0.035, World: func(v *View) bool {
+		return v.anyRule(func(r Rule, _ bool) bool {
+			for route := range numRulePrefixes {
+				if len(r.Via) > 0 && len(v.routersOf(route, r.Via)) > 1 {
+					return true
+				}
+			}
+
+			return false
+		})
+	}},
 	{Name: "via-router-among-sources", Why: "a via router that is also a source", Min: 0.015, World: func(v *View) bool {
 		return v.anyRule(func(r Rule, _ bool) bool {
 			for _, tag := range r.Via {
@@ -830,6 +855,20 @@ var Required = []Shape{
 				return slices.ContainsFunc(gone.Addrs(), func(x netip.Addr) bool { return slices.Contains(j.Node.Addrs(), x) })
 			}) {
 				return true
+			}
+		}
+
+		return false
+	}},
+	{Name: "primary-down", Why: "an election moving a route to another router", Min: 0.015, Step: func(b, _ *View, st Step) bool {
+		for _, e := range edits[SetOnline](st) {
+			for route := range numRulePrefixes {
+				routers := b.routersOf(route, nil)
+				i := slices.IndexFunc(routers, func(n Node) bool { return !n.Offline && !n.Expired })
+
+				if !e.Online && len(routers) > 1 && i >= 0 && routers[i].ID == e.ID {
+					return true
+				}
 			}
 		}
 

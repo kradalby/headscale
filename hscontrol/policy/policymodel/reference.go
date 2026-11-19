@@ -274,6 +274,9 @@ type RefNode struct {
 	// Announced and Approved are the routes the node advertises and the
 	// routes approved for it.
 	Announced, Approved []netip.Prefix
+	// Unavailable is a node offline or expired: no router an election
+	// picks while another is available.
+	Unavailable bool
 }
 
 func (n RefNode) tagged() bool { return len(n.Tags) > 0 }
@@ -513,25 +516,43 @@ const (
 	// destination. Delete the clause once one reading is chosen: fix
 	// production, or make headscale's reading the reference's own.
 	AppWildcard
+	// ViaRouterCover: a via grant's destination side is its via routers
+	// routing a destination. Headscale writes that side as the routers'
+	// own addresses, so a node with a subnet route over a via router's
+	// address is on it too: it sees the grant's sources, and they see it.
+	// Fails open, for visibility only.
+	//
+	// TODO(kradalby): policy/via-router-cover: fails open, peers only.
+	// With `{"src": ["h-net"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via":
+	// ["tag:a"]}` (h-net 10.0.0.0/24), n2 a tag:a router of 10.0.0.0/24 on
+	// 100.64.0.2 and n1 routing 100.64.0.0/30, n1 and n2 are shown each
+	// other, though n1 is neither a source nor a via router. No capture or
+	// document decides it. The properties in policy/v2/reference_test.go
+	// and the delivery property count it under "via router covered".
+	// Production: viaPeerRule in policy/v2/compiled.go and the via role
+	// of Sides in visibility.go name the router's own addresses. Delete
+	// the clause once that side is the routers alone.
+	ViaRouterCover
 )
 
 // ContestedClauses is every contested clause, in the order a property
 // tries them.
 var ContestedClauses = []Contested{
 	OthersSelf, StarApprovedRoutes, InternetAtSubnetRouters,
-	ViaOwnAddress, ViaReach, ViaRouterAddress, ViaSelf, ExitDestinationRoutes, AppWildcard,
+	ViaOwnAddress, ViaReach, ViaRouterAddress, ViaSelf, ExitDestinationRoutes, AppWildcard, ViaRouterCover,
 }
 
 // FailsOpen reports whether headscale's side of c admits what the
 // reference refuses.
 func (c Contested) FailsOpen() bool {
-	return c&(StarApprovedRoutes|InternetAtSubnetRouters|ViaOwnAddress) != 0
+	return c&(StarApprovedRoutes|InternetAtSubnetRouters|ViaOwnAddress|ViaRouterCover) != 0
 }
 
 func (c Contested) String() string {
 	names := []string{
 		"others' self rules", "* adds approved routes", "internet at subnet routers",
 		"via own address", "via reach", "via router without address", "via to self", "exit routes as destination", "* as app destination",
+		"via router covered",
 	}
 
 	var parts []string
@@ -584,7 +605,7 @@ func RefOf(w World) *Ref {
 	nodes := make([]RefNode, len(w.Topology.Nodes))
 
 	for i, n := range w.Topology.Nodes {
-		rn := RefNode{ID: n.ID, Addrs: n.Addrs()}
+		rn := RefNode{ID: n.ID, Addrs: n.Addrs(), Unavailable: n.Offline || n.Expired}
 
 		if _, ok := w.Topology.User(n.User); ok {
 			rn.User = n.User
@@ -1189,6 +1210,18 @@ func (r *Ref) onDst(rl refRule, n RefNode) bool {
 		return on(n, rl.dst) || len(rl.ip) > 0 && n.exit() && rl.reachesInternet()
 	}
 
+	if r.viaRouter(rl, n) {
+		return true
+	}
+
+	return r.without&ViaRouterCover != 0 && slices.ContainsFunc(r.nodes, func(m RefNode) bool {
+		return m.ID != n.ID && r.viaRouter(rl, m) && slices.ContainsFunc(n.subnets(), func(q netip.Prefix) bool { return slices.ContainsFunc(m.Addrs, q.Contains) })
+	})
+}
+
+// viaRouter reports whether n is one of via rule rl's routers: it carries
+// a via tag and routes one of rl's destinations.
+func (r *Ref) viaRouter(rl refRule, n RefNode) bool {
 	if !n.hasTag(rl.via) || r.without&ViaRouterAddress != 0 && len(n.Addrs) == 0 {
 		return false
 	}

@@ -26,11 +26,8 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/require"
-	"go4.org/netipx"
 	"pgregory.net/rapid"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tailcfg/peercap"
-	"tailscale.com/types/logger"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -68,72 +65,6 @@ func refInputs(users types.Users, nodes types.Nodes) ([]policymodel.User, []poli
 	}
 
 	return us, ns
-}
-
-// acceptsThrough returns whether rules accept a probe through a
-// destination entry keep admits, as the client would with view.
-func acceptsThrough(rules []tailcfg.FilterRule, view policymodel.ClientView, keep func(tailcfg.NetPortRange) bool) func(policymodel.Probe) bool {
-	var kept []tailcfg.FilterRule
-
-	for _, r := range rules {
-		var dsts []tailcfg.NetPortRange
-
-		for _, d := range r.DstPorts {
-			if keep(d) {
-				dsts = append(dsts, d)
-			}
-		}
-
-		if len(dsts) > 0 {
-			r.DstPorts, r.CapGrant = dsts, nil
-			kept = append(kept, r)
-		}
-	}
-
-	ms, err := filter.MatchesFromFilterRules(kept)
-	if err != nil || len(ms) == 0 {
-		return func(policymodel.Probe) bool { return false }
-	}
-
-	f := filter.New(ms, view.HasCap, view.LocalNets, nil, nil, logger.Discard)
-
-	return func(p policymodel.Probe) bool { return f.RunIn(p.Packet(), 0) == filter.Accept }
-}
-
-// starAccepts returns whether rules accept a probe through a destination
-// written "*". That is the one way the captures show a node taking packets
-// for a route it announces but is not approved for: every such captured
-// accept comes from such a rule.
-func starAccepts(rules []tailcfg.FilterRule, view policymodel.ClientView) func(policymodel.Probe) bool {
-	return acceptsThrough(rules, view, func(d tailcfg.NetPortRange) bool { return d.IP == "*" })
-}
-
-// wholeAccepts returns whether rules accept a probe through a destination
-// entry that also names something the node serves (served): a rule that
-// reaches the node, written whole. "*" is one; the captures hold no other.
-func wholeAccepts(rules []tailcfg.FilterRule, view policymodel.ClientView, served *netipx.IPSet) func(policymodel.Probe) bool {
-	return acceptsThrough(rules, view, func(d tailcfg.NetPortRange) bool {
-		if d.IP == "*" {
-			return true
-		}
-
-		r, err := netipx.ParseIPRange(d.IP)
-		if err != nil {
-			p, perr := netip.ParsePrefix(d.IP)
-			if perr != nil {
-				a, aerr := netip.ParseAddr(d.IP)
-				if aerr != nil {
-					return false
-				}
-
-				p = netip.PrefixFrom(a, a.BitLen())
-			}
-
-			r = netipx.RangeOfPrefix(p)
-		}
-
-		return served.OverlapsRange(r)
-	})
 }
 
 type refGoldenTally struct {
@@ -324,7 +255,7 @@ func refGoldenCapture(t *testing.T, tally *refGoldenTally, id string, captures m
 
 		view := policymodel.ViewFromNetmap(capture.Netmap)
 		rep := policymodel.Compare(capture.PacketFilterRules, ref.Rules(node.ID), view)
-		star := starAccepts(capture.PacketFilterRules, view)
+		star := policymodel.StarAccepts(capture.PacketFilterRules, view)
 		unrouted := 0
 
 		rep.Verdicts = slices.DeleteFunc(rep.Verdicts, func(d policymodel.VerdictDiff) bool {
@@ -662,225 +593,6 @@ func viewOf(n policymodel.Node, w policymodel.World, caps *policymodel.NetmapCap
 	return v
 }
 
-// verdictClasses are the differences from the reference a property
-// allows, each counted; anything else fails it.
-type verdictClasses struct {
-	// unrouted: the client takes packets for a route its node announces
-	// but is not approved for, through a rule whose destination is "*";
-	// the captures show exactly that.
-	unrouted int
-	// unroutedWhole: the same through any other destination entry that
-	// also names something the node serves, written whole. No capture
-	// holds one; reported as a question, not encoded.
-	unroutedWhole int
-	// crossFamilyICMP: capability form refuses a packet carrying the
-	// other family's ICMP protocol, which address form accepts: decided as
-	// malformed, failing closed.
-	crossFamilyICMP int
-	// repeatedValues: an app capability's values come once per
-	// destination entry of a grant that names the receiver, where the
-	// reference gives them once per grant. Reported, not encoded; no
-	// capture holds an app grant with two destinations.
-	repeatedValues int
-	// contested counts the differences that are exactly some contested
-	// clauses of the reference, by the set of clauses.
-	contested map[policymodel.Contested]int
-}
-
-func (c *verdictClasses) addContested(k policymodel.Contested, n int) {
-	if c.contested == nil {
-		c.contested = map[policymodel.Contested]int{}
-	}
-
-	c.contested[k] += n
-}
-
-// contestedSets are the sets of contested clauses a difference is tried
-// against, in order: each alone, each pair, then all of them.
-var contestedSets = func() []policymodel.Contested {
-	cs := policymodel.ContestedClauses
-	out := slices.Clone(cs)
-
-	var all policymodel.Contested
-
-	for i, a := range cs {
-		all |= a
-
-		for _, b := range cs[i+1:] {
-			out = append(out, a|b)
-		}
-	}
-
-	return append(out, all)
-}()
-
-func (c *verdictClasses) String() string {
-	var parts []string
-
-	for _, k := range contestedSets {
-		if c.contested[k] > 0 {
-			open := ""
-			if k.FailsOpen() {
-				open = ", fails open"
-			}
-
-			parts = append(parts, fmt.Sprintf("%d %s%s", c.contested[k], k, open))
-		}
-	}
-
-	return fmt.Sprintf("allowed %d cross-family ICMP, %d through * on unapproved routes; suspected: %d through other whole destinations on unapproved routes, %d app values repeated; contested %v",
-		c.crossFamilyICMP, c.unrouted, c.unroutedWhole, c.repeatedValues, parts)
-}
-
-// judge holds rep, a comparison of the reference's rules (as Ref) with
-// production's got (as Cand) at node n, to the allowed classes, and
-// returns the differences left.
-func (c *verdictClasses) judge(rep policymodel.Report, ref *policymodel.Ref, n policymodel.Node, view policymodel.ClientView,
-	got []tailcfg.FilterRule, capForm bool,
-) policymodel.Report {
-	if capForm {
-		crossed, rest := rep.SplitCrossFamilyICMP()
-		c.crossFamilyICMP += crossed
-		rep = rest
-	}
-
-	rep.Caps = slices.DeleteFunc(rep.Caps, func(d policymodel.CapsDiff) bool {
-		// TODO(kradalby): policy/app-values-repeated: cosmetic, no verdict
-		// moves. An app grant with "dst": ["*", "*"] gives the receiver
-		// its capability values twice in CapsWithValues: production
-		// writes one CapGrant per destination entry naming the receiver
-		// (capGrantRules in expand.go), the reference one per grant. No
-		// capture holds an app grant with two destinations. Delete this
-		// allowance once production merges the entries, or once a capture
-		// shows the hosted service repeating them.
-		if sameUpToRepeats(d.Ref, d.Cand) {
-			c.repeatedValues++
-
-			return true
-		}
-
-		return false
-	})
-
-	var star, whole func(policymodel.Probe) bool
-
-	rep.Verdicts = slices.DeleteFunc(rep.Verdicts, func(d policymodel.VerdictDiff) bool {
-		if d.Ref != filter.Drop || d.Cand != filter.Accept || ref.Serves(n.ID, d.Probe.Dst) || !view.LocalNets.Contains(d.Probe.Dst) {
-			return false
-		}
-
-		if star == nil {
-			star, whole = starAccepts(got, view), wholeAccepts(got, view, ref.Served(n.ID))
-		}
-
-		switch {
-		case star(d.Probe):
-			c.unrouted++
-		case whole(d.Probe):
-			// TODO(kradalby): policy/unrouted-whole-destination: fails
-			// open, narrow. A destination entry that reaches the node is
-			// written whole, so the client also accepts the rest of it
-			// inside a route the node announces unapproved: host h-pub
-			// 100.64.0.0/30, `* -> h-pub:*`, n1 on 100.64.0.1 announcing
-			// 100.64.0.0/30 unapproved accepts packets to 100.64.0.0.
-			// Nobody routes those to n1. The captures show this only
-			// through *, which the case above accepts; none decides any
-			// other entry. Production: dstPorts in expand.go keeps a
-			// literal entry whole once receiver.overlaps finds it
-			// reaching the node. Delete this case once entries are cut to
-			// what the node serves, or once a capture shows the hosted
-			// service doing it.
-			c.unroutedWhole++
-		default:
-			return false
-		}
-
-		return true
-	})
-
-	return rep
-}
-
-// sameUpToRepeats reports whether cand grants what ref does, in the same
-// order, with some values repeated more often: the same runs of equal
-// values, none shorter.
-func sameUpToRepeats(ref, cand tailcfg.PeerCapMap) bool {
-	if len(ref) != len(cand) {
-		return false
-	}
-
-	type run struct {
-		v tailcfg.RawMessage
-		n int
-	}
-
-	runs := func(c peercap.Cap, vs []tailcfg.RawMessage) []run {
-		var out []run
-
-		for _, v := range vs {
-			if len(out) > 0 && policymodel.SamePeerCaps(tailcfg.PeerCapMap{c: {out[len(out)-1].v}}, tailcfg.PeerCapMap{c: {v}}) {
-				out[len(out)-1].n++
-
-				continue
-			}
-
-			out = append(out, run{v: v, n: 1})
-		}
-
-		return out
-	}
-
-	for c, rv := range ref {
-		cv, ok := cand[c]
-		if !ok {
-			return false
-		}
-
-		rr, cr := runs(c, rv), runs(c, cv)
-		if len(rr) != len(cr) {
-			return false
-		}
-
-		for i := range rr {
-			if cr[i].n < rr[i].n || !policymodel.SamePeerCaps(tailcfg.PeerCapMap{c: {rr[i].v}}, tailcfg.PeerCapMap{c: {cr[i].v}}) {
-				return false
-			}
-		}
-	}
-
-	return true
-}
-
-// compareAt holds production's rules got at node n to the reference
-// through the client, and returns what is left once the allowed classes
-// are taken out. A node whose whole difference is the reference less
-// some contested clauses is counted under those clauses.
-func (c *verdictClasses) compareAt(ref *policymodel.Ref, n policymodel.Node, got []tailcfg.FilterRule, view policymodel.ClientView, capForm bool) policymodel.Report {
-	var trial verdictClasses
-
-	rep := trial.judge(policymodel.Compare(ref.Rules(n.ID), got, view), ref, n, view, got, capForm)
-	if !rep.Equivalent() {
-		for _, k := range contestedSets {
-			var without verdictClasses
-
-			rest := without.judge(policymodel.Compare(ref.Without(k).Rules(n.ID), got, view), ref, n, view, got, capForm)
-			if rest.Equivalent() {
-				c.addContested(k, len(rep.Verdicts)+len(rep.Caps))
-				rep, trial = rest, without
-
-				break
-			}
-		}
-	}
-
-	c.unrouted += trial.unrouted
-	c.unroutedWhole += trial.unroutedWhole
-	c.crossFamilyICMP += trial.crossFamilyICMP
-	c.repeatedValues += trial.repeatedValues
-
-	return rep
-}
-
 // refSteps is how long a drawn scenario may be: a failing case replays
 // every step for each shrink candidate.
 const refSteps = 10
@@ -1024,7 +736,7 @@ func TestServedFiltersFollowReference(t *testing.T) {
 	var (
 		counts  judgedCounts
 		probes  int
-		classes verdictClasses
+		classes policymodel.Verdicts
 	)
 
 	rapid.Check(t, func(t *rapid.T) {
@@ -1044,7 +756,7 @@ func TestServedFiltersFollowReference(t *testing.T) {
 				}
 
 				view := viewOf(n, sv.w, nil)
-				rep := classes.compareAt(sv.ref, n, got, view, false)
+				rep := classes.CompareAt(sv.ref, id, got, view, false)
 
 				counts.judged++
 				probes += rep.Probes
@@ -1079,7 +791,7 @@ func TestCapabilityFormFollowsReference(t *testing.T) {
 	var (
 		counts               judgedCounts
 		probes               int
-		rendered, referenced verdictClasses
+		rendered, referenced policymodel.Verdicts
 	)
 
 	rapid.Check(t, func(t *rapid.T) {
@@ -1110,7 +822,7 @@ func TestCapabilityFormFollowsReference(t *testing.T) {
 
 				caps := policymodel.NewNetmapCaps(sv.render(id, true), peers)
 				view := viewOf(n, sv.w, &caps)
-				rep := rendered.compareAt(sv.ref, n, got, view, true)
+				rep := rendered.CompareAt(sv.ref, id, got, view, true)
 
 				counts.judged++
 				probes += rep.Probes
@@ -1128,7 +840,7 @@ func TestCapabilityFormFollowsReference(t *testing.T) {
 				refCaps := policymodel.NewNetmapCaps(self, refPeers)
 				view = viewOf(n, sv.w, &refCaps)
 
-				rep = referenced.compareAt(sv.ref, n, got, view, true)
+				rep = referenced.CompareAt(sv.ref, id, got, view, true)
 				probes += rep.Probes
 
 				if !rep.Equivalent() {
@@ -1180,7 +892,7 @@ func TestPeersAndRoutesFollowReference(t *testing.T) {
 				}
 
 				if !slices.Equal(got, want) {
-					if k, ok := contestedPeers(sv.ref, n.ID, got); ok {
+					if k, ok := policymodel.ContestedPeers(sv.ref, n.ID, got); ok {
 						contested[k]++
 
 						continue
@@ -1223,7 +935,7 @@ func TestPeersAndRoutesFollowReference(t *testing.T) {
 					}
 
 					if !slices.Equal(got, want) {
-						if k, ok := contestedRoutes(sv.ref, v.ID, p, got); ok {
+						if k, ok := policymodel.ContestedRoutes(sv.ref, v.ID, p, got); ok {
 							contested[k]++
 
 							continue
@@ -1238,7 +950,7 @@ func TestPeersAndRoutesFollowReference(t *testing.T) {
 
 	var named []string
 
-	for _, k := range contestedSets {
+	for _, k := range policymodel.ContestedSets {
 		if contested[k] > 0 {
 			named = append(named, fmt.Sprintf("%d %s", contested[k], k))
 		}
@@ -1247,33 +959,6 @@ func TestPeersAndRoutesFollowReference(t *testing.T) {
 	t.Logf("contested %v", named)
 	requireJudged(t, "peers", peerCounts, floorPeers)
 	requireJudged(t, "routes", routeCounts, floorRoutes)
-}
-
-// contestedPeers reports which contested clauses, left out of the
-// reference, show node id exactly got.
-func contestedPeers(ref *policymodel.Ref, id types.NodeID, got []types.NodeID) (policymodel.Contested, bool) {
-	for _, k := range contestedSets {
-		if slices.Equal(got, ref.Without(k).Peers(id)) {
-			return k, true
-		}
-	}
-
-	return 0, false
-}
-
-// contestedRoutes reports which contested clauses, left out of the
-// reference, give viewer exactly got of peer's routes.
-func contestedRoutes(ref *policymodel.Ref, viewer, peer types.NodeID, got []netip.Prefix) (policymodel.Contested, bool) {
-	for _, k := range contestedSets {
-		want := ref.Without(k).Routes(viewer, peer)
-		slices.SortFunc(want, netip.Prefix.Compare)
-
-		if slices.Equal(got, want) {
-			return k, true
-		}
-	}
-
-	return 0, false
 }
 
 // TestStampsFollowReference holds the source capabilities headscale

@@ -970,7 +970,7 @@ func TestShrinksToSmallCases(t *testing.T) {
 	// Fail files go nowhere, and the seed is fixed, whatever seed the
 	// properties are given: shrinking reaches the smallest case from some
 	// seeds, not all. Flags are process-wide: not parallel.
-	settings := map[string]string{"rapid.nofailfile": "true", "rapid.seed": "3"}
+	settings := map[string]string{"rapid.nofailfile": "true", "rapid.seed": "2"}
 
 	for name, value := range settings {
 		old := flag.Lookup(name).Value.String()
