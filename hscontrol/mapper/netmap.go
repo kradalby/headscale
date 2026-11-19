@@ -530,11 +530,7 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 		r.chunks = nm.chunks
 	}
 
-	err = r.renderPeers(snap, self, capMaps, nm)
-	if err != nil {
-		return nil, err
-	}
-
+	r.renderPeers(snap, self, capMaps, nm)
 	r.renderProfiles(self, nm)
 	r.last = nm
 
@@ -554,7 +550,7 @@ func (r *renderer) renderPeers(
 	self types.NodeView,
 	capMaps capsOf,
 	nm *netMap,
-) error {
+) {
 	// An unmoved peers cell holds the same views and side sets, unmoved
 	// sides the same facts.
 	view, side, facts := r.lastPeerIDs, r.lastKey.side, r.lastKey.facts
@@ -639,43 +635,8 @@ func (r *renderer) renderPeers(
 		}
 	}
 
-	if len(routed) > 0 {
-		if r.routedPrimaries == nil {
-			r.routedPrimaries = make(map[tailcfg.NodeID][]netip.Prefix, len(routed))
-		}
-
-		for _, id := range routed {
-			base, _ := class.Get(id.NodeID())
-			peer, _ := snap.GetNode(id)
-
-			r.routedPrimaries[id.NodeID()] = snap.PrimaryRoutesForNode(id)
-
-			tn := withRoutes(base, snap.RoutesForPeer(self, peer))
-			if ipv4Disabled {
-				tn = withoutIPv4Identity(tn)
-			}
-
-			if tn != base {
-				overlaid = append(overlaid, id.NodeID())
-			}
-
-			if old, _ := peers.Get(id.NodeID()); old != tn {
-				peers.Set(id.NodeID(), tn)
-			}
-		}
-	}
-
-	for _, id := range candidates {
-		delete(r.overlaid, id)
-	}
-
-	if len(overlaid) > 0 && r.overlaid == nil {
-		r.overlaid = make(map[tailcfg.NodeID]struct{}, len(overlaid))
-	}
-
-	for _, id := range overlaid {
-		r.overlaid[id] = struct{}{}
-	}
+	overlaid = append(overlaid, r.overlayRouted(snap, self, class, peers, routed, ipv4Disabled)...)
+	r.recordOverlaid(candidates, overlaid)
 
 	// Only routed peers differ per viewer; a session without them
 	// shares its class's map outright.
@@ -692,8 +653,65 @@ func (r *renderer) renderPeers(
 	// Only a render that completed moves the cursor; a failed one is
 	// retried from the same place.
 	r.markRendered(snap, key, self, class, view, nodes)
+}
 
-	return nil
+// overlayRouted gives each routed peer the routes this viewer is given of
+// it and returns those whose entry then differs from the class's.
+func (r *renderer) overlayRouted(
+	snap *state.Snapshot,
+	self types.NodeView,
+	class *peerMap,
+	peers *graph.MapEdit[tailcfg.NodeID, *tailcfg.Node],
+	routed []types.NodeID,
+	ipv4Disabled bool,
+) []tailcfg.NodeID {
+	if len(routed) == 0 {
+		return nil
+	}
+
+	if r.routedPrimaries == nil {
+		r.routedPrimaries = make(map[tailcfg.NodeID][]netip.Prefix, len(routed))
+	}
+
+	var overlaid []tailcfg.NodeID
+
+	for _, id := range routed {
+		base, _ := class.Get(id.NodeID())
+		peer, _ := snap.GetNode(id)
+
+		r.routedPrimaries[id.NodeID()] = snap.PrimaryRoutesForNode(id)
+
+		tn := withRoutes(base, snap.RoutesForPeer(self, peer))
+		if ipv4Disabled {
+			tn = withoutIPv4Identity(tn)
+		}
+
+		if tn != base {
+			overlaid = append(overlaid, id.NodeID())
+		}
+
+		if old, _ := peers.Get(id.NodeID()); old != tn {
+			peers.Set(id.NodeID(), tn)
+		}
+	}
+
+	return overlaid
+}
+
+// recordOverlaid replaces what r remembers of the candidates' overlays
+// with overlaid; the other peers keep what they had.
+func (r *renderer) recordOverlaid(candidates, overlaid []tailcfg.NodeID) {
+	for _, id := range candidates {
+		delete(r.overlaid, id)
+	}
+
+	if len(overlaid) > 0 && r.overlaid == nil {
+		r.overlaid = make(map[tailcfg.NodeID]struct{}, len(overlaid))
+	}
+
+	for _, id := range overlaid {
+		r.overlaid[id] = struct{}{}
+	}
 }
 
 // peerCandidates keeps membership churn from comparing unrelated class maps:

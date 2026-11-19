@@ -1413,8 +1413,6 @@ func (pol *Policy) allGrants() []Grant {
 	return grants
 }
 
-func sharedRules(grants []compiledGrant) []tailcfg.FilterRule { return globalFilterRules(grants) }
-
 func grantRulesForNode(cg *compiledGrant, node types.NodeView, userIdx userNodeIndex) []tailcfg.FilterRule {
 	switch cg.category {
 	case grantCategorySelf:

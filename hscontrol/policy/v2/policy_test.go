@@ -2,7 +2,6 @@ package v2
 
 import (
 	"bytes"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -5099,29 +5098,6 @@ func BenchmarkNewPolicyManager(b *testing.B) {
 		})
 	}
 }
-
-// legacySidesKey preserves the byte serialization used before the builder.
-func legacySidesKey(src, dst []uint64) string {
-	b := make([]byte, 0, 2*binary.MaxVarintLen64+8*(len(src)+len(dst)))
-	for _, side := range [][]uint64{src, dst} {
-		if side == nil {
-			b = append(b, 0)
-
-			continue
-		}
-
-		b = append(b, 1)
-
-		b = binary.AppendUvarint(b, uint64(len(side)))
-		for _, word := range side {
-			b = binary.LittleEndian.AppendUint64(b, word)
-		}
-	}
-
-	return string(b)
-}
-
-var sidesKeyResult string
 
 func BenchmarkNewPolicyManagerAfterTagJoin(b *testing.B) {
 	const (

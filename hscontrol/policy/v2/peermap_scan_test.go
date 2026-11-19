@@ -1532,58 +1532,6 @@ func TestNewPolicyManagerFromTransitions(t *testing.T) {
 
 const scanServerURL = "https://headscale.example.com"
 
-// userAliasFixture varies nodes, identities and rules independently. Groups overlap
-// so a change to one user reaches both groups containing that user.
-func userAliasFixture(tb testing.TB, nodeCount, userCount, ruleCount int, groups bool) ([]byte, types.Users, types.Nodes) {
-	tb.Helper()
-
-	users := make(types.Users, userCount)
-	for i := range users {
-		users[i] = types.User{ID: uint(i + 1), Name: fmt.Sprintf("alias-user-%d", i)} //nolint:gosec
-	}
-
-	nodes := make(types.Nodes, nodeCount)
-	ip := netip.MustParseAddr("100.64.0.1")
-
-	for i := range nodes {
-		u := &users[i%userCount]
-		nodes[i] = &types.Node{ID: types.NodeID(i + 1), Hostname: fmt.Sprintf("alias-node-%d", i), UserID: &u.ID, User: u, IPv4: new(ip)} //nolint:gosec
-		ip = ip.Next()
-	}
-
-	var policy strings.Builder
-	policy.WriteString(`{"groups":{`)
-
-	if groups {
-		for i := range users {
-			if i > 0 {
-				policy.WriteByte(',')
-			}
-
-			fmt.Fprintf(&policy, `"group:alias-%d":[%q,%q]`, i, users[i].Name+"@", users[(i+1)%userCount].Name+"@")
-		}
-	}
-
-	policy.WriteString(`},"grants":[`)
-
-	for i := range ruleCount {
-		if i > 0 {
-			policy.WriteByte(',')
-		}
-
-		alias := users[i%userCount].Name + "@"
-		if groups {
-			alias = fmt.Sprintf("group:alias-%d", i%userCount)
-		}
-
-		fmt.Fprintf(&policy, `{"src":[%q],"dst":[%q],"ip":["tcp:%d"]}`, alias, alias, 443+i)
-	}
-
-	policy.WriteString(`]}`)
-
-	return []byte(policy.String()), users, nodes
-}
-
 // TestUserAliasIncrementalIdentities keeps stale embedded user records on nodes:
 // token and domain membership must follow the current users, including collisions.
 func TestUserAliasIncrementalIdentities(t *testing.T) {

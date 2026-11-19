@@ -113,22 +113,8 @@ func diff(sent, next *netMap, frames *frameCache) []*tailcfg.MapResponse {
 		changed = true
 	}
 
-	switch {
-	case sent.chunked != next.chunked:
-		// The session's delivery changed (its client reports another
-		// client): the client's chunks are no help.
-		resp.PacketFilters = filterReset(next)
-		changed = true
-	case sameRules(sent.filter, next.filter):
-	case next.chunked:
-		// A chunk's name is a hash of its rules: the names the client
-		// holds say what it holds.
-		if d := next.chunks.Delta(sent.chunks); d != nil {
-			resp.PacketFilters = d
-			changed = true
-		}
-	case !reflect.DeepEqual(sent.filter, next.filter):
-		resp.PacketFilters = map[string][]tailcfg.FilterRule{"base": next.filter}
+	if pf := filtersToSend(sent, next); pf != nil {
+		resp.PacketFilters = pf
 		changed = true
 	}
 
@@ -176,6 +162,27 @@ func diff(sent, next *netMap, frames *frameCache) []*tailcfg.MapResponse {
 	}
 
 	return out
+}
+
+// filtersToSend returns the PacketFilters that take a client holding sent's
+// filter to next's, nil when it holds it already.
+func filtersToSend(sent, next *netMap) map[string][]tailcfg.FilterRule {
+	switch {
+	case sent.chunked != next.chunked:
+		// The session's delivery changed (its client reports another
+		// client): the client's chunks are no help.
+		return filterReset(next)
+	case sameRules(sent.filter, next.filter):
+		return nil
+	case next.chunked:
+		// A chunk's name is a hash of its rules: the names the client
+		// holds say what it holds.
+		return next.chunks.Delta(sent.chunks)
+	case !reflect.DeepEqual(sent.filter, next.filter):
+		return map[string][]tailcfg.FilterRule{"base": next.filter}
+	}
+
+	return nil
 }
 
 // profilesToCompare returns the users whose profile may differ between
