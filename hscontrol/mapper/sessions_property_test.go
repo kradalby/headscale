@@ -610,6 +610,12 @@ var sessionScripts = []struct {
 // reconnects, or reconnects before its old connection ends.
 var failoverActs = []string{"down", "up", "health", "reconnect", "overlap"}
 
+// scriptedWorld is the most nodes a world starts with that the routing
+// properties end a case with a script in, or delivery plays membership
+// churn in: in a larger one each act judges dozens of sessions, and its
+// drawn rules leave a script's move alone least.
+const scriptedWorld = 8
+
 // drawScript draws a script to play from w: one of [sessionScripts], or a
 // failover and what then happens to its routers. Nothing when it does not
 // apply to w.

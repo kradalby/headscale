@@ -154,13 +154,21 @@ func ruleRuns(t *rapid.T) runs {
 
 // stepRuns draws how a scenario's steps come, and how many it may take in
 // all: none, rarely, which is the plainest; else at least one run, up to
-// maxSteps steps, or a few times that in a long scenario.
-func stepRuns(t *rapid.T, maxSteps int) (runs, int) {
+// maxSteps steps, or a few times that in a long scenario. A large world
+// takes a short scenario, half as long and never long: each of its steps
+// is judged for every session of a large tailnet, and no shape needs the
+// two tails together.
+func stepRuns(t *rapid.T, maxSteps int, w World) (runs, int) {
 	busy := usually(t, quietBits, "busy")
 	long := chance(t, longScenarios, "long-scenario")
+	large := len(w.Topology.Nodes) > 2*fleetNodes
 
 	r, total := runs{each: stepRun}, maxSteps
-	if long {
+
+	switch {
+	case large:
+		total = max(1, maxSteps/2)
+	case long:
 		r.each, total = longStepRun, total*longScenarioTimes
 	}
 

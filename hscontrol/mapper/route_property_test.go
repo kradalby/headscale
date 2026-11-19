@@ -16,6 +16,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"gorm.io/gorm"
 	"pgregory.net/rapid"
 	"tailscale.com/envknob"
@@ -478,8 +479,19 @@ var aloneFloors = map[string]int{
 	"Nodes": 25, "Primaries": 0, "PeerSets": 0, "Filters": 0, "Caps": 0, "RouteViewers": 0, "Routers": 0,
 }
 
+// scenarioSteps is how long the route property's scenarios run: half as
+// long under the race detector, which watches the hub's goroutines, not
+// what the scenario says.
+func scenarioSteps() int {
+	if util.RaceEnabled {
+		return 5
+	}
+
+	return 10
+}
+
 func playScenario(t *rapid.T, reach *scenarioReach) {
-	s := policymodel.Scenarios(10).Draw(t, "scenario")
+	s := policymodel.Scenarios(scenarioSteps()).Draw(t, "scenario")
 	coalesce := pbtChance(t, 3, "coalesce")
 	mixed := pbtChance(t, 4, "mixed-versions")
 
@@ -548,9 +560,10 @@ func playScenario(t *rapid.T, reach *scenarioReach) {
 		}
 	}()
 
-	// One case in two ends with a script moving one part of what a viewer
-	// is sent alone, most of its acts read by every session.
-	if pbtChance(t, 2, "script") {
+	// One case in four ends with a script moving one part of what a
+	// viewer is sent alone, most of its acts read by every session; none
+	// in a large world ([scriptedWorld]) or under the race detector.
+	if pbtChance(t, 4, "script") && !util.RaceEnabled && len(s.Start.Topology.Nodes) <= scriptedWorld {
 		name, acts := drawScript(t, r.p.w)
 		r.edit = nil
 		reach.scripts[name]++

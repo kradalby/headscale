@@ -97,7 +97,7 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 			}
 		}
 
-		bounds, total := stepRuns(t, maxSteps)
+		bounds, total := stepRuns(t, maxSteps, w)
 
 		// Steps come in runs of a few, each run keeping to a focus, and
 		// each step and each run is a group the shrinker can delete whole.

@@ -2058,8 +2058,9 @@ func playDelivery(t *rapid.T, r *deliveryRun) {
 		play("step", st)
 
 		// Now and then a node joins and then leaves, each alone: membership
-		// moving and nothing else, which few drawn steps are.
-		if pbtChance(t, 3, "churn") {
+		// moving and nothing else, which few drawn steps are; not in a
+		// large world ([scriptedWorld]).
+		if pbtChance(t, 4, "churn") && len(s.Start.Topology.Nodes) <= scriptedWorld {
 			if n, ok := churnNode(t, worlds[0].p.w, churned); ok {
 				churned++
 
@@ -2069,15 +2070,18 @@ func playDelivery(t *rapid.T, r *deliveryRun) {
 		}
 	}
 
-	// One case in two ends with a script moving one part of what a viewer
-	// is sent alone ([drawScript]).
+	// One case in eight ends with a script moving one part of what a
+	// viewer is sent alone ([drawScript]): each is several steps of four
+	// worlds, and routing per part is the route property's to judge. None
+	// in a large world ([scriptedWorld]), nor under the race detector,
+	// which a script gives no goroutine to watch.
 	defer func() {
 		for k, n := range worlds[0].p.made {
 			r.reach.writes[k] += n
 		}
 	}()
 
-	if pbtChance(t, 2, "script") {
+	if pbtChance(t, 8, "script") && !util.RaceEnabled && len(s.Start.Topology.Nodes) <= scriptedWorld {
 		name, acts := drawScript(t, worlds[0].p.w)
 		r.reach.scripts[name]++
 
