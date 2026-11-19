@@ -692,6 +692,24 @@ func assertCurlDockerHostname(c *assert.CollectT, client TailscaleClient, url, m
 	assert.Len(c, result, dockerHostnameLen, msg)
 }
 
+// requireCapabilitySources reports whether headscale names filter sources
+// by capability (policy.capability_sources), as the server says: a test
+// asserting a client's filter asserts the form the server is in.
+func requireCapabilitySources(t *testing.T, headscale ControlServer) bool {
+	t.Helper()
+
+	var on bool
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		info, err := headscale.DebugCapabilitySources()
+		if assert.NoError(c, err) && assert.NotNil(c, info) {
+			on = info.Enabled
+		}
+	}, integrationutil.ScaledTimeout(10*time.Second), integrationutil.FastPoll, "reading whether headscale names sources by capability")
+
+	return on
+}
+
 // snapshotClientFilters snapshots each client's current netmap
 // PacketFilter keyed by hostname. Pair with [waitForClientFilterChange].
 func snapshotClientFilters(t *testing.T, clients []TailscaleClient) map[string][]filter.Match {

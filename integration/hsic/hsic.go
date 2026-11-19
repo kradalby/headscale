@@ -29,6 +29,7 @@ import (
 	clientv2 "github.com/juanfont/headscale/gen/client/v2"
 	"github.com/juanfont/headscale/hscontrol"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
+	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/integration/dockertestutil"
@@ -1776,6 +1777,13 @@ func (t *HeadscaleInContainer) DebugNodeStore() (map[types.NodeID]types.Node, er
 // DebugFilter fetches the current filter rules from the debug endpoint.
 func (t *HeadscaleInContainer) DebugFilter() ([]tailcfg.FilterRule, error) {
 	return t.debugJSON[[]tailcfg.FilterRule]("filter")
+}
+
+// DebugCapabilitySources fetches which filter sources the server sends as
+// addresses instead of capabilities, and whether it names any by
+// capability at all.
+func (t *HeadscaleInContainer) DebugCapabilitySources() (*state.DebugCapabilitySourcesInfo, error) {
+	return t.debugJSON[*state.DebugCapabilitySourcesInfo]("capability-sources")
 }
 
 // debugJSON fetches and decodes a JSON-returning debug endpoint by name.

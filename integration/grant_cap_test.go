@@ -3,6 +3,7 @@ package integration
 import (
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -33,13 +34,26 @@ func hasCapMatchInPacketFilter(pf []filter.Match, peerCap peercap.Cap) bool {
 	return false
 }
 
-// hasCapMatchForIP checks if any [filter.CapMatch] with the given capability
-// has a Dst prefix that contains the given IP. This validates that
-// the cap is directed at the correct node, not just present.
-func hasCapMatchForIP(pf []filter.Match, peerCap peercap.Cap, ip netip.Addr) bool {
+// hasCapMatchFrom checks that one [filter.Match] grants peerCap to dst
+// from every address in srcs, by address: the client grants app
+// capabilities by a rule's addresses only, so such a rule names its
+// sources as addresses with capability sources on or off, and a rule
+// naming them by capability would grant nothing.
+func hasCapMatchFrom(pf []filter.Match, peerCap peercap.Cap, dst netip.Addr, srcs ...netip.Addr) bool {
 	for _, m := range pf {
+		if len(m.SrcCaps) > 0 {
+			continue
+		}
+
+		from := !slices.ContainsFunc(srcs, func(src netip.Addr) bool {
+			return !slices.ContainsFunc(m.Srcs, func(p netip.Prefix) bool { return p.Contains(src) })
+		})
+		if !from {
+			continue
+		}
+
 		for _, cm := range m.Caps {
-			if cm.Cap == peerCap && cm.Dst.Contains(ip) {
+			if cm.Cap == peerCap && cm.Dst.Contains(dst) {
 				return true
 			}
 		}
@@ -286,24 +300,24 @@ func TestGrantCapRelay(t *testing.T) {
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		pf, err := relayR.PacketFilter()
 		assert.NoError(c, err)
-		assert.True(c, hasCapMatchForIP(pf, peercap.Relay, relayIPv4),
-			"Relay R should have cap/relay with Dst matching relay's IP %s", relayIPv4)
+		assert.True(c, hasCapMatchFrom(pf, peercap.Relay, relayIPv4, clientAIPv4, clientBIPv4),
+			"Relay R should have cap/relay with Dst matching relay's IP %s, from the clients' addresses", relayIPv4)
 	}, assertTimeout, 500*time.Millisecond, "R should have cap/relay targeting its own IP")
 
 	// Client A should have cap/relay-target targeting client A's IP.
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		pf, err := clientA.PacketFilter()
 		assert.NoError(c, err)
-		assert.True(c, hasCapMatchForIP(pf, peercap.RelayTarget, clientAIPv4),
-			"Client A should have cap/relay-target with Dst matching A's IP %s", clientAIPv4)
+		assert.True(c, hasCapMatchFrom(pf, peercap.RelayTarget, clientAIPv4, relayIPv4),
+			"Client A should have cap/relay-target with Dst matching A's IP %s, from the relay's address", clientAIPv4)
 	}, assertTimeout, 500*time.Millisecond, "A should have cap/relay-target targeting its own IP")
 
 	// Client B should have cap/relay-target targeting client B's IP.
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		pf, err := clientB.PacketFilter()
 		assert.NoError(c, err)
-		assert.True(c, hasCapMatchForIP(pf, peercap.RelayTarget, clientBIPv4),
-			"Client B should have cap/relay-target with Dst matching B's IP %s", clientBIPv4)
+		assert.True(c, hasCapMatchFrom(pf, peercap.RelayTarget, clientBIPv4, relayIPv4),
+			"Client B should have cap/relay-target with Dst matching B's IP %s, from the relay's address", clientBIPv4)
 	}, assertTimeout, 500*time.Millisecond, "B should have cap/relay-target targeting its own IP")
 
 	// --- Negative checks: wrong caps must NOT be present ---
@@ -755,32 +769,33 @@ func TestGrantCapDrive(t *testing.T) {
 
 	// --- Positive checks ---
 
-	// Sharer should have cap/drive targeting its own IP (it's the drive destination).
+	rwClientIPv4, roClientIPv4 := rwClient.MustIPv4(), roClient.MustIPv4()
+
+	// Sharer should have cap/drive targeting its own IP (it's the drive
+	// destination), one rule per client grant.
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		pf, err := sharer.PacketFilter()
 		assert.NoError(c, err)
-		assert.True(c, hasCapMatchForIP(pf, peercap.Taildrive, sharerIPv4),
-			"Sharer should have cap/drive with Dst matching sharer's IP %s", sharerIPv4)
+		assert.True(c, hasCapMatchFrom(pf, peercap.Taildrive, sharerIPv4, rwClientIPv4),
+			"Sharer should have cap/drive with Dst matching sharer's IP %s, from rw-client's address", sharerIPv4)
+		assert.True(c, hasCapMatchFrom(pf, peercap.Taildrive, sharerIPv4, roClientIPv4),
+			"Sharer should have cap/drive with Dst matching sharer's IP %s, from ro-client's address", sharerIPv4)
 	}, assertTimeout, 500*time.Millisecond, "sharer should have cap/drive targeting its own IP")
 
 	// RW client should have cap/drive-sharer (companion) targeting rw-client's IP.
-	rwClientIPv4 := rwClient.MustIPv4()
-
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		pf, err := rwClient.PacketFilter()
 		assert.NoError(c, err)
-		assert.True(c, hasCapMatchForIP(pf, peercap.TaildriveSharer, rwClientIPv4),
-			"RW client should have cap/drive-sharer with Dst matching rw-client's IP %s", rwClientIPv4)
+		assert.True(c, hasCapMatchFrom(pf, peercap.TaildriveSharer, rwClientIPv4, sharerIPv4),
+			"RW client should have cap/drive-sharer with Dst matching rw-client's IP %s, from the sharer's address", rwClientIPv4)
 	}, assertTimeout, 500*time.Millisecond, "rw-client should have cap/drive-sharer")
 
 	// RO client should have cap/drive-sharer (companion) targeting ro-client's IP.
-	roClientIPv4 := roClient.MustIPv4()
-
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		pf, err := roClient.PacketFilter()
 		assert.NoError(c, err)
-		assert.True(c, hasCapMatchForIP(pf, peercap.TaildriveSharer, roClientIPv4),
-			"RO client should have cap/drive-sharer with Dst matching ro-client's IP %s", roClientIPv4)
+		assert.True(c, hasCapMatchFrom(pf, peercap.TaildriveSharer, roClientIPv4, sharerIPv4),
+			"RO client should have cap/drive-sharer with Dst matching ro-client's IP %s, from the sharer's address", roClientIPv4)
 	}, assertTimeout, 500*time.Millisecond, "ro-client should have cap/drive-sharer")
 
 	// --- Negative checks ---

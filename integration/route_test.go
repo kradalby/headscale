@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"net/netip"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
@@ -1559,6 +1561,23 @@ func TestSubnetRouteACL(t *testing.T) {
 		},
 	}
 
+	// The client announces no route and runs Tailscale's client, so with
+	// capability sources on, group:admins goes as the capability its
+	// members carry; both nodes are user4's, so the client admits exactly
+	// the addresses the address form lists.
+	admins := nodecap.Cap("https://headscale.net/cap/src/group:admins")
+	capSources := requireCapabilitySources(t, headscale)
+
+	// Unswitched, the run must reach headscale's default.
+	if os.Getenv("HEADSCALE_INTEGRATION_CAPABILITY_SOURCES") == "" {
+		require.True(t, capSources, "headscale names sources by capability by default")
+	}
+
+	if capSources {
+		wantClientFilter[0].Srcs = []netip.Prefix{}
+		wantClientFilter[0].SrcCaps = []nodecap.Cap{admins}
+	}
+
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
 		clientNm, err := client.Netmap()
 		assert.NoError(c, err)
@@ -1566,11 +1585,22 @@ func TestSubnetRouteACL(t *testing.T) {
 		if diff := cmpdiff.Diff(wantClientFilter, clientNm.PacketFilter, util.ViewSliceIPProtoComparer, util.PrefixComparer); diff != "" {
 			assert.Fail(c, fmt.Sprintf("Client (%s) filter, unexpected result (-want +got):\n%s", client.Hostname(), diff))
 		}
+
+		if !capSources {
+			return
+		}
+
+		assert.True(c, clientNm.SelfNode.HasCap(admins), "the client carries group:admins")
+
+		for _, p := range clientNm.Peers {
+			assert.True(c, p.HasCap(admins), "peer %s carries group:admins", p.Name())
+		}
 	}, integrationutil.ScaledTimeout(10*time.Second), integrationutil.FastPoll, "Waiting for client packet filter to update")
 
 	// Wait for packet filter updates to propagate to subnet router netmap
 	// The two ACL rules (group:admins -> group:admins:* and group:admins -> 10.33.0.0/16:*)
 	// are merged into one filter rule since they share the same SrcIPs and IPProto.
+	// A node announcing routes is sent addresses in either mode.
 	wantSubnetFilter := []filter.Match{
 		{
 			IPProto: views.SliceOf([]ipproto.Proto{
