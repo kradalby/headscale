@@ -33,9 +33,9 @@ func identitySources(ident, mixed bool, ids, general []Sel) []Sel {
 	return ids
 }
 
-// The fallbacks a form tour flips its receiver through. Each is a step
-// turning it on and a step turning it off, the receiver reading after
-// both; tourValues is three steps.
+// The fallbacks a form tour flips its receiver through, and two shapes
+// beside them. Each is a step turning it on and a step turning it off, the
+// receiver reading after both; tourValues is three steps.
 const (
 	tourAnnounce     = iota // announces a route, approved only if the auto-approvers approve it
 	tourApproved            // announces a route and an admin approves it
@@ -46,6 +46,7 @@ const (
 	tourCapGrant            // the rule it reads grants app capabilities too
 	tourPortless            // the rule it reads goes over a protocol without ports
 	tourValues              // app capability values that differ past the first
+	tourNoIPv4              // nodeAttrs give it disable-ipv4: its client is shown no IPv4 address
 	numTour
 )
 
@@ -188,11 +189,16 @@ func tourFlip(w World, n Node, ref RuleRef, target Sel, stop int) [][]Edit {
 		return [][]Edit{{Announce{n.ID, routes}, Approve{n.ID, routes}}, {Withdraw{n.ID, routes}, Unapprove{n.ID, routes}}}
 	case tourAppConnector:
 		return [][]Edit{{SetClient{n.ID, AppConnector}}, {official}}
-	case tourServiceHost:
-		attrs := w.Policy.NodeAttrs
-		host := append(slices.Clone(attrs), NodeAttr{Targets: []Sel{target}, Attrs: []int{attrServiceHost}})
+	case tourServiceHost, tourNoIPv4:
+		attr := attrServiceHost
+		if stop == tourNoIPv4 {
+			attr = attrDisableIPv4
+		}
 
-		return [][]Edit{{SetNodeAttrs{host}}, {SetNodeAttrs{attrs}}}
+		attrs := w.Policy.NodeAttrs
+		with := append(slices.Clone(attrs), NodeAttr{Targets: []Sel{target}, Attrs: []int{attr}})
+
+		return [][]Edit{{SetNodeAttrs{with}}, {SetNodeAttrs{attrs}}}
 	case tourUnknown:
 		return [][]Edit{{SetClient{n.ID, Unknown}}, {official}}
 	case tourRS:

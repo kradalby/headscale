@@ -50,6 +50,16 @@ func reachOf(s Scenario) formReach {
 		fr.world(v)
 	}
 
+	for i := 1; i < len(worlds); i++ {
+		before, after := NewView(worlds[i-1]), NewView(worlds[i])
+
+		for _, n := range worlds[i].Topology.Nodes {
+			if was, ok := worlds[i-1].Topology.Node(n.ID); ok && n.V4.IsValid() && before.IPv4Disabled(was) != after.IPv4Disabled(n) {
+				fr.shapes["disable-ipv4-flip"] = true
+			}
+		}
+	}
+
 	for i, st := range s.Steps {
 		cur := worlds[i]
 
@@ -250,7 +260,7 @@ var capFormFloors = map[string]int{
 	"flip-into-routes":                130, "flip-out-of-routes": 70, "flip-into-client": 55, "flip-out-of-client": 30,
 	"flip-into-app-connector": 25, "flip-out-of-app-connector": 25, "flip-into-service-host": 25, "flip-out-of-service-host": 25,
 	"rule-gains-cap-grant": 35, "rule-loses-cap-grant": 35, "rule-gains-portless": 15, "rule-loses-portless": 15,
-	"app-values": 100, "app-capabilities": 45, "app-values-past-first": 20, "public-ipv6-rule": 25, "disable-ipv4": 35,
+	"app-values": 100, "app-capabilities": 45, "app-values-past-first": 20, "public-ipv6-rule": 25, "disable-ipv4": 35, "disable-ipv4-flip": 25,
 }
 
 // capFormReadShare is the least share of reads at which a capability is
