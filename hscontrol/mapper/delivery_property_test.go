@@ -365,6 +365,15 @@ func clientPeer(n tailcfg.NodeView) string {
 		p.LastSeen = nil
 	}
 
+	// TODO(kradalby): render/addresses-nil: see clientAddresses.
+	if p.Addresses == nil {
+		p.Addresses = []netip.Prefix{}
+	}
+
+	if p.AllowedIPs == nil {
+		p.AllowedIPs = p.Addresses
+	}
+
 	return jsonOf(p)
 }
 
@@ -1352,6 +1361,8 @@ func combosAgree(t *rapid.T, at string, r *deliveryRun, worlds []*deliveryWorld,
 				r.reach.crossFamily += crossed
 			}
 
+			_, rep = rep.SplitHidden(policymodel.NotShown(dw.p.w, slices.Concat(cand.Peers, []tailcfg.NodeView{cand.SelfNode}), slices.Concat(ref.Peers, []tailcfg.NodeView{ref.SelfNode})))
+
 			if !rep.Equivalent() {
 				t.Fatalf("combos: %s: n%d's client enforces otherwise under %s than under %s: %s", at, id, dw.combo, worlds[0].combo, rep)
 			}
@@ -1528,6 +1539,18 @@ func (c heldClient) peers() {
 		got = append(got, types.NodeID(p.ID())) //nolint:gosec // small
 	}
 
+	for _, nv := range append([]tailcfg.NodeView{c.nm.SelfNode}, c.nm.Peers...) {
+		var addrs []netip.Addr
+
+		for _, p := range nv.Addresses().All() {
+			addrs = append(addrs, p.Addr())
+		}
+
+		if want := policymodel.ShownAddrs(c.dw.p.w, c.id, types.NodeID(nv.ID())); !c.shared && !slices.Equal(addrs, want) { //nolint:gosec // small
+			c.fail("its client is shown n%d at %v, the model at %v", nv.ID(), addrs, want)
+		}
+	}
+
 	c.rt.peerSets++
 
 	if want := c.ref.Peers(c.id); !slices.Equal(got, want) {
@@ -1693,7 +1716,12 @@ func refView(n policymodel.Node, w policymodel.World, nm *netmap.NetworkMap) pol
 	own := make([]netip.Prefix, 0, 2)
 	announced := make([]netip.Prefix, 0, len(n.Announced))
 
-	for _, a := range n.Addrs() {
+	// disable-ipv4 keeps addresses from the netmap, its own among them;
+	// whether rightly the shown addresses' check says.
+	hidden := policymodel.NotShown(w, slices.Concat(nm.Peers, []tailcfg.NodeView{nm.SelfNode}))
+	addrs := slices.DeleteFunc(n.Addrs(), func(a netip.Addr) bool { return slices.Contains(hidden, a) })
+
+	for _, a := range addrs {
 		own = append(own, netip.PrefixFrom(a, a.BitLen()))
 	}
 
@@ -1701,7 +1729,7 @@ func refView(n policymodel.Node, w policymodel.World, nm *netmap.NetworkMap) pol
 		announced = append(announced, policymodel.Prefixes[r])
 	}
 
-	v := policymodel.ClientView{Self: n.Addrs(), LocalNets: policymodel.LocalNets(own, announced, n.Client == policymodel.AppConnector, nil)}
+	v := policymodel.ClientView{Self: addrs, LocalNets: policymodel.LocalNets(own, announced, n.Client == policymodel.AppConnector, nil), Hidden: hidden}
 
 	for _, m := range w.Topology.Nodes {
 		v.Known = append(v.Known, m.Addrs()...)

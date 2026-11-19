@@ -141,6 +141,10 @@ func (fr *formReach) read(v *View, ref *Ref, n Node, last map[types.NodeID]strin
 func (fr *formReach) world(v *View) {
 	w := v.World
 
+	if slices.ContainsFunc(w.Topology.Nodes, func(n Node) bool { return n.V4.IsValid() && v.IPv4Disabled(n) }) {
+		fr.shapes["disable-ipv4"] = true
+	}
+
 	for _, r := range slices.Concat(w.Policy.ACLs, w.Policy.Grants) {
 		if len(r.App) > 1 {
 			fr.shapes["app-capabilities"] = true
@@ -246,7 +250,7 @@ var capFormFloors = map[string]int{
 	"flip-into-routes":                130, "flip-out-of-routes": 70, "flip-into-client": 55, "flip-out-of-client": 30,
 	"flip-into-app-connector": 25, "flip-out-of-app-connector": 25, "flip-into-service-host": 25, "flip-out-of-service-host": 25,
 	"rule-gains-cap-grant": 35, "rule-loses-cap-grant": 35, "rule-gains-portless": 15, "rule-loses-portless": 15,
-	"app-values": 100, "app-capabilities": 45, "app-values-past-first": 20, "public-ipv6-rule": 25,
+	"app-values": 100, "app-capabilities": 45, "app-values-past-first": 20, "public-ipv6-rule": 25, "disable-ipv4": 35,
 }
 
 // capFormReadShare is the least share of reads at which a capability is

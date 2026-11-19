@@ -11,6 +11,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"go4.org/netipx"
 	"pgregory.net/rapid"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
 )
 
@@ -156,6 +157,8 @@ func nodeFactsDiffer(w policymodel.World, v *policymodel.View, pm *PolicyManager
 			return fmt.Sprintf("n%d (%s) reads as an official client %t", n.ID, m.Client, facts.Client)
 		case svc != slices.Contains(v.ServiceHosts(), n.ID):
 			return fmt.Sprintf("n%d is a service host %t, the model says otherwise", n.ID, svc)
+		case hasCap(caps[n.ID], types.NodeAttrDisableIPv4) != v.IPv4Disabled(m):
+			return fmt.Sprintf("n%d has disable-ipv4 %t, the model says %t", n.ID, !v.IPv4Disabled(m), v.IPv4Disabled(m))
 		case (facts.Client && !facts.Announces && !facts.AppConnector && !facts.ServiceHost) != v.Eligible(m):
 			return fmt.Sprintf("n%d's facts %+v disagree with the model's eligibility", n.ID, facts)
 		}
@@ -395,4 +398,10 @@ func stableError(err error) string {
 	slices.Sort(lines)
 
 	return strings.Join(lines, "\n")
+}
+
+func hasCap(caps tailcfg.NodeCapMap, c nodecap.Cap) bool {
+	_, ok := caps[c]
+
+	return ok
 }

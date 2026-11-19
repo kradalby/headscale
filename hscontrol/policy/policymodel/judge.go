@@ -33,6 +33,9 @@ type Verdicts struct {
 	// other family's ICMP protocol, which address form accepts: decided as
 	// malformed, failing closed.
 	CrossFamilyICMP int
+	// Hidden: a verdict or app capability on an address the client is
+	// shown no node at, which no packet carries (disable-ipv4).
+	Hidden int
 	// RepeatedValues: an app capability's values come once per
 	// destination entry of a grant that names the receiver, where the
 	// reference gives them once per grant. Reported, not encoded; no
@@ -84,8 +87,8 @@ func (c *Verdicts) String() string {
 		}
 	}
 
-	return fmt.Sprintf("allowed %d cross-family ICMP, %d through * on unapproved routes; suspected: %d through other whole destinations on unapproved routes, %d app values repeated; contested %v",
-		c.CrossFamilyICMP, c.Unrouted, c.UnroutedWhole, c.RepeatedValues, parts)
+	return fmt.Sprintf("allowed %d cross-family ICMP, %d through * on unapproved routes, %d on hidden addresses; suspected: %d through other whole destinations on unapproved routes, %d app values repeated; contested %v",
+		c.CrossFamilyICMP, c.Unrouted, c.Hidden, c.UnroutedWhole, c.RepeatedValues, parts)
 }
 
 // judge holds rep, a comparison of the reference's rules (as Ref) with
@@ -97,6 +100,10 @@ func (c *Verdicts) judge(rep Report, ref *Ref, id types.NodeID, view ClientView,
 		c.CrossFamilyICMP += crossed
 		rep = rest
 	}
+
+	hidden, rest := rep.SplitHidden(view.Hidden)
+	c.Hidden += hidden
+	rep = rest
 
 	rep.Caps = slices.DeleteFunc(rep.Caps, func(d CapsDiff) bool {
 		// TODO(kradalby): policy/app-values-repeated: cosmetic, no verdict
@@ -181,6 +188,7 @@ func (c *Verdicts) CompareAt(ref *Ref, id types.NodeID, got []tailcfg.FilterRule
 	c.Unrouted += trial.Unrouted
 	c.UnroutedWhole += trial.UnroutedWhole
 	c.CrossFamilyICMP += trial.CrossFamilyICMP
+	c.Hidden += trial.Hidden
 	c.RepeatedValues += trial.RepeatedValues
 
 	return rep

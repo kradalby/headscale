@@ -336,3 +336,100 @@ func b2i(b bool) int {
 
 	return 0
 }
+
+// IPv4Disabled reports whether nodeAttrs give n disable-ipv4. They grant
+// by address, as for service hosts.
+func (v *View) IPv4Disabled(n Node) bool {
+	return slices.ContainsFunc(v.World.Policy.NodeAttrs, func(a NodeAttr) bool {
+		return slices.Contains(a.Attrs, attrDisableIPv4) && v.holds(a.Targets, n)
+	})
+}
+
+// HiddenAddrs are the node addresses node id's client is shown no node
+// at under disable-ipv4: every IPv4 address when id has it, else the IPv4
+// address of each node that has it. Sorted.
+func HiddenAddrs(w World, id types.NodeID) []netip.Addr {
+	v := NewView(w)
+	self, ok := w.Topology.Node(id)
+	all := ok && v.IPv4Disabled(self)
+
+	var out []netip.Addr
+
+	for _, n := range w.Topology.Nodes {
+		if n.V4.IsValid() && (all || v.IPv4Disabled(n)) {
+			out = append(out, n.V4)
+		}
+	}
+
+	slices.SortFunc(out, netip.Addr.Compare)
+
+	return slices.Compact(out)
+}
+
+// ShownAddrs are the addresses node viewer's client is shown node of
+// holding: its own, less those disable-ipv4 hides. As the hosted service
+// does: a node with it is shown no IPv4 address of its own or its peers',
+// and its peers are shown none of its.
+func ShownAddrs(w World, viewer, of types.NodeID) []netip.Addr {
+	n, ok := w.Topology.Node(of)
+	if !ok {
+		return nil
+	}
+
+	hidden := HiddenAddrs(w, viewer)
+
+	return slices.DeleteFunc(n.Addrs(), func(a netip.Addr) bool { return slices.Contains(hidden, a) })
+}
+
+// NotShown are the IPv4 addresses of w's nodes that no node of any of
+// shown holds: what a client holding those nodes is shown no node at,
+// disable-ipv4 having hidden them. Sorted.
+func NotShown(w World, shown ...[]tailcfg.NodeView) []netip.Addr {
+	held := map[netip.Addr]bool{}
+
+	for _, ns := range shown {
+		for _, n := range ns {
+			for _, p := range n.Addresses().All() {
+				held[p.Addr()] = true
+			}
+		}
+	}
+
+	var out []netip.Addr
+
+	for _, n := range w.Topology.Nodes {
+		if n.V4.IsValid() && !held[n.V4] {
+			out = append(out, n.V4)
+		}
+	}
+
+	slices.SortFunc(out, netip.Addr.Compare)
+
+	return slices.Compact(out)
+}
+
+// SplitHidden takes out the differences on an address of hidden: a
+// verdict from or to one, app capabilities from one.
+func (r Report) SplitHidden(hidden []netip.Addr) (int, Report) {
+	if len(hidden) == 0 {
+		return 0, r
+	}
+
+	n := 0
+	rest := r
+
+	rest.Verdicts = slices.DeleteFunc(slices.Clone(r.Verdicts), func(d VerdictDiff) bool {
+		in := slices.Contains(hidden, d.Probe.Src) || slices.Contains(hidden, d.Probe.Dst)
+		n += b2i(in)
+
+		return in
+	})
+	rest.Caps = slices.DeleteFunc(slices.Clone(r.Caps), func(d CapsDiff) bool {
+		in := slices.Contains(hidden, d.Src) || slices.Contains(hidden, d.Dst)
+		n += b2i(in)
+
+		return in
+	})
+
+	return n, rest
+}

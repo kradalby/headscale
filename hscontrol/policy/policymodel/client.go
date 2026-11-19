@@ -51,6 +51,11 @@ type ClientView struct {
 	// HasCap answers whether a source address holds a capability; nil
 	// holds none.
 	HasCap filter.CapTestFunc
+
+	// Hidden holds node addresses the client is shown no node at: no
+	// packet from one passes WireGuard's check of a peer's allowed IPs,
+	// so a verdict on one decides nothing.
+	Hidden []netip.Addr
 }
 
 // clientDefaultRouteExclusions mirrors what the client cuts from an

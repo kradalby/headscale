@@ -148,10 +148,15 @@ const appSingles = 2
 var SSHUsers = []string{"root", "autogroup:nonroot", "localpart:*@example.com", "alice"}
 
 // Attrs are the node attributes nodeAttrs grants; service-host makes a
-// node a service host, which takes it out of capability form.
-var Attrs = []string{"randomize-client-port", "drive:share", "service-host"}
+// node a service host, which takes it out of capability form; disable-ipv4
+// takes the node's IPv4 address from its own netmap and every peer's, and
+// its peers' from its own.
+var Attrs = []string{"randomize-client-port", "drive:share", "service-host", "disable-ipv4"}
 
-const attrServiceHost = 2
+const (
+	attrServiceHost = 2
+	attrDisableIPv4 = 3
+)
 
 // Node addresses. Node n owns 100.64.0.n and fd7a:115c:a1e0::n, so nodes
 // are distinct unless a draw says otherwise; moved addresses are tailnet

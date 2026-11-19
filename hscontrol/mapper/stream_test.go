@@ -750,7 +750,7 @@ func (c *modelClient) sameAs(fresh *modelClient) string {
 	switch {
 	case !reflect.DeepEqual(fresh.self, c.self):
 		return "self"
-	case !reflect.DeepEqual(fresh.peers, c.peers):
+	case !reflect.DeepEqual(clientAddresses(fresh.peers), clientAddresses(c.peers)):
 		have, err := json.Marshal(c.peers)
 		if err != nil {
 			return fmt.Sprintf("peers: encoding current client: %v", err)
@@ -11071,4 +11071,41 @@ func TestRouteWakesViewersOfARevokedStamp(t *testing.T) {
 			return p.ID == ids[0].NodeID() && !held
 		})
 	}), "n1 comes without the stamp: %s", describeResponses(resps))
+}
+
+// clientAddresses is peers with their addresses as the client reads
+// them: no addresses whether nil or empty, AllowedIPs nil as the
+// addresses (capability version 112).
+//
+// TODO(kradalby): render/addresses-nil: a peer with no address left is
+// rendered with nil from one path and [] from another: Addresses [] and
+// AllowedIPs nil from TailNode under its own disable-ipv4, both [] once
+// withoutIPv4Identity strips them for a viewer with it, both nil for a
+// node without addresses (netmap.go, types/node.go); peerRestEqual
+// compares them with slices.Equal, so a session keeps whichever it was
+// sent first. The same to the client only because no address is left:
+// nil AllowedIPs means the addresses. Reached with disable-ipv4 on an
+// IPv4-only node whose attribute or address moves. Delete this once each
+// render writes one of them, or peerRestEqual tells them apart.
+func clientAddresses(peers map[tailcfg.NodeID]*tailcfg.Node) map[tailcfg.NodeID]*tailcfg.Node {
+	out := make(map[tailcfg.NodeID]*tailcfg.Node, len(peers))
+
+	for id, p := range peers {
+		if p != nil && (p.Addresses == nil || p.AllowedIPs == nil) {
+			c := *p
+			if c.Addresses == nil {
+				c.Addresses = []netip.Prefix{}
+			}
+
+			if c.AllowedIPs == nil {
+				c.AllowedIPs = c.Addresses
+			}
+
+			p = &c
+		}
+
+		out[id] = p
+	}
+
+	return out
 }
