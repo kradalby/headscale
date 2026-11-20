@@ -2,10 +2,8 @@ package mapper
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"net/netip"
-	"reflect"
 	"runtime"
 	"strings"
 	"time"
@@ -170,49 +168,6 @@ func (w *wakeTally) String() string {
 	}
 
 	return sb.String()
-}
-
-// putNode writes n, built as tn, as production would come to hold it:
-// what the model does not hold (keys, endpoints, names, DERP, sessions,
-// health) stays as the State holds it, and a node connects and
-// disconnects through [state.State.Connect] and [state.State.Disconnect],
-// after any other write: a registration writes the node offline, its
-// first session connects it. Connection state alone moving writes nothing
-// else.
-func (p *pbtWorld) putNode(was policymodel.Node, existed bool, n policymodel.Node, tn *types.Node) {
-	if cur, ok := p.s.Snapshot().GetNode(n.ID); ok {
-		c := cur.AsStruct()
-		tn.NodeKey, tn.DiscoKey, tn.Endpoints = c.NodeKey, c.DiscoKey, c.Endpoints
-		tn.Hostname, tn.GivenName = c.Hostname, c.GivenName
-
-		if c.Hostinfo != nil {
-			tn.Hostinfo.Hostname, tn.Hostinfo.NetInfo = c.Hostinfo.Hostname, c.Hostinfo.NetInfo
-		}
-
-		tn.SessionStart, tn.ActiveSessions, tn.SessionEpoch, tn.LastSeen = c.SessionStart, c.ActiveSessions, c.SessionEpoch, c.LastSeen
-		tn.Unhealthy = c.Unhealthy
-	}
-
-	// The State's gates: an expired key is not online, and the prober's
-	// mark holds only on an online node serving routes.
-	tn.IsOnline = new(tn.ShouldBeOnline())
-	tn.Unhealthy = tn.Unhealthy && tn.Online() && len(tn.AllApprovedRoutes()) > 0
-
-	body := was
-	body.Offline = n.Offline
-
-	if !existed || !reflect.DeepEqual(body, n) {
-		p.call(func() { p.s.PutNodeInStoreForTest(*tn) })
-	}
-
-	switch {
-	case !n.Offline && len(p.conns[n.ID]) == 0:
-		p.connect(n.ID)
-	case n.Offline:
-		for len(p.conns[n.ID]) > 0 {
-			p.disconnect(n.ID)
-		}
-	}
 }
 
 // connect opens a connection of id, as a map session's start does; one
@@ -389,8 +344,10 @@ func (p *pbtWorld) session(sw sessionWrite) string {
 	}
 
 	n := from[sw.Who%len(from)]
+	did := p.sessionAt(n, sw)
+	p.requireStored(p.w, "a "+sw.Kind.String()+" write")
 
-	return fmt.Sprintf("n%d: %s", n.ID, p.sessionAt(n, sw))
+	return fmt.Sprintf("n%d: %s", n.ID, did)
 }
 
 // count notes a write of kind made.
@@ -460,7 +417,7 @@ func (p *pbtWorld) sessionAt(n *types.Node, sw sessionWrite) string {
 
 		p.call(func() {
 			_, err := p.s.RenameNode(id, name)
-			if err != nil && !errors.Is(err, state.ErrNodeNotInNodeStore) {
+			if err != nil {
 				p.t.Fatalf("n%d renamed %s: %v", id, name, err)
 			}
 		})
@@ -476,7 +433,7 @@ func (p *pbtWorld) sessionAt(n *types.Node, sw sessionWrite) string {
 
 		p.call(func() {
 			_, err := p.s.SetNodeExpiry(id, at)
-			if err != nil && !errors.Is(err, state.ErrNodeNotInNodeStore) {
+			if err != nil {
 				p.t.Fatalf("n%d's expiry: %v", id, err)
 			}
 		})
@@ -518,10 +475,8 @@ func (p *pbtWorld) mapRequest(n *types.Node, edit func(*tailcfg.Hostinfo, *tailc
 	edit(hi, &req)
 
 	p.call(func() {
-		// The node is in the world alone: what it reports lands in
-		// memory, and the database write after finds no row.
 		err := p.s.UpdateNodeFromMapRequest(n.ID, req)
-		if err != nil && !errors.Is(err, state.ErrNodeNotInNodeStore) {
+		if err != nil {
 			p.t.Fatalf("n%d's map request: %v", n.ID, err)
 		}
 	})
@@ -540,7 +495,10 @@ func (p *pbtWorld) sessionTo(id types.NodeID, kind sessionKind, value int) strin
 		return ""
 	}
 
-	return fmt.Sprintf("n%d: %s", id, p.sessionAt(n, sessionWrite{Kind: kind, Value: value}))
+	did := p.sessionAt(n, sessionWrite{Kind: kind, Value: value})
+	p.requireStored(p.w, "a "+kind.String()+" write")
+
+	return fmt.Sprintf("n%d: %s", id, did)
 }
 
 // scriptAct is one act of a drawn script: a model step, or a write of a

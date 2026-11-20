@@ -16,6 +16,15 @@ The properties built on it use [rapid](https://pkg.go.dev/pgregory.net/rapid):
 | `mapper/hub_property_test.go`      | The hub under drawn schedules: coalesced commits, slow and overlapping sessions                  |
 | `mapper/delivery_property_test.go` | What a real Tailscale client assembles, in all four option combinations, against the reference   |
 
+The mapper properties share one driver (`pbtWorld`): it writes nodes through
+the State's production entry points (registration, login, restart, map
+requests, the admin's tag, route and expiry writes, deletion), steered to the
+model's IDs and addresses, and the rest (addresses registration does not hand
+out, cleared endpoints, logins headscale would not convert) straight into the
+database row and the world. After every write it holds what production stored
+to the model and every row to its node in memory; a run logs which path each
+node write took (`entry_property_test.go`).
+
 ## Run
 
 `go test ./...` runs every property on 100 generated cases with a fresh seed.

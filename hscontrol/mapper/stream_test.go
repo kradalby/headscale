@@ -11087,11 +11087,18 @@ func TestRouteWakesViewersOfARevokedStamp(t *testing.T) {
 // nil AllowedIPs means the addresses. Reached with disable-ipv4 on an
 // IPv4-only node whose attribute or address moves. Delete this once each
 // render writes one of them, or peerRestEqual tells them apart.
+//
+// TODO(kradalby): state/untag-empty-tags: a login that untags a node
+// stores its tags as [] (processReauthTags), every other path as nil, and
+// the render carries either; a session that held the node untagged before
+// a retag and the login, routed together, keeps nil. Neither reaches the
+// client, which reads no empty list off the wire. Delete the tags half
+// once the login stores nil.
 func clientAddresses(peers map[tailcfg.NodeID]*tailcfg.Node) map[tailcfg.NodeID]*tailcfg.Node {
 	out := make(map[tailcfg.NodeID]*tailcfg.Node, len(peers))
 
 	for id, p := range peers {
-		if p != nil && (p.Addresses == nil || p.AllowedIPs == nil) {
+		if p != nil && (p.Addresses == nil || p.AllowedIPs == nil || p.Tags != nil && len(p.Tags) == 0) {
 			c := *p
 			if c.Addresses == nil {
 				c.Addresses = []netip.Prefix{}
@@ -11099,6 +11106,10 @@ func clientAddresses(peers map[tailcfg.NodeID]*tailcfg.Node) map[tailcfg.NodeID]
 
 			if c.AllowedIPs == nil {
 				c.AllowedIPs = c.Addresses
+			}
+
+			if len(c.Tags) == 0 {
+				c.Tags = nil
 			}
 
 			p = &c

@@ -616,15 +616,17 @@ type deliveryReach struct {
 }
 
 func (r deliveryReach) String() string {
+	prod, all := carried(r.writes)
+
 	return fmt.Sprintf("sessions held to a fresh one %d, lagged renders %d, failed writes %d, reconnects %d, delivery flips %d, "+
 		"clears %d, chunks added %d and deleted %d, whole filters sent %d, membership-churn receivers judged %d, "+
 		"nodes held across the four combinations %d (cross-family ICMP refused %d), kept chunks cleared %d, overlapping reconnects %d, "+
 		"address indexes held %d (own address lost after a shared one %d), offline peers held without LastSeen %d, "+
-		"lagged renders across a delivery flip %d and across a form flip %d; writes through production entry points %v, "+
-		"scripts %v; renders that sent something: %s",
+		"lagged renders across a delivery flip %d and across a form flip %d; writes through production entry points %v "+
+		"(node writes that reached one %d of %d), scripts %v; renders that sent something: %s",
 		r.compared, r.lagged, r.failed, r.reconnected, r.flips, r.clears, r.added, r.deleted, r.wholeSent,
 		r.churnJudged, r.combosCompared, r.crossFamily, r.keptCleared, r.overlapped, r.indexed, r.unindexed, r.unseen,
-		r.laggedFlips, r.laggedForms, r.writes, r.scripts, r.wakes)
+		r.laggedFlips, r.laggedForms, r.writes, prod, all, r.scripts, r.wakes)
 }
 
 // deliveryJudge is one part of what [TestDeliveryConvergesThroughTheClient]
@@ -1124,14 +1126,12 @@ func (dw *deliveryWorld) step(st policymodel.Step, touch, clearEndpoint bool, wh
 			}
 		}
 
-		n := pick.AsStruct()
-
-		n.Endpoints = nil
+		var eps []netip.AddrPort
 		if !clearEndpoint {
-			n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(i+1))} //nolint:gosec // small
+			eps = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(i+1))} //nolint:gosec // small
 		}
 
-		dw.p.call(func() { dw.p.s.PutNodeInStoreForTest(*n) })
+		dw.p.endpoint(pick.ID(), eps)
 	}
 
 	for _, w := range writes {
@@ -1805,8 +1805,8 @@ func refView(n policymodel.Node, w policymodel.World, nm *netmap.NetworkMap) pol
 
 // enforced is what of a netmap no delivery option may move: the node and
 // its peers without the stamps capability mode adds, SSH and DNS. When a
-// node last disconnected is each world's own clock's, so LastSeen is left
-// out.
+// node registered and last disconnected are each world's own clock's, so
+// Created and LastSeen are left out.
 func enforced(nm *netmap.NetworkMap) string {
 	strip := func(n tailcfg.NodeView) string {
 		if !n.Valid() {
@@ -1814,7 +1814,7 @@ func enforced(nm *netmap.NetworkMap) string {
 		}
 
 		c := n.AsStruct()
-		c.LastSeen = nil
+		c.LastSeen, c.Created = nil, time.Time{}
 		maps.DeleteFunc(c.CapMap, func(k nodecap.Cap, _ []tailcfg.RawMessage) bool {
 			return strings.HasPrefix(string(k), policymodel.StampPrefix)
 		})
@@ -2006,6 +2006,8 @@ func TestDeliveryConvergesThroughTheClient(t *testing.T) {
 	// delivery flip, which only some cases draw; a deep one always does.
 	if deep {
 		floors["membership churn"], floors["delivery flips"] = reach.churnJudged, reach.flips
+
+		requireCarried(t, reach.writes)
 	}
 
 	for name, n := range floors {

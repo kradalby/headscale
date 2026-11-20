@@ -34,9 +34,10 @@ type pbtT interface {
 
 // pbtWorld is a State written from a policymodel world, one State call
 // per write: users through the State's user API, the policy through
-// SetPolicy, nodes straight into the world, since the model's addresses
-// include ones only the database can hold. Each call commits at most
-// once, and committed, when set, hears of every call.
+// SetPolicy, nodes through the State's production entry points where
+// production can express the write, else straight into the database row
+// and the world (see entry_property_test.go). committed, when set, hears
+// of every call; a production call may commit more than once.
 type pbtWorld struct {
 	t   pbtT
 	cfg *types.Config
@@ -55,8 +56,21 @@ type pbtWorld struct {
 	elections *policymodel.Elections
 	// started is when the last run began, as the State stamped it.
 	started time.Time
-	// made counts the writes [pbtWorld.session] made, by kind.
+	// made counts the writes [pbtWorld.session] made, by kind, and each
+	// node write by edit kind and the path it took.
 	made map[string]int
+
+	// reg is how each node registered; alloc the allocator's last
+	// addresses, as predicted; reports counts the client reports made.
+	reg     map[types.NodeID]regInfo
+	alloc   [2]netip.Addr
+	reports int
+	// kind is the edit being written; part the production call being
+	// made, or the store write; cur counts the node write in progress,
+	// storing set while a store write commits.
+	kind, part string
+	cur        *nodeWrite
+	storing    bool
 }
 
 func newPBTWorld(t pbtT, w policymodel.World, configure ...func(*types.Config)) *pbtWorld {
@@ -90,8 +104,14 @@ func newPBTWorld(t pbtT, w policymodel.World, configure ...func(*types.Config)) 
 		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
 	})
 
-	p := &pbtWorld{t: t, cfg: cfg, s: s, conns: map[types.NodeID][]uint64{}, elections: policymodel.NewElections(), made: map[string]int{}}
+	p := &pbtWorld{
+		t: t, cfg: cfg, s: s, conns: map[types.NodeID][]uint64{}, elections: policymodel.NewElections(), made: map[string]int{},
+		reg: map[types.NodeID]regInfo{}, alloc: [2]netip.Addr{cfg.Prefixes.V4.Masked().Addr(), cfg.Prefixes.V6.Masked().Addr()},
+	}
+
+	p.kind = "start"
 	p.write(w)
+	p.kind = ""
 
 	return p
 }
@@ -99,6 +119,10 @@ func newPBTWorld(t pbtT, w policymodel.World, configure ...func(*types.Config)) 
 // call runs one State write and tells committed of it.
 func (p *pbtWorld) call(write func()) {
 	before := p.s.Snapshot().Rev()
+
+	if p.cur != nil && !p.storing {
+		p.cur.prod++
+	}
 
 	write()
 
@@ -113,21 +137,25 @@ func (p *pbtWorld) call(write func()) {
 
 // write brings the State from p.w to w: deleted nodes and users, changed
 // and new users, the policy, then new and changed nodes (see
-// [pbtWorld.putNode]). A single edit
-// touches one of them; a batch (a world written from scratch, a step taken
-// back) needs that order — a policy can name a user only once the user who
-// would make it ambiguous is gone, and a user can take a name only once
-// its holder let it go — and renames in two passes, through names of
-// their own, since two users of a batch can trade names.
+// [pbtWorld.register] and [pbtWorld.change]), and holds what production
+// stored to w. A single edit touches one of them; a batch (a world written
+// from scratch, a step taken back) needs that order — a policy can name a
+// user only once the user who would make it ambiguous is gone, and a user
+// can take a name only once its holder let it go — and renames in two
+// passes, through names of their own, since two users of a batch can
+// trade names.
 func (p *pbtWorld) write(w policymodel.World) {
 	p.t.Helper()
 
 	users, nodes := w.Topology.Build()
 
+	// cur is the world as written so far.
+	cur := p.w
+
 	for _, n := range p.w.Topology.Nodes {
 		if _, ok := w.Topology.Node(n.ID); !ok {
-			p.call(func() { p.s.DeleteNodeFromStoreForTest(n.ID) })
-			delete(p.conns, n.ID)
+			p.leave(n)
+			cur = cur.Apply(policymodel.Leave{ID: n.ID})
 		}
 	}
 
@@ -204,6 +232,10 @@ func (p *pbtWorld) write(w policymodel.World) {
 		})
 	}
 
+	cur.Policy, cur.Topology.Users, cur.Topology.NextUserID = w.Policy, w.Topology.Users, w.Topology.NextUserID
+
+	var fresh []newcomer
+
 	for i, n := range w.Topology.Nodes {
 		was, existed := p.w.Topology.Node(n.ID)
 		if existed && reflect.DeepEqual(was, n) {
@@ -221,14 +253,45 @@ func (p *pbtWorld) write(w policymodel.World) {
 			tn.User = u
 		}
 
-		p.putNode(was, existed, n, tn)
+		if !existed {
+			fresh = append(fresh, newcomer{n: n, tn: tn})
+
+			continue
+		}
+
+		p.change(cur, was, n, tn)
+		cur = withNode(cur, n)
+	}
+
+	if len(fresh) > 0 {
+		p.register(fresh, w)
 	}
 
 	p.w = w
+	p.requireStored(w, p.kindOr("a write"))
 }
 
 // edit commits e, alone.
-func (p *pbtWorld) edit(e policymodel.Edit) { p.write(p.w.Apply(e)) }
+func (p *pbtWorld) edit(e policymodel.Edit) {
+	p.kind = strings.TrimPrefix(fmt.Sprintf("%T", e), "policymodel.")
+	if r, ok := e.(policymodel.Retag); ok && len(r.Tags) == 0 {
+		p.kind = "Login"
+	}
+
+	p.write(p.w.Apply(e))
+	p.kind = ""
+}
+
+// withNode is w with n in place of the node of its ID.
+func withNode(w policymodel.World, n policymodel.Node) policymodel.World {
+	w.Topology.Nodes = slices.Clone(w.Topology.Nodes)
+
+	if i := slices.IndexFunc(w.Topology.Nodes, func(m policymodel.Node) bool { return m.ID == n.ID }); i >= 0 {
+		w.Topology.Nodes[i] = n
+	}
+
+	return w
+}
 
 // pbtChance is true about once in k draws, and false shrunk.
 func pbtChance(t *rapid.T, k int, label string) bool {
@@ -383,6 +446,16 @@ func TestSessionsFollowGeneratedScenarios(t *testing.T) {
 			t.Logf("wakes: %s", reach.wakes)
 			t.Logf("writes through production entry points %v; scripts played %v", reach.writes, reach.scripts)
 
+			prod, all := carried(reach.writes)
+			t.Logf("node writes that reached a production entry point %d of %d", prod, all)
+
+			if f := flag.Lookup("rapid.checks"); !testing.Short() && f != nil {
+				n, err := strconv.Atoi(f.Value.String())
+				if err == nil && n >= 1000 {
+					requireCarried(t, reach.writes)
+				}
+			}
+
 			byField, idleByField := map[string]int{}, map[string]int{}
 
 			for _, kind := range slices.Sorted(maps.Keys(reach.woken)) {
@@ -526,10 +599,8 @@ func playScenario(t *rapid.T, reach *scenarioReach) {
 		}
 
 		if nodes := r.p.s.Snapshot().ListNodes(); touch && nodes.Len() > 0 {
-			n := nodes.At(who % nodes.Len()).AsStruct()
-			n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(i+1))} //nolint:gosec // small
 			r.edit = nil
-			r.p.call(func() { r.p.s.PutNodeInStoreForTest(*n) })
+			r.p.endpoint(nodes.At(who%nodes.Len()).ID(), []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(i+1))}) //nolint:gosec // small
 		}
 
 		// Now and then a client, the HA prober or an operator writes too,

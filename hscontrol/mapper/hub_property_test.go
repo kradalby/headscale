@@ -846,17 +846,7 @@ func (m *hubMachine) touchNode(id types.NodeID) {
 	m.t.Logf("commit r%d: endpoint of n%d", m.p.s.Snapshot().Rev(), id)
 }
 
-func (m *hubMachine) setEndpoints(id types.NodeID, eps []netip.AddrPort) {
-	nv, ok := m.p.s.Snapshot().GetNode(id)
-	if !ok {
-		return
-	}
-
-	n := nv.AsStruct()
-	n.Endpoints = eps
-
-	m.p.call(func() { m.p.s.PutNodeInStoreForTest(*n) })
-}
+func (m *hubMachine) setEndpoints(id types.NodeID, eps []netip.AddrPort) { m.p.endpoint(id, eps) }
 
 func (m *hubMachine) advance(t *rapid.T) {
 	if m.w.at.at == watchIdle {
@@ -1637,10 +1627,7 @@ func (h *stressRun) write(undo func()) func() {
 		// production entry point, racing the renders.
 		p.session(sessionWrite{Kind: sessionKind(r.IntN(int(numSessionKinds))), Who: r.IntN(16), Value: r.IntN(3)}) //nolint:gosec // small
 	default:
-		nv := nodes.At(r.IntN(nodes.Len()))
-		n := nv.AsStruct()
-		n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(r.IntN(1<<16)))} //nolint:gosec // any port
-		p.s.PutNodeInStoreForTest(*n)
+		p.endpoint(nodes.At(r.IntN(nodes.Len())).ID(), []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(r.IntN(1<<16)))}) //nolint:gosec // any port
 	}
 
 	h.follow()
@@ -1680,10 +1667,7 @@ func (h *stressRun) straddle() bool {
 		return false
 	}
 
-	nv := nodes.At(r.IntN(nodes.Len()))
-	n := nv.AsStruct()
-	n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.2"), uint16(r.IntN(1<<16)))} //nolint:gosec // any port
-	p.s.PutNodeInStoreForTest(*n)
+	p.endpoint(nodes.At(r.IntN(nodes.Len())).ID(), []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.2"), uint16(r.IntN(1<<16)))}) //nolint:gosec // any port
 
 	woke := p.s.Snapshot().Rev()
 
