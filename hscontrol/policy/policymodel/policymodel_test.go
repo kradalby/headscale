@@ -425,8 +425,9 @@ func docGrants(t *rapid.T, p Policy, grants []struct {
 // counters; where Undo says there is none, an edit of the step has none
 // (a deletion, a replacement onto a token already held), or what stays
 // different is approvals, which no write puts back once auto-approval or
-// an admin moved them, or the document, which a policy write refuses
-// once users made a token in it ambiguous.
+// an admin moved them, and the expiry of a node the undo logs in, which
+// the login renews, or the document, which a policy write refuses once
+// users made a token in it ambiguous.
 func TestEditUndo(t *testing.T) {
 	t.Parallel()
 
@@ -453,7 +454,7 @@ func TestEditUndo(t *testing.T) {
 			switch {
 			case ok && !reflect.DeepEqual(back, w):
 				t.Fatalf("step %d (%s) undone by %s gives\n%#v\nnot\n%#v", i+1, st, inv, back, w)
-			case !ok && !noInverse && !onlyApprovalsDiffer(back, w) && len(NewView(back).AmbiguousRefs()) == 0:
+			case !ok && !noInverse && !onlyApprovalsDiffer(back, w, inv) && len(NewView(back).AmbiguousRefs()) == 0:
 				t.Fatalf("step %d (%s): Undo says no write takes it back, yet more than approvals differ after %s:\n%#v\nnot\n%#v", i+1, st, inv, back, w)
 			}
 
@@ -515,12 +516,25 @@ func TestUndoKeepsReplacedTokensApart(t *testing.T) {
 }
 
 // onlyApprovalsDiffer reports whether a and b differ in nodes' approvals
-// alone.
-func onlyApprovalsDiffer(a, b World) bool {
+// alone, and in the expiry of the nodes inv logs in.
+func onlyApprovalsDiffer(a, b World, inv Step) bool {
+	var logins []types.NodeID
+
+	for _, e := range inv.Edits {
+		if r, ok := e.(Retag); ok && len(r.Tags) == 0 {
+			logins = append(logins, r.ID)
+		}
+	}
+
 	strip := func(w World) World {
 		c := w.clone()
 		for i := range c.Topology.Nodes {
-			c.Topology.Nodes[i].Approved, c.Topology.Nodes[i].AutoApproved = nil, nil
+			n := &c.Topology.Nodes[i]
+			n.Approved, n.AutoApproved = nil, nil
+
+			if slices.Contains(logins, n.ID) {
+				n.Expired = false
+			}
 		}
 
 		return c
