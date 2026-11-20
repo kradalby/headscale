@@ -27,6 +27,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/wgengine/filter"
 )
@@ -1125,6 +1126,99 @@ func TestInternetClausesAreHeadscalesReading(t *testing.T) {
 		}
 
 		require.Equal(t, c.decides != 0, differs, "%s: whether %v decides", c.name, c.decides)
+	}
+}
+
+// TestViaRouterExitRoutesIsHeadscalesReading pins policymodel's
+// ViaRouterExitRoutes to headscale's route access, from scratch, on
+// hand-built worlds: a via router among its grant's sources, whose part of
+// the destinations reaches a public address, is given every exit route of
+// an exit node, both families, and no other node is. On each world every
+// node is given of the exit node the exit routes the reference with the
+// clause gives, via steering decides none of them, and the reference
+// without it differs exactly where the world says the clause decides. It
+// fails once production changes the reading.
+func TestViaRouterExitRoutesIsHeadscalesReading(t *testing.T) {
+	t.Parallel()
+
+	addr := netip.MustParseAddr
+	// Prefixes 0, 4 and 8 are 10.0.0.0/24, 8.8.8.0/24 and 2001:4860::/32;
+	// 9 and 10 the exit routes.
+	world := func(src policymodel.Sel, tagged bool, served, exits []int, dsts ...int) policymodel.World {
+		var w policymodel.World
+
+		w.Topology.Users = []policymodel.User{{ID: 1, Name: "alice"}}
+		router := policymodel.Node{ID: 1, User: 1, V4: addr("100.64.0.1"), V6: addr("fd7a:115c:a1e0::1"), Announced: served, Approved: served}
+
+		if tagged {
+			router.User, router.Tags = 0, []int{0}
+		}
+
+		w.Topology.Nodes = []policymodel.Node{
+			router,
+			{ID: 2, User: 1, V4: addr("100.64.0.2"), V6: addr("fd7a:115c:a1e0::2"), Announced: exits, Approved: exits},
+			{ID: 3, User: 1, V4: addr("100.64.0.3"), V6: addr("fd7a:115c:a1e0::3")},
+		}
+		w.Topology.NextID, w.Topology.NextUserID = 4, 2
+		w.Policy.Defined[0] = true
+
+		rule := policymodel.Rule{Src: []policymodel.Sel{src}, IP: []policymodel.IP{{Proto: slices.Index(policymodel.Protos, "tcp")}}, Via: []int{0}}
+		for _, d := range dsts {
+			rule.Dst = append(rule.Dst, policymodel.Dest{Sel: policymodel.Sel{Kind: policymodel.SelPrefix, I: d}})
+		}
+
+		w.Policy.Grants = []policymodel.Rule{rule}
+
+		return w
+	}
+
+	all, alice, both := policymodel.Sel{Kind: policymodel.SelAll}, policymodel.Sel{Kind: policymodel.SelUser}, []int{9, 10}
+
+	for _, c := range []struct {
+		name    string
+		w       policymodel.World
+		decides bool
+	}{
+		{"a via router of a public IPv4 prefix among the sources", world(all, true, []int{4}, both, 4), true},
+		{"a via router of a public IPv6 prefix among the sources", world(all, true, []int{8}, both, 8), true},
+		{"the same beside an exit node of IPv4 alone", world(all, true, []int{4}, []int{9}, 4), true},
+		{"a via router not among the sources", world(alice, true, []int{4}, both, 4), false},
+		{"a via router of a private prefix", world(all, true, []int{0}, both, 0), false},
+		{"a via router of the private half of a destination", world(all, true, []int{0}, both, 0, 4), false},
+		{"a router of the public prefix without the via tag", world(all, false, []int{4}, both, 4), false},
+	} {
+		sv, err := serve(nil, c.w, policymodel.Change{})
+		require.NoError(t, err, c.name)
+
+		headscale := sv.ref.Without(policymodel.ViaRouterExitRoutes)
+		exit, _ := sv.nm.Get(2)
+		exits := exit.View().ExitRoutes()
+		differs := false
+
+		for _, v := range c.w.Topology.Nodes {
+			if v.ID == 2 {
+				continue
+			}
+
+			viewer, _ := sv.nm.Get(v.ID)
+			steer := sv.pm.ViaRoutesForPeer(viewer.View(), exit.View())
+			require.Falsef(t, slices.ContainsFunc(slices.Concat(steer.Include, steer.Exclude), tsaddr.IsExitRoute), "%s: steering decides n%d's exit routes: %+v", c.name, v.ID, steer)
+			require.Falsef(t, sv.ref.Steered(v.ID, 2), "%s: the reference steers n%d's routes of the exit node", c.name, v.ID)
+
+			exitOnly := func(routes []netip.Prefix) []netip.Prefix {
+				out := slices.DeleteFunc(slices.Clone(routes), func(q netip.Prefix) bool { return !tsaddr.IsExitRoute(q) })
+				slices.SortFunc(out, netip.Prefix.Compare)
+
+				return out
+			}
+
+			got := exitOnly(sv.sides.RouteAccess(v.ID, exits))
+			require.Equalf(t, exitOnly(headscale.Routes(v.ID, 2)), got, "%s: n%d's exit routes against the reference with the clause", c.name, v.ID)
+
+			differs = differs || !slices.Equal(exitOnly(sv.ref.Routes(v.ID, 2)), got)
+		}
+
+		require.Equal(t, c.decides, differs, "%s: whether the clause decides", c.name)
 	}
 }
 

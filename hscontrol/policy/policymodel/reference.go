@@ -567,6 +567,32 @@ const (
 	// ranges any of its routes overlap. Delete the clause once the via
 	// rule keeps to the router's exit routes.
 	ViaExitInternet
+	// ViaRouterExitRoutes: a via grant offers its sources exit nodes only
+	// for autogroup:internet, and only its via-tagged ones. Headscale's
+	// route access reads a via grant, at a via router, as the router's
+	// own rule: a router among the grant's sources whose part of the
+	// destinations (the prefixes overlapping its subnet routes) reaches a
+	// public address is given every peer's exit routes, both families, as
+	// a rule without via to that address would give them. Fails open,
+	// routes only: no exit node's filter carries the grant.
+	//
+	// TODO(kradalby): policy/via-router-exit-routes: fails open, routes
+	// only. With `* -> 8.8.8.0/24 via tag:a`, n1 a tag:a router of
+	// 8.8.8.0/24 and n2 an untagged exit node, n1 is given n2's 0.0.0.0/0
+	// and ::/0, though a source routing nothing is given neither.
+	// docs/ref/routes.md offers exit nodes to a rule reaching a public
+	// address, and through a via grant only its via-tagged ones; no
+	// capture holds a via grant to a public prefix. The properties in
+	// policy/v2/reference_test.go and the delivery property count it
+	// under "via router exit routes"; TestViaRouterExitRoutesIsHeadscalesReading
+	// pins it to what headscale does. Production: compileViaForNode and
+	// viaDstsForNode in policy/v2/compiled.go put the grant's rule in the
+	// router's matchers, which Sides.RouteAccess (policy/v2/visibility.go,
+	// as Node.CanAccessRoutes) reads with the router on its source side;
+	// ViaPlan.Steer steers exit routes only for autogroup:internet. Delete
+	// the clause once route access leaves a via router's own rule to its
+	// destination side.
+	ViaRouterExitRoutes
 )
 
 // ContestedClauses is every contested clause, in the order a property
@@ -574,19 +600,20 @@ const (
 var ContestedClauses = []Contested{
 	OthersSelf, StarApprovedRoutes, InternetAtSubnetRouters,
 	ViaOwnAddress, ViaReach, ViaRouterAddress, ViaSelf, ExitDestinationRoutes, AppWildcard, ViaRouterCover, ViaExitInternet,
+	ViaRouterExitRoutes,
 }
 
 // FailsOpen reports whether headscale's side of c admits what the
 // reference refuses.
 func (c Contested) FailsOpen() bool {
-	return c&(StarApprovedRoutes|InternetAtSubnetRouters|ViaOwnAddress|ViaRouterCover|ViaExitInternet) != 0
+	return c&(StarApprovedRoutes|InternetAtSubnetRouters|ViaOwnAddress|ViaRouterCover|ViaExitInternet|ViaRouterExitRoutes) != 0
 }
 
 func (c Contested) String() string {
 	names := []string{
 		"others' self rules", "* adds approved routes", "internet at subnet routers",
 		"via own address", "via reach", "via router without address", "via to self", "exit routes as destination", "* as app destination",
-		"via router covered", "via exit internet",
+		"via router covered", "via exit internet", "via router exit routes",
 	}
 
 	var parts []string
@@ -1329,7 +1356,11 @@ func (r *Ref) Routes(viewer, peer types.NodeID) []netip.Prefix {
 			via := len(rl.via) > 0
 
 			if isExitRoute(q) {
-				return !via && on(v, rl.src) && len(rl.ip) > 0 && rl.reachesInternet()
+				if via {
+					return r.without&ViaRouterExitRoutes != 0 && on(v, rl.src) && len(rl.ip) > 0 && r.viaPartReachesInternet(rl, v)
+				}
+
+				return on(v, rl.src) && len(rl.ip) > 0 && rl.reachesInternet()
 			}
 
 			dstSide := r.onDst(rl, v)
@@ -1354,16 +1385,46 @@ func (r *Ref) Routes(viewer, peer types.NodeID) []netip.Prefix {
 
 // Steered reports whether the routes viewer is given of peer are via
 // steering's to decide: viewer is a source of a via grant one of peer's
-// routes reaches.
+// routes reaches, an exit route only through autogroup:internet.
 func (r *Ref) Steered(viewer, peer types.NodeID) bool {
 	v, _ := r.node(viewer)
 	p, _ := r.node(peer)
 
 	return slices.ContainsFunc(r.rules, func(rl refRule) bool {
 		return len(rl.via) > 0 && on(v, rl.src) && slices.ContainsFunc(p.routes(), func(q netip.Prefix) bool {
-			return rl.dst.OverlapsPrefix(q) || rl.internet && (isExitRoute(q) || internet.OverlapsPrefix(q))
+			return !isExitRoute(q) && rl.dst.OverlapsPrefix(q) || rl.internet && (isExitRoute(q) || internet.OverlapsPrefix(q))
 		})
 	})
+}
+
+// viaPartReachesInternet reports whether the part of via rule rl that
+// headscale gives n, as one of its via routers, reaches a public address:
+// a destination prefix, as headscale resolves it, overlapping a subnet
+// route n serves ([ViaRouterExitRoutes]).
+func (r *Ref) viaPartReachesInternet(rl refRule, n RefNode) bool {
+	if !n.hasTag(rl.via) {
+		return false
+	}
+
+	for _, term := range rl.viaTerms {
+		for _, p := range term.Prefixes() {
+			if !slices.ContainsFunc(n.subnets(), p.Overlaps) {
+				continue
+			}
+
+			var b netipx.IPSetBuilder
+
+			b.AddPrefix(p)
+			b.Intersect(rl.hsDst)
+			b.Intersect(internet)
+
+			if s, _ := b.IPSet(); len(s.Prefixes()) > 0 {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // HasVia reports whether a rule is a via grant.
