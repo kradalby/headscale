@@ -1045,6 +1045,89 @@ func TestViaRouterCoverIsHeadscalesReading(t *testing.T) {
 	}
 }
 
+// TestInternetClausesAreHeadscalesReading pins policymodel's two
+// autogroup:internet clauses to what headscale compiles, from scratch, on
+// hand-built worlds: InternetAtSubnetRouters (a rule without via takes the
+// internet as addresses, so a subnet router serving a public prefix gets
+// it) and ViaExitInternet (a via grant gives it to a via router with any
+// exit route, through all of its routes, and to no other). On each world every
+// node's served filter equals the reference less both clauses, and differs
+// from the reference less the other clause alone exactly where the world
+// says this one decides. It fails once production changes either reading.
+func TestInternetClausesAreHeadscalesReading(t *testing.T) {
+	t.Parallel()
+
+	addr := netip.MustParseAddr
+	// Routes 4 and 8 are 8.8.8.0/24 and 2001:4860::/32; 9 and 10 the exit
+	// routes.
+	world := func(via bool, tagged bool, routes ...int) policymodel.World {
+		var w policymodel.World
+
+		w.Topology.Users = []policymodel.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
+		router := policymodel.Node{ID: 2, User: 2, V4: addr("100.64.0.2"), V6: addr("fd7a:115c:a1e0::2"), Announced: routes, Approved: routes}
+
+		if tagged {
+			router.User, router.Tags = 0, []int{0}
+		}
+
+		w.Topology.Nodes = []policymodel.Node{{ID: 1, User: 1, V4: addr("100.64.0.1"), V6: addr("fd7a:115c:a1e0::1")}, router}
+		w.Topology.NextID, w.Topology.NextUserID = 3, 3
+		w.Policy.Defined[0] = true
+
+		tcp := slices.Index(policymodel.Protos, "tcp")
+		rule := policymodel.Rule{Src: []policymodel.Sel{{Kind: policymodel.SelUser}}, Dst: []policymodel.Dest{{Sel: policymodel.Sel{Kind: policymodel.SelInternet}}}}
+
+		if via {
+			rule.IP, rule.Via = []policymodel.IP{{Proto: tcp}}, []int{0}
+			w.Policy.Grants = []policymodel.Rule{rule}
+		} else {
+			rule.Proto = tcp
+			w.Policy.ACLs = []policymodel.Rule{rule}
+		}
+
+		return w
+	}
+
+	both := policymodel.InternetAtSubnetRouters | policymodel.ViaExitInternet
+
+	for _, c := range []struct {
+		name    string
+		w       policymodel.World
+		decides policymodel.Contested
+	}{
+		{"a subnet router of a public IPv6 prefix", world(false, false, 8), policymodel.InternetAtSubnetRouters},
+		{"a subnet router of a public IPv4 prefix", world(false, false, 4), policymodel.InternetAtSubnetRouters},
+		{"an exit node of one family", world(false, false, 9), 0},
+		{"a via router of a public prefix, no exit", world(true, true, 8), 0},
+		{"a via exit node of IPv4 alone", world(true, true, 9), 0},
+		{"a via exit node of IPv6 alone", world(true, true, 10), 0},
+		{"a via exit node of IPv4 serving a public IPv6 prefix", world(true, true, 9, 8), policymodel.ViaExitInternet},
+		{"a via exit node of IPv6 serving a public IPv4 prefix", world(true, true, 10, 4), policymodel.ViaExitInternet},
+		{"a via exit node of both families serving a public prefix", world(true, true, 9, 10, 8), 0},
+		{"an exit node without the via tag", world(true, false, 9), 0},
+	} {
+		sv, err := serve(nil, c.w, policymodel.Change{})
+		require.NoError(t, err, c.name)
+
+		headscale, plain := sv.ref.Without(both), sv.ref.Without(both&^c.decides)
+		differs := false
+
+		for _, n := range c.w.Topology.Nodes {
+			got, err := sv.ip.ForNode(n.ID, ReceiverFacts{})
+			require.NoError(t, err, c.name)
+
+			view := viewOf(n, c.w, nil)
+
+			rep := policymodel.Compare(headscale.Rules(n.ID), got, view)
+			require.Truef(t, rep.Equivalent(), "%s: n%d's filter differs from the reference less both clauses: %s\nreference %v\nheadscale %v", c.name, n.ID, rep, headscale.Rules(n.ID), got)
+
+			differs = differs || !policymodel.Compare(plain.Rules(n.ID), got, view).Equivalent()
+		}
+
+		require.Equal(t, c.decides != 0, differs, "%s: whether %v decides", c.name, c.decides)
+	}
+}
+
 // TestStampsFollowReference holds the source capabilities headscale
 // renders on a node after every step, to itself and to its peers, to the
 // reference: a stamp for every source selector the node is a member of

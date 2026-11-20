@@ -403,9 +403,10 @@ const (
 	// reads served routes.
 	StarApprovedRoutes
 	// InternetAtSubnetRouters: autogroup:internet is the internet through
-	// exit nodes. Headscale reads it as an address set like any other, so a
-	// subnet router serving a public prefix takes it, is on its side, and
-	// its route is given by it, a via router's too. Fails open.
+	// exit nodes. Headscale reads it as an address set like any other in a
+	// rule without via, so a subnet router serving a public prefix takes
+	// it, is on its side, and its route is given by it (a via grant reads
+	// it apart: ViaExitInternet). Fails open.
 	//
 	// TODO(kradalby): policy/internet-at-subnet-routers: fails open. With
 	// `* -> autogroup:internet:*`, a subnet router serving 8.8.8.0/24
@@ -544,26 +545,48 @@ const (
 	// Delete the clause once a via router is linked with its grant's
 	// sources alone.
 	ViaRouterCover
+	// ViaExitInternet: a via grant's autogroup:internet is, at a via
+	// router, the internet through its exit routes. Headscale writes the
+	// whole internet at a via router with any exit route, and nothing at
+	// one without, and then keeps what any route of the router reaches:
+	// a via exit node also takes the internet through a public subnet
+	// route, in the family it does not exit too. Fails open.
+	//
+	// TODO(kradalby): policy/via-exit-internet: fails open. With
+	// `alice@ -> autogroup:internet via tag:a`, a tag:a node approved for
+	// 0.0.0.0/0 and serving 2001:4860::/32 accepts alice's packets to
+	// 2001:4860::/32, which no exit route of it carries. No capture holds
+	// a via exit node with a public subnet. The properties in
+	// policy/v2/reference_test.go and the delivery property count it under
+	// "via exit internet"; TestInternetClausesAreHeadscalesReading pins
+	// this clause and InternetAtSubnetRouters to what headscale does.
+	// Production: viaDstsForNode in policy/v2/compiled.go and cutVia in
+	// policy/v2/expand.go write util.TheInternet whole at a via router for
+	// which IsExitNode holds; the receiver cut (newReceiver in
+	// policy/v2/expand.go, ReduceFilterRules in policyutil) keeps the
+	// ranges any of its routes overlap. Delete the clause once the via
+	// rule keeps to the router's exit routes.
+	ViaExitInternet
 )
 
 // ContestedClauses is every contested clause, in the order a property
 // tries them.
 var ContestedClauses = []Contested{
 	OthersSelf, StarApprovedRoutes, InternetAtSubnetRouters,
-	ViaOwnAddress, ViaReach, ViaRouterAddress, ViaSelf, ExitDestinationRoutes, AppWildcard, ViaRouterCover,
+	ViaOwnAddress, ViaReach, ViaRouterAddress, ViaSelf, ExitDestinationRoutes, AppWildcard, ViaRouterCover, ViaExitInternet,
 }
 
 // FailsOpen reports whether headscale's side of c admits what the
 // reference refuses.
 func (c Contested) FailsOpen() bool {
-	return c&(StarApprovedRoutes|InternetAtSubnetRouters|ViaOwnAddress|ViaRouterCover) != 0
+	return c&(StarApprovedRoutes|InternetAtSubnetRouters|ViaOwnAddress|ViaRouterCover|ViaExitInternet) != 0
 }
 
 func (c Contested) String() string {
 	names := []string{
 		"others' self rules", "* adds approved routes", "internet at subnet routers",
 		"via own address", "via reach", "via router without address", "via to self", "exit routes as destination", "* as app destination",
-		"via router covered",
+		"via router covered", "via exit internet",
 	}
 
 	var parts []string
@@ -673,7 +696,7 @@ func newRef(doc Doc, users []User, nodes []RefNode, without Contested) *Ref {
 			}
 		}
 
-		if inet && without&InternetAtSubnetRouters != 0 {
+		if inet && len(d.Via) == 0 && without&InternetAtSubnetRouters != 0 {
 			dsts, inet = append(slices.Clone(dsts), internetSel), false
 		}
 
@@ -1025,6 +1048,14 @@ func (r *Ref) dstsAt(rl refRule, n RefNode) *netipx.IPSet {
 
 		for _, p := range n.exitRoutes() {
 			exits.AddPrefix(p)
+		}
+
+		// Headscale's reading at a via exit node: the internet through
+		// any of its routes.
+		if len(rl.via) > 0 && r.without&ViaExitInternet != 0 && n.exit() {
+			for _, p := range n.routes() {
+				exits.AddPrefix(p)
+			}
 		}
 
 		exits.Intersect(internet)
