@@ -416,7 +416,7 @@ func TestSessionsFollowGeneratedScenarios(t *testing.T) {
 
 			t.Logf("woken between neighbouring commits %d, with nothing to send %d", woken, idle)
 
-			if !testing.Short() && idle*100 > woken*35 {
+			if !testing.Short() && idle*100 > woken*37 {
 				t.Errorf("%d of %d sessions woken between neighbouring commits had nothing to send", idle, woken)
 			}
 

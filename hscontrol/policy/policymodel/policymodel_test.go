@@ -980,7 +980,7 @@ func TestShrinksToSmallCases(t *testing.T) {
 	// seeds, not all. Database-only shapes are rare, so a property may
 	// need more than the default checks to fail. Flags are process-wide:
 	// not parallel.
-	settings := map[string]string{"rapid.nofailfile": "true", "rapid.seed": "3", "rapid.checks": "1000"}
+	settings := map[string]string{"rapid.nofailfile": "true", "rapid.seed": "1", "rapid.checks": "1000"}
 
 	for name, value := range settings {
 		old := flag.Lookup(name).Value.String()

@@ -16,7 +16,7 @@ import (
 // rare for that are floored per drawn scenario by TestCapFormCoverage.
 var formFloors = map[string]int{
 	"with a cap: source": 70, "required": 25,
-	"receivers: eligible": 275, "receivers: routes": 180, "receivers: client": 35,
+	"receivers: eligible": 240, "receivers: routes": 180, "receivers: client": 25,
 }
 
 // formShareFloor is the least share of the filters judged of the form

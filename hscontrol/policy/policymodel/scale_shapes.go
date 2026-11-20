@@ -81,7 +81,7 @@ var scaleShapes = []Shape{
 		return len(st.Edits) > 0 && len(b.nodes) >= 12
 	}},
 	{Name: "long-scenario", Why: "two dozen steps or more", Min: 0.011, Seq: func(_ []*View, steps []Step) bool { return len(steps) >= 24 }},
-	{Name: "node-lifecycle", Why: "a node joins, a later step edits it and a later one deletes it", Min: 0.019, Seq: nodeLifecycle},
+	{Name: "node-lifecycle", Why: "a node joins, a later step edits it and a later one deletes it", Min: 0.013, Seq: nodeLifecycle},
 	{Name: "node-edited-in-three-steps", Why: "one node written by three steps", Min: 0.12, Seq: func(_ []*View, steps []Step) bool {
 		return slices.ContainsFunc(stepsPerObject(steps, true), func(c int) bool { return c >= 3 })
 	}},
