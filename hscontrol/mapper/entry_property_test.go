@@ -27,8 +27,9 @@ import (
 // cannot write goes to the store: the database row and the world, as an
 // edit of the database and a restart would leave them. That is addresses
 // other than the allocator's, an endpoint cleared, a login of a user who
-// cannot claim the node, and approvals a batch of edits moved that no
-// order of writes reaches.
+// cannot claim the node, and approvals no order of writes reaches: a batch
+// of edits moved them, or a start's shapes moved the node after they were
+// given.
 //
 // Production allocates IDs and addresses; the driver steers it to the
 // model's. The model's IDs follow the column's autoincrement but for the
@@ -231,7 +232,7 @@ func (p *pbtWorld) register(fresh []newcomer, w policymodel.World) {
 
 	for i := range fresh {
 		p.cur = fresh[i].w
-		p.settleIn(fresh[i])
+		p.settleIn(fresh[i], w)
 		p.cur = nil
 		p.tally(kind, fresh[i].w)
 	}
@@ -347,11 +348,11 @@ func admitted(tn *types.Node) []netip.Prefix {
 	return slices.DeleteFunc(slices.Clone(tn.ApprovedRoutes), func(r netip.Prefix) bool { return slices.Contains(tn.AutoApprovedRoutes, r) })
 }
 
-// settleIn finishes nc's registration: the admin approves the rest before
-// the client announces, so that what auto-approval then adds is what the
-// model counts as its own; the client's first map request; an admin's
-// expiry; the first map session.
-func (p *pbtWorld) settleIn(nc newcomer) {
+// settleIn finishes nc's registration into w: the admin approves the rest
+// before the client announces, so that what auto-approval then adds is
+// what the model counts as its own; the client's first map request; an
+// admin's expiry; the first map session.
+func (p *pbtWorld) settleIn(nc newcomer, w policymodel.World) {
 	p.t.Helper()
 
 	n, tn, id := nc.n, nc.tn, nc.n.ID
@@ -366,6 +367,18 @@ func (p *pbtWorld) settleIn(nc newcomer) {
 	p.produce(id, "map request", func() error {
 		return p.s.UpdateNodeFromMapRequest(id, tailcfg.MapRequest{NodeKey: tn.NodeKey, DiscoKey: tn.DiscoKey, Hostinfo: tn.Hostinfo.Clone()})
 	})
+
+	// A start's shapes can move a node's owner or addresses after its
+	// routes were auto-approved, which leaves approvals w's auto-approvers
+	// no longer give; only a write before the move reaches them.
+	v := policymodel.NewView(w)
+	approvable := slices.DeleteFunc(slices.Clone(n.Announced), func(r int) bool { return !v.Approvable(n, r) })
+
+	if !slices.Equal(approvable, n.AutoApproved) {
+		p.store("approvals from before a move", id, func(c *types.Node) {
+			c.ApprovedRoutes, c.AutoApprovedRoutes = tn.ApprovedRoutes, tn.AutoApprovedRoutes
+		})
+	}
 
 	if n.Expired {
 		p.produce(id, "expiry", func() error {
