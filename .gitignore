@@ -61,3 +61,4 @@ package.json
 
 # rapid counterexamples are replayed from regression tests, not from these
 **/testdata/rapid/
+/pbt-soak/

@@ -409,6 +409,12 @@ a broken one.
   runs one size), `BenchmarkFirstMap` (1,000 and 10,000 nodes; pick one
   with `-bench 'BenchmarkFirstMap$/nodes=1000'`),
   `BenchmarkWorldEndpointWrite` (`hscontrol/state`).
+- **Property tests** (`hscontrol/policy/policymodel` and the
+  `*_property_test.go` files) hold filters, peers, routes, change routing
+  and delivery to a reference on generated scenarios. Read
+  [`hscontrol/policy/policymodel/README.md`](hscontrol/policy/policymodel/README.md)
+  before changing them or when one fails: how to replay a seed, run deep
+  or soak, and why a failing seed is never fixed by widening a tolerance.
 - **Policy options in tests**: `policy.capability_sources` and
   `policy.filter_chunks` are on by default, and test binaries follow:
   each is on unless its switch, `HEADSCALE_TEST_CAPABILITY_SOURCES` or
