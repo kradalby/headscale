@@ -20,12 +20,14 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/juanfont/headscale/hscontrol/mapper"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/oauth2-proxy/mockoidc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/key"
 )
 
@@ -1592,7 +1594,13 @@ func TestOIDCCallbackDispatchesUserIdentityChange(t *testing.T) {
 	stream.Delivered()
 
 	initial := frames[0]
-	require.NotEmpty(t, initial.PacketFilters["base"])
+	held := policyv2.FilterChunks{}.ApplyResponse(initial)
+	require.NotEmpty(t, held.Rules())
+
+	capForm := b.app.state.Snapshot().CapabilitySources()
+	if capForm {
+		require.Contains(t, initial.Node.CapMap, nodecap.Cap("https://headscale.net/cap/src/alice@old.example"), "the node holds its stamp")
+	}
 
 	b.idp.QueueUser(&mockoidc.MockUser{
 		Subject: "identity-change", PreferredUsername: "alice",
@@ -1614,9 +1622,17 @@ func TestOIDCCallbackDispatchesUserIdentityChange(t *testing.T) {
 			stream.Delivered()
 
 			for _, response := range frames {
-				filters, present := response.PacketFilters["base"]
-				if present && len(filters) == 0 {
+				held = held.ApplyResponse(response)
+				if response.PacketFilters != nil && len(held.Rules()) == 0 {
 					return true
+				}
+
+				// In capability form the rule names alice@old.example
+				// whoever holds it; the node's own stamp goes instead.
+				if capForm && response.Node != nil {
+					if _, held := response.Node.CapMap[nodecap.Cap("https://headscale.net/cap/src/alice@old.example")]; !held {
+						return true
+					}
 				}
 			}
 
@@ -1624,7 +1640,7 @@ func TestOIDCCallbackDispatchesUserIdentityChange(t *testing.T) {
 		default:
 			return false
 		}
-	}, 3*time.Second, 20*time.Millisecond, "the connected node must receive the updated filter before registration confirmation")
+	}, 3*time.Second, 20*time.Millisecond, "the connected node must receive the updated filter, or lose its stamp, before registration confirmation")
 }
 
 func (b *oidcBrowser) pendingSSHCheck(t *testing.T) (types.AuthID, types.Nodes) {

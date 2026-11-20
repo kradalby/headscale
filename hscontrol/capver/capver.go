@@ -26,7 +26,11 @@ const FullNetmapRemovalsCapVer tailcfg.CapabilityVersion = 148
 // [tailcfg.CapabilityVersion] threshold with the message identifying
 // the code to remove.
 //
-// All capability-version-gated cleanups should be registered here.
+// All capability-version-gated cleanups should be registered here. A
+// client-forced fallback of capability sources (the client reasons in
+// hscontrol/policy/v2/fallback.go) is, with the capability version of the
+// first client release that lifts it; one a client misreports its version
+// for (tailscale-rs) cannot be gated here.
 func CanOldCodeBeCleanedUp() {
 	if MinSupportedCapabilityVersion >= FullNetmapRemovalsCapVer {
 		panic("the tailscale/tailscale#15660 compat can be cleaned up: grep for it (hscontrol/mapper/diff.go and its tests)")

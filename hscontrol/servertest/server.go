@@ -56,6 +56,8 @@ type serverConfig struct {
 	dnsResolvers          []string
 	certProvider          hsdns.Provider
 	prefixV4              netip.Prefix
+	capSources            bool
+	filterChunks          bool
 }
 
 func defaultServerConfig() *serverConfig {
@@ -65,6 +67,21 @@ func defaultServerConfig() *serverConfig {
 		taildropEnabled:  true,
 		prefixV4:         netip.MustParsePrefix("100.64.0.0/10"),
 	}
+}
+
+// WithCapabilitySources names filter sources by node capability
+// (policy.capability_sources) whatever the test switch says. Without it
+// the option follows [state.TestCapabilitySourcesEnv], or the production
+// default; a test pins it off through that switch.
+func WithCapabilitySources() ServerOption {
+	return func(c *serverConfig) { c.capSources = true }
+}
+
+// WithFilterChunks sends packet filters as named chunks
+// (policy.filter_chunks) whatever the test switch says, as
+// [WithCapabilitySources] does for its option.
+func WithFilterChunks() ServerOption {
+	return func(c *serverConfig) { c.filterChunks = true }
 }
 
 // WithBatchDelay sets how long a map session coalesces a burst of
@@ -161,6 +178,8 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 	cfg.Database.Type = types.DatabaseSqlite
 	cfg.Database.Sqlite.Path = tmpDir + "/headscale_test.db"
 	cfg.Policy.Mode = types.PolicyModeDB
+	cfg.Policy.CapabilitySources = sc.capSources
+	cfg.Policy.FilterChunks = sc.filterChunks
 	cfg.Taildrop.Enabled = sc.taildropEnabled
 	cfg.LogTail.Enabled = sc.logTailEnabled
 	cfg.Tuning.BatchChangeDelay = sc.batchDelay
@@ -277,6 +296,17 @@ func start(tb testing.TB, cfg types.Config, ephemeralTimeout time.Duration, real
 	go httpServer.Serve(ln) //nolint:errcheck // will return on Close
 
 	serverURL := "http://" + ln.Addr().String()
+
+	// In-process clients reach a real listener's server too, at the same
+	// URL, so they can share a tailnet with external programs.
+	if realListener {
+		memLn, err := memNetwork.Listen("tcp", ln.Addr().String())
+		if err != nil {
+			tb.Fatalf("servertest: Listen: %v", err)
+		}
+
+		go httpServer.Serve(memLn) //nolint:errcheck // will return on Close
+	}
 
 	ts := &TestServer{
 		App:        app,

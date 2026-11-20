@@ -139,7 +139,19 @@ func main() {
 		quotedPostgresTests[i] = fmt.Sprintf("\"%s\"", test)
 	}
 
-	// Update both SQLite and PostgreSQL job matrices
+	// The opt-out, both policy options off, runs the tests whose assertions
+	// read packet filters and peers: every ACL test and the route and app
+	// grant tests that assert a filter's form.
+	var quotedAddressTests []string
+
+	for _, test := range expandedTests {
+		if strings.HasPrefix(test, "TestACL") || test == "TestSubnetRouteACL" || test == "TestGrantCapDrive" {
+			quotedAddressTests = append(quotedAddressTests, fmt.Sprintf("\"%s\"", test))
+		}
+	}
+
+	// Update the SQLite, PostgreSQL and opt-out job matrices
 	updateYAML(quotedTests, "sqlite", "./test-integration.yaml")
 	updateYAML(quotedPostgresTests, "postgres", "./test-integration.yaml")
+	updateYAML(quotedAddressTests, "address", "./test-integration.yaml")
 }

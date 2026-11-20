@@ -30,7 +30,6 @@ import (
 	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
-	"tailscale.com/wgengine/filter"
 )
 
 // viaCompatTests lists golden captures that exercise via grant steering.
@@ -1044,7 +1043,7 @@ func comparePacketFilter(
 	}
 
 	wantList := saasFilterTriples(t, want.PacketFilterRules, saasAddrs)
-	gotList := hsFilterTriples(got.PacketFilter, hsAddrsByPeer(clients))
+	gotList := hsFilterTriples(got, hsAddrsByPeer(clients))
 
 	if reason, listed := skips[key]; listed {
 		if slices.Equal(wantList, gotList) {
@@ -1101,21 +1100,38 @@ func saasFilterTriples(t require.TestingT, rules []tailcfg.FilterRule, saasAddrs
 
 // hsFilterTriples renders a client's packet filter as the triples
 // [saasFilterTriples] gives, peers named by hsAddrs.
-func hsFilterTriples(matches []filter.Match, hsAddrs map[netip.Addr]string) []string {
+func hsFilterTriples(nm *netmap.NetworkMap, hsAddrs map[netip.Addr]string) []string {
 	triples := map[string]struct{}{}
 
-	for _, match := range matches {
-		srcs := strings.Join(canonicaliseSrcPrefixes(match.Srcs, hsAddrs), ",")
+	for _, match := range nm.PacketFilter {
+		// A capability source stands for the addresses the client admits
+		// for it: those of the nodes it holds itself and its peers with it.
+		srcs := slices.Clone(match.Srcs)
+		for _, c := range match.SrcCaps {
+			srcs = append(srcs, servertest.CapHolders(nm, c)...)
+		}
+
+		slices.SortFunc(srcs, netip.Prefix.Compare)
+		srcs = slices.Compact(srcs)
+		joined := strings.Join(canonicaliseSrcPrefixes(srcs, hsAddrs), ",")
 
 		for _, dp := range match.Dsts {
 			for _, dst := range peerIdents(dp.Net, hsAddrs) {
-				triples[filterTriple(srcs, dst, dp.Ports.First, dp.Ports.Last)] = struct{}{}
+				triples[filterTriple(joined, dst, dp.Ports.First, dp.Ports.Last)] = struct{}{}
 			}
 		}
 
+		// App capabilities follow address sources only: the client's
+		// CapsWithValues reads no capability source.
+		if len(match.Caps) == 0 {
+			continue
+		}
+
+		addrSrcs := strings.Join(canonicaliseSrcPrefixes(match.Srcs, hsAddrs), ",")
+
 		for _, cm := range match.Caps {
 			for _, dst := range peerIdents(cm.Dst, hsAddrs) {
-				triples[capTriple(srcs, dst, cm.Cap)] = struct{}{}
+				triples[capTriple(addrSrcs, dst, cm.Cap)] = struct{}{}
 			}
 		}
 	}

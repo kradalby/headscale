@@ -570,6 +570,14 @@ func (prep *sshPrep) forNode(node types.NodeView) *tailcfg.SSHPolicy {
 }
 
 // ipSetToPrincipals converts an [netipx.IPSet] into SSH principals, one per address.
+//
+// TODO(capsrc/ssh): lift when tailcfg gains a principal naming a node capability
+// TODO(kradalby): capsrc/ssh: SSH principals name source nodes by address
+// (tailcfg.SSHPrincipal has Node, NodeIP, UserLogin, Any), so a member joining an
+// SSH rule's source changes the SSH policy of every destination, as packet
+// filters did before capability sources; routed by SSHChangedNodes
+// (overwake/ssh-changed-nodes). No upstream issue: the principal types are
+// in https://github.com/tailscale/tailscale/blob/f7c1b8e52600c1926623b29c91972a5ea1364d2f/tailcfg/tailcfg.go.
 func ipSetToPrincipals(ipSet *netipx.IPSet) []*tailcfg.SSHPrincipal {
 	if ipSet == nil {
 		return nil

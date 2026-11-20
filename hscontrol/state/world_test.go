@@ -18,7 +18,6 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/graph"
-	"github.com/juanfont/headscale/hscontrol/policy"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
@@ -60,7 +59,7 @@ func TestWorldDNSNoOpPublication(t *testing.T) {
 	after := w.snapshot()
 	require.Greater(t, after.DNSRev(), before.DNSRev())
 	assert.Equal(t, before.PolicyRev(), after.PolicyRev())
-	assert.Equal(t, before.PeerPolicyRev(), after.PeerPolicyRev())
+	assert.Equal(t, before.CapsRev(), after.CapsRev())
 	assert.Equal(t, before.PeersRev(), after.PeersRev())
 
 	select {
@@ -136,7 +135,8 @@ func worldNode(id types.NodeID, user *types.User, ip string) *types.Node {
 		UserID:     &uid,
 		User:       user,
 		IsOnline:   new(true),
-		Hostinfo:   &tailcfg.Hostinfo{},
+		// What the official client reports of itself.
+		Hostinfo: &tailcfg.Hostinfo{GoVersion: "go1.27.3", IPNVersion: "1.94.1"},
 	}
 }
 
@@ -700,7 +700,7 @@ func checkPeersMatchFullBuild(t fatalfer, snap *Snapshot) {
 
 	nodes := snap.ListNodes()
 
-	fresh, err := policy.NewPolicyManager(snap.PolicySource(), snap.Users(), nodes)
+	fresh, err := policyv2.NewPolicyManager(snap.PolicySource(), snap.Users(), nodes)
 	if err != nil {
 		t.Fatalf("fresh policy: %v", err)
 	}
@@ -1408,7 +1408,7 @@ func TestPolicyCachesSurviveStaleView(t *testing.T) {
 		mutate func(n *types.Node)
 		// probe reports a property of node 1's policy artefact that the
 		// write flips from !want to want.
-		probe func(pm policy.PolicyManager, view types.NodeView) (bool, error)
+		probe func(pm *policyv2.PolicyManager, view types.NodeView) (bool, error)
 		want  bool
 	}{
 		{
@@ -1417,7 +1417,7 @@ func TestPolicyCachesSurviveStaleView(t *testing.T) {
 				n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{subnet}}
 				n.ApprovedRoutes = []netip.Prefix{subnet}
 			},
-			probe: func(pm policy.PolicyManager, view types.NodeView) (bool, error) {
+			probe: func(pm *policyv2.PolicyManager, view types.NodeView) (bool, error) {
 				rules, err := pm.FilterForNode(view)
 				if err != nil {
 					return false, err
@@ -1443,7 +1443,7 @@ func TestPolicyCachesSurviveStaleView(t *testing.T) {
 				n.Tags = []string{"tag:srv"}
 				n.UserID, n.User = nil, nil
 			},
-			probe: func(pm policy.PolicyManager, view types.NodeView) (bool, error) {
+			probe: func(pm *policyv2.PolicyManager, view types.NodeView) (bool, error) {
 				sshPol, err := pm.SSHPolicy("", view)
 				if err != nil {
 					return false, err
@@ -1476,14 +1476,18 @@ func TestPolicyCachesSurviveStaleView(t *testing.T) {
 			before, ok := w.snapshot().GetNode(1)
 			require.True(t, ok)
 
-			got, err := tt.probe(w.snapshot().Policy(), before)
+			pm, ok := w.snapshot().Policy().(*policyv2.PolicyManager)
+			require.True(t, ok, "test sanity: a v2 policy")
+
+			got, err := tt.probe(pm, before)
 			require.NoError(t, err)
 			require.NotEqual(t, tt.want, got, "precondition: the write must flip the probed artefact")
 
 			after, ok := w.UpdateNode(1, tt.mutate)
 			require.True(t, ok)
 
-			pm := w.snapshot().Policy()
+			pm, ok = w.snapshot().Policy().(*policyv2.PolicyManager)
+			require.True(t, ok, "test sanity: a v2 policy")
 
 			_, err = tt.probe(pm, before)
 			require.NoError(t, err)
@@ -1888,14 +1892,12 @@ func TestWorldViaPolicyLifecycle(t *testing.T) {
 		t.Helper()
 
 		viewer, _ := snap.GetNode(5)
-		matchers, err := snap.Policy().MatchersForNode(viewer)
-		require.NoError(t, err)
 
 		var ids []types.NodeID
 
 		for _, id := range []types.NodeID{3, 4} {
 			peer, ok := snap.GetNode(id)
-			if ok && slices.Contains(snap.RoutesForPeer(viewer, peer, matchers), route) {
+			if ok && slices.Contains(snap.RoutesForPeer(viewer, peer), route) {
 				ids = append(ids, id)
 			}
 		}
@@ -2362,7 +2364,12 @@ func TestWorldViaElectionHistory(t *testing.T) {
 	w.UpdateNode(4, func(n *types.Node) { n.IsOnline = new(false) })
 	second := w.snapshot()
 	require.Equal(t, []types.NodeID{3, 6}, second.s.Get(w.primaries).via.ChangedNodes(before.s.Get(w.primaries).via))
-	require.True(t, second.Since(before).Global, "coalesced transitions wake viewers of intermediate winners")
+	// Compared end to end: the intermediate winner flipped itself, so the
+	// node log names it and its viewers are woken through it; a session
+	// that rendered the snapshot between is the hub's to wake again.
+	change := second.Since(before)
+	require.False(t, change.Global, "coalesced commits are compared end to end")
+	require.Subset(t, change.Nodes, []types.NodeID{3, 4}, "the intermediate winner is named")
 
 	for i := range 601 {
 		w.update(func(e *nodeEdit) {
@@ -2386,7 +2393,7 @@ func TestWorldViaElectionHistory(t *testing.T) {
 	w.UpdateNode(6, func(n *types.Node) { n.IsOnline = new(false) })
 	returned := w.snapshot()
 	require.Empty(t, returned.s.Get(w.primaries).via.ChangedNodes(before.s.Get(w.primaries).via))
-	require.True(t, returned.Since(before).Global, "changed-back winners still invalidate skipped snapshots")
+	require.True(t, returned.Since(before).Global, "commits past the node log are global")
 
 	_, err := w.SetPolicy([]byte(`{"grants":[]}`), func(s *Snapshot) error { return s.PolicyErr() })
 	require.NoError(t, err)
@@ -4281,7 +4288,10 @@ func TestDuplicateUserNameKeepsNodeChangesCompiling(t *testing.T) {
 		t.Helper()
 
 		nv, _ := w.snapshot().GetNode(3)
-		rules, err := w.snapshot().Policy().FilterForNode(nv)
+		pm, ok := w.snapshot().Policy().(*policyv2.PolicyManager)
+		require.True(t, ok, "test sanity: a v2 policy")
+
+		rules, err := pm.FilterForNode(nv)
 		require.NoError(t, err)
 
 		return slices.ContainsFunc(rules, func(r tailcfg.FilterRule) bool {

@@ -318,8 +318,9 @@ func (node *Node) IsTagged() bool {
 	return len(node.Tags) > 0
 }
 
-// IsUserOwned returns true if node is owned by a user (not tagged).
-// Tagged nodes may have a UserID for "created by" tracking, but the tag is the owner.
+// IsUserOwned returns true if node is owned by a user (not tagged). State
+// clears a tagged node's user, but a node built by hand can carry both, and
+// the tag is the owner.
 func (node *Node) IsUserOwned() bool {
 	return !node.IsTagged()
 }
@@ -1622,6 +1623,11 @@ func PeerHostinfo(hi tailcfg.HostinfoView) tailcfg.HostinfoView {
 
 // renderedHostinfoEqual compares the union of SelfHostinfo, PeerHostinfo,
 // TailNode's HomeDERP and NextDNS metadata (OS), without copying reports.
+//
+// TODO(kradalby): overwake/announce-readers: the union makes a field only
+// SelfHostinfo carries (the announced routes) a change to every peer's
+// render too, so mapper.Route wakes the node's viewers for nothing. No
+// upstream reference: the self and peer Hostinfo split is headscale's.
 func renderedHostinfoEqual(a, b *tailcfg.Hostinfo) bool {
 	if a == b {
 		return true

@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/db"
-	"github.com/juanfont/headscale/hscontrol/policy"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog"
@@ -132,7 +131,7 @@ func TestSetPolicyRejectsWhatFailsAsPublished(t *testing.T) {
 	var (
 		before      *Snapshot
 		src         []byte
-		filter      policy.PolicyManager
+		was         []tailcfg.FilterRule
 		interleaved bool
 	)
 
@@ -142,7 +141,13 @@ func TestSetPolicyRejectsWhatFailsAsPublished(t *testing.T) {
 		require.NoError(t, s.refreshUsers())
 
 		before = s.Snapshot()
-		src, filter = before.PolicySource(), before.Policy()
+		src = before.PolicySource()
+
+		var err error
+
+		was, err = before.FilterForNode(nodeID)
+		require.NoError(t, err)
+
 		interleaved = true
 	}
 
@@ -156,13 +161,7 @@ func TestSetPolicyRejectsWhatFailsAsPublished(t *testing.T) {
 	assert.Equal(t, before.Rev(), after.Rev(), "a refused document is never published, not even briefly")
 	assert.Equal(t, string(src), string(after.PolicySource()))
 
-	node, ok := after.GetNode(nodeID)
-	require.True(t, ok)
-
-	was, err := filter.FilterForNode(node)
-	require.NoError(t, err)
-
-	is, err := after.Policy().FilterForNode(node)
+	is, err := after.FilterForNode(nodeID)
 	require.NoError(t, err)
 	assert.Equal(t, was, is, "the live filter must stay the last good one")
 }
@@ -201,7 +200,7 @@ func TestSetPolicyEnforcesPolicyTests(t *testing.T) {
 			node, ok := before.GetNode(nodeID)
 			require.True(t, ok)
 
-			wasFilter, err := before.Policy().FilterForNode(node)
+			wasFilter, err := before.FilterForNode(nodeID)
 			require.NoError(t, err)
 
 			wasSSH, err := s.SSHPolicy(node)
@@ -214,7 +213,7 @@ func TestSetPolicyEnforcesPolicyTests(t *testing.T) {
 			assert.Equal(t, before.Rev(), after.Rev(), "a document failing its tests is never published, not even briefly")
 			assert.Equal(t, string(before.PolicySource()), string(after.PolicySource()))
 
-			isFilter, err := after.Policy().FilterForNode(node)
+			isFilter, err := after.FilterForNode(nodeID)
 			require.NoError(t, err)
 			assert.Equal(t, wasFilter, isFilter)
 
@@ -242,7 +241,8 @@ func TestSetPolicyUnchangedDocumentIsANoOp(t *testing.T) {
 	node, ok := s.GetNodeByID(nodeID)
 	require.True(t, ok)
 	require.NoError(t, s.DeleteNode(node))
-	require.Error(t, policyRefusal(s.Snapshot().Policy()), "test sanity: the document's tests now fail")
+	snap := s.Snapshot()
+	require.Error(t, policyRefusal(snap, snap.Policy()), "test sanity: the document's tests now fail")
 
 	changed, err := s.SetPolicy(pol)
 	require.NoError(t, err, "an unchanged document is already live")
@@ -380,7 +380,8 @@ func TestUserMutationDropsAmbiguousName(t *testing.T) {
 			_, err := s.SetPolicy([]byte(`{"acls":[{"action":"accept","src":["persist-user@"],"dst":["*:22"]}]}`))
 			require.NoError(t, err)
 
-			rules, _ := s.Snapshot().Policy().Filter()
+			rules, _, err := s.Snapshot().Filter()
+			require.NoError(t, err)
 			require.NotEmpty(t, rules, "precondition: persist-user@ has a node")
 
 			var logged bytes.Buffer
@@ -408,7 +409,8 @@ func TestUserMutationDropsAmbiguousName(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, s.Snapshot().PolicyErr())
 
-			rules, _ = s.Snapshot().Policy().Filter()
+			rules, _, err = s.Snapshot().Filter()
+			require.NoError(t, err)
 			assert.Empty(t, rules, "an ambiguous name grants nothing")
 			assert.Contains(t, logged.String(), `"level":"warn"`, "the operator learns a name went ambiguous")
 			assert.Contains(t, logged.String(), "persist-user", "the warning names the token")

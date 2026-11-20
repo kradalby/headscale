@@ -1551,8 +1551,6 @@ func TestBuildTailPeersCapMapsReference(t *testing.T) {
 			require.NoError(t, err)
 			out, err := NewStream(cfg, NewHub(), ids[0], capVer).Initial(snap)
 			require.NoError(t, err)
-			matchers, err := snap.Policy().MatchersForNode(viewer)
-			require.NoError(t, err)
 
 			_, disable4 := caps[viewer.ID()][types.NodeAttrDisableIPv4]
 
@@ -1560,10 +1558,10 @@ func TestBuildTailPeersCapMapsReference(t *testing.T) {
 
 			for _, peerID := range snap.ListPeerIDs(viewer.ID()) {
 				peer, _ := snap.GetNode(peerID)
-				tn, err := peer.TailNode(capVer, func(types.NodeID) []netip.Prefix { return snap.RoutesForPeer(viewer, peer, matchers) }, cfg, snap.DNS(), caps[peerID])
+				tn, err := peer.TailNode(capVer, func(types.NodeID) []netip.Prefix { return snap.RoutesForPeer(viewer, peer) }, cfg, snap.DNS(), snap.NodeCaps(peerID))
 				require.NoError(t, err)
 
-				tn.CapMap = policyv2.PeerCapMap(peer, caps[peerID])
+				tn.CapMap = policyv2.PeerCapMap(peer, snap.NodeCaps(peerID), snap.CapabilitySources())
 				tn.Hostinfo = types.PeerHostinfo(tn.Hostinfo)
 
 				if disable4 {

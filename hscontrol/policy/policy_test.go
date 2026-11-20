@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
@@ -274,7 +275,10 @@ func TestBuildPeerMapFromPolicy(t *testing.T) {
 				pm, err = pmf(nil, tt.nodes.ViewSlice())
 				require.NoError(t, err)
 
-				matchers, err := pm.MatchersForNode(tt.node.View())
+				compiled, ok := pm.(*policyv2.PolicyManager)
+				require.True(t, ok, "test sanity: a v2 policy")
+
+				matchers, err := compiled.MatchersForNode(tt.node.View())
 				require.NoError(t, err)
 				assert.Len(t, matchers, tt.wantMatchers)
 
@@ -283,7 +287,7 @@ func TestBuildPeerMapFromPolicy(t *testing.T) {
 					want = append(want, n.ID)
 				}
 
-				got := pm.BuildPeerMap(tt.nodes.ViewSlice())[tt.node.ID]
+				got := compiled.BuildPeerMap(tt.nodes.ViewSlice())[tt.node.ID]
 				if !assert.ElementsMatch(t, want, got) {
 					t.Log("Matchers: ")
 

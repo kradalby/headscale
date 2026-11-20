@@ -114,6 +114,7 @@ var (
 	ErrNodeAttrUnsupported          = errors.New("nodeAttrs uses a feature headscale does not yet support")
 	ErrNodeAttrIPPoolUnsupported    = errors.New("nodeAttrs ipPool requires the IP allocator (https://github.com/juanfont/headscale/issues/2912)")
 	ErrNodeAttrTargetUnsupported    = errors.New("nodeAttrs target alias type is not supported")
+	ErrCapReserved                  = errors.New("capabilities under " + selectorCapPrefix + " are reserved for headscale's source capabilities")
 )
 
 // NextDNSAttrPrefix is the form Tailscale uses for per-node NextDNS profile
@@ -403,6 +404,10 @@ func (a Asterix) resolve(_ *Policy, _ types.Users, _ views.Slice[types.NodeView]
 // These are collected separately from the Asterix IPSet because
 // IPSet merges overlapping ranges (e.g. 10.0.0.0/8 absorbs
 // 10.33.0.0/16), but Tailscale preserves individual route entries.
+//
+// TODO(kradalby): policy/star-approved-routes: approved but unannounced
+// routes widen * as a source, which no capture confirms (fails open); see
+// policymodel.StarApprovedRoutes.
 func approvedSubnetRoutes(nodes views.Slice[types.NodeView]) []string {
 	seen := make(set.Set[string])
 
@@ -931,6 +936,11 @@ func (ag *AutoGroup) resolve(p *Policy, users types.Users, nodes views.Slice[typ
 	var build netipx.IPSetBuilder
 
 	switch *ag {
+	// TODO(kradalby): policy/internet-at-subnet-routers: an address set like
+	// any other, so a subnet router serving a public prefix takes rules to
+	// it, is on their side and has its route given by them (fails open);
+	// docs/ref/policy.md says "through exit nodes". See
+	// policymodel.InternetAtSubnetRouters.
 	case AutoGroupInternet:
 		return util.TheInternet(), nil
 
@@ -2803,6 +2813,12 @@ func (p *Policy) validate() error {
 		// Tailscale requires cap names to be {domain}/{path} (no URL scheme)
 		// and rejects caps in the tailscale.com domain.
 		for capName := range grant.App {
+			if IsSourceCap(string(capName)) {
+				errs = append(errs, fmt.Errorf("%w: app %q", ErrCapReserved, capName))
+
+				continue
+			}
+
 			err := validateCapabilityName(string(capName))
 			if err != nil {
 				errs = append(errs, err)
@@ -2987,6 +3003,10 @@ func (p *Policy) validate() error {
 		}
 
 		for _, attr := range na.Attrs {
+			if IsSourceCap(string(attr)) {
+				errs = append(errs, fmt.Errorf("%w: nodeAttrs %q", ErrCapReserved, attr))
+			}
+
 			issue, ok := nodeAttrUnsupportedCaps[attr]
 			if ok {
 				errs = append(errs, fmt.Errorf("%w: %q tracked in %s", ErrNodeAttrUnsupported, attr, issue))

@@ -436,10 +436,10 @@ func TestRunTestsManyAssertionsAndDestinations(t *testing.T) {
 		"tests": [{"src": "alice@headscale.net", "accept": [%s], "deny": [%s]}]
 	}`, strings.Join(dsts, ","), strings.Join(accept, ","), strings.Join(deny, ","))
 
-	pol, err := unmarshalPolicy([]byte(policy))
+	pm, err := NewPolicyManager([]byte(policy), users, nodes.ViewSlice())
 	require.NoError(t, err)
 
-	require.NoError(t, evaluateTests(pol, users, nodes.ViewSlice()))
+	require.NoError(t, pm.RunTests())
 }
 
 // TestSetPolicyEvaluatesTestsUnlocked asserts that a policy's tests run

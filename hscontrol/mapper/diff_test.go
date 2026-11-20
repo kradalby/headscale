@@ -1,20 +1,36 @@
 package mapper
 
 import (
+	"cmp"
 	"encoding/json"
+	"fmt"
+	"maps"
 	"net/netip"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/db"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
+	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go4.org/netipx"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
 	"tailscale.com/types/opt"
+	"tailscale.com/types/views"
+	"tailscale.com/wgengine/filter"
 )
 
 func testPeer(id tailcfg.NodeID) *tailcfg.Node {
@@ -577,7 +593,7 @@ func TestWithRoutesMatchesTailNode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	base, err := (&peerRenders{}).render(cfg, cfg.DNSView(), capVer, 1, 1, peer, nil)
+	base, err := (&peerRenders{}).render(cfg, cfg.DNSView(), capVer, 1, 1, peer, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -782,14 +798,14 @@ func TestPatchSendsExpiryInUTC(t *testing.T) {
 	}
 	cfg := &types.Config{DNSConfig: types.DNSConfig{BaseDomain: "example.com"}}
 
-	before, err := (&peerRenders{}).render(cfg, cfg.DNSView(), capVer, 1, 1, node.View(), nil)
+	before, err := (&peerRenders{}).render(cfg, cfg.DNSView(), capVer, 1, 1, node.View(), nil, false)
 	require.NoError(t, err)
 
 	// A relogin rotates the key and sets the expiry.
 	node.NodeKey = key.NewNode().Public()
 	node.Expiry = &loaded
 
-	after, err := (&peerRenders{}).render(cfg, cfg.DNSView(), capVer, 2, 1, node.View(), nil)
+	after, err := (&peerRenders{}).render(cfg, cfg.DNSView(), capVer, 2, 1, node.View(), nil, false)
 	require.NoError(t, err)
 
 	responses := diff(testNetMap(before), testNetMap(after), nil)
@@ -897,4 +913,760 @@ func saasDiscoRotation(t *testing.T) (bool, bool) {
 	t.Fatal("no disco rotation reached bystander")
 
 	return false, false
+}
+
+// chunkDoc is the policy the chunk tests start from: rules of every kind a
+// node is sent, ports, two protocols, an app capability each way (one with
+// two values), own rules and autogroup:self.
+const chunkDoc = `{"groups":{"group:a":["u1@"],"group:b":["u2@"]},"tagOwners":{"tag:t":["u1@"]},
+	"grants":[
+		{"src":["group:a"],"dst":["u2@"],"ip":["tcp:22"]},
+		{"src":["group:b"],"dst":["u1@"],"ip":["tcp:80","udp:53"]},
+		{"src":["u1@"],"dst":["u1@"],"ip":["tcp:443"]},
+		{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["tcp:8080"]},
+		{"src":["group:a"],"dst":["u2@"],"app":{"example.com/cap/x":[{"v":1},{"v":"second"}]}},
+		{"src":["group:b"],"dst":["u1@"],"app":{"example.com/cap/y":[{"v":2}]}}
+	]}`
+
+// chunkSession is a stream and the client it writes to. The client keeps
+// its chunks across map sessions, as tailscale-rs does; the Go client
+// starts every map session holding none.
+type chunkSession struct {
+	id     types.NodeID
+	st     *Stream
+	client *modelClient
+}
+
+// chunkRun is a tailnet of sessions.
+type chunkRun struct {
+	t        *testing.T
+	cfg      *types.Config
+	s        *state.State
+	hub      *Hub
+	sessions map[types.NodeID]*chunkSession
+	// switching is set while a render may change a session's delivery,
+	// whose update then clears.
+	switching bool
+}
+
+// open starts a stream for id, as a reconnect does: its first response
+// goes to the client cs holds, or to a new one.
+func (cr *chunkRun) open(id types.NodeID) *chunkSession {
+	cr.t.Helper()
+
+	cs := cr.sessions[id]
+	if cs == nil {
+		cs = &chunkSession{id: id, client: newModelClient(&tailcfg.MapResponse{})}
+		cr.sessions[id] = cs
+	}
+
+	cs.st = NewStream(cr.cfg, cr.hub, id, capVer)
+
+	resps, err := cs.st.Initial(cr.s.Snapshot())
+	require.NoError(cr.t, err)
+	cs.st.Delivered()
+
+	f := resps[0].PacketFilters
+	require.Contains(cr.t, f, "*", "a stream's first response clears what the client held")
+	require.Nil(cr.t, f["*"])
+	requireWireNulls(cr.t, resps[0])
+
+	for _, r := range resps {
+		cs.client.apply(r)
+	}
+
+	return cs
+}
+
+// render updates the sessions of ids, or all, to the current snapshot and
+// requires each to hold what a fresh session is sent. It returns the
+// PacketFilters each was sent.
+func (cr *chunkRun) render(step string, ids ...types.NodeID) map[types.NodeID]map[string][]tailcfg.FilterRule {
+	cr.t.Helper()
+
+	if len(ids) == 0 {
+		ids = slices.Sorted(maps.Keys(cr.sessions))
+	}
+
+	snap := cr.s.Snapshot()
+	sent := make(map[types.NodeID]map[string][]tailcfg.FilterRule)
+
+	for _, id := range ids {
+		cs := cr.sessions[id]
+
+		resps, err := cs.st.Update(snap)
+		require.NoError(cr.t, err)
+		cs.st.Delivered()
+
+		for _, r := range resps {
+			if r.PacketFilters != nil {
+				_, cleared := r.PacketFilters["*"]
+				require.Equalf(cr.t, cr.switching, cleared, "%s: node %d: a delta clears only when the delivery switches", step, id)
+				requireWireNulls(cr.t, r)
+				sent[id] = r.PacketFilters
+			}
+
+			cs.client.apply(r)
+		}
+
+		cr.requireFresh(step, cs)
+	}
+
+	return sent
+}
+
+// requireFresh requires cs's client to hold what a new session is sent.
+func (cr *chunkRun) requireFresh(step string, cs *chunkSession) {
+	cr.t.Helper()
+
+	fresh, err := NewStream(cr.cfg, NewHub(), cs.id, capVer).Initial(cr.s.Snapshot())
+	require.NoError(cr.t, err)
+
+	require.Emptyf(cr.t, cs.client.sameAs(newModelClient(fresh[0])), "%s: node %d", step, cs.id)
+}
+
+// requireWireNulls requires every chunk resp deletes, and the clear, to be
+// a literal null as the client reads it: an omitted or empty value would
+// leave the chunk in force.
+func requireWireNulls(t *testing.T, resp *tailcfg.MapResponse) {
+	t.Helper()
+
+	wire, err := Marshal(resp)
+	require.NoError(t, err)
+
+	for name, rules := range resp.PacketFilters {
+		if rules == nil {
+			require.Contains(t, string(wire), `"`+name+`":null`)
+		}
+	}
+
+	var back tailcfg.MapResponse
+	require.NoError(t, json.Unmarshal(wire, &back))
+	require.Len(t, back.PacketFilters, len(resp.PacketFilters), "every chunk survives the wire")
+
+	for name, rules := range resp.PacketFilters {
+		got, ok := back.PacketFilters[name]
+		require.True(t, ok)
+		require.Equalf(t, rules == nil, got == nil, "chunk %q: null on one side only", name)
+	}
+}
+
+// edits returns how update changed the chunks: names deleted, names sent.
+func edits(update map[string][]tailcfg.FilterRule) ([]string, []string) {
+	var gone, sent []string
+
+	for name, rules := range update {
+		if rules == nil {
+			gone = append(gone, name)
+		} else {
+			sent = append(sent, name)
+		}
+	}
+
+	slices.Sort(gone)
+	slices.Sort(sent)
+
+	return gone, sent
+}
+
+// TestStreamChunksConvergeToFresh drives sessions in capability mode, with
+// filter chunks, through
+// every way a node's filter moves and requires, after each, the client to
+// hold exactly the chunks a new session is sent, and the update to carry
+// only what moved: a rule removed, a port, a protocol, an app capability's
+// value, rules reordered, the receiver's form flipping to addresses and
+// back, the members of an address-form rule, the receiver's own address, a
+// session that lags several commits, a failed render, a failed write and
+// a reconnect.
+func TestStreamChunksConvergeToFresh(t *testing.T) {
+	t.Setenv(state.TestCapabilitySourcesEnv, "true")
+	t.Setenv(state.TestFilterChunksEnv, "true")
+
+	cfg, s, ids := streamTestState(t, chunkDoc)
+	n1, n1b, n2 := ids[0], ids[1], ids[2]
+
+	cr := &chunkRun{t: t, cfg: cfg, s: s, hub: NewHub(), sessions: map[types.NodeID]*chunkSession{}}
+	for _, id := range ids {
+		cr.open(id)
+	}
+
+	doc := chunkDoc
+	edit := func(old, next string) {
+		t.Helper()
+		require.Contains(t, doc, old)
+		doc = strings.Replace(doc, old, next, 1)
+
+		_, err := s.SetPolicy([]byte(doc))
+		require.NoError(t, err)
+	}
+
+	chunksOf := func(id types.NodeID) policyv2.FilterChunks { return cr.sessions[id].client.chunks }
+
+	// A rule removed: its chunk deleted, nothing sent.
+	before := chunksOf(n1)
+
+	edit(`{"src":["u1@"],"dst":["u1@"],"ip":["tcp:443"]},`, "")
+
+	gone, added := edits(cr.render("rule removed")[n1])
+	require.Len(t, gone, 1)
+	require.Empty(t, added)
+	require.Equal(t, before.Len()-1, chunksOf(n1).Len())
+
+	// A port edited: the old name deleted, the new one sent.
+	edit(`"tcp:22"`, `"tcp:2222"`)
+
+	gone, added = edits(cr.render("port edited")[n2])
+	require.Len(t, gone, 1)
+	require.Len(t, added, 1)
+
+	// A protocol edited: tcp:80 and udp:53 become one rule.
+	edit(`"udp:53"`, `"tcp:53"`)
+
+	gone, added = edits(cr.render("protocol edited")[n1])
+	require.Len(t, gone, 2)
+	require.Len(t, added, 1)
+
+	// An app capability's value: the CapGrant chunk again, nothing else.
+	edit(`{"v":1}`, `{"v":3}`)
+
+	gone, added = edits(cr.render("capability value edited")[n2])
+	require.Len(t, gone, 1)
+	require.Len(t, added, 1)
+	require.True(t, strings.HasPrefix(added[0], "c/"), "the CapGrant chunk: %v", added)
+
+	// Its second value alone: the CapGrant chunk again.
+	edit(`{"v":"second"}`, `{"v":"2nd"}`)
+
+	gone, added = edits(cr.render("second capability value edited")[n2])
+	require.Len(t, gone, 1)
+	require.Len(t, added, 1)
+
+	// Only a protocol edited, and back: the rule is renamed each time.
+	edit(`"tcp:2222"`, `"udp:2222"`)
+
+	gone, added = edits(cr.render("only the protocol edited")[n2])
+	require.Len(t, gone, 1)
+	require.Len(t, added, 1)
+
+	edit(`"udp:2222"`, `"tcp:2222"`)
+	cr.render("protocol edited back")
+
+	// Rules reordered: the same rules, under the same names.
+	edit(`{"src":["group:a"],"dst":["u2@"],"ip":["tcp:2222"]},
+		{"src":["group:b"],"dst":["u1@"],"ip":["tcp:80","tcp:53"]},`,
+		`{"src":["group:b"],"dst":["u1@"],"ip":["tcp:80","tcp:53"]},
+		{"src":["group:a"],"dst":["u2@"],"ip":["tcp:2222"]},`)
+	require.Empty(t, cr.render("rules reordered"), "reordering rules sends no filter")
+
+	// n2 announces a route: every rule it is sent goes as addresses, and
+	// back. The CapGrant rule is addresses in both forms.
+	announce := func(routes ...netip.Prefix) {
+		t.Helper()
+
+		node := mustNode(t, s, n2).AsStruct()
+		hi := node.Hostinfo.Clone()
+		hi.RoutableIPs = routes
+		node.Hostinfo = hi
+		s.PutNodeInStoreForTest(*node)
+	}
+
+	capChunk := func(c policyv2.FilterChunks) string {
+		i := slices.IndexFunc(c.Names(), func(n string) bool { return strings.HasPrefix(n, "c/") })
+		require.GreaterOrEqual(t, i, 0)
+
+		return c.Names()[i]
+	}
+
+	capBefore := capChunk(chunksOf(n2))
+
+	announce(netip.MustParsePrefix("10.9.0.0/24"))
+
+	gone, added = edits(cr.render("form flips to addresses", n2)[n2])
+	require.NotEmpty(t, gone)
+	require.Len(t, added, len(gone))
+	require.NotContains(t, gone, capBefore, "the CapGrant chunk is the same in both forms")
+
+	addressForm := chunksOf(n2)
+
+	// In address form, a member leaving group:a moves its two rules, the
+	// port's and the app capability's, and no other.
+	_, err := s.SetNodeTags(n1b, []string{"tag:t"})
+	require.NoError(t, err)
+
+	gone, added = edits(cr.render("member of an address-form rule left", n2)[n2])
+	require.Len(t, gone, 2)
+	require.Len(t, added, 2)
+	require.Contains(t, gone, capChunk(addressForm))
+	require.Equal(t, addressForm.Len(), chunksOf(n2).Len())
+
+	announce()
+	cr.render("form flips back")
+
+	// n1's own address moves: every rule that reaches it is cut again.
+	node := mustNode(t, s, n1).AsStruct()
+	node.IPv4 = new(netip.MustParseAddr("100.64.0.99"))
+	s.PutNodeInStoreForTest(*node)
+
+	gone, added = edits(cr.render("own address moved", n1)[n1])
+	require.NotEmpty(t, gone)
+	require.NotEmpty(t, added)
+	cr.render("own address moved, the others")
+
+	// n2 lags three commits, then renders once.
+	edit(`"tcp:2222"`, `"tcp:22"`)
+	cr.render("lag 1", n1, n1b)
+	edit(`{"v":3}`, `{"v":4}`)
+	cr.render("lag 2", n1, n1b)
+	edit(`"tcp:22"`, `"tcp:2200"`)
+	cr.render("lag 3", n1, n1b)
+	cr.render("lagging session renders", n2)
+
+	// A render that fails leaves what the session holds: the next one
+	// sends everything that moved since the last it sent. (A render fails
+	// only before it reads the filter: a peer that cannot render is left
+	// out instead.)
+	broken := mustNode(t, s, n2).AsStruct()
+	name := broken.GivenName
+	broken.GivenName = strings.Repeat("a", types.MaxHostnameLength+1)
+	s.PutNodeInStoreForTest(*broken)
+	edit(`"tcp:2200"`, `"tcp:2201"`)
+
+	_, err = cr.sessions[n2].st.Update(s.Snapshot())
+	require.ErrorIs(t, err, types.ErrHostnameTooLong, "test sanity: its map cannot render")
+
+	broken.GivenName = name
+	s.PutNodeInStoreForTest(*broken)
+
+	gone, added = edits(cr.render("after a failed render", n2)[n2])
+	require.Len(t, gone, 1)
+	require.Len(t, added, 1)
+	cr.render("after a failed render, the others")
+
+	// A write that fails ends the session: what it carried never reaches
+	// the client, and the next session starts from a clear.
+	edit(`"tcp:8080"`, `"tcp:8081"`)
+
+	lost, err := cr.sessions[n1].st.Update(s.Snapshot())
+	require.NoError(t, err)
+	require.True(t, slices.ContainsFunc(lost, func(r *tailcfg.MapResponse) bool { return r.PacketFilters != nil }), "test sanity: the lost write carried the edit")
+
+	cs := cr.open(n1)
+	cr.requireFresh("reconnect after a failed write", cs)
+	cr.render("after the reconnect")
+
+	// A reconnect after a delivered edit: the client still holds what the
+	// last session sent it.
+	edit(`"tcp:80"`, `"tcp:81"`)
+	cr.render("before the reconnect")
+	cr.requireFresh("reconnect", cr.open(n2))
+}
+
+// TestFilterDeliveryCombinations pins what each combination of
+// policy.capability_sources and policy.filter_chunks sends, and the
+// per-client fallback: every first response clears; with chunks off the
+// filter goes whole under "base", with chunks on as named chunks, in
+// either source form; a node whose client is not Tailscale's (here
+// tailscale-rs) is sent "base" either way; a session whose node's client
+// changes is sent the whole state again, clear first. After every step
+// each client holds what a new session is sent.
+func TestFilterDeliveryCombinations(t *testing.T) {
+	for _, capSources := range []bool{false, true} {
+		for _, chunks := range []bool{false, true} {
+			t.Run(fmt.Sprintf("capability_sources=%t/filter_chunks=%t", capSources, chunks), func(t *testing.T) {
+				t.Setenv(state.TestCapabilitySourcesEnv, strconv.FormatBool(capSources))
+				t.Setenv(state.TestFilterChunksEnv, strconv.FormatBool(chunks))
+
+				cfg, s, ids := streamTestState(t, chunkDoc)
+				n1, rust, n2 := ids[0], ids[1], ids[2]
+
+				client := func(id types.NodeID, app string) {
+					t.Helper()
+
+					node := mustNode(t, s, id).AsStruct()
+					node.Hostinfo = node.Hostinfo.Clone()
+					node.Hostinfo.App = app
+					s.PutNodeInStoreForTest(*node)
+				}
+
+				client(rust, "tailscale-rs")
+
+				cr := &chunkRun{t: t, cfg: cfg, s: s, hub: NewHub(), sessions: map[types.NodeID]*chunkSession{}}
+
+				// shape names what a response's filter is: "base" or chunks,
+				// and whether a source is a capability.
+				shape := func(f map[string][]tailcfg.FilterRule) (string, bool) {
+					keys := slices.Sorted(maps.Keys(f))
+					keys = slices.DeleteFunc(keys, func(k string) bool { return k == "*" })
+
+					capForm := false
+
+					for _, rules := range f {
+						for _, r := range rules {
+							capForm = capForm || slices.ContainsFunc(r.SrcIPs, func(src string) bool { return strings.HasPrefix(src, "cap:") })
+						}
+					}
+
+					if slices.Equal(keys, []string{"base"}) {
+						return "base", capForm
+					}
+
+					require.Truef(t, !slices.Contains(keys, "base") && len(keys) > 0, "chunks or base, not %v", keys)
+
+					return "chunks", capForm
+				}
+
+				want := map[bool]string{false: "base", true: "chunks"}
+
+				for _, id := range []types.NodeID{n1, rust, n2} {
+					cs := cr.open(id)
+
+					fresh, err := NewStream(cfg, NewHub(), id, capVer).Initial(s.Snapshot())
+					require.NoError(t, err)
+
+					got, capForm := shape(fresh[0].PacketFilters)
+					wantShape := want[chunks]
+
+					if id == rust {
+						wantShape = "base"
+
+						require.False(t, capForm, "tailscale-rs is sent addresses")
+					} else {
+						require.Equal(t, capSources, capForm, "node %d: the source form follows capability_sources alone", id)
+					}
+
+					require.Equalf(t, wantShape, got, "node %d's first response", id)
+					require.Len(t, cs.client.chunks.Names(), len(policyv2.FilterChunks{}.ApplyResponse(fresh[0]).Names()))
+				}
+
+				// A port edited: chunks send the rule's change, base the whole
+				// filter again; tailscale-rs is sent base.
+				_, err := s.SetPolicy([]byte(strings.Replace(chunkDoc, `"tcp:80"`, `"tcp:8080"`, 1)))
+				require.NoError(t, err)
+
+				sent := cr.render("port edited")
+
+				for _, id := range []types.NodeID{n1, rust} {
+					f, ok := sent[id]
+					require.Truef(t, ok, "node %d is sent the edit", id)
+
+					got, _ := shape(f)
+					if id == rust || !chunks {
+						require.Equal(t, "base", got, "node %d", id)
+					} else {
+						gone, added := edits(f)
+						require.NotEmpty(t, gone)
+						require.NotEmpty(t, added)
+					}
+				}
+
+				// n2's client turns into tailscale-rs and back: with chunks on,
+				// each switch is the whole state again, clear first.
+				cr.switching = chunks
+
+				before := s.Snapshot()
+
+				client(n2, "tailscale-rs")
+
+				// Routing wakes n2 for it, though no map renders its client.
+				after := s.Snapshot()
+				if all, wake := Route(before, after, after.Since(before)); chunks && !all {
+					require.Contains(t, wake, n2, "a node whose delivery moved is woken")
+				}
+
+				// Without chunks only the source form can move: tailscale-rs is
+				// sent addresses.
+				switched := cr.render("n2 reports tailscale-rs", n2)[n2]
+				if chunks || capSources {
+					got, capForm := shape(switched)
+					require.Equal(t, "base", got)
+					require.False(t, capForm)
+				} else {
+					require.Nil(t, switched, "base before and after, in address form: nothing to send")
+				}
+
+				client(n2, "")
+				cr.render("n2 reports Tailscale again", n2)
+
+				// Each field the decision reads, across the floor and back: the
+				// client ends holding the whole filter, then chunks again, with
+				// nothing of the other left.
+				for _, tweak := range []struct {
+					name string
+					set  func(*tailcfg.Hostinfo)
+				}{
+					{"a release before the oldest served", func(hi *tailcfg.Hostinfo) { hi.IPNVersion = "1.0.0" }},
+					{"a Go client reporting no release", func(hi *tailcfg.Hostinfo) { hi.IPNVersion = "" }},
+					{"not built with Go", func(hi *tailcfg.Hostinfo) { hi.GoVersion = "" }},
+				} {
+					node := mustNode(t, s, n2).AsStruct()
+					was := node.Hostinfo.Clone()
+					node.Hostinfo = node.Hostinfo.Clone()
+					tweak.set(node.Hostinfo)
+
+					before := s.Snapshot()
+					s.PutNodeInStoreForTest(*node)
+
+					after := s.Snapshot()
+					if all, wake := Route(before, after, after.Since(before)); chunks && !all {
+						require.Contains(t, wake, n2, "%s: woken", tweak.name)
+					}
+
+					cr.render(tweak.name, n2)
+					require.Equal(t, []string{"base"}, cr.sessions[n2].client.chunks.Names(), "%s: the client holds the whole filter alone", tweak.name)
+
+					node = mustNode(t, s, n2).AsStruct()
+					node.Hostinfo = was
+					s.PutNodeInStoreForTest(*node)
+					cr.render(tweak.name+", and back", n2)
+
+					if chunks {
+						require.NotContains(t, cr.sessions[n2].client.chunks.Names(), "base", "%s, and back: chunks again, base gone", tweak.name)
+					}
+				}
+
+				cr.switching = false
+
+				cr.render("all")
+				cr.requireFresh("a reconnect of n2", cr.open(n2))
+			})
+		}
+	}
+}
+
+// heldDivergence reports how the filter a client assembled from what it
+// holds, held, answers otherwise than want, the compile's address form for
+// the same node, through the client's own filter: every verdict from every
+// node address and every address a rule names, to the node's addresses
+// and every destination a rule names, on every port a rule names, by TCP,
+// UDP, SCTP, ICMP and every protocol a rule names, and every app
+// capability's values in order. caps answers capability sources as the
+// client does from its netmap; local are the node's local nets. Neither
+// the order of rules nor a rule held twice changes an answer, so it judges
+// a chunked filter without going through the chunking. "" when they agree.
+func heldDivergence(held, want []tailcfg.FilterRule, caps filter.CapTestFunc, local *netipx.IPSet, nodes views.Slice[types.NodeView]) string {
+	build := func(rules []tailcfg.FilterRule) (*filter.Filter, error) {
+		ms, err := filter.MatchesFromFilterRules(rules)
+		if err != nil {
+			return nil, err
+		}
+
+		return filter.New(ms, caps, local, nil, nil, logger.Discard), nil
+	}
+
+	got, err := build(held)
+	if err != nil {
+		return "held filter: " + err.Error()
+	}
+
+	ref, err := build(want)
+	if err != nil {
+		return "compile's filter: " + err.Error()
+	}
+
+	var srcs, dsts []netip.Addr
+
+	ports := []uint16{0, 1, 65535}
+	protos := []ipproto.Proto{ipproto.TCP, ipproto.UDP, ipproto.SCTP}
+
+	// edges adds a rule entry's first and last address and the ones past
+	// them; "*" and capabilities name no address.
+	edges := func(out *[]netip.Addr, entry string) {
+		r, err := util.ParseIPRange(entry)
+		if err != nil {
+			return
+		}
+
+		*out = append(*out, r.From(), r.To(), r.From().Prev(), r.To().Next())
+	}
+
+	for _, n := range nodes.All() {
+		srcs = append(srcs, n.IPs()...)
+	}
+
+	for _, r := range local.Ranges() {
+		dsts = append(dsts, r.From(), r.To())
+	}
+
+	for _, rule := range slices.Concat(held, want) {
+		for _, s := range rule.SrcIPs {
+			edges(&srcs, s)
+		}
+
+		for _, d := range rule.DstPorts {
+			edges(&dsts, d.IP)
+			ports = append(ports, d.Ports.First, d.Ports.Last, d.Ports.First-1, d.Ports.Last+1)
+		}
+
+		for _, g := range rule.CapGrant {
+			for _, p := range g.Dsts {
+				dsts = append(dsts, p.Masked().Addr())
+			}
+		}
+
+		for _, p := range rule.IPProto {
+			protos = append(protos, ipproto.Proto(p)) //nolint:gosec // protocol numbers fit
+		}
+	}
+
+	srcs = append(srcs, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1"))
+
+	slices.SortFunc(srcs, netip.Addr.Compare)
+	slices.SortFunc(dsts, netip.Addr.Compare)
+	slices.Sort(ports)
+	slices.Sort(protos)
+
+	ports, protos = slices.Compact(ports), slices.Compact(protos)
+
+	for _, src := range slices.Compact(srcs) {
+		for _, dst := range slices.Compact(dsts) {
+			if !src.IsValid() || !dst.IsValid() || src.Is4() != dst.Is4() {
+				continue
+			}
+
+			if a, b := ref.CapsWithValues(src, dst), got.CapsWithValues(src, dst); !reflect.DeepEqual(a, b) {
+				return fmt.Sprintf("caps %s -> %s: compile %v, held %v", src, dst, a, b)
+			}
+
+			icmp := ipproto.ICMPv4
+			if src.Is6() {
+				icmp = ipproto.ICMPv6
+			}
+
+			for _, proto := range append(slices.Clone(protos), icmp) {
+				for _, port := range ports {
+					if a, b := ref.Check(src, dst, port, proto), got.Check(src, dst, port, proto); a != b {
+						return fmt.Sprintf("%s %s -> %s:%d: compile %v, held %v", proto, src, dst, port, a, b)
+					}
+
+					if proto != ipproto.TCP && proto != ipproto.UDP && proto != ipproto.SCTP {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+// clientLookup answers capability sources as a client holding c does: an
+// address names the node, itself or a peer, holding it, the last in ID
+// order when two do, and that node's CapMap answers.
+func clientLookup(c *modelClient) filter.CapTestFunc {
+	byAddr := map[netip.Addr]*tailcfg.Node{}
+
+	nodes := slices.SortedFunc(maps.Values(c.peers), func(a, b *tailcfg.Node) int { return cmp.Compare(a.ID, b.ID) })
+	if c.self != nil {
+		nodes = append([]*tailcfg.Node{c.self}, nodes...)
+	}
+
+	for _, n := range nodes {
+		for _, p := range n.Addresses {
+			if p.IsSingleIP() {
+				byAddr[p.Addr()] = n
+			}
+		}
+	}
+
+	return func(src netip.Addr, capability nodecap.Cap) bool {
+		n, ok := byAddr[src]
+		if !ok {
+			return false
+		}
+
+		_, has := n.CapMap[capability]
+
+		return has
+	}
+}
+
+// localNets are a node's local nets as its client builds them: its own
+// addresses, the routes it announces, and everything for an app connector.
+func localNets(n types.NodeView) *netipx.IPSet {
+	var b netipx.IPSetBuilder
+
+	for _, ip := range n.IPs() {
+		b.Add(ip)
+	}
+
+	if hi := n.Hostinfo(); hi.Valid() {
+		for _, p := range hi.RoutableIPs().All() {
+			b.AddPrefix(p)
+		}
+
+		if hi.AppConnector().EqualBool(true) {
+			b.AddPrefix(netip.MustParsePrefix("0.0.0.0/0"))
+			b.AddPrefix(netip.MustParsePrefix("::/0"))
+		}
+	}
+
+	set, _ := b.IPSet()
+
+	return set
+}
+
+// TestNodeWithoutHostinfoRenders loads a node whose stored Hostinfo is
+// NULL, as a row stored before its node reported one loads, and connects
+// it: its own map and its peer's render, and routing the commit, with
+// filter chunks off and on. A node with no Hostinfo reports no client and is
+// sent the whole filter.
+func TestNodeWithoutHostinfoRenders(t *testing.T) {
+	for _, chunks := range []bool{false, true} {
+		t.Run(fmt.Sprintf("filter_chunks=%t", chunks), func(t *testing.T) {
+			t.Setenv(state.TestCapabilitySourcesEnv, "false")
+			t.Setenv(state.TestFilterChunksEnv, strconv.FormatBool(chunks))
+
+			p4 := netip.MustParsePrefix("100.64.0.0/10")
+			p6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+			cfg := &types.Config{
+				Database:  types.DatabaseConfig{Type: types.DatabaseSqlite, Sqlite: types.SqliteConfig{Path: t.TempDir() + "/h.db"}},
+				ServerURL: "https://headscale.test",
+				Policy:    types.PolicyConfig{Mode: types.PolicyModeDB},
+				Prefixes:  types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential},
+				DNSConfig: types.DNSConfig{BaseDomain: "headscale.test"},
+			}
+
+			database, err := db.NewHeadscaleDatabase(cfg)
+			require.NoError(t, err)
+
+			u := database.CreateUserForTest("u1")
+			bare := database.CreateRegisteredNodeForTest(u, "bare")
+			peer := database.CreateRegisteredNodeForTest(u, "peer")
+			require.NoError(t, database.DB.Exec("UPDATE nodes SET host_info = NULL WHERE id = ?", bare.ID).Error)
+			require.NoError(t, database.Close())
+
+			s, err := state.NewState(cfg)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = s.Close() })
+
+			nv, ok := s.GetNodeByID(bare.ID)
+			require.True(t, ok)
+			require.False(t, nv.Hostinfo().Valid(), "test sanity: the node loads with no Hostinfo")
+
+			hub := NewHub()
+
+			streams := map[types.NodeID]*Stream{}
+			for _, id := range []types.NodeID{bare.ID, peer.ID} {
+				streams[id] = NewStream(cfg, hub, id, capVer)
+
+				first, err := streams[id].Initial(s.Snapshot())
+				require.NoError(t, err)
+
+				_, whole := first[0].PacketFilters["base"]
+				require.Equal(t, id == bare.ID || !chunks, whole, "node %d: a node reporting no client, and every node with chunks off, is sent the whole filter", id)
+			}
+
+			before := s.Snapshot()
+			s.Connect(bare.ID)
+			after := s.Snapshot()
+
+			all, wake := Route(before, after, after.Since(before))
+			require.True(t, all || len(wake) > 0, "test sanity: connecting wakes someone")
+
+			for id, st := range streams {
+				_, err := st.Update(after)
+				require.NoError(t, err, "node %d", id)
+			}
+		})
+	}
 }

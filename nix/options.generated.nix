@@ -158,6 +158,22 @@ in
       '';
       example = "database";
     };
+    capability_sources = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Sends a rule's users, groups, tags and autogroups as node capabilities their members are stamped with: a member joining or leaving changes the capabilities its peers are sent with it, not the packet filter nodes in capability form are sent. Every peer then sees the selectors a node is in, group names included. Sources the client cannot match this way, and nodes that cannot be sent them (nodes announcing routes, approved or not, app connectors, service hosts, clients other than Tailscale's), stay as addresses. Off sends every source as addresses and stamps nothing. Read at startup only. In either mode a policy naming a capability under `https://headscale.net/cap/src/` is refused, a stored one at startup.
+      '';
+      example = false;
+    };
+    filter_chunks = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Sends each node's packet filter as named chunks, so a change sends what changed instead of the whole filter: a chunk per rule, but one chunk for every app capability rule, sent whole again when any of them changes, since their order is what an application reads. Only Tailscale's own client is sent chunks; any other, tailscale-rs among them, is sent the whole filter. Off sends every client the whole filter. Independent of `policy.capability_sources`. Read at startup only. Every map session starts by clearing what the client held, so this can be turned on and off between restarts. Tailscale's client holds chunks per map session, so even a rollback to a headscale release that sends no such clear leaves none behind; only a client reporting itself as Tailscale's while keeping chunks across sessions could hold stale ones.
+      '';
+      example = false;
+    };
   };
   log = {
     level = lib.mkOption {

@@ -122,6 +122,36 @@ override that refusal. `policy get` keeps its read-only bypass behaviour against
 
 [#37](https://github.com/kradalby/headscale/pull/37)
 
+### Packet filters name groups and tags, and send only what changed
+
+Two options under `policy`, on by default and each switchable off, change how a
+node's packet filter reaches its client. Both are read at startup.
+
+`policy.capability_sources` writes a rule's users, groups, tags,
+`autogroup:member`, `autogroup:tagged` and `autogroup:self` owners as
+capabilities, such as `cap:https://headscale.net/cap/src/group:eng`, instead of
+their members' addresses. Each node is sent, to its peers and to itself, with a
+`CapMap` entry for every such source it belongs to, and the client accepts a
+packet when the sending node carries the capability. A node joining, leaving or
+being retagged then changes the peers other nodes are sent, not the packet
+filters of nodes sent capabilities. Sources that are addresses, nodes that
+announce routes, app connectors, service hosts, clients other than Tailscale's
+own, app capability rules and protocols other than TCP, UDP, SCTP and ICMP stay
+as addresses. Peers can then read which source groups, tags and users a node
+belongs to, and a node that starts announcing routes briefly accepts more ICMP
+than its policy allows; see BREAKING.
+
+`policy.filter_chunks` sends the filter as named chunks, one per rule and one
+for all app capability rules, so a change sends only the chunks that changed;
+an unchanged filter sends nothing.
+Only Tailscale's own client is sent chunks; others get the whole filter under
+`"base"`.
+
+`/debug/capability-sources` and the `headscale_policy_address_form_*` and
+`headscale_policy_filter_deliveries_total` metrics show which nodes and rules
+are sent addresses, and why. See
+[the policy reference](docs/ref/policy.md#how-filters-reach-clients).
+
 ### Via-scoped subnet failover elects live routers
 
 Subnet failover for a grant with `via` now elects from the routers that are
@@ -166,6 +196,9 @@ See [the routes reference](docs/ref/routes.md) for the failover rules.
 - A policy without `acls` or `grants` allows only tailnet addresses and approved routes. Hosts outside the tailnet cannot connect to nodes. Use `autogroup:danger-all` to allow all addresses. [#3649](https://github.com/juanfont/headscale/pull/3649)
 - A user's devices are always peers of each other. The packet filter still controls access. [#3649](https://github.com/juanfont/headscale/pull/3649)
 - SSH `dst` rejects `autogroup:member`, as Tailscale does. Use `autogroup:self`, tags, or the source's own user. A policy file that still uses it stops headscale at startup. [#3343](https://github.com/juanfont/headscale/pull/3343)
+- Peers can read which source selectors a node belongs to: for itself and every peer it sees, a node is sent the groups, tags, users, `user:*@domain` domains and autogroups the policy names as sources, and with `autogroup:self` the owner's user ID, e.g. in `tailscale debug netmap`. Set `policy.capability_sources: false` to send addresses and no membership.
+- A node that starts announcing routes, or becomes an app connector, accepts ICMP (except echo replies and errors, which it accepts from anyone anyway) from any holder of a capability its filter names, to any address of its new local networks, until it installs the address-form filter its announcement earns; for an exit node, every address it forwards to. This normally lasts one map request round trip, and has no bound while headscale refuses that map request (e.g. HTTP 413 for an oversized Hostinfo) or is unreachable. TCP, UDP and SCTP are not affected; withdrawing routes opens no window. Tracked as [tailscale/tailscale#12542](https://github.com/tailscale/tailscale/issues/12542). Set `policy.capability_sources: false` if this is not acceptable.
+- Capabilities under `https://headscale.net/cap/src/` are reserved in either mode. A policy naming one in `nodeAttrs` or an `app` grant is refused; a stored one stops headscale at startup.
 
 #### Nodes and routes
 
@@ -195,6 +228,10 @@ See [the routes reference](docs/ref/routes.md) for the failover rules.
 - Without MagicDNS, `dns.base_domain` is not a search domain. [#3649](https://github.com/juanfont/headscale/pull/3649)
 - A deleted node's map requests get a 404, as from Tailscale. Its client no longer polls `/machine/map` in a tight loop. Tailscale 1.106 and later show "Device removed" and need a new login; older clients keep retrying until `tailscale up --force-reauth`. [#3688](https://github.com/juanfont/headscale/issues/3688)
 - A tagged node sees itself as its own user, with the node name. `tailscale status` shows this name, not `tagged-devices`. Tagged nodes are not devices of one owner for Taildrop. [#3649](https://github.com/juanfont/headscale/pull/3649)
+- By default, packet filters name identity sources as `cap:https://headscale.net/cap/src/<selector>` and nodes carry those capabilities in their `CapMap`, as peers and as themselves; filters arrive as named chunks in `PacketFilters`, not under `"base"`. Integrations reading a node's packet filter or its peers' `CapMap` must handle both forms, or set `policy.capability_sources: false` and `policy.filter_chunks: false`.
+- Tailscale's own client gets its filter as named chunks: one per rule (`r/<hash>`), every app capability rule together (`c/<hash>`). Later responses carry only new chunks and `null` for removed ones; an unchanged filter sends no `PacketFilters`. Other clients, tailscale-rs among them, get the whole filter under `"base"`, as every client does with `policy.filter_chunks: false`.
+- The first response of every map stream carries `"PacketFilters": {"*": null, …}`, clearing what the client held, with either option on or off. Both options can be switched between restarts.
+- Rolling back to an earlier release leaves no stale chunks. Tailscale's client keeps chunks for one map session, and the restart starts new sessions, which replace the whole filter; tailscale-rs, which keeps chunks across sessions, is never sent chunks. Only a client reporting itself as Tailscale's while keeping chunks across sessions could hold stale ones. The new sessions also drop the capability entries and `cap:` rules.
 
 #### API
 

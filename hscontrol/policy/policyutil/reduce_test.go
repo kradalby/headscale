@@ -13,6 +13,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/policy/policyutil"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
@@ -791,7 +792,10 @@ func TestReduceFilterRules(t *testing.T) {
 				pm, err = pmf(users, append(tt.peers, tt.node).ViewSlice())
 				require.NoError(t, err)
 
-				got, _ := pm.Filter()
+				compiled, ok := pm.(*policyv2.PolicyManager)
+				require.True(t, ok, "test sanity: a v2 policy")
+
+				got, _ := compiled.Filter()
 				t.Logf("full filter:\n%s", must.Get(json.MarshalIndent(got, "", "  ")))
 				got = policyutil.ReduceFilterRules(tt.node.View(), got)
 

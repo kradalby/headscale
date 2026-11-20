@@ -20,27 +20,51 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/util/mak"
 )
 
-// PeerCapMap returns [nodecap.SuggestExitNode] for an approved exit node,
-// preserving its policy value from peerSelfCaps. Other peers return nil,
-// matching the wire shape where [tailcfg.Node.CapMap] is omitted.
+// PeerCapMap returns, when stamped, the source capabilities the peer is
+// stamped with and, for an approved exit node, [nodecap.SuggestExitNode], preserving its
+// policy value from peerSelfCaps. A peer with neither returns nil, matching
+// the wire shape where [tailcfg.Node.CapMap] is omitted.
 //
 // Mapper peer rendering and compatibility tests share this emission rule.
-func PeerCapMap(peer types.NodeView, peerSelfCaps tailcfg.NodeCapMap) tailcfg.NodeCapMap {
+func PeerCapMap(peer types.NodeView, peerSelfCaps tailcfg.NodeCapMap, stamped bool) tailcfg.NodeCapMap {
+	var out tailcfg.NodeCapMap
+
+	// The source capabilities the peer is stamped with, in capability mode:
+	// a viewer's filter names them, and the viewer looks them up on the peer.
+	//
+	// TODO(capsrc/trim): lift when per-viewer trimming is worth giving up renders shared across viewers; every viewer sees every selector a peer is in
+	// TODO(kradalby): capsrc/trim, overwake/stamp-viewers: so a stamp that
+	// comes or goes wakes every viewer of the restamped node and sends each
+	// the node's whole CapMap, whether or not any of the viewer's rules
+	// names the stamp (a group edit restamps its users' nodes for the whole
+	// tailnet); the client applies a CapMap patch by rebuilding its netmap,
+	// a CapMap change being no NodeMutation (NodeMutationsFromPatch,
+	// https://github.com/tailscale/tailscale/blob/f7c1b8e52600c1926623b29c91972a5ea1364d2f/types/netmap/nodemut.go;
+	// the delta work under https://github.com/tailscale/tailscale/issues/12542). Mapper.Route
+	// wakes them through Change.Caps. Fixing it takes rendering each peer
+	// per viewer with the stamps the viewer's own rules name, giving up the
+	// renders shared across viewers. No test tolerates it: the stamps are
+	// what TestStampsFollowReference and TestWorldMatchesScratchWorld hold.
+	for c := range peerSelfCaps {
+		if stamped && IsSourceCap(string(c)) {
+			mak.Set(&out, c, nil)
+		}
+	}
+
 	// suggest-exit-node — surfaced on Peer.CapMap when the peer
 	// advertises exit routes AND those routes are approved, with or
 	// without a nodeAttrs grant: SaaS stamps it by default, and Apple
 	// clients hide the exit-node list without a suggestion. A policy
 	// value, if any, wins. Approval gating prevents the suggestion from
 	// following an advertised-but-not-yet-trusted node.
-	if !peer.IsExitNode() {
-		return nil
+	if peer.IsExitNode() {
+		mak.Set(&out, nodecap.SuggestExitNode, peerSelfCaps[nodecap.SuggestExitNode])
 	}
 
-	return tailcfg.NodeCapMap{
-		nodecap.SuggestExitNode: peerSelfCaps[nodecap.SuggestExitNode],
-	}
+	return out
 }
 
 // unmodelledTailnetStateCaps lists [tailcfg.NodeCapability] values

@@ -4,7 +4,6 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
@@ -15,20 +14,12 @@ import (
 var ErrPolicyEmpty = policyv2.ErrPolicyEmpty
 
 // PolicyManager is a policy compiled against fixed users and nodes. It is
-// only read; a change to any of its inputs compiles a new one.
+// only read; a change to any of its inputs compiles a new one. It serves
+// what the graph's cells do not; packet filters, peers and via steering
+// are served by the cells, and the v2 manager's address compile, which the
+// audit holds them to, is deliberately not part of this interface.
 type PolicyManager interface {
 	DERPMap() *tailcfg.DERPMap
-	// Filter returns the current filter rules for the entire tailnet and the associated matchers.
-	Filter() ([]tailcfg.FilterRule, []matcher.Match)
-	// FilterForNode returns filter rules for a specific node, handling autogroup:self
-	FilterForNode(node types.NodeView) ([]tailcfg.FilterRule, error)
-	// MatchersForNode returns matchers for peer relationship determination (unreduced)
-	MatchersForNode(node types.NodeView) ([]matcher.Match, error)
-	// BuildPeerMap constructs peer relationship maps for the given nodes
-	BuildPeerMap(nodes views.Slice[types.NodeView]) map[types.NodeID][]types.NodeID
-	// BuildPeerClasses works out who sees whom, grouping nodes that see
-	// the same nodes.
-	BuildPeerClasses(nodes views.Slice[types.NodeView], prev *policyv2.PeerClasses) *policyv2.PeerClasses
 	SSHPolicy(baseURL string, node types.NodeView) (*tailcfg.SSHPolicy, error)
 	// SSHCheckParams resolves the SSH check period for src logging in to
 	// dst as localUser from the current policy, avoiding trust of
@@ -55,15 +46,6 @@ type PolicyManager interface {
 	// NodeCanApproveRoute reports whether the given node can approve the given route.
 	NodeCanApproveRoute(node types.NodeView, route netip.Prefix) bool
 
-	// ViaRoutesForPeer is static policy inspection. Live routing must use
-	// the immutable result of ElectViaRoutes instead.
-	ViaRoutesForPeer(viewer, peer types.NodeView) types.ViaRouteResult
-	// ElectViaRoutes revisits only scopes a change can move: touched
-	// prefixes, and on a new binding the scopes whose candidates moved. It
-	// reports winner changes, not policy-binding changes; callers must
-	// adopt the returned result even when the boolean is false.
-	ElectViaRoutes(previous *policyv2.ViaRoutes, touched map[netip.Prefix]struct{}, elect func(views.Slice[types.NodeID], types.NodeID) (types.NodeID, bool)) (*policyv2.ViaRoutes, bool)
-
 	// NodeCapMap returns compiled policy capabilities for the given node,
 	// or nil when none target it. The map is a defensive clone; its values
 	// are shared and read-only. It describes the node's own capabilities,
@@ -76,7 +58,6 @@ type PolicyManager interface {
 	NodeCapMaps() map[types.NodeID]tailcfg.NodeCapMap
 
 	Version() int
-	DebugString() string
 }
 
 // NewPolicyManagerFrom is [NewPolicyManager] reusing what prev compiled
@@ -137,4 +118,16 @@ func PolicyManagerFuncsForTest(pol []byte) []func([]types.User, views.Slice[type
 
 func ValidatePolicy(pol []byte, users []types.User, nodes views.Slice[types.NodeView]) error {
 	return policyv2.ValidatePolicy(pol, users, nodes)
+}
+
+// ValidatePolicyAgainst is [ValidatePolicy] with the tests run against the
+// global filter global expands for the candidate, see
+// [policyv2.ValidatePolicyAgainst].
+func ValidatePolicyAgainst(
+	pol []byte,
+	users []types.User,
+	nodes views.Slice[types.NodeView],
+	global func(*policyv2.PolicyManager) ([]tailcfg.FilterRule, error),
+) error {
+	return policyv2.ValidatePolicyAgainst(pol, users, nodes, global)
 }

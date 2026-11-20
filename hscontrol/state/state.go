@@ -152,7 +152,7 @@ func (e invalidPolicyError) Unwrap() []error { return []error{ErrInvalidPolicy, 
 func (s *State) ValidatePolicy(pol []byte) error {
 	snapshot := s.Snapshot()
 
-	err := policy.ValidatePolicy(pol, snapshot.Users(), snapshot.ListNodes())
+	err := policy.ValidatePolicyAgainst(pol, snapshot.Users(), snapshot.ListNodes(), snapshot.globalFilterOf)
 	if err != nil {
 		return invalidPolicyError{err}
 	}
@@ -425,10 +425,12 @@ func NewState(cfg *types.Config) (*State, error) {
 		return nil, fmt.Errorf("loading policy: %w", err)
 	}
 
-	w, err := newWorld(nodes, users, pol, cfg.DNSView())
+	w, err := newWorldMode(nodes, users, pol, cfg.DNSView(), optionsOf(cfg.Policy))
 	if err != nil {
 		return nil, fmt.Errorf("initializing policy manager: %w", err)
 	}
+
+	censusWorld.Store(w)
 
 	w.batchSize, w.batchTimeout = cfg.Tuning.NodeStoreBatchSize, cfg.Tuning.NodeStoreBatchTimeout
 	w.servesRoute = cfg.ServesRoute
@@ -449,7 +451,9 @@ func NewState(cfg *types.Config) (*State, error) {
 			log.Warn().Err(refErr).Msg("stored policy names users ambiguously, who get nothing; server starting anyway, fix the policy or users")
 		}
 
-		if err := t.RunTests(); err != nil { //nolint:noinlineerr // warn and continue
+		snap := w.snapshot()
+
+		if err := t.RunTestsAgainst(func() ([]tailcfg.FilterRule, error) { return snap.globalFilterFor(snap.Policy()) }); err != nil { //nolint:noinlineerr // warn and continue
 			log.Warn().Err(err).Msg("policy tests failed at boot; server starting anyway, fix the policy and reload")
 		}
 
@@ -1761,9 +1765,15 @@ func (s *State) SSHCheckParams(
 	return s.Snapshot().Policy().SSHCheckParams(srcNodeID, dstNodeID, localUser)
 }
 
-// Filter returns the current network filter rules and matches.
+// Filter returns the current network filter rules and matches: the rules
+// every node's filter is reduced from, see [Snapshot.Filter].
 func (s *State) Filter() ([]tailcfg.FilterRule, []matcher.Match) {
-	return s.Snapshot().Policy().Filter()
+	rules, matchers, err := s.Snapshot().Filter()
+	if err != nil {
+		log.Error().Err(err).Msg("expanding the policy's filter")
+	}
+
+	return rules, matchers
 }
 
 // NodeCanHaveTag checks if a node is allowed to have a specific tag.
@@ -1777,7 +1787,7 @@ func (s *State) NodeCanHaveTag(node types.NodeView, tag string) bool {
 type policyTester interface {
 	ValidateUserReferences() error
 	AmbiguousUserReferences() ([]string, error)
-	RunTests() error
+	RunTestsAgainst(global func() ([]tailcfg.FilterRule, error)) error
 	RunSSHTests() error
 }
 
@@ -1854,7 +1864,7 @@ func (s *State) publishPolicy(pol []byte, persist func() error) (bool, error) {
 			return false, invalidPolicyError{err}
 		}
 
-		err = policyRefusal(candidate)
+		err = policyRefusal(snap, candidate)
 		if err != nil {
 			return false, invalidPolicyError{err}
 		}
@@ -1881,7 +1891,7 @@ func (s *State) publishPolicy(pol []byte, persist func() error) (bool, error) {
 	}
 
 	return s.world.SetPolicy(pol, func(next *Snapshot) error {
-		validationErr := multierr.New(next.PolicyErr(), policyRefusal(next.Policy()))
+		validationErr := multierr.New(next.PolicyErr(), policyRefusal(next, next.Policy()))
 		if validationErr != nil {
 			return invalidPolicyError{validationErr}
 		}
@@ -1896,10 +1906,14 @@ func (s *State) publishPolicy(pol []byte, persist func() error) (bool, error) {
 
 // policyRefusal returns why setting pm's document is refused: a user name
 // several users answer to, or failing tests or sshTests. The compile drops
-// such a name, so only a document change checks it, as upstream does.
-func policyRefusal(pm policy.PolicyManager) error {
+// such a name, so only a document change checks it, as upstream does. pm
+// is compiled against snap's users and nodes, whose membership the tests'
+// filter is expanded from.
+func policyRefusal(snap *Snapshot, pm policy.PolicyManager) error {
 	if t, ok := pm.(policyTester); ok {
-		return multierr.New(t.ValidateUserReferences(), t.RunTests(), t.RunSSHTests())
+		global := func() ([]tailcfg.FilterRule, error) { return snap.globalFilterFor(pm) }
+
+		return multierr.New(t.ValidateUserReferences(), t.RunTestsAgainst(global), t.RunSSHTests())
 	}
 
 	return nil
@@ -4170,7 +4184,7 @@ func (s *State) UpdatePolicy(ctx context.Context, pol []byte) (*types.Policy, er
 
 	current := s.Snapshot()
 
-	err = policy.ValidatePolicy(pol, current.Users(), current.ListNodes())
+	err = policy.ValidatePolicyAgainst(pol, current.Users(), current.ListNodes(), current.globalFilterOf)
 	if err != nil {
 		return nil, invalidPolicyError{err}
 	}

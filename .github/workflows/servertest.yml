@@ -34,3 +34,19 @@ jobs:
         env:
           CGO_ENABLED: "0"
         run: go test -timeout=40m ./hscontrol/servertest/...
+
+  # Both policy options off, the opt-out, which the default run above
+  # leaves to the tests that pin it.
+  servertest-address:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: NixOS/nix-installer-action@v1.0.0
+      - uses: Mic92/hestia@v3.1.0
+
+      - name: go test ./hscontrol/servertest, both policy options off
+        env:
+          CGO_ENABLED: "0"
+          HEADSCALE_TEST_CAPABILITY_SOURCES: "false"
+          HEADSCALE_TEST_FILTER_CHUNKS: "false"
+        run: go test -timeout=40m ./hscontrol/servertest/...

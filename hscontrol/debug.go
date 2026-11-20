@@ -182,6 +182,16 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 		writeJSON(w, filter)
 	}))
 
+	debug.Handle("capability-sources", "Filter sources sent as addresses instead of capabilities, by reason", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		info, err := h.state.DebugCapabilitySources()
+		if err != nil {
+			httpError(w, err)
+			return
+		}
+
+		writeJSON(w, info)
+	}))
+
 	// SSH policies endpoint
 	debug.Handle("ssh", "SSH policies per node", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, h.state.DebugSSHPolicies())

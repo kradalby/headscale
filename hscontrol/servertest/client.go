@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"path"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ import (
 	"tailscale.com/types/persist"
 	"tailscale.com/types/views"
 	"tailscale.com/util/eventbus"
+	"tailscale.com/version"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -77,6 +79,9 @@ type TestClient struct {
 	// streams and streamMaps: see [TestClient.Stream].
 	streams, streamMaps int
 
+	// unknownClient: see [WithUnknownClient].
+	unknownClient bool
+
 	// deltaUpdates, deltaRemoved and deltaSeen: see [WithDeltaUpdates].
 	deltaUpdates bool
 	deltaRemoved []tailcfg.NodeID
@@ -84,6 +89,11 @@ type TestClient struct {
 
 	// registers: see [TestClient.RegisterAttempts].
 	registers []testcapture.RegisterAttempt
+
+	// filterHeld is set while the last netmap in history is one a
+	// [WithDeltaUpdates] client's in-place filter update made for the
+	// response in hand, which a full rebuild of the same response replaces.
+	filterHeld bool
 
 	// frames: see [TestClient.Frames]. stamped is set while the response
 	// in hand carried a ControlTime, so its rebuild is already counted.
@@ -115,6 +125,7 @@ type clientConfig struct {
 	deltaUpdates  bool
 	noHistory     bool
 	hostinfo      *tailcfg.Hostinfo
+	unknownClient bool
 	approve       func(authID string) error
 	loginFlags    controlclient.LoginFlags
 	endpoints     []tailcfg.Endpoint
@@ -161,6 +172,14 @@ func WithAuthKey(key string) ClientOption {
 // registration.
 func WithHostinfo(hi *tailcfg.Hostinfo) ClientOption {
 	return func(c *clientConfig) { c.hostinfo = hi }
+}
+
+// WithUnknownClient makes the client report no Go client and no Tailscale
+// version, as tailscale-rs does: the server cannot tell it applies
+// capability sources. Without it, every Hostinfo the client sends carries
+// the Go and Tailscale versions the official client reports.
+func WithUnknownClient() ClientOption {
+	return func(c *clientConfig) { c.unknownClient = true }
 }
 
 // WithInteractiveLogin registers without an auth key, as `tailscale up`
@@ -285,8 +304,9 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 		dialer:     dialer,
 		tracker:    tracker,
 
-		deltaUpdates: cc.deltaUpdates,
-		noHistory:    cc.noHistory,
+		deltaUpdates:  cc.deltaUpdates,
+		noHistory:     cc.noHistory,
+		unknownClient: cc.unknownClient,
 	}
 
 	tc.logf = func(format string, args ...any) {
@@ -300,6 +320,7 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 		if strings.Contains(line, `{"controltime":`) {
 			tc.frames++
 			tc.stamped = true
+			tc.filterHeld = false
 		}
 		tc.mu.Unlock()
 	}
@@ -376,7 +397,7 @@ func NewAutoClient(
 		GetMachinePrivateKey: func() (key.MachinePrivate, error) { return machineKey, nil },
 		ServerURL:            server.URL,
 		AuthKey:              server.CreatePreAuthKey(tb, types.UserID(user.ID)),
-		Hostinfo:             hi,
+		Hostinfo:             officialHostinfo(hi),
 		DiscoPublicKey:       key.NewDisco().Public(),
 		Logf:                 tb.Logf,
 		HealthTracker:        health.NewTracker(bus),
@@ -409,7 +430,7 @@ func (c *TestClient) newDirect(
 		GetMachinePrivateKey: func() (key.MachinePrivate, error) { return c.machineKey, nil },
 		ServerURL:            c.server.URL,
 		AuthKey:              authKey,
-		Hostinfo:             hi,
+		Hostinfo:             c.clientHostinfo(hi),
 		DiscoPublicKey:       c.discoKey,
 		Logf:                 c.logf,
 		HealthTracker:        c.tracker,
@@ -422,6 +443,35 @@ func (c *TestClient) newDirect(
 	}
 
 	return direct, err
+}
+
+// clientHostinfo is hi as the client sends it: with the Go and Tailscale
+// versions [hostinfo.New] fills in, unless the client is unknown.
+func (c *TestClient) clientHostinfo(hi *tailcfg.Hostinfo) *tailcfg.Hostinfo {
+	if c.unknownClient {
+		return hi
+	}
+
+	return officialHostinfo(hi)
+}
+
+// officialHostinfo is hi with the Go and Tailscale versions [hostinfo.New]
+// fills in, where it has none; a copy.
+func officialHostinfo(hi *tailcfg.Hostinfo) *tailcfg.Hostinfo {
+	if hi == nil || hi.GoVersion != "" && hi.IPNVersion != "" {
+		return hi
+	}
+
+	out := hi.Clone()
+	if out.GoVersion == "" {
+		out.GoVersion = runtime.Version()
+	}
+
+	if out.IPNVersion == "" {
+		out.IPNVersion = version.Long()
+	}
+
+	return out
 }
 
 // register performs the initial [controlclient.Direct.TryLogin] to register the client.
@@ -548,16 +598,31 @@ func (c *TestClient) resetNetmapState() {
 func (c *TestClient) UpdateFullNetmap(nm *netmap.NetworkMap) {
 	c.mu.Lock()
 	c.netmap = nm
-	c.updatesReceived++
-	c.streamMaps++
+
+	// A rebuild of a response whose filter was installed in place stands
+	// for it: one netmap per response.
+	if c.filterHeld {
+		c.filterHeld = false
+
+		if !c.noHistory && len(c.history) > 0 {
+			c.history[len(c.history)-1] = nm
+		}
+	} else {
+		c.updatesReceived++
+		c.streamMaps++
+
+		if !c.noHistory {
+			c.history = append(c.history, nm)
+		}
+	}
 
 	// A client built without TryNewClient has no firstMap.
 	if c.updatesReceived == 1 && c.firstMap != nil {
-		close(c.firstMap)
-	}
-
-	if !c.noHistory {
-		c.history = append(c.history, nm)
+		select {
+		case <-c.firstMap:
+		default:
+			close(c.firstMap)
+		}
 	}
 
 	// Removals sent ahead of their batch carry no ControlTime, so a rebuild
@@ -585,7 +650,37 @@ func (c *TestClient) UpdateFullNetmap(nm *netmap.NetworkMap) {
 // full netmap is still delivered and the client's peer state stays exact.
 type deltaRecorder struct{ *TestClient }
 
-func (d deltaRecorder) UpdatePacketFilter(views.Slice[tailcfg.FilterRule], []filter.Match) bool {
+// UpdatePacketFilter installs the filter in the netmap the client holds,
+// as tailscaled's backend does: a response carrying only a filter builds
+// no full netmap. The netmap it makes counts as one, in
+// [TestClient.UpdateCount] and [TestClient.History], unless the response
+// goes on to a full rebuild, which takes its place.
+func (d deltaRecorder) UpdatePacketFilter(rules views.Slice[tailcfg.FilterRule], matches []filter.Match) bool {
+	d.mu.Lock()
+
+	nm := d.netmap
+	if nm != nil {
+		held := *nm
+		held.PacketFilterRules, held.PacketFilter = rules, matches
+		nm = &held
+		d.netmap = nm
+		d.updatesReceived++
+		d.streamMaps++
+		d.filterHeld = true
+
+		if !d.noHistory {
+			d.history = append(d.history, nm)
+		}
+	}
+	d.mu.Unlock()
+
+	if nm != nil {
+		select {
+		case d.updates <- nm:
+		default:
+		}
+	}
+
 	return true
 }
 
@@ -668,6 +763,21 @@ func (c *TestClient) Disconnect(tb testing.TB) {
 	if c.pollCancel != nil {
 		c.pollCancel()
 		<-c.pollDone
+	}
+}
+
+// Polling reports whether the client's long-poll session is running: a
+// client that disconnected, or went down, holds the netmap it last got.
+func (c *TestClient) Polling() bool {
+	if c.pollDone == nil {
+		return false
+	}
+
+	select {
+	case <-c.pollDone:
+		return false
+	default:
+		return true
 	}
 }
 
@@ -1059,7 +1169,8 @@ func (c *TestClient) PeerNames() []string {
 	return names
 }
 
-// UpdateCount returns the total number of full netmap updates received.
+// UpdateCount returns the total number of netmaps received: full netmap
+// updates, and the filters a [WithDeltaUpdates] client installs in place.
 func (c *TestClient) UpdateCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

@@ -290,7 +290,7 @@ func testNodeAttrsSuccess(
 				}
 
 				gotPeer := stripUnmodelledTailnetStateCaps(
-					PeerCapMap(peerNode.View(), got[peerNode.ID]),
+					PeerCapMap(peerNode.View(), got[peerNode.ID], false),
 				)
 				wantPeer := stripUnmodelledTailnetStateCaps(
 					capMapFromView(peer.CapMap()),

@@ -977,7 +977,7 @@ func scalePacketFilterMismatch(
 		return err.Error()
 	}
 
-	packetFilter := filter.New(nm.PacketFilter, nil, local, nil, nil, logger.Discard)
+	packetFilter := filter.New(nm.PacketFilter, CapLookup(nm), local, nil, nil, logger.Discard)
 
 	first := viewer / scaleDevicesPerUser * scaleDevicesPerUser
 	groupSize := min(scaleDevicesPerUser, len(selfNodes)-first)
@@ -1501,7 +1501,7 @@ func scaleViaMismatch(nm *netmap.NetworkMap, nodes []tailcfg.NodeView, indices m
 		return err.Error()
 	}
 
-	packetFilter := filter.New(nm.PacketFilter, nil, local, nil, nil, logger.Discard)
+	packetFilter := filter.New(nm.PacketFilter, CapLookup(nm), local, nil, nil, logger.Discard)
 
 	otherPort := uint16(8443)
 	if port == otherPort {

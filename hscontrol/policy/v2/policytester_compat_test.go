@@ -269,7 +269,7 @@ func testWant(accept bool) string {
 func testerBreakdown(pm *PolicyManager) []string {
 	var out []string
 
-	for _, res := range runPolicyTests(pm.pol, pm.filter, pm.users, pm.nodes).Results {
+	for _, res := range runPolicyTests(pm.pol, pm.addresses().filter, pm.users, pm.nodes).Results {
 		for range res.Errors {
 			out = append(out, res.Src+": error")
 		}

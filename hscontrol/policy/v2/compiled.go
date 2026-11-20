@@ -195,7 +195,25 @@ func (pol *Policy) compileGrants(
 	users types.Users,
 	nodes views.Slice[types.NodeView],
 ) []compiledGrant {
-	compiled, _ := pol.compileGrantsFrom(nil, nil, users, nodes)
+	if pol == nil || (pol.ACLs == nil && pol.Grants == nil) {
+		return nil
+	}
+
+	grants := pol.allGrants()
+	compiled := make([]compiledGrant, 0, len(grants))
+	srcs := sourceCache{}
+
+	for _, grant := range grants {
+		cg, err := pol.compileOneGrant(grant, users, nodes, srcs)
+		if err != nil {
+			log.Trace().Err(err).Msg("compiling grant")
+		}
+
+		if cg != nil {
+			cg.ruleKeys = ruleKeys(cg.rules)
+			compiled = append(compiled, *cg)
+		}
+	}
 
 	return compiled
 }
@@ -922,6 +940,10 @@ func viaDstsForNode(
 		// on a router covering more than the operator asked for. The
 		// rule emits the literal dst either way because that is what
 		// the policy authorised.
+		// TODO(kradalby): policy/via-own-address: the literal dst also covers
+		// the router's own address, which a broader dst does not restrict
+		// (fails open); cutVia in expand.go does the same. See
+		// policymodel.ViaOwnAddress.
 		if slices.ContainsFunc(nodeSubnetRoutes, dstPrefix.Overlaps) {
 			viaDstPrefixes = append(viaDstPrefixes, dstPrefix)
 		}
@@ -994,6 +1016,8 @@ func compileViaForNode(
 //
 // shortcut: a node with an approved route over the router's address also matches,
 // as for any rule naming a node. Bind the link to the router if that shape matters.
+// TODO(kradalby): policy/via-peer-shortcut: decide whether that shape matters;
+// no capture or property covers it.
 func viaPeerRule(
 	cg *compiledGrant,
 	node types.NodeView,
@@ -1078,6 +1102,9 @@ func (pol *Policy) compileNodeAttrsFrom(
 
 		ips := n.IPs()
 
+		// TODO(kradalby): policy/nodeattrs-by-address: a target naming an
+		// identity grants every holder of its addresses, and nothing to an
+		// address-less member; see View.ServiceHosts in policymodel.
 		for _, t := range targets {
 			if slices.ContainsFunc(ips, t.ips.Contains) {
 				for _, attr := range t.attrs {
@@ -1092,6 +1119,11 @@ func (pol *Policy) compileNodeAttrsFrom(
 	result := make(map[types.NodeID]tailcfg.NodeCapMap, len(prev))
 
 	for _, n := range nodes.All() {
+		// TODO(kradalby): policy/stale-under-shared-address: targets resolve
+		// to addresses, so another holder of n's address moving changes n's
+		// attributes though n did not; reused, they stay stale until a
+		// document edit (database-only: State shares no address). Tolerated,
+		// with what lifts it, by TestPipelineIncrementalMatchesScratch.
 		if old, ok := prevNodes[n.ID()]; ok && prev != nil && old == n {
 			if c, ok := prev[n.ID()]; ok {
 				result[n.ID()] = c
@@ -1108,60 +1140,9 @@ func (pol *Policy) compileNodeAttrsFrom(
 	return result, nil
 }
 
-type compiledGrantResult struct {
-	cg *compiledGrant
-}
-
-// compileGrantsFrom compiles every grant, reusing prev, the results of a
-// compile of the same policy and users, for each grant the change since
-// cannot reach. prev and change are nil for a compile from scratch.
-func (pol *Policy) compileGrantsFrom(
-	prev []compiledGrantResult,
-	change *nodeChange,
-	users types.Users,
-	nodes views.Slice[types.NodeView],
-) ([]compiledGrant, []compiledGrantResult) {
-	if pol == nil || (pol.ACLs == nil && pol.Grants == nil) {
-		return nil, nil
-	}
-
-	grants := pol.allGrants()
-
-	if len(prev) != len(grants) {
-		prev, change = nil, nil
-	}
-
-	results := make([]compiledGrantResult, len(grants))
-	compiled := make([]compiledGrant, 0, len(grants))
-	srcs := sourceCache{}
-
-	for i, grant := range grants {
-		if change != nil && !change.reaches(grant) {
-			results[i] = prev[i]
-		} else {
-			cg, err := pol.compileOneGrant(grant, users, nodes, srcs)
-			if err != nil {
-				log.Trace().Err(err).Msg("compiling grant")
-			}
-
-			if cg != nil {
-				cg.ruleKeys = ruleKeys(cg.rules)
-			}
-
-			results[i] = compiledGrantResult{cg: cg}
-		}
-
-		if results[i].cg != nil {
-			compiled = append(compiled, *results[i].cg)
-		}
-	}
-
-	return compiled, results
-}
-
 // nodeChange summarises what changed in the nodes between two compiles,
-// as grant compilation reads them: which tags and users gained or lost a
-// node or one of its addresses or routes, whether an untagged node
+// as alias resolution and SSH read them: which tags and users gained or
+// lost a node or one of its addresses or routes, whether an untagged node
 // changed, and whether approved routes changed.
 type nodeChange struct {
 	tags     map[Tag]struct{}
@@ -1273,19 +1254,6 @@ func diffNodes(prev map[types.NodeID]types.NodeView, nodes views.Slice[types.Nod
 	}
 
 	return c
-}
-
-// reaches reports whether the change can alter grant's compile: one of
-// its aliases resolves differently, see [nodeChange.moves], or a via tag
-// gained or lost a node.
-func (c *nodeChange) reaches(grant Grant) bool {
-	for _, t := range grant.Via {
-		if _, ok := c.tags[t]; ok {
-			return true
-		}
-	}
-
-	return slices.ContainsFunc(slices.Concat(grant.Sources, grant.Destinations), c.moves)
 }
 
 // moves reports whether the change can alter what a resolves to: a tag or
@@ -1444,8 +1412,6 @@ func (pol *Policy) allGrants() []Grant {
 
 	return grants
 }
-
-func sharedRules(grants []compiledGrant) []tailcfg.FilterRule { return globalFilterRules(grants) }
 
 func grantRulesForNode(cg *compiledGrant, node types.NodeView, userIdx userNodeIndex) []tailcfg.FilterRule {
 	switch cg.category {

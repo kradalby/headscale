@@ -7,6 +7,7 @@ import (
 	clientv1 "github.com/juanfont/headscale/gen/client/v1"
 	"github.com/juanfont/headscale/hscontrol"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
+	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/integration/hsic"
 	"github.com/ory/dockertest/v3"
@@ -50,4 +51,5 @@ type ControlServer interface {
 	DebugBatcher() (*hscontrol.DebugBatcherInfo, error)
 	DebugNodeStore() (map[types.NodeID]types.Node, error)
 	DebugFilter() ([]tailcfg.FilterRule, error)
+	DebugCapabilitySources() (*state.DebugCapabilitySourcesInfo, error)
 }
