@@ -117,6 +117,7 @@ type ClientOption func(*clientConfig)
 
 type clientConfig struct {
 	deferFirstMap bool
+	noPoll        bool
 	ephemeral     bool
 	hostname      string
 	tags          []string
@@ -217,6 +218,13 @@ func WithUser(user *types.User) ClientOption {
 // The caller must release its gate and wait for a map before checking client state.
 func WithoutInitialMapWait() ClientOption {
 	return func(c *clientConfig) { c.deferFirstMap = true }
+}
+
+// WithoutPoll returns once the client is registered, without opening a map
+// session, as a node that registered and went down before it connected;
+// [TestClient.RestartPoll] connects it.
+func WithoutPoll() ClientOption {
+	return func(c *clientConfig) { c.noPoll = true }
 }
 
 // NewClient creates a [TestClient], registers it with the [TestServer]
@@ -349,6 +357,10 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 	err = tc.tryLogin(ctx, controlclient.LoginDefault, tc.approve)
 	if err != nil {
 		return tc, err
+	}
+
+	if cc.noPoll {
+		return tc, nil
 	}
 
 	// Start long-polling in the background.
