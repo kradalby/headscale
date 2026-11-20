@@ -438,8 +438,9 @@ func filterDiff(have, want []tailcfg.FilterRule, view func() policymodel.ClientV
 
 // netmapDiff reports how the netmap a client assembled differs from the
 // one a fresh session gives, field by field, or "". Keys the client holds
-// of itself and the parsed filter (compared as rules) are not compared.
-func netmapDiff(have, want *netmap.NetworkMap) string {
+// of itself and the parsed filter (compared as rules) are not compared;
+// unseen is called for each offline peer held without its LastSeen.
+func netmapDiff(have, want *netmap.NetworkMap, unseen func()) string {
 	if !sameNode(have.SelfNode, want.SelfNode) {
 		return fmt.Sprintf("self: have %s, want %s", jsonOf(have.SelfNode), jsonOf(want.SelfNode))
 	}
@@ -449,9 +450,26 @@ func netmapDiff(have, want *netmap.NetworkMap) string {
 	}
 
 	for i, w := range want.Peers {
-		if h := have.Peers[i]; !sameNode(h, w) {
-			return fmt.Sprintf("peer %d: have %s, want %s", w.ID(), clientPeer(h), clientPeer(w))
+		h := have.Peers[i]
+		if sameNode(h, w) {
+			continue
 		}
+
+		// TODO(kradalby): render/lastseen-patchify: a peer going offline
+		// in a change no patch carries (its CapMap or endpoints emptied) is
+		// sent whole; Tailscale's client patchifies it and keeps no
+		// LastSeen it did not hold, so its session shows the peer offline
+		// without the LastSeen a fresh one does. Counted, not judged.
+		if hs := h.AsStruct(); hs.LastSeen == nil && w.LastSeen().Valid() && !w.Online().GetOr(true) && !h.Online().GetOr(true) {
+			hs.LastSeen = new(w.LastSeen().Get())
+			if sameNode(hs.View(), w) {
+				unseen()
+
+				continue
+			}
+		}
+
+		return fmt.Sprintf("peer %d: have %s, want %s", w.ID(), clientPeer(h), clientPeer(w))
 	}
 
 	if d := filterDiff(have.PacketFilterRules.AsSlice(), want.PacketFilterRules.AsSlice(), func() policymodel.ClientView {
@@ -583,9 +601,10 @@ type deliveryReach struct {
 	compared, lagged, failed, reconnected, flips, clears, added, deleted, wholeSent int
 	churnJudged, crossFamily, combosCompared, keptCleared                           int
 	overlapped, indexed                                                             int
-	// unindexed counts the clients whose index lost their own address
-	// after a shared one.
-	unindexed int
+	// unseen counts offline peers a client holds without the LastSeen a
+	// fresh session shows (see [netmapDiff]), and unindexed the clients
+	// whose index lost their own address after a shared one.
+	unseen, unindexed int
 	// laggedFlips counts lagged renders across a delivery flip, and
 	// laggedForms across a flip of the form the node is served.
 	laggedFlips, laggedForms int
@@ -600,11 +619,11 @@ func (r deliveryReach) String() string {
 	return fmt.Sprintf("sessions held to a fresh one %d, lagged renders %d, failed writes %d, reconnects %d, delivery flips %d, "+
 		"clears %d, chunks added %d and deleted %d, whole filters sent %d, membership-churn receivers judged %d, "+
 		"nodes held across the four combinations %d (cross-family ICMP refused %d), kept chunks cleared %d, overlapping reconnects %d, "+
-		"address indexes held %d (own address lost after a shared one %d), "+
+		"address indexes held %d (own address lost after a shared one %d), offline peers held without LastSeen %d, "+
 		"lagged renders across a delivery flip %d and across a form flip %d; writes through production entry points %v, "+
 		"scripts %v; renders that sent something: %s",
 		r.compared, r.lagged, r.failed, r.reconnected, r.flips, r.clears, r.added, r.deleted, r.wholeSent,
-		r.churnJudged, r.combosCompared, r.crossFamily, r.keptCleared, r.overlapped, r.indexed, r.unindexed,
+		r.churnJudged, r.combosCompared, r.crossFamily, r.keptCleared, r.overlapped, r.indexed, r.unindexed, r.unseen,
 		r.laggedFlips, r.laggedForms, r.writes, r.scripts, r.wakes)
 }
 
@@ -1272,7 +1291,7 @@ func (dw *deliveryWorld) fresh(at string) map[types.NodeID]*netmap.NetworkMap {
 
 		want, chunks := fresh.client(dw.t)
 
-		if d := netmapDiff(have, want); d != "" {
+		if d := netmapDiff(have, want, func() { dw.reach.unseen++ }); d != "" {
 			dw.failf(judgeClient, "%s: n%d's client, last rendered r%d, differs from a fresh session's of r%d: %s", at, id, s.rev, snap.Rev(), d)
 		}
 
