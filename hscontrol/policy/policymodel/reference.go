@@ -405,7 +405,7 @@ const (
 	// InternetAtSubnetRouters: autogroup:internet is the internet through
 	// exit nodes. Headscale reads it as an address set like any other, so a
 	// subnet router serving a public prefix takes it, is on its side, and
-	// its route is given by it. Fails open.
+	// its route is given by it, a via router's too. Fails open.
 	//
 	// TODO(kradalby): policy/internet-at-subnet-routers: fails open. With
 	// `* -> autogroup:internet:*`, a subnet router serving 8.8.8.0/24
@@ -673,7 +673,7 @@ func newRef(doc Doc, users []User, nodes []RefNode, without Contested) *Ref {
 			}
 		}
 
-		if inet && len(d.Via) == 0 && without&InternetAtSubnetRouters != 0 {
+		if inet && without&InternetAtSubnetRouters != 0 {
 			dsts, inet = append(slices.Clone(dsts), internetSel), false
 		}
 
