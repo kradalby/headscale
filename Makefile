@@ -45,7 +45,7 @@ build: check-deps $(GO_SOURCES) go.mod go.sum
 .PHONY: test
 test: check-deps $(GO_SOURCES) go.mod go.sum
 	@echo "Running Go tests..."
-	CGO_ENABLED=1 go test -race ./...
+	CGO_ENABLED=1 go test -race -timeout 60m ./...
 
 # The suite under any combination of policy.capability_sources and
 # policy.filter_chunks, wherever a test does not pin them; both are on by

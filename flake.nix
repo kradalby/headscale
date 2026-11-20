@@ -225,6 +225,9 @@
               ];
               goSkip = [ "TestPostgres" ];
               testEnv = "export CGO_ENABLED=0";
+              # The mapper suite nears go test's default 10m per-package
+              # timeout on a loaded builder.
+              testFlags = [ "-timeout=30m" ];
             }
           );
 
