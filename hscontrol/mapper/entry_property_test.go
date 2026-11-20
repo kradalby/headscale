@@ -52,7 +52,8 @@ import (
 type regInfo struct {
 	method string
 	// key is the pre-auth key it registered with, "" when it has none
-	// to restart with; keyUser the key's user, 0 for a tags-only key.
+	// to restart with; keyUser the key's user, or the user who made a
+	// tagged key, 0 for a tags-only key.
 	key       string
 	keyUser   uint
 	ephemeral bool
@@ -290,9 +291,15 @@ func (p *pbtWorld) enrol(nc newcomer, w policymodel.World, several bool) {
 
 		var uid *types.UserID
 
-		if !n.Tagged() {
+		switch {
+		case !n.Tagged():
 			u := types.UserID(n.User)
 			uid, ri.keyUser = &u, n.User
+		case len(users) > 0 && id%4 == 3:
+			// A tagged key a user made: the node is the tags', and that
+			// user's login takes it back.
+			u := types.UserID(users[0].ID)
+			uid, ri.keyUser = &u, users[0].ID
 		}
 
 		pak, err := p.s.CreatePreAuthKey(uid, false, ri.ephemeral, nil, tn.Tags)
