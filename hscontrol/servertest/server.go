@@ -13,6 +13,8 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,9 +38,19 @@ type TestServer struct {
 
 	memNet     *memnet.Network
 	ln         net.Listener
+	conns      *connListener
 	httpServer *http.Server
 	st         *state.State
 	cfg        *types.Config
+
+	// realListener and the two ephemeral timeouts are what a restart
+	// starts from: cfg is validated again with the timeout it was loaded
+	// with, then shortened as before.
+	realListener                    bool
+	loadedTimeout, ephemeralTimeout time.Duration
+
+	// stops end what the running server started, last first.
+	stops []func()
 }
 
 // ServerOption configures a [TestServer].
@@ -229,6 +241,45 @@ func NewServerFromConfig(tb testing.TB, cfg types.Config) *TestServer {
 func start(tb testing.TB, cfg types.Config, ephemeralTimeout time.Duration, realListener bool) *TestServer {
 	tb.Helper()
 
+	ts := &TestServer{
+		memNet:           &memnet.Network{},
+		realListener:     realListener,
+		loadedTimeout:    cfg.Node.Ephemeral.InactivityTimeout,
+		ephemeralTimeout: ephemeralTimeout,
+	}
+
+	// Registered first so clients, HTTP, and background subsystems stop first.
+	tb.Cleanup(ts.stop)
+
+	ts.boot(tb, cfg)
+
+	return ts
+}
+
+// stopTB is tb with its cleanups left to the server's stop, so that a
+// restart can end one server before the next starts.
+type stopTB struct {
+	testing.TB
+
+	ts *TestServer
+}
+
+func (s stopTB) Cleanup(f func()) { s.ts.stops = append(s.ts.stops, f) }
+
+// stop ends the running server: what boot started, last first.
+func (s *TestServer) stop() {
+	stops := s.stops
+	s.stops = nil
+
+	for _, f := range slices.Backward(stops) {
+		f()
+	}
+}
+
+// boot starts cfg as the server, on its in-memory network.
+func (s *TestServer) boot(tb testing.TB, cfg types.Config) {
+	tb.Helper()
+
 	app, err := hscontrol.NewHeadscale(&cfg)
 	if err != nil {
 		tb.Fatalf("servertest: NewHeadscale: %v", err)
@@ -236,10 +287,11 @@ func start(tb testing.TB, cfg types.Config, ephemeralTimeout time.Duration, real
 
 	// Validate's floor is for clients that reconnect over real networks;
 	// tests shorten it once the configuration has been validated.
-	cfg.Node.Ephemeral.InactivityTimeout = ephemeralTimeout
+	cfg.Node.Ephemeral.InactivityTimeout = s.ephemeralTimeout
 
-	// Registered first so clients, HTTP, and background subsystems stop first.
-	tb.Cleanup(func() {
+	stb := stopTB{TB: tb, ts: s}
+
+	stb.Cleanup(func() {
 		err := app.GetState().Close()
 		if err != nil {
 			tb.Errorf("servertest: close state: %v", err)
@@ -265,28 +317,28 @@ func start(tb testing.TB, cfg types.Config, ephemeralTimeout time.Duration, real
 	})
 
 	// Start subsystems.
-	tb.Cleanup(app.DrainMapSessions)
-	app.StartEphemeralGCForTest(tb)
+	stb.Cleanup(app.DrainMapSessions)
+	app.StartEphemeralGCForTest(stb)
 
 	// Start the HTTP server. By default it binds an in-memory network so all
 	// TCP connections stay in-process; WithRealListener swaps in a real loopback
 	// port so external binaries can connect.
-	var (
-		memNetwork memnet.Network
-		ln         net.Listener
-	)
+	var ln net.Listener
 
-	if realListener {
+	if s.realListener {
 		var lc net.ListenConfig
 
 		ln, err = lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	} else {
-		ln, err = memNetwork.Listen("tcp", "127.0.0.1:443")
+		ln, err = s.memNet.Listen("tcp", "127.0.0.1:443")
 	}
 
 	if err != nil {
 		tb.Fatalf("servertest: Listen: %v", err)
 	}
+
+	conns := &connListener{Listener: ln}
+	ln = conns
 
 	httpServer := &http.Server{
 		Handler:           app.HTTPHandler(),
@@ -299,8 +351,8 @@ func start(tb testing.TB, cfg types.Config, ephemeralTimeout time.Duration, real
 
 	// In-process clients reach a real listener's server too, at the same
 	// URL, so they can share a tailnet with external programs.
-	if realListener {
-		memLn, err := memNetwork.Listen("tcp", ln.Addr().String())
+	if s.realListener {
+		memLn, err := s.memNet.Listen("tcp", ln.Addr().String())
 		if err != nil {
 			tb.Fatalf("servertest: Listen: %v", err)
 		}
@@ -308,23 +360,66 @@ func start(tb testing.TB, cfg types.Config, ephemeralTimeout time.Duration, real
 		go httpServer.Serve(memLn) //nolint:errcheck // will return on Close
 	}
 
-	ts := &TestServer{
-		App:        app,
-		URL:        serverURL,
-		memNet:     &memNetwork,
-		ln:         ln,
-		httpServer: httpServer,
-		st:         app.GetState(),
-		cfg:        &cfg,
-	}
+	s.App, s.URL, s.ln, s.conns, s.httpServer, s.st, s.cfg = app, serverURL, ln, conns, httpServer, app.GetState(), &cfg
 
-	tb.Cleanup(ts.Close)
+	stb.Cleanup(s.Close)
 
 	// Now update the config to point at the real URL so that
 	// MapResponse.ControlURL etc. are correct.
 	app.SetServerURLForTest(tb, serverURL)
+}
 
-	return ts
+// Restart stops the server and starts it again from its database and
+// Noise key, listening where it did, as headscale restarted on its host:
+// every map session ends, and clients find the new server at the same
+// URL. A server with a real listener cannot restart.
+func (s *TestServer) Restart(tb testing.TB) {
+	tb.Helper()
+
+	if s.realListener {
+		tb.Fatalf("servertest: Restart: a real listener's port is not kept")
+	}
+
+	cfg := *s.cfg
+	cfg.Node.Ephemeral.InactivityTimeout = s.loadedTimeout
+
+	s.stop()
+
+	// The Noise upgrade takes connections over from net/http, which then
+	// no longer closes them; an exiting process's would close.
+	s.conns.closeAll()
+
+	s.boot(tb, cfg)
+}
+
+// connListener is a listener that remembers the connections it accepted.
+type connListener struct {
+	net.Listener
+
+	mu    sync.Mutex
+	conns []net.Conn
+}
+
+func (l *connListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.mu.Lock()
+		l.conns = append(l.conns, c)
+		l.mu.Unlock()
+	}
+
+	return c, err
+}
+
+func (l *connListener) closeAll() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	for _, c := range l.conns {
+		_ = c.Close()
+	}
+
+	l.conns = nil
 }
 
 // State returns the server's state manager for creating users,
