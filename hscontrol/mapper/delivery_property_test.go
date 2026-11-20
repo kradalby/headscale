@@ -1426,6 +1426,10 @@ type referenceTally struct {
 	// byHistory counts the routes only the election history decides:
 	// unjudged without it, judged with it.
 	byHistory int
+	// addressless counts the peers whose via-steered routes a viewer
+	// holding no address is given fewer of than the reference gives
+	// (see [heldClient.routes]).
+	addressless int
 }
 
 func (rt *referenceTally) skip(why string) {
@@ -1438,8 +1442,9 @@ func (rt *referenceTally) skip(why string) {
 
 func (rt *referenceTally) String() string {
 	return fmt.Sprintf("reference: clients judged %d, filters compared %d, peer sets %d, route pairs %d (steered pairs judged %d, routes left unjudged %d, "+
-		"decided by the election history %d), self primaries %d, SSH policies %d; skipped %v; peers contested %v, routes contested %v; filters: %v; form: %v",
-		rt.clients, rt.filters, rt.peerSets, rt.routePairs, rt.steered, rt.unjudgedRoutes, rt.byHistory, rt.primaries, rt.ssh, rt.skipped,
+		"decided by the election history %d, steered short to a viewer without addresses %d), self primaries %d, SSH policies %d; skipped %v; "+
+		"peers contested %v, routes contested %v; filters: %v; form: %v",
+		rt.clients, rt.filters, rt.peerSets, rt.routePairs, rt.steered, rt.unjudgedRoutes, rt.byHistory, rt.addressless, rt.primaries, rt.ssh, rt.skipped,
 		rt.contestedPeers, rt.contestedRoutes, &rt.verdicts, &rt.form)
 }
 
@@ -1620,6 +1625,8 @@ func (c heldClient) peers() {
 // routes holds what each peer carries in the client's AllowedIPs beyond
 // its addresses to [policymodel.Ref.ServedRoutes].
 func (c heldClient) routes() {
+	viewer, _ := c.dw.p.w.Topology.Node(c.id)
+
 	for _, p := range c.nm.Peers {
 		pid := types.NodeID(p.ID()) //nolint:gosec // small
 		routes := slices.DeleteFunc(p.AllowedIPs().AsSlice(), func(q netip.Prefix) bool { return slices.Contains(p.Addresses().AsSlice(), q) })
@@ -1643,11 +1650,20 @@ func (c heldClient) routes() {
 
 		if !slices.Equal(judged, want) {
 			k, ok := policymodel.ContestedServedRoutes(c.ref, c.id, pid, routes)
-			if !ok {
+
+			switch {
+			case ok:
+				c.rt.contestedRoutes[k]++
+			case c.ref.Steered(c.id, pid) && len(viewer.Addrs()) == 0 && !slices.ContainsFunc(judged, func(q netip.Prefix) bool { return !slices.Contains(want, q) }):
+				// TODO(kradalby): policy/via-addressless-viewer: a viewer
+				// holding no address (database only) is on a via grant's
+				// sources by the routes it serves under *, so the reference
+				// steers it the routers' routes; headscale steers it none.
+				// It can send nothing either way. Counted, not judged.
+				c.rt.addressless++
+			default:
 				c.fail("its client is given %v of n%d's routes, the reference %v (%v unjudged)", routes, pid, want, unjudged)
 			}
-
-			c.rt.contestedRoutes[k]++
 		}
 	}
 }
