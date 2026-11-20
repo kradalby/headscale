@@ -1304,7 +1304,9 @@ type stressSession struct {
 	end  func()
 	// busy is set from the session's start and from each wake it takes
 	// until its render ends: the test's own view of whether it is idle.
-	busy atomic.Bool
+	// A wake taken is not busy yet, so renders counts what ended.
+	busy    atomic.Bool
+	renders atomic.Int64
 }
 
 // stressRun is one run of [TestHubSessionsConvergeUnderConcurrency].
@@ -1441,9 +1443,16 @@ func audited(w policymodel.World, st policymodel.Step) bool {
 		}
 	}
 
-	next := w.Apply(st.Edits...)
+	// Each edit commits on its own, so every world on the way is one the
+	// audits see.
+	for _, e := range st.Edits {
+		w = w.Apply(e)
+		if !allocatorAddresses(w) || policymodel.MergesApart(w) {
+			return false
+		}
+	}
 
-	return allocatorAddresses(next) && !policymodel.MergesApart(next)
+	return true
 }
 
 // slowly now and then holds the watcher before it loads a snapshot, so
@@ -1487,6 +1496,7 @@ func (h *stressRun) spawn(id types.NodeID) {
 			return
 		}
 
+		ls.renders.Add(1)
 		ls.busy.Store(false)
 
 		for {
@@ -1502,6 +1512,7 @@ func (h *stressRun) spawn(id types.NodeID) {
 					return
 				}
 
+				ls.renders.Add(1)
 				ls.busy.Store(false)
 			}
 		}
@@ -1723,8 +1734,20 @@ func (h *stressRun) settled(step int) {
 		default:
 		}
 
+		renders := ls.renders.Load()
+
 		out, err := freshDiff(h.p.cfg, fresh, nv.ID(), ls.capVer, ls.st.sent, &versionCache{})
 		require.NoError(t, err)
+
+		// Idle, to the check above, is also a session that took its wake
+		// and has not marked itself busy: it renders in a moment, and one
+		// never woken does not.
+		for len(out) > 0 && ls.rendersAgain(renders) {
+			renders = ls.renders.Load()
+
+			out, err = freshDiff(h.p.cfg, fresh, nv.ID(), ls.capVer, ls.st.sent, &versionCache{})
+			require.NoError(t, err)
+		}
 
 		if len(out) > 0 {
 			t.Fatalf("HEADSCALE_HUB_SEED=%d run %d step %d: node %d's session holds a stale map: %s\n%#v", h.seed, h.run, step, nv.ID(), describeResponses(out), h.p.w)
@@ -1732,6 +1755,20 @@ func (h *stressRun) settled(step int) {
 
 		h.reach.compared++
 	}
+}
+
+// rendersAgain reports whether ls ends a render after its renders-th
+// within a while and is idle again.
+func (ls *stressSession) rendersAgain(renders int64) bool {
+	for range 2000 {
+		if ls.renders.Load() > renders && !ls.busy.Load() && len(ls.sess.wakes) == 0 {
+			return true
+		}
+
+		time.Sleep(time.Millisecond) //nolint:forbidigo // a render taken up late, not a wait
+	}
+
+	return false
 }
 
 // auditLines collects, while installed, every line the policy audits log,
