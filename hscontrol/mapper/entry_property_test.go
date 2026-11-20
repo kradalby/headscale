@@ -936,13 +936,13 @@ var entryCalls = []string{
 }
 
 // requireCarried fails a deep run in which some production call went
-// unmade, a login that untags went through none, or fewer than nine in
-// ten node writes reached a production entry point.
-func requireCarried(t *testing.T, made map[string]int) {
+// unmade, but those in rare, a login that untags went through none, or
+// fewer than nine in ten node writes reached a production entry point.
+func requireCarried(t *testing.T, made map[string]int, rare ...string) {
 	t.Helper()
 
 	for _, c := range entryCalls {
-		if made["call "+c] == 0 {
+		if made["call "+c] == 0 && !slices.Contains(rare, c) {
 			t.Errorf("no write went through the %s path", c)
 		}
 	}
