@@ -65,12 +65,11 @@ type pbtWorld struct {
 	reg     map[types.NodeID]regInfo
 	alloc   [2]netip.Addr
 	reports int
-	// kind is the edit being written; part the production call being
-	// made, or the store write; cur counts the node write in progress,
-	// storing set while a store write commits.
-	kind, part string
-	cur        *nodeWrite
-	storing    bool
+	// kind is the edit being written; cur counts the node write in
+	// progress, storing set while a store write commits.
+	kind    string
+	cur     *nodeWrite
+	storing bool
 }
 
 func newPBTWorld(t pbtT, w policymodel.World, configure ...func(*types.Config)) *pbtWorld {

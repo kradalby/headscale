@@ -105,13 +105,10 @@ func (p *pbtWorld) kindOr(def string) string {
 	return def
 }
 
-// produce makes one production call of the write in progress; part names
-// it for the commits it makes.
+// produce makes one production call of the write in progress, counted by
+// part, the path it takes.
 func (p *pbtWorld) produce(id types.NodeID, part string, write func() error) {
 	p.t.Helper()
-
-	p.part = part
-	defer func() { p.part = "" }()
 
 	p.made["call "+part]++
 
@@ -151,11 +148,11 @@ func (p *pbtWorld) store(reason string, id types.NodeID, set func(*types.Node)) 
 		p.cur.stores = append(p.cur.stores, reason)
 	}
 
-	p.storing, p.part = true, "store "+reason
+	p.storing = true
 
 	p.call(func() { p.s.PutNodeInStoreForTest(*n) })
 
-	p.storing, p.part = false, ""
+	p.storing = false
 }
 
 // steerID has the next registration take id: the counter the column
