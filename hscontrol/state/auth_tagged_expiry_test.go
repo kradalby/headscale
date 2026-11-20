@@ -104,6 +104,51 @@ func TestTaggedReauthKeepsNilExpiry(t *testing.T) {
 		"tagged node must keep nil key expiry (tagged nodes never expire)")
 }
 
+// TestLoginUntagLeavesEmptyTags pins what a login that takes a tagged node
+// back stores as its tags: an empty list, where every other path stores
+// none. The render carries either and treats them as equal, so a session
+// can hold nil while a fresh one gets [], which no client sees.
+//
+// TODO(kradalby): state/untag-empty-tags: flip once the login stores nil;
+// until then the mapper's property client folds [] to nil
+// (clientAddresses).
+func TestLoginUntagLeavesEmptyTags(t *testing.T) {
+	dbPath := t.TempDir() + "/headscale.db"
+	cfg := persistTestConfig(dbPath)
+
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(t, err)
+
+	user := database.CreateUserForTest("untag-user")
+	node := database.CreateRegisteredNodeForTest(user, "untag-node")
+	require.NoError(t, database.Close())
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	_, err = s.SetPolicy(fmt.Appendf(nil, `{"tagOwners":{"tag:foo":["%s@"]}}`, user.Name))
+	require.NoError(t, err)
+
+	_, err = s.SetNodeTags(node.ID, []string{"tag:foo"})
+	require.NoError(t, err)
+
+	authID := types.MustAuthID()
+	require.NoError(t, s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: node.MachineKey, NodeKey: node.NodeKey, Hostname: node.Hostname,
+		Hostinfo: &tailcfg.Hostinfo{Hostname: node.Hostname},
+	})))
+
+	got, err := s.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, util.RegisterMethodCLI)
+	require.NoError(t, err)
+	require.Equal(t, node.ID, got.ID(), "the login takes the node back")
+	require.False(t, got.IsTagged())
+
+	tags := got.AsStruct().Tags
+	assert.NotNil(t, tags, "the login stores an empty list")
+	assert.Empty(t, tags)
+}
+
 // TestTaggedReauthWithReusedUserPAK reproduces issue #3312: a containerized
 // node registered with a user-owned one-shot pre-auth key, then converted to a
 // tagged node (UserID cleared to NULL), is logged out when the container

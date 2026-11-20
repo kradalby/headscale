@@ -11093,7 +11093,7 @@ func TestRouteWakesViewersOfARevokedStamp(t *testing.T) {
 // the render carries either; a session that held the node untagged before
 // a retag and the login, routed together, keeps nil. Neither reaches the
 // client, which reads no empty list off the wire. Delete the tags half
-// once the login stores nil.
+// once the login stores nil (TestLoginUntagLeavesEmptyTags, state).
 func clientAddresses(peers map[tailcfg.NodeID]*tailcfg.Node) map[tailcfg.NodeID]*tailcfg.Node {
 	out := make(map[tailcfg.NodeID]*tailcfg.Node, len(peers))
 
