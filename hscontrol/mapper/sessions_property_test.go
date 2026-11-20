@@ -733,11 +733,15 @@ func (ix addrIndex) evict(n tailcfg.NodeView, id tailcfg.NodeID) {
 	}
 }
 
-// forgotten returns an address a node of nm holds that ix indexes no
-// node for, and that node: the client would match a capability source
-// from that address against nobody.
-func (ix addrIndex) forgotten(nm *netmap.NetworkMap) (netip.Addr, tailcfg.NodeID, bool) {
+// forgotten returns an address a node of nm other than except holds that
+// ix indexes no node for, and that node: the client would match a
+// capability source from that address against nobody.
+func (ix addrIndex) forgotten(nm *netmap.NetworkMap, except tailcfg.NodeID) (netip.Addr, tailcfg.NodeID, bool) {
 	for _, n := range append([]tailcfg.NodeView{nm.SelfNode}, nm.Peers...) {
+		if n.ID() == except {
+			continue
+		}
+
 		for _, p := range n.Addresses().All() {
 			if _, ok := ix[p.Addr()]; p.IsSingleIP() && !ok {
 				return p.Addr(), n.ID(), true

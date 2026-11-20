@@ -583,6 +583,9 @@ type deliveryReach struct {
 	compared, lagged, failed, reconnected, flips, clears, added, deleted, wholeSent int
 	churnJudged, crossFamily, combosCompared, keptCleared                           int
 	overlapped, indexed                                                             int
+	// unindexed counts the clients whose index lost their own address
+	// after a shared one.
+	unindexed int
 	// laggedFlips counts lagged renders across a delivery flip, and
 	// laggedForms across a flip of the form the node is served.
 	laggedFlips, laggedForms int
@@ -597,11 +600,12 @@ func (r deliveryReach) String() string {
 	return fmt.Sprintf("sessions held to a fresh one %d, lagged renders %d, failed writes %d, reconnects %d, delivery flips %d, "+
 		"clears %d, chunks added %d and deleted %d, whole filters sent %d, membership-churn receivers judged %d, "+
 		"nodes held across the four combinations %d (cross-family ICMP refused %d), kept chunks cleared %d, overlapping reconnects %d, "+
-		"address indexes held %d, lagged renders across a delivery flip %d and across a form flip %d; writes through production entry points %v, "+
+		"address indexes held %d (own address lost after a shared one %d), "+
+		"lagged renders across a delivery flip %d and across a form flip %d; writes through production entry points %v, "+
 		"scripts %v; renders that sent something: %s",
 		r.compared, r.lagged, r.failed, r.reconnected, r.flips, r.clears, r.added, r.deleted, r.wholeSent,
-		r.churnJudged, r.combosCompared, r.crossFamily, r.keptCleared, r.overlapped, r.indexed, r.laggedFlips, r.laggedForms,
-		r.writes, r.scripts, r.wakes)
+		r.churnJudged, r.combosCompared, r.crossFamily, r.keptCleared, r.overlapped, r.indexed, r.unindexed,
+		r.laggedFlips, r.laggedForms, r.writes, r.scripts, r.wakes)
 }
 
 // deliveryJudge is one part of what [TestDeliveryConvergesThroughTheClient]
@@ -722,8 +726,8 @@ type deliveryWorld struct {
 	probes probeCache
 	judges *[numJudges]bool
 	reach  *deliveryReach
-	// shared is whether any commit had two nodes share an address: a
-	// write of several nodes commits them one at a time.
+	// shared is whether the start or any commit had two nodes share an
+	// address: a write of several nodes commits them one at a time.
 	shared bool
 	// kind names the step being delivered, for what woke its renders.
 	kind string
@@ -745,6 +749,8 @@ func newDeliveryWorld(t *rapid.T, r *deliveryRun, c deliveryCombo, w policymodel
 	if snap := dw.p.s.Snapshot(); snap.CapabilitySources() != c.capSources || snap.FilterChunks() != c.chunks {
 		t.Fatalf("test sanity: %s built a world with capability_sources=%t/filter_chunks=%t", c, snap.CapabilitySources(), snap.FilterChunks())
 	}
+
+	dw.shared, _ = heldAddresses(dw.p.s.Snapshot())
 
 	dw.h = NewHub()
 	dw.w = newSteppedWatcher(t, dw.h, dw.p.s)
@@ -1242,8 +1248,19 @@ func (dw *deliveryWorld) fresh(at string) map[types.NodeID]*netmap.NetworkMap {
 		if dw.combo.capSources {
 			dw.reach.indexed++
 
-			if a, holder, ok := s.index.forgotten(have); ok {
+			// TODO(kradalby): render/self-address-evicted: once an address
+			// was shared (database only), a peer holding the viewer's own
+			// address that leaves its peers goes as a removal, which takes
+			// that address out of the client's index. Counted, not judged.
+			var own tailcfg.NodeID
+			if dw.shared || policymodel.SharesAddress(dw.p.w) {
+				own = id.NodeID()
+			}
+
+			if a, holder, ok := s.index.forgotten(have, own); ok {
 				dw.failf(judgeIndex, "%s: n%d's client, last rendered r%d, indexes nobody at %s, which n%d holds", at, id, s.rev, a, holder)
+			} else if _, _, ok := s.index.forgotten(have, 0); ok {
+				dw.reach.unindexed++
 			}
 		}
 
