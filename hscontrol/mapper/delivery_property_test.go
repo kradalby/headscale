@@ -2007,10 +2007,11 @@ func TestDeliveryConvergesThroughTheClient(t *testing.T) {
 	if deep {
 		floors["membership churn"], floors["delivery flips"] = reach.churnJudged, reach.flips
 
-		// Its leaves are mostly nodes joined for a moment, in session: the
-		// collector, which takes an idle ephemeral node, is the route
-		// property's to ask for.
-		requireCarried(t, reach.writes, "ephemeral collector")
+		// Its leaves are mostly nodes joined for a moment, in session, and
+		// it draws few logins: the collector, which takes an idle ephemeral
+		// node, and the login that untags are the route property's to ask
+		// for.
+		requireCarried(t, reach.writes, "ephemeral collector", untaggingLogin)
 	}
 
 	for name, n := range floors {

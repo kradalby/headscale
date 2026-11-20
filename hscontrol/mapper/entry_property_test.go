@@ -943,9 +943,13 @@ var entryCalls = []string{
 	"register", "login", "restart", "tags", "approve", "map request", "expiry", "delete", "logout", "ephemeral collector",
 }
 
-// requireCarried fails a deep run in which some production call went
-// unmade, but those in rare, a login that untags went through none, or
-// fewer than nine in ten node writes reached a production entry point.
+// untaggingLogin names, among the paths requireCarried asks for, a login
+// that takes a tagged node back.
+const untaggingLogin = "untagging login"
+
+// requireCarried fails a deep run in which some production call, or an
+// untagging login, went unmade, but those in rare, or fewer than nine in
+// ten node writes reached a production entry point.
 func requireCarried(t *testing.T, made map[string]int, rare ...string) {
 	t.Helper()
 
@@ -955,7 +959,7 @@ func requireCarried(t *testing.T, made map[string]int, rare ...string) {
 		}
 	}
 
-	if made["Login: production"] == 0 {
+	if made["Login: production"] == 0 && !slices.Contains(rare, untaggingLogin) {
 		t.Errorf("no login that untags a node went through production")
 	}
 
