@@ -78,9 +78,11 @@ func (p watchPoint) String() string {
 // has loaded and computed its answer but visited no session's shard, or
 // visited every one but advanced nothing and woken nobody.
 //
-// Commits wake the watcher through a subscription holding one wake-up, so
-// each State call must commit at most once: a second commit could land
-// before or after the watcher took the first one's wake-up.
+// Commits wake the watcher through a subscription holding one wake-up.
+// Between routings the watcher waits at routed rather than on its
+// subscription, so the commits of a State call, however many, land while
+// nothing takes their wake-ups and coalesce into one the test hands it;
+// it is parked there once at the start.
 type steppedWatcher struct {
 	t      pbtT
 	h      *Hub
@@ -95,6 +97,8 @@ type steppedWatcher struct {
 
 	// token is set by a commit the watcher has not taken the wake-up of.
 	token bool
+	// held is set while it is idle at routed, its goroutine parked.
+	held bool
 	// loaded is what the routing in progress loaded; routed what the last
 	// one routed to.
 	loaded, routed *state.Snapshot
@@ -141,6 +145,19 @@ func newSteppedWatcher(t pbtT, h *Hub, s *state.State) *steppedWatcher {
 		close(w.quit)
 		h.Close()
 	})
+
+	// A DERP region in and out again parks the goroutine at routed before
+	// any write it is to route.
+	dm := s.DERPMap().AsStruct()
+	other := &tailcfg.DERPMap{Regions: maps.Clone(dm.Regions)}
+	other.Regions[901] = &tailcfg.DERPRegion{RegionID: 901}
+
+	for _, m := range []*tailcfg.DERPMap{other, dm} {
+		before := s.Snapshot().Rev()
+		s.SetDERPMap(m)
+		w.committed(before)
+		w.settle()
+	}
 
 	return w
 }
@@ -212,9 +229,14 @@ func (w *steppedWatcher) committed(before uint64) {
 
 	switch rev := w.s.Snapshot().Rev(); {
 	case rev == before:
-	case rev > before+1:
-		w.t.Fatalf("one State call committed %d times", rev-before)
+	case w.at.at == watchIdle && !w.held && rev > before+1:
+		w.t.Fatalf("one State call committed %d times before the watcher first routed", rev-before)
 	case w.at.at == watchIdle:
+		if w.held {
+			w.held = false
+			w.resume <- struct{}{}
+		}
+
 		w.await()
 
 		if w.at.at != watchLoad {
@@ -240,13 +262,13 @@ func (w *steppedWatcher) step() bool {
 		w.loaded = w.s.Snapshot()
 	}
 
-	w.resume <- struct{}{}
-
 	if at == watchRouted && !w.token {
-		w.at = watchPoint{}
+		w.at, w.held = watchPoint{}, true
 
 		return true
 	}
+
+	w.resume <- struct{}{}
 
 	w.await()
 
