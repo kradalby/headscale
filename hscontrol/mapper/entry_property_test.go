@@ -217,8 +217,9 @@ type newcomer struct {
 // register writes new nodes as clients and an admin bring them in: each
 // registers, then each has the admin approve what auto-approval does not,
 // its client send its first map request, an admin expire it, its first map
-// session open. Several register first so that what each announces is
-// approved against all of them, as the model's start is.
+// session open. All register first, so that where nodes share addresses
+// what each announces is approved against all of them, as the model's
+// start is.
 func (p *pbtWorld) register(fresh []newcomer, w policymodel.World) {
 	p.t.Helper()
 
@@ -240,8 +241,8 @@ func (p *pbtWorld) register(fresh []newcomer, w policymodel.World) {
 
 // enrol registers nc as its client does, steered to the model's ID and
 // holding the allocator to its sequence: without the routes it announces
-// when several register, or its addresses or the admin's approvals must
-// come first.
+// where its addresses, the admin's approvals or nodes sharing its
+// addresses must come first.
 func (p *pbtWorld) enrol(nc newcomer, w policymodel.World, several bool) {
 	p.t.Helper()
 
@@ -254,12 +255,12 @@ func (p *pbtWorld) enrol(nc newcomer, w policymodel.World, several bool) {
 	bare := full.Clone()
 	bare.RoutableIPs = nil
 
-	// Auto-approvers may name addresses: what the node announces waits
-	// for the model's addresses where registration hands out others, and
-	// for the others registering beside it.
+	// Auto-approvers are matched by address: what the node announces waits
+	// for the model's addresses where registration hands out others, and,
+	// where nodes share addresses, for the others registering beside it.
 	v4, v6 := nextAddr(p.alloc[0]), nextAddr(p.alloc[1])
 	moved := n.V4 != v4 || n.V6 != v6
-	alone := !several && !moved && len(admitted(tn)) == 0
+	alone := !moved && len(admitted(tn)) == 0 && (!several || !policymodel.SharesAddress(w))
 
 	oidc := false
 
