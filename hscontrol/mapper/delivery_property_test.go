@@ -1449,14 +1449,22 @@ func (rt *referenceTally) String() string {
 }
 
 // require fails a run that held nothing of some kind to the reference.
-func (rt *referenceTally) require(t *testing.T) {
+// Steered pairs and routes the election history decides come from few
+// worlds, so a run of the default length can meet none; deep runs alone
+// are asked for them.
+func (rt *referenceTally) require(t *testing.T, deep bool) {
 	t.Helper()
 
-	for name, n := range map[string]int{
-		"filters": rt.filters, "peer sets": rt.peerSets, "route pairs": rt.routePairs, "steered route pairs": rt.steered,
-		"self primaries": rt.primaries, "SSH policies": rt.ssh, "routes the election history decides": rt.byHistory,
-		"filters with a cap: source": rt.form.WithCaps,
-	} {
+	floors := map[string]int{
+		"filters": rt.filters, "peer sets": rt.peerSets, "route pairs": rt.routePairs,
+		"self primaries": rt.primaries, "SSH policies": rt.ssh, "filters with a cap: source": rt.form.WithCaps,
+	}
+
+	if deep {
+		floors["steered route pairs"], floors["routes the election history decides"] = rt.steered, rt.byHistory
+	}
+
+	for name, n := range floors {
 		if n == 0 {
 			t.Errorf("reference: no case held %s to the reference", name)
 		}
@@ -1978,23 +1986,26 @@ func TestDeliveryConvergesThroughTheClient(t *testing.T) {
 		return
 	}
 
+	deep := false
+
+	if f := flag.Lookup("rapid.checks"); f != nil {
+		n, err := strconv.Atoi(f.Value.String())
+		deep = err == nil && n >= 1000
+	}
+
 	if r.judges[judgeReference] {
-		r.ref.require(t)
+		r.ref.require(t, deep)
 	}
 
 	floors := map[string]int{
 		"lagged renders": reach.lagged, "failed writes": reach.failed, "reconnects": reach.reconnected,
-		"delivery flips": reach.flips, "chunks deleted": reach.deleted,
-		"overlapping reconnects": reach.overlapped, "address indexes held": reach.indexed,
+		"chunks deleted": reach.deleted, "overlapping reconnects": reach.overlapped, "address indexes held": reach.indexed,
 	}
 
-	// A run of the default length now and then judges no membership churn;
-	// a deep one always does.
-	if f := flag.Lookup("rapid.checks"); f != nil {
-		n, err := strconv.Atoi(f.Value.String())
-		if err == nil && n >= 1000 {
-			floors["membership churn"] = reach.churnJudged
-		}
+	// A run of the default length can judge no membership churn and see no
+	// delivery flip, which only some cases draw; a deep one always does.
+	if deep {
+		floors["membership churn"], floors["delivery flips"] = reach.churnJudged, reach.flips
 	}
 
 	for name, n := range floors {

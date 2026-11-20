@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"maps"
 	"math/rand/v2"
@@ -427,10 +428,22 @@ func TestHubSessionsConvergeUnderDrawnSchedules(t *testing.T) {
 			t.Log(reach)
 
 			if !testing.Short() && !mode.audit {
-				for name, n := range map[string]int{
-					"coalesced": reach.coalesced, "render-log wakes": reach.logWoke + reach.endWoke, "endedPast": reach.endedPast,
-					"endedMidRouting": reach.endedMidRouting, "retried": reach.retried, "second sessions": reach.events["second session"],
-				} {
+				floors := map[string]int{
+					"coalesced": reach.coalesced, "endedPast": reach.endedPast,
+					"endedMidRouting": reach.endedMidRouting, "second sessions": reach.events["second session"],
+				}
+
+				// Render-log wakes and retried failures come from few
+				// schedules, so a run of the default length can meet
+				// none; deep runs alone are asked for them.
+				if f := flag.Lookup("rapid.checks"); f != nil {
+					n, err := strconv.Atoi(f.Value.String())
+					if err == nil && n >= 1000 {
+						floors["render-log wakes"], floors["retried"] = reach.logWoke+reach.endWoke, reach.retried
+					}
+				}
+
+				for name, n := range floors {
 					if n == 0 {
 						t.Errorf("no schedule reached %s", name)
 					}

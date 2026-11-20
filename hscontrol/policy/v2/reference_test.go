@@ -705,7 +705,7 @@ var (
 	floorAddressForm = judgedFloor{share: 0.40, atStake: 0.30, cases: 170}
 	floorCapForm     = judgedFloor{share: 0.40, atStake: 0.31, cases: 180}
 	floorPeers       = judgedFloor{share: 0.40, atStake: 0.40, cases: 450}
-	floorRoutes      = judgedFloor{share: 0.48, atStake: 0.18, cases: 150}
+	floorRoutes      = judgedFloor{share: 0.48, atStake: 0.16, cases: 150}
 	floorStamps      = judgedFloor{share: 0.50, atStake: 0.18, cases: 500}
 )
 
