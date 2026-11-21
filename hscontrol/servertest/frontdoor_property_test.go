@@ -22,6 +22,7 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
 	"github.com/juanfont/headscale/hscontrol/state"
+	"github.com/juanfont/headscale/hscontrol/state/statemodel"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
@@ -98,23 +99,15 @@ var stepNames = [numSteps]string{
 }
 
 // fdNode is a model node's client and how it joined, which a login, a
-// relogin and the stored judge need.
+// relogin and the stored judge need; its Key is "" after a login.
 type fdNode struct {
+	statemodel.Joined
+
 	tc *TestClient
-	// method is how it last registered; key the pre-auth key it can log
-	// in again with, "" after a login; keyUser that key's user, or the
-	// user who made a tagged key, 0 for a tags-only key.
-	method    string
-	key       string
-	keyUser   uint
-	ephemeral bool
 	// reusable: a single-use key is spent by the registration, and a login
-	// with it under a new node key is refused.
+	// with it under a new node key is refused. keyID is the key's ID.
 	reusable bool
-	// keyTagged: the key carries tags, and outlives the user who made it; a
-	// user's own key is deleted with the user. keyID is the key's ID.
-	keyTagged bool
-	keyID     string
+	keyID    string
 	// loggedOut is set once its client logged out: it holds no node key.
 	loggedOut bool
 }
@@ -526,7 +519,7 @@ func (fd *frontDoor) edit(at string, e policymodel.Edit, ids map[types.NodeID]ty
 
 		for _, id := range slices.Sorted(maps.Keys(fd.nodes)) {
 			nd := fd.nodes[id]
-			if nd.keyUser != e.ID || nd.keyID == "" {
+			if nd.KeyUser != e.ID || nd.keyID == "" {
 				continue
 			}
 
@@ -538,12 +531,12 @@ func (fd *frontDoor) edit(at string, e policymodel.Edit, ids map[types.NodeID]ty
 			})
 
 			switch {
-			case nd.keyTagged && !listed:
+			case nd.Tagged && !listed:
 				fd.t.Fatalf("%s: u%d is deleted, and the tagged key n%d registered with is gone with it", at, e.ID, id)
-			case !nd.keyTagged && listed:
+			case !nd.Tagged && listed:
 				fd.t.Fatalf("%s: u%d is deleted, and its own key n%d registered with is still listed", at, e.ID, id)
-			case !nd.keyTagged:
-				nd.key = ""
+			case !nd.Tagged:
+				nd.Key = ""
 			}
 
 			fd.made("DeleteUser", "its keys checked")
@@ -704,9 +697,7 @@ func tagNames(tags []int) []string {
 // hostinfo is what n's client reports: n as headscale holds it, its routes
 // only when routes is set.
 func (fd *frontDoor) hostinfo(n policymodel.Node, routes bool) *tailcfg.Hostinfo {
-	_, nodes := policymodel.Topology{Users: fd.w.Topology.Users, Nodes: []policymodel.Node{n}}.Build()
-
-	hi := nodes[0].Hostinfo.Clone()
+	hi := fd.w.Topology.BuildNode(n).Hostinfo.Clone()
 	hi.BackendLogID = fmt.Sprintf("frontdoor-%d", n.ID)
 
 	if !routes {
@@ -891,7 +882,7 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 	admitted := without(n.Approved, n.AutoApproved)
 	full := kind != joinLoginTagged && len(admitted) == 0
 
-	nd := &fdNode{ephemeral: kind == joinEphemeral}
+	nd := &fdNode{Ephemeral: kind == joinEphemeral}
 
 	opts := []ClientOption{
 		WithHostinfo(fd.hostinfo(n, full)), WithUnknownClient(), WithUser(&types.User{}), WithoutNetmapHistory(), WithoutPoll(),
@@ -906,31 +897,31 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 			as = logins[0]
 		}
 
-		nd.method = util.RegisterMethodCLI
+		nd.Method = util.RegisterMethodCLI
 		if as.OIDC() {
-			nd.method = util.RegisterMethodOIDC
+			nd.Method = util.RegisterMethodOIDC
 		}
 
 		opts = append(opts, WithInteractiveLogin(fd.approverAt(as)))
 	default:
-		nd.method = util.RegisterMethodAuthKey
+		nd.Method = util.RegisterMethodAuthKey
 
 		// A single-use key is spent by the registration; a relogin with it
 		// must still find the node it made.
 		nd.reusable = rapid.Bool().Draw(fd.t, "reusable")
-		body := map[string]any{"reusable": nd.reusable, "ephemeral": nd.ephemeral}
+		body := map[string]any{"reusable": nd.reusable, "ephemeral": nd.Ephemeral}
 
 		switch {
 		case !n.Tagged():
-			nd.keyUser = n.User
+			nd.KeyUser = n.User
 		case kind == joinUserTaggedKey:
-			nd.keyUser = users[0].ID
+			nd.KeyUser = users[0].ID
 		}
 
-		nd.keyTagged = n.Tagged()
+		nd.Tagged = n.Tagged()
 
-		if nd.keyUser != 0 {
-			body["user"] = strconv.FormatUint(uint64(nd.keyUser), 10)
+		if nd.KeyUser != 0 {
+			body["user"] = strconv.FormatUint(uint64(nd.KeyUser), 10)
 		}
 
 		if n.Tagged() {
@@ -945,8 +936,8 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 		}
 
 		fd.mustAPI(at, http.MethodPost, "/api/v1/preauthkey", body, &out)
-		nd.key, nd.keyID = out.PreAuthKey.Key, out.PreAuthKey.ID
-		opts = append(opts, WithAuthKey(nd.key))
+		nd.Key, nd.keyID = out.PreAuthKey.Key, out.PreAuthKey.ID
+		opts = append(opts, WithAuthKey(nd.Key))
 	}
 
 	tc, err := TryNewClient(fd.tb, fd.srv, fmt.Sprintf("n%d", n.ID), opts...)
@@ -1165,7 +1156,7 @@ func (fd *frontDoor) leave(at string, id types.NodeID) {
 	nd := fd.nodes[id]
 	n, _ := fd.w.Topology.Node(id)
 
-	if nd.ephemeral && !n.Expired && nd.tc.Polling() && rapid.Bool().Draw(fd.t, "ephemeral-logout") {
+	if nd.Ephemeral && !n.Expired && nd.tc.Polling() && rapid.Bool().Draw(fd.t, "ephemeral-logout") {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 
@@ -1210,7 +1201,7 @@ func (fd *frontDoor) untag(at string, e policymodel.Retag) {
 	nd := fd.nodes[e.ID]
 	u, _ := fd.w.Topology.User(e.User)
 
-	if nd.method == util.RegisterMethodAuthKey && nd.keyUser != e.User || !fd.loginUser(u) {
+	if nd.Method == util.RegisterMethodAuthKey && nd.KeyUser != e.User || !fd.loginUser(u) {
 		fd.made("Login", "left out (a login it cannot claim)")
 
 		return
@@ -1266,9 +1257,9 @@ func (fd *frontDoor) login(at string, id types.NodeID, u policymodel.User, n pol
 		return
 	}
 
-	nd.method, nd.key, nd.keyUser, nd.reusable, nd.keyTagged, nd.ephemeral = util.RegisterMethodCLI, "", 0, false, false, false
+	nd.Method, nd.Key, nd.KeyUser, nd.reusable, nd.Tagged, nd.Ephemeral = util.RegisterMethodCLI, "", 0, false, false, false
 	if u.OIDC() {
-		nd.method = util.RegisterMethodOIDC
+		nd.Method = util.RegisterMethodOIDC
 	}
 }
 
@@ -1315,7 +1306,7 @@ func (fd *frontDoor) weather(at string, kind int) {
 		// The session drops and the client registers again at once, well
 		// inside the reconnect grace, with the key it still has, if any.
 		nd.tc.Disconnect(fd.tb)
-		err = nd.tc.Login(ctx, nd.tc.Persist(), nd.key, controlclient.LoginDefault, fd.hostinfo(n, true), nil)
+		err = nd.tc.Login(ctx, nd.tc.Persist(), nd.Key, controlclient.LoginDefault, fd.hostinfo(n, true), nil)
 	case stepRestartPoll:
 		err = nd.tc.RestartPoll(ctx)
 	case stepClientRestart:
@@ -1394,7 +1385,7 @@ func (fd *frontDoor) logout(at string) {
 		fd.t.Fatalf("%s: n%d logs out: %v", at, n.ID, err)
 	}
 
-	if nd.ephemeral {
+	if nd.Ephemeral {
 		fd.drop(n.ID)
 		fd.apply(policymodel.Leave{ID: n.ID})
 
@@ -1417,7 +1408,7 @@ func (fd *frontDoor) relogin(at string) {
 	n, ok := fd.pick("logs-in", func(n policymodel.Node, nd *fdNode) bool {
 		owner, _ := fd.w.Topology.User(n.User)
 
-		return (n.Expired || nd.loggedOut) && (nd.key != "" && nd.reusable || !n.Tagged() && fd.loginUser(owner))
+		return (n.Expired || nd.loggedOut) && (nd.Key != "" && nd.reusable || !n.Tagged() && fd.loginUser(owner))
 	})
 	if !ok {
 		fd.run.tally.steps[stepNames[stepRelogin]+" (no node)"]++
@@ -1429,7 +1420,7 @@ func (fd *frontDoor) relogin(at string) {
 
 	nd := fd.nodes[n.ID]
 
-	if nd.key == "" || !nd.reusable {
+	if nd.Key == "" || !nd.reusable {
 		u, _ := fd.w.Topology.User(n.User)
 		fd.login(at, n.ID, u, n)
 		fd.apply(policymodel.SetExpired{ID: n.ID, Expired: false})
@@ -1441,7 +1432,7 @@ func (fd *frontDoor) relogin(at string) {
 
 	edits := fd.keyLoginEdits(n)
 
-	err := fd.keyLogin(n, nd.key)
+	err := fd.keyLogin(n, nd.Key)
 	if err != nil {
 		fd.t.Fatalf("%s: n%d logs in again with its key: %v", at, n.ID, err)
 	}
@@ -1467,8 +1458,8 @@ func (fd *frontDoor) keyLogin(n policymodel.Node, key string) error {
 func (fd *frontDoor) keyLoginEdits(n policymodel.Node) []policymodel.Edit {
 	var out []policymodel.Edit
 
-	if nd := fd.nodes[n.ID]; n.Tagged() && !nd.keyTagged {
-		out = append(out, policymodel.Retag{ID: n.ID, User: nd.keyUser})
+	if nd := fd.nodes[n.ID]; n.Tagged() && !nd.Tagged {
+		out = append(out, policymodel.Retag{ID: n.ID, User: nd.KeyUser})
 	}
 
 	if len(n.Announced) > 0 {
@@ -1487,10 +1478,10 @@ func (fd *frontDoor) keyLoggedIn(at string, n policymodel.Node) {
 
 	fd.answered(at, n.ID, nd.tc)
 	nd.loggedOut = false
-	nd.method = util.RegisterMethodAuthKey
+	nd.Method = util.RegisterMethodAuthKey
 
-	if n.Tagged() && !nd.keyTagged {
-		nd.ephemeral = false
+	if n.Tagged() && !nd.Tagged {
+		nd.Ephemeral = false
 		fd.run.tally.edits["a user's key takes a tagged node back"]++
 	}
 }
@@ -1554,7 +1545,7 @@ func (fd *frontDoor) claims(n policymodel.Node, u policymodel.User) bool {
 
 	nd := fd.nodes[n.ID]
 
-	return nd.method != util.RegisterMethodAuthKey || nd.keyUser == u.ID
+	return nd.Method != util.RegisterMethodAuthKey || nd.KeyUser == u.ID
 }
 
 func (fd *frontDoor) claimByLogin(at string) bool {
@@ -1587,7 +1578,7 @@ func (fd *frontDoor) claimByLogin(at string) bool {
 		n, ok := fd.pick("tag-to-claim", func(n policymodel.Node, nd *fdNode) bool {
 			u, _ := fd.w.Topology.User(n.User)
 
-			return len(defined) > 0 && fd.claims(n, u) && (nd.method != util.RegisterMethodAuthKey || nd.keyUser == n.User)
+			return len(defined) > 0 && fd.claims(n, u) && (nd.Method != util.RegisterMethodAuthKey || nd.KeyUser == n.User)
 		})
 		if !ok {
 			return false
@@ -1610,14 +1601,14 @@ func (fd *frontDoor) claimByLogin(at string) bool {
 }
 
 func (fd *frontDoor) loginWithKey(at string) bool {
-	n, ok := fd.pick("key-login", func(_ policymodel.Node, nd *fdNode) bool { return nd.key != "" && nd.reusable })
+	n, ok := fd.pick("key-login", func(_ policymodel.Node, nd *fdNode) bool { return nd.Key != "" && nd.reusable })
 	if !ok {
 		return false
 	}
 
 	edits := fd.keyLoginEdits(n)
 
-	err := fd.keyLogin(n, fd.nodes[n.ID].key)
+	err := fd.keyLogin(n, fd.nodes[n.ID].Key)
 	if err != nil {
 		fd.t.Fatalf("%s: n%d logs in again with its key: %v", at, n.ID, err)
 	}
@@ -1854,9 +1845,9 @@ func (fd *frontDoor) reauthTags(at string) bool {
 
 	if n.Tagged() {
 		// A login onto a tagged node registers it as the login does.
-		nd.method = util.RegisterMethodCLI
+		nd.Method = util.RegisterMethodCLI
 		if a.u.OIDC() {
-			nd.method = util.RegisterMethodOIDC
+			nd.Method = util.RegisterMethodOIDC
 		}
 
 		what = "a tagged node retagged"
@@ -1896,7 +1887,7 @@ func (fd *frontDoor) ownerGone(at string) bool {
 	n, ok := fd.pick("owner-gone", func(n policymodel.Node, nd *fdNode) bool {
 		alone := !slices.ContainsFunc(fd.w.Topology.Nodes, func(m policymodel.Node) bool { return m.ID != n.ID && m.User == n.User && !m.Tagged() })
 
-		return len(defined) > 0 && !n.Tagged() && nd.key != "" && !nd.keyTagged && nd.keyUser == n.User && alone
+		return len(defined) > 0 && !n.Tagged() && nd.Key != "" && !nd.Tagged && nd.KeyUser == n.User && alone
 	})
 	if !ok {
 		return false
@@ -1904,7 +1895,7 @@ func (fd *frontDoor) ownerGone(at string) bool {
 
 	nd := fd.nodes[n.ID]
 	t := defined[rapid.IntRange(0, len(defined)-1).Draw(fd.t, "tag-away")]
-	dead, owner := nd.key, n.User
+	dead, owner := nd.Key, n.User
 
 	fd.mustAPI(at, http.MethodPost, fmt.Sprintf("/api/v1/node/%d/tags", n.ID), map[string]any{"tags": tagNames([]int{t})}, nil)
 	fd.apply(policymodel.Retag{ID: n.ID, Tags: []int{t}})
@@ -2251,7 +2242,7 @@ func (fd *frontDoor) race(at string) {
 
 	switch kind {
 	case raceExpireLogin:
-		n, ok = fd.pick("racer", func(_ policymodel.Node, nd *fdNode) bool { return nd.key != "" && nd.reusable })
+		n, ok = fd.pick("racer", func(_ policymodel.Node, nd *fdNode) bool { return nd.Key != "" && nd.reusable })
 	default:
 		n, ok = fd.pick("racer", func(n policymodel.Node, nd *fdNode) bool { return !n.Expired && !nd.loggedOut })
 	}
@@ -2281,7 +2272,7 @@ func (fd *frontDoor) race(at string) {
 		edits := fd.keyLoginEdits(n)
 		expiry := policymodel.SetExpired{ID: n.ID, Expired: true}
 
-		errA, errB := both(expire, func() error { return fd.keyLogin(n, nd.key) })
+		errA, errB := both(expire, func() error { return fd.keyLogin(n, nd.Key) })
 		if errA != nil || errB != nil {
 			fd.t.Fatalf("%s: n%d: the expiry (%v) and the login with its key (%v) racing", at, n.ID, errA, errB)
 		}
@@ -2303,7 +2294,7 @@ func (fd *frontDoor) race(at string) {
 		nd.loggedOut = errB == nil
 
 		outcomes = map[string]policymodel.World{"expired": expired}
-		if nd.ephemeral {
+		if nd.Ephemeral {
 			outcomes["deleted by its logout"] = gone
 		}
 	case raceDeleteLogout:
@@ -2367,9 +2358,7 @@ func (fd *frontDoor) outcome(at string, id types.NodeID, outcomes map[string]pol
 			return name
 		}
 
-		_, nodes := policymodel.Topology{Users: w.Topology.Users, Nodes: []policymodel.Node{n}}.Build()
-
-		if d := storedDiff(nv.AsStruct(), nodes[0], n, fd.nodes[id]); d != "" {
+		if d := statemodel.NodeDiff(nv.AsStruct(), w, n, fd.nodes[id].Joined); d != "" {
 			diffs = append(diffs, name+": "+d)
 
 			continue
@@ -2511,18 +2500,11 @@ func (fd *frontDoor) elect() {
 		return int(a.ID()) - int(b.ID()) //nolint:gosec // small
 	})
 
-	nodes := make([]policymodel.RefNode, 0, len(all))
-
 	for i, nv := range all {
-		n := nv.AsStruct()
-		fd.elections.Started[n.ID] = uint64(i + 1) //nolint:gosec // small
-		nodes = append(nodes, policymodel.RefNode{
-			ID: n.ID, Tags: n.Tags, Announced: n.AnnouncedRoutes(), Approved: n.ApprovedRoutes,
-			Unavailable: !n.Online() || n.IsExpired(),
-		})
+		fd.elections.Started[nv.ID()] = uint64(i + 1) //nolint:gosec // small
 	}
 
-	fd.elections.Commit(nodes, map[types.NodeID]bool{})
+	fd.elections.Commit(statemodel.ElectionNodes(snap))
 
 	for q := range fd.unheld {
 		if fd.served(q) {

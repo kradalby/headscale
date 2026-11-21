@@ -10,6 +10,7 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
 	"github.com/juanfont/headscale/hscontrol/state"
+	"github.com/juanfont/headscale/hscontrol/state/statemodel"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"go4.org/mem"
 	"pgregory.net/rapid"
@@ -221,24 +222,7 @@ func (p *pbtWorld) disconnect(id types.NodeID) {
 // each node what the election reads: its routes, whether it is online and
 // unexpired, and the prober's mark.
 func (p *pbtWorld) elect() {
-	var (
-		nodes     []policymodel.RefNode
-		unhealthy = map[types.NodeID]bool{}
-	)
-
-	for _, nv := range p.s.Snapshot().ListNodes().All() {
-		n := nv.AsStruct()
-		nodes = append(nodes, policymodel.RefNode{
-			ID: n.ID, Tags: n.Tags, Announced: n.AnnouncedRoutes(), Approved: n.ApprovedRoutes,
-			Unavailable: !n.Online() || n.IsExpired(),
-		})
-
-		if n.Unhealthy {
-			unhealthy[n.ID] = true
-		}
-	}
-
-	p.elections.Commit(nodes, unhealthy)
+	p.elections.Commit(statemodel.ElectionNodes(p.s.Snapshot()))
 }
 
 // sessionKind is a write a node's client, the HA prober or an operator

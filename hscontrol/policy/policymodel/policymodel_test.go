@@ -33,7 +33,8 @@ const modulePath = "github.com/juanfont/headscale/"
 // through any chain of imports is the compile, the world or the mapper;
 // and its own code calls no method of headscale's node and user types,
 // several of which evaluate access through the policy matchers. And it
-// stays out of the binary: no file outside tests imports it.
+// stays out of the binary: no file outside tests imports it, but those of
+// a test-support package that only tests import.
 func TestImports(t *testing.T) {
 	t.Parallel()
 
@@ -60,13 +61,22 @@ func TestImports(t *testing.T) {
 		t.Errorf("%s calls a method of headscale's node or user types; read their fields", call)
 	}
 
+	// Test-support packages, which may import the model, by import path.
+	support := map[string]bool{modulePath + "hscontrol/state/statemodel": true}
 	self, _ := filepath.Abs(".")
 
 	for _, dir := range []string{"../..", "../../../cmd"} {
 		for path, imports := range importsOf(t, dir, true) {
 			abs, _ := filepath.Abs(filepath.Dir(path))
-			if abs != self && slices.Contains(imports, modulePath+"hscontrol/policy/policymodel") {
-				t.Errorf("%s imports policymodel; only tests may", path)
+			rel, _ := filepath.Rel(filepath.Join(self, "../../.."), abs)
+
+			for _, imp := range imports {
+				switch {
+				case support[imp]:
+					t.Errorf("%s imports %s, test support; only tests may", path, imp)
+				case imp == modulePath+"hscontrol/policy/policymodel" && abs != self && !support[modulePath+filepath.ToSlash(rel)]:
+					t.Errorf("%s imports policymodel; only tests may", path)
+				}
 			}
 		}
 	}

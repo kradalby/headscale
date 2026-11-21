@@ -6,12 +6,12 @@ import (
 	"net/netip"
 	"reflect"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
+	"github.com/juanfont/headscale/hscontrol/state/statemodel"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"go4.org/mem"
@@ -47,21 +47,6 @@ import (
 // every database row equals its node in memory on the columns a write
 // persists: the model's predictions of auto-approval, tag ownership and
 // a login's renewal are judged against what production stored.
-
-// regInfo is how a node registered, as the driver did it: what a login
-// or a restart needs, and what production must hold of it.
-type regInfo struct {
-	method string
-	// key is the pre-auth key it registered with, "" when it has none
-	// to restart with; keyUser the key's user, or the user who made a
-	// tagged key, 0 for a tags-only key.
-	key       string
-	keyUser   uint
-	ephemeral bool
-	// tagged is set for a tagged key, which outlives the user who made
-	// it; a user's own key goes with the user.
-	tagged bool
-}
 
 // nodeWrite counts the calls one node's write made: to production entry
 // points, and to the store, with why.
@@ -277,41 +262,41 @@ func (p *pbtWorld) enrol(nc newcomer, w policymodel.World, several bool) {
 	defined := !slices.ContainsFunc(n.Tags, func(t int) bool { return !w.Policy.DefinesTag(t) })
 
 	var (
-		ri  regInfo
+		ri  statemodel.Joined
 		got types.NodeView
 	)
 
 	switch {
 	case n.Tagged() && len(users) > 0 && defined && id%2 == 0:
 		// An admin tags a node a user brought in.
-		ri.method = util.RegisterMethodCLI
-		got = p.login(id, tn.MachineKey, tn.NodeKey, tn.Hostname, users[0].ID, ri.method)
+		ri.Method = util.RegisterMethodCLI
+		got = p.login(id, tn.MachineKey, tn.NodeKey, tn.Hostname, users[0].ID, ri.Method)
 		p.produce(id, "tags", func() error {
 			_, err := p.s.SetNodeTags(id, tn.Tags)
 			return err
 		})
 	case n.Tagged() || !oidc && id%2 == 1:
-		ri.method, ri.ephemeral = util.RegisterMethodAuthKey, id%3 == 0
+		ri.Method, ri.Ephemeral = util.RegisterMethodAuthKey, id%3 == 0
 
 		var uid *types.UserID
 
 		switch {
 		case !n.Tagged():
 			u := types.UserID(n.User)
-			uid, ri.keyUser = &u, n.User
+			uid, ri.KeyUser = &u, n.User
 		case len(users) > 0 && id%4 == 3:
 			// A tagged key a user made: the node is the tags', and that
 			// user's login takes it back.
 			u := types.UserID(users[0].ID)
-			uid, ri.keyUser = &u, users[0].ID
+			uid, ri.KeyUser = &u, users[0].ID
 		}
 
-		pak, err := p.s.CreatePreAuthKey(uid, false, ri.ephemeral, nil, tn.Tags)
+		pak, err := p.s.CreatePreAuthKey(uid, false, ri.Ephemeral, nil, tn.Tags)
 		if err != nil {
 			p.t.Fatalf("n%d: pre-auth key: %v", id, err)
 		}
 
-		ri.key, ri.tagged = pak.Key, n.Tagged()
+		ri.Key, ri.Tagged = pak.Key, n.Tagged()
 
 		hi := bare
 		if alone {
@@ -328,12 +313,12 @@ func (p *pbtWorld) enrol(nc newcomer, w policymodel.World, several bool) {
 			return err
 		})
 	default:
-		ri.method = util.RegisterMethodCLI
+		ri.Method = util.RegisterMethodCLI
 		if oidc {
-			ri.method = util.RegisterMethodOIDC
+			ri.Method = util.RegisterMethodOIDC
 		}
 
-		got = p.login(id, tn.MachineKey, tn.NodeKey, tn.Hostname, n.User, ri.method)
+		got = p.login(id, tn.MachineKey, tn.NodeKey, tn.Hostname, n.User, ri.Method)
 	}
 
 	if got.ID() != id {
@@ -616,7 +601,7 @@ func (p *pbtWorld) untag(was, n policymodel.Node, tn *types.Node, users []policy
 	id := n.ID
 	ri := p.reg[id]
 
-	if was.Tagged() && (ri.method != util.RegisterMethodAuthKey || ri.keyUser == n.User) {
+	if was.Tagged() && (ri.Method != util.RegisterMethodAuthKey || ri.KeyUser == n.User) {
 		nv, _ := p.s.Snapshot().GetNode(id)
 
 		method := util.RegisterMethodCLI
@@ -634,7 +619,7 @@ func (p *pbtWorld) untag(was, n policymodel.Node, tn *types.Node, users []policy
 
 		hi.Hostname = nv.Hostname()
 		p.loginWith(id, nv.MachineKey(), reauthKey(nv.NodeKey()), hi, n.User, method)
-		p.reg[id] = regInfo{method: method}
+		p.reg[id] = statemodel.Joined{Method: method}
 
 		return
 	}
@@ -648,7 +633,7 @@ func (p *pbtWorld) untag(was, n policymodel.Node, tn *types.Node, users []policy
 	nv, _ := p.s.Snapshot().GetNode(id)
 	p.produce(id, "auto-approve", func() error { return p.s.AutoApproveRoutes(nv) })
 
-	ri.key = ""
+	ri.Key = ""
 	p.reg[id] = ri
 }
 
@@ -683,12 +668,12 @@ func (p *pbtWorld) report(n policymodel.Node, tn *types.Node) {
 	p.reports++
 
 	ri := p.reg[id]
-	finds := ri.keyUser == 0 || cur.IsTagged() || cur.UserID != nil && *cur.UserID == ri.keyUser
+	finds := ri.KeyUser == 0 || cur.IsTagged() || cur.UserID != nil && *cur.UserID == ri.KeyUser
 
-	if ri.key != "" && finds && !cur.IsExpired() && p.reports%2 == 0 {
+	if ri.Key != "" && finds && !cur.IsExpired() && p.reports%2 == 0 {
 		p.produce(id, "restart", func() error {
 			_, err := p.s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
-				NodeKey: cur.NodeKey, Hostinfo: hi, Auth: &tailcfg.RegisterResponseAuth{AuthKey: ri.key},
+				NodeKey: cur.NodeKey, Hostinfo: hi, Auth: &tailcfg.RegisterResponseAuth{AuthKey: ri.Key},
 			}, cur.MachineKey)
 
 			return err
@@ -731,7 +716,7 @@ func (p *pbtWorld) leave(n policymodel.Node) {
 	}
 
 	switch ri := p.reg[id]; {
-	case ri.ephemeral && len(p.conns[id]) == 0:
+	case ri.Ephemeral && len(p.conns[id]) == 0:
 		p.produce(id, "ephemeral collector", func() error {
 			deleted, err := p.s.DeleteEphemeralNode(id)
 			if err == nil && !deleted {
@@ -740,7 +725,7 @@ func (p *pbtWorld) leave(n policymodel.Node) {
 
 			return err
 		})
-	case ri.ephemeral && !nv.IsExpired():
+	case ri.Ephemeral && !nv.IsExpired():
 		p.produce(id, "logout", func() error {
 			now := time.Now()
 
@@ -784,208 +769,14 @@ func (p *pbtWorld) endpoint(id types.NodeID, eps []netip.AddrPort) {
 	})
 }
 
-// requireStored holds what production stored to w after a write: every
-// node equals the model's on what the model holds and on how the driver
-// registered it, and every row equals its node in memory.
+// requireStored holds what production stored to w after a write
+// ([statemodel.Stored]).
 func (p *pbtWorld) requireStored(w policymodel.World, after string) {
 	p.t.Helper()
 
-	snap := p.s.Snapshot()
-	_, nodes := w.Topology.Build()
-
-	ids := func(all []types.NodeID) string { return fmt.Sprint(all) }
-
-	held, want := make([]types.NodeID, 0, len(nodes)), make([]types.NodeID, 0, len(nodes))
-
-	for _, nv := range snap.ListNodes().All() {
-		held = append(held, nv.ID())
+	if d := statemodel.Stored(p.s, w, func(id types.NodeID) statemodel.Joined { return p.reg[id] }); d != "" {
+		p.t.Fatalf("after %s: %s", after, d)
 	}
-
-	for _, tn := range nodes {
-		want = append(want, tn.ID)
-	}
-
-	if !slices.Equal(held, want) {
-		p.t.Fatalf("stored: after %s, the State holds nodes %s, the model %s", after, ids(held), ids(want))
-	}
-
-	for i, tn := range nodes {
-		nv, _ := snap.GetNode(tn.ID)
-
-		if d := storedDiff(nv.AsStruct(), tn, w.Topology.Nodes[i], p.reg[tn.ID]); d != "" {
-			p.t.Fatalf("stored: after %s, n%d: %s", after, tn.ID, d)
-		}
-	}
-
-	rows, err := p.s.DB().ListNodes()
-	if err != nil {
-		p.t.Fatalf("persisted: after %s: %v", after, err)
-	}
-
-	stored := make([]types.NodeID, 0, len(rows))
-
-	for _, row := range rows {
-		stored = append(stored, row.ID)
-	}
-
-	if !slices.Equal(stored, want) {
-		p.t.Fatalf("persisted: after %s, the database holds nodes %s, the model %s", after, ids(stored), ids(want))
-	}
-
-	for _, row := range rows {
-		nv, _ := snap.GetNode(row.ID)
-
-		if d := rowDiff(row, nv.AsStruct()); d != "" {
-			p.t.Fatalf("persisted: after %s, n%d's row differs from the node in memory: %s", after, row.ID, d)
-		}
-	}
-}
-
-// storedDiff is how got, as production holds it, differs from tn, model
-// node n built, and from how the driver registered it.
-func storedDiff(got, tn *types.Node, n policymodel.Node, ri regInfo) string {
-	var out []string
-
-	differ := func(what string, have, want any) {
-		out = append(out, fmt.Sprintf("%s %v, the model %v", what, have, want))
-	}
-
-	addr := func(a *netip.Addr) netip.Addr {
-		if a == nil {
-			return netip.Addr{}
-		}
-
-		return *a
-	}
-
-	if addr(got.IPv4) != n.V4 || addr(got.IPv6) != n.V6 {
-		differ("addresses", []netip.Addr{addr(got.IPv4), addr(got.IPv6)}, []netip.Addr{n.V4, n.V6})
-	}
-
-	if tags := slices.Sorted(slices.Values(got.Tags)); !slices.Equal(tags, tn.Tags) {
-		differ("tags", tags, tn.Tags)
-	}
-
-	user := func(u *uint) uint {
-		if u == nil {
-			return 0
-		}
-
-		return *u
-	}
-
-	if user(got.UserID) != n.User {
-		differ("user", user(got.UserID), n.User)
-	}
-
-	sorted := func(ps []netip.Prefix) []netip.Prefix {
-		return slices.SortedFunc(slices.Values(ps), netip.Prefix.Compare)
-	}
-
-	if a, b := sorted(got.AnnouncedRoutes()), sorted(tn.Hostinfo.RoutableIPs); !slices.Equal(a, b) {
-		differ("announced", a, b)
-	}
-
-	if a, b := sorted(got.ApprovedRoutes), sorted(tn.ApprovedRoutes); !slices.Equal(a, b) {
-		differ("approved", a, b)
-	}
-
-	if a, b := sorted(got.AutoApprovedRoutes), sorted(tn.AutoApprovedRoutes); !slices.Equal(a, b) {
-		differ("auto-approved", a, b)
-	}
-
-	client := func(hi *tailcfg.Hostinfo) string {
-		if hi == nil {
-			return "none"
-		}
-
-		return fmt.Sprintf("go=%q ipn=%q app=%q connector=%v", hi.GoVersion, hi.IPNVersion, hi.App, hi.AppConnector)
-	}
-
-	if a, b := client(got.Hostinfo), client(tn.Hostinfo); a != b {
-		differ("client", a, b)
-	}
-
-	if got.IsExpired() != n.Expired {
-		differ("expired", got.IsExpired(), n.Expired)
-	}
-
-	if online := !n.Offline && !n.Expired; got.Online() != online {
-		differ("online", got.Online(), online)
-	}
-
-	if got.RegisterMethod != ri.method || got.Ephemeral != ri.ephemeral {
-		differ("registration", fmt.Sprintf("%s ephemeral=%t", got.RegisterMethod, got.Ephemeral), fmt.Sprintf("%s ephemeral=%t (the driver's)", ri.method, ri.ephemeral))
-	}
-
-	return strings.Join(out, "; ")
-}
-
-// rowDiff is how row, as the database holds it, differs from n in memory
-// on the columns a write persists; when it was last seen rides along with
-// the next write that persists anything.
-func rowDiff(row, n *types.Node) string {
-	var out []string
-
-	differ := func(what string, have, want any) {
-		out = append(out, fmt.Sprintf("%s %v, in memory %v", what, have, want))
-	}
-
-	str := func(a *netip.Addr) string {
-		if a == nil {
-			return "none"
-		}
-
-		return a.String()
-	}
-
-	at := func(t *time.Time) string {
-		if t == nil {
-			return "never"
-		}
-
-		return t.UTC().Format(time.RFC3339Nano)
-	}
-
-	user := func(u *uint) string {
-		if u == nil {
-			return "none"
-		}
-
-		return strconv.FormatUint(uint64(*u), 10)
-	}
-
-	cols := []struct {
-		name       string
-		have, want string
-	}{
-		{"machine key", row.MachineKey.String(), n.MachineKey.String()},
-		{"node key", row.NodeKey.String(), n.NodeKey.String()},
-		{"disco key", row.DiscoKey.String(), n.DiscoKey.String()},
-		{"endpoints", fmt.Sprint(row.Endpoints), fmt.Sprint(n.Endpoints)},
-		{"addresses", str(row.IPv4) + " " + str(row.IPv6), str(n.IPv4) + " " + str(n.IPv6)},
-		{"hostname", row.Hostname, n.Hostname},
-		{"given name", row.GivenName, n.GivenName},
-		{"user", user(row.UserID), user(n.UserID)},
-		{"register method", row.RegisterMethod, n.RegisterMethod},
-		{"tags", fmt.Sprint([]string(row.Tags)), fmt.Sprint([]string(n.Tags))},
-		{"expiry", at(row.Expiry), at(n.Expiry)},
-		{"approved", fmt.Sprint([]netip.Prefix(row.ApprovedRoutes)), fmt.Sprint([]netip.Prefix(n.ApprovedRoutes))},
-		{"auto-approved", fmt.Sprint([]netip.Prefix(row.AutoApprovedRoutes)), fmt.Sprint([]netip.Prefix(n.AutoApprovedRoutes))},
-		{"ephemeral", strconv.FormatBool(row.Ephemeral), strconv.FormatBool(n.Ephemeral)},
-	}
-
-	for _, c := range cols {
-		if c.have != c.want {
-			differ(c.name, c.have, c.want)
-		}
-	}
-
-	if !row.Hostinfo.Equal(n.Hostinfo) {
-		differ("hostinfo", policymodel.JSON(row.Hostinfo), policymodel.JSON(n.Hostinfo))
-	}
-
-	return strings.Join(out, "; ")
 }
 
 // storeKinds are the node writes the share leaves out: addresses, which no

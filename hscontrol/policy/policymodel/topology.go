@@ -202,6 +202,14 @@ func (t Topology) Build() (types.Users, types.Nodes) {
 	return users, nodes
 }
 
+// BuildNode is n as headscale holds it beside t's users, its User
+// pointing into them, whether t holds n or not.
+func (t Topology) BuildNode(n Node) *types.Node {
+	users, _ := Topology{Users: t.Users}.Build()
+
+	return n.build(users)
+}
+
 func (n Node) build(users types.Users) *types.Node {
 	name := fmt.Sprintf("n%d", n.ID)
 

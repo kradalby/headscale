@@ -15,6 +15,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
 	"github.com/juanfont/headscale/hscontrol/state"
+	"github.com/juanfont/headscale/hscontrol/state/statemodel"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"gorm.io/gorm"
@@ -62,7 +63,7 @@ type pbtWorld struct {
 
 	// reg is how each node registered; alloc the allocator's last
 	// addresses, as predicted; reports counts the client reports made.
-	reg     map[types.NodeID]regInfo
+	reg     map[types.NodeID]statemodel.Joined
 	alloc   [2]netip.Addr
 	reports int
 	// kind is the edit being written; cur counts the node write in
@@ -105,7 +106,7 @@ func newPBTWorld(t pbtT, w policymodel.World, configure ...func(*types.Config)) 
 
 	p := &pbtWorld{
 		t: t, cfg: cfg, s: s, conns: map[types.NodeID][]uint64{}, elections: policymodel.NewElections(), made: map[string]int{},
-		reg: map[types.NodeID]regInfo{}, alloc: [2]netip.Addr{cfg.Prefixes.V4.Masked().Addr(), cfg.Prefixes.V6.Masked().Addr()},
+		reg: map[types.NodeID]statemodel.Joined{}, alloc: [2]netip.Addr{cfg.Prefixes.V4.Masked().Addr(), cfg.Prefixes.V6.Masked().Addr()},
 	}
 
 	p.kind = "start"
@@ -323,7 +324,7 @@ func (p *pbtWorld) leaveUsers(cur, w policymodel.World, built func(int) *types.N
 		case len(defined) > 0:
 			next := cur.Apply(policymodel.Retag{ID: n.ID, Tags: defined})
 			mid, _ := next.Topology.Node(n.ID)
-			p.change(cur, was, mid, builtOne(next, mid))
+			p.change(cur, was, mid, next.Topology.BuildNode(mid))
 			cur, mids[n.ID] = next, mid
 		default:
 			next := cur.Apply(policymodel.Retag{ID: n.ID, Tags: n.Tags})
@@ -344,18 +345,11 @@ func (p *pbtWorld) leaveUsers(cur, w policymodel.World, built func(int) *types.N
 // with it: a node it tagged away can no longer restart with one.
 func (p *pbtWorld) forgetKeys(uid uint) {
 	for id, ri := range p.reg {
-		if ri.keyUser == uid && !ri.tagged {
-			ri.key = ""
+		if ri.KeyUser == uid && !ri.Tagged {
+			ri.Key = ""
 			p.reg[id] = ri
 		}
 	}
-}
-
-// builtOne is n of w as built, with no user: a tagged node.
-func builtOne(w policymodel.World, n policymodel.Node) *types.Node {
-	_, nodes := policymodel.Topology{Users: w.Topology.Users, Nodes: []policymodel.Node{n}}.Build()
-
-	return nodes[0]
 }
 
 // withNode is w with n in place of the node of its ID.
