@@ -72,6 +72,11 @@ func registerUsers(api huma.API, b Backend) {
 	}, func(ctx context.Context, in *createUserInput) (*userOutput, error) {
 		// Pre-check yields a 409 for the common case; the DB unique constraint
 		// is the real guard.
+		// TODO(kradalby): api/create-name-oidc-holders: GetUserByName
+		// errors when several OIDC users hold the name, so this pre-check
+		// passes and the user is created where one holder is refused with
+		// 409; the unique index covers only API users' names. Pinned by
+		// TestCreatingANameOIDCUsersHoldDependsOnHowMany (servertest).
 		if in.Body.Name != "" {
 			_, err := b.State.GetUserByName(in.Body.Name)
 			if err == nil {
@@ -113,6 +118,12 @@ func registerUsers(api huma.API, b Backend) {
 			return nil, mapError("renaming user", err)
 		}
 
+		// TODO(kradalby): api/rename-to-shared-name: RenameUser checks no
+		// uniqueness against OIDC users, so the rename commits to a name
+		// an OIDC user also holds and the lookup below finds two users,
+		// answering 500 for a rename that happened, where create refuses
+		// the same name with 409. Pinned by
+		// TestRenameToANameAnOIDCUserHoldsAnswers500 (servertest).
 		_, err = b.State.RenameUser(types.UserID(oldUser.ID), in.NewName)
 		if err != nil {
 			return nil, mapError("renaming user", err)
