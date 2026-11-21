@@ -574,6 +574,15 @@ const refSteps = 10
 func drive(t *rapid.T, f func(step int, sv *served, reads []types.NodeID)) {
 	s := policymodel.Scenarios(refSteps).Draw(t, "scenario")
 
+	slice, err := refSlice()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !slice.Holds(s) {
+		return
+	}
+
 	sv, err := serve(nil, s.Start, policymodel.Change{})
 	if err != nil {
 		t.Fatalf("the start's policy is refused: %s", stableError(err))
@@ -638,9 +647,19 @@ type judgedFloor struct {
 	cases int
 }
 
+// refSlice is the shapes a run of the reference properties is narrowed
+// to; each property is one judge.
+var refSlice = sync.OnceValues(func() (policymodel.Slice, error) { return policymodel.SliceOf() })
+
 // requireJudged fails a property that judged less than floor.
 func requireJudged(t *testing.T, what string, j judgedCounts, floor judgedFloor) {
 	t.Helper()
+
+	if slice, _ := refSlice(); !slice.Whole() {
+		t.Logf("%s: %v over %v", what, &j, slice)
+
+		return
+	}
 
 	skipped := 0
 	for _, n := range j.skipped {

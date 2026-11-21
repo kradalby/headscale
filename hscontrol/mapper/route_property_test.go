@@ -71,6 +71,8 @@ type pbtWorld struct {
 	kind    string
 	cur     *nodeWrite
 	storing bool
+	// unstored leaves the stored judge out of a run narrowed past it.
+	unstored bool
 }
 
 // The driver is a level the shared judges read.

@@ -774,8 +774,10 @@ func (p *pbtWorld) endpoint(id types.NodeID, eps []netip.AddrPort) {
 func (p *pbtWorld) requireStored(after string) {
 	p.t.Helper()
 
-	if d := statemodel.Stored(p); d != "" {
-		p.t.Fatalf("after %s: %s", after, d)
+	if !p.unstored {
+		if d := statemodel.Stored(p); d != "" {
+			p.t.Fatalf("after %s: %s", after, d)
+		}
 	}
 }
 

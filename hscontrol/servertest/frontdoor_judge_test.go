@@ -225,17 +225,22 @@ func pending(gs []goroutine, loopLine int) []string {
 func (fd *frontDoor) judgeClients(at string) {
 	snap := fd.srv.State().Snapshot()
 	w := fd.w
+	client := fd.run.slice.Judges("client")
 
 	for _, n := range w.Topology.Nodes {
 		nd := fd.nodes[n.ID]
-		if polling := nd.tc.Polling(); polling == n.Offline {
+		if polling := nd.tc.Polling(); client && polling == n.Offline {
 			fd.t.Fatalf("%s: n%d's client polls: %t; the model has it offline: %t", at, n.ID, polling, n.Offline)
 		}
 	}
 
-	m := statemodel.Moment(fd)
-	m.Unheld = fd.unheld
-	ref := fd.run.held.At(m)
+	var ref *policymodel.Held
+
+	if fd.run.slice.Judges("reference") {
+		m := statemodel.Moment(fd)
+		m.Unheld = fd.unheld
+		ref = fd.run.held.At(m)
+	}
 
 	for _, n := range w.Topology.Nodes {
 		if n.Offline {
@@ -249,12 +254,14 @@ func (fd *frontDoor) judgeClients(at string) {
 			fd.t.Fatalf("%s: n%d's client polls, and holds no map", at, n.ID)
 		}
 
-		fresh := freshNetmap(fd, snap, n.ID, nd.tc.Persist())
+		if client {
+			fresh := freshNetmap(fd, snap, n.ID, nd.tc.Persist())
 
-		fd.run.tally.clients++
+			fd.run.tally.clients++
 
-		if d := policymodel.NetmapDiff(nm, fresh, func() { fd.run.tally.unseen++ }); d != "" {
-			fd.t.Fatalf("%s: n%d's client, the server quiet, holds other than a fresh session of r%d is given: %s", at, n.ID, snap.Rev(), d)
+			if d := policymodel.NetmapDiff(nm, fresh, func() { fd.run.tally.unseen++ }); d != "" {
+				fd.t.Fatalf("%s: n%d's client, the server quiet, holds other than a fresh session of r%d is given: %s", at, n.ID, snap.Rev(), d)
+			}
 		}
 
 		if ref == nil {
@@ -339,6 +346,10 @@ func durable(nm *netmap.NetworkMap) string {
 // requireStored holds what the server stored to the model
 // ([statemodel.Stored]).
 func (fd *frontDoor) requireStored(after string) {
+	if !fd.run.slice.Judges("stored") {
+		return
+	}
+
 	if d := statemodel.Stored(fd); d != "" {
 		fd.t.Fatalf("after %s: %s", after, d)
 	}

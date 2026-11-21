@@ -28,6 +28,10 @@ const formShareFloor = 0.08
 func requireForm(t *testing.T, form policymodel.FormJudge) {
 	t.Helper()
 
+	if slice, _ := refSlice(); !slice.Whole() {
+		return
+	}
+
 	checks := rapidChecks()
 	if checks < 100 {
 		return

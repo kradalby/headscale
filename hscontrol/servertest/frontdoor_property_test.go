@@ -93,6 +93,11 @@ const (
 	numSteps
 )
 
+// fdJudges are the parts of the property a slice names: what the server
+// stored, what clients hold against a fresh session (and that they poll
+// as the model says), against the reference, and across a restart.
+var fdJudges = []string{"stored", "client", "reference", "restart"}
+
 var stepNames = [numSteps]string{
 	"world", "burst", "flap", "poll restart", "client restart", "endpoints", "rename", "logout", "relogin", "server restart",
 	"ownership", "identity", "race",
@@ -119,6 +124,10 @@ type fdRun struct {
 	// loopLine is where serveLongPoll waits between updates.
 	loopLine int
 	held     policymodel.HeldJudge
+	// slice is the part of the property the run holds (fdJudges), and
+	// outside counts the cases it dropped.
+	slice   policymodel.Slice
+	outside int
 	// a37 lists the logins auth/followup-lookup-race started over.
 	a37 []string
 }
@@ -172,7 +181,12 @@ func TestFrontDoorClientsFollowTheModel(t *testing.T) {
 		t.Fatalf("test sanity: %v", err)
 	}
 
-	run := &fdRun{steps: fdSteps(), tally: newFDTally(), loopLine: line}
+	slice, err := policymodel.SliceOf(fdJudges...)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	run := &fdRun{steps: fdSteps(), tally: newFDTally(), loopLine: line, slice: slice}
 
 	rapid.Check(t, func(rt *rapid.T) { playFrontDoor(t, rt, run) })
 
@@ -181,6 +195,12 @@ func TestFrontDoorClientsFollowTheModel(t *testing.T) {
 
 	for _, l := range run.a37 {
 		t.Logf("auth/followup-lookup-race: %s", l)
+	}
+
+	if !run.slice.Whole() {
+		t.Logf("slice: %v; %d cases outside it", run.slice, run.outside)
+
+		return
 	}
 
 	if f := flag.Lookup("rapid.checks"); f != nil {
@@ -232,6 +252,11 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 	}
 
 	start := policymodel.Worlds().Draw(rt, "start")
+	if !run.slice.Holds(policymodel.Scenario{Start: start}) {
+		run.outside++
+
+		return
+	}
 
 	opts := []ServerOption{WithEphemeralTimeout(time.Hour), WithBatchDelay(20 * time.Millisecond)}
 	if fd.capSources {
@@ -2426,7 +2451,7 @@ func (fd *frontDoor) restart(at string) {
 			fd.t.Fatalf("%s: n%d does not poll the restarted server", at, id)
 		}
 
-		if now := durable(nd.tc.Netmap()); now != held[id] {
+		if now := durable(nd.tc.Netmap()); now != held[id] && fd.run.slice.Judges("restart") {
 			fd.t.Fatalf("%s: n%d's client holds after the restart what it did not before:\nbefore %s\nafter  %s", at, id, held[id], now)
 		}
 	}

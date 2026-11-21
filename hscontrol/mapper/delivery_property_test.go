@@ -11,7 +11,6 @@ import (
 	"maps"
 	"net/http"
 	"net/netip"
-	"os"
 	"reflect"
 	"slices"
 	"strconv"
@@ -489,36 +488,32 @@ const (
 	// responses as tailscaled keeps it, indexes every address its netmap
 	// holds (see [addrIndex]).
 	judgeIndex
+	// judgeStored: what production stored is the model's after every
+	// write ([statemodel.Stored]); a run without it holds the start's.
+	judgeStored
 	numJudges
 )
 
-var judgeNames = [numJudges]string{"client", "model", "wire", "churn", "kept", "combos", "reference", "index"}
+var judgeNames = [numJudges]string{"client", "model", "wire", "churn", "kept", "combos", "reference", "index", "stored"}
 
 func (j deliveryJudge) String() string { return judgeNames[j] }
 
-// deliveryJudgesEnv, a comma-separated list of [judgeNames], narrows a run
-// to those parts, so a mutation run can tell which part kills what.
-const deliveryJudgesEnv = "HEADSCALE_PBT_DELIVERY_JUDGES"
-
-func deliveryJudges(t *testing.T) [numJudges]bool {
+// deliverySlice is the slice of the property a run holds
+// ([policymodel.JudgesEnv] names [judgeNames]), and the parts it holds.
+func deliverySlice(t *testing.T) (policymodel.Slice, [numJudges]bool) {
 	t.Helper()
 
+	slice, err := policymodel.SliceOf(judgeNames[:]...)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	var on [numJudges]bool
-
-	v := os.Getenv(deliveryJudgesEnv)
 	for j := range numJudges {
-		on[j] = v == ""
+		on[j] = slice.Judges(judgeNames[j])
 	}
 
-	for name := range strings.SplitSeq(v, ",") {
-		if i := slices.Index(judgeNames[:], name); i >= 0 {
-			on[i] = true
-		} else if name != "" {
-			t.Fatalf("%s: no part %q", deliveryJudgesEnv, name)
-		}
-	}
-
-	return on
+	return slice, on
 }
 
 // deliverySess is one map session of a node and the client it writes to.
@@ -598,6 +593,7 @@ func newDeliveryWorld(t *rapid.T, r *deliveryRun, c deliveryCombo, w policymodel
 	dw.p = newPBTWorld(t, w, func(cfg *types.Config) {
 		cfg.Policy.CapabilitySources, cfg.Policy.FilterChunks = c.capSources, c.chunks
 	})
+	dw.p.unstored = !r.judges[judgeStored]
 
 	if snap := dw.p.s.Snapshot(); snap.CapabilitySources() != c.capSources || snap.FilterChunks() != c.chunks {
 		t.Fatalf("test sanity: %s built a world with capability_sources=%t/filter_chunks=%t", c, snap.CapabilitySources(), snap.FilterChunks())
@@ -1080,7 +1076,6 @@ func (dw *deliveryWorld) fresh(at string) map[types.NodeID]*netmap.NetworkMap {
 			continue
 		}
 
-		fresh := newFreshSession(dw.t, dw.p.cfg, snap, id, s.capVer)
 		have := s.client.nm
 
 		if dw.sess[id] == s {
@@ -1106,8 +1101,13 @@ func (dw *deliveryWorld) fresh(at string) map[types.NodeID]*netmap.NetworkMap {
 			}
 		}
 
+		if !dw.judges[judgeClient] {
+			continue
+		}
+
 		// The client is a function of what it read: the same netmap held
 		// against the same first map was judged already.
+		fresh := newFreshSession(dw.t, dw.p.cfg, snap, id, s.capVer)
 		if s.judged.nm == have && string(s.judged.wire) == string(fresh.wire) {
 			continue
 		}
@@ -1499,8 +1499,8 @@ const churnIDs = 1000
 // of the client's chunks (policyv2.FilterChunks) is held to the real
 // client after every response, and used alone only where the real client
 // cannot go: chunk names held, and a client keeping them across sessions.
-// Each failure names its part ([deliveryJudge]); deliveryJudgesEnv runs
-// some parts alone.
+// Each failure names its part ([deliveryJudge]); a slice
+// ([policymodel.Slice]) runs some parts alone, over some shapes.
 func TestDeliveryConvergesThroughTheClient(t *testing.T) {
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "false")
 	// Each world sets its own options. A configuration can only pin an
@@ -1509,7 +1509,7 @@ func TestDeliveryConvergesThroughTheClient(t *testing.T) {
 	t.Setenv(state.TestFilterChunksEnv, "false")
 
 	r := &deliveryRun{
-		probes: probeCache{}, judges: deliveryJudges(t), steps: 5,
+		probes: probeCache{}, steps: 5,
 		reach: deliveryReach{wakes: newWakeTally(), writes: map[string]int{}, scripts: map[string]int{}},
 	}
 
@@ -1528,6 +1528,8 @@ func TestDeliveryConvergesThroughTheClient(t *testing.T) {
 		r.steps = 1
 	}
 
+	r.slice, r.judges = deliverySlice(t)
+
 	rapid.Check(t, func(t *rapid.T) { playDelivery(t, r) })
 
 	reach := r.reach
@@ -1535,8 +1537,11 @@ func TestDeliveryConvergesThroughTheClient(t *testing.T) {
 	t.Log(&r.ref)
 
 	// What follows asks what the run reached, which takes scenarios of
-	// full length: under the race detector they are one step.
-	if testing.Short() || util.RaceEnabled {
+	// full length, the whole property: under the race detector they are
+	// one step.
+	if testing.Short() || util.RaceEnabled || !r.slice.Whole() {
+		t.Logf("slice: %v; %d cases outside it", r.slice, r.outside)
+
 		return
 	}
 
@@ -1580,13 +1585,22 @@ func TestDeliveryConvergesThroughTheClient(t *testing.T) {
 type deliveryRun struct {
 	reach  deliveryReach
 	probes probeCache
+	slice  policymodel.Slice
 	judges [numJudges]bool
 	steps  int
 	ref    referenceTally
+	// outside counts the cases the slice dropped.
+	outside int
 }
 
 func playDelivery(t *rapid.T, r *deliveryRun) {
 	s := policymodel.Scenarios(r.steps).Draw(t, "scenario")
+	if !r.slice.Holds(s) {
+		r.outside++
+
+		return
+	}
+
 	coalesce := pbtChance(t, 3, "coalesce")
 	mixed := pbtChance(t, 4, "mixed-versions")
 
