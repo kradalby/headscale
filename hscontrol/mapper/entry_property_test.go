@@ -57,6 +57,9 @@ type regInfo struct {
 	key       string
 	keyUser   uint
 	ephemeral bool
+	// tagged is set for a tagged key, which outlives the user who made
+	// it; a user's own key goes with the user.
+	tagged bool
 }
 
 // nodeWrite counts the calls one node's write made: to production entry
@@ -307,7 +310,7 @@ func (p *pbtWorld) enrol(nc newcomer, w policymodel.World, several bool) {
 			p.t.Fatalf("n%d: pre-auth key: %v", id, err)
 		}
 
-		ri.key = pak.Key
+		ri.key, ri.tagged = pak.Key, n.Tagged()
 
 		hi := bare
 		if alone {

@@ -185,6 +185,8 @@ func (p *pbtWorld) write(w policymodel.World) {
 					p.t.Fatalf("delete user %d: %v", u.ID, err)
 				}
 			})
+
+			p.forgetKeys(u.ID)
 		}
 	}
 
@@ -337,6 +339,17 @@ func (p *pbtWorld) leaveUsers(cur, w policymodel.World, built func(int) *types.N
 	}
 
 	return cur, early, mids
+}
+
+// forgetKeys drops the pre-auth keys user uid made for itself, which go
+// with it: a node it tagged away can no longer restart with one.
+func (p *pbtWorld) forgetKeys(uid uint) {
+	for id, ri := range p.reg {
+		if ri.keyUser == uid && !ri.tagged {
+			ri.key = ""
+			p.reg[id] = ri
+		}
+	}
 }
 
 // builtOne is n of w as built, with no user: a tagged node.
