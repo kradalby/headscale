@@ -3,13 +3,15 @@ package policymodel
 import (
 	"slices"
 
+	"github.com/juanfont/headscale/hscontrol/types"
 	"pgregory.net/rapid"
 )
 
 // Neighbourhoods where findings came from, drawn often enough that what
 // lies beside a finding is met too: a via grant to autogroup:internet
 // meeting exit nodes and public subnet routes, routes announced unapproved
-// inside a via destination, and contested clauses stacked on one node.
+// inside a via destination, contested clauses stacked on one node, and a
+// node moving onto an identity that auto-approves a route it announces.
 
 // viaInternetWorlds: one world in so many draws [viaInternetWorld].
 const viaInternetWorlds = 6
@@ -201,4 +203,163 @@ func stackedRouter(w *World, who int) {
 		Rule{Src: []Sel{all}, Dst: []Dest{{Sel: Sel{Kind: SelSelf}}}},
 		Rule{Src: []Sel{all}, Dst: []Dest{{Sel: Sel{Kind: SelPrefix, I: publicPrefix6}}}},
 		Rule{Src: []Sel{{Kind: SelMember}}, Dst: []Dest{{Sel: Sel{Kind: SelInternet}}}})
+}
+
+// approverScripts: one scenario in so many ends with [approverScript].
+const approverScripts = 6
+
+// The ways a node comes to be approved for a route it announces, once the
+// auto-approvers start approving it for an identity it does not hold.
+const (
+	approverRetag    = iota // retagged onto the approving tag
+	approverLogin           // a tagged node logs in as the approving user
+	approverAnnounce        // it announces another route
+	numApproverWays
+)
+
+// approverScript is steps on a node of w that announces a route its
+// owner's approvers do not approve: it announces the route where it does
+// not already; the auto-approvers come to approve the route for a tag the
+// node does not carry, or for a user, and every session reads; then the
+// node is retagged onto the tag, logs in as the user, or announces a
+// further route, and every session reads. Auto-approval runs on the last
+// step alone, if at all. None when no node of w is addressed or no route
+// is left to approve, or w holds a token users made ambiguous, which no
+// policy write gets past.
+func approverScript(w World, who, way int) []Step {
+	v := NewView(w)
+	nodes := w.Topology.Nodes
+
+	if len(v.AmbiguousRefs()) > 0 {
+		return nil
+	}
+
+	all := make([]types.NodeID, 0, len(nodes))
+	for _, n := range nodes {
+		all = append(all, n.ID)
+	}
+
+	for k := range nodes {
+		n := nodes[(who+k)%len(nodes)]
+		if len(n.Addrs()) == 0 || way == approverLogin && !n.Tagged() {
+			continue
+		}
+
+		route, ok := unapprovable(v, n)
+		if !ok {
+			continue
+		}
+
+		by, last, ok := approverFor(v, n, way, route)
+		if !ok {
+			continue
+		}
+
+		var steps []Step
+		if !slices.Contains(n.Announced, route) {
+			steps = append(steps, Step{Edits: []Edit{Announce{n.ID, []int{route}}}})
+		}
+
+		// One entry a route: the document keys approvers by it.
+		aa := w.Policy.AutoApprovers.clone()
+		if i := slices.IndexFunc(aa.Routes, func(ra RouteApproval) bool { return ra.Route == route }); i >= 0 {
+			aa.Routes[i].By = append(aa.Routes[i].By, by)
+		} else {
+			aa.Routes = append(aa.Routes, RouteApproval{Route: route, By: []Sel{by}})
+		}
+
+		return append(steps,
+			Step{Edits: []Edit{SetAutoApprovers{aa}}, Reads: all},
+			Step{Edits: []Edit{last}, Reads: all})
+	}
+
+	return nil
+}
+
+// unapprovable is a subnet route n announces unapproved, else one it may
+// announce, that no approver approves for it.
+func unapprovable(v *View, n Node) (int, bool) {
+	for _, r := range dropRoutes(n.Announced, n.Approved) {
+		if r < numRulePrefixes && !v.Approvable(n, r) {
+			return r, true
+		}
+	}
+
+	for _, r := range []int{0, publicPrefix, touching, publicPrefix6, 2} {
+		if !slices.Contains(n.Announced, r) && !slices.Contains(n.Approved, r) && !v.Approvable(n, r) {
+			return r, true
+		}
+	}
+
+	return 0, false
+}
+
+// approverFor is the approver of route for n's way onto it, and the edit
+// that takes n there: a tag n does not carry, a user other than n's own
+// whom a token names alone, or n's own owner for a further announcement.
+func approverFor(v *View, n Node, way, route int) (Sel, Edit, bool) {
+	switch way {
+	case approverRetag:
+		for tag := range numTags {
+			if !slices.Contains(n.Tags, tag) {
+				return Sel{Kind: SelTag, I: tag}, Retag{n.ID, []int{tag}, 0}, true
+			}
+		}
+	case approverLogin:
+		for ref := range UserRefs {
+			if us := v.RefUsers(ref); len(us) == 1 {
+				return Sel{Kind: SelUser, I: ref}, Retag{n.ID, nil, us[0]}, true
+			}
+		}
+	case approverAnnounce:
+		by, ok := ownIdentity(v, n)
+		if !ok {
+			break
+		}
+
+		for _, r := range []int{0, publicPrefix, touching, publicPrefix6} {
+			if r != route && !slices.Contains(n.Announced, r) {
+				return by, Announce{n.ID, []int{r}}, true
+			}
+		}
+	}
+
+	return Sel{}, nil, false
+}
+
+// ownIdentity is a selector naming n by what owns it: its first tag, or
+// a token naming its user alone.
+func ownIdentity(v *View, n Node) (Sel, bool) {
+	if n.Tagged() {
+		return Sel{Kind: SelTag, I: n.Tags[0]}, true
+	}
+
+	for ref := range UserRefs {
+		if us := v.RefUsers(ref); len(us) == 1 && us[0] == n.User {
+			return Sel{Kind: SelUser, I: ref}, true
+		}
+	}
+
+	return Sel{}, false
+}
+
+// approvingTag is a tag the policy defines that n does not carry and
+// that auto-approves a route n announces unapproved: a retag onto it
+// approves the route.
+func approvingTag(w World, n Node) (int, bool) {
+	if len(dropRoutes(n.Announced, n.Approved)) == 0 {
+		return 0, false
+	}
+
+	for tag := range numTags {
+		if !w.Policy.DefinesTag(tag) || slices.Contains(n.Tags, tag) {
+			continue
+		}
+
+		if after, ok := w.Apply(Retag{n.ID, []int{tag}, 0}).Topology.Node(n.ID); ok && len(after.Approved) > len(n.Approved) {
+			return tag, true
+		}
+	}
+
+	return 0, false
 }

@@ -11,7 +11,8 @@ import (
 // proneShapes are the neighbourhoods findings came from (see prone.go):
 // via grants to autogroup:internet at exit nodes and public routes, routes
 // announced unapproved inside a destination, several contested clauses at
-// one node. Their floors sit five standard deviations under what the
+// one node, and nodes moving onto an identity that auto-approves a route
+// they announce. Their floors sit five standard deviations under what the
 // coverage sample holds, as a count drawn afresh would.
 var proneShapes = []Shape{
 	{Name: "via-exit-router-among-sources", Why: "a via exit node among the sources of its grant to autogroup:internet", Min: 0.025, World: func(v *View) bool {
@@ -78,6 +79,28 @@ var proneShapes = []Shape{
 		})
 	}},
 	{Name: "three-clauses-at-a-node", Why: "three contested clauses each deciding at one node", Min: 0.02, World: threeClauses},
+	{Name: "retag-onto-approver", Why: "a retag onto a tag that auto-approves a route the node announces", Min: 0.01, Step: func(b, a *View, st Step) bool {
+		return slices.ContainsFunc(edits[Retag](st), func(e Retag) bool {
+			return len(e.Tags) > 0 && nodeMoved(b, a, e.ID, func(was, is Node) bool { return len(dropRoutes(is.Approved, was.Approved)) > 0 })
+		})
+	}},
+	{Name: "login-onto-approver", Why: "a tagged node logging in as a user who auto-approves a route it announces", Min: 0.008, Step: func(b, a *View, st Step) bool {
+		return slices.ContainsFunc(edits[Retag](st), func(e Retag) bool {
+			return len(e.Tags) == 0 && nodeMoved(b, a, e.ID, func(was, is Node) bool {
+				return was.Tagged() && slices.ContainsFunc(dropRoutes(is.Announced, is.Approved), func(r int) bool { return a.Approvable(is, r) })
+			})
+		})
+	}},
+	{Name: "approvers-moved-under-announced", Why: "the auto-approvers come to approve a route a node announces, which nothing approves yet", Min: 0.01, Step: func(b, a *View, st Step) bool {
+		return len(edits[SetAutoApprovers](st)) > 0 && a.anyNode(func(n Node) bool {
+			return slices.ContainsFunc(dropRoutes(n.Announced, n.Approved), func(r int) bool {
+				was, ok := b.World.Topology.Node(n.ID)
+
+				return ok && !b.Approvable(was, r) && a.Approvable(n, r)
+			})
+		})
+	}},
+	{Name: "approved-after-approvers-moved", Why: "a route approved by a later write once the auto-approvers moved under it", Min: 0.009, Seq: approvedAfterApproversMoved},
 }
 
 func publicRoute(r int) bool { return r < numRulePrefixes && public(Prefixes[r]) }
@@ -206,4 +229,32 @@ func ruleText(rules []tailcfg.FilterRule) string {
 	slices.Sort(out)
 
 	return strings.Join(out, "\n")
+}
+
+// approvedAfterApproversMoved reports whether a step's auto-approvers
+// came to approve a route a node announced unapproved, and a later step
+// approved it.
+func approvedAfterApproversMoved(vs []*View, steps []Step) bool {
+	for i, st := range steps {
+		if len(edits[SetAutoApprovers](st)) == 0 {
+			continue
+		}
+
+		for _, n := range vs[i+1].nodes {
+			for _, r := range dropRoutes(n.Announced, n.Approved) {
+				was, ok := vs[i].World.Topology.Node(n.ID)
+				if !ok || vs[i].Approvable(was, r) || !vs[i+1].Approvable(n, r) {
+					continue
+				}
+
+				for j := i + 2; j < len(vs); j++ {
+					if later, ok := vs[j].World.Topology.Node(n.ID); ok && slices.Contains(later.AutoApproved, r) {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	return false
 }

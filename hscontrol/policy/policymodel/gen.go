@@ -49,7 +49,9 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 		// one; a node stopping being named through an address it shares,
 		// where the start shares addresses; a node's form flipping, its
 		// address moving and its form flipping back, unread until the
-		// end; and the same with a source of its rules moving instead.
+		// end; and the same with a source of its rules moving instead; and,
+		// last, a node moving onto an identity that auto-approves a route
+		// it announces.
 		move := chance(t, 2, "anchor-move")
 		chain := chance(t, shareChains, "share-chain")
 		script := chance(t, 8, "flip-script")
@@ -58,6 +60,8 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 		who := rapid.IntRange(0, anyOf).Draw(t, "flipper")
 		tour := chance(t, 3, "form-tour")
 		stops := tourStops.Draw(t, "tour-stops")
+		approver := chance(t, approverScripts, "approver-script")
+		way := index(t, numApproverWays, "approver-way")
 
 		var scripted []Step
 
@@ -118,6 +122,19 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 
 		if len(s.Steps) > total {
 			s.Steps = s.Steps[:total]
+		}
+
+		// A node moving onto an approver comes after the drawn steps,
+		// which make room for it: cut short, it would not move.
+		if approver {
+			if as := approverScript(s.end(), who, way); len(as) > 0 {
+				if over := len(s.Steps) + len(as) - total; over > 0 {
+					s.Steps = s.Steps[:max(0, len(s.Steps)-over)]
+					as = approverScript(s.end(), who, way)
+				}
+
+				s.Steps = append(s.Steps, as...)
+			}
 		}
 
 		// A primary goes down last, so that no drawn step after it needs
@@ -1600,6 +1617,14 @@ func drawRetag(t *rapid.T, w World, n Node) (Edit, bool) {
 
 	untag := chance(t, 2, "untag")
 	tags := drawTags(t, defined)
+
+	// A retag onto a tag that auto-approves a route the node announces
+	// unapproved, which the drawn tags rarely are.
+	if approve := chance(t, 3, "onto-approver"); approve && !untag {
+		if tag, ok := approvingTag(w, n); ok {
+			tags = []int{tag}
+		}
+	}
 
 	switch {
 	case n.Tagged() && untag && len(w.Topology.Users) > 0:
