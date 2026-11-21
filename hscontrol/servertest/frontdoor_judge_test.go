@@ -233,7 +233,9 @@ func (fd *frontDoor) judgeClients(at string) {
 		}
 	}
 
-	ref := fd.run.held.At(policymodel.Moment{World: w, Elections: fd.elections, Unheld: fd.unheld})
+	m := statemodel.Moment(fd)
+	m.Unheld = fd.unheld
+	ref := fd.run.held.At(m)
 
 	for _, n := range w.Topology.Nodes {
 		if n.Offline {
@@ -337,7 +339,15 @@ func durable(nm *netmap.NetworkMap) string {
 // requireStored holds what the server stored to the model
 // ([statemodel.Stored]).
 func (fd *frontDoor) requireStored(after string) {
-	if d := statemodel.Stored(fd.srv.State(), fd.w, func(id types.NodeID) statemodel.Joined { return fd.nodes[id].Joined }); d != "" {
+	if d := statemodel.Stored(fd); d != "" {
 		fd.t.Fatalf("after %s: %s", after, d)
 	}
 }
+
+// The front door is a level the shared judges read.
+var _ statemodel.Level = (*frontDoor)(nil)
+
+func (fd *frontDoor) Model() policymodel.World                 { return fd.w }
+func (fd *frontDoor) State() *state.State                      { return fd.srv.State() }
+func (fd *frontDoor) Joined(id types.NodeID) statemodel.Joined { return fd.nodes[id].Joined }
+func (fd *frontDoor) Elections() *policymodel.Elections        { return fd.elections }

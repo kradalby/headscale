@@ -33,11 +33,12 @@ type Joined struct {
 	Tagged bool
 }
 
-// Stored holds what s stored to w, the model it was driven to: every node
-// equals the model's on what the model holds and on how it joined, the
-// users equal the model's, and every database row equals its node in
+// Stored holds what l's State stored to the model l was driven to: every
+// node equals the model's on what the model holds and on how it joined,
+// the users equal the model's, and every database row equals its node in
 // memory. It says how they differ, or "".
-func Stored(s *state.State, w policymodel.World, joined func(types.NodeID) Joined) string {
+func Stored(l Level) string {
+	s, w := l.State(), l.Model()
 	snap := s.Snapshot()
 	users, nodes := w.Topology.Build()
 
@@ -58,7 +59,7 @@ func Stored(s *state.State, w policymodel.World, joined func(types.NodeID) Joine
 	for i, tn := range nodes {
 		nv, _ := snap.GetNode(tn.ID)
 
-		if d := storedDiff(nv.AsStruct(), tn, w.Topology.Nodes[i], joined(tn.ID)); d != "" {
+		if d := storedDiff(nv.AsStruct(), tn, w.Topology.Nodes[i], l.Joined(tn.ID)); d != "" {
 			return fmt.Sprintf("stored: n%d: %s", tn.ID, d)
 		}
 	}

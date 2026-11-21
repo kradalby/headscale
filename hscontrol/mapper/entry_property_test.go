@@ -769,12 +769,12 @@ func (p *pbtWorld) endpoint(id types.NodeID, eps []netip.AddrPort) {
 	})
 }
 
-// requireStored holds what production stored to w after a write
+// requireStored holds what production stored to the model after a write
 // ([statemodel.Stored]).
-func (p *pbtWorld) requireStored(w policymodel.World, after string) {
+func (p *pbtWorld) requireStored(after string) {
 	p.t.Helper()
 
-	if d := statemodel.Stored(p.s, w, func(id types.NodeID) statemodel.Joined { return p.reg[id] }); d != "" {
+	if d := statemodel.Stored(p); d != "" {
 		p.t.Fatalf("after %s: %s", after, d)
 	}
 }

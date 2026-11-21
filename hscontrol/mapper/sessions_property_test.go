@@ -329,7 +329,7 @@ func (p *pbtWorld) session(sw sessionWrite) string {
 
 	n := from[sw.Who%len(from)]
 	did := p.sessionAt(n, sw)
-	p.requireStored(p.w, "a "+sw.Kind.String()+" write")
+	p.requireStored("a " + sw.Kind.String() + " write")
 
 	return fmt.Sprintf("n%d: %s", n.ID, did)
 }
@@ -480,7 +480,7 @@ func (p *pbtWorld) sessionTo(id types.NodeID, kind sessionKind, value int) strin
 	}
 
 	did := p.sessionAt(n, sessionWrite{Kind: kind, Value: value})
-	p.requireStored(p.w, "a "+kind.String()+" write")
+	p.requireStored("a " + kind.String() + " write")
 
 	return fmt.Sprintf("n%d: %s", id, did)
 }

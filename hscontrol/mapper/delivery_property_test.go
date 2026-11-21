@@ -25,6 +25,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/state"
+	"github.com/juanfont/headscale/hscontrol/state/statemodel"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"pgregory.net/rapid"
@@ -1290,7 +1291,10 @@ func (r *deliveryRun) holdToReference(t *rapid.T, at string, worlds []*deliveryW
 	// node connected, the prober's marks, who held each route last.
 	w := worlds[0].p.w
 
-	ref := r.ref.At(policymodel.Moment{World: w, Elections: worlds[0].p.elections, Shared: shared})
+	m := statemodel.Moment(worlds[0].p)
+	m.Shared = shared
+
+	ref := r.ref.At(m)
 	if ref == nil {
 		return
 	}

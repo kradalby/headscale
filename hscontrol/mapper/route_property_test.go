@@ -73,6 +73,14 @@ type pbtWorld struct {
 	storing bool
 }
 
+// The driver is a level the shared judges read.
+var _ statemodel.Level = (*pbtWorld)(nil)
+
+func (p *pbtWorld) Model() policymodel.World                 { return p.w }
+func (p *pbtWorld) State() *state.State                      { return p.s }
+func (p *pbtWorld) Joined(id types.NodeID) statemodel.Joined { return p.reg[id] }
+func (p *pbtWorld) Elections() *policymodel.Elections        { return p.elections }
+
 func newPBTWorld(t pbtT, w policymodel.World, configure ...func(*types.Config)) *pbtWorld {
 	t.Helper()
 
@@ -284,7 +292,7 @@ func (p *pbtWorld) write(w policymodel.World) {
 	}
 
 	p.w = w
-	p.requireStored(w, p.kindOr("a write"))
+	p.requireStored(p.kindOr("a write"))
 }
 
 // edit commits e, alone.
