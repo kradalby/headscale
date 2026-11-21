@@ -613,6 +613,10 @@ var errUnreachable = errors.New("not something headscale's writes produce")
 func checkReachable(w World) error {
 	tp := w.Topology
 
+	if s, ok := strayIndex(w.Policy); ok {
+		return fmt.Errorf("%w: %v carries an index its kind reads none of: %#v", errUnreachable, s, s)
+	}
+
 	if !slices.IsSortedFunc(tp.Users, func(a, b User) int { return cmp.Compare(a.ID, b.ID) }) {
 		return fmt.Errorf("%w: users out of order: %v", errUnreachable, tp.Users)
 	}
@@ -659,6 +663,45 @@ func checkReachable(w World) error {
 	}
 
 	return nil
+}
+
+// strayIndex returns a selector of p holding an index its kind reads
+// none of. It prints as its kind alone, so the model would hold one
+// selector twice where headscale's table holds it once.
+func strayIndex(p Policy) (Sel, bool) {
+	var (
+		stray Sel
+		found bool
+		walk  func(v reflect.Value)
+	)
+
+	walk = func(v reflect.Value) {
+		switch {
+		case found:
+		case v.Type() == selType:
+			s, _ := reflect.TypeAssert[Sel](v)
+
+			switch s.Kind { //nolint:exhaustive // the rest read no index
+			case SelUser, SelGroup, SelTag, SelHost, SelPrefix:
+			default:
+				stray, found = s, s.I != 0
+			}
+		case v.Kind() == reflect.Struct:
+			for i := range v.NumField() {
+				if v.Type().Field(i).IsExported() {
+					walk(v.Field(i))
+				}
+			}
+		case v.Kind() == reflect.Slice, v.Kind() == reflect.Array:
+			for i := range v.Len() {
+				walk(v.Index(i))
+			}
+		}
+	}
+
+	walk(reflect.ValueOf(p))
+
+	return stray, found
 }
 
 // checkWrite holds e, written to w, to what headscale accepts.

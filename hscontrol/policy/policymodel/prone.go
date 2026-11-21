@@ -90,8 +90,15 @@ func viaInternetWorld(w *World, who int, d viaInternet) {
 	}
 
 	var src []Sel
+	// Only a tag reads the index: any other kind keeps it zero, or it
+	// would be a second selector of that kind to the model.
 	for _, k := range viaInternetSrcs[d.src] {
-		src = append(src, Sel{Kind: k, I: tag})
+		s := Sel{Kind: k}
+		if k == SelTag {
+			s.I = tag
+		}
+
+		src = append(src, s)
 	}
 
 	grant := Rule{Src: src, Dst: []Dest{{Sel: Sel{Kind: SelInternet}}}, IP: []IP{{Proto: slices.Index(Protos, viaInternetProtos[d.proto])}}, Via: []int{tag}}
