@@ -101,7 +101,12 @@ func (r *Ref) viaRules(v RefNode, q netip.Prefix) []refRule {
 //     ("an overlapping grant without via uses the ordinary tailnet-wide
 //     election instead" and grants with other tags combine elections,
 //     which this does not follow: unjudged);
-//   - an exit route a via grant steers: unjudged;
+//   - an exit route a via grant steers: only from an exit node carrying a
+//     via tag of such a grant, or from any where a rule without via lets
+//     viewer reach the internet ("A user who matches several via grants
+//     can use the exit nodes of all of them. A via grant does not hide
+//     exit nodes from a user who also has a rule that allows access to
+//     the internet without via");
 //   - a route viewer serves itself that it is not given: unjudged
 //     (headscale shows a standby its primary whatever the policy, which no
 //     document states).
@@ -139,7 +144,11 @@ func (r *Ref) ServedRoutes(viewer, peer types.NodeID) ([]netip.Prefix, []netip.P
 			} else if id == peer {
 				want = append(want, q)
 			}
-		case isExitRoute(q) || has || !sameVia(via):
+		case isExitRoute(q):
+			if slices.ContainsFunc(via, func(rl refRule) bool { return p.hasTag(rl.via) }) || r.internetWithoutVia(v) {
+				want = append(want, q)
+			}
+		case has || !sameVia(via):
 			unjudged = append(unjudged, q)
 		default:
 			if id, _ := r.ViaPrimary(via[0].via, q); p.hasTag(via[0].via) && id == peer {
@@ -152,6 +161,14 @@ func (r *Ref) ServedRoutes(viewer, peer types.NodeID) ([]netip.Prefix, []netip.P
 	slices.SortFunc(unjudged, netip.Prefix.Compare)
 
 	return want, unjudged
+}
+
+// internetWithoutVia reports whether a port rule without via lets v reach
+// the internet, which gives it every exit route.
+func (r *Ref) internetWithoutVia(v RefNode) bool {
+	return slices.ContainsFunc(r.rules, func(rl refRule) bool {
+		return len(rl.via) == 0 && len(rl.ip) > 0 && r.ownSelf(rl, v) && on(v, rl.src) && rl.reachesInternet()
+	})
 }
 
 // sameVia reports whether rules all carry one set of via tags.
