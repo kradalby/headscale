@@ -998,7 +998,10 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 
 // answered holds what a registration answered tc to what the server
 // stored: the node of its new key, owned by the user it was told it logs
-// in as, the tagged devices' for a tagged node.
+// in as, the tagged devices' for a tagged node. The client takes its user
+// from its first map once one arrives, which shows a tagged node itself
+// as a user of its own (taggedSelfUserID in mapper), so for a tagged node
+// that ID is its owner too.
 func (fd *frontDoor) answered(at string, id types.NodeID, tc *TestClient) {
 	p := tc.Persist()
 
@@ -1012,7 +1015,7 @@ func (fd *frontDoor) answered(at string, id types.NodeID, tc *TestClient) {
 		owner = nv.UserID().Get()
 	}
 
-	if got := uint(p.UserProfile.ID); got != owner { //nolint:gosec // small
+	if got := uint(p.UserProfile.ID); got != owner && (!nv.IsTagged() || got != types.TaggedDevicesUserID+1+uint(nv.ID())) { //nolint:gosec // small
 		fd.t.Fatalf("%s: n%d's client was told it logs in as user %d; the server stored its node as user %d's", at, nv.ID(), got, owner)
 	}
 }
@@ -1565,23 +1568,24 @@ func (fd *frontDoor) loginWithKey(at string) bool {
 	return true
 }
 
-// ownsTag reports whether owners of tag t in w name n.
+// ownsTag reports whether node n may take tag t at a login, on its own
+// account: a user's node through its user. A tag-owned node carries no
+// user, and tags among a tag's owners resolve to no node, so it owns no
+// tag (processReauthTags, NodeCanHaveTag, resolveTagOwners).
 func ownsTag(w policymodel.World, n policymodel.Node, t int) bool {
-	owners := w.Policy.TagOwners[t]
-
-	return slices.ContainsFunc(policymodel.NewView(w).MembersOf(owners...), func(m policymodel.Node) bool { return m.ID == n.ID })
+	return !n.Tagged() && userOwnsTag(w, n.User, t)
 }
 
 // fdProbe is the ID of a node no world holds, standing for a user's device.
 const fdProbe types.NodeID = 1 << 30
 
-// userOwnsTag reports whether owners of tag t in w name user u: whether a
-// device of u's would be named.
+// userOwnsTag reports whether owners of tag t in w name user u, directly
+// or through a group: whether they name a device of u's.
 func userOwnsTag(w policymodel.World, u uint, t int) bool {
 	probe := policymodel.Node{ID: fdProbe, User: u}
 	w.Topology.Nodes = append(slices.Clone(w.Topology.Nodes), probe)
 
-	return ownsTag(w, probe, t)
+	return slices.ContainsFunc(policymodel.NewView(w).MembersOf(w.Policy.TagOwners[t]...), func(m policymodel.Node) bool { return m.ID == fdProbe })
 }
 
 // tagAsk is a login as u onto node n requesting tags.
