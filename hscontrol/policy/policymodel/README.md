@@ -71,6 +71,11 @@ production by a hand-built case that fails once production changes.
 `git grep 'TODO(kradalby): policy/'` lists them; `overwake/` lists the wakes
 that are wider than needed.
 
+A judge forgives a difference only where the reference less every clause is
+production exactly, so each clause must restate headscale beside all the
+others. A failure that names clauses "restated inexactly" is one that does
+not: fix that clause's restatement, never the judge.
+
 ## Changing the generators
 
 - Draw only what the API and the client protocol can produce. Database-only
