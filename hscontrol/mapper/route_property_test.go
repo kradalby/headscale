@@ -134,8 +134,9 @@ func (p *pbtWorld) call(write func()) {
 	}
 }
 
-// write brings the State from p.w to w: deleted nodes and users, changed
-// and new users, the policy, then new and changed nodes (see
+// write brings the State from p.w to w: deleted nodes, nodes leaving a
+// deleted user ([pbtWorld.leaveUsers]), deleted users, changed and new
+// users, the policy, then new and changed nodes (see
 // [pbtWorld.register] and [pbtWorld.change]), and holds what production
 // stored to w. A single edit touches one of them; a batch (a world written
 // from scratch, a step taken back) needs that order — a policy can name a
@@ -157,6 +158,24 @@ func (p *pbtWorld) write(w policymodel.World) {
 			cur = cur.Apply(policymodel.Leave{ID: n.ID})
 		}
 	}
+
+	// built is node i of w as built, with its user as the State holds it,
+	// as registration loads it.
+	built := func(i int) *types.Node {
+		tn := nodes[i]
+		if tn.UserID != nil {
+			u, err := p.s.GetUserByID(types.UserID(*tn.UserID))
+			if err != nil {
+				p.t.Fatalf("node %d's user: %v", tn.ID, err)
+			}
+
+			tn.User = u
+		}
+
+		return tn
+	}
+
+	cur, early, mids := p.leaveUsers(cur, w, built)
 
 	for _, u := range p.w.Topology.Users {
 		if _, ok := w.Topology.User(u.ID); !ok {
@@ -237,20 +256,15 @@ func (p *pbtWorld) write(w policymodel.World) {
 
 	for i, n := range w.Topology.Nodes {
 		was, existed := p.w.Topology.Node(n.ID)
-		if existed && reflect.DeepEqual(was, n) {
+		if mid, ok := mids[n.ID]; ok {
+			was = mid
+		}
+
+		if existed && reflect.DeepEqual(was, n) || early[n.ID] {
 			continue
 		}
 
-		tn := nodes[i]
-		if tn.UserID != nil {
-			// The user as the State holds it, as registration loads it.
-			u, err := p.s.GetUserByID(types.UserID(*tn.UserID))
-			if err != nil {
-				p.t.Fatalf("node %d's user: %v", n.ID, err)
-			}
-
-			tn.User = u
-		}
+		tn := built(i)
 
 		if !existed {
 			fresh = append(fresh, newcomer{n: n, tn: tn})
@@ -279,6 +293,57 @@ func (p *pbtWorld) edit(e policymodel.Edit) {
 
 	p.write(p.w.Apply(e))
 	p.kind = ""
+}
+
+// leaveUsers writes, of w's nodes, those leaving a user the batch deletes,
+// under the document as it stands, before the deletion: headscale deletes
+// no user who owns a node. Tags that document does not define a node
+// takes after the document's write, holding meanwhile those it does, or,
+// with none, the target's through the store. It returns the world as
+// written, the nodes written whole, and where the others stand.
+func (p *pbtWorld) leaveUsers(cur, w policymodel.World, built func(int) *types.Node) (policymodel.World, map[types.NodeID]bool, map[types.NodeID]policymodel.Node) {
+	early := map[types.NodeID]bool{}
+	mids := map[types.NodeID]policymodel.Node{}
+
+	for i, n := range w.Topology.Nodes {
+		was, existed := p.w.Topology.Node(n.ID)
+		if _, kept := w.Topology.User(was.User); !existed || was.Tagged() || kept || reflect.DeepEqual(was, n) {
+			continue
+		}
+
+		defined := slices.DeleteFunc(slices.Clone(n.Tags), func(t int) bool { return !cur.Policy.DefinesTag(t) })
+
+		switch {
+		case len(defined) == len(n.Tags):
+			p.change(cur, was, n, built(i))
+			cur = withNode(cur, n)
+			early[n.ID] = true
+		case len(defined) > 0:
+			next := cur.Apply(policymodel.Retag{ID: n.ID, Tags: defined})
+			mid, _ := next.Topology.Node(n.ID)
+			p.change(cur, was, mid, builtOne(next, mid))
+			cur, mids[n.ID] = next, mid
+		default:
+			mid := was
+			mid.Tags, mid.User = n.Tags, 0
+			tags := built(i).Tags
+
+			done := p.begin(p.kindOr("batch"))
+			p.store("tags no document defines yet", n.ID, func(c *types.Node) { c.Tags, c.UserID, c.User = tags, nil, nil })
+			done()
+
+			cur, mids[n.ID] = withNode(cur, mid), mid
+		}
+	}
+
+	return cur, early, mids
+}
+
+// builtOne is n of w as built, with no user: a tagged node.
+func builtOne(w policymodel.World, n policymodel.Node) *types.Node {
+	_, nodes := policymodel.Topology{Users: w.Topology.Users, Nodes: []policymodel.Node{n}}.Build()
+
+	return nodes[0]
 }
 
 // withNode is w with n in place of the node of its ID.
