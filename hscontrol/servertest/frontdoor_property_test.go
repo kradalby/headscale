@@ -957,8 +957,9 @@ func without(from, rs []int) []int {
 
 // approve sets id's approved routes through the API, the whole list as
 // an admin does, adding add and dropping drop. The API takes one exit
-// route for both, so an edit of one family is written, and modelled, as
-// both.
+// route in the list for both: an edit of one family is written, and
+// modelled, as both, and a list still holding one family, as
+// auto-approval of a node announcing one leaves it, gains the other.
 func (fd *frontDoor) approve(at string, id types.NodeID, add, drop []int) {
 	n, _ := fd.w.Topology.Node(id)
 	exits := []int{exitRoute(4), exitRoute(6)}
@@ -982,6 +983,15 @@ func (fd *frontDoor) approve(at string, id types.NodeID, add, drop []int) {
 	for _, r := range add {
 		if !slices.Contains(want, r) {
 			want = append(want, r)
+		}
+	}
+
+	if slices.ContainsFunc(want, func(r int) bool { return slices.Contains(exits, r) }) {
+		for _, x := range exits {
+			if !slices.Contains(want, x) {
+				want, add = append(want, x), append(add, x)
+				fd.run.tally.edits["approval list holding one exit family: both"]++
+			}
 		}
 	}
 
