@@ -14,12 +14,14 @@ import (
 
 // Generators for the package's properties. Every draw shrinks towards the
 // plain case: the first alternative, false flags, the smallest counts. A
-// rare shape sits behind chance, which is false at zero. Cells and commits
-// are each one group the shrinker can drop whole.
+// rare shape sits behind chance, which is false at zero. Cells, commits,
+// edits and steps are each one group the shrinker can drop whole.
 //
 // The parts compose. cellGraphs draws cells; drawCommit draws one commit
 // against a graphModel; scenarios is a graph and the commits run on it,
-// which the scheduler, subscription and concurrency properties share. The
+// which the scheduler, subscription and concurrency properties share.
+// mapHistories draws Map edits and the pairs to compare; groupingCases adds
+// what GroupBy groups by and the steps it takes over such a history. The
 // plans hold indices and small numbers only, so a failure prints itself.
 
 // chance is true one time in k, and false at zero.
@@ -944,3 +946,485 @@ func (r *failureLog) Fatal(...any)          { r.failed = true }
 func (r *failureLog) FailNow()              { r.failed = true }
 func (r *failureLog) Fail()                 { r.failed = true }
 func (r *failureLog) Failed() bool          { return r.failed }
+
+// mapKeys bounds the keys of drawn Maps: few, so that edits collide.
+const mapKeys = 6
+
+// mapOpKind is one write of an edit.
+type mapOpKind uint8
+
+const (
+	mapSet     mapOpKind = iota // K = V
+	mapDelete                   // K removed
+	mapSetSame                  // K set to what it holds, or deleted while absent
+	mapReAdd                    // K deleted, then set to V
+	mapRestore                  // K set to V, then back to what it held
+)
+
+const mapOpKinds = int(mapRestore) + 1
+
+type mapOp struct {
+	Kind mapOpKind
+	K, V int
+}
+
+func (o mapOp) String() string {
+	switch o.Kind {
+	case mapDelete:
+		return fmt.Sprintf("del %d", o.K)
+	case mapSetSame:
+		return fmt.Sprintf("same %d", o.K)
+	case mapReAdd:
+		return fmt.Sprintf("readd %d=%d", o.K, o.V)
+	case mapRestore:
+		return fmt.Sprintf("restore %d=%d", o.K, o.V)
+	default:
+		return fmt.Sprintf("%d=%d", o.K, o.V)
+	}
+}
+
+// rootKind is how a lineage starts.
+type rootKind uint8
+
+const (
+	rootNew  rootKind = iota // NewMap of drawn entries
+	rootCopy                 // NewMap of the entries of version Of: equal, unrelated
+	rootZero                 // the zero Map
+	rootNil                  // a nil *Map
+)
+
+// editPlan is one step of a history: a new lineage, or an edit of the
+// version Base back from the latest, after Filler one-key edits of it.
+type editPlan struct {
+	Root   bool
+	Kind   rootKind
+	Of     int
+	Init   []mapOp
+	Base   int
+	Filler int
+	Ops    []mapOp
+}
+
+func (e editPlan) String() string {
+	if e.Root {
+		k := [...]string{"new", "copy", "zero", "nil"}[e.Kind]
+
+		switch e.Kind {
+		case rootNew:
+			return fmt.Sprintf("root %s %v", k, e.Init)
+		case rootCopy:
+			return fmt.Sprintf("root copy of -%d", e.Of)
+		default:
+			return "root " + k
+		}
+	}
+
+	s := fmt.Sprintf("edit -%d %v", e.Base, e.Ops)
+	if e.Filler > 0 {
+		s += fmt.Sprintf(" after %d fillers", e.Filler)
+	}
+
+	return s
+}
+
+// pairKind is how a pair's sides are read.
+type pairKind uint8
+
+const (
+	pairPlain  pairKind = iota
+	pairCursor          // Old through its Cursor
+	pairNilOld
+	pairNilNew
+)
+
+// pairPlan compares two versions, each named versions back from the latest.
+type pairPlan struct {
+	Kind     pairKind
+	Old, New int
+}
+
+// mapHistory is a first lineage of Init, then edits and lineages, then the
+// pairs to compare. Every step adds one named version.
+type mapHistory struct {
+	Eq    eqKind
+	Init  []mapOp
+	Edits []editPlan
+	Pairs []pairPlan
+}
+
+func (h mapHistory) GoString() string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "eq=%s\n  0 root new %v", h.Eq, h.Init)
+
+	for k, e := range h.Edits {
+		fmt.Fprintf(&b, "\n  %d %s", k+1, e)
+	}
+
+	for _, p := range h.Pairs {
+		fmt.Fprintf(&b, "\n  pair %s %d -> %d", [...]string{"plain", "cursor", "nil-old", "nil-new"}[p.Kind], p.Old, p.New)
+	}
+
+	return b.String()
+}
+
+// mapSizes bounds what the Map generators draw. One edit in longEdits
+// first makes a run of one-key edits, up to three logs long.
+type mapSizes struct{ entries, edits, ops, pairs int }
+
+var defaultMapSizes = mapSizes{entries: 4, edits: 12, ops: 4, pairs: 6}
+
+const longEdits = 24
+
+var entries = rapid.Custom(func(t *rapid.T) mapOp {
+	return mapOp{K: index(t, mapKeys, "k"), V: rapid.IntRange(0, maxValue).Draw(t, "v")}
+})
+
+// mapHistories draws an edit history: mostly edits of the latest version,
+// some of older ones (branches), some new lineages.
+func mapHistories(sz mapSizes) *rapid.Generator[mapHistory] {
+	return rapid.Custom(func(t *rapid.T) mapHistory {
+		h := mapHistory{Eq: drawEq(t, "eq"), Init: rapid.SliceOfN(entries, 0, sz.entries).Draw(t, "init")}
+		named := 1
+
+		op := rapid.Custom(func(t *rapid.T) mapOp {
+			return mapOp{
+				Kind: mapOpKind(rapid.IntRange(0, mapOpKinds-1).Draw(t, "op")),
+				K:    index(t, mapKeys, "k"),
+				V:    rapid.IntRange(0, maxValue).Draw(t, "v"),
+			}
+		})
+
+		edit := rapid.Custom(func(t *rapid.T) editPlan {
+			if chance(t, 8, "root") {
+				e := editPlan{Root: true, Kind: rootKind(rapid.IntRange(0, 3).Draw(t, "root-kind"))}
+
+				switch e.Kind {
+				case rootNew:
+					e.Init = rapid.SliceOfN(entries, 0, sz.entries).Draw(t, "init")
+				case rootCopy:
+					e.Of = anyOf(t, named, "of")
+				}
+
+				return e
+			}
+
+			e := editPlan{}
+			if branch, back := chance(t, 3, "branch"), anyOf(t, max(1, named-1), "base"); branch && named > 1 {
+				e.Base = 1 + back
+			}
+
+			// Fillers carry a lineage to its log's edges: a few, about
+			// mapLog, or past twice that, where the log is trimmed. Shrinking
+			// takes the few when the length does not matter.
+			if chance(t, longEdits, "long") {
+				switch rapid.IntRange(0, 2).Draw(t, "filler-size") {
+				case 0:
+					e.Filler = rapid.IntRange(1, 8).Draw(t, "filler")
+				case 1:
+					e.Filler = rapid.IntRange(mapLog-2, mapLog+2).Draw(t, "filler")
+				default:
+					e.Filler = rapid.IntRange(2*mapLog-2, 3*mapLog).Draw(t, "filler")
+				}
+			}
+
+			e.Ops = rapid.SliceOfN(op, 0, sz.ops).Draw(t, "ops")
+
+			return e
+		})
+
+		for range rapid.IntRange(0, sz.edits).Draw(t, "edits") {
+			h.Edits = append(h.Edits, edit.Draw(t, "edit"))
+			named++
+		}
+
+		pair := rapid.Custom(func(t *rapid.T) pairPlan {
+			p := pairPlan{Old: anyOf(t, named, "old"), New: anyOf(t, named, "new")}
+
+			switch rapid.IntRange(0, 5).Draw(t, "pair-kind") {
+			case 3:
+				p.Kind = pairCursor
+			case 4:
+				p.Kind = pairNilOld
+			case 5:
+				p.Kind = pairNilNew
+			}
+
+			return p
+		})
+
+		h.Pairs = rapid.SliceOfN(pair, 0, sz.pairs).Draw(t, "pairs")
+
+		return h
+	})
+}
+
+// groupingPlan is what groupsOf names for an entry: a group by the value
+// modulo Mod (none for 0 when None), one by the key's parity when ByKey,
+// the first again when Dup, and Wide more for values whose group is a
+// multiple of 3. Groups read the value only through the Map's equality,
+// as GroupBy needs (see TestGroupByTrustsTheInputsEquality).
+type groupingPlan struct {
+	Mod   int
+	ByKey bool
+	Dup   bool
+	None  bool
+	Wide  int
+	Skip  bool // GroupBy is given sameGroups
+}
+
+func (p groupingPlan) groups(eq eqKind) func(k, v int) []int {
+	return func(k, v int) []int {
+		c := eq.view(v) % p.Mod
+
+		var gs []int
+		if !p.None || c != 0 {
+			gs = append(gs, c)
+		}
+
+		if p.ByKey {
+			gs = append(gs, 10+k%2)
+		}
+
+		if p.Dup && len(gs) > 0 {
+			gs = append(gs, gs[0])
+		}
+
+		if c%3 == 0 {
+			for i := range p.Wide {
+				gs = append(gs, 100+i)
+			}
+		}
+
+		return gs
+	}
+}
+
+func (p groupingPlan) same(eq eqKind) func(a, b int) bool {
+	if !p.Skip {
+		return nil
+	}
+
+	return func(a, b int) bool { return eq.view(a)%p.Mod == eq.view(b)%p.Mod }
+}
+
+// groupStepKind is how GroupBy is called for a version.
+type groupStepKind uint8
+
+const (
+	stepNext    groupStepKind = iota // from the latest result
+	stepSkip                         // not at all: the next step catches up over several edits
+	stepOlder                        // from the result Back before the latest: a branch
+	stepScratch                      // from nothing
+)
+
+type groupStep struct {
+	Kind groupStepKind
+	Back int
+}
+
+// groupingCase is a history, what to group its versions by, and one step
+// for each named version, in order.
+type groupingCase struct {
+	History  mapHistory
+	Grouping groupingPlan
+	Steps    []groupStep
+}
+
+func (c groupingCase) GoString() string {
+	return fmt.Sprintf("%#v\ngrouping %+v\nsteps %v", c.History, c.Grouping, c.Steps)
+}
+
+func groupingCases(sz mapSizes) *rapid.Generator[groupingCase] {
+	return rapid.Custom(func(t *rapid.T) groupingCase {
+		c := groupingCase{History: mapHistories(sz).Draw(t, "history")}
+
+		c.Grouping = groupingPlan{
+			Mod:   1 + rapid.IntRange(0, 3).Draw(t, "mod"),
+			ByKey: chance(t, 2, "by-key"),
+			Dup:   chance(t, 4, "dup"),
+			None:  chance(t, 4, "none"),
+			Skip:  chance(t, 2, "same-groups"),
+		}
+
+		if chance(t, 4, "wide") {
+			c.Grouping.Wide = smallGroupList + 1 + rapid.IntRange(0, 3).Draw(t, "wide")
+		}
+
+		step := rapid.Custom(func(t *rapid.T) groupStep {
+			switch rapid.IntRange(0, 7).Draw(t, "step") {
+			case 5:
+				return groupStep{Kind: stepSkip}
+			case 6:
+				return groupStep{Kind: stepOlder, Back: rapid.IntRange(1, 4).Draw(t, "back")}
+			case 7:
+				return groupStep{Kind: stepScratch}
+			default:
+				return groupStep{}
+			}
+		})
+
+		n := 1 + len(c.History.Edits)
+		c.Steps = rapid.SliceOfN(step, n, n).Draw(t, "steps")
+
+		return c
+	})
+}
+
+// historyShapes names the shapes h reaches, replaying it.
+func historyShapes(h mapHistory) map[string]bool {
+	shapes := map[string]bool{h.Eq.String() + " eq": true}
+	r := replayHistory(h, false)
+
+	for _, e := range h.Edits {
+		switch {
+		case e.Root:
+			shapes["root "+[...]string{"new", "copy", "zero", "nil"}[e.Kind]] = true
+		case e.Base > 0:
+			shapes["branch"] = true
+		}
+
+		if e.Filler > 0 {
+			shapes["long lineage"] = true
+		}
+
+		for _, o := range e.Ops {
+			shapes["op "+[...]string{"set", "delete", "same", "readd", "restore"}[o.Kind]] = true
+		}
+	}
+
+	for k := range r.excepts {
+		shapes[k] = true
+	}
+
+	for _, v := range r.versions {
+		if v.base < 0 || v.filler {
+			continue
+		}
+
+		base := r.versions[v.base]
+
+		switch {
+		case base.ident == zeroIdent:
+			shapes["edit of the zero Map"] = true
+		case base.ident == nilIdent:
+			shapes["edit of nil"] = true
+		}
+
+		if v.ident == base.ident && base.ident != nilIdent {
+			shapes["net-zero edit"] = true
+		}
+	}
+
+	for _, id := range r.idents {
+		if id.parent >= 0 && id.logLen == mapLog && r.idents[id.parent].logLen == 2*mapLog {
+			shapes["log trimmed"] = true
+		}
+	}
+
+	kin := func(old, new int, what string) {
+		switch {
+		case old == nilIdent || new == nilIdent || old == new:
+		case r.descends(new, old):
+			shapes["ancestor "+what] = true
+		case r.descends(old, new):
+			shapes["descendant "+what] = true
+		case r.rootOf(old) == r.rootOf(new):
+			shapes["sibling "+what] = true
+		default:
+			shapes["unrelated "+what] = true
+		}
+	}
+
+	for _, p := range h.Pairs {
+		switch p.Kind {
+		case pairCursor:
+			shapes["cursor pair"] = true
+		case pairNilOld, pairNilNew:
+			shapes["nil pair"] = true
+
+			continue
+		}
+
+		kin(r.versions[r.versionAt(p.Old)].ident, r.versions[r.versionAt(p.New)].ident, "pair")
+	}
+
+	for i := 1; i < len(r.named); i++ {
+		kin(r.versions[r.named[i-1]].ident, r.versions[r.named[i]].ident, "in turn")
+	}
+
+	return shapes
+}
+
+// TestMapHistoryCoverage holds the history generator to the shapes the Map
+// property needs.
+func TestMapHistoryCoverage(t *testing.T) {
+	t.Parallel()
+
+	requireShapes(t, mapHistories(defaultMapSizes), historyShapes, map[string]float64{
+		"same eq": 0.2, "class eq": 0.05, "never eq": 0.05,
+		"op set": 0.2, "op delete": 0.1, "op same": 0.1, "op readd": 0.1, "op restore": 0.1,
+		"branch": 0.1, "net-zero edit": 0.1, "long lineage": 0.05, "log trimmed": 0.02,
+		"root new": 0.02, "root copy": 0.02, "root zero": 0.02, "root nil": 0.02,
+		"edit of the zero Map": 0.01, "edit of nil": 0.01, excNilEditDone: 0.002,
+		"ancestor pair": 0.06, "descendant pair": 0.05, "sibling pair": 0.02, "unrelated pair": 0.02,
+		"ancestor in turn": 0.2, "sibling in turn": 0.1, "unrelated in turn": 0.05,
+		"cursor pair": 0.05, "nil pair": 0.05,
+	})
+}
+
+// groupingShapes names the shapes c reaches, from the plan alone.
+func groupingShapes(c groupingCase) map[string]bool {
+	shapes := map[string]bool{c.History.Eq.String() + " eq": true}
+	g := c.Grouping
+
+	for _, e := range c.History.Edits {
+		if !e.Root && e.Base > 0 {
+			shapes["branch"] = true
+		}
+	}
+
+	for name, on := range map[string]bool{"by key": g.ByKey, "dup": g.Dup, "none": g.None, "wide": g.Wide > 0, "same groups": g.Skip} {
+		if on {
+			shapes[name] = true
+		}
+	}
+
+	for _, st := range c.Steps {
+		shapes["step "+[...]string{"next", "skip", "older", "scratch"}[st.Kind]] = true
+	}
+
+	return shapes
+}
+
+// TestGroupingCoverage holds the grouping generator to the shapes the
+// GroupBy property needs.
+func TestGroupingCoverage(t *testing.T) {
+	t.Parallel()
+
+	requireShapes(t, groupingCases(defaultMapSizes), groupingShapes, map[string]float64{
+		"by key": 0.2, "dup": 0.1, "none": 0.1, "wide": 0.1, "same groups": 0.2,
+		"step next": 0.3, "step skip": 0.1, "step older": 0.1, "step scratch": 0.1,
+		"branch": 0.1, "class eq": 0.05,
+	})
+}
+
+// TestMapHistoriesShrinkToSmallCases is TestScenariosShrinkToSmallCases for
+// edit histories.
+func TestMapHistoriesShrinkToSmallCases(t *testing.T) {
+	shrinking(t)
+
+	var last mapHistory
+
+	failing(t, func(t *rapid.T) {
+		last = mapHistories(defaultMapSizes).Draw(t, "history")
+		if historyShapes(last)["sibling in turn"] {
+			t.Fatal("siblings")
+		}
+	})
+
+	// An edit, and another of the version before it.
+	if len(last.Edits) > 2 || len(last.Pairs) > 0 {
+		t.Errorf("minimised to%#v", last)
+	}
+}
