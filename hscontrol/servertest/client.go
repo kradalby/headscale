@@ -2,6 +2,7 @@ package servertest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"path"
@@ -525,6 +526,10 @@ func (c *TestClient) tryLogin(ctx context.Context, flags controlclient.LoginFlag
 	return c.direct.SendUpdate(ctx)
 }
 
+// errLoginStartedOver is a login the server answered with a new auth URL
+// once approve had completed it.
+var errLoginStartedOver = errors.New("the login was answered with a new auth URL")
+
 // waitLogin waits on the auth URL while approve completes the login it names.
 func (c *TestClient) waitLogin(ctx context.Context, url string, approve func(string) error) error {
 	ctx, cancel := context.WithCancel(ctx)
@@ -533,7 +538,12 @@ func (c *TestClient) waitLogin(ctx context.Context, url string, approve func(str
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := c.direct.WaitLoginURL(ctx, url)
+		next, err := c.direct.WaitLoginURL(ctx, url)
+		if err == nil && next != "" {
+			// The server told the client to start over: it is not logged in.
+			err = fmt.Errorf("%w: %q", errLoginStartedOver, next)
+		}
+
 		done <- err
 	}()
 
