@@ -2515,3 +2515,26 @@ func TestRenameToANameAnOIDCUserHoldsAnswers500(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "alice", renamed.Name, "the API answered 500, and the user is renamed")
 }
+
+// TestCreatingANameOIDCUsersHoldDependsOnHowMany pins
+// api/create-name-oidc-holders: the v1 API refuses an API user whose name
+// one OIDC user holds, and creates one whose name two OIDC users hold. It
+// fails once both are answered alike; then drop the exception in the
+// front-door property's identity step.
+func TestCreatingANameOIDCUsersHoldDependsOnHowMany(t *testing.T) {
+	srv := NewServer(t)
+
+	for i, name := range []string{"alice", "alice", "bob"} {
+		_, err := srv.State().CreateUser(types.User{
+			Name: name, Provider: util.RegisterMethodOIDC, ProviderIdentifier: sql.NullString{String: fmt.Sprintf("https://idp.example.com/%d", i), Valid: true},
+		})
+		require.NoError(t, err)
+	}
+
+	fd := &frontDoor{srv: srv, apiKey: srv.CreateAPIKey(t, nil), http: &http.Client{Transport: &http.Transport{DialContext: srv.MemNet().Dial, DisableKeepAlives: true}}}
+
+	require.ErrorContains(t, fd.api(http.MethodPost, "/api/v1/user", map[string]any{"name": "bob"}, nil), "409", "one OIDC user holds bob")
+
+	// TODO(kradalby): api/create-name-oidc-holders: two hold alice.
+	assert.NoError(t, fd.api(http.MethodPost, "/api/v1/user", map[string]any{"name": "alice"}, nil), "two OIDC users hold alice, and the API creates a third")
+}
