@@ -1908,10 +1908,17 @@ func (fd *frontDoor) retagApprover(at string) bool {
 		aa := fd.w.Policy.AutoApprovers
 		by := policymodel.Sel{Kind: policymodel.SelTag, I: t}
 
-		if q := policymodel.Prefixes[r]; q.Bits() == 0 {
+		// The document keys approvals by route: a route already listed
+		// gains the tag.
+		aa.Routes = slices.Clone(aa.Routes)
+
+		switch i := slices.IndexFunc(aa.Routes, func(ra policymodel.RouteApproval) bool { return ra.Route == r }); {
+		case policymodel.Prefixes[r].Bits() == 0:
 			aa.Exit = append(slices.Clone(aa.Exit), by)
-		} else {
-			aa.Routes = append(slices.Clone(aa.Routes), policymodel.RouteApproval{Route: r, By: []policymodel.Sel{by}})
+		case i >= 0:
+			aa.Routes[i].By = append(slices.Clone(aa.Routes[i].By), by)
+		default:
+			aa.Routes = append(aa.Routes, policymodel.RouteApproval{Route: r, By: []policymodel.Sel{by}})
 		}
 
 		fd.edit(at, policymodel.SetAutoApprovers{AutoApprovers: aa}, nil)
