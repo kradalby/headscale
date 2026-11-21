@@ -7,14 +7,15 @@ an oracle that runs Tailscale's own packet filter. It imports nothing from
 
 The properties built on it use [rapid](https://pkg.go.dev/pgregory.net/rapid):
 
-| Where                              | Holds                                                                                            |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `policy/v2/*_property_test.go`     | The compile's layers: incremental against from scratch, the filter change set, the emitted form  |
-| `policy/v2/*reference_test.go`     | Filters, peers, routes and capability form against the reference; the reference against captures |
-| `state/world_property_test.go`     | The world against one built from scratch; what `Since` reports                                   |
-| `mapper/route_property_test.go`    | Every session a change reaches is woken                                                          |
-| `mapper/hub_property_test.go`      | The hub under drawn schedules: coalesced commits, slow and overlapping sessions                  |
-| `mapper/delivery_property_test.go` | What a real Tailscale client assembles, in all four option combinations, against the reference   |
+| Where                                   | Holds                                                                                            |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `policy/v2/*_property_test.go`          | The compile's layers: incremental against from scratch, the filter change set, the emitted form  |
+| `policy/v2/*reference_test.go`          | Filters, peers, routes and capability form against the reference; the reference against captures |
+| `state/world_property_test.go`          | The world against one built from scratch; what `Since` reports                                   |
+| `mapper/route_property_test.go`         | Every session a change reaches is woken                                                          |
+| `mapper/hub_property_test.go`           | The hub under drawn schedules: coalesced commits, slow and overlapping sessions                  |
+| `mapper/delivery_property_test.go`      | What a real Tailscale client assembles, in all four option combinations, against the reference   |
+| `servertest/frontdoor_property_test.go` | Real clients against a real server: registration, the long poll, the admin API, restarts         |
 
 The mapper properties share one driver (`pbtWorld`): it writes nodes through
 the State's production entry points (registration, login, restart, map
