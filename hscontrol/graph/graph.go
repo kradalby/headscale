@@ -196,6 +196,11 @@ func Peek[T any](tx *Tx, n Node[T]) T {
 	}
 
 	if tx.base == nil {
+		// TODO(kradalby): graph/peek-first-zero: before the first
+		// snapshot Peek returns the zero value of an input it did not
+		// set, not the initial value the first snapshot will hold; the
+		// doc names only the latest snapshot, of which there is none.
+		// Pinned by TestPeekInTheFirstUpdateSeesZero.
 		var zero T
 
 		return zero
@@ -307,6 +312,10 @@ func (g *Graph) commit(prev *Snapshot, sets map[int]any) (*Snapshot, bool) {
 			continue
 		}
 
+		// TODO(kradalby): graph/input-equal-kept: an input set to a value
+		// its equality calls equal keeps the value it held, where a
+		// derived cell below stores the new one; NewInput's doc does not
+		// say which. Pinned by TestInputKeepsAValueItsEqualityCallsEqual.
 		if first || !c.equal(next.values[i], v) {
 			next.values[i] = v
 			next.changed[i] = next.rev
@@ -331,6 +340,11 @@ func (g *Graph) commit(prev *Snapshot, sets map[int]any) (*Snapshot, bool) {
 
 		// An equal value is still stored, so the next computation sees
 		// the latest state it carried, but is not a change.
+		// TODO(kradalby): graph/changedat-values: storing each new value
+		// without moving the revision means two snapshots reporting the
+		// same revision hold values the equality calls equal, not the
+		// same value, as ChangedAt's doc says. Pinned by
+		// TestChangedAtSpansValuesItsEqualityCallsEqual.
 		if first || !c.equal(next.values[i], v) {
 			next.changed[i] = next.rev
 		}

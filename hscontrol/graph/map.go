@@ -167,6 +167,12 @@ func Changes[K comparable, V any](old, m *Map[K, V]) []K {
 
 	// Done already records unique, exact differences for its base Map.
 	// Cursors hold no entries and are only ChangedSince tokens.
+	// TODO(kradalby): graph/changes-cursor: when the log reaches the
+	// cursor's Map, this returns the logged keys the new Map holds, which
+	// is neither the difference from the Map the cursor stands for nor,
+	// as Cursor's doc reads, from an empty Map. No production caller
+	// passes a cursor here. Pinned by
+	// TestChangesFromACursorNamesLoggedKeys.
 	if m != nil && m.log != nil && old != nil && old.items != nil && m.log.from == old.id {
 		return slices.Clone(m.log.keys)
 	}
@@ -174,6 +180,13 @@ func Changes[K comparable, V any](old, m *Map[K, V]) []K {
 	eq := m.eqOr(old)
 
 	if logged, ok := m.ChangedSince(old); ok {
+		// TODO(kradalby): graph/changes-never: over a Map whose equality
+		// calls nothing equal (Never, and the zero and nil-born Maps,
+		// which have none), this path names only the keys the edits
+		// between wrote, where comparing every key below names every key
+		// either side holds, so the answer depends on how far the log
+		// reaches; the doc calls it exact. Pinned by
+		// TestChangesUnderNeverDependsOnTheLog.
 		// The log also names keys that changed back.
 		seen := make(map[K]struct{}, len(logged))
 		keys := logged[:0:0]
@@ -298,6 +311,10 @@ func (e *MapEdit[K, V]) Done() *Map[K, V] {
 		}
 	}
 
+	// TODO(kradalby): graph/nil-edit-done: the unchanged check spares
+	// only a non-nil base, so an edit of a nil Map that changes nothing
+	// returns a new empty Map, not the nil it started from, as Done's
+	// doc says. Pinned by TestEditOfANilMapReturnsAMap.
 	if len(changed) == 0 && e.base != nil {
 		return e.base
 	}
