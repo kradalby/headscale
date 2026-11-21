@@ -530,6 +530,16 @@ func (c *TestClient) tryLogin(ctx context.Context, flags controlclient.LoginFlag
 // once approve had completed it.
 var errLoginStartedOver = errors.New("the login was answered with a new auth URL")
 
+// loginStartedOverError is [errLoginStartedOver] with the URL of the login the
+// client was told to start, which approving completes it.
+type loginStartedOverError struct{ url string }
+
+func (e *loginStartedOverError) Error() string {
+	return fmt.Sprintf("%v: %q", errLoginStartedOver, e.url)
+}
+
+func (e *loginStartedOverError) Unwrap() error { return errLoginStartedOver }
+
 // waitLogin waits on the auth URL while approve completes the login it names.
 func (c *TestClient) waitLogin(ctx context.Context, url string, approve func(string) error) error {
 	ctx, cancel := context.WithCancel(ctx)
@@ -541,7 +551,7 @@ func (c *TestClient) waitLogin(ctx context.Context, url string, approve func(str
 		next, err := c.direct.WaitLoginURL(ctx, url)
 		if err == nil && next != "" {
 			// The server told the client to start over: it is not logged in.
-			err = fmt.Errorf("%w: %q", errLoginStartedOver, next)
+			err = &loginStartedOverError{url: next}
 		}
 
 		done <- err
