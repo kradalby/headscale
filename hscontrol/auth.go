@@ -314,6 +314,12 @@ func (h *Headscale) waitForFollowup(
 		return nil, NewHTTPError(http.StatusUnauthorized, "invalid registration ID", err)
 	}
 
+	// TODO(kradalby): auth/followup-lookup-race: handleRegister looks the
+	// node up by key before this lookup of the pending login, and an
+	// approval that completes between the two stores the node and removes
+	// the cache entry, so both miss and the follow-up is told to start a
+	// new login, its client never learning it is in. Pinned by
+	// TestAFollowupAcrossAnApprovalIsToldToStartOver (package hscontrol).
 	if reg, ok := h.state.GetAuthCacheEntry(followupReg); ok {
 		// The followup poll is only authenticated by the auth ID in the
 		// URL, so fail closed unless the Noise session asking for the
@@ -334,6 +340,12 @@ func (h *Headscale) waitForFollowup(
 		superseded := reg.Park()
 
 		var verdict types.AuthVerdict
+		// TODO(kradalby): auth/followup-lookup-race: both reads below take
+		// the verdict without the channel's ok flag, and FinishAuth sends
+		// one verdict then closes, so a second reader takes the zero
+		// verdict as an expired registration. The SSH path guards this
+		// with verdictOK (noise.go). Pinned by
+		// TestAFollowupAcrossAnApprovalIsToldToStartOver (package hscontrol).
 		select {
 		// Prefer a completed registration even if the context has also
 		// expired. When both are ready, a plain select picks at random and
