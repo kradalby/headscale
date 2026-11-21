@@ -105,6 +105,9 @@ type fdNode struct {
 	// reusable: a single-use key is spent by the registration, and a login
 	// with it under a new node key is refused.
 	reusable bool
+	// keyTagged: the key carries tags, and outlives the user who made it; a
+	// user's own key is deleted with the user.
+	keyTagged bool
 	// loggedOut is set once its client logged out: it holds no node key.
 	loggedOut bool
 }
@@ -495,6 +498,14 @@ func (fd *frontDoor) edit(at string, e policymodel.Edit, ids map[types.NodeID]ty
 		fd.mustAPI(at, http.MethodDelete, fmt.Sprintf("/api/v1/user/%d", e.ID), nil, nil)
 		fd.made(kind, "API")
 		fd.apply(e)
+
+		// The user's own pre-auth keys went with it: a node it tagged away
+		// can no longer present one.
+		for _, nd := range fd.nodes {
+			if nd.keyUser == e.ID && !nd.keyTagged {
+				nd.key = ""
+			}
+		}
 	case policymodel.RenameUser:
 		fd.renameUser(at, e)
 	case policymodel.SetEmail:
@@ -815,6 +826,8 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 			nd.keyUser = users[0].ID
 		}
 
+		nd.keyTagged = n.Tagged()
+
 		if nd.keyUser != 0 {
 			body["user"] = strconv.FormatUint(uint64(nd.keyUser), 10)
 		}
@@ -1093,8 +1106,10 @@ func (fd *frontDoor) untag(at string, e policymodel.Retag) {
 
 // login logs id's client in interactively as u, with a new node key, as
 // `tailscale up --force-reauth` does; its map session restarts. A login
-// that takes a tagged node back registers it as the login does; one that
-// renews a user's node keeps how it registered.
+// that renews a user's node keeps how it registered. One that takes a
+// tagged node back registers it as the login does and drops its key, and
+// the device the user claimed is no longer ephemeral (processReauthTags),
+// so the collector cannot delete it at its next disconnect.
 func (fd *frontDoor) login(at string, id types.NodeID, u policymodel.User, n policymodel.Node) {
 	nd := fd.nodes[id]
 
@@ -1114,7 +1129,7 @@ func (fd *frontDoor) login(at string, id types.NodeID, u policymodel.User, n pol
 		return
 	}
 
-	nd.method, nd.key, nd.keyUser, nd.reusable = util.RegisterMethodCLI, "", 0, false
+	nd.method, nd.key, nd.keyUser, nd.reusable, nd.keyTagged, nd.ephemeral = util.RegisterMethodCLI, "", 0, false, false, false
 	if u.OIDC() {
 		nd.method = util.RegisterMethodOIDC
 	}
@@ -1161,9 +1176,9 @@ func (fd *frontDoor) weather(at string, kind int) {
 	switch kind {
 	case stepFlap:
 		// The session drops and the client registers again at once, well
-		// inside the reconnect grace.
+		// inside the reconnect grace, with the key it still has, if any.
 		nd.tc.Disconnect(fd.tb)
-		nd.tc.Reconnect(fd.tb)
+		err = nd.tc.Login(ctx, nd.tc.Persist(), nd.key, controlclient.LoginDefault, fd.hostinfo(n, true), nil)
 	case stepRestartPoll:
 		err = nd.tc.RestartPoll(ctx)
 	case stepClientRestart:
@@ -1258,7 +1273,9 @@ func (fd *frontDoor) logout(at string) {
 // relogin renews a node whose client logged out or whose key expired: it
 // logs in again with a new node key, with its reusable pre-auth key or
 // interactively as its user, and connects. A tagged node with no such key
-// has no way back but a login that untags it.
+// has no way back but a login that untags it. A user's own key presented
+// for a node an admin tagged since takes it back as that user's device,
+// untagged and no longer ephemeral (preAuthKeyClaimsTaggedNode).
 func (fd *frontDoor) relogin(at string) {
 	n, ok := fd.pick("logs-in", func(n policymodel.Node, nd *fdNode) bool {
 		owner, _ := fd.w.Topology.User(n.User)
@@ -1289,6 +1306,12 @@ func (fd *frontDoor) relogin(at string) {
 
 		fd.answered(at, n.ID, nd.tc)
 		nd.loggedOut = false
+
+		if n.Tagged() && !nd.keyTagged {
+			fd.apply(policymodel.Retag{ID: n.ID, User: nd.keyUser})
+			nd.ephemeral = false
+			fd.run.tally.steps[stepNames[stepRelogin]+" (a user's key takes a tagged node back)"]++
+		}
 	}
 
 	fd.apply(policymodel.SetExpired{ID: n.ID, Expired: false})
