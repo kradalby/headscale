@@ -457,8 +457,13 @@ func (e Retag) apply(w *World) {
 	autoApprove(w, e.ID, false)
 }
 
+// undo has none when a login renews an expired key, here or in the
+// retag back: no retag expires it again.
 func (e Retag) undo(w World) (Edit, bool) {
 	n := w.mustNode(e.ID)
+	if n.Expired && (len(e.Tags) == 0 || len(n.Tags) == 0) {
+		return nil, false
+	}
 
 	return Retag{e.ID, n.Tags, n.User}, true
 }
