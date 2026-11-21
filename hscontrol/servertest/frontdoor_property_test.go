@@ -3,6 +3,7 @@ package servertest
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -21,6 +22,8 @@ import (
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
@@ -592,10 +595,24 @@ func (fd *frontDoor) addUser(u policymodel.User) {
 func (fd *frontDoor) renameUser(at string, e policymodel.RenameUser) {
 	u, _ := fd.w.Topology.User(e.ID)
 
-	if u.OIDC() {
+	shared := slices.ContainsFunc(fd.w.Topology.Users, func(o policymodel.User) bool { return o.OIDC() && o.Name == e.Name })
+
+	switch {
+	case u.OIDC():
 		fd.updateUser(at, e.ID, func(u *types.User) { u.Name = e.Name })
 		fd.made("RenameUser", "identity provider")
-	} else {
+	case shared:
+		// TODO(kradalby): api/rename-to-shared-name: renaming an API user
+		// to a name an OIDC user holds renames it, then the handler's
+		// lookup by the new name finds two users and answers 500. Counted;
+		// the stored judge holds that the rename happened.
+		err := fd.api(http.MethodPost, fmt.Sprintf("/api/v1/user/%d/rename/%s", e.ID, e.Name), nil, nil)
+		if err == nil || !strings.Contains(err.Error(), "expected exactly one user") {
+			fd.t.Fatalf("%s: renaming u%d to %q, which an OIDC user holds: %v", at, e.ID, e.Name, err)
+		}
+
+		fd.made("RenameUser", "API, answered 500 (api/rename-to-shared-name)")
+	default:
 		fd.mustAPI(at, http.MethodPost, fmt.Sprintf("/api/v1/user/%d/rename/%s", e.ID, e.Name), nil, nil)
 		fd.made("RenameUser", "API")
 	}
@@ -1494,4 +1511,31 @@ func (t *fdTally) require(tb testing.TB) {
 			tb.Errorf("no case held %s to the reference", name)
 		}
 	}
+}
+
+// TestRenameToANameAnOIDCUserHoldsAnswers500 pins
+// api/rename-to-shared-name: the v1 API renames an API user to a name an
+// OIDC user holds, then answers 500, its lookup of the renamed user by
+// name finding two. It fails once the rename is refused, or answered with
+// the user; then drop the exception in the front-door property's
+// renameUser.
+func TestRenameToANameAnOIDCUserHoldsAnswers500(t *testing.T) {
+	srv := NewServer(t)
+
+	_, err := srv.State().CreateUser(types.User{
+		Name: "alice", Provider: util.RegisterMethodOIDC, ProviderIdentifier: sql.NullString{String: "https://idp.example.com/1", Valid: true},
+	})
+	require.NoError(t, err)
+
+	bob := srv.CreateUser(t, "bob")
+	fd := &frontDoor{srv: srv, apiKey: srv.CreateAPIKey(t, nil), http: &http.Client{Transport: &http.Transport{DialContext: srv.MemNet().Dial, DisableKeepAlives: true}}}
+
+	err = fd.api(http.MethodPost, fmt.Sprintf("/api/v1/user/%d/rename/alice", bob.ID), nil, nil)
+
+	// TODO(kradalby): api/rename-to-shared-name: the rename happened.
+	require.ErrorContains(t, err, "500")
+
+	renamed, err := srv.State().GetUserByID(types.UserID(bob.ID))
+	require.NoError(t, err)
+	assert.Equal(t, "alice", renamed.Name, "the API answered 500, and the user is renamed")
 }
