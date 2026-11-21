@@ -1470,6 +1470,14 @@ func (pm *PolicyManager) userMatchesOwner(user types.UserView, owner Owner) bool
 		if o == nil {
 			return false
 		}
+		// TODO(kradalby): policy/owner-wildcard-user-half: resolveUser
+		// matches the token as a literal name or e-mail, ignoring the
+		// user:*@domain wildcard Username.resolve honours when it builds
+		// the owner address set, so a wildcard owner names that domain's
+		// users' devices but not the users; their logins and pre-auth keys
+		// are refused where their existing devices are tagged. Fails
+		// closed. Pinned by TestAWildcardTagOwnerNamesDevicesNotUsers
+		// (servertest).
 		// Resolve the username to find the user it refers to
 		resolvedUser, err := o.resolveUser(pm.users)
 		if err != nil {
