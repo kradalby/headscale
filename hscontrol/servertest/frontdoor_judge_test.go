@@ -53,6 +53,8 @@ var parkedStates = map[string]bool{
 const (
 	pollFunc  = "github.com/juanfont/headscale/hscontrol.(*mapSession).serveLongPoll"
 	watchFunc = "github.com/juanfont/headscale/hscontrol/mapper.(*Hub).watch"
+	// followupFunc waits for an interactive login's verdict.
+	followupFunc = "github.com/juanfont/headscale/hscontrol.(*Headscale).waitForFollowup"
 )
 
 // pollLoopLine is the line of hscontrol/poll.go at which serveLongPoll

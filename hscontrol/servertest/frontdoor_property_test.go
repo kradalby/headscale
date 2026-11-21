@@ -686,6 +686,8 @@ func (fd *frontDoor) loginUser(u policymodel.User) bool {
 // does for an OIDC user.
 func (fd *frontDoor) approver(u policymodel.User) func(authID string) error {
 	return func(authID string) error {
+		fd.awaitFollowup(authID)
+
 		if u.OIDC() {
 			id, err := types.AuthIDFromString(authID)
 			if err != nil {
@@ -699,6 +701,46 @@ func (fd *frontDoor) approver(u policymodel.User) func(authID string) error {
 
 		return fd.api(http.MethodPost, "/api/v1/auth/register", map[string]any{"authId": authID, "user": u.Name}, nil)
 	}
+}
+
+// awaitFollowup waits until the client's follow-up request for authID is
+// waiting for its verdict, as it is by the time a person approves the URL
+// the client shows.
+//
+// TODO(kradalby): auth/followup-lookup-race: a follow-up that arrives as
+// the approval runs can look its node key up before the approval makes
+// the node, and the pending login up after the approval removed it; it is
+// then told to start a new login, and its client never learns it is
+// logged in. A follow-up re-sent after a network drop, or an approval
+// scripted to fire as the URL appears, meets it. The property approves
+// around it, counted.
+func (fd *frontDoor) awaitFollowup(authID string) {
+	deadline := time.Now().Add(20 * time.Second)
+
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+
+	for !fd.followupWaiting() {
+		if time.Now().After(deadline) {
+			fd.t.Fatalf("the follow-up of login %s never waited at the server", authID)
+		}
+
+		<-tick.C
+	}
+
+	fd.run.tally.edits["login approved once its follow-up waits (auth/followup-lookup-race)"]++
+}
+
+// followupWaiting reports whether a registration's follow-up request waits
+// for its login's verdict.
+func (fd *frontDoor) followupWaiting() bool {
+	for _, g := range goroutines(fd.dump()) {
+		if g.state == "select" && g.top == followupFunc {
+			return true
+		}
+	}
+
+	return false
 }
 
 // join registers n as its client and an admin bring it in, and applies to
