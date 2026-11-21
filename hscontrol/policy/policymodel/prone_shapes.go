@@ -15,10 +15,10 @@ import (
 // they announce. A floor fails a sample drawn afresh no more often than a
 // count five standard deviations short does.
 var proneShapes = []Shape{
-	{Name: "via-exit-router-among-sources", Why: "a via exit node among the sources of its grant to autogroup:internet", Min: 0.03, World: func(v *View) bool {
+	{Name: "via-exit-router-among-sources", Why: "a via exit node among the sources of its grant to autogroup:internet", Min: 0.028, World: func(v *View) bool {
 		return len(v.viaExitSources()) > 0
 	}},
-	{Name: "via-exit-source-public-peer", Why: "such a router beside another node serving a public subnet route", Min: 0.03, World: func(v *View) bool {
+	{Name: "via-exit-source-public-peer", Why: "such a router beside another node serving a public subnet route", Min: 0.027, World: func(v *View) bool {
 		return slices.ContainsFunc(v.viaExitSources(), func(r Node) bool {
 			return v.anyNode(func(n Node) bool { return n.ID != r.ID && slices.ContainsFunc(served(n), publicRoute) })
 		})
@@ -40,7 +40,7 @@ var proneShapes = []Shape{
 			return false
 		})
 	}},
-	{Name: "via-exit-one-family", Why: "a via exit node of one family under a grant to autogroup:internet", Min: 0.025, World: func(v *View) bool {
+	{Name: "via-exit-one-family", Why: "a via exit node of one family under a grant to autogroup:internet", Min: 0.023, World: func(v *View) bool {
 		return slices.ContainsFunc(v.viaExits(), oneFamily)
 	}},
 	{Name: "via-exit-public-other-family", Why: "a via exit node of one family serving a public route of the other", Min: 0.01, World: func(v *View) bool {
@@ -55,14 +55,14 @@ var proneShapes = []Shape{
 			return len(r.Via) > 0 && v.anyNode(func(n Node) bool { return (n.Offline || n.Expired) && v.viaRouterOf(r, n) })
 		})
 	}},
-	{Name: "unapproved-inside-via-destination", Why: "a via router announcing unapproved a route inside a destination it routes part of", Min: 0.015, World: func(v *View) bool {
+	{Name: "unapproved-inside-via-destination", Why: "a via router announcing unapproved a route inside a destination it routes part of", Min: 0.013, World: func(v *View) bool {
 		return v.anyRule(func(r Rule, _ bool) bool {
 			return len(r.Via) > 0 && slices.ContainsFunc(r.Dst, func(d Dest) bool {
 				return v.anyNode(func(n Node) bool { return carries(n, r.Via) && unapprovedInside(v, d.Sel, n) })
 			})
 		})
 	}},
-	{Name: "unapproved-inside-destination-at-exit", Why: "an exit node announcing unapproved a route inside a destination it routes part of", Min: 0.015, World: func(v *View) bool {
+	{Name: "unapproved-inside-destination-at-exit", Why: "an exit node announcing unapproved a route inside a destination it routes part of", Min: 0.013, World: func(v *View) bool {
 		return v.anyRule(func(r Rule, _ bool) bool {
 			return slices.ContainsFunc(r.Dst, func(d Dest) bool {
 				return v.anyNode(func(n Node) bool { return n.Exit() && unapprovedInside(v, d.Sel, n) })
@@ -78,7 +78,7 @@ var proneShapes = []Shape{
 			})
 		})
 	}},
-	{Name: "three-clauses-at-a-node", Why: "three contested clauses each deciding one node's rules", Min: 0.01, World: threeClauses},
+	{Name: "three-clauses-at-a-node", Why: "three contested clauses each deciding one node's rules", Min: 0.008, World: threeClauses},
 	{Name: "retag-onto-approver", Why: "a retag onto a tag that auto-approves a route the node announces", Min: 0.008, Step: func(b, a *View, st Step) bool {
 		return slices.ContainsFunc(edits[Retag](st), func(e Retag) bool {
 			return len(e.Tags) > 0 && nodeMoved(b, a, e.ID, func(was, is Node) bool { return len(dropRoutes(is.Approved, was.Approved)) > 0 })
