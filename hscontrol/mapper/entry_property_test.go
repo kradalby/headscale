@@ -14,6 +14,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"go4.org/mem"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -407,10 +408,17 @@ func (p *pbtWorld) settleIn(nc newcomer, w policymodel.World) {
 func (p *pbtWorld) login(id types.NodeID, machine key.MachinePublic, node key.NodePublic, hostname string, uid uint, method string) types.NodeView {
 	p.t.Helper()
 
+	return p.loginWith(id, machine, node, &tailcfg.Hostinfo{Hostname: hostname}, uid, method)
+}
+
+// loginWith is login with the client reporting hi.
+func (p *pbtWorld) loginWith(id types.NodeID, machine key.MachinePublic, node key.NodePublic, hi *tailcfg.Hostinfo, uid uint, method string) types.NodeView {
+	p.t.Helper()
+
 	authID := types.MustAuthID()
 
 	err := p.s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
-		MachineKey: machine, NodeKey: node, Hostname: hostname, Hostinfo: &tailcfg.Hostinfo{Hostname: hostname},
+		MachineKey: machine, NodeKey: node, Hostname: hi.Hostname, Hostinfo: hi,
 	}))
 	if err != nil {
 		p.t.Fatalf("n%d: pending login: %v", id, err)
@@ -595,7 +603,16 @@ func (p *pbtWorld) untag(was, n policymodel.Node, tn *types.Node, users []policy
 			method = util.RegisterMethodOIDC
 		}
 
-		p.login(id, nv.MachineKey(), nv.NodeKey(), nv.Hostname(), n.User, method)
+		// With a new node key and what the client reports, as `tailscale
+		// up --force-reauth` does: the registration then runs
+		// auto-approval for the new owner, as the model's login does.
+		hi := nv.Hostinfo().AsStruct()
+		if hi == nil {
+			hi = &tailcfg.Hostinfo{}
+		}
+
+		hi.Hostname = nv.Hostname()
+		p.loginWith(id, nv.MachineKey(), reauthKey(nv.NodeKey()), hi, n.User, method)
 		p.reg[id] = regInfo{method: method}
 
 		return
@@ -605,8 +622,22 @@ func (p *pbtWorld) untag(was, n policymodel.Node, tn *types.Node, users []policy
 		c.Tags, c.UserID, c.User, c.Expiry = nil, tn.UserID, tn.User, nil
 	})
 
+	// Then the auto-approval the model's login runs for the new owner,
+	// through production.
+	nv, _ := p.s.Snapshot().GetNode(id)
+	p.produce(id, "auto-approve", func() error { return p.s.AutoApproveRoutes(nv) })
+
 	ri.key = ""
 	p.reg[id] = ri
+}
+
+// reauthKey is the node key a client takes for a new login after k,
+// derived from k so a case replays.
+func reauthKey(k key.NodePublic) key.NodePublic {
+	raw := k.AppendTo(nil)
+	raw[1]++
+
+	return key.NodePublicFromRaw32(mem.B(raw))
 }
 
 // report has n's client report what tn announces and runs: a restart

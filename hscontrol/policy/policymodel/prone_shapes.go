@@ -93,9 +93,7 @@ var proneShapes = []Shape{
 	}},
 	{Name: "login-onto-approver", Why: "a tagged node logging in as a user who auto-approves a route it announces", Min: 0.003, Step: func(b, a *View, st Step) bool {
 		return slices.ContainsFunc(edits[Retag](st), func(e Retag) bool {
-			return len(e.Tags) == 0 && nodeMoved(b, a, e.ID, func(was, is Node) bool {
-				return was.Tagged() && slices.ContainsFunc(dropRoutes(is.Announced, is.Approved), func(r int) bool { return a.Approvable(is, r) })
-			})
+			return len(e.Tags) == 0 && nodeMoved(b, a, e.ID, func(was, is Node) bool { return was.Tagged() && len(dropRoutes(is.Approved, was.Approved)) > 0 })
 		})
 	}},
 	{Name: "approvers-moved-under-announced", Why: "the auto-approvers come to approve a route a node announces, which nothing approves yet", Min: 0.007, Step: func(b, a *View, st Step) bool {

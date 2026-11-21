@@ -433,7 +433,8 @@ func (e Leave) String() string { return fmt.Sprintf("leave n%d", e.ID) }
 
 // Retag sets a node's tags, as an admin does (tags the policy defines;
 // the node loses its user, and auto-approval runs); or, with none, makes
-// it User's again, as a login of that user does, which renews its key.
+// it User's again, as a login of that user does, which renews its key
+// and runs auto-approval for the new owner.
 type Retag struct {
 	ID   types.NodeID
 	Tags []int
@@ -448,11 +449,9 @@ func (e Retag) apply(w *World) {
 
 	if len(e.Tags) == 0 {
 		n.Tags, n.User, n.Expired = nil, e.User, false
-
-		return
+	} else {
+		n.Tags, n.User = slices.Clone(e.Tags), 0
 	}
-
-	n.Tags, n.User = slices.Clone(e.Tags), 0
 
 	autoApprove(w, e.ID, false)
 }
