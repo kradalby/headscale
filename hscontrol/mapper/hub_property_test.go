@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net/netip"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -1276,7 +1277,9 @@ func TestHubSessionsConvergeUnderConcurrency(t *testing.T) {
 	// compile's incremental node attributes and SSH policies differ from
 	// its compile from scratch after an address moves, and the filter
 	// audit's two forms differ for nodes outside the tailnet's ranges or
-	// without addresses.
+	// without addresses. A run whose own commits held a user whose
+	// addresses sort apart under a self destination may log the filter
+	// audit's merge order, counted (see [auditLines.judge]).
 	for _, capSources := range []bool{false, true} {
 		t.Run(fmt.Sprintf("audit/capability=%t", capSources), func(t *testing.T) {
 			t.Setenv(state.TestCapabilitySourcesEnv, strconv.FormatBool(capSources))
@@ -1287,12 +1290,19 @@ func TestHubSessionsConvergeUnderConcurrency(t *testing.T) {
 			for _, chunks := range []bool{false, true} {
 				failures, audited, policy := RouteAuditFailures(), RouteAuditRuns(), state.PolicyAuditFailures()
 
-				reach.add(stressConverges(t, seed, 100, writes, true, chunks))
+				run := stressConverges(t, seed, 100, writes, true, chunks)
+				reach.add(run)
+
+				known := map[string]int{}
+				if msg := audits.judgeAt(func(rev uint64) bool { return run.apart[rev] }, known); msg != "" {
+					t.Errorf("filter_chunks=%t: an audit logged a line no known false alarm explains: %s", chunks, msg)
+				}
 
 				assert.Equal(t, failures, RouteAuditFailures(), "filter_chunks=%t: the route audit found no stale session", chunks)
-				assert.Equal(t, policy, state.PolicyAuditFailures(), "filter_chunks=%t: no other audit line", chunks)
-				assert.Empty(t, audits.take(), "filter_chunks=%t: no audit logs a line, counted or not", chunks)
+				assert.Equal(t, policy+uint64(known["merge order"]), state.PolicyAuditFailures(), "filter_chunks=%t: no other audit line", chunks) //nolint:gosec // a count
 				assert.Greater(t, RouteAuditRuns(), audited, "filter_chunks=%t: test sanity: the route audit rendered sessions afresh", chunks)
+
+				reach.mergeOrder += known["merge order"]
 			}
 		})
 	}
@@ -1308,6 +1318,13 @@ func TestHubSessionsConvergeUnderConcurrency(t *testing.T) {
 // reached; it depends on the schedule.
 type stressReach struct {
 	compared, coalesced, between, reconnected, undone, straddled int
+	// apart holds the commits that held a user whose addresses sort apart
+	// under a self destination: production's own commits between two
+	// model worlds can, a registration at the allocator's addresses before
+	// the model's land, or a user's node before an admin tags it.
+	apart map[uint64]bool
+	// mergeOrder counts the filter audit's merge-order lines excused.
+	mergeOrder int
 }
 
 func (r *stressReach) add(o stressReach) {
@@ -1317,6 +1334,7 @@ func (r *stressReach) add(o stressReach) {
 	r.between += o.between
 	r.reconnected += o.reconnected
 	r.undone += o.undone
+	r.mergeOrder += o.mergeOrder
 }
 
 // stressSession is a session on a goroutine of its own.
@@ -1382,6 +1400,16 @@ func stressConverges(t *testing.T, seed, run uint64, writes int, audit, chunks b
 	}
 
 	h.p = newPBTWorld(t, world, func(cfg *types.Config) { cfg.Policy.FilterChunks = chunks })
+
+	h.reach.apart = map[uint64]bool{}
+	h.p.committed = func(before uint64) {
+		snap := h.p.s.Snapshot()
+		if _, sorted := heldAddresses(snap); sorted && policymodel.SelfDestination(h.p.w.Policy) {
+			for rev := before + 1; rev <= snap.Rev(); rev++ {
+				h.reach.apart[rev] = true
+			}
+		}
+	}
 
 	h.hub = NewHub()
 	t.Cleanup(h.hub.Close)
@@ -1848,13 +1876,35 @@ func (a *auditLines) take() []auditLine {
 // filter audit's merge order once it held a user whose addresses sort
 // apart.
 func (a *auditLines) judge(shared, sorted bool, known map[string]int) string {
+	return a.judgeWith(shared, func(auditLine) bool { return sorted }, known)
+}
+
+// judgeAt is judge for a case that shared no address, excusing the merge
+// order only in a line of a commit sortedAt names.
+func (a *auditLines) judgeAt(sortedAt func(rev uint64) bool, known map[string]int) string {
+	return a.judgeWith(false, func(l auditLine) bool {
+		m := auditCommit.FindStringSubmatch(l.Error)
+		if m == nil {
+			return false
+		}
+
+		rev, err := strconv.ParseUint(m[1], 10, 64)
+
+		return err == nil && sortedAt(rev)
+	}, known)
+}
+
+// auditCommit finds the commit a filter audit line names.
+var auditCommit = regexp.MustCompile(`at commit (\d+):`)
+
+func (a *auditLines) judgeWith(shared bool, sorted func(auditLine) bool, known map[string]int) string {
 	for _, l := range a.take() {
 		switch {
 		case shared && l.Message == "policy audit" && (strings.Contains(l.Error, "node attributes") || strings.Contains(l.Error, "SSH policy of node")):
 			// TODO(kradalby): policy/stale-under-shared-address: see the
 			// exception in TestPipelineIncrementalMatchesScratch.
 			known["stale under a shared address"]++
-		case sorted && l.Message == "policy audit: filter" && strings.Contains(l.Error, "capability form expands otherwise than address form"):
+		case l.Message == "policy audit: filter" && strings.Contains(l.Error, "capability form expands otherwise than address form") && sorted(l):
 			// TODO(kradalby): policy/merge-order: see
 			// policymodel.MergesApart.
 			known["merge order"]++
