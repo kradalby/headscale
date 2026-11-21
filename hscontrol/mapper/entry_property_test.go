@@ -982,7 +982,7 @@ func rowDiff(row, n *types.Node) string {
 	}
 
 	if !row.Hostinfo.Equal(n.Hostinfo) {
-		differ("hostinfo", jsonOf(row.Hostinfo), jsonOf(n.Hostinfo))
+		differ("hostinfo", policymodel.JSON(row.Hostinfo), policymodel.JSON(n.Hostinfo))
 	}
 
 	return strings.Join(out, "; ")

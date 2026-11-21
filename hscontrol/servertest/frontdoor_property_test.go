@@ -125,11 +125,7 @@ type fdRun struct {
 	tally *fdTally
 	// loopLine is where serveLongPoll waits between updates.
 	loopLine int
-	verdicts policymodel.Verdicts
-	form     policymodel.FormJudge
-	// passed holds the filters held to the reference already, by
-	// everything the comparison reads.
-	passed map[string]bool
+	held     policymodel.HeldJudge
 	// a37 lists the logins auth/followup-lookup-race started over.
 	a37 []string
 }
@@ -183,12 +179,12 @@ func TestFrontDoorClientsFollowTheModel(t *testing.T) {
 		t.Fatalf("test sanity: %v", err)
 	}
 
-	run := &fdRun{steps: fdSteps(), tally: newFDTally(), loopLine: line, passed: map[string]bool{}}
+	run := &fdRun{steps: fdSteps(), tally: newFDTally(), loopLine: line}
 
 	rapid.Check(t, func(rt *rapid.T) { playFrontDoor(t, rt, run) })
 
 	t.Log(run.tally)
-	t.Logf("reference: filters %v; form %v", &run.verdicts, &run.form)
+	t.Log(&run.held)
 
 	for _, l := range run.a37 {
 		t.Logf("auth/followup-lookup-race: %s", l)
@@ -197,7 +193,7 @@ func TestFrontDoorClientsFollowTheModel(t *testing.T) {
 	if f := flag.Lookup("rapid.checks"); f != nil {
 		n, err := strconv.Atoi(f.Value.String())
 		if err == nil && n >= 1000 {
-			run.tally.require(t)
+			run.tally.require(t, &run.held)
 		}
 	}
 }
@@ -846,7 +842,7 @@ func (fd *frontDoor) startedOver(at string, id types.NodeID, tc *TestClient, err
 	}
 
 	fd.run.tally.edits["login started over though approved (auth/followup-lookup-race)"]++
-	fd.run.a37 = append(fd.run.a37, fmt.Sprintf("%s: n%d: %v; its exchanges %s", at, id, err, jsonOf(tc.RegisterAttempts())))
+	fd.run.a37 = append(fd.run.a37, fmt.Sprintf("%s: n%d: %v; its exchanges %s", at, id, err, policymodel.JSON(tc.RegisterAttempts())))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -959,7 +955,7 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 	}
 
 	if err != nil {
-		fd.t.Fatalf("%s: n%d does not register (%s): %v; its exchanges %s", at, n.ID, joinNames[kind], err, jsonOf(tc.RegisterAttempts()))
+		fd.t.Fatalf("%s: n%d does not register (%s): %v; its exchanges %s", at, n.ID, joinNames[kind], err, policymodel.JSON(tc.RegisterAttempts()))
 	}
 
 	nd.tc = tc
@@ -2590,24 +2586,17 @@ type fdTally struct {
 	cases, restarts int
 	steps, edits    map[string]int
 	joins           map[string]int
-	// clients counts the clients held to a fresh session, refClients those
-	// held to the reference too; unseen the peers held offline without the
-	// LastSeen a fresh session gives (render/lastseen-patchify).
-	clients, refClients, unseen int
-	peerSets, routePairs        int
-	filters, primaries          int
-	contested                   map[string]int
-	skipped                     map[string]int
+	// clients counts the clients held to a fresh session; unseen the
+	// peers held offline without the LastSeen a fresh session gives
+	// (render/lastseen-patchify).
+	clients, unseen int
 	// quiets counts the waits for quiet, and how long they took.
 	quiets             int
 	quietAll, quietMax time.Duration
 }
 
 func newFDTally() *fdTally {
-	return &fdTally{
-		steps: map[string]int{}, edits: map[string]int{}, joins: map[string]int{},
-		contested: map[string]int{}, skipped: map[string]int{},
-	}
+	return &fdTally{steps: map[string]int{}, edits: map[string]int{}, joins: map[string]int{}}
 }
 
 func (t *fdTally) String() string {
@@ -2617,15 +2606,13 @@ func (t *fdTally) String() string {
 	}
 
 	return fmt.Sprintf("front door: cases %d, server restarts %d; steps %v; joins %v; edits %v; "+
-		"clients held to a fresh session %d, to the reference %d (peer sets %d, route pairs %d, filters %d, primaries %d; contested %v; skipped %v); "+
-		"peers held offline without LastSeen %d; quiet waits %d (mean %v, longest %v)",
-		t.cases, t.restarts, t.steps, t.joins, t.edits, t.clients, t.refClients, t.peerSets, t.routePairs, t.filters, t.primaries,
-		t.contested, t.skipped, t.unseen, t.quiets, mean, t.quietMax)
+		"clients held to a fresh session %d; peers held offline without LastSeen %d; quiet waits %d (mean %v, longest %v)",
+		t.cases, t.restarts, t.steps, t.joins, t.edits, t.clients, t.unseen, t.quiets, mean, t.quietMax)
 }
 
 // require fails a deep run that never took some step or join, never
 // restarted, or held nothing of some kind to the reference.
-func (t *fdTally) require(tb testing.TB) {
+func (t *fdTally) require(tb testing.TB, held *policymodel.HeldJudge) {
 	tb.Helper()
 
 	for _, s := range stepNames {
@@ -2641,7 +2628,7 @@ func (t *fdTally) require(tb testing.TB) {
 	}
 
 	for name, n := range map[string]int{
-		"clients": t.refClients, "peer sets": t.peerSets, "route pairs": t.routePairs, "filters": t.filters, "primaries": t.primaries,
+		"clients": held.Clients, "peer sets": held.PeerSets, "route pairs": held.RoutePairs, "filters": held.Filters, "primaries": held.Primaries,
 	} {
 		if n == 0 {
 			tb.Errorf("no case held %s to the reference", name)

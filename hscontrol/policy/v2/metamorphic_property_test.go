@@ -25,7 +25,7 @@ func servedAt(st *stage, n policymodel.Node, mode SourceMode) ([]tailcfg.FilterR
 	if mode != CapabilitySources {
 		rules, err := st.ip.Fresh().ForNode(n.ID, ReceiverFacts{})
 
-		return rules, viewOf(n, st.w, nil), err
+		return rules, policymodel.ModelView(n, st.w, nil, nil), err
 	}
 
 	rules, err := st.cap.Fresh().ForNode(n.ID, st.recv.Of(n.ID))
@@ -37,7 +37,7 @@ func servedAt(st *stage, n policymodel.Node, mode SourceMode) ([]tailcfg.FilterR
 
 	caps := policymodel.NewNetmapCaps(st.render(n.ID, true), peers)
 
-	return rules, viewOf(n, st.w, &caps), err
+	return rules, policymodel.ModelView(n, st.w, &caps, nil), err
 }
 
 // verdictsDiffer returns how what a and b serve node n's client differs,

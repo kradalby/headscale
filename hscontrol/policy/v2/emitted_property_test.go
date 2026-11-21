@@ -421,7 +421,7 @@ func hostileViews(sv *served, n policymodel.Node, w policymodel.World, c string)
 
 		caps := policymodel.NewNetmapCaps(render(n.ID, true, drop), peers)
 
-		return viewOf(n, w, &caps)
+		return policymodel.ModelView(n, w, &caps, nil)
 	}
 
 	return views(false), views(true)

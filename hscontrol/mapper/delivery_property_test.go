@@ -335,183 +335,14 @@ func TestCanaryClientMapSessionAcrossResponses(t *testing.T) {
 			got := c.apply(t, resp).PacketFilterRules.AsSlice()
 
 			if !reflect.DeepEqual(got, step.want) {
-				t.Errorf("response %d: the client holds %s, want %s; FilterChunks, the model of it, must follow", i, jsonOf(got), jsonOf(step.want))
+				t.Errorf("response %d: the client holds %s, want %s; FilterChunks, the model of it, must follow", i, policymodel.JSON(got), policymodel.JSON(step.want))
 			}
 
 			if m := model.Rules(); !reflect.DeepEqual(got, m) {
-				t.Errorf("response %d: the client holds %s, the model of it %s", i, jsonOf(got), jsonOf(m))
+				t.Errorf("response %d: the client holds %s, the model of it %s", i, policymodel.JSON(got), policymodel.JSON(m))
 			}
 		}
 	})
-}
-
-// jsonOf is v as the wire has it, for comparisons where nil and empty are
-// the same and messages.
-func jsonOf(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return "unencodable: " + err.Error()
-	}
-
-	return string(b)
-}
-
-// clientPeer is a peer as the client acts on it. A patch cannot clear
-// LastSeen when a peer comes online, and the client acts on Online then
-// (see [peerPatch]), so an online peer's LastSeen is left out.
-func clientPeer(n tailcfg.NodeView) string {
-	p := n.AsStruct()
-	if p.Online != nil && *p.Online {
-		p.LastSeen = nil
-	}
-
-	// TODO(kradalby): render/addresses-nil: see clientAddresses.
-	if p.Addresses == nil {
-		p.Addresses = []netip.Prefix{}
-	}
-
-	if p.AllowedIPs == nil {
-		p.AllowedIPs = p.Addresses
-	}
-
-	return jsonOf(p)
-}
-
-// sameNode reports whether a and b are the same node to the client; on the
-// wire when [tailcfg.NodeView.Equal], which is stricter about nil and
-// empty, cannot tell.
-func sameNode(a, b tailcfg.NodeView) bool {
-	// Equal leaves out two fields the wire carries.
-	if a.Equal(b) && a.DataPlaneAuditLogID() == b.DataPlaneAuditLogID() && a.ExitNodeDNSResolvers().Len() == 0 && b.ExitNodeDNSResolvers().Len() == 0 {
-		return true
-	}
-
-	return clientPeer(a) == clientPeer(b)
-}
-
-// ruleCounts is a filter as a multiset of rules.
-func ruleCounts(rules []tailcfg.FilterRule) map[string]int {
-	out := map[string]int{}
-	for _, r := range rules {
-		out[jsonOf(r)]++
-	}
-
-	return out
-}
-
-// countsDiff names the rules a has more of than b, sorted.
-func countsDiff(a, b map[string]int) []string {
-	var out []string
-
-	for _, r := range slices.Sorted(maps.Keys(a)) {
-		if a[r] > b[r] {
-			out = append(out, fmt.Sprintf("%dx %s", a[r]-b[r], r))
-		}
-	}
-
-	return out
-}
-
-// filterDiff compares two filters a client holds: the same rules as a
-// multiset, and when their order differs, the same verdicts and app
-// capabilities, in order, through the client's own filter under view.
-func filterDiff(have, want []tailcfg.FilterRule, view func() policymodel.ClientView) string {
-	if slices.EqualFunc(have, want, func(a, b tailcfg.FilterRule) bool { return reflect.DeepEqual(a, b) }) {
-		return ""
-	}
-
-	hc, wc := ruleCounts(have), ruleCounts(want)
-	if !maps.Equal(hc, wc) {
-		return fmt.Sprintf("filter: only held %v; only fresh %v", countsDiff(hc, wc), countsDiff(wc, hc))
-	}
-
-	if ruleList(have) == ruleList(want) {
-		return ""
-	}
-
-	if rep := policymodel.Compare(want, have, view()); !rep.Equivalent() {
-		return "filter reordered so that it answers otherwise: " + rep.String()
-	}
-
-	return ""
-}
-
-// netmapDiff reports how the netmap a client assembled differs from the
-// one a fresh session gives, field by field, or "". Keys the client holds
-// of itself and the parsed filter (compared as rules) are not compared;
-// unseen is called for each offline peer held without its LastSeen.
-func netmapDiff(have, want *netmap.NetworkMap, unseen func()) string {
-	if !sameNode(have.SelfNode, want.SelfNode) {
-		return fmt.Sprintf("self: have %s, want %s", jsonOf(have.SelfNode), jsonOf(want.SelfNode))
-	}
-
-	if h, w := peerIDsOfNetmap(have), peerIDsOfNetmap(want); !slices.Equal(h, w) {
-		return fmt.Sprintf("peers: have %v, want %v", h, w)
-	}
-
-	for i, w := range want.Peers {
-		h := have.Peers[i]
-		if sameNode(h, w) {
-			continue
-		}
-
-		// TODO(kradalby): render/lastseen-patchify: a peer going offline
-		// in a change no patch carries (its CapMap or endpoints emptied) is
-		// sent whole; Tailscale's client patchifies it and keeps no
-		// LastSeen it did not hold, so its session shows the peer offline
-		// without the LastSeen a fresh one does. Counted, not judged.
-		if hs := h.AsStruct(); hs.LastSeen == nil && w.LastSeen().Valid() && !w.Online().GetOr(true) && !h.Online().GetOr(true) {
-			hs.LastSeen = new(w.LastSeen().Get())
-			if sameNode(hs.View(), w) {
-				unseen()
-
-				continue
-			}
-		}
-
-		return fmt.Sprintf("peer %d: have %s, want %s", w.ID(), clientPeer(h), clientPeer(w))
-	}
-
-	if d := filterDiff(have.PacketFilterRules.AsSlice(), want.PacketFilterRules.AsSlice(), func() policymodel.ClientView {
-		return policymodel.ViewFromNetmap(want)
-	}); d != "" {
-		return d
-	}
-
-	for _, f := range []struct {
-		name       string
-		have, want any
-	}{
-		{"ssh", have.SSHPolicy, want.SSHPolicy},
-		{"dns", have.DNS, want.DNS},
-		{"derp", have.DERPMap, want.DERPMap},
-		{"domain", have.Domain, want.Domain},
-		{"collect-services", have.CollectServices, want.CollectServices},
-		{"profiles", have.UserProfiles, want.UserProfiles},
-		{"display-messages", have.DisplayMessages, want.DisplayMessages},
-		{"tka", []any{have.TKAEnabled, have.TKAHead}, []any{want.TKAEnabled, want.TKAHead}},
-		{"caps", have.AllCaps, want.AllCaps},
-	} {
-		if reflect.DeepEqual(f.have, f.want) {
-			continue
-		}
-
-		if h, w := jsonOf(f.have), jsonOf(f.want); h != w {
-			return fmt.Sprintf("%s: have %s, want %s", f.name, h, w)
-		}
-	}
-
-	return ""
-}
-
-// peerIDsOfNetmap is nm's peers, in the client's order (by ID).
-func peerIDsOfNetmap(nm *netmap.NetworkMap) []tailcfg.NodeID {
-	out := make([]tailcfg.NodeID, len(nm.Peers))
-	for i, p := range nm.Peers {
-		out[i] = p.ID()
-	}
-
-	return out
 }
 
 // deliveryCombo is one setting of policy.capability_sources and
@@ -581,7 +412,7 @@ func (cr *chunkRegistry) see(name string, rules []tailcfg.FilterRule) string {
 		return fmt.Sprintf("chunk name %q has no known prefix", name)
 	}
 
-	content := jsonOf(rules)
+	content := policymodel.JSON(rules)
 
 	if was, ok := cr.byName[name]; ok && was != content {
 		return fmt.Sprintf("chunk %s named %s before, now %s", name, was, content)
@@ -602,7 +433,7 @@ type deliveryReach struct {
 	churnJudged, crossFamily, combosCompared, keptCleared                           int
 	overlapped, indexed                                                             int
 	// unseen counts offline peers a client holds without the LastSeen a
-	// fresh session shows (see [netmapDiff]), and unindexed the clients
+	// fresh session shows (see [policymodel.NetmapDiff]), and unindexed the clients
 	// whose index lost their own address after a shared one.
 	unseen, unindexed int
 	// laggedFlips counts lagged renders across a delivery flip, and
@@ -905,8 +736,8 @@ func (dw *deliveryWorld) checkWire(s *deliverySess, resps []*tailcfg.MapResponse
 		held = held.Apply(pf)
 
 		// The whole filter goes again only when what it holds would move.
-		if _, ok := pf["base"]; ok && !cleared && ruleList(before) == ruleList(held.Rules()) {
-			dw.failf(judgeWire, "n%d is sent its whole filter again, unchanged: %s", s.id, ruleList(before))
+		if _, ok := pf["base"]; ok && !cleared && policymodel.RuleList(before) == policymodel.RuleList(held.Rules()) {
+			dw.failf(judgeWire, "n%d is sent its whole filter again, unchanged: %s", s.id, policymodel.RuleList(before))
 		}
 	}
 
@@ -960,7 +791,7 @@ func (dw *deliveryWorld) write(s *deliverySess, resps []*tailcfg.MapResponse) {
 		nm := s.client.apply(dw.t, r)
 		s.index = s.index.apply(before, nm, r)
 
-		if have, model := ruleList(nm.PacketFilterRules.AsSlice()), ruleList(s.held.Rules()); have != model {
+		if have, model := policymodel.RuleList(nm.PacketFilterRules.AsSlice()), policymodel.RuleList(s.held.Rules()); have != model {
 			dw.failf(judgeModel, "n%d response %d: the client assembled %s, the model of it %s", s.id, i, have, model)
 		}
 	}
@@ -982,7 +813,7 @@ func (dw *deliveryWorld) lose(s *deliverySess, resps []*tailcfg.MapResponse) {
 type probeCache map[string]policymodel.Report
 
 func (pc probeCache) compare(ref []tailcfg.FilterRule, refNM *netmap.NetworkMap, cand []tailcfg.FilterRule, candNM *netmap.NetworkMap) policymodel.Report {
-	k := ruleList(ref) + clientViewKey(refNM) + "\x00" + ruleList(cand) + clientViewKey(candNM)
+	k := policymodel.RuleList(ref) + clientViewKey(refNM) + "\x00" + policymodel.RuleList(cand) + clientViewKey(candNM)
 	if rep, ok := pc[k]; ok {
 		return rep
 	}
@@ -1010,16 +841,7 @@ func clientViewKey(nm *netmap.NetworkMap) string {
 		peers = append(peers, peer{p.Addresses().AsSlice(), p.AsStruct().CapMap, p.UnsignedPeerAPIOnly()})
 	}
 
-	return jsonOf(nm.SelfNode) + jsonOf(peers)
-}
-
-// ruleList is rules as the wire has them, an empty list as none.
-func ruleList(rules []tailcfg.FilterRule) string {
-	if len(rules) == 0 {
-		return "[]"
-	}
-
-	return jsonOf(rules)
+	return policymodel.JSON(nm.SelfNode) + policymodel.JSON(peers)
 }
 
 // render has s take its wake and render the latest snapshot; its write
@@ -1291,7 +1113,7 @@ func (dw *deliveryWorld) fresh(at string) map[types.NodeID]*netmap.NetworkMap {
 
 		want, chunks := fresh.client(dw.t)
 
-		if d := netmapDiff(have, want, func() { dw.reach.unseen++ }); d != "" {
+		if d := policymodel.NetmapDiff(have, want, func() { dw.reach.unseen++ }); d != "" {
 			dw.failf(judgeClient, "%s: n%d's client, last rendered r%d, differs from a fresh session's of r%d: %s", at, id, s.rev, snap.Rev(), d)
 		}
 
@@ -1321,12 +1143,12 @@ func servedDiff(pc probeCache, nm *netmap.NetworkMap, served []tailcfg.FilterRul
 		return ""
 	}
 
-	if a, s := slices.Sorted(maps.Keys(ruleCounts(assembled))), slices.Sorted(maps.Keys(ruleCounts(served))); !slices.Equal(a, s) {
+	if a, s := slices.Sorted(maps.Keys(policymodel.RuleCounts(assembled))), slices.Sorted(maps.Keys(policymodel.RuleCounts(served))); !slices.Equal(a, s) {
 		return fmt.Sprintf("assembled %v, served %v", a, s)
 	}
 
 	capRules := func(rules []tailcfg.FilterRule) string {
-		return ruleList(slices.DeleteFunc(slices.Clone(rules), func(r tailcfg.FilterRule) bool { return len(r.CapGrant) == 0 }))
+		return policymodel.RuleList(slices.DeleteFunc(slices.Clone(rules), func(r tailcfg.FilterRule) bool { return len(r.CapGrant) == 0 }))
 	}
 
 	if a, s := capRules(assembled), capRules(served); a != s {
@@ -1335,7 +1157,7 @@ func servedDiff(pc probeCache, nm *netmap.NetworkMap, served []tailcfg.FilterRul
 
 	// Past the two checks above no view can tell them apart, so each pair
 	// is put through the client once, under the first view it comes with.
-	k := "served " + ruleList(served) + ruleList(assembled)
+	k := "served " + policymodel.RuleList(served) + policymodel.RuleList(assembled)
 	rep, ok := pc[k]
 
 	if !ok {
@@ -1410,42 +1232,24 @@ func combosAgree(t *rapid.T, at string, r *deliveryRun, worlds []*deliveryWorld,
 	}
 }
 
-// referenceTally is what [deliveryRun.holdToReference] met.
+// referenceTally is what [deliveryRun.holdToReference] met: what the
+// shared judge held, and the SSH policies held to a compile from scratch.
 type referenceTally struct {
-	verdicts policymodel.Verdicts
-	form     policymodel.FormJudge
-	// passed holds the filters held to the reference already, by
-	// everything the comparison reads.
-	passed map[string]bool
+	policymodel.HeldJudge
 
-	clients, filters, peerSets, routePairs, ssh int
-	steered, unjudgedRoutes, primaries          int
-	contestedPeers, contestedRoutes             map[policymodel.Contested]int
-	skipped                                     map[string]int
-
-	// byHistory counts the routes only the election history decides:
-	// unjudged without it, judged with it.
-	byHistory int
-	// addressless counts the peers whose via-steered routes a viewer
-	// holding no address is given fewer of than the reference gives
-	// (see [heldClient.routes]).
-	addressless int
+	ssh int
 }
 
 func (rt *referenceTally) skip(why string) {
-	if rt.skipped == nil {
-		rt.skipped = map[string]int{}
+	if rt.Skipped == nil {
+		rt.Skipped = map[string]int{}
 	}
 
-	rt.skipped[why]++
+	rt.Skipped[why]++
 }
 
 func (rt *referenceTally) String() string {
-	return fmt.Sprintf("reference: clients judged %d, filters compared %d, peer sets %d, route pairs %d (steered pairs judged %d, routes left unjudged %d, "+
-		"decided by the election history %d, steered short to a viewer without addresses %d), self primaries %d, SSH policies %d; skipped %v; "+
-		"peers contested %v, routes contested %v; filters: %v; form: %v",
-		rt.clients, rt.filters, rt.peerSets, rt.routePairs, rt.steered, rt.unjudgedRoutes, rt.byHistory, rt.addressless, rt.primaries, rt.ssh, rt.skipped,
-		rt.contestedPeers, rt.contestedRoutes, &rt.verdicts, &rt.form)
+	return fmt.Sprintf("%v; SSH policies %d", &rt.HeldJudge, rt.ssh)
 }
 
 // require fails a run that held nothing of some kind to the reference.
@@ -1456,12 +1260,12 @@ func (rt *referenceTally) require(t *testing.T, deep bool) {
 	t.Helper()
 
 	floors := map[string]int{
-		"filters": rt.filters, "peer sets": rt.peerSets, "route pairs": rt.routePairs,
-		"self primaries": rt.primaries, "SSH policies": rt.ssh, "filters with a cap: source": rt.form.WithCaps,
+		"filters": rt.Filters, "peer sets": rt.PeerSets, "route pairs": rt.RoutePairs,
+		"self primaries": rt.Primaries, "SSH policies": rt.ssh, "filters with a cap: source": rt.Form.WithCaps,
 	}
 
 	if deep {
-		floors["steered route pairs"], floors["routes the election history decides"] = rt.steered, rt.byHistory
+		floors["steered route pairs"], floors["routes the election history decides"] = rt.Steered, rt.ByHistory
 	}
 
 	for name, n := range floors {
@@ -1473,17 +1277,10 @@ func (rt *referenceTally) require(t *testing.T, deep bool) {
 
 // holdToReference holds what the client of every session held to a fresh
 // one holds to the reference, read for the latest world, in each of the
-// four worlds: its peers are the reference's; each peer carries in its
-// AllowedIPs what the reference gives once the routers are elected
-// ([policymodel.Ref.ServedRoutes]), and the node itself is primary for
-// what the election gives it; its packet filter answers as the
-// reference's rules through its own client ([policymodel.Verdicts], the
-// allowances and contested clauses of the reference properties); it and
-// its peers carry the reference's stamps in capability mode and none in
-// address mode; and its SSH policy is a compile from scratch's. Oracle:
-// the reference and the client's filter, and for SSH a compile that
-// inherits nothing. Worlds out of the reference's domain are skipped, as
-// the reference properties skip them.
+// four worlds ([policymodel.Held.Client]), and its SSH policy to a compile
+// from scratch's. Oracle: the reference and the client's filter, and for
+// SSH a compile that inherits nothing. Worlds out of the reference's
+// domain are skipped, as the reference properties skip them.
 func (r *deliveryRun) holdToReference(t *rapid.T, at string, worlds []*deliveryWorld, held []map[types.NodeID]*netmap.NetworkMap, shared bool) {
 	if !r.judges[judgeReference] {
 		return
@@ -1492,18 +1289,10 @@ func (r *deliveryRun) holdToReference(t *rapid.T, at string, worlds []*deliveryW
 	// Elections read the history the State was driven through: when each
 	// node connected, the prober's marks, who held each route last.
 	w := worlds[0].p.w
-	plain := policymodel.RefOf(w)
-	ref := plain.WithElections(worlds[0].p.elections)
 
-	if why := ref.OutOfDomain(); why != "" {
-		r.ref.skip(why)
-
+	ref := r.ref.At(policymodel.Moment{World: w, Elections: worlds[0].p.elections, Shared: shared})
+	if ref == nil {
 		return
-	}
-
-	if r.ref.passed == nil {
-		r.ref.passed = map[string]bool{}
-		r.ref.contestedPeers, r.ref.contestedRoutes = map[policymodel.Contested]int{}, map[policymodel.Contested]int{}
 	}
 
 	// TODO(kradalby): policy/stale-under-shared-address: SSH policies
@@ -1526,281 +1315,42 @@ func (r *deliveryRun) holdToReference(t *rapid.T, at string, worlds []*deliveryW
 		r.ref.skip("SSH after a shared address")
 	}
 
-	// What a client's view reads of the world besides its own node: every
-	// node's addresses, as sources worth probing.
-	var known []netip.Addr
-	for _, n := range w.Topology.Nodes {
-		known = append(known, n.Addrs()...)
-	}
-
-	world, key := jsonOf(w.Topology)+string(w.Policy.HuJSON()), fmt.Sprint(known)
-
 	for i, dw := range worlds {
 		for _, id := range slices.Sorted(maps.Keys(held[i])) {
-			r.ref.clients++
-			dw.holdClient(t, at, ref, plain, world, key, id, held[i][id], fresh, shared, &r.ref)
+			nm := held[i][id]
+			if d := ref.Client(id, nm, dw.combo.capSources); d != "" {
+				dw.failf(judgeReference, "%s: n%d: %s", at, id, d)
+			}
+
+			if fresh != nil {
+				dw.ssh(t, at, id, nm, fresh, &r.ref)
+			}
 		}
 	}
 }
 
-// heldClient is one client held to the reference: node id's, holding nm.
-type heldClient struct {
-	dw  *deliveryWorld
-	at  string
-	ref *policymodel.Ref
-	// plain is ref without the election history.
-	plain *policymodel.Ref
-	id    types.NodeID
-	nm    *netmap.NetworkMap
-	rt    *referenceTally
-	fail  func(format string, args ...any)
-	// shared: an address was shared in the case, so node attributes may
-	// be stale (TODO(kradalby): policy/stale-under-shared-address).
-	shared bool
-}
-
-// holdClient holds node id's client, holding nm, to ref; see
-// [deliveryRun.holdToReference].
-func (dw *deliveryWorld) holdClient(t *rapid.T, at string, ref, plain *policymodel.Ref, world, key string, id types.NodeID, nm *netmap.NetworkMap,
-	fresh *policyv2.PolicyManager, shared bool, rt *referenceTally,
-) {
-	c := heldClient{dw: dw, at: at, ref: ref, plain: plain, id: id, nm: nm, rt: rt, shared: shared}
-	c.fail = func(format string, args ...any) {
-		dw.failf(judgeReference, "%s: n%d: "+format, append([]any{at, id}, args...)...)
-	}
-
-	c.peers()
-	c.routes()
-	c.filter(world, key)
-	c.stamps()
-
-	if fresh != nil {
-		c.ssh(t, fresh)
-	}
-}
-
-// peers holds the client's peers, and what each carries in its
-// AllowedIPs, to the reference, and the routes the node is primary for to
-// the election.
-func (c heldClient) peers() {
-	got := make([]types.NodeID, 0, len(c.nm.Peers))
-	for _, p := range c.nm.Peers {
-		got = append(got, types.NodeID(p.ID())) //nolint:gosec // small
-	}
-
-	for _, nv := range append([]tailcfg.NodeView{c.nm.SelfNode}, c.nm.Peers...) {
-		var addrs []netip.Addr
-
-		for _, p := range nv.Addresses().All() {
-			addrs = append(addrs, p.Addr())
-		}
-
-		if want := policymodel.ShownAddrs(c.dw.p.w, c.id, types.NodeID(nv.ID())); !c.shared && !slices.Equal(addrs, want) { //nolint:gosec // small
-			c.fail("its client is shown n%d at %v, the model at %v", nv.ID(), addrs, want)
-		}
-	}
-
-	c.rt.peerSets++
-
-	if want := c.ref.Peers(c.id); !slices.Equal(got, want) {
-		k, ok := policymodel.ContestedPeers(c.ref, c.id, got)
-		if !ok {
-			c.fail("its client is shown %v, the reference shows it %v", got, want)
-		}
-
-		c.rt.contestedPeers[k]++
-	}
-
-	self, ok := c.ref.Node(c.id)
+// ssh holds node id's client's SSH policy, from nm, to fresh's, a compile
+// from scratch.
+func (dw *deliveryWorld) ssh(t *rapid.T, at string, id types.NodeID, nm *netmap.NetworkMap, fresh *policyv2.PolicyManager, rt *referenceTally) {
+	nv, ok := dw.p.s.Snapshot().GetNode(id)
 	if !ok {
 		return
 	}
 
-	for _, q := range self.ServedRoutes() {
-		primary, decided := c.ref.Primary(q)
-		if q.Bits() == 0 || !decided {
-			continue
-		}
-
-		c.rt.primaries++
-
-		if want, has := primary == c.id && !policymodel.NamesNode(q), slices.Contains(c.nm.SelfNode.PrimaryRoutes().AsSlice(), q); want != has {
-			c.fail("its client is primary for %s: %t, the election gives it to n%d", q, has, primary)
-		}
-	}
-}
-
-// routes holds what each peer carries in the client's AllowedIPs beyond
-// its addresses to [policymodel.Ref.ServedRoutes].
-func (c heldClient) routes() {
-	viewer, _ := c.dw.p.w.Topology.Node(c.id)
-
-	for _, p := range c.nm.Peers {
-		pid := types.NodeID(p.ID()) //nolint:gosec // small
-		routes := slices.DeleteFunc(p.AllowedIPs().AsSlice(), func(q netip.Prefix) bool { return slices.Contains(p.Addresses().AsSlice(), q) })
-		slices.SortFunc(routes, netip.Prefix.Compare)
-
-		want, unjudged := c.ref.ServedRoutes(c.id, pid)
-		judged := policymodel.Judged(routes, unjudged)
-		c.rt.unjudgedRoutes += len(unjudged)
-
-		if _, without := c.plain.ServedRoutes(c.id, pid); len(without) > len(unjudged) {
-			c.rt.byHistory += len(without) - len(unjudged)
-		}
-
-		if c.ref.Steered(c.id, pid) && len(judged)+len(want) > 0 {
-			c.rt.steered++
-		}
-
-		if len(routes)+len(want) > 0 {
-			c.rt.routePairs++
-		}
-
-		if !slices.Equal(judged, want) {
-			k, ok := policymodel.ContestedServedRoutes(c.ref, c.id, pid, routes)
-
-			switch {
-			case ok:
-				c.rt.contestedRoutes[k]++
-			case c.ref.Steered(c.id, pid) && len(viewer.Addrs()) == 0 && !slices.ContainsFunc(judged, func(q netip.Prefix) bool { return !slices.Contains(want, q) }):
-				// TODO(kradalby): policy/via-addressless-viewer: a viewer
-				// holding no address (database only) is on a via grant's
-				// sources by the routes it serves under *, so the reference
-				// steers it the routers' routes; headscale steers it none.
-				// It can send nothing either way. Counted, not judged.
-				c.rt.addressless++
-			default:
-				c.fail("its client is given %v of n%d's routes, the reference %v (%v unjudged)", routes, pid, want, unjudged)
-			}
-		}
-	}
-}
-
-// filter holds the client's packet filter to the reference's rules
-// through its own filter. A comparison that holds without a contested
-// clause reads only the reference's rules for the node and what it
-// serves, the view and the filter; one that needs a clause reads the
-// whole world.
-func (c heldClient) filter(world, key string) {
-	n, _ := c.dw.p.w.Topology.Node(c.id)
-	rules := c.nm.PacketFilterRules.AsSlice()
-
-	if msg := c.rt.form.Check(c.dw.p.w, c.ref, c.id, rules, c.dw.combo.capSources, c.shared); msg != "" {
-		c.fail("its client's filter is in the wrong form: %s\nheadscale %v", msg, rules)
-	}
-
-	k := fmt.Sprint(n, c.dw.combo.capSources, c.ref.Served(c.id).Prefixes()) + ruleList(c.ref.Rules(c.id)) + key + ruleList(rules) + clientViewKey(c.nm)
-	if c.rt.passed[k] || c.rt.passed[world+k] {
-		return
-	}
-
-	c.rt.filters++
-
-	contested := 0
-	for _, n := range c.rt.verdicts.Contested {
-		contested += n
-	}
-
-	rep := c.rt.verdicts.CompareAt(c.ref, c.id, rules, refView(n, c.dw.p.w, c.nm), c.dw.combo.capSources)
-	if !rep.Equivalent() {
-		c.fail("its client's filter differs from the reference (reference, candidate headscale): %s\nreference %v\nheadscale %v", rep, c.ref.Rules(c.id), rules)
-	}
-
-	for _, n := range c.rt.verdicts.Contested {
-		contested -= n
-	}
-
-	if contested == 0 {
-		c.rt.passed[k] = true
-	} else {
-		c.rt.passed[world+k] = true
-	}
-}
-
-// stamps holds the stamps the client holds of itself and its peers to the
-// reference's, none in address mode.
-func (c heldClient) stamps() {
-	for _, nv := range append([]tailcfg.NodeView{c.nm.SelfNode}, c.nm.Peers...) {
-		of := types.NodeID(nv.ID()) //nolint:gosec // small
-
-		var has, want []string
-
-		for k := range nv.CapMap().All() {
-			if strings.Contains(string(k), strings.TrimPrefix(policymodel.StampPrefix, "https://")) {
-				has = append(has, string(k))
-			}
-		}
-
-		slices.Sort(has)
-
-		for _, s := range c.ref.Stamps(of) {
-			if c.dw.combo.capSources {
-				want = append(want, policymodel.StampPrefix+s)
-			}
-		}
-
-		if !slices.Equal(has, want) {
-			c.fail("its client holds n%d with stamps %v, the reference stamps it %v", of, has, want)
-		}
-	}
-}
-
-// ssh holds the client's SSH policy to fresh's, a compile from scratch.
-func (c heldClient) ssh(t *rapid.T, fresh *policyv2.PolicyManager) {
-	nv, ok := c.dw.p.s.Snapshot().GetNode(c.id)
-	if !ok {
-		return
-	}
-
-	want, err := fresh.SSHPolicy(c.dw.p.cfg.ServerURL, nv)
+	want, err := fresh.SSHPolicy(dw.p.cfg.ServerURL, nv)
 	if err != nil {
-		t.Fatalf("reference: %s: n%d's SSH policy from scratch: %v", c.at, c.id, err)
+		t.Fatalf("reference: %s: n%d's SSH policy from scratch: %v", at, id, err)
 	}
 
 	if want == nil {
 		want = &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}}
 	}
 
-	c.rt.ssh++
+	rt.ssh++
 
-	if h, w := jsonOf(c.nm.SSHPolicy), jsonOf(want); h != w {
-		c.fail("its client's SSH policy is %s, a compile from scratch gives %s", h, w)
+	if h, w := policymodel.JSON(nm.SSHPolicy), policymodel.JSON(want); h != w {
+		dw.failf(judgeReference, "%s: n%d: its client's SSH policy is %s, a compile from scratch gives %s", at, id, h, w)
 	}
-}
-
-// refView is what node n's client knows when it filters, holding nm: local
-// nets from what it announces and runs as, every node's addresses as
-// sources worth probing, capabilities from nm, for a client that looks
-// them up.
-func refView(n policymodel.Node, w policymodel.World, nm *netmap.NetworkMap) policymodel.ClientView {
-	own := make([]netip.Prefix, 0, 2)
-	announced := make([]netip.Prefix, 0, len(n.Announced))
-
-	// disable-ipv4 keeps addresses from the netmap, its own among them;
-	// whether rightly the shown addresses' check says.
-	hidden := policymodel.NotShown(w, slices.Concat(nm.Peers, []tailcfg.NodeView{nm.SelfNode}))
-	addrs := slices.DeleteFunc(n.Addrs(), func(a netip.Addr) bool { return slices.Contains(hidden, a) })
-
-	for _, a := range addrs {
-		own = append(own, netip.PrefixFrom(a, a.BitLen()))
-	}
-
-	for _, r := range n.Announced {
-		announced = append(announced, policymodel.Prefixes[r])
-	}
-
-	v := policymodel.ClientView{Self: addrs, LocalNets: policymodel.LocalNets(own, announced, n.Client == policymodel.AppConnector, nil), Hidden: hidden}
-
-	for _, m := range w.Topology.Nodes {
-		v.Known = append(v.Known, m.Addrs()...)
-	}
-
-	if n.Client == policymodel.Official || n.Client == policymodel.AppConnector {
-		caps := policymodel.NewNetmapCaps(nm.SelfNode, nm.Peers)
-		v.HasCap = caps.HasCap
-	}
-
-	return v
 }
 
 // enforced is what of a netmap no delivery option may move: the node and
@@ -1823,7 +1373,7 @@ func enforced(nm *netmap.NetworkMap) string {
 			c.CapMap = nil
 		}
 
-		return clientPeer(c.View())
+		return policymodel.ClientPeer(c.View())
 	}
 
 	var sb strings.Builder
@@ -1834,7 +1384,7 @@ func enforced(nm *netmap.NetworkMap) string {
 		fmt.Fprintf(&sb, " peer %s;", strip(p))
 	}
 
-	fmt.Fprintf(&sb, " ssh %s; dns %s", jsonOf(nm.SSHPolicy), jsonOf(nm.DNS))
+	fmt.Fprintf(&sb, " ssh %s; dns %s", policymodel.JSON(nm.SSHPolicy), policymodel.JSON(nm.DNS))
 
 	return sb.String()
 }
@@ -2211,7 +1761,7 @@ func (dw *deliveryWorld) judgeChurn(start *state.Snapshot, current, subjects map
 		for _, r := range resps {
 			if r.PacketFilters != nil {
 				dw.failf(judgeChurn, "a step changing only %v sent n%d, served capability form, the filter %s",
-					slices.Sorted(maps.Keys(subjects)), id, jsonOf(r.PacketFilters))
+					slices.Sorted(maps.Keys(subjects)), id, policymodel.JSON(r.PacketFilters))
 			}
 		}
 

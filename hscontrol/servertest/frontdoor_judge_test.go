@@ -8,10 +8,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"maps"
 	"net/netip"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
@@ -234,20 +232,7 @@ func (fd *frontDoor) judgeClients(at string) {
 		}
 	}
 
-	ref := policymodel.RefOf(w).WithElections(fd.elections)
-	why := ref.OutOfDomain()
-
-	if why != "" {
-		fd.run.tally.skipped[why]++
-	}
-
-	var known []netip.Addr
-	for _, n := range w.Topology.Nodes {
-		known = append(known, n.Addrs()...)
-	}
-
-	key := fmt.Sprint(known)
-	world := fmt.Sprint(w.Topology) + string(w.Policy.HuJSON())
+	ref := fd.run.held.At(policymodel.Moment{World: w, Elections: fd.elections, Unheld: fd.unheld})
 
 	for _, n := range w.Topology.Nodes {
 		if n.Offline {
@@ -265,21 +250,17 @@ func (fd *frontDoor) judgeClients(at string) {
 
 		fd.run.tally.clients++
 
-		if d := netmapDiff(nm, fresh, func() { fd.run.tally.unseen++ }); d != "" {
+		if d := policymodel.NetmapDiff(nm, fresh, func() { fd.run.tally.unseen++ }); d != "" {
 			fd.t.Fatalf("%s: n%d's client, the server quiet, holds other than a fresh session of r%d is given: %s", at, n.ID, snap.Rev(), d)
 		}
 
-		if why != "" {
+		if ref == nil {
 			continue
 		}
 
-		c := heldClient{fd: fd, at: at, ref: ref, w: w, id: n.ID, nm: nm}
-		c.peers()
-		c.routes()
-		c.filter(world, key)
-		c.stamps()
-
-		fd.run.tally.refClients++
+		if d := ref.Client(n.ID, nm, fd.capSources); d != "" {
+			fd.t.Fatalf("%s: n%d: reference: %s", at, n.ID, d)
+		}
 	}
 }
 
@@ -318,179 +299,6 @@ func freshNetmap(fd *frontDoor, snap *state.Snapshot, id types.NodeID, p persist
 	return nm
 }
 
-func jsonOf(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return "unencodable: " + err.Error()
-	}
-
-	return string(b)
-}
-
-// clientPeer is a peer as the client acts on it. A patch cannot clear
-// LastSeen when a peer comes online, and the client acts on Online then,
-// so an online peer's LastSeen is left out.
-func clientPeer(n tailcfg.NodeView) string {
-	p := n.AsStruct()
-	if p.Online != nil && *p.Online {
-		p.LastSeen = nil
-	}
-
-	// TODO(kradalby): render/addresses-nil: a peer with no address is
-	// rendered as nil or as an empty list; the client reads both alike.
-	if p.Addresses == nil {
-		p.Addresses = []netip.Prefix{}
-	}
-
-	if p.AllowedIPs == nil {
-		p.AllowedIPs = p.Addresses
-	}
-
-	return jsonOf(p)
-}
-
-// sameNode reports whether a and b are the same node to the client.
-func sameNode(a, b tailcfg.NodeView) bool {
-	// Equal leaves out two fields the wire carries.
-	if a.Equal(b) && a.DataPlaneAuditLogID() == b.DataPlaneAuditLogID() && a.ExitNodeDNSResolvers().Len() == 0 && b.ExitNodeDNSResolvers().Len() == 0 {
-		return true
-	}
-
-	return clientPeer(a) == clientPeer(b)
-}
-
-// ruleCounts is a filter as a multiset of rules.
-func ruleCounts(rules []tailcfg.FilterRule) map[string]int {
-	out := map[string]int{}
-	for _, r := range rules {
-		out[jsonOf(r)]++
-	}
-
-	return out
-}
-
-// countsDiff names the rules a has more of than b, sorted.
-func countsDiff(a, b map[string]int) []string {
-	var out []string
-
-	for _, r := range slices.Sorted(maps.Keys(a)) {
-		if a[r] > b[r] {
-			out = append(out, fmt.Sprintf("%dx %s", a[r]-b[r], r))
-		}
-	}
-
-	return out
-}
-
-func ruleList(rules []tailcfg.FilterRule) string {
-	parts := make([]string, len(rules))
-	for i, r := range rules {
-		parts[i] = jsonOf(r)
-	}
-
-	return strings.Join(parts, "\n")
-}
-
-// filterDiff compares two filters a client holds: the same rules as a
-// multiset, and when their order differs, the same verdicts and app
-// capabilities, in order, through the client's own filter under view.
-func filterDiff(have, want []tailcfg.FilterRule, view func() policymodel.ClientView) string {
-	if slices.EqualFunc(have, want, func(a, b tailcfg.FilterRule) bool { return reflect.DeepEqual(a, b) }) {
-		return ""
-	}
-
-	hc, wc := ruleCounts(have), ruleCounts(want)
-	if !maps.Equal(hc, wc) {
-		return fmt.Sprintf("filter: only held %v; only fresh %v", countsDiff(hc, wc), countsDiff(wc, hc))
-	}
-
-	if ruleList(have) == ruleList(want) {
-		return ""
-	}
-
-	if rep := policymodel.Compare(want, have, view()); !rep.Equivalent() {
-		return "filter reordered so that it answers otherwise: " + rep.String()
-	}
-
-	return ""
-}
-
-// peerIDsOfNetmap is nm's peers, in the client's order (by ID).
-func peerIDsOfNetmap(nm *netmap.NetworkMap) []tailcfg.NodeID {
-	out := make([]tailcfg.NodeID, len(nm.Peers))
-	for i, p := range nm.Peers {
-		out[i] = p.ID()
-	}
-
-	return out
-}
-
-// netmapDiff reports how the netmap a client assembled differs from the
-// one a fresh session gives, field by field, or "". Keys the client holds
-// of itself and the parsed filter (compared as rules) are not compared;
-// unseen is called for each offline peer held without its LastSeen.
-func netmapDiff(have, want *netmap.NetworkMap, unseen func()) string {
-	if !sameNode(have.SelfNode, want.SelfNode) {
-		return fmt.Sprintf("self: have %s, want %s", jsonOf(have.SelfNode), jsonOf(want.SelfNode))
-	}
-
-	if h, w := peerIDsOfNetmap(have), peerIDsOfNetmap(want); !slices.Equal(h, w) {
-		return fmt.Sprintf("peers: have %v, want %v", h, w)
-	}
-
-	for i, w := range want.Peers {
-		h := have.Peers[i]
-		if sameNode(h, w) {
-			continue
-		}
-
-		// TODO(kradalby): render/lastseen-patchify: a peer going offline
-		// in a change no patch carries is sent whole; the client patchifies
-		// it and keeps no LastSeen it did not hold. Counted, not judged.
-		if hs := h.AsStruct(); hs.LastSeen == nil && w.LastSeen().Valid() && !w.Online().GetOr(true) && !h.Online().GetOr(true) {
-			hs.LastSeen = new(w.LastSeen().Get())
-			if sameNode(hs.View(), w) {
-				unseen()
-
-				continue
-			}
-		}
-
-		return fmt.Sprintf("peer %d: have %s, want %s", w.ID(), clientPeer(h), clientPeer(w))
-	}
-
-	if d := filterDiff(have.PacketFilterRules.AsSlice(), want.PacketFilterRules.AsSlice(), func() policymodel.ClientView {
-		return policymodel.ViewFromNetmap(want)
-	}); d != "" {
-		return d
-	}
-
-	for _, f := range []struct {
-		name       string
-		have, want any
-	}{
-		{"ssh", have.SSHPolicy, want.SSHPolicy},
-		{"dns", have.DNS, want.DNS},
-		{"derp", have.DERPMap, want.DERPMap},
-		{"domain", have.Domain, want.Domain},
-		{"collect-services", have.CollectServices, want.CollectServices},
-		{"profiles", have.UserProfiles, want.UserProfiles},
-		{"display-messages", have.DisplayMessages, want.DisplayMessages},
-		{"tka", []any{have.TKAEnabled, have.TKAHead}, []any{want.TKAEnabled, want.TKAHead}},
-		{"caps", have.AllCaps, want.AllCaps},
-	} {
-		if reflect.DeepEqual(f.have, f.want) {
-			continue
-		}
-
-		if h, w := jsonOf(f.have), jsonOf(f.want); h != w {
-			return fmt.Sprintf("%s: have %s, want %s", f.name, h, w)
-		}
-	}
-
-	return ""
-}
-
 // durable is what of a netmap a restart must keep. A restart ends every
 // session, so peers' online state and last-seen times move, and the new
 // server elects HA routers in the order their clients reconnect, keeping
@@ -508,7 +316,7 @@ func durable(nm *netmap.NetworkMap) string {
 			return !slices.Contains(c.Addresses, q) && !tsaddr.IsExitRoute(q)
 		})
 
-		return clientPeer(c.View())
+		return policymodel.ClientPeer(c.View())
 	}
 
 	var sb strings.Builder
@@ -520,223 +328,9 @@ func durable(nm *netmap.NetworkMap) string {
 	}
 
 	fmt.Fprintf(&sb, "\n filter %v;\n ssh %s;\n dns %s;\n profiles %s;\n caps %s",
-		countsDiff(ruleCounts(nm.PacketFilterRules.AsSlice()), nil), jsonOf(nm.SSHPolicy), jsonOf(nm.DNS), jsonOf(nm.UserProfiles), jsonOf(nm.AllCaps))
+		policymodel.CountsDiff(policymodel.RuleCounts(nm.PacketFilterRules.AsSlice()), nil), policymodel.JSON(nm.SSHPolicy), policymodel.JSON(nm.DNS), policymodel.JSON(nm.UserProfiles), policymodel.JSON(nm.AllCaps))
 
 	return sb.String()
-}
-
-// heldClient is one client held to the reference.
-type heldClient struct {
-	fd  *frontDoor
-	at  string
-	ref *policymodel.Ref
-	w   policymodel.World
-	id  types.NodeID
-	nm  *netmap.NetworkMap
-}
-
-func (c heldClient) failf(format string, args ...any) {
-	c.fd.t.Fatalf("%s: n%d: reference: "+format, append([]any{c.at, c.id}, args...)...)
-}
-
-// peers holds the client's peers, and the addresses it is shown, to the
-// reference, and the routes the node is primary for to the election.
-func (c heldClient) peers() {
-	got := make([]types.NodeID, 0, len(c.nm.Peers))
-	for _, p := range c.nm.Peers {
-		got = append(got, types.NodeID(p.ID())) //nolint:gosec // small
-	}
-
-	for _, nv := range append([]tailcfg.NodeView{c.nm.SelfNode}, c.nm.Peers...) {
-		var addrs []netip.Addr
-
-		for _, p := range nv.Addresses().All() {
-			addrs = append(addrs, p.Addr())
-		}
-
-		if want := policymodel.ShownAddrs(c.w, c.id, types.NodeID(nv.ID())); !slices.Equal(addrs, want) { //nolint:gosec // small
-			c.failf("its client is shown n%d at %v, the model at %v", nv.ID(), addrs, want)
-		}
-	}
-
-	c.fd.run.tally.peerSets++
-
-	if want := c.ref.Peers(c.id); !slices.Equal(got, want) {
-		k, ok := policymodel.ContestedPeers(c.ref, c.id, got)
-		if !ok {
-			c.failf("its client is shown %v, the reference shows it %v", got, want)
-		}
-
-		c.fd.run.tally.contested["peers "+k.String()]++
-	}
-
-	self, ok := c.ref.Node(c.id)
-	if !ok {
-		return
-	}
-
-	for _, q := range self.ServedRoutes() {
-		primary, decided := c.ref.Primary(q)
-		if q.Bits() == 0 || !decided || c.fd.unheld[q] {
-			continue
-		}
-
-		c.fd.run.tally.primaries++
-
-		if want, has := primary == c.id && !policymodel.NamesNode(q), slices.Contains(c.nm.SelfNode.PrimaryRoutes().AsSlice(), q); want != has {
-			c.failf("its client is primary for %s: %t, the election gives it to n%d", q, has, primary)
-		}
-	}
-}
-
-// routes holds what each peer carries in the client's AllowedIPs beyond
-// its addresses to [policymodel.Ref.ServedRoutes].
-func (c heldClient) routes() {
-	for _, p := range c.nm.Peers {
-		pid := types.NodeID(p.ID()) //nolint:gosec // small
-		routes := slices.DeleteFunc(p.AllowedIPs().AsSlice(), func(q netip.Prefix) bool { return slices.Contains(p.Addresses().AsSlice(), q) })
-		slices.SortFunc(routes, netip.Prefix.Compare)
-
-		want, unjudged := c.ref.ServedRoutes(c.id, pid)
-		want = slices.DeleteFunc(want, func(q netip.Prefix) bool { return c.fd.unheld[q] })
-
-		for q := range c.fd.unheld {
-			unjudged = append(unjudged, q)
-		}
-
-		judged := policymodel.Judged(routes, unjudged)
-
-		if len(routes)+len(want) > 0 {
-			c.fd.run.tally.routePairs++
-		}
-
-		if !slices.Equal(judged, want) {
-			k, ok := policymodel.ContestedServedRoutes(c.ref, c.id, pid, routes)
-
-			switch {
-			case ok:
-				c.fd.run.tally.contested["routes "+k.String()]++
-			default:
-				c.failf("its client is given %v of n%d's routes, the reference %v (%v unjudged)", routes, pid, want, unjudged)
-			}
-		}
-	}
-}
-
-// filter holds the client's packet filter to the reference's rules
-// through its own filter. A comparison that holds without a contested
-// clause reads only the reference's rules for the node and what it
-// serves, the view and the filter; one that needs a clause reads the
-// whole world.
-func (c heldClient) filter(world, key string) {
-	n, _ := c.w.Topology.Node(c.id)
-	rules := c.nm.PacketFilterRules.AsSlice()
-	capSources := c.fd.capSources
-
-	if msg := c.fd.run.form.Check(c.w, c.ref, c.id, rules, capSources, false); msg != "" {
-		c.failf("its client's filter is in the wrong form: %s\nheadscale %v", msg, rules)
-	}
-
-	k := fmt.Sprint(n, capSources, c.ref.Served(c.id).Prefixes()) + ruleList(c.ref.Rules(c.id)) + key + ruleList(rules) + jsonOf(c.nm.SelfNode.CapMap()) + jsonOf(peerCaps(c.nm))
-	if c.fd.run.passed[k] || c.fd.run.passed[world+k] {
-		return
-	}
-
-	c.fd.run.tally.filters++
-
-	contested := 0
-	for _, n := range c.fd.run.verdicts.Contested {
-		contested += n
-	}
-
-	rep := c.fd.run.verdicts.CompareAt(c.ref, c.id, rules, refView(n, c.w, c.nm), capSources)
-	if !rep.Equivalent() {
-		c.failf("its client's filter differs from the reference (reference, candidate headscale): %s\nreference %v\nheadscale %v", rep, c.ref.Rules(c.id), rules)
-	}
-
-	for _, n := range c.fd.run.verdicts.Contested {
-		contested -= n
-	}
-
-	if contested == 0 {
-		c.fd.run.passed[k] = true
-	} else {
-		c.fd.run.passed[world+k] = true
-	}
-}
-
-// peerCaps is what the client's view reads of its peers: their
-// capabilities, by address.
-func peerCaps(nm *netmap.NetworkMap) []string {
-	out := make([]string, 0, len(nm.Peers))
-	for _, p := range nm.Peers {
-		out = append(out, fmt.Sprint(p.Addresses().AsSlice())+jsonOf(p.CapMap()))
-	}
-
-	return out
-}
-
-// stamps holds the stamps the client holds of itself and its peers to the
-// reference's, none in address mode.
-func (c heldClient) stamps() {
-	for _, nv := range append([]tailcfg.NodeView{c.nm.SelfNode}, c.nm.Peers...) {
-		of := types.NodeID(nv.ID()) //nolint:gosec // small
-
-		var has, want []string
-
-		for k := range nv.CapMap().All() {
-			if strings.Contains(string(k), strings.TrimPrefix(policymodel.StampPrefix, "https://")) {
-				has = append(has, string(k))
-			}
-		}
-
-		slices.Sort(has)
-
-		for _, s := range c.ref.Stamps(of) {
-			if c.fd.capSources {
-				want = append(want, policymodel.StampPrefix+s)
-			}
-		}
-
-		if !slices.Equal(has, want) {
-			c.failf("its client holds n%d with stamps %v, the reference stamps it %v", of, has, want)
-		}
-	}
-}
-
-// refView is what node n's client knows when it filters, holding nm: local
-// nets from what it announces and runs as, every node's addresses as
-// sources worth probing, capabilities from nm, for a client that looks
-// them up.
-func refView(n policymodel.Node, w policymodel.World, nm *netmap.NetworkMap) policymodel.ClientView {
-	own := make([]netip.Prefix, 0, 2)
-	announced := make([]netip.Prefix, 0, len(n.Announced))
-
-	// disable-ipv4 keeps addresses from the netmap, its own among them;
-	// whether rightly the shown addresses' check says.
-	hidden := policymodel.NotShown(w, slices.Concat(nm.Peers, []tailcfg.NodeView{nm.SelfNode}))
-	addrs := slices.DeleteFunc(n.Addrs(), func(a netip.Addr) bool { return slices.Contains(hidden, a) })
-
-	for _, a := range addrs {
-		own = append(own, netip.PrefixFrom(a, a.BitLen()))
-	}
-
-	for _, r := range n.Announced {
-		announced = append(announced, policymodel.Prefixes[r])
-	}
-
-	v := policymodel.ClientView{Self: addrs, LocalNets: policymodel.LocalNets(own, announced, n.Client == policymodel.AppConnector, nil), Hidden: hidden}
-
-	for _, m := range w.Topology.Nodes {
-		v.Known = append(v.Known, m.Addrs()...)
-	}
-
-	if n.Client == policymodel.Official || n.Client == policymodel.AppConnector {
-		caps := policymodel.NewNetmapCaps(nm.SelfNode, nm.Peers)
-		v.HasCap = caps.HasCap
-	}
-
-	return v
 }
 
 // requireStored holds what the server stored to the model: every node
@@ -958,7 +552,7 @@ func rowDiff(row, n *types.Node) string {
 	}
 
 	if !row.Hostinfo.Equal(n.Hostinfo) {
-		differ("hostinfo", jsonOf(row.Hostinfo), jsonOf(n.Hostinfo))
+		differ("hostinfo", policymodel.JSON(row.Hostinfo), policymodel.JSON(n.Hostinfo))
 	}
 
 	return strings.Join(out, "; ")

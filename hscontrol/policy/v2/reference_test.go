@@ -564,36 +564,6 @@ func (sv *served) peersOf(id types.NodeID) []types.NodeID {
 	return slices.DeleteFunc(slices.Clone(sv.peers.Peers(id)), func(p types.NodeID) bool { return p == id })
 }
 
-// viewOf is what node n's client knows when it filters: local nets from
-// what it announces and runs as, every node's addresses as sources worth
-// probing, and capabilities from caps. A client not known to match
-// capability sources (one reporting no versions, tailscale-rs) matches
-// none: it parses a cap: source and finds nobody holding it.
-func viewOf(n policymodel.Node, w policymodel.World, caps *policymodel.NetmapCaps) policymodel.ClientView {
-	own := make([]netip.Prefix, 0, 2)
-	announced := make([]netip.Prefix, 0, len(n.Announced))
-
-	for _, a := range n.Addrs() {
-		own = append(own, netip.PrefixFrom(a, a.BitLen()))
-	}
-
-	for _, r := range n.Announced {
-		announced = append(announced, policymodel.Prefixes[r])
-	}
-
-	v := policymodel.ClientView{Self: n.Addrs(), LocalNets: policymodel.LocalNets(own, announced, n.Client == policymodel.AppConnector, nil)}
-
-	for _, m := range w.Topology.Nodes {
-		v.Known = append(v.Known, m.Addrs()...)
-	}
-
-	if caps != nil && (n.Client == policymodel.Official || n.Client == policymodel.AppConnector) {
-		v.HasCap = caps.HasCap
-	}
-
-	return v
-}
-
 // refSteps is how long a drawn scenario may be: a failing case replays
 // every step for each shrink candidate.
 const refSteps = 10
@@ -756,7 +726,7 @@ func TestServedFiltersFollowReference(t *testing.T) {
 					t.Fatalf("after step %d n%d: %v", step, id, err)
 				}
 
-				view := viewOf(n, sv.w, nil)
+				view := policymodel.ModelView(n, sv.w, nil, nil)
 				rep := classes.CompareAt(sv.ref, id, got, view, false)
 
 				counts.judged++
@@ -833,7 +803,7 @@ func TestCapabilityFormFollowsReference(t *testing.T) {
 				}
 
 				caps := policymodel.NewNetmapCaps(sv.render(id, true), peers)
-				view := viewOf(n, sv.w, &caps)
+				view := policymodel.ModelView(n, sv.w, &caps, nil)
 				rep := rendered.CompareAt(sv.ref, id, got, view, true)
 
 				counts.judged++
@@ -850,7 +820,7 @@ func TestCapabilityFormFollowsReference(t *testing.T) {
 
 				self, refPeers := sv.ref.Netmap(id)
 				refCaps := policymodel.NewNetmapCaps(self, refPeers)
-				view = viewOf(n, sv.w, &refCaps)
+				view = policymodel.ModelView(n, sv.w, &refCaps, nil)
 
 				rep = referenced.CompareAt(sv.ref, id, got, view, true)
 				probes += rep.Probes
@@ -1109,7 +1079,7 @@ func TestInternetClausesAreHeadscalesReading(t *testing.T) {
 			got, err := sv.ip.ForNode(n.ID, ReceiverFacts{})
 			require.NoError(t, err, c.name)
 
-			view := viewOf(n, c.w, nil)
+			view := policymodel.ModelView(n, c.w, nil, nil)
 
 			rep := policymodel.Compare(headscale.Rules(n.ID), got, view)
 			require.Truef(t, rep.Equivalent(), "%s: n%d's filter differs from the reference less both clauses: %s\nreference %v\nheadscale %v", c.name, n.ID, rep, headscale.Rules(n.ID), got)
