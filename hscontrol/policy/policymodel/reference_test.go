@@ -21,7 +21,7 @@ func TestReferenceLaws(t *testing.T) {
 	for i := range 300 {
 		w := Worlds().Example(i)
 
-		for _, without := range append([]Contested{0}, ContestedClauses...) {
+		for _, without := range append([]Contested{0, Headscale}, ContestedClauses...) {
 			ref := RefOf(w).Without(without)
 
 			for _, n := range ref.nodes {

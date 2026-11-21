@@ -962,15 +962,7 @@ func TestPeersAndRoutesFollowReference(t *testing.T) {
 		})
 	})
 
-	var named []string
-
-	for _, k := range policymodel.ContestedSets {
-		if contested[k] > 0 {
-			named = append(named, fmt.Sprintf("%d %s", contested[k], k))
-		}
-	}
-
-	t.Logf("contested %v", named)
+	t.Logf("contested %v", policymodel.ContestedCounts(contested))
 	requireJudged(t, "peers", peerCounts, floorPeers)
 	requireJudged(t, "routes", routeCounts, floorRoutes)
 }

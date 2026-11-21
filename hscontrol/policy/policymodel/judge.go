@@ -3,6 +3,7 @@ package policymodel
 import (
 	"fmt"
 	"maps"
+	"math/bits"
 	"net/netip"
 	"slices"
 	"strings"
@@ -54,38 +55,91 @@ func (c *Verdicts) addContested(k Contested, n int) {
 	c.Contested[k] += n
 }
 
-// ContestedSets are the sets of contested clauses a difference is tried
-// against, in order: each alone, each pair, then all of them.
-var ContestedSets = func() []Contested {
-	cs := ContestedClauses
-	out := slices.Clone(cs)
-
+// Headscale is every contested clause: the reference less it is
+// headscale's reading, each clause restated together with every other.
+var Headscale = func() Contested {
 	var all Contested
+	for _, k := range ContestedClauses {
+		all |= k
+	}
 
-	for i, a := range cs {
-		all |= a
+	return all
+}()
 
-		for _, b := range cs[i+1:] {
-			out = append(out, a|b)
+// attribute holds a difference from the reference to headscale's reading:
+// reproduces tells whether the reference less some clauses gives what
+// production does. Production must be the reference less [Headscale]
+// exactly, so no mix of clauses forgives more than all of them do
+// together. It returns the clauses the difference is counted under: the
+// first that alone reproduces it, else the fewest that do together
+// found by leaving clauses back in one at a time.
+func attribute(reproduces func(Contested) bool) (Contested, bool) {
+	if !reproduces(Headscale) {
+		return 0, false
+	}
+
+	for _, k := range ContestedClauses {
+		if reproduces(k) {
+			return k, true
 		}
 	}
 
-	return append(out, all)
-}()
+	set := Headscale
 
-func (c *Verdicts) String() string {
+	for _, k := range ContestedClauses {
+		if rest := set &^ k; bits.OnesCount16(uint16(rest)) > 1 && reproduces(rest) {
+			set = rest
+		}
+	}
+
+	return set, true
+}
+
+// inexact names clauses that reproduce a difference headscale's reading
+// does not: every clause but one, which is then restated otherwise than
+// headscale behaves beside the others; else one or two alone.
+func inexact(reproduces func(Contested) bool) Contested {
+	for _, k := range ContestedClauses {
+		if reproduces(Headscale &^ k) {
+			return Headscale &^ k
+		}
+	}
+
+	for i, a := range ContestedClauses {
+		if reproduces(a) {
+			return a
+		}
+
+		for _, b := range ContestedClauses[i+1:] {
+			if reproduces(a | b) {
+				return a | b
+			}
+		}
+	}
+
+	return 0
+}
+
+// ContestedCounts lists counts by clause set, in the order of the sets.
+func ContestedCounts(counts map[Contested]int) []string {
 	var parts []string
 
-	for _, k := range ContestedSets {
-		if c.Contested[k] > 0 {
+	for _, k := range slices.Sorted(maps.Keys(counts)) {
+		if counts[k] > 0 {
 			open := ""
 			if k.FailsOpen() {
 				open = ", fails open"
 			}
 
-			parts = append(parts, fmt.Sprintf("%d %s%s", c.Contested[k], k, open))
+			parts = append(parts, fmt.Sprintf("%d %s%s", counts[k], k, open))
 		}
 	}
+
+	return parts
+}
+
+func (c *Verdicts) String() string {
+	parts := ContestedCounts(c.Contested)
 
 	return fmt.Sprintf("allowed %d cross-family ICMP, %d through * on unapproved routes, %d on hidden addresses; suspected: %d through other whole destinations on unapproved routes, %d app values repeated; contested %v",
 		c.CrossFamilyICMP, c.Unrouted, c.Hidden, c.UnroutedWhole, c.RepeatedValues, parts)
@@ -165,23 +219,29 @@ func (c *Verdicts) judge(rep Report, ref *Ref, id types.NodeID, view ClientView,
 // CompareAt holds production's rules got at node id to the reference
 // through the client under view, and returns what is left once the
 // allowed classes are taken out; capForm allows the class only capability
-// form has. A node whose whole difference is the reference less some
-// contested clauses is counted under those clauses.
+// form has. A node whose whole difference is headscale's reading
+// ([Headscale]) is counted under the clauses that make it (see
+// [attribute]).
 func (c *Verdicts) CompareAt(ref *Ref, id types.NodeID, got []tailcfg.FilterRule, view ClientView, capForm bool) Report {
 	var trial Verdicts
 
 	rep := trial.judge(Compare(ref.Rules(id), got, view), ref, id, view, got, capForm)
 	if !rep.Equivalent() {
-		for _, k := range ContestedSets {
+		rests, classes := map[Contested]Report{}, map[Contested]Verdicts{}
+		reproduces := func(k Contested) bool {
 			var without Verdicts
 
 			rest := without.judge(Compare(ref.Without(k).Rules(id), got, view), ref, id, view, got, capForm)
-			if rest.Equivalent() {
-				c.addContested(k, len(rep.Verdicts)+len(rep.Caps))
-				rep, trial = rest, without
+			rests[k], classes[k] = rest, without
 
-				break
-			}
+			return rest.Equivalent()
+		}
+
+		if k, ok := attribute(reproduces); ok {
+			c.addContested(k, len(rep.Verdicts)+len(rep.Caps))
+			rep, trial = rests[k], classes[k]
+		} else {
+			rep.Inexact = inexact(reproduces)
 		}
 	}
 
@@ -312,31 +372,22 @@ func wholeAccepts(rules []tailcfg.FilterRule, view ClientView, served *netipx.IP
 	})
 }
 
-// ContestedPeers reports which contested clauses, left out of the
-// reference, show node id exactly got.
+// ContestedPeers reports whether headscale's reading shows node id
+// exactly got, and the clauses that make it (see [attribute]).
 func ContestedPeers(ref *Ref, id types.NodeID, got []types.NodeID) (Contested, bool) {
-	for _, k := range ContestedSets {
-		if slices.Equal(got, ref.Without(k).Peers(id)) {
-			return k, true
-		}
-	}
-
-	return 0, false
+	return attribute(func(k Contested) bool { return slices.Equal(got, ref.Without(k).Peers(id)) })
 }
 
-// ContestedRoutes reports which contested clauses, left out of the
-// reference, give viewer exactly got of peer's routes, both sorted.
+// ContestedRoutes reports whether headscale's reading gives viewer
+// exactly got of peer's routes, both sorted, and the clauses that make it
+// (see [attribute]).
 func ContestedRoutes(ref *Ref, viewer, peer types.NodeID, got []netip.Prefix) (Contested, bool) {
-	for _, k := range ContestedSets {
+	return attribute(func(k Contested) bool {
 		want := ref.Without(k).Routes(viewer, peer)
 		slices.SortFunc(want, netip.Prefix.Compare)
 
-		if slices.Equal(got, want) {
-			return k, true
-		}
-	}
-
-	return 0, false
+		return slices.Equal(got, want)
+	})
 }
 
 // MergesApart reports whether w has a self destination and a user whose

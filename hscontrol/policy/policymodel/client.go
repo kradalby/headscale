@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"math/bits"
 	"net/netip"
 	"slices"
 	"strconv"
@@ -300,6 +301,9 @@ type Report struct {
 	Parse    []string
 	Verdicts []VerdictDiff
 	Caps     []CapsDiff
+	// Inexact, set by [Verdicts.CompareAt], names clauses that alone or
+	// in pairs reproduce what headscale's reading does not.
+	Inexact Contested
 }
 
 // Equivalent reports whether the client enforces both rule sets alike.
@@ -363,6 +367,15 @@ func (r Report) String() string {
 		}
 
 		fmt.Fprintf(&sb, "\n  caps %s -> %s: reference %s, candidate %s", d.Src, d.Dst, PeerCapsString(d.Ref), PeerCapsString(d.Cand))
+	}
+
+	if r.Inexact != 0 {
+		less := r.Inexact.String()
+		if bits.OnesCount16(uint16(r.Inexact)) > len(ContestedClauses)/2 {
+			less = "every clause but " + (Headscale &^ r.Inexact).String()
+		}
+
+		fmt.Fprintf(&sb, "\n  the reference less %s gives what headscale does, less every clause does not: a clause is restated inexactly", less)
 	}
 
 	return sb.String()

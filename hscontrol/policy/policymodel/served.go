@@ -161,19 +161,15 @@ func sameVia(rules []refRule) bool {
 	return !slices.ContainsFunc(rules[1:], func(rl refRule) bool { return !slices.Equal(set(rl), set(rules[0])) })
 }
 
-// ContestedServedRoutes reports which contested clauses, left out of the
-// reference, give viewer exactly got of peer's routes as served, but for
-// the routes that reference leaves unjudged.
+// ContestedServedRoutes reports whether headscale's reading gives viewer
+// exactly got of peer's routes as served, but for the routes it leaves
+// unjudged, and the clauses that make it (see [attribute]).
 func ContestedServedRoutes(ref *Ref, viewer, peer types.NodeID, got []netip.Prefix) (Contested, bool) {
-	for _, k := range ContestedSets {
+	return attribute(func(k Contested) bool {
 		want, unjudged := ref.Without(k).ServedRoutes(viewer, peer)
 
-		if slices.Equal(Judged(got, unjudged), want) {
-			return k, true
-		}
-	}
-
-	return 0, false
+		return slices.Equal(Judged(got, unjudged), want)
+	})
 }
 
 // Judged is routes without the unjudged ones.
