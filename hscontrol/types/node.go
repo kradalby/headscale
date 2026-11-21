@@ -813,6 +813,11 @@ func (node *Node) PeerChangeFromMapRequest(req tailcfg.MapRequest) tailcfg.PeerC
 	}
 
 	// Compare endpoints using order-independent comparison
+	// TODO(kradalby): state/map-request-keeps-endpoints: an empty
+	// req.Endpoints clears nothing. slices.Clone of an empty slice is
+	// nil, and ApplyPeerChange skips a nil, so a client that reports no
+	// endpoints keeps its old ones on the server and in every peer's
+	// map. Intended or not is undecided; pinned by no test.
 	if EndpointsChanged(node.Endpoints, req.Endpoints) {
 		ret.Endpoints = slices.Clone(req.Endpoints)
 	}
