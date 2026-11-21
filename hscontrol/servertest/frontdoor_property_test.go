@@ -790,7 +790,8 @@ func (fd *frontDoor) approveNow(u policymodel.User) func(authID string) error {
 // then told to start a new login, and its client never learns it is
 // logged in. A follow-up re-sent after a network drop, or an approval
 // scripted to fire as the URL appears, meets it. The property approves
-// around it, counted.
+// around it, counted; TestAFollowupAcrossAnApprovalIsToldToStartOver
+// (package hscontrol) holds it to production.
 func (fd *frontDoor) awaitFollowup(authID string) {
 	deadline := time.Now().Add(20 * time.Second)
 
