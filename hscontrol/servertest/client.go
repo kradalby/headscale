@@ -560,6 +560,15 @@ func (c *TestClient) waitLogin(ctx context.Context, url string, approve func(str
 	// The URL ends in the auth ID: /register/<id>.
 	err := approve(path.Base(url))
 	if err != nil {
+		// A follow-up the server already told to start over is why the
+		// approval found no login.
+		cancel()
+
+		ferr := <-done
+		if errors.Is(ferr, errLoginStartedOver) {
+			return ferr
+		}
+
 		return err
 	}
 
