@@ -12,13 +12,13 @@ import (
 // via grants to autogroup:internet at exit nodes and public routes, routes
 // announced unapproved inside a destination, several contested clauses at
 // one node, and nodes moving onto an identity that auto-approves a route
-// they announce. Their floors sit five standard deviations under what the
-// coverage sample holds, as a count drawn afresh would.
+// they announce. A floor fails a sample drawn afresh no more often than a
+// count five standard deviations short does.
 var proneShapes = []Shape{
-	{Name: "via-exit-router-among-sources", Why: "a via exit node among the sources of its grant to autogroup:internet", Min: 0.025, World: func(v *View) bool {
+	{Name: "via-exit-router-among-sources", Why: "a via exit node among the sources of its grant to autogroup:internet", Min: 0.03, World: func(v *View) bool {
 		return len(v.viaExitSources()) > 0
 	}},
-	{Name: "via-exit-source-public-peer", Why: "such a router beside another node serving a public subnet route", Min: 0.025, World: func(v *View) bool {
+	{Name: "via-exit-source-public-peer", Why: "such a router beside another node serving a public subnet route", Min: 0.03, World: func(v *View) bool {
 		return slices.ContainsFunc(v.viaExitSources(), func(r Node) bool {
 			return v.anyNode(func(n Node) bool { return n.ID != r.ID && slices.ContainsFunc(served(n), publicRoute) })
 		})
@@ -43,14 +43,14 @@ var proneShapes = []Shape{
 	{Name: "via-exit-one-family", Why: "a via exit node of one family under a grant to autogroup:internet", Min: 0.025, World: func(v *View) bool {
 		return slices.ContainsFunc(v.viaExits(), oneFamily)
 	}},
-	{Name: "via-exit-public-other-family", Why: "a via exit node of one family serving a public route of the other", Min: 0.008, World: func(v *View) bool {
+	{Name: "via-exit-public-other-family", Why: "a via exit node of one family serving a public route of the other", Min: 0.01, World: func(v *View) bool {
 		return slices.ContainsFunc(v.viaExits(), func(n Node) bool {
 			return oneFamily(n) && slices.ContainsFunc(served(n), func(r int) bool {
 				return publicRoute(r) && Prefixes[r].Addr().Is4() != slices.Contains(served(n), exit4)
 			})
 		})
 	}},
-	{Name: "via-router-unavailable", Why: "a via router offline or expired", Min: 0.02, World: func(v *View) bool {
+	{Name: "via-router-unavailable", Why: "a via router offline or expired", Min: 0.025, World: func(v *View) bool {
 		return v.anyRule(func(r Rule, _ bool) bool {
 			return len(r.Via) > 0 && v.anyNode(func(n Node) bool { return (n.Offline || n.Expired) && v.viaRouterOf(r, n) })
 		})
@@ -69,7 +69,7 @@ var proneShapes = []Shape{
 			})
 		})
 	}},
-	{Name: "via-route-over-node", Why: "a via router's route holding another node's address", Min: 0.015, World: func(v *View) bool {
+	{Name: "via-route-over-node", Why: "a via router's route holding another node's address", Min: 0.02, World: func(v *View) bool {
 		return v.anyRule(func(r Rule, _ bool) bool {
 			return len(r.Via) > 0 && v.anyNode(func(n Node) bool {
 				return v.viaRouterOf(r, n) && slices.ContainsFunc(served(n), func(rt int) bool {
@@ -79,19 +79,26 @@ var proneShapes = []Shape{
 		})
 	}},
 	{Name: "three-clauses-at-a-node", Why: "three contested clauses each deciding one node's rules", Min: 0.01, World: threeClauses},
-	{Name: "retag-onto-approver", Why: "a retag onto a tag that auto-approves a route the node announces", Min: 0.01, Step: func(b, a *View, st Step) bool {
+	{Name: "retag-onto-approver", Why: "a retag onto a tag that auto-approves a route the node announces", Min: 0.008, Step: func(b, a *View, st Step) bool {
 		return slices.ContainsFunc(edits[Retag](st), func(e Retag) bool {
 			return len(e.Tags) > 0 && nodeMoved(b, a, e.ID, func(was, is Node) bool { return len(dropRoutes(is.Approved, was.Approved)) > 0 })
 		})
 	}},
-	{Name: "login-onto-approver", Why: "a tagged node logging in as a user who auto-approves a route it announces", Min: 0.008, Step: func(b, a *View, st Step) bool {
+	{Name: "retag-off-approver", Why: "a retag off the identity that auto-approved a route the node keeps", Min: 0.006, Step: func(b, a *View, st Step) bool {
+		return slices.ContainsFunc(edits[Retag](st), func(e Retag) bool {
+			return len(e.Tags) > 0 && nodeMoved(b, a, e.ID, func(was, is Node) bool {
+				return slices.ContainsFunc(was.AutoApproved, func(r int) bool { return slices.Contains(is.Approved, r) && !a.Approvable(is, r) })
+			})
+		})
+	}},
+	{Name: "login-onto-approver", Why: "a tagged node logging in as a user who auto-approves a route it announces", Min: 0.003, Step: func(b, a *View, st Step) bool {
 		return slices.ContainsFunc(edits[Retag](st), func(e Retag) bool {
 			return len(e.Tags) == 0 && nodeMoved(b, a, e.ID, func(was, is Node) bool {
 				return was.Tagged() && slices.ContainsFunc(dropRoutes(is.Announced, is.Approved), func(r int) bool { return a.Approvable(is, r) })
 			})
 		})
 	}},
-	{Name: "approvers-moved-under-announced", Why: "the auto-approvers come to approve a route a node announces, which nothing approves yet", Min: 0.01, Step: func(b, a *View, st Step) bool {
+	{Name: "approvers-moved-under-announced", Why: "the auto-approvers come to approve a route a node announces, which nothing approves yet", Min: 0.007, Step: func(b, a *View, st Step) bool {
 		return len(edits[SetAutoApprovers](st)) > 0 && a.anyNode(func(n Node) bool {
 			return slices.ContainsFunc(dropRoutes(n.Announced, n.Approved), func(r int) bool {
 				was, ok := b.World.Topology.Node(n.ID)
@@ -100,7 +107,7 @@ var proneShapes = []Shape{
 			})
 		})
 	}},
-	{Name: "approved-after-approvers-moved", Why: "a route approved by a later write once the auto-approvers moved under it", Min: 0.009, Seq: approvedAfterApproversMoved},
+	{Name: "approved-after-approvers-moved", Why: "a route approved by a later write once the auto-approvers moved under it", Min: 0.005, Seq: approvedAfterApproversMoved},
 }
 
 func publicRoute(r int) bool { return r < numRulePrefixes && public(Prefixes[r]) }

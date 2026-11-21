@@ -214,6 +214,7 @@ const (
 	approverRetag    = iota // retagged onto the approving tag
 	approverLogin           // a tagged node logs in as the approving user
 	approverAnnounce        // it announces another route
+	approverAway            // approved by its own identity, retagged off it
 	numApproverWays
 )
 
@@ -223,7 +224,8 @@ const (
 // node does not carry, or for a user, and every session reads; then the
 // node is retagged onto the tag, logs in as the user, or announces a
 // further route, and every session reads. Auto-approval runs on the last
-// step alone, if at all. None when no node of w is addressed or no route
+// step alone, if at all. Or the other way off an approver
+// ([approverAwayScript]). None when no node of w is addressed or no route
 // is left to approve, or w holds a token users made ambiguous, which no
 // policy write gets past.
 func approverScript(w World, who, way int) []Step {
@@ -245,6 +247,14 @@ func approverScript(w World, who, way int) []Step {
 			continue
 		}
 
+		if way == approverAway {
+			if steps := approverAwayScript(v, n, all); len(steps) > 0 {
+				return steps
+			}
+
+			continue
+		}
+
 		route, ok := unapprovable(v, n)
 		if !ok {
 			continue
@@ -260,20 +270,60 @@ func approverScript(w World, who, way int) []Step {
 			steps = append(steps, Step{Edits: []Edit{Announce{n.ID, []int{route}}}})
 		}
 
-		// One entry a route: the document keys approvers by it.
-		aa := w.Policy.AutoApprovers.clone()
-		if i := slices.IndexFunc(aa.Routes, func(ra RouteApproval) bool { return ra.Route == route }); i >= 0 {
-			aa.Routes[i].By = append(aa.Routes[i].By, by)
-		} else {
-			aa.Routes = append(aa.Routes, RouteApproval{Route: route, By: []Sel{by}})
-		}
-
 		return append(steps,
-			Step{Edits: []Edit{SetAutoApprovers{aa}}, Reads: all},
+			Step{Edits: []Edit{SetAutoApprovers{approving(w.Policy.AutoApprovers, route, by)}}, Reads: all},
 			Step{Edits: []Edit{last}, Reads: all})
 	}
 
 	return nil
+}
+
+// approving is aa with by approving route too, in route's entry: the
+// document keys approvers by route.
+func approving(aa AutoApprovers, route int, by Sel) AutoApprovers {
+	aa = aa.clone()
+	if i := slices.IndexFunc(aa.Routes, func(ra RouteApproval) bool { return ra.Route == route }); i >= 0 {
+		aa.Routes[i].By = append(aa.Routes[i].By, by)
+	} else {
+		aa.Routes = append(aa.Routes, RouteApproval{Route: route, By: []Sel{by}})
+	}
+
+	return aa
+}
+
+// approverAwayScript is three steps on n: the auto-approvers come to
+// approve a route it does not announce for its own identity; it announces
+// the route, which they approve; it is retagged onto a tag the policy
+// defines that does not approve it, and the approval stays. None when n
+// has no identity a token names alone, or no route or tag is left.
+func approverAwayScript(v *View, n Node, all []types.NodeID) []Step {
+	by, ok := ownIdentity(v, n)
+	if !ok {
+		return nil
+	}
+
+	route := -1
+
+	for _, r := range []int{0, publicPrefix, touching, publicPrefix6, 2} {
+		if !slices.Contains(n.Announced, r) && !slices.Contains(n.Approved, r) && !v.Approvable(n, r) {
+			route = r
+
+			break
+		}
+	}
+
+	tag := slices.IndexFunc(allTags, func(t int) bool {
+		return v.World.Policy.DefinesTag(t) && !slices.Contains(n.Tags, t) && (by.Kind != SelTag || by.I != t)
+	})
+	if route < 0 || tag < 0 {
+		return nil
+	}
+
+	return []Step{
+		{Edits: []Edit{SetAutoApprovers{approving(v.World.Policy.AutoApprovers, route, by)}}, Reads: all},
+		{Edits: []Edit{Announce{n.ID, []int{route}}}},
+		{Edits: []Edit{Retag{n.ID, []int{tag}, 0}}, Reads: all},
+	}
 }
 
 // unapprovable is a subnet route n announces unapproved, else one it may
