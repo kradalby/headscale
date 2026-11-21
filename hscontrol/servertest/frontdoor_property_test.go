@@ -112,8 +112,9 @@ type fdNode struct {
 	// with it under a new node key is refused.
 	reusable bool
 	// keyTagged: the key carries tags, and outlives the user who made it; a
-	// user's own key is deleted with the user.
+	// user's own key is deleted with the user. keyID is the key's ID.
 	keyTagged bool
+	keyID     string
 	// loggedOut is set once its client logged out: it holds no node key.
 	loggedOut bool
 }
@@ -518,11 +519,38 @@ func (fd *frontDoor) edit(at string, e policymodel.Edit, ids map[types.NodeID]ty
 		fd.apply(e)
 
 		// The user's own pre-auth keys went with it: a node it tagged away
-		// can no longer present one.
-		for _, nd := range fd.nodes {
-			if nd.keyUser == e.ID && !nd.keyTagged {
+		// can no longer present one. Tagged keys it made stay, their tags'.
+		var keys struct {
+			PreAuthKeys []struct {
+				ID string `json:"id"`
+			} `json:"preAuthKeys"`
+		}
+
+		fd.mustAPI(at, http.MethodGet, "/api/v1/preauthkey", nil, &keys)
+
+		for _, id := range slices.Sorted(maps.Keys(fd.nodes)) {
+			nd := fd.nodes[id]
+			if nd.keyUser != e.ID || nd.keyID == "" {
+				continue
+			}
+
+			listed := slices.ContainsFunc(keys.PreAuthKeys, func(k struct {
+				ID string `json:"id"`
+			},
+			) bool {
+				return k.ID == nd.keyID
+			})
+
+			switch {
+			case nd.keyTagged && !listed:
+				fd.t.Fatalf("%s: u%d is deleted, and the tagged key n%d registered with is gone with it", at, e.ID, id)
+			case !nd.keyTagged && listed:
+				fd.t.Fatalf("%s: u%d is deleted, and its own key n%d registered with is still listed", at, e.ID, id)
+			case !nd.keyTagged:
 				nd.key = ""
 			}
+
+			fd.made("DeleteUser", "its keys checked")
 		}
 	case policymodel.RenameUser:
 		fd.renameUser(at, e)
@@ -901,12 +929,13 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 
 		var out struct {
 			PreAuthKey struct {
+				ID  string `json:"id"`
 				Key string `json:"key"`
 			} `json:"preAuthKey"`
 		}
 
 		fd.mustAPI(at, http.MethodPost, "/api/v1/preauthkey", body, &out)
-		nd.key = out.PreAuthKey.Key
+		nd.key, nd.keyID = out.PreAuthKey.Key, out.PreAuthKey.ID
 		opts = append(opts, WithAuthKey(nd.key))
 	}
 
@@ -1631,12 +1660,58 @@ func (fd *frontDoor) tagLogins() ([]tagAsk, []tagAsk) {
 	return granted, refused
 }
 
+// makeTagOwner has an admin make a user who can log in onto a tagged node
+// an owner of its tags, through a token naming that user alone, so that
+// the user's login keeps the node tagged.
+func (fd *frontDoor) makeTagOwner(at string) {
+	v := policymodel.NewView(fd.w)
+	if len(v.AmbiguousRefs()) > 0 {
+		return
+	}
+
+	type owner struct {
+		n   policymodel.Node
+		ref int
+	}
+
+	var can []owner
+
+	for _, n := range fd.w.Topology.Nodes {
+		for ref := range policymodel.UserRefs {
+			if us := v.RefUsers(ref); n.Tagged() && len(us) == 1 && !v.Ambiguous(ref) {
+				if u, _ := fd.w.Topology.User(us[0]); fd.claims(n, u) {
+					can = append(can, owner{n, ref})
+				}
+			}
+		}
+	}
+
+	if len(can) == 0 {
+		return
+	}
+
+	o := can[rapid.IntRange(0, len(can)-1).Draw(fd.t, "tag-owner")]
+	by := policymodel.Sel{Kind: policymodel.SelUser, I: o.ref}
+
+	for _, t := range o.n.Tags {
+		if owners := fd.w.Policy.TagOwners[t]; !slices.Contains(owners, by) {
+			fd.edit(at, policymodel.SetTagOwners{Tag: t, Owners: append(slices.Clone(owners), by), Defined: true}, nil)
+		}
+	}
+
+	fd.made("policy", "a login's user made an owner of a tagged node's tags")
+}
+
 // reauthTags has a user log a node in interactively requesting tags, as
 // `tailscale up --force-reauth --advertise-tags` does: a tag the node or
 // the user owns is granted, and the node becomes, or stays, the tags',
 // its key renewed; a request any tag of which neither owns is refused
 // and changes nothing. A tagged node is expired first now and then.
 func (fd *frontDoor) reauthTags(at string) bool {
+	if rapid.Bool().Draw(fd.t, "make-owner") {
+		fd.makeTagOwner(at)
+	}
+
 	granted, refused := fd.tagLogins()
 
 	refuse := len(refused) > 0 && (len(granted) == 0 || rapid.IntRange(0, 3).Draw(fd.t, "refused-tags") == 3)
