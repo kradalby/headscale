@@ -78,7 +78,7 @@ var proneShapes = []Shape{
 			})
 		})
 	}},
-	{Name: "three-clauses-at-a-node", Why: "three contested clauses each deciding at one node", Min: 0.02, World: threeClauses},
+	{Name: "three-clauses-at-a-node", Why: "three contested clauses each deciding one node's rules", Min: 0.01, World: threeClauses},
 	{Name: "retag-onto-approver", Why: "a retag onto a tag that auto-approves a route the node announces", Min: 0.01, Step: func(b, a *View, st Step) bool {
 		return slices.ContainsFunc(edits[Retag](st), func(e Retag) bool {
 			return len(e.Tags) > 0 && nodeMoved(b, a, e.ID, func(was, is Node) bool { return len(dropRoutes(is.Approved, was.Approved)) > 0 })
@@ -181,30 +181,39 @@ func unapprovedInside(v *View, d Sel, n Node) bool {
 }
 
 // threeClauses reports whether three contested clauses each, left out of
-// the reference alone, change what it gives one node: its rules, its peers
-// or a peer's routes.
+// the reference alone, change the rules it gives one node. Only clauses
+// the policy can bring into play are read, and three must be: reading the
+// document and leaving a clause out build the reference again.
 func threeClauses(v *View) bool {
-	ref := RefOf(v.World)
-	if ref.OutOfDomain() != "" || len(ref.rules) == 0 {
+	ks := inPlay(v.World.Policy)
+	if len(ks) < 3 {
 		return false
 	}
 
-	withouts := make([]*Ref, len(ContestedClauses))
-	for i, k := range ContestedClauses {
+	ref := RefOf(v.World)
+	if ref.OutOfDomain() != "" {
+		return false
+	}
+
+	withouts := make([]*Ref, len(ks))
+	for i, k := range ks {
 		withouts[i] = ref.Without(k)
 	}
 
 	for _, n := range ref.nodes {
-		rules, peers := ruleText(ref.Rules(n.ID)), ref.Peers(n.ID)
-		decides := 0
+		rules, decides := ruleText(ref.Rules(n.ID)), 0
 
-		for _, o := range withouts {
-			if ruleText(o.Rules(n.ID)) != rules || !slices.Equal(o.Peers(n.ID), peers) || routesMoved(ref, o, n) {
+		for i, o := range withouts {
+			if ruleText(o.Rules(n.ID)) != rules {
 				decides++
 			}
 
 			if decides == 3 {
 				return true
+			}
+
+			if decides+len(withouts)-i-1 < 3 {
+				break
 			}
 		}
 	}
@@ -212,10 +221,36 @@ func threeClauses(v *View) bool {
 	return false
 }
 
-func routesMoved(ref, o *Ref, n RefNode) bool {
-	return slices.ContainsFunc(ref.nodes, func(m RefNode) bool {
-		return len(m.routes()) > 0 && !slices.Equal(ref.Routes(n.ID, m.ID), o.Routes(n.ID, m.ID))
-	})
+// inPlay are the contested clauses that can change a node's rules under
+// p: those whose kind of rule p holds.
+func inPlay(p Policy) []Contested {
+	rules := slices.Concat(p.ACLs, p.Grants)
+	has := func(f func(Rule) bool) bool { return slices.ContainsFunc(rules, f) }
+	dst := func(r Rule, k SelKind) bool {
+		return slices.ContainsFunc(r.Dst, func(d Dest) bool { return d.Sel.Kind == k })
+	}
+	via := has(func(r Rule) bool { return len(r.Via) > 0 })
+
+	in := map[Contested]bool{
+		OthersSelf:              has(func(r Rule) bool { return dst(r, SelSelf) }),
+		StarApprovedRoutes:      has(func(r Rule) bool { return slices.ContainsFunc(r.Src, func(s Sel) bool { return s.Kind == SelAll }) }),
+		InternetAtSubnetRouters: has(func(r Rule) bool { return len(r.Via) == 0 && dst(r, SelInternet) }),
+		AppWildcard:             has(func(r Rule) bool { return len(r.App) > 0 && dst(r, SelAll) }),
+		ViaOwnAddress:           via,
+		ViaReach:                via,
+		ViaSelf:                 has(func(r Rule) bool { return len(r.Via) > 0 && dst(r, SelSelf) }),
+		ViaExitInternet:         has(func(r Rule) bool { return len(r.Via) > 0 && dst(r, SelInternet) }),
+	}
+
+	var out []Contested
+
+	for _, k := range ContestedClauses {
+		if in[k] {
+			out = append(out, k)
+		}
+	}
+
+	return out
 }
 
 // ruleText is rules written out in a sorted order, which two readings
