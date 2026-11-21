@@ -301,7 +301,7 @@ func (p *pbtWorld) edit(e policymodel.Edit) {
 // under the document as it stands, before the deletion: headscale deletes
 // no user who owns a node. Tags that document does not define a node
 // takes after the document's write, holding meanwhile those it does, or,
-// with none, the target's through the store. It returns the world as
+// with none, the target's through the store ([pbtWorld.storeTags]). It returns the world as
 // written, the nodes written whole, and where the others stand.
 func (p *pbtWorld) leaveUsers(cur, w policymodel.World, built func(int) *types.Node) (policymodel.World, map[types.NodeID]bool, map[types.NodeID]policymodel.Node) {
 	early := map[types.NodeID]bool{}
@@ -326,15 +326,14 @@ func (p *pbtWorld) leaveUsers(cur, w policymodel.World, built func(int) *types.N
 			p.change(cur, was, mid, builtOne(next, mid))
 			cur, mids[n.ID] = next, mid
 		default:
-			mid := was
-			mid.Tags, mid.User = n.Tags, 0
-			tags := built(i).Tags
+			next := cur.Apply(policymodel.Retag{ID: n.ID, Tags: n.Tags})
+			mid, _ := next.Topology.Node(n.ID)
 
 			done := p.begin(p.kindOr("batch"))
-			p.store("tags no document defines yet", n.ID, func(c *types.Node) { c.Tags, c.UserID, c.User = tags, nil, nil })
+			p.storeTags(n.ID, built(i).Tags)
 			done()
 
-			cur, mids[n.ID] = withNode(cur, mid), mid
+			cur, mids[n.ID] = next, mid
 		}
 	}
 

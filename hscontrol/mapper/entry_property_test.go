@@ -510,11 +510,13 @@ func (p *pbtWorld) change(cur policymodel.World, was, n policymodel.Node, tn *ty
 	}
 
 	switch {
-	case owner && n.Tagged():
+	case owner && n.Tagged() && definesAll(cur.Policy, n.Tags):
 		p.produce(id, "tags", func() error {
 			_, err := p.s.SetNodeTags(id, tn.Tags)
 			return err
 		})
+	case owner && n.Tagged():
+		p.storeTags(id, tn.Tags)
 	case owner:
 		p.untag(was, n, tn, cur.Topology.Users)
 	}
@@ -561,6 +563,25 @@ func (p *pbtWorld) change(cur policymodel.World, was, n policymodel.Node, tn *ty
 	}
 
 	p.online(n)
+}
+
+// definesAll reports whether pol defines every one of tags: an admin
+// tags a node with no other.
+func definesAll(pol policymodel.Policy, tags []int) bool {
+	return !slices.ContainsFunc(tags, func(t int) bool { return !pol.DefinesTag(t) })
+}
+
+// storeTags gives node id tags the document in force does not define, as
+// it came to hold them before a policy write dropped them: the tags
+// through the store, then the auto-approval a tag write runs, through
+// production.
+func (p *pbtWorld) storeTags(id types.NodeID, tags []string) {
+	p.t.Helper()
+
+	p.store("tags the document does not define", id, func(c *types.Node) { c.Tags, c.UserID, c.User = tags, nil, nil })
+
+	nv, _ := p.s.Snapshot().GetNode(id)
+	p.produce(id, "auto-approve", func() error { return p.s.AutoApproveRoutes(nv) })
 }
 
 // sameRoutes reports whether a and b agree on all but expiry and
