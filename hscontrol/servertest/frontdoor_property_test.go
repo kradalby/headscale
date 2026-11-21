@@ -797,27 +797,40 @@ func (fd *frontDoor) awaitFollowup(authID string) {
 	tick := time.NewTicker(time.Millisecond)
 	defer tick.Stop()
 
-	for !fd.followupWaiting() {
-		if time.Now().After(deadline) {
+	for {
+		waiting, inFlight := fd.followupState()
+
+		switch {
+		case waiting:
+			fd.run.tally.edits["login approved once its follow-up waits (auth/followup-lookup-race)"]++
+
+			return
+		case !inFlight:
+			// The follow-up was answered without waiting: approving now
+			// lets the login report how.
+			fd.run.tally.edits["login approved after its follow-up was answered"]++
+
+			return
+		case time.Now().After(deadline):
 			fd.t.Fatalf("the follow-up of login %s never waited at the server", authID)
 		}
 
 		<-tick.C
 	}
-
-	fd.run.tally.edits["login approved once its follow-up waits (auth/followup-lookup-race)"]++
 }
 
-// followupWaiting reports whether a registration's follow-up request waits
-// for its login's verdict.
-func (fd *frontDoor) followupWaiting() bool {
+// followupState reports whether a registration's follow-up request waits
+// at the server for its login's verdict, and whether a client's follow-up
+// is still in flight.
+func (fd *frontDoor) followupState() (bool, bool) {
+	var waiting, inFlight bool
+
 	for _, g := range goroutines(fd.dump()) {
-		if g.state == "select" && g.top == followupFunc {
-			return true
-		}
+		waiting = waiting || g.state == "select" && g.top == followupFunc
+		inFlight = inFlight || strings.Contains(g.stack, "servertest.(*TestClient).waitLogin.func")
 	}
 
-	return false
+	return waiting, inFlight
 }
 
 // startedOver carries a login past auth/followup-lookup-race: when the
@@ -1210,7 +1223,18 @@ func (fd *frontDoor) untag(at string, e policymodel.Retag) {
 	fd.login(at, e.ID, u, n)
 	fd.made("Login", "interactive login")
 	fd.apply(e)
+	fd.autoApprove(e.ID)
 	fd.apply(policymodel.SetOnline{ID: e.ID, Online: true})
+}
+
+// autoApprove has the model run auto-approval on id, as the server does
+// after a login or a key takes a tagged node back, its owner changed
+// (approveRoutesAfterRegistration). The model's Retag to a user runs none,
+// so the driver announces what id announces already.
+func (fd *frontDoor) autoApprove(id types.NodeID) {
+	if n, ok := fd.w.Topology.Node(id); ok && len(n.Announced) > 0 {
+		fd.apply(policymodel.Announce{ID: id, Routes: n.Announced})
+	}
 }
 
 // login logs id's client in interactively as u, with a new node key, as
@@ -1445,6 +1469,11 @@ func (fd *frontDoor) keyLoginEdits(n policymodel.Node) []policymodel.Edit {
 
 	if nd := fd.nodes[n.ID]; n.Tagged() && !nd.keyTagged {
 		out = append(out, policymodel.Retag{ID: n.ID, User: nd.keyUser})
+
+		// The owner changed: the server runs auto-approval (see autoApprove).
+		if len(n.Announced) > 0 {
+			out = append(out, policymodel.Announce{ID: n.ID, Routes: n.Announced})
+		}
 	}
 
 	return append(out, policymodel.SetExpired{ID: n.ID, Expired: false}, policymodel.SetOnline{ID: n.ID, Online: true})
