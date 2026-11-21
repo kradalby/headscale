@@ -1229,9 +1229,10 @@ func (fd *frontDoor) untag(at string, e policymodel.Retag) {
 }
 
 // autoApprove has the model run auto-approval on id, as the server does
-// after a login or a key takes a tagged node back, its owner changed
-// (approveRoutesAfterRegistration). The model's Retag to a user runs none,
-// so the driver announces what id announces already.
+// after every login, interactive or with a key, under a new node key
+// (approveRoutesAfterRegistration): a route an admin unapproved comes back
+// if the policy approves it. The model's login edits run none, so the
+// driver announces what id announces already.
 func (fd *frontDoor) autoApprove(id types.NodeID) {
 	if n, ok := fd.w.Topology.Node(id); ok && len(n.Announced) > 0 {
 		fd.apply(policymodel.Announce{ID: id, Routes: n.Announced})
@@ -1437,6 +1438,7 @@ func (fd *frontDoor) relogin(at string) {
 		fd.login(at, n.ID, u, n)
 		fd.apply(policymodel.SetExpired{ID: n.ID, Expired: false})
 		fd.apply(policymodel.SetOnline{ID: n.ID, Online: true})
+		fd.autoApprove(n.ID)
 
 		return
 	}
@@ -1464,17 +1466,17 @@ func (fd *frontDoor) keyLogin(n policymodel.Node, key string) error {
 
 // keyLoginEdits is what a login with n's key makes of n: a user's own key
 // presented for a node an admin tagged since takes it back as that user's
-// device (preAuthKeyClaimsTaggedNode); any other renews it. It connects.
+// device (preAuthKeyClaimsTaggedNode); any other renews it. It connects,
+// and the server runs auto-approval (see autoApprove).
 func (fd *frontDoor) keyLoginEdits(n policymodel.Node) []policymodel.Edit {
 	var out []policymodel.Edit
 
 	if nd := fd.nodes[n.ID]; n.Tagged() && !nd.keyTagged {
 		out = append(out, policymodel.Retag{ID: n.ID, User: nd.keyUser})
+	}
 
-		// The owner changed: the server runs auto-approval (see autoApprove).
-		if len(n.Announced) > 0 {
-			out = append(out, policymodel.Announce{ID: n.ID, Routes: n.Announced})
-		}
+	if len(n.Announced) > 0 {
+		out = append(out, policymodel.Announce{ID: n.ID, Routes: n.Announced})
 	}
 
 	return append(out, policymodel.SetExpired{ID: n.ID, Expired: false}, policymodel.SetOnline{ID: n.ID, Online: true})
@@ -1877,6 +1879,7 @@ func (fd *frontDoor) reauthTags(at string) bool {
 
 	fd.apply(policymodel.SetExpired{ID: n.ID, Expired: false})
 	fd.apply(policymodel.SetOnline{ID: n.ID, Online: true})
+	fd.autoApprove(n.ID)
 	fd.made("Login requesting tags", what)
 
 	return true
