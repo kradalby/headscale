@@ -380,8 +380,10 @@ var (
 		// lose their addresses; an own rule that reaches nothing on its
 		// receiver yet places a merged rule; an app grant to public space
 		// that exits see one way; three rules merging into one; a merged
-		// rule placed by an earlier rule its receiver does not get. The
-		// last two go in last, as the one before them takes every ACL
+		// rule placed by an earlier rule its receiver does not get; a via
+		// grant to autogroup:internet at an exit node among its sources,
+		// beside public routes; a router meeting three contested clauses.
+		// The merges go in last, as the first of them takes every ACL
 		// away.
 		hide := chance(t, 12, "hidden-tag")
 		merge := chance(t, 14, "merge-anchor")
@@ -392,9 +394,20 @@ var (
 		cover := chance(t, 2, "via-router-covered")
 		fan := chance(t, mergeFans, "merge-fan")
 		who := rapid.IntRange(0, anyOf).Draw(t, "who")
+		viaNet := chance(t, viaInternetWorlds, "via-internet")
+		viaNetShape := viaInternets.Draw(t, "via-internet-shape")
+		stacked := chance(t, stackedRouters, "stacked-router")
 
 		if via {
 			viaRouters(&w, who, down, cover)
+		}
+
+		if viaNet {
+			viaInternetWorld(&w, who+1, viaNetShape)
+		}
+
+		if stacked {
+			stackedRouter(&w, who+2)
 		}
 
 		if hide {

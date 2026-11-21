@@ -906,7 +906,7 @@ var Required = append([]Shape{
 	{Name: "long-unread", Why: "a session reads after three commits it did not", Min: 0.1, Seq: longUnread},
 	{Name: "flip-move-flip-back", Why: "a filter carried across a form flip, a move and a flip back", Min: 0.04, Seq: flipMoveFlipBack},
 	{Name: "flip-source-moves-flip-back", Why: "an address form carried across a flip, a source moving only it sees, and a flip back", Min: 0.01, Seq: flipSourceMovesFlipBack},
-}, scaleShapes...)
+}, slices.Concat(scaleShapes, proneShapes)...)
 
 // longUnread reports whether some node's session reads after three or
 // more steps it did not read.
