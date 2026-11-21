@@ -1224,15 +1224,15 @@ func (fd *frontDoor) untag(at string, e policymodel.Retag) {
 	fd.login(at, e.ID, u, n)
 	fd.made("Login", "interactive login")
 	fd.apply(e)
-	fd.autoApprove(e.ID)
 	fd.apply(policymodel.SetOnline{ID: e.ID, Online: true})
 }
 
 // autoApprove has the model run auto-approval on id, as the server does
 // after every login, interactive or with a key, under a new node key
 // (approveRoutesAfterRegistration): a route an admin unapproved comes back
-// if the policy approves it. The model's login edits run none, so the
-// driver announces what id announces already.
+// if the policy approves it. The model runs it only for a Retag to a
+// user, a login taking a node back; for the other logins the driver
+// announces what id announces already.
 func (fd *frontDoor) autoApprove(id types.NodeID) {
 	if n, ok := fd.w.Topology.Node(id); ok && len(n.Announced) > 0 {
 		fd.apply(policymodel.Announce{ID: id, Routes: n.Announced})
