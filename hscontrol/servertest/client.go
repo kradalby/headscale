@@ -53,6 +53,9 @@ type TestClient struct {
 	// approve completes an interactive login; see [WithInteractiveLogin].
 	approve func(authID string) error
 
+	// startOverRecovery: see [WithStartOverRecovery].
+	startOverRecovery bool
+
 	// loginFlags and endpoints: see [WithLoginFlags] and [WithEndpoints].
 	loginFlags controlclient.LoginFlags
 	endpoints  []tailcfg.Endpoint
@@ -132,6 +135,8 @@ type clientConfig struct {
 	loginFlags    controlclient.LoginFlags
 	endpoints     []tailcfg.Endpoint
 	c2nHandler    http.Handler
+
+	startOverRecovery bool
 }
 
 // WithoutNetmapHistory retains only the latest netmap and one queued update.
@@ -189,6 +194,15 @@ func WithUnknownClient() ClientOption {
 // completes the login, as `headscale auth register` would.
 func WithInteractiveLogin(approve func(authID string) error) ClientOption {
 	return func(c *clientConfig) { c.approve = approve }
+}
+
+// WithStartOverRecovery completes an interactive login the server told to
+// start over although its approval had registered the node
+// (auth/followup-lookup-race), as the person shown the follow-up's new
+// auth URL would. Off by default: the front-door property counts each
+// occurrence instead of recovering it.
+func WithStartOverRecovery() ClientOption {
+	return func(c *clientConfig) { c.startOverRecovery = true }
 }
 
 // WithLoginFlags adds flags to every login, as tailscaled adds
@@ -297,21 +311,22 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 	}
 
 	tc := &TestClient{
-		Name:       name,
-		server:     server,
-		authKey:    authKey,
-		user:       user,
-		machineKey: key.NewMachine(),
-		discoKey:   key.NewDisco().Public(),
-		approve:    cc.approve,
-		loginFlags: cc.loginFlags,
-		endpoints:  cc.endpoints,
-		c2nHandler: cc.c2nHandler,
-		updates:    make(chan *netmap.NetworkMap, updateBuffer),
-		firstMap:   make(chan struct{}),
-		bus:        bus,
-		dialer:     dialer,
-		tracker:    tracker,
+		Name:              name,
+		server:            server,
+		authKey:           authKey,
+		user:              user,
+		machineKey:        key.NewMachine(),
+		discoKey:          key.NewDisco().Public(),
+		approve:           cc.approve,
+		loginFlags:        cc.loginFlags,
+		endpoints:         cc.endpoints,
+		c2nHandler:        cc.c2nHandler,
+		startOverRecovery: cc.startOverRecovery,
+		updates:           make(chan *netmap.NetworkMap, updateBuffer),
+		firstMap:          make(chan struct{}),
+		bus:               bus,
+		dialer:            dialer,
+		tracker:           tracker,
 
 		deltaUpdates:  cc.deltaUpdates,
 		noHistory:     cc.noHistory,
@@ -510,6 +525,16 @@ func (c *TestClient) tryLogin(ctx context.Context, flags controlclient.LoginFlag
 	case err != nil:
 	case url != "" && approve != nil:
 		err = c.waitLogin(ctx, url, approve)
+
+		if c.startOverRecovery {
+			// auth/followup-lookup-race: the approval had already
+			// registered the node; a person shown the new URL
+			// completes it, as the front-door property does.
+			so, ok := errors.AsType[*loginStartedOverError](err)
+			if ok {
+				err = c.waitLogin(ctx, so.url, approve)
+			}
+		}
 	case url != "":
 		err = fmt.Errorf("unexpected auth URL %q (expected auto-auth with preauth key)", url) //nolint:err113
 	}
