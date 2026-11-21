@@ -79,12 +79,13 @@ var (
 // router is among, and makes two nodes of w that router, an exit node, and
 // a peer serving a public subnet route. The drawn rules stay, so the
 // clauses they meet stack on the same nodes. A world of fewer than three
-// nodes is left as it is.
+// nodes is left as it is, and one allowing everything, which another
+// shape needs.
 func viaInternetWorld(w *World, who int, d viaInternet) {
 	t := &w.Topology
 
 	tag := ownedTag(w.Policy)
-	if len(t.Nodes) < 3 || tag < 0 {
+	if len(t.Nodes) < 3 || tag < 0 || w.Policy.AllowAll {
 		return
 	}
 
@@ -100,7 +101,7 @@ func viaInternetWorld(w *World, who int, d viaInternet) {
 		}
 	}
 
-	w.Policy.Grants, w.Policy.AllowAll = append(w.Policy.Grants, grant), false
+	w.Policy.Grants = append(w.Policy.Grants, grant)
 
 	if d.plain {
 		w.Policy.ACLs = append(w.Policy.ACLs, Rule{Src: []Sel{{Kind: SelMember}}, Dst: []Dest{{Sel: Sel{Kind: SelInternet}}}})
@@ -173,10 +174,11 @@ const stackedRouters = 8
 // user's own devices and to the public prefix, and from the members to the
 // internet. The router then meets three contested clauses at once: others'
 // self rules, * adding approved routes and the internet at subnet routers.
-// A world of fewer than three nodes is left as it is.
+// A world of fewer than three nodes is left as it is, and one allowing
+// everything.
 func stackedRouter(w *World, who int) {
 	nodes := w.Topology.Nodes
-	if len(nodes) < 3 {
+	if len(nodes) < 3 || w.Policy.AllowAll {
 		return
 	}
 
@@ -198,7 +200,6 @@ func stackedRouter(w *World, who int) {
 	o.Announced, o.Approved = dropRoutes(o.Announced, []int{0}), addRoutes(o.Approved, []int{0})
 
 	all := Sel{Kind: SelAll}
-	w.Policy.AllowAll = false
 	w.Policy.ACLs = append(w.Policy.ACLs,
 		Rule{Src: []Sel{all}, Dst: []Dest{{Sel: Sel{Kind: SelSelf}}}},
 		Rule{Src: []Sel{all}, Dst: []Dest{{Sel: Sel{Kind: SelPrefix, I: publicPrefix6}}}},
