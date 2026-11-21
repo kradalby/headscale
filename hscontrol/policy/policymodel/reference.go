@@ -422,13 +422,16 @@ const (
 	InternetAtSubnetRouters
 	// ViaOwnAddress: a via grant reaches what its via routers route.
 	// Headscale writes each destination prefix whole at a via router with a
-	// route overlapping it, so the router also takes it for its own
-	// address. Fails open.
+	// subnet route overlapping it, so the router also takes it for its own
+	// address, and for whatever else of it the client handles: a route it
+	// announces unapproved, the internet through its exit route. Fails
+	// open.
 	//
 	// TODO(kradalby): policy/via-own-address: fails open. With
 	// `* -> * via tag:a`, a tag:a router on 100.64.0.1 serving
 	// 100.64.0.2/32 is given the overlapping tailnet prefix whole, so it
-	// accepts every tailnet source to its own address on every port. The
+	// accepts every tailnet source to its own address on every port, and
+	// to 100.64.0.3 once it announces 100.64.0.3/32 unapproved. The
 	// plain reading reaches only what the router routes; no capture
 	// decides it. The properties in policy/v2/reference_test.go count it
 	// under "via own address", alone or with "via reach". Production:
@@ -674,7 +677,9 @@ type refRule struct {
 	ip       []IPSpec
 	app      tailcfg.PeerCapMap
 	// via restricts the rule to routers holding one of these tags;
-	// viaTerms are its destinations one term at a time.
+	// viaTerms are its destinations one term at a time as headscale
+	// resolves them, * as the tailnet's ranges: what its readings of a
+	// via rule ([ViaOwnAddress], [ViaRouterExitRoutes]) cut by.
 	via      []string
 	viaTerms []*netipx.IPSet
 	// hsDst is a via rule's destinations as headscale resolves them, *
@@ -771,13 +776,7 @@ func newRef(doc Doc, users []User, nodes []RefNode, without Contested) *Ref {
 			}
 
 			for _, t := range dsts {
-				if without&ViaReach != 0 && t == "*" {
-					via.viaTerms = append(via.viaTerms, tailnetRanges)
-
-					continue
-				}
-
-				via.viaTerms = append(via.viaTerms, r.addrs([]string{t}, false))
+				via.viaTerms = append(via.viaTerms, r.starAsTailnet([]string{t}))
 			}
 
 			r.add(via, nil, nil)
@@ -794,6 +793,12 @@ func newRef(doc Doc, users []User, nodes []RefNode, without Contested) *Ref {
 			app.ip, app.dst = nil, r.starAsTailnet(dsts)
 			base.app = nil
 			r.add(app, r.srcAddrs(dsts), r.starAsTailnet(d.Src))
+
+			// The clause reads * alone: the grant's autogroup:self part
+			// keeps its capabilities.
+			if self {
+				r.addSelf(app)
+			}
 		}
 
 		if len(dsts) > 0 || inet {
@@ -1087,12 +1092,7 @@ func (r *Ref) dstsAt(rl refRule, n RefNode) *netipx.IPSet {
 			for _, term := range rl.viaTerms {
 				for _, p := range term.Prefixes() {
 					if slices.ContainsFunc(n.subnets(), p.Overlaps) {
-						var own netipx.IPSetBuilder
-
-						own.AddPrefix(p)
-						own.Intersect(addrsOf([]RefNode{n}))
-						s, _ := own.IPSet()
-						b.AddSet(s)
+						b.AddPrefix(p)
 					}
 				}
 			}
@@ -1196,7 +1196,8 @@ func (r *Ref) Rules(id types.NodeID) []tailcfg.FilterRule {
 	var out []tailcfg.FilterRule
 
 	for _, rl := range r.rules {
-		if !r.ownSelf(rl, n) {
+		// Headscale cuts every owner's self rules at an exit node.
+		if !r.ownSelf(rl, n) && !n.exit() {
 			continue
 		}
 
@@ -1401,7 +1402,12 @@ func (r *Ref) Routes(viewer, peer types.NodeID) []netip.Prefix {
 			switch {
 			case r.without&ExitDestinationRoutes == 0:
 			case via:
-				dstSide = v.hasTag(rl.via) && slices.ContainsFunc(v.subnets(), rl.dst.OverlapsPrefix)
+				// A via router is on the side of its own part of the
+				// grant: what its subnet routes overlap, and the internet
+				// at an exit node.
+				dstSide = v.hasTag(rl.via) && slices.ContainsFunc(v.subnets(), func(s netip.Prefix) bool {
+					return rl.dst.OverlapsPrefix(s) || rl.internet && v.exit() && internet.OverlapsPrefix(s)
+				})
 			default:
 				dstSide = on(v, rl.dst)
 			}
