@@ -1605,6 +1605,36 @@ func ownsTag(w policymodel.World, n policymodel.Node, t int) bool {
 	return !n.Tagged() && userOwnsTag(w, n.User, t)
 }
 
+// noWildcardOwners is w with no user:*@domain token among tag owners or
+// in groups: the user half of a login's tag check does not read one.
+//
+// TODO(kradalby): policy/owner-wildcard-user-half: a tag owner
+// user:*@domain names that domain's users' devices through their
+// addresses (Username.resolve builds the owner set), but not the users
+// (resolveUser, behind UserCanHaveTag and NodeCanHaveTag's user fallback,
+// matches the token as a name or e-mail). So a user's existing device may
+// take the tag and the same user's login onto a tagged node, a new device
+// or a pre-auth key may not. Fails closed. Followed here, counted;
+// TestAWildcardTagOwnerNamesDevicesNotUsers holds it to production.
+func noWildcardOwners(w policymodel.World) policymodel.World {
+	wild := func(s policymodel.Sel) bool {
+		return s.Kind == policymodel.SelUser && strings.HasPrefix(policymodel.UserRefs[s.I], "user:*@")
+	}
+
+	p := w.Policy
+	for t := range p.TagOwners {
+		p.TagOwners[t] = slices.DeleteFunc(slices.Clone(p.TagOwners[t]), wild)
+	}
+
+	for g := range p.Groups {
+		p.Groups[g] = slices.DeleteFunc(slices.Clone(p.Groups[g]), func(ref int) bool { return strings.HasPrefix(policymodel.UserRefs[ref], "user:*@") })
+	}
+
+	w.Policy = p
+
+	return w
+}
+
 // fdProbe is the ID of a node no world holds, standing for a user's device.
 const fdProbe types.NodeID = 1 << 30
 
@@ -1647,7 +1677,7 @@ func (fd *frontDoor) tagLogins() ([]tagAsk, []tagAsk) {
 			}
 
 			for _, tags := range sets {
-				ok := !slices.ContainsFunc(tags, func(t int) bool { return !ownsTag(fd.w, n, t) && !userOwnsTag(fd.w, u.ID, t) })
+				ok := !slices.ContainsFunc(tags, func(t int) bool { return !ownsTag(fd.w, n, t) && !userOwnsTag(noWildcardOwners(fd.w), u.ID, t) })
 				if ok {
 					granted = append(granted, tagAsk{n, u, tags})
 				} else {
@@ -1678,6 +1708,10 @@ func (fd *frontDoor) makeTagOwner(at string) {
 
 	for _, n := range fd.w.Topology.Nodes {
 		for ref := range policymodel.UserRefs {
+			if strings.HasPrefix(policymodel.UserRefs[ref], "user:*@") {
+				continue
+			}
+
 			if us := v.RefUsers(ref); n.Tagged() && len(us) == 1 && !v.Ambiguous(ref) {
 				if u, _ := fd.w.Topology.User(us[0]); fd.claims(n, u) {
 					can = append(can, owner{n, ref})
@@ -1764,6 +1798,10 @@ func (fd *frontDoor) reauthTags(at string) bool {
 		}
 
 		fd.made("Login requesting tags", "refused (tags neither node nor user owns)")
+
+		if !slices.ContainsFunc(a.tags, func(t int) bool { return !ownsTag(fd.w, n, t) && !userOwnsTag(fd.w, a.u.ID, t) }) {
+			fd.made("Login requesting tags", "refused as a user:*@ owner names its user (policy/owner-wildcard-user-half)")
+		}
 
 		return true
 	}
@@ -2623,4 +2661,44 @@ func TestCreatingANameOIDCUsersHoldDependsOnHowMany(t *testing.T) {
 
 	// TODO(kradalby): api/create-name-oidc-holders: two hold alice.
 	assert.NoError(t, fd.api(http.MethodPost, "/api/v1/user", map[string]any{"name": "alice"}, nil), "two OIDC users hold alice, and the API creates a third")
+}
+
+// TestAWildcardTagOwnerNamesDevicesNotUsers pins
+// policy/owner-wildcard-user-half: with tag:a owned by user:*@example.com,
+// bob (bob@example.com) logging in on his own node requesting tag:a is
+// granted it, through his node's address, and bob logging in on a node an
+// admin tagged requesting tag:a is refused, the token matching no user by
+// name or e-mail. It fails once both are answered alike; then drop
+// noWildcardOwners from the front-door property.
+func TestAWildcardTagOwnerNamesDevicesNotUsers(t *testing.T) {
+	srv := NewServer(t)
+
+	_, err := srv.State().SetPolicy([]byte(`{"tagOwners": {"tag:a": ["user:*@example.com"]}, "acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]}`))
+	require.NoError(t, err)
+
+	bob, err := srv.State().CreateUser(types.User{Name: "bob", Email: "bob@example.com"})
+	require.NoError(t, err)
+
+	approve := func(authID string) error { return srv.ApproveAuth(t.Context(), authID, "bob") }
+	requestA := func(name string) *tailcfg.Hostinfo {
+		return &tailcfg.Hostinfo{BackendLogID: name, Hostname: name, RequestTags: []string{"tag:a"}}
+	}
+
+	own := NewClient(t, srv, "own", WithUser(bob), WithoutPoll())
+	tagged := NewClient(t, srv, "tagged", WithUser(bob), WithoutPoll())
+
+	nv, ok := srv.State().GetNodeByNodeKey(tagged.Persist().PrivateNodeKey.Public())
+	require.True(t, ok)
+
+	_, err = srv.State().SetNodeTags(nv.ID(), []string{"tag:a"})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	require.NoError(t, own.Login(ctx, own.Persist(), "", controlclient.LoginInteractive, requestA("own"), approve), "bob's own node, through its address")
+
+	// TODO(kradalby): policy/owner-wildcard-user-half: the same user, refused.
+	assert.ErrorContains(t, tagged.Login(ctx, tagged.Persist(), "", controlclient.LoginInteractive, requestA("tagged"), approve),
+		"not permitted", "bob logging in on a tagged node: the wildcard owner names no user")
 }
