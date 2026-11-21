@@ -12,8 +12,7 @@ import (
 // via grants to autogroup:internet at exit nodes and public routes, routes
 // announced unapproved inside a destination, several contested clauses at
 // one node, and nodes moving onto an identity that auto-approves a route
-// they announce. A floor fails a sample drawn afresh no more often than a
-// count five standard deviations short does.
+// they announce.
 var proneShapes = []Shape{
 	{Name: "via-exit-router-among-sources", Why: "a via exit node among the sources of its grant to autogroup:internet", Min: 0.028, World: func(v *View) bool {
 		return len(v.viaExitSources()) > 0
@@ -40,10 +39,10 @@ var proneShapes = []Shape{
 			return false
 		})
 	}},
-	{Name: "via-exit-one-family", Why: "a via exit node of one family under a grant to autogroup:internet", Min: 0.023, World: func(v *View) bool {
+	{Name: "via-exit-one-family", Why: "a via exit node of one family under a grant to autogroup:internet", Min: 0.022, World: func(v *View) bool {
 		return slices.ContainsFunc(v.viaExits(), oneFamily)
 	}},
-	{Name: "via-exit-public-other-family", Why: "a via exit node of one family serving a public route of the other", Min: 0.01, World: func(v *View) bool {
+	{Name: "via-exit-public-other-family", Why: "a via exit node of one family serving a public route of the other", Min: 0.009, World: func(v *View) bool {
 		return slices.ContainsFunc(v.viaExits(), func(n Node) bool {
 			return oneFamily(n) && slices.ContainsFunc(served(n), func(r int) bool {
 				return publicRoute(r) && Prefixes[r].Addr().Is4() != slices.Contains(served(n), exit4)
@@ -69,7 +68,7 @@ var proneShapes = []Shape{
 			})
 		})
 	}},
-	{Name: "via-route-over-node", Why: "a via router's route holding another node's address", Min: 0.02, World: func(v *View) bool {
+	{Name: "via-route-over-node", Why: "a via router's route holding another node's address", Min: 0.017, World: func(v *View) bool {
 		return v.anyRule(func(r Rule, _ bool) bool {
 			return len(r.Via) > 0 && v.anyNode(func(n Node) bool {
 				return v.viaRouterOf(r, n) && slices.ContainsFunc(served(n), func(rt int) bool {

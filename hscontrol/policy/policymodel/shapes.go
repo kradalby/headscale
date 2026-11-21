@@ -508,9 +508,11 @@ func readAt(steps []Step, i int, id types.NodeID) bool {
 }
 
 // Required is the shapes the generators must reach; a builder adds a row
-// for each shape its properties need. Floors sit at about half of what the
-// generators reach at the step count builders run, so they catch a
-// generator that stops reaching a shape, not noise.
+// for each shape its properties need. A floor fails a sample drawn afresh
+// no more often than a count five standard deviations short would, at the
+// rate the generators reach at the step count builders run, so it catches
+// a generator that stops reaching a shape, not noise; a shape too rare for
+// that at the coverage sample's size has none.
 var Required = append([]Shape{
 	// Topology.
 	{Name: "unaddressed", Why: "a node no address set holds (database only)", Min: 0.15, World: func(v *View) bool {
@@ -520,7 +522,7 @@ var Required = append([]Shape{
 	{Name: "single-family", Why: "rules that reach a node in one family only", Min: 0.3, World: func(v *View) bool {
 		return v.anyNode(func(n Node) bool { return len(n.Addrs()) == 1 })
 	}},
-	{Name: "outside-address", Why: "addresses * and the tailnet ranges do not cover (database only)", Min: 0.02, World: (*View).outsideAddr},
+	{Name: "outside-address", Why: "addresses * and the tailnet ranges do not cover (database only)", Min: 0.013, World: (*View).outsideAddr},
 	{Name: "user-without-nodes", Why: "a user a token names who owns nothing", Min: 0.3, World: func(v *View) bool {
 		return slices.ContainsFunc(v.users, func(u User) bool {
 			return !v.anyNode(func(n Node) bool { return n.User == u.ID })
@@ -587,7 +589,7 @@ var Required = append([]Shape{
 	{Name: "offline-node", Why: "online state", Min: 0.2, World: func(v *View) bool { return v.anyNode(func(n Node) bool { return n.Offline }) }},
 
 	// Policy.
-	{Name: "allow-all", Why: "no rule section at all, which allows everything", Min: 0.065, World: func(v *View) bool { return v.World.Policy.AllowAll }},
+	{Name: "allow-all", Why: "no rule section at all, which allows everything", Min: 0.041, World: func(v *View) bool { return v.World.Policy.AllowAll }},
 	{Name: "named-by-address-only", Why: "a node a rule names through a host or prefix", Min: 0.1, World: func(v *View) bool {
 		return v.anyRule(func(r Rule, _ bool) bool {
 			for _, d := range r.Dst {
@@ -602,7 +604,7 @@ var Required = append([]Shape{
 	{Name: "self-rule", Why: "owner rules, cut per owner", Min: 0.2, World: func(v *View) bool {
 		return v.anyRule(func(r Rule, _ bool) bool { return r.selfRule() })
 	}},
-	{Name: "self-and-shared-rule", Why: "one ACL with a self and another destination", Min: 0.065, World: func(v *View) bool {
+	{Name: "self-and-shared-rule", Why: "one ACL with a self and another destination", Min: 0.064, World: func(v *View) bool {
 		return v.anyRule(func(r Rule, _ bool) bool { return r.selfRule() && len(r.Dst) > 1 })
 	}},
 	{Name: "via-grant", Why: "via steering", Min: 0.09, World: func(v *View) bool { return v.anyRule(func(r Rule, _ bool) bool { return len(r.Via) > 0 }) }},
@@ -685,7 +687,7 @@ var Required = append([]Shape{
 		return false
 	}},
 	{Name: "ssh-rule", Why: "SSH, which makes no peers", Min: 0.15, World: func(v *View) bool { return len(v.World.Policy.SSH) > 0 }},
-	{Name: "ssh-check", Why: "check actions", Min: 0.035, World: func(v *View) bool {
+	{Name: "ssh-check", Why: "check actions", Min: 0.032, World: func(v *View) bool {
 		return slices.ContainsFunc(v.World.Policy.SSH, func(r SSHRule) bool { return r.Check })
 	}},
 	{Name: "auto-approvers", Why: "route auto-approval", Min: 0.15, World: func(v *View) bool {
@@ -695,7 +697,7 @@ var Required = append([]Shape{
 	}},
 
 	// Pairs.
-	{Name: "tag-all-unaddressed", Why: "a tag destination resolving to no address", Min: 0.01, World: func(v *View) bool {
+	{Name: "tag-all-unaddressed", Why: "a tag destination resolving to no address", Min: 0.004, World: func(v *View) bool {
 		return v.anyRule(func(r Rule, _ bool) bool {
 			return slices.ContainsFunc(r.Dst, func(d Dest) bool {
 				ms := v.MembersOf(d.Sel)
@@ -704,7 +706,7 @@ var Required = append([]Shape{
 			})
 		})
 	}},
-	{Name: "self-from-star-outside-owner", Why: "* as a self source names owners by range", Min: 0.001, World: func(v *View) bool {
+	{Name: "self-from-star-outside-owner", Why: "* as a self source names owners by range", Min: 0, World: func(v *View) bool {
 		star := slices.ContainsFunc(v.World.Policy.ACLs, func(r Rule) bool {
 			return r.selfRule() && slices.ContainsFunc(r.Src, func(s Sel) bool { return s.Kind == SelAll })
 		})
@@ -720,7 +722,7 @@ var Required = append([]Shape{
 			})
 		})
 	}},
-	{Name: "outside-address-exit", Why: "exit visibility with addresses outside the tailnet", Min: 0.008, World: func(v *View) bool { return v.outsideAddr() && v.exitPresent() }},
+	{Name: "outside-address-exit", Why: "exit visibility with addresses outside the tailnet", Min: 0.001, World: func(v *View) bool { return v.outsideAddr() && v.exitPresent() }},
 	{Name: "shared-address-cap-receiver", Why: "sharing decides capability form for eligible receivers", Min: 0.02, World: func(v *View) bool {
 		return v.sharedAddr() && v.anyNode(v.Eligible)
 	}},
@@ -730,12 +732,12 @@ var Required = append([]Shape{
 				slices.ContainsFunc(r.Dst, func(d Dest) bool { return v.reachesInternet(d.Sel) })
 		})
 	}},
-	{Name: "via-star-outside-viewer", Why: "a viewer outside the tailnet under a * via source", Min: 0.001, World: func(v *View) bool {
+	{Name: "via-star-outside-viewer", Why: "a viewer outside the tailnet under a * via source", Min: 0, World: func(v *View) bool {
 		return v.outsideAddr() && slices.ContainsFunc(v.World.Policy.Grants, func(r Rule) bool {
 			return len(r.Via) > 0 && slices.ContainsFunc(r.Src, func(s Sel) bool { return s.Kind == SelAll })
 		})
 	}},
-	{Name: "companion-outside", Why: "companion rules with addresses outside the tailnet", Min: 0.004, World: func(v *View) bool {
+	{Name: "companion-outside", Why: "companion rules with addresses outside the tailnet", Min: 0, World: func(v *View) bool {
 		return v.outsideAddr() && v.anyRule(func(r Rule, _ bool) bool {
 			return slices.ContainsFunc(r.App, func(a App) bool { return strings.HasPrefix(Apps[a.Cap], "tailscale.com/") })
 		})
@@ -775,16 +777,16 @@ var Required = append([]Shape{
 	{Name: "app-capabilities-changed", Why: "only a grant's capabilities or their values move", Min: 0.025, Step: func(b, a *View, st Step) bool {
 		return slices.ContainsFunc(edits[SetApp](st), func(e SetApp) bool { return ruleChanged(b, a, e.Rule) })
 	}},
-	{Name: "via-changed", Why: "a grant's via tags move", Min: 0.009, Step: func(b, a *View, st Step) bool {
+	{Name: "via-changed", Why: "a grant's via tags move", Min: 0.004, Step: func(b, a *View, st Step) bool {
 		return slices.ContainsFunc(edits[SetVia](st), func(e SetVia) bool { return ruleChanged(b, a, e.Rule) })
 	}},
-	{Name: "allow-all-to-rules", Why: "the first rule after allowing everything", Min: 0.03, Step: func(b, a *View, _ Step) bool {
+	{Name: "allow-all-to-rules", Why: "the first rule after allowing everything", Min: 0.016, Step: func(b, a *View, _ Step) bool {
 		return b.World.Policy.AllowAll && !a.World.Policy.AllowAll
 	}},
-	{Name: "rules-to-allow-all", Why: "every rule gone, allowing everything", Min: 0.03, Step: func(b, a *View, _ Step) bool {
+	{Name: "rules-to-allow-all", Why: "every rule gone, allowing everything", Min: 0.013, Step: func(b, a *View, _ Step) bool {
 		return !b.World.Policy.AllowAll && a.World.Policy.AllowAll
 	}},
-	{Name: "host-edit-named", Why: "a host's prefix edited while rules keep naming it", Min: 0.008, Step: func(b, a *View, st Step) bool {
+	{Name: "host-edit-named", Why: "a host's prefix edited while rules keep naming it", Min: 0.001, Step: func(b, a *View, st Step) bool {
 		return slices.ContainsFunc(edits[SetHost](st), func(e SetHost) bool {
 			return b.World.Policy.referenced().hosts[e.Host] && b.World.Policy.Hosts[e.Host] != a.World.Policy.Hosts[e.Host]
 		})
@@ -792,7 +794,7 @@ var Required = append([]Shape{
 	{Name: "service-host-flip-by-policy", Why: "a receiver fact flipped by the policy alone", Min: 0.004, Step: func(b, a *View, st Step) bool {
 		return onlyPolicy(st) && !slices.Equal(b.ServiceHosts(), a.ServiceHosts())
 	}},
-	{Name: "user-refs-replaced", Why: "the write that fixes a token users made ambiguous", Min: 0.03, Step: func(_, _ *View, st Step) bool {
+	{Name: "user-refs-replaced", Why: "the write that fixes a token users made ambiguous", Min: 0.021, Step: func(_, _ *View, st Step) bool {
 		return len(edits[ReplaceUserRefs](st)) > 0
 	}},
 	{Name: "user-edit-makes-token-ambiguous", Why: "an accepted document whose token users then make ambiguous", Min: 0.05, Step: func(b, a *View, _ Step) bool {
@@ -825,13 +827,13 @@ var Required = append([]Shape{
 			return nodeMoved(b, a, e.ID, func(was, is Node) bool { return len(is.Approved) < len(was.Approved) })
 		})
 	}},
-	{Name: "address-gained-v4", Why: "a node gains an IPv4 address", Min: 0.03, Step: func(b, a *View, _ Step) bool { return addrMoves(b, a, 4, gained) }},
+	{Name: "address-gained-v4", Why: "a node gains an IPv4 address", Min: 0.022, Step: func(b, a *View, _ Step) bool { return addrMoves(b, a, 4, gained) }},
 	{Name: "address-gained-v6", Why: "a node gains an IPv6 address", Min: 0.01, Step: func(b, a *View, _ Step) bool { return addrMoves(b, a, 6, gained) }},
 	{Name: "address-lost-v4", Why: "a node loses its IPv4 address", Min: 0.02, Step: func(b, a *View, _ Step) bool { return addrMoves(b, a, 4, lost) }},
-	{Name: "address-lost-v6", Why: "a node loses its IPv6 address", Min: 0.025, Step: func(b, a *View, _ Step) bool { return addrMoves(b, a, 6, lost) }},
+	{Name: "address-lost-v6", Why: "a node loses its IPv6 address", Min: 0.02, Step: func(b, a *View, _ Step) bool { return addrMoves(b, a, 6, lost) }},
 	{Name: "address-moved-v4", Why: "a node moves to another IPv4 address", Min: 0.07, Step: func(b, a *View, _ Step) bool { return addrMoves(b, a, 4, moved) }},
 	{Name: "address-moved-v6", Why: "a node moves to another IPv6 address", Min: 0.03, Step: func(b, a *View, _ Step) bool { return addrMoves(b, a, 6, moved) }},
-	{Name: "address-onto-shared", Why: "a node moving onto an address another holds (database only)", Min: 0.001, Step: func(b, a *View, _ Step) bool {
+	{Name: "address-onto-shared", Why: "a node moving onto an address another holds (database only)", Min: 0, Step: func(b, a *View, _ Step) bool {
 		for _, n := range a.nodes {
 			o, ok := b.World.Topology.Node(n.ID)
 			if !ok {
@@ -898,8 +900,8 @@ var Required = append([]Shape{
 
 		return false
 	}},
-	{Name: "merge-anchor-moved", Why: "an anchor's key moves while an address-form receiver of its merged rule reads", Min: 0.015, Step: anchorMoved},
-	{Name: "self-source-sharer-moved", Why: "whether a self rule names a node moves, and another node shares an address the step left alone (database only)", Min: 0.008, Step: selfSourceSharerMoved},
+	{Name: "merge-anchor-moved", Why: "an anchor's key moves while an address-form receiver of its merged rule reads", Min: 0.013, Step: anchorMoved},
+	{Name: "self-source-sharer-moved", Why: "whether a self rule names a node moves, and another node shares an address the step left alone (database only)", Min: 0.002, Step: selfSourceSharerMoved},
 	{Name: "partial-read", Why: "some sessions read a commit, others do not", Min: 0.25, Step: func(_, a *View, st Step) bool {
 		return len(st.Reads) > 0 && len(st.Reads) < len(a.nodes)
 	}},

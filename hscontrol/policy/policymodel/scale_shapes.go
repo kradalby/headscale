@@ -14,18 +14,18 @@ const wide = 10
 // tailnets reach, fan-out through one selector, rule or class, and edit
 // scripts that keep working on one node or one rule.
 var scaleShapes = []Shape{
-	{Name: "dozen-nodes", Why: "a tailnet of a dozen nodes or more", Min: 0.015, World: func(v *View) bool { return len(v.nodes) >= 12 }},
-	{Name: "dozens-of-nodes", Why: "a tailnet of two dozen nodes or more", Min: 0.007, World: func(v *View) bool { return len(v.nodes) >= 24 }},
-	{Name: "crowd-of-users", Why: "more users than any one token names", Min: 0.035, World: func(v *View) bool { return len(v.users) > len(defaultUsers) }},
-	{Name: "wide-selector", Why: "many nodes behind one identity a rule names", Min: 0.01, World: func(v *View) bool {
+	{Name: "dozen-nodes", Why: "a tailnet of a dozen nodes or more", Min: 0.008, World: func(v *View) bool { return len(v.nodes) >= 12 }},
+	{Name: "dozens-of-nodes", Why: "a tailnet of two dozen nodes or more", Min: 0.001, World: func(v *View) bool { return len(v.nodes) >= 24 }},
+	{Name: "crowd-of-users", Why: "more users than any one token names", Min: 0.03, World: func(v *View) bool { return len(v.users) > len(defaultUsers) }},
+	{Name: "wide-selector", Why: "many nodes behind one identity a rule names", Min: 0.004, World: func(v *View) bool {
 		return v.anyRule(func(r Rule, _ bool) bool {
 			return slices.ContainsFunc(slices.Concat(r.Src, dstSels(r)), func(s Sel) bool { return byOwner(s) && len(v.MembersOf(s)) >= wide })
 		})
 	}},
-	{Name: "wide-rule", Why: "one rule received by many nodes", Min: 0.011, World: func(v *View) bool {
+	{Name: "wide-rule", Why: "one rule received by many nodes", Min: 0.004, World: func(v *View) bool {
 		return v.anyRule(func(r Rule, _ bool) bool { return len(v.MembersOf(dstSels(r)...)) >= wide })
 	}},
-	{Name: "wide-class", Why: "many nodes one rule links both ways, one peer class", Min: 0.008, World: func(v *View) bool {
+	{Name: "wide-class", Why: "many nodes one rule links both ways, one peer class", Min: 0.001, World: func(v *View) bool {
 		return v.anyRule(func(r Rule, _ bool) bool {
 			src, dst := v.MembersOf(r.Src...), v.MembersOf(dstSels(r)...)
 
@@ -33,8 +33,8 @@ var scaleShapes = []Shape{
 				len(slices.DeleteFunc(src, func(n Node) bool { return !slices.ContainsFunc(dst, func(m Node) bool { return m.ID == n.ID }) })) >= wide
 		})
 	}},
-	{Name: "three-rules-one-key", Why: "three rules merging into one at a receiver", Min: 0.035, World: threeRulesOneKey},
-	{Name: "long-policy", Why: "a dozen rules or more", Min: 0.008, World: func(v *View) bool {
+	{Name: "three-rules-one-key", Why: "three rules merging into one at a receiver", Min: 0.034, World: threeRulesOneKey},
+	{Name: "long-policy", Why: "a dozen rules or more", Min: 0.004, World: func(v *View) bool {
 		return len(v.World.Policy.ACLs)+len(v.World.Policy.Grants) >= 12
 	}},
 	{Name: "several-routers-and-exits", Why: "more than one subnet router and more than one exit node", Min: 0.015, World: func(v *View) bool {
@@ -77,11 +77,11 @@ var scaleShapes = []Shape{
 
 		return v6 >= 2 && dual > 0
 	}},
-	{Name: "steps-in-a-dozen-nodes", Why: "edits committed in a tailnet of a dozen nodes or more", Min: 0.015, Step: func(b, _ *View, st Step) bool {
+	{Name: "steps-in-a-dozen-nodes", Why: "edits committed in a tailnet of a dozen nodes or more", Min: 0.008, Step: func(b, _ *View, st Step) bool {
 		return len(st.Edits) > 0 && len(b.nodes) >= 12
 	}},
 	{Name: "long-scenario", Why: "two dozen steps or more", Min: 0.003, Seq: func(_ []*View, steps []Step) bool { return len(steps) >= 24 }},
-	{Name: "node-lifecycle", Why: "a node joins, a later step edits it and a later one deletes it", Min: 0.013, Seq: nodeLifecycle},
+	{Name: "node-lifecycle", Why: "a node joins, a later step edits it and a later one deletes it", Min: 0.007, Seq: nodeLifecycle},
 	{Name: "node-edited-in-three-steps", Why: "one node written by three steps", Min: 0.12, Seq: func(_ []*View, steps []Step) bool {
 		return slices.ContainsFunc(stepsPerObject(steps, true), func(c int) bool { return c >= 3 })
 	}},
