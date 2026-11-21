@@ -593,6 +593,35 @@ const (
 	// the clause once route access leaves a via router's own rule to its
 	// destination side.
 	ViaRouterExitRoutes
+	// ViaExitSourceRoutes: a via grant to autogroup:internet offers its
+	// sources exit routes, steered to its via-tagged exit nodes, and no
+	// subnet route. Headscale's route access reads the grant, at a via
+	// exit router among its sources, as the router's own rule to the
+	// whole internet: it is given every peer's exit routes and every
+	// peer's subnet route reaching a public address, as a rule without
+	// via to the internet would give them. Steering takes back the exit
+	// routes of peers without a via tag, not the subnet routes. Fails
+	// open in route access, closed in effect: the peer's filter carries
+	// nothing from the router, which sends it the traffic.
+	//
+	// TODO(kradalby): policy/via-exit-source-routes: fails open in route
+	// access, closed in effect. With `autogroup:tagged ->
+	// autogroup:internet via tag:b`, n1 a tag:b exit node and n2 an
+	// untagged router of 8.8.8.0/24, n1's client holds 8.8.8.0/24 in n2's
+	// allowed IPs, though n2 is no via router of the grant and accepts
+	// nothing from n1; with accept-routes on, n1's traffic to 8.8.8.0/24
+	// goes to n2 and is dropped there. docs/ref/routes.md: via "route
+	// selection does not widen the grant's destination"; no capture holds
+	// a via exit router among its own grant's sources. The delivery and
+	// front-door properties count it under "via exit source routes";
+	// TestViaExitSourceRoutesIsHeadscalesReading pins it to what headscale
+	// does. Production: Sides.viaRules in policy/v2/visibility.go gives
+	// the router the rule sources -> util.TheInternet, which
+	// Sides.RouteAccess reads with the router on its source side;
+	// ViaPlan.Steer steers autogroup:internet through exit routes alone.
+	// Delete the clause once route access leaves a via router's own rule
+	// to its destination side, or steering takes those routes back.
+	ViaExitSourceRoutes
 )
 
 // ContestedClauses is every contested clause, in the order a property
@@ -600,20 +629,20 @@ const (
 var ContestedClauses = []Contested{
 	OthersSelf, StarApprovedRoutes, InternetAtSubnetRouters,
 	ViaOwnAddress, ViaReach, ViaRouterAddress, ViaSelf, ExitDestinationRoutes, AppWildcard, ViaRouterCover, ViaExitInternet,
-	ViaRouterExitRoutes,
+	ViaRouterExitRoutes, ViaExitSourceRoutes,
 }
 
 // FailsOpen reports whether headscale's side of c admits what the
 // reference refuses.
 func (c Contested) FailsOpen() bool {
-	return c&(StarApprovedRoutes|InternetAtSubnetRouters|ViaOwnAddress|ViaRouterCover|ViaExitInternet|ViaRouterExitRoutes) != 0
+	return c&(StarApprovedRoutes|InternetAtSubnetRouters|ViaOwnAddress|ViaRouterCover|ViaExitInternet|ViaRouterExitRoutes|ViaExitSourceRoutes) != 0
 }
 
 func (c Contested) String() string {
 	names := []string{
 		"others' self rules", "* adds approved routes", "internet at subnet routers",
 		"via own address", "via reach", "via router without address", "via to self", "exit routes as destination", "* as app destination",
-		"via router covered", "via exit internet", "via router exit routes",
+		"via router covered", "via exit internet", "via router exit routes", "via exit source routes",
 	}
 
 	var parts []string
@@ -1355,6 +1384,10 @@ func (r *Ref) Routes(viewer, peer types.NodeID) []netip.Prefix {
 
 			via := len(rl.via) > 0
 
+			if via && r.without&ViaExitSourceRoutes != 0 && viaExitSource(rl, v) && (isExitRoute(q) || internet.OverlapsPrefix(q)) {
+				return true
+			}
+
 			if isExitRoute(q) {
 				if via {
 					return r.without&ViaRouterExitRoutes != 0 && on(v, rl.src) && len(rl.ip) > 0 && r.viaPartReachesInternet(rl, v)
@@ -1425,6 +1458,13 @@ func (r *Ref) viaPartReachesInternet(rl refRule, n RefNode) bool {
 	}
 
 	return false
+}
+
+// viaExitSource reports whether v reads via rule rl as its own rule to
+// the internet ([ViaExitSourceRoutes]): rl names autogroup:internet, and
+// v is one of its via exit routers and among its sources.
+func viaExitSource(rl refRule, v RefNode) bool {
+	return rl.internet && len(rl.ip) > 0 && v.hasTag(rl.via) && v.exit() && on(v, rl.src)
 }
 
 // HasVia reports whether a rule is a via grant.

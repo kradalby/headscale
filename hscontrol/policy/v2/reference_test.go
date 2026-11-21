@@ -1222,6 +1222,97 @@ func TestViaRouterExitRoutesIsHeadscalesReading(t *testing.T) {
 	}
 }
 
+// TestViaExitSourceRoutesIsHeadscalesReading pins policymodel's
+// ViaExitSourceRoutes to headscale's route access, from scratch, on
+// hand-built worlds: a via exit router among the sources of its grant to
+// autogroup:internet is given a peer's subnet route reaching a public
+// address, of either family whatever families it exits, which steering
+// leaves alone, and no other node is. On each world every node is given of
+// the peer the subnet routes the reference with the clause gives, and the
+// reference without it differs exactly where the world says the clause
+// decides. It fails once production changes the reading.
+func TestViaExitSourceRoutesIsHeadscalesReading(t *testing.T) {
+	t.Parallel()
+
+	addr := netip.MustParseAddr
+	// Prefixes 0, 4 and 8 are 10.0.0.0/24, 8.8.8.0/24 and 2001:4860::/32;
+	// 9 and 10 the exit routes. Tag 0 is the via tag.
+	world := func(src policymodel.Sel, tag int, exits []int, peerTagged bool, routes ...int) policymodel.World {
+		var w policymodel.World
+
+		w.Topology.Users = []policymodel.User{{ID: 1, Name: "alice"}}
+		peer := policymodel.Node{ID: 2, User: 1, V4: addr("100.64.0.2"), V6: addr("fd7a:115c:a1e0::2"), Announced: routes, Approved: routes}
+
+		if peerTagged {
+			peer.User, peer.Tags = 0, []int{0}
+		}
+
+		w.Topology.Nodes = []policymodel.Node{
+			{ID: 1, Tags: []int{tag}, V4: addr("100.64.0.1"), V6: addr("fd7a:115c:a1e0::1"), Announced: exits, Approved: exits},
+			peer,
+			{ID: 3, User: 1, V4: addr("100.64.0.3"), V6: addr("fd7a:115c:a1e0::3")},
+		}
+		w.Topology.NextID, w.Topology.NextUserID = 4, 2
+		w.Policy.Defined[0], w.Policy.Defined[1] = true, true
+		w.Policy.Grants = []policymodel.Rule{{
+			Src: []policymodel.Sel{src}, Dst: []policymodel.Dest{{Sel: policymodel.Sel{Kind: policymodel.SelInternet}}},
+			IP: []policymodel.IP{{Proto: slices.Index(policymodel.Protos, "udp")}}, Via: []int{0},
+		}}
+
+		return w
+	}
+
+	tagged, member, both := policymodel.Sel{Kind: policymodel.SelTagged}, policymodel.Sel{Kind: policymodel.SelMember}, []int{9, 10}
+
+	for _, c := range []struct {
+		name    string
+		w       policymodel.World
+		decides bool
+	}{
+		{"a via exit router among the sources, a public IPv4 route", world(tagged, 0, both, false, 4), true},
+		{"a via exit router among the sources, a public IPv6 route", world(tagged, 0, both, false, 8), true},
+		{"a via exit router of IPv4 alone, a public IPv6 route", world(tagged, 0, []int{9}, false, 8), true},
+		{"a via exit router of IPv6 alone, a public IPv4 route", world(tagged, 0, []int{10}, false, 4), true},
+		{"the peer carrying the via tag", world(tagged, 0, both, true, 4), true},
+		{"a via exit router among the sources, a private route", world(tagged, 0, both, false, 0), false},
+		{"a via exit router not among the sources", world(member, 0, both, false, 4), false},
+		{"an exit node without the via tag", world(tagged, 1, both, false, 4), false},
+		{"a via-tagged node without an exit route", world(tagged, 0, nil, false, 4), false},
+	} {
+		sv, err := serve(nil, c.w, policymodel.Change{})
+		require.NoError(t, err, c.name)
+
+		headscale := sv.ref.Without(policymodel.ViaExitSourceRoutes)
+		peer, _ := sv.nm.Get(2)
+		routes := peer.View().SubnetRoutes()
+		differs := false
+
+		subnets := func(rs []netip.Prefix) []netip.Prefix {
+			out := slices.DeleteFunc(slices.Clone(rs), tsaddr.IsExitRoute)
+			slices.SortFunc(out, netip.Prefix.Compare)
+
+			return out
+		}
+
+		for _, v := range c.w.Topology.Nodes {
+			if v.ID == 2 {
+				continue
+			}
+
+			viewer, _ := sv.nm.Get(v.ID)
+			steer := sv.pm.ViaRoutesForPeer(viewer.View(), peer.View())
+			require.Emptyf(t, subnets(slices.Concat(steer.Include, steer.Exclude)), "%s: steering decides n%d's subnet routes of the peer: %+v", c.name, v.ID, steer)
+
+			got := subnets(sv.sides.RouteAccess(v.ID, routes))
+			require.Equalf(t, subnets(headscale.Routes(v.ID, 2)), got, "%s: n%d's subnet routes of the peer against the reference with the clause", c.name, v.ID)
+
+			differs = differs || !slices.Equal(subnets(sv.ref.Routes(v.ID, 2)), got)
+		}
+
+		require.Equal(t, c.decides, differs, "%s: whether the clause decides", c.name)
+	}
+}
+
 // TestStampsFollowReference holds the source capabilities headscale
 // renders on a node after every step, to itself and to its peers, to the
 // reference: a stamp for every source selector the node is a member of

@@ -22,7 +22,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
@@ -617,56 +616,11 @@ func (c heldClient) routes() {
 			switch {
 			case ok:
 				c.fd.run.tally.contested["routes "+k.String()]++
-			case viaExitSourceRoutes(c.w, c.id, pid, judged, want):
-				// TODO(kradalby): policy/via-exit-source-routes: FOLLOWUPS
-				// A33. A via exit router on the source side of its own via
-				// grant to autogroup:internet is given a peer's public
-				// subnet routes, though that peer is no via router of the
-				// grant. The reference has no clause for it. Counted, not
-				// judged.
-				c.fd.run.tally.contested["routes via exit source (A33)"]++
 			default:
 				c.failf("its client is given %v of n%d's routes, the reference %v (%v unjudged)", routes, pid, want, unjudged)
 			}
 		}
 	}
-}
-
-// viaExitSourceRoutes reports whether judged is want and public subnet
-// routes of peer that FOLLOWUPS A33 gives viewer: viewer is an exit node
-// carrying the via tags of a grant to autogroup:internet whose sources
-// it is among, and peer carries none of them.
-func viaExitSourceRoutes(w policymodel.World, viewer, peer types.NodeID, judged, want []netip.Prefix) bool {
-	v, _ := w.Topology.Node(viewer)
-	p, _ := w.Topology.Node(peer)
-
-	extra := slices.DeleteFunc(slices.Clone(judged), func(q netip.Prefix) bool { return slices.Contains(want, q) })
-	if !v.Exit() || len(extra) == 0 || slices.ContainsFunc(want, func(q netip.Prefix) bool { return !slices.Contains(judged, q) }) {
-		return false
-	}
-
-	for _, q := range extra {
-		r := slices.Index(policymodel.Prefixes, q)
-		if q.Bits() == 0 || !util.TheInternet().ContainsPrefix(q) || !slices.Contains(p.Announced, r) || !slices.Contains(p.Approved, r) {
-			return false
-		}
-	}
-
-	view := policymodel.NewView(w)
-	carries := func(n policymodel.Node, via []int) bool {
-		return slices.ContainsFunc(n.Tags, func(t int) bool { return slices.Contains(via, t) })
-	}
-
-	for _, g := range w.Policy.Grants {
-		internet := slices.ContainsFunc(g.Dst, func(d policymodel.Dest) bool { return d.Sel.Kind == policymodel.SelInternet })
-		source := slices.ContainsFunc(view.MembersOf(g.Src...), func(n policymodel.Node) bool { return n.ID == viewer })
-
-		if internet && len(g.Via) > 0 && carries(v, g.Via) && !carries(p, g.Via) && source {
-			return true
-		}
-	}
-
-	return false
 }
 
 // filter holds the client's packet filter to the reference's rules
