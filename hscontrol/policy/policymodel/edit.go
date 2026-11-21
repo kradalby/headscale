@@ -135,8 +135,9 @@ func (w World) Commit(st Step) (World, Change) {
 
 // Undo returns a step of writes that takes w.Apply(step.Edits...) back to
 // w, but for the ID counters, and whether there is one: there is none
-// when the step deletes a node or a user, or when auto-approval or a
-// manual approval moved approvals that no write puts back.
+// when the step deletes a node or a user, when auto-approval or a
+// manual approval moved approvals that no write puts back, or when a
+// node would be retagged onto a tag the document then no longer defines.
 func Undo(w World, step Step) (Step, bool) {
 	var inv Step
 
@@ -156,7 +157,19 @@ func Undo(w World, step Step) (Step, bool) {
 
 	slices.Reverse(inv.Edits)
 
-	back := cur.Apply(inv.Edits...)
+	// An admin's tag write takes only tags the document then in force
+	// defines, though a node keeps tags its document stops defining: an
+	// inverse retag onto those is refused.
+	back := cur
+
+	for _, e := range inv.Edits {
+		if r, retag := e.(Retag); retag && slices.ContainsFunc(r.Tags, func(t int) bool { return !back.Policy.DefinesTag(t) }) {
+			ok = false
+		}
+
+		back = back.Apply(e)
+	}
+
 	back.Topology.NextID, back.Topology.NextUserID = w.Topology.NextID, w.Topology.NextUserID
 
 	// Writing w's document again is refused if the users have made a

@@ -514,6 +514,46 @@ func TestUndoKeepsReplacedTokensApart(t *testing.T) {
 	}
 }
 
+// TestUndoRetagsOnlyOntoDefinedTags: a node keeps a tag its document stops
+// defining, but an admin cannot tag it back onto one, so a step that drops
+// a tag's definition and then retags a node off it has no inverse; the
+// same edits the other way round have one, as the inverse puts the
+// definition back before the tag.
+func TestUndoRetagsOnlyOntoDefinedTags(t *testing.T) {
+	t.Parallel()
+
+	const tagB, tagC = 1, 2
+
+	w := World{
+		Policy: Policy{Defined: [numTags]bool{tagB: true, tagC: true}},
+		Topology: Topology{
+			Users:      slices.Clone(defaultUsers[:1]),
+			Nodes:      []Node{{ID: 1, Tags: []int{tagB}, V4: ownAddr(4, 1), V6: ownAddr(6, 1)}},
+			NextID:     2,
+			NextUserID: 2,
+		},
+	}
+	drop, retag := SetTagOwners{Tag: tagB}, Retag{ID: 1, Tags: []int{tagC}}
+
+	for _, tc := range []struct {
+		edits   []Edit
+		inverse bool
+	}{
+		{[]Edit{drop, retag}, false},
+		{[]Edit{retag, drop}, true},
+	} {
+		step := Step{Edits: tc.edits}
+
+		inv, ok := Undo(w, step)
+		back := w.Apply(step.Edits...).Apply(inv.Edits...)
+		back.Topology.NextID, back.Topology.NextUserID = w.Topology.NextID, w.Topology.NextUserID
+
+		if ok != tc.inverse || ok && !reflect.DeepEqual(back, w) {
+			t.Fatalf("%s: Undo says %t, undone by %s gives\n%#v", step, ok, inv, back)
+		}
+	}
+}
+
 // onlyApprovalsDiffer reports whether a and b differ in nodes' approvals
 // alone.
 func onlyApprovalsDiffer(a, b World) bool {
