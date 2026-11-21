@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -84,11 +86,15 @@ const (
 	stepLogout
 	stepRelogin
 	stepServerRestart
+	stepOwnership
+	stepIdentity
+	stepRace
 	numSteps
 )
 
 var stepNames = [numSteps]string{
 	"world", "burst", "flap", "poll restart", "client restart", "endpoints", "rename", "logout", "relogin", "server restart",
+	"ownership", "identity", "race",
 }
 
 // fdNode is a model node's client and how it joined, which a login, a
@@ -123,6 +129,8 @@ type fdRun struct {
 	// passed holds the filters held to the reference already, by
 	// everything the comparison reads.
 	passed map[string]bool
+	// a37 lists the logins auth/followup-lookup-race started over.
+	a37 []string
 }
 
 // frontDoor is one case: a server, its clients, and the model of what
@@ -180,6 +188,10 @@ func TestFrontDoorClientsFollowTheModel(t *testing.T) {
 
 	t.Log(run.tally)
 	t.Logf("reference: filters %v; form %v", &run.verdicts, &run.form)
+
+	for _, l := range run.a37 {
+		t.Logf("auth/followup-lookup-race: %s", l)
+	}
 
 	if f := flag.Lookup("rapid.checks"); f != nil {
 		n, err := strconv.Atoi(f.Value.String())
@@ -264,29 +276,35 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 	for i := range steps {
 		at := fmt.Sprintf("step %d", i+1)
 
-		kind := rapid.IntRange(0, 20).Draw(rt, "kind")
+		kind := rapid.IntRange(0, 27).Draw(rt, "kind")
 
 		switch {
-		case kind < 8:
+		case kind < 6:
 			fd.world(at, policymodel.Steps(fd.w).Draw(rt, "edits"))
-		case kind < 11:
+		case kind < 9:
 			fd.burst(at, rapid.IntRange(2, 4).Draw(rt, "burst"))
-		case kind < 13:
+		case kind < 11:
 			fd.weather(at, stepFlap)
-		case kind < 14:
+		case kind < 12:
 			fd.weather(at, stepRestartPoll)
-		case kind < 15:
+		case kind < 13:
 			fd.weather(at, stepClientRestart)
-		case kind < 16:
+		case kind < 14:
 			fd.weather(at, stepEndpoints)
-		case kind < 17:
+		case kind < 15:
 			fd.rename(at)
-		case kind < 18:
+		case kind < 16:
 			fd.logout(at)
-		case kind < 19:
+		case kind < 17:
 			fd.relogin(at)
-		default:
+		case kind < 19:
 			fd.restart(at)
+		case kind < 23:
+			fd.ownership(at)
+		case kind < 26:
+			fd.identity(at)
+		default:
+			fd.race(at)
 		}
 
 		fd.settle(at)
@@ -699,6 +717,26 @@ func (fd *frontDoor) approver(u policymodel.User) func(authID string) error {
 	return func(authID string) error {
 		fd.awaitFollowup(authID)
 
+		return fd.approveNow(u)(authID)
+	}
+}
+
+// approverAt is approver at a drawn moment: mostly once the client's
+// follow-up waits, as a person approves; one login in four at once,
+// racing the follow-up on its way (auth/followup-lookup-race).
+func (fd *frontDoor) approverAt(u policymodel.User) func(authID string) error {
+	if rapid.IntRange(0, 3).Draw(fd.t, "approve-at") < 3 {
+		return fd.approver(u)
+	}
+
+	fd.run.tally.edits["login approved as its follow-up arrives"]++
+
+	return fd.approveNow(u)
+}
+
+// approveNow completes an interactive login as u at once.
+func (fd *frontDoor) approveNow(u policymodel.User) func(authID string) error {
+	return func(authID string) error {
 		if u.OIDC() {
 			id, err := types.AuthIDFromString(authID)
 			if err != nil {
@@ -752,6 +790,31 @@ func (fd *frontDoor) followupWaiting() bool {
 	}
 
 	return false
+}
+
+// startedOver carries a login past auth/followup-lookup-race: when the
+// server answered the client's follow-up with a new login although the
+// approval had registered the node, the property approves the new one, as
+// the person shown its URL would, and counts it. It returns err otherwise,
+// nil once the client is logged in.
+func (fd *frontDoor) startedOver(at string, id types.NodeID, tc *TestClient, err error, u policymodel.User) error {
+	var so *loginStartedOverError
+	if !errors.As(err, &so) {
+		return err
+	}
+
+	fd.run.tally.edits["login started over though approved (auth/followup-lookup-race)"]++
+	fd.run.a37 = append(fd.run.a37, fmt.Sprintf("%s: n%d: %v; its exchanges %s", at, id, err, jsonOf(tc.RegisterAttempts())))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	err = tc.waitLogin(ctx, so.url, fd.approver(u))
+	if err == nil {
+		err = tc.direct.SendUpdate(ctx)
+	}
+
+	return err
 }
 
 // join registers n as its client and an admin bring it in, and applies to
@@ -810,7 +873,7 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 			nd.method = util.RegisterMethodOIDC
 		}
 
-		opts = append(opts, WithInteractiveLogin(fd.approver(as)))
+		opts = append(opts, WithInteractiveLogin(fd.approverAt(as)))
 	default:
 		nd.method = util.RegisterMethodAuthKey
 
@@ -848,6 +911,10 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 	}
 
 	tc, err := TryNewClient(fd.tb, fd.srv, fmt.Sprintf("n%d", n.ID), opts...)
+	if kind == joinLogin || kind == joinLoginTagged {
+		err = fd.startedOver(at, n.ID, tc, err, as)
+	}
+
 	if err != nil {
 		fd.t.Fatalf("%s: n%d does not register (%s): %v; its exchanges %s", at, n.ID, joinNames[kind], err, jsonOf(tc.RegisterAttempts()))
 	}
@@ -1126,9 +1193,15 @@ func (fd *frontDoor) login(at string, id types.NodeID, u policymodel.User, n pol
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	err := nd.tc.Login(ctx, nd.tc.Persist(), "", controlclient.LoginInteractive, fd.hostinfo(n, true), fd.approver(u))
+	err := nd.tc.Login(ctx, nd.tc.Persist(), "", controlclient.LoginInteractive, fd.hostinfo(n, true), fd.approverAt(u))
 	if err != nil {
-		fd.t.Fatalf("%s: n%d logs in as u%d: %v", at, id, u.ID, err)
+		err = fd.startedOver(at, id, nd.tc, err, u)
+		if err != nil {
+			fd.t.Fatalf("%s: n%d logs in as u%d: %v", at, id, u.ID, err)
+		}
+
+		nd.tc.resetNetmapState()
+		nd.tc.startPollLoop()
 	}
 
 	fd.answered(at, id, nd.tc)
@@ -1305,27 +1378,855 @@ func (fd *frontDoor) relogin(at string) {
 	if nd.key == "" || !nd.reusable {
 		u, _ := fd.w.Topology.User(n.User)
 		fd.login(at, n.ID, u, n)
-	} else {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
+		fd.apply(policymodel.SetExpired{ID: n.ID, Expired: false})
+		fd.apply(policymodel.SetOnline{ID: n.ID, Online: true})
 
-		err := nd.tc.Login(ctx, nd.tc.Persist(), nd.key, controlclient.LoginInteractive, fd.hostinfo(n, true), nil)
+		return
+	}
+
+	edits := fd.keyLoginEdits(n)
+
+	err := fd.keyLogin(n, nd.key)
+	if err != nil {
+		fd.t.Fatalf("%s: n%d logs in again with its key: %v", at, n.ID, err)
+	}
+
+	fd.keyLoggedIn(at, n)
+	fd.w = fd.w.Apply(edits...)
+}
+
+// keyLogin logs n's client in again with key under a new node key, as
+// `tailscale up --force-reauth --auth-key` does; its map session restarts.
+// Safe off the test's goroutine.
+func (fd *frontDoor) keyLogin(n policymodel.Node, key string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	return fd.nodes[n.ID].tc.Login(ctx, fd.nodes[n.ID].tc.Persist(), key, controlclient.LoginInteractive, fd.hostinfo(n, true), nil)
+}
+
+// keyLoginEdits is what a login with n's key makes of n: a user's own key
+// presented for a node an admin tagged since takes it back as that user's
+// device (preAuthKeyClaimsTaggedNode); any other renews it. It connects.
+func (fd *frontDoor) keyLoginEdits(n policymodel.Node) []policymodel.Edit {
+	var out []policymodel.Edit
+
+	if nd := fd.nodes[n.ID]; n.Tagged() && !nd.keyTagged {
+		out = append(out, policymodel.Retag{ID: n.ID, User: nd.keyUser})
+	}
+
+	return append(out, policymodel.SetExpired{ID: n.ID, Expired: false}, policymodel.SetOnline{ID: n.ID, Online: true})
+}
+
+// keyLoggedIn records a login with n's key: the claimed device is no
+// longer ephemeral.
+func (fd *frontDoor) keyLoggedIn(at string, n policymodel.Node) {
+	nd := fd.nodes[n.ID]
+
+	fd.answered(at, n.ID, nd.tc)
+	nd.loggedOut = false
+
+	if n.Tagged() && !nd.keyTagged {
+		nd.ephemeral = false
+		fd.run.tally.edits["a user's key takes a tagged node back"]++
+	}
+}
+
+// The ownership scripts: where a node changes hands.
+const (
+	ownClaimLogin = iota
+	ownKeyLogin
+	ownReauthTags
+	ownOwnerGone
+	ownRetagApprover
+	numOwn
+)
+
+var ownNames = [numOwn]string{"claim back by login", "login with its key", "login requesting tags", "a key gone with its user", "retag onto an approver"}
+
+// ownership changes who owns a node through the front door, the
+// neighbourhood the soak's driver gaps sat in: a user's login takes a
+// tagged node back; a node logs in again with its key, which takes a
+// tagged node back for the key's user; a login requests tags, which tags a
+// user's node or keeps a tagged node tagged, renewing an expired key; a
+// user's own key dies with the user, and a login with it is refused.
+func (fd *frontDoor) ownership(at string) {
+	kind := rapid.IntRange(0, numOwn-1).Draw(fd.t, "ownership")
+
+	var done bool
+
+	switch kind {
+	case ownClaimLogin:
+		done = fd.claimByLogin(at)
+	case ownKeyLogin:
+		done = fd.loginWithKey(at)
+	case ownReauthTags:
+		done = fd.reauthTags(at)
+	case ownOwnerGone:
+		done = fd.ownerGone(at)
+	case ownRetagApprover:
+		done = fd.retagApprover(at)
+	}
+
+	name := stepNames[stepOwnership] + ": " + ownNames[kind]
+	if !done {
+		name += " (no node)"
+	}
+
+	fd.run.tally.steps[stepNames[stepOwnership]]++
+	fd.run.tally.steps[name]++
+}
+
+// claims reports whether a login as u takes over n's client's node rather
+// than adding a device beside it: a user's node by its user, a tagged node
+// by anyone unless a key registered it, then by the key's user.
+func (fd *frontDoor) claims(n policymodel.Node, u policymodel.User) bool {
+	if !fd.loginUser(u) {
+		return false
+	}
+
+	if !n.Tagged() {
+		return n.User == u.ID
+	}
+
+	nd := fd.nodes[n.ID]
+
+	return nd.method != util.RegisterMethodAuthKey || nd.keyUser == u.ID
+}
+
+func (fd *frontDoor) claimByLogin(at string) bool {
+	type pair struct {
+		n policymodel.Node
+		u policymodel.User
+	}
+
+	var can []pair
+
+	for _, n := range fd.w.Topology.Nodes {
+		for _, u := range fd.w.Topology.Users {
+			if n.Tagged() && fd.claims(n, u) {
+				can = append(can, pair{n, u})
+			}
+		}
+	}
+
+	// With no tagged node a login can take, an admin tags a user's node
+	// first, and its user takes it back.
+	if len(can) == 0 {
+		var defined []int
+
+		for t := range policymodel.Tags {
+			if fd.w.Policy.DefinesTag(t) {
+				defined = append(defined, t)
+			}
+		}
+
+		n, ok := fd.pick("tag-to-claim", func(n policymodel.Node, nd *fdNode) bool {
+			u, _ := fd.w.Topology.User(n.User)
+
+			return len(defined) > 0 && fd.claims(n, u) && (nd.method != util.RegisterMethodAuthKey || nd.keyUser == n.User)
+		})
+		if !ok {
+			return false
+		}
+
+		t := defined[rapid.IntRange(0, len(defined)-1).Draw(fd.t, "tag")]
+		u, _ := fd.w.Topology.User(n.User)
+
+		fd.mustAPI(at, http.MethodPost, fmt.Sprintf("/api/v1/node/%d/tags", n.ID), map[string]any{"tags": tagNames([]int{t})}, nil)
+		fd.apply(policymodel.Retag{ID: n.ID, Tags: []int{t}})
+		fd.made("Retag", "API, to be claimed back")
+
+		can = append(can, pair{n, u})
+	}
+
+	c := can[rapid.IntRange(0, len(can)-1).Draw(fd.t, "claim")]
+	fd.untag(at, policymodel.Retag{ID: c.n.ID, User: c.u.ID})
+
+	return true
+}
+
+func (fd *frontDoor) loginWithKey(at string) bool {
+	n, ok := fd.pick("key-login", func(_ policymodel.Node, nd *fdNode) bool { return nd.key != "" && nd.reusable })
+	if !ok {
+		return false
+	}
+
+	edits := fd.keyLoginEdits(n)
+
+	err := fd.keyLogin(n, fd.nodes[n.ID].key)
+	if err != nil {
+		fd.t.Fatalf("%s: n%d logs in again with its key: %v", at, n.ID, err)
+	}
+
+	fd.keyLoggedIn(at, n)
+	fd.w = fd.w.Apply(edits...)
+
+	return true
+}
+
+// ownsTag reports whether owners of tag t in w name n.
+func ownsTag(w policymodel.World, n policymodel.Node, t int) bool {
+	owners := w.Policy.TagOwners[t]
+
+	return slices.ContainsFunc(policymodel.NewView(w).MembersOf(owners...), func(m policymodel.Node) bool { return m.ID == n.ID })
+}
+
+// fdProbe is the ID of a node no world holds, standing for a user's device.
+const fdProbe types.NodeID = 1 << 30
+
+// userOwnsTag reports whether owners of tag t in w name user u: whether a
+// device of u's would be named.
+func userOwnsTag(w policymodel.World, u uint, t int) bool {
+	probe := policymodel.Node{ID: fdProbe, User: u}
+	w.Topology.Nodes = append(slices.Clone(w.Topology.Nodes), probe)
+
+	return ownsTag(w, probe, t)
+}
+
+// tagAsk is a login as u onto node n requesting tags.
+type tagAsk struct {
+	n    policymodel.Node
+	u    policymodel.User
+	tags []int
+}
+
+// tagLogins are the logins requesting tags that the server grants, every
+// tag owned by the node or the user, and those it refuses.
+func (fd *frontDoor) tagLogins() ([]tagAsk, []tagAsk) {
+	var granted, refused []tagAsk
+
+	for _, n := range fd.w.Topology.Nodes {
+		for _, u := range fd.w.Topology.Users {
+			if !fd.claims(n, u) {
+				continue
+			}
+
+			var sets [][]int
+			if n.Tagged() {
+				sets = append(sets, n.Tags)
+			}
+
+			for t := range policymodel.Tags {
+				if fd.w.Policy.DefinesTag(t) && !slices.Equal(n.Tags, []int{t}) {
+					sets = append(sets, []int{t})
+				}
+			}
+
+			for _, tags := range sets {
+				ok := !slices.ContainsFunc(tags, func(t int) bool { return !ownsTag(fd.w, n, t) && !userOwnsTag(fd.w, u.ID, t) })
+				if ok {
+					granted = append(granted, tagAsk{n, u, tags})
+				} else {
+					refused = append(refused, tagAsk{n, u, tags})
+				}
+			}
+		}
+	}
+
+	return granted, refused
+}
+
+// reauthTags has a user log a node in interactively requesting tags, as
+// `tailscale up --force-reauth --advertise-tags` does: a tag the node or
+// the user owns is granted, and the node becomes, or stays, the tags',
+// its key renewed; a request any tag of which neither owns is refused
+// and changes nothing. A tagged node is expired first now and then.
+func (fd *frontDoor) reauthTags(at string) bool {
+	granted, refused := fd.tagLogins()
+
+	refuse := len(refused) > 0 && (len(granted) == 0 || rapid.IntRange(0, 3).Draw(fd.t, "refused-tags") == 3)
+
+	if len(granted) == 0 && !refuse {
+		return false
+	}
+
+	pool := granted
+	if refuse {
+		pool = refused
+	}
+
+	// A tagged node asking for the tags it has comes first: the shape that
+	// renews a tagged node's key while it stays tagged.
+	if same := slices.DeleteFunc(slices.Clone(pool), func(a tagAsk) bool { return !a.n.Tagged() || !slices.Equal(a.n.Tags, a.tags) }); len(same) > 0 && rapid.Bool().Draw(fd.t, "keep-tags") {
+		pool = same
+	}
+
+	a := pool[rapid.IntRange(0, len(pool)-1).Draw(fd.t, "tags-login")]
+	n, nd := a.n, fd.nodes[a.n.ID]
+
+	if !refuse && n.Tagged() && !n.Expired && rapid.Bool().Draw(fd.t, "expire-first") {
+		fd.mustAPI(at, http.MethodPost, fmt.Sprintf("/api/v1/node/%d/expire", n.ID), map[string]any{}, nil)
+		fd.apply(policymodel.SetExpired{ID: n.ID, Expired: true})
+		n, _ = fd.w.Topology.Node(n.ID)
+	}
+
+	hi := fd.hostinfo(n, true)
+	hi.RequestTags = tagNames(a.tags)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	approve := fd.approverAt(a.u)
+	if refuse {
+		approve = fd.approver(a.u)
+	}
+
+	err := nd.tc.Login(ctx, nd.tc.Persist(), "", controlclient.LoginInteractive, hi, approve)
+
+	if refuse {
+		if err == nil {
+			fd.t.Fatalf("%s: n%d logs in as u%d requesting %v, which neither owns, and is let in", at, n.ID, a.u.ID, tagNames(a.tags))
+		}
+
+		// The client keeps its node key; its session comes back.
+		if !n.Offline {
+			fd.connect(at, n.ID)
+		}
+
+		fd.made("Login requesting tags", "refused (tags neither node nor user owns)")
+
+		return true
+	}
+
+	if err != nil {
+		err = fd.startedOver(at, n.ID, nd.tc, err, a.u)
 		if err != nil {
-			fd.t.Fatalf("%s: n%d logs in again with its key: %v", at, n.ID, err)
+			fd.t.Fatalf("%s: n%d logs in as u%d requesting %v: %v", at, n.ID, a.u.ID, tagNames(a.tags), err)
 		}
 
-		fd.answered(at, n.ID, nd.tc)
-		nd.loggedOut = false
+		nd.tc.resetNetmapState()
+		nd.tc.startPollLoop()
+	}
 
-		if n.Tagged() && !nd.keyTagged {
-			fd.apply(policymodel.Retag{ID: n.ID, User: nd.keyUser})
-			nd.ephemeral = false
-			fd.run.tally.steps[stepNames[stepRelogin]+" (a user's key takes a tagged node back)"]++
+	fd.answered(at, n.ID, nd.tc)
+	nd.loggedOut = false
+
+	what := "a user's node tagged"
+
+	if n.Tagged() {
+		// A login onto a tagged node registers it as the login does.
+		nd.method = util.RegisterMethodCLI
+		if a.u.OIDC() {
+			nd.method = util.RegisterMethodOIDC
 		}
+
+		what = "a tagged node retagged"
+		if slices.Equal(n.Tags, a.tags) {
+			what = "a tagged node stays tagged"
+		}
+
+		if n.Expired {
+			what += ", its key renewed"
+		}
+	}
+
+	if !slices.Equal(n.Tags, a.tags) {
+		fd.apply(policymodel.Retag{ID: n.ID, Tags: a.tags})
 	}
 
 	fd.apply(policymodel.SetExpired{ID: n.ID, Expired: false})
 	fd.apply(policymodel.SetOnline{ID: n.ID, Online: true})
+	fd.made("Login requesting tags", what)
+
+	return true
+}
+
+// ownerGone tags a user's node away from the user whose own key registered
+// it, deletes that user, whose keys go with it, and has the node log in
+// with the dead key: the login is refused and changes nothing.
+func (fd *frontDoor) ownerGone(at string) bool {
+	var defined []int
+
+	for t := range policymodel.Tags {
+		if fd.w.Policy.DefinesTag(t) {
+			defined = append(defined, t)
+		}
+	}
+
+	n, ok := fd.pick("owner-gone", func(n policymodel.Node, nd *fdNode) bool {
+		alone := !slices.ContainsFunc(fd.w.Topology.Nodes, func(m policymodel.Node) bool { return m.ID != n.ID && m.User == n.User && !m.Tagged() })
+
+		return len(defined) > 0 && !n.Tagged() && nd.key != "" && !nd.keyTagged && nd.keyUser == n.User && alone
+	})
+	if !ok {
+		return false
+	}
+
+	nd := fd.nodes[n.ID]
+	t := defined[rapid.IntRange(0, len(defined)-1).Draw(fd.t, "tag-away")]
+	dead, owner := nd.key, n.User
+
+	fd.mustAPI(at, http.MethodPost, fmt.Sprintf("/api/v1/node/%d/tags", n.ID), map[string]any{"tags": tagNames([]int{t})}, nil)
+	fd.apply(policymodel.Retag{ID: n.ID, Tags: []int{t}})
+	fd.edit(at, policymodel.DeleteUser{ID: owner}, nil)
+
+	n, _ = fd.w.Topology.Node(n.ID)
+
+	err := fd.keyLogin(n, dead)
+	if err == nil {
+		fd.t.Fatalf("%s: n%d logs in with the key of u%d, deleted with it", at, n.ID, owner)
+	}
+
+	if !n.Offline {
+		fd.connect(at, n.ID)
+	}
+
+	fd.made("Login with a key gone with its user", "refused")
+
+	return true
+}
+
+// retagApprover has an admin tag a node onto a tag that auto-approves a
+// route it announces and is not approved for: the node announces one if
+// it has none, the tag is defined and made an approver of the route if it
+// is not, and the tag write must approve the route.
+func (fd *frontDoor) retagApprover(at string) bool {
+	if len(policymodel.NewView(fd.w).AmbiguousRefs()) > 0 {
+		return false
+	}
+
+	n, ok := fd.pick("retagged", func(n policymodel.Node, nd *fdNode) bool { return !nd.loggedOut })
+	if !ok {
+		return false
+	}
+
+	pending := without(n.Announced, n.Approved)
+	if len(pending) == 0 {
+		var routes []int
+
+		for r := range policymodel.Prefixes {
+			if !slices.Contains(n.Announced, r) && !policymodel.NewView(fd.w).Approvable(n, r) {
+				routes = append(routes, r)
+			}
+		}
+
+		if len(routes) == 0 {
+			return false
+		}
+
+		r := routes[rapid.IntRange(0, len(routes)-1).Draw(fd.t, "announced")]
+		fd.edit(at, policymodel.Announce{ID: n.ID, Routes: []int{r}}, nil)
+		n, _ = fd.w.Topology.Node(n.ID)
+		pending = without(n.Announced, n.Approved)
+	}
+
+	if len(pending) == 0 {
+		return false
+	}
+
+	r := pending[rapid.IntRange(0, len(pending)-1).Draw(fd.t, "pending")]
+	t := rapid.IntRange(0, len(policymodel.Tags)-1).Draw(fd.t, "approver-tag")
+
+	if !fd.w.Policy.DefinesTag(t) {
+		fd.edit(at, policymodel.SetTagOwners{Tag: t, Owners: fd.w.Policy.TagOwners[t], Defined: true}, nil)
+	}
+
+	tagged := n
+	tagged.Tags, tagged.User = []int{t}, 0
+
+	if !policymodel.NewView(fd.w).Approvable(tagged, r) {
+		aa := fd.w.Policy.AutoApprovers
+		by := policymodel.Sel{Kind: policymodel.SelTag, I: t}
+
+		if q := policymodel.Prefixes[r]; q.Bits() == 0 {
+			aa.Exit = append(slices.Clone(aa.Exit), by)
+		} else {
+			aa.Routes = append(slices.Clone(aa.Routes), policymodel.RouteApproval{Route: r, By: []policymodel.Sel{by}})
+		}
+
+		fd.edit(at, policymodel.SetAutoApprovers{AutoApprovers: aa}, nil)
+	}
+
+	fd.mustAPI(at, http.MethodPost, fmt.Sprintf("/api/v1/node/%d/tags", n.ID), map[string]any{"tags": tagNames([]int{t})}, nil)
+	fd.apply(policymodel.Retag{ID: n.ID, Tags: []int{t}})
+	fd.made("Retag", "API, onto an approver of a route it announces")
+
+	return true
+}
+
+// The identity collisions an admin and an identity provider can make.
+const (
+	idOIDC = iota
+	idCreate
+	idRename
+	idClaims
+	idRewrite
+	numID
+)
+
+var idNames = [numID]string{"OIDC user sharing a name or e-mail", "API user created", "API user renamed", "OIDC claims changed", "policy written again"}
+
+// fdUserNames and fdUserEmails are the names and e-mails the policy's
+// user tokens name.
+var (
+	fdUserNames  = []string{"erin", "alice", "bob", "carol", "dave"}
+	fdUserEmails = []string{"", "erin@example.com", "bob@example.com", "carol@example.org", "dave@example.com", "alice@example.org"}
+)
+
+// identity makes users collide, as an admin and an identity provider can:
+// an OIDC user sharing another's name or e-mail, an API user created or
+// renamed onto a name others hold, OIDC claims changing onto another's,
+// and the policy written again once its tokens name two users. The
+// reference reads a token two users answer to as naming nobody, as the
+// server does once users change under an accepted policy; the API's
+// answers are held to what its handlers promise.
+func (fd *frontDoor) identity(at string) {
+	kind := rapid.IntRange(0, numID-1).Draw(fd.t, "identity")
+	label := stepNames[stepIdentity] + ": " + idNames[kind]
+
+	switch kind {
+	case idOIDC:
+		label += fd.identityOIDC()
+	case idCreate:
+		label += fd.identityCreate(at)
+	case idRename:
+		label += fd.identityRename(at)
+	case idClaims:
+		label += fd.identityClaims(at)
+	case idRewrite:
+		label += fd.identityRewrite(at)
+	}
+
+	if len(policymodel.NewView(fd.w).AmbiguousRefs()) > 0 {
+		fd.run.tally.edits["identity: the policy holds a token several users answer to"]++
+	}
+
+	fd.run.tally.steps[stepNames[stepIdentity]]++
+	fd.run.tally.steps[label]++
+}
+
+// drawName draws a name the policy's tokens or a user holds.
+func (fd *frontDoor) drawName(label string) string {
+	pool := slices.Clone(fdUserNames)
+
+	for _, u := range fd.w.Topology.Users {
+		if u.Name != "" {
+			pool = append(pool, u.Name)
+		}
+	}
+
+	return pool[rapid.IntRange(0, len(pool)-1).Draw(fd.t, label)]
+}
+
+// drawEmail draws an e-mail the policy's tokens or a user holds.
+func (fd *frontDoor) drawEmail(label string) string {
+	pool := slices.Clone(fdUserEmails)
+
+	for _, u := range fd.w.Topology.Users {
+		pool = append(pool, u.Email)
+	}
+
+	return pool[rapid.IntRange(0, len(pool)-1).Draw(fd.t, label)]
+}
+
+// holders are the users holding name, but except.
+func (fd *frontDoor) holders(name string, except uint) []policymodel.User {
+	return slices.DeleteFunc(slices.Clone(fd.w.Topology.Users), func(u policymodel.User) bool { return u.Name != name || u.ID == except })
+}
+
+func (fd *frontDoor) identityOIDC() string {
+	id := fd.nextUserID()
+	u := policymodel.User{ID: id, Name: fd.drawName("oidc-name"), Email: fd.drawEmail("oidc-email"), Provider: "https://idp.example.com/" + strconv.FormatUint(uint64(id), 10)}
+	collides := len(fd.holders(u.Name, id)) > 0 || u.Email != "" && slices.ContainsFunc(fd.w.Topology.Users, func(o policymodel.User) bool { return o.Email == u.Email })
+
+	fd.addUser(u)
+
+	if collides {
+		return " (collides)"
+	}
+
+	return ""
+}
+
+func (fd *frontDoor) identityCreate(at string) string {
+	nm, em := fd.drawName("api-name"), fd.drawEmail("api-email")
+	hold := fd.holders(nm, 0)
+	api := slices.ContainsFunc(hold, func(u policymodel.User) bool { return !u.OIDC() })
+	err := fd.api(http.MethodPost, "/api/v1/user", map[string]any{"name": nm, "email": em}, nil)
+
+	switch {
+	case len(hold) == 1:
+		if err == nil || !strings.Contains(err.Error(), "409") {
+			fd.t.Fatalf("%s: creating API user %q, which u%d holds: %v", at, nm, hold[0].ID, err)
+		}
+
+		return " (refused: the name is held)"
+	case api:
+		if err == nil {
+			fd.t.Fatalf("%s: creating API user %q, which an API user and others hold, is let through", at, nm)
+		}
+
+		return " (refused: an API user holds the name)"
+	case err != nil:
+		fd.t.Fatalf("%s: creating API user %q: %v", at, nm, err)
+	}
+
+	fd.apply(policymodel.AddUser{User: policymodel.User{ID: fd.nextUserID(), Name: nm, Email: em}})
+
+	if len(hold) > 1 {
+		// TODO(kradalby): api/create-name-oidc-holders: the API refuses a
+		// user name one OIDC user holds ("user already exists") and
+		// creates one several OIDC users hold: its check is a lookup
+		// expecting one user, and the database keeps only API users'
+		// names apart. Counted.
+		return " (created though OIDC users hold the name: api/create-name-oidc-holders)"
+	}
+
+	return ""
+}
+
+func (fd *frontDoor) identityRename(at string) string {
+	var api []policymodel.User
+
+	for _, u := range fd.w.Topology.Users {
+		if !u.OIDC() {
+			api = append(api, u)
+		}
+	}
+
+	if len(api) == 0 {
+		return " (no API user)"
+	}
+
+	a := api[rapid.IntRange(0, len(api)-1).Draw(fd.t, "renamed-user")]
+	nm := fd.drawName("new-name")
+	hold := fd.holders(nm, a.ID)
+
+	switch {
+	case nm == a.Name:
+		return " (its own name)"
+	case slices.ContainsFunc(hold, func(u policymodel.User) bool { return !u.OIDC() }):
+		err := fd.api(http.MethodPost, fmt.Sprintf("/api/v1/user/%d/rename/%s", a.ID, nm), nil, nil)
+		if err == nil {
+			fd.t.Fatalf("%s: u%d is renamed %q, which another API user holds", at, a.ID, nm)
+		}
+
+		return " (refused: another API user holds the name)"
+	}
+
+	fd.renameUser(at, policymodel.RenameUser{ID: a.ID, Name: nm})
+
+	if len(hold) > 0 {
+		return " (onto an OIDC user's name)"
+	}
+
+	return ""
+}
+
+func (fd *frontDoor) identityClaims(at string) string {
+	var oidc []policymodel.User
+
+	for _, u := range fd.w.Topology.Users {
+		if u.OIDC() {
+			oidc = append(oidc, u)
+		}
+	}
+
+	if len(oidc) == 0 {
+		return " (no OIDC user)"
+	}
+
+	users := fd.w.Topology.Users
+	o := oidc[rapid.IntRange(0, len(oidc)-1).Draw(fd.t, "claims-user")]
+	src := users[rapid.IntRange(0, len(users)-1).Draw(fd.t, "claims-from")]
+
+	if rapid.Bool().Draw(fd.t, "claims-email") {
+		fd.updateUser(at, o.ID, func(u *types.User) { u.Email = src.Email })
+		fd.apply(policymodel.SetEmail{ID: o.ID, Email: src.Email})
+
+		return " (e-mail)"
+	}
+
+	fd.updateUser(at, o.ID, func(u *types.User) { u.Name = src.Name })
+	fd.apply(policymodel.RenameUser{ID: o.ID, Name: src.Name})
+
+	return " (name)"
+}
+
+func (fd *frontDoor) identityRewrite(at string) string {
+	amb := policymodel.NewView(fd.w).AmbiguousRefs()
+	err := fd.api(http.MethodPut, "/api/v1/policy", map[string]any{"policy": string(fd.w.Policy.HuJSON())}, nil)
+
+	switch {
+	case len(amb) > 0 && err == nil:
+		fd.t.Fatalf("%s: the policy is written again though its tokens %v name several users", at, amb)
+	case len(amb) == 0 && err != nil:
+		fd.t.Fatalf("%s: the policy, its tokens unambiguous, is not written again: %v", at, err)
+	case len(amb) > 0:
+		return " (refused: a token names several users)"
+	}
+
+	return ""
+}
+
+// nextUserID is the ID the next user created takes: users' IDs are never
+// handed out twice.
+func (fd *frontDoor) nextUserID() uint {
+	next := max(fd.w.Topology.NextUserID, 1)
+	if us := fd.w.Topology.Users; len(us) > 0 {
+		next = max(next, us[len(us)-1].ID+1)
+	}
+
+	return next
+}
+
+// The races: two front-door writes to one node at once.
+const (
+	raceExpireLogin = iota
+	raceExpireLogout
+	raceDeleteLogout
+	numRaces
+)
+
+var raceNames = [numRaces]string{"an admin's expiry and a login with the node's key", "an admin's expiry and the client's logout", "an admin's deletion and the client's logout"}
+
+// race starts two writes to one node at once, an admin's and its
+// client's, and holds the server to the outcome of one order of them or
+// the other.
+func (fd *frontDoor) race(at string) {
+	kind := rapid.IntRange(0, numRaces-1).Draw(fd.t, "race")
+	fd.run.tally.steps[stepNames[stepRace]]++
+
+	var (
+		n  policymodel.Node
+		ok bool
+	)
+
+	switch kind {
+	case raceExpireLogin:
+		n, ok = fd.pick("racer", func(_ policymodel.Node, nd *fdNode) bool { return nd.key != "" && nd.reusable })
+	default:
+		n, ok = fd.pick("racer", func(n policymodel.Node, nd *fdNode) bool { return !n.Expired && !nd.loggedOut })
+	}
+
+	if !ok {
+		fd.run.tally.steps[stepNames[stepRace]+": "+raceNames[kind]+" (no node)"]++
+
+		return
+	}
+
+	nd := fd.nodes[n.ID]
+	base := fd.w
+	expire := func() error {
+		return fd.api(http.MethodPost, fmt.Sprintf("/api/v1/node/%d/expire", n.ID), map[string]any{}, nil)
+	}
+	logout := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		return nd.tc.LogoutAndDisconnect(ctx)
+	}
+
+	var outcomes map[string]policymodel.World
+
+	switch kind {
+	case raceExpireLogin:
+		edits := fd.keyLoginEdits(n)
+		expiry := policymodel.SetExpired{ID: n.ID, Expired: true}
+
+		errA, errB := both(expire, func() error { return fd.keyLogin(n, nd.key) })
+		if errA != nil || errB != nil {
+			fd.t.Fatalf("%s: n%d: the expiry (%v) and the login with its key (%v) racing", at, n.ID, errA, errB)
+		}
+
+		fd.keyLoggedIn(at, n)
+
+		outcomes = map[string]policymodel.World{
+			"the login last":  base.Apply(expiry).Apply(edits...),
+			"the expiry last": base.Apply(edits...).Apply(expiry),
+		}
+	case raceExpireLogout:
+		_, errB := both(expire, logout)
+
+		fd.quiet(at)
+
+		polling := nd.tc.Polling()
+		gone := base.Apply(policymodel.Leave{ID: n.ID})
+		expired := base.Apply(policymodel.SetExpired{ID: n.ID, Expired: true}, policymodel.SetOnline{ID: n.ID, Online: polling})
+		nd.loggedOut = errB == nil
+
+		outcomes = map[string]policymodel.World{"expired": expired}
+		if nd.ephemeral {
+			outcomes["deleted by its logout"] = gone
+		}
+	case raceDeleteLogout:
+		// Either may fail, as the other got there first; the node goes.
+		_, _ = both(func() error { return fd.api(http.MethodDelete, fmt.Sprintf("/api/v1/node/%d", n.ID), nil, nil) }, logout)
+
+		outcomes = map[string]policymodel.World{"deleted": base.Apply(policymodel.Leave{ID: n.ID})}
+	}
+
+	fd.quiet(at)
+	won := fd.outcome(at, n.ID, outcomes)
+	fd.run.tally.steps[stepNames[stepRace]+": "+raceNames[kind]+", "+won]++
+}
+
+// both runs a and b at once and returns their errors.
+func both(a, b func() error) (error, error) {
+	var (
+		ea, eb error
+		wg     sync.WaitGroup
+	)
+
+	start := make(chan struct{})
+
+	wg.Go(func() {
+		<-start
+
+		ea = a()
+	})
+	wg.Go(func() {
+		<-start
+
+		eb = b()
+	})
+
+	close(start)
+	wg.Wait()
+
+	return ea, eb
+}
+
+// outcome takes as the model the outcome whose node id the server holds,
+// and fails when it holds none of them.
+func (fd *frontDoor) outcome(at string, id types.NodeID, outcomes map[string]policymodel.World) string {
+	nv, held := fd.srv.State().Snapshot().GetNode(id)
+
+	var diffs []string
+
+	for _, name := range slices.Sorted(maps.Keys(outcomes)) {
+		w := outcomes[name]
+		n, ok := w.Topology.Node(id)
+
+		switch {
+		case ok != held:
+			diffs = append(diffs, fmt.Sprintf("%s: the node held %t", name, held))
+
+			continue
+		case !ok:
+			fd.w = w
+			fd.drop(id)
+
+			return name
+		}
+
+		_, nodes := policymodel.Topology{Users: w.Topology.Users, Nodes: []policymodel.Node{n}}.Build()
+
+		if d := storedDiff(nv.AsStruct(), nodes[0], n, fd.nodes[id]); d != "" {
+			diffs = append(diffs, name+": "+d)
+
+			continue
+		}
+
+		fd.w = w
+
+		return name
+	}
+
+	fd.t.Fatalf("%s: n%d after the race matches no order of it: %s", at, id, strings.Join(diffs, "; "))
+
+	return ""
 }
 
 // restart restarts the server from its database; every client that was
