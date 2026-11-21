@@ -861,6 +861,11 @@ func nodeTouch(e Edit) []string {
 	case Leave:
 		return node(e.ID, "left")
 	case Retag:
+		// A login that untags renews the key.
+		if len(e.Tags) == 0 {
+			return node(e.ID, "Tags", "User", "Expired", "Approved", "AutoApproved")
+		}
+
 		return node(e.ID, "Tags", "User", "Approved", "AutoApproved")
 	case SetAddr:
 		return node(e.ID, family(e.Family))
