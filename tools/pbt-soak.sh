@@ -21,6 +21,7 @@ declare -A PKG=(
 	[mapper]=hscontrol/mapper [v2]=hscontrol/policy/v2 [state]=hscontrol/state
 	[model]=hscontrol/policy/policymodel [scope]=hscontrol/scope [types]=hscontrol/types
 	[matcher]=hscontrol/policy/matcher [servertest]=hscontrol/servertest
+	[graph]=hscontrol/graph
 )
 # Cases per run: by package, unless the test is named. Cheap properties get more.
 declare -A DEPTH=([mapper]=2000 [v2]=5000 [state]=5000 [servertest]=1000)
@@ -35,7 +36,7 @@ declare -A WEIGHT=([TestDeliveryConvergesThroughTheClient]=4 [TestSessionsFollow
 # -rapid.steps lengthens these; one run in three trades cases for length.
 STEPPED=" TestDeliveryConvergesThroughTheClient TestHubSessionsConvergeUnderDrawnSchedules "
 # Built with the race detector as well, a tenth of the cases.
-RACED="mapper state servertest"
+RACED="mapper state servertest graph"
 
 cd "$WT" || exit 1
 git rev-parse HEAD >"$OUT/commit"

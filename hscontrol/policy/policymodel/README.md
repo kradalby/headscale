@@ -9,6 +9,7 @@ The properties built on it use [rapid](https://pkg.go.dev/pgregory.net/rapid):
 
 | Where                                   | Holds                                                                                            |
 | --------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `graph/*_property_test.go`              | The graph package against a model that recomputes from scratch; `Map` against plain maps         |
 | `policy/v2/*_property_test.go`          | The compile's layers: incremental against from scratch, the filter change set, the emitted form  |
 | `policy/v2/*reference_test.go`          | Filters, peers, routes and capability form against the reference; the reference against captures |
 | `state/world_property_test.go`          | The world against one built from scratch; what `Since` reports                                   |
