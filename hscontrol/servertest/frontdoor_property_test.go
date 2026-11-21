@@ -1479,13 +1479,16 @@ func (fd *frontDoor) keyLoginEdits(n policymodel.Node) []policymodel.Edit {
 	return append(out, policymodel.SetExpired{ID: n.ID, Expired: false}, policymodel.SetOnline{ID: n.ID, Online: true})
 }
 
-// keyLoggedIn records a login with n's key: the claimed device is no
-// longer ephemeral.
+// keyLoggedIn records a login with n's key: under a new node key it
+// registers the node with the key, whatever registered it last (an
+// interactive login may have since); the claimed device is no longer
+// ephemeral.
 func (fd *frontDoor) keyLoggedIn(at string, n policymodel.Node) {
 	nd := fd.nodes[n.ID]
 
 	fd.answered(at, n.ID, nd.tc)
 	nd.loggedOut = false
+	nd.method = util.RegisterMethodAuthKey
 
 	if n.Tagged() && !nd.keyTagged {
 		nd.ephemeral = false
