@@ -99,6 +99,9 @@ type fdNode struct {
 	key       string
 	keyUser   uint
 	ephemeral bool
+	// reusable: a single-use key is spent by the registration, and a login
+	// with it under a new node key is refused.
+	reusable bool
 	// loggedOut is set once its client logged out: it holds no node key.
 	loggedOut bool
 }
@@ -131,6 +134,9 @@ type frontDoor struct {
 	// patient cases disconnect clients for good, which the server waits
 	// out for its reconnect grace; the others leave such edits out.
 	patient bool
+	// magicDNS names nodes in the tailnet's domain, so their names and the
+	// DNS config reach every map.
+	magicDNS bool
 
 	w         policymodel.World
 	nodes     map[types.NodeID]*fdNode
@@ -210,9 +216,11 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 		capSources: rapid.Bool().Draw(rt, "capability-sources"),
 		chunks:     rapid.Bool().Draw(rt, "filter-chunks"),
 		patient:    rapid.IntRange(0, 3).Draw(rt, "patient") == 3,
+		magicDNS:   rapid.Bool().Draw(rt, "magic-dns"),
 		nodes:      map[types.NodeID]*fdNode{},
 		elections:  policymodel.NewElections(),
 		unheld:     map[netip.Prefix]bool{},
+		stacks:     make([]byte, 1<<20),
 	}
 
 	start := policymodel.Worlds().Draw(rt, "start")
@@ -224,6 +232,10 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 
 	if fd.chunks {
 		opts = append(opts, WithFilterChunks())
+	}
+
+	if fd.magicDNS {
+		opts = append(opts, WithMagicDNS("frontdoor.example"))
 	}
 
 	fd.srv = NewServer(tb, opts...)
@@ -734,7 +746,8 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 
 		// A single-use key is spent by the registration; a relogin with it
 		// must still find the node it made.
-		body := map[string]any{"reusable": rapid.Bool().Draw(fd.t, "reusable"), "ephemeral": nd.ephemeral}
+		nd.reusable = rapid.Bool().Draw(fd.t, "reusable")
+		body := map[string]any{"reusable": nd.reusable, "ephemeral": nd.ephemeral}
 
 		switch {
 		case !n.Tagged():
@@ -764,7 +777,7 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 
 	tc, err := TryNewClient(fd.tb, fd.srv, fmt.Sprintf("n%d", n.ID), opts...)
 	if err != nil {
-		fd.t.Fatalf("%s: n%d does not register (%s): %v", at, n.ID, joinNames[kind], err)
+		fd.t.Fatalf("%s: n%d does not register (%s): %v; its exchanges %s", at, n.ID, joinNames[kind], err, jsonOf(tc.RegisterAttempts()))
 	}
 
 	nd.tc = tc
@@ -773,6 +786,8 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 	if !ok {
 		fd.t.Fatalf("%s: n%d registered (%s), and the server holds no node of its key", at, n.ID, joinNames[kind])
 	}
+
+	fd.answered(at, n.ID, tc)
 
 	if nv.ID() != n.ID {
 		fd.run.tally.edits["Join: renumbered"]++
@@ -840,6 +855,27 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 	got, _ := fd.w.Topology.Node(id)
 
 	return got
+}
+
+// answered holds what a registration answered tc to what the server
+// stored: the node of its new key, owned by the user it was told it logs
+// in as, the tagged devices' for a tagged node.
+func (fd *frontDoor) answered(at string, id types.NodeID, tc *TestClient) {
+	p := tc.Persist()
+
+	nv, ok := fd.srv.State().GetNodeByNodeKey(p.PrivateNodeKey.Public())
+	if !ok {
+		fd.t.Fatalf("%s: n%d's client was registered under a key the server holds no node of", at, id)
+	}
+
+	owner := types.TaggedDevices.ID
+	if !nv.IsTagged() && nv.UserID().Valid() {
+		owner = nv.UserID().Get()
+	}
+
+	if got := uint(p.UserProfile.ID); got != owner { //nolint:gosec // small
+		fd.t.Fatalf("%s: n%d's client was told it logs in as user %d; the server stored its node as user %d's", at, nv.ID(), got, owner)
+	}
 }
 
 // without is from less rs.
@@ -997,7 +1033,9 @@ func (fd *frontDoor) untag(at string, e policymodel.Retag) {
 }
 
 // login logs id's client in interactively as u, with a new node key, as
-// `tailscale up --force-reauth` does; its map session restarts.
+// `tailscale up --force-reauth` does; its map session restarts. A login
+// that takes a tagged node back registers it as the login does; one that
+// renews a user's node keeps how it registered.
 func (fd *frontDoor) login(at string, id types.NodeID, u policymodel.User, n policymodel.Node) {
 	nd := fd.nodes[id]
 
@@ -1009,7 +1047,15 @@ func (fd *frontDoor) login(at string, id types.NodeID, u policymodel.User, n pol
 		fd.t.Fatalf("%s: n%d logs in as u%d: %v", at, id, u.ID, err)
 	}
 
-	nd.method, nd.key, nd.keyUser, nd.ephemeral, nd.loggedOut = util.RegisterMethodCLI, "", 0, false, false
+	fd.answered(at, id, nd.tc)
+
+	nd.loggedOut = false
+
+	if !n.Tagged() {
+		return
+	}
+
+	nd.method, nd.key, nd.keyUser, nd.reusable = util.RegisterMethodCLI, "", 0, false
 	if u.OIDC() {
 		nd.method = util.RegisterMethodOIDC
 	}
@@ -1151,12 +1197,14 @@ func (fd *frontDoor) logout(at string) {
 }
 
 // relogin renews a node whose client logged out or whose key expired: it
-// logs in again with a new node key, with its pre-auth key or
-// interactively as its user, and connects. A node a login tagged has no
-// way back but a login that untags it.
+// logs in again with a new node key, with its reusable pre-auth key or
+// interactively as its user, and connects. A tagged node with no such key
+// has no way back but a login that untags it.
 func (fd *frontDoor) relogin(at string) {
 	n, ok := fd.pick("logs-in", func(n policymodel.Node, nd *fdNode) bool {
-		return (n.Expired || nd.loggedOut) && (nd.key != "" || !n.Tagged())
+		owner, _ := fd.w.Topology.User(n.User)
+
+		return (n.Expired || nd.loggedOut) && (nd.key != "" && nd.reusable || !n.Tagged() && fd.loginUser(owner))
 	})
 	if !ok {
 		fd.run.tally.steps[stepNames[stepRelogin]+" (no node)"]++
@@ -1168,7 +1216,7 @@ func (fd *frontDoor) relogin(at string) {
 
 	nd := fd.nodes[n.ID]
 
-	if nd.key == "" {
+	if nd.key == "" || !nd.reusable {
 		u, _ := fd.w.Topology.User(n.User)
 		fd.login(at, n.ID, u, n)
 	} else {
@@ -1180,6 +1228,7 @@ func (fd *frontDoor) relogin(at string) {
 			fd.t.Fatalf("%s: n%d logs in again with its key: %v", at, n.ID, err)
 		}
 
+		fd.answered(at, n.ID, nd.tc)
 		nd.loggedOut = false
 	}
 

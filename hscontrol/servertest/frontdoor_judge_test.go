@@ -124,26 +124,32 @@ func (fd *frontDoor) quiet(at string) {
 	}
 }
 
-// busy lists the goroutines at work, each with why.
-func (fd *frontDoor) busy() []string {
-	if fd.stacks == nil {
-		fd.stacks = make([]byte, 1<<20)
-	}
-
+// dump is every goroutine's stack, the caller's first.
+func (fd *frontDoor) dump() string {
 	for {
 		n := runtime.Stack(fd.stacks, true)
 		if n < len(fd.stacks) {
-			return pending(string(fd.stacks[:n]), fd.run.loopLine)
+			return string(fd.stacks[:n])
 		}
 
 		fd.stacks = make([]byte, 2*len(fd.stacks))
 	}
 }
 
-// pending reads dump, every goroutine's stack but the caller's first, and
-// lists those at work.
-func pending(dump string, loopLine int) []string {
-	var out []string
+// busy lists the goroutines at work, each with why.
+func (fd *frontDoor) busy() []string {
+	return pending(goroutines(fd.dump()), fd.run.loopLine)
+}
+
+// goroutine is one goroutine of a dump: its state, the first function
+// outside the runtime and where in it, and its whole stack.
+type goroutine struct {
+	state, top, at, stack string
+}
+
+// goroutines reads dump, but for its first goroutine, the caller.
+func goroutines(dump string) []goroutine {
+	var out []goroutine
 
 	for i, g := range strings.Split(dump, "\n\n") {
 		if i == 0 {
@@ -158,12 +164,11 @@ func pending(dump string, loopLine int) []string {
 		}
 
 		state, _, _ = strings.Cut(state, ",")
+		gr := goroutine{state: state, stack: g}
 
 		// Frames alternate a call and its file:line; the first outside
 		// the runtime is where the goroutine waits.
 		lines := strings.Split(body, "\n")
-
-		var fn, at string
 
 		for j := 0; j+1 < len(lines); j += 2 {
 			call := lines[j]
@@ -171,32 +176,43 @@ func pending(dump string, loopLine int) []string {
 				continue
 			}
 
-			fn, _, _ = strings.Cut(call, "(0x")
-			fn = strings.TrimSuffix(strings.TrimSuffix(fn, "(...)"), "()")
-			at = strings.TrimSpace(lines[j+1])
+			fn, _, _ := strings.Cut(call, "(0x")
+			gr.top = strings.TrimSuffix(strings.TrimSuffix(fn, "(...)"), "()")
+			gr.at = strings.TrimSpace(lines[j+1])
 
 			break
 		}
 
+		out = append(out, gr)
+	}
+
+	return out
+}
+
+// pending lists the goroutines at work, each with why.
+func pending(gs []goroutine, loopLine int) []string {
+	var out []string
+
+	for _, g := range gs {
 		var why string
 
 		switch {
-		case strings.Contains(body, pollFunc+".func"):
+		case strings.Contains(g.stack, pollFunc+".func"):
 			why = "a map session ending"
-		case strings.Contains(body, pollFunc+"("):
-			if state != "select" || fn != pollFunc || !strings.Contains(at, "/poll.go:"+strconv.Itoa(loopLine)+" ") {
+		case strings.Contains(g.stack, pollFunc+"("):
+			if g.state != "select" || g.top != pollFunc || !strings.Contains(g.at, "/poll.go:"+strconv.Itoa(loopLine)+" ") {
 				why = "a map session between a wake and its write"
 			}
-		case strings.Contains(body, watchFunc+"("):
-			if state != "select" || fn != watchFunc {
+		case strings.Contains(g.stack, watchFunc+"("):
+			if g.state != "select" || g.top != watchFunc {
 				why = "the hub routing a commit"
 			}
-		case !parkedStates[state]:
-			why = state
+		case !parkedStates[g.state]:
+			why = g.state
 		}
 
 		if why != "" {
-			out = append(out, why+": "+g)
+			out = append(out, why+": "+g.stack)
 		}
 	}
 
