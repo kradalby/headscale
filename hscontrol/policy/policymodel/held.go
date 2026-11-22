@@ -274,6 +274,9 @@ type HeldJudge struct {
 	// held on.
 	Clients, Filters, PeerSets, RoutePairs, Primaries int
 	SSHDecisions                                      int
+	// WireFlags counts the self and peer entries whose expiry flags
+	// were held.
+	WireFlags int
 	// Steered counts the route pairs via steering decides, Unjudged the
 	// routes left unjudged, ByHistory those only the election history
 	// decides.
@@ -293,9 +296,11 @@ type HeldJudge struct {
 
 func (j *HeldJudge) String() string {
 	return fmt.Sprintf("reference: clients %d, filters compared %d, peer sets %d, route pairs %d (steered %d, routes left unjudged %d, "+
-		"decided by the election history %d, steered short to a viewer without addresses %d), self primaries %d, SSH decisions %d; skipped %v; "+
+		"decided by the election history %d, steered short to a viewer without addresses %d), self primaries %d, SSH decisions %d, "+
+		"expiry flags %d; skipped %v; "+
 		"peers contested %v, routes contested %v; filters: %v; form: %v",
-		j.Clients, j.Filters, j.PeerSets, j.RoutePairs, j.Steered, j.Unjudged, j.ByHistory, j.Addressless, j.Primaries, j.SSHDecisions, j.Skipped,
+		j.Clients, j.Filters, j.PeerSets, j.RoutePairs, j.Steered, j.Unjudged, j.ByHistory, j.Addressless, j.Primaries, j.SSHDecisions,
+		j.WireFlags, j.Skipped,
 		ContestedCounts(j.ContestedPeers), ContestedCounts(j.ContestedRoutes), &j.Verdicts, &j.Form)
 }
 
@@ -362,12 +367,13 @@ func (j *HeldJudge) At(m Moment) *Held {
 // ([Ref.ServedRoutes]), and the routes the node is primary for; its
 // packet filter, through its own client ([Verdicts], with the allowances
 // and contested clauses of the reference properties) and in the form
-// capSources says; and the stamps it and its peers carry, none in address
-// mode. It also checks bounded SSH login decisions against the policy inputs.
+// capSources says; the stamps it and its peers carry, none in address
+// mode; what it is told of expiry on the wire, itself and each peer. It
+// also checks bounded SSH login decisions against the policy inputs.
 func (h *Held) Client(id types.NodeID, nm *netmap.NetworkMap, capSources bool) string {
 	h.j.Clients++
 
-	for _, judge := range []func(types.NodeID, *netmap.NetworkMap, bool) string{h.peers, h.routes, h.filter, h.stamps, h.ssh} {
+	for _, judge := range []func(types.NodeID, *netmap.NetworkMap, bool) string{h.peers, h.routes, h.filter, h.stamps, h.flags, h.ssh} {
 		if d := judge(id, nm, capSources); d != "" {
 			return d
 		}
@@ -549,6 +555,52 @@ func (h *Held) stamps(_ types.NodeID, nm *netmap.NetworkMap, capSources bool) st
 
 		if !slices.Equal(has, want) {
 			return fmt.Sprintf("its client holds n%d with stamps %v, the reference stamps it %v", of, has, want)
+		}
+	}
+
+	return ""
+}
+
+// flags holds what a client is told of expiry on the wire: its own
+// entry is never marked expired — the key expiry carries that, zero
+// while the model keeps the node alive — and each peer it holds says
+// expired, and carries a key expiry, exactly when the model expires
+// it, an expired peer carrying neither endpoints nor a home DERP.
+func (h *Held) flags(id types.NodeID, nm *netmap.NetworkMap, _ bool) string {
+	if !nm.SelfNode.Valid() {
+		return ""
+	}
+
+	self, ok := h.m.World.Topology.Node(id)
+	if !ok {
+		return ""
+	}
+
+	h.j.WireFlags++
+
+	if nm.SelfNode.Expired() {
+		return "its client is told it is expired in its own entry"
+	}
+
+	if nm.SelfNode.KeyExpiry().IsZero() == self.Expired {
+		return fmt.Sprintf("its client holds itself with key expiry %v, the model expires it %t", nm.SelfNode.KeyExpiry(), self.Expired)
+	}
+
+	for _, p := range nm.Peers {
+		m, ok := h.m.World.Topology.Node(types.NodeID(p.ID())) //nolint:gosec // small
+		if !ok {
+			continue
+		}
+
+		h.j.WireFlags++
+
+		if p.Expired() != m.Expired || p.KeyExpiry().IsZero() == m.Expired {
+			return fmt.Sprintf("its client holds n%d expired %t with key expiry %v, the model expires it %t",
+				p.ID(), p.Expired(), p.KeyExpiry(), m.Expired)
+		}
+
+		if m.Expired && (p.Endpoints().Len() > 0 || p.HomeDERP() != 0) {
+			return fmt.Sprintf("its client holds expired n%d with endpoints %v and home DERP %d", p.ID(), p.Endpoints().AsSlice(), p.HomeDERP())
 		}
 	}
 
