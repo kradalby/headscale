@@ -17,6 +17,8 @@ import (
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/rs/zerolog/log"
+	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/views"
@@ -271,13 +273,50 @@ func ReceiverFactsOf(n types.NodeView, caps tailcfg.NodeCapMap) ReceiverFacts {
 	}
 }
 
+// debugAssumeOfficialClient counts a client that reports no version as the
+// Tailscale client's own. Load generators that speak the control protocol
+// directly report none and apply no filter; without this a scale run never
+// reaches capability form or chunked delivery. A client that names itself
+// is still read by what it reports.
+var debugAssumeOfficialClient = envknob.RegisterBool("HEADSCALE_DEBUG_BENCHMARK_ASSUME_OFFICIAL_CLIENT")
+
+var warnAssumedOfficial sync.Once
+
+// unversioned reports whether hi names no client at all: no report, or one
+// with no application, Go version or Tailscale version.
+func unversioned(hi tailcfg.HostinfoView) bool {
+	return !hi.Valid() || hi.App() == "" && hi.GoVersion() == "" && hi.IPNVersion() == ""
+}
+
+// assumedOfficial is the answer for a client that reports no version:
+// addresses, unless the debug switch says otherwise. A real client sent
+// capability form it cannot look up drops those rules, so the first use
+// is logged.
+func assumedOfficial() bool {
+	if !debugAssumeOfficialClient() {
+		return false
+	}
+
+	warnAssumedOfficial.Do(func() {
+		log.Warn().
+			Str("env", "HEADSCALE_DEBUG_BENCHMARK_ASSUME_OFFICIAL_CLIENT").
+			Msg("clients that report no version are sent capability sources and chunked filters; for benchmarks only")
+	})
+
+	return true
+}
+
 // officialClient reports whether hi is the Tailscale client's own, which
 // looks capability sources up: built with Go, a Tailscale release at or
 // past the oldest headscale serves, and not tailscale-rs. Anything else is
 // sent addresses: a client that parses cap: but looks nothing up drops
 // every such rule.
 func officialClient(hi tailcfg.HostinfoView) bool {
-	if !hi.Valid() || strings.HasPrefix(hi.App(), "tailscale-rs") || !strings.HasPrefix(hi.GoVersion(), "go") {
+	if unversioned(hi) {
+		return assumedOfficial()
+	}
+
+	if strings.HasPrefix(hi.App(), "tailscale-rs") || !strings.HasPrefix(hi.GoVersion(), "go") {
 		return false
 	}
 

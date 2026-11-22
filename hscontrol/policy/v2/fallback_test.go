@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -29,6 +30,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/envknob"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
@@ -1480,5 +1482,41 @@ func TestReceiverFormFollowsFacts(t *testing.T) {
 			require.Equal(t, tt.want, receiverForm(CapabilitySources, facts), "facts %+v", facts)
 			require.Equal(t, reasonAddressMode, receiverForm(AddressSources, facts))
 		})
+	}
+}
+
+// TestAssumedOfficialOnlyWithoutVersion holds the benchmark switch to
+// clients that report no version: one that names itself is read by what it
+// reports, switch or not.
+func TestAssumedOfficialOnlyWithoutVersion(t *testing.T) {
+	floor := capver.TailscaleVersion(capver.MinSupportedCapabilityVersion)
+
+	clients := []struct {
+		name    string
+		hi      *tailcfg.Hostinfo
+		off, on bool
+	}{
+		{"no report", nil, false, true},
+		{"empty report", &tailcfg.Hostinfo{}, false, true},
+		{"load generator", &tailcfg.Hostinfo{Hostname: "load-1", BackendLogID: "x", FrontendLogID: "x"}, false, true},
+		{"tailscale", &tailcfg.Hostinfo{GoVersion: "go1.26", IPNVersion: floor}, true, true},
+		{"tailscale below the floor", &tailcfg.Hostinfo{GoVersion: "go1.20", IPNVersion: "1.2.3"}, false, false},
+		{"tailscale-rs", &tailcfg.Hostinfo{App: "tailscale-rs"}, false, false},
+		{"not built with Go", &tailcfg.Hostinfo{IPNVersion: floor}, false, false},
+	}
+
+	for _, on := range []bool{false, true} {
+		envknob.SetenvForTest(t, "HEADSCALE_DEBUG_BENCHMARK_ASSUME_OFFICIAL_CLIENT", strconv.FormatBool(on))
+
+		for _, c := range clients {
+			want := c.off
+			if on {
+				want = c.on
+			}
+
+			if got := officialClient(c.hi.View()); got != want {
+				t.Errorf("switch %v, %s: official %v, want %v", on, c.name, got, want)
+			}
+		}
 	}
 }

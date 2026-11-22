@@ -215,6 +215,11 @@ differ. Mismatches log `policy audit`; integration tests treat them as failures.
 tests, or check DNS rendering, network writes or client state. It scans every pair of nodes, which is quadratic, so it
 can add substantial cost on large tailnets.
 
+`HEADSCALE_DEBUG_BENCHMARK_ASSUME_OFFICIAL_CLIENT=1` treats a client that reports no application, Go version or
+Tailscale version as Tailscale's own client, so that load generators speaking the control protocol directly are sent
+capability sources and chunked filters. A client that names itself is unaffected. For benchmarks only: a real client
+that reports nothing and cannot look capabilities up would drop those rules.
+
 ### Offline peer-history memory
 
 The map-session hub keeps peer IDs across disconnects so a reconnect can announce
