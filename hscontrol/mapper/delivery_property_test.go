@@ -11,6 +11,8 @@ import (
 	"maps"
 	"net/http"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
@@ -36,6 +38,7 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
@@ -2137,4 +2140,149 @@ func matchingReport(got *types.Node, legal ...*types.Node) *types.Node {
 	}
 
 	return nil
+}
+
+func TestDeliveryPolicyFileReplacementHistory(t *testing.T) {
+	const (
+		allow = `{
+			"grants":[{"src":["u2@"],"dst":["u1@"],"ip":["tcp:22"]}],
+			"ssh":[{"action":"check","src":["u1@"],"dst":["autogroup:self"],"users":["alice"]}],
+			"autoApprovers":{"routes":{"10.28.0.0/24":["u2@"]}}
+		}`
+		deny        = `{"grants":[]}`
+		invalid     = `{"grants":`
+		failingTest = `{"grants":[],"tests":[{"src":"u2@","proto":"tcp","accept":["u1@:22"]}]}`
+	)
+
+	path := filepath.Join(t.TempDir(), "policy.hujson")
+	stage := func(doc string) {
+		t.Helper()
+		require.NoError(t, os.WriteFile(path+".next", []byte(doc), 0o600))
+		require.NoError(t, os.Rename(path+".next", path))
+	}
+
+	stage(allow)
+
+	cfg, s, ids := streamTestState(t, "", func(cfg *types.Config) {
+		cfg.Policy.Mode, cfg.Policy.Path = types.PolicyModeFile, path
+	})
+	sshSource, viewer, router := ids[0], ids[1], ids[2]
+	prefix := netip.MustParsePrefix("10.28.0.0/24")
+	r := mustNode(t, s, router)
+	require.NoError(t, s.UpdateNodeFromMapRequest(router, tailcfg.MapRequest{
+		NodeKey: r.NodeKey(), DiscoKey: r.DiscoKey(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: r.Hostname(), RoutableIPs: []netip.Prefix{prefix}},
+	}))
+	s.SetLastSSHAuth(sshSource, viewer)
+	auth, ok := s.GetLastSSHAuth(sshSource, viewer)
+	require.True(t, ok)
+
+	client, observe := observeDelivery(t, cfg, s, viewer)
+
+	wantPacket := tailcfg.FilterRule{IPProto: []int{int(ipproto.TCP)}}
+	for _, addr := range r.IPs() {
+		wantPacket.SrcIPs = append(wantPacket.SrcIPs, addr.String())
+	}
+
+	for _, addr := range mustNode(t, s, viewer).IPs() {
+		wantPacket.DstPorts = append(wantPacket.DstPorts, tailcfg.NetPortRange{IP: addr.String(), Ports: tailcfg.PortRange{First: 22, Last: 22}})
+	}
+
+	check := func(active string, keepAuth bool) {
+		t.Helper()
+		require.Equal(t, active, string(s.Snapshot().PolicySource()))
+
+		var want []tailcfg.FilterRule
+		if active == allow {
+			want = []tailcfg.FilterRule{wantPacket}
+		}
+
+		nm := client.nm
+		require.Equal(t, active == allow, slices.ContainsFunc(nm.Peers, func(n tailcfg.NodeView) bool { return n.ID() == router.NodeID() }))
+		verdict := policymodel.Compare(want, nm.PacketFilterRules.AsSlice(), policymodel.ViewFromNetmap(nm))
+		require.True(t, verdict.Equivalent(), "%s", verdict)
+		require.NotNil(t, nm.SSHPolicy)
+		require.Equal(t, active == allow, len(nm.SSHPolicy.Rules) > 0)
+
+		got := mustNode(t, s, router)
+		require.Equal(t, []netip.Prefix{prefix}, got.ApprovedRoutes().AsSlice())
+		require.Equal(t, []netip.Prefix{prefix}, got.AutoApprovedRoutes().AsSlice())
+
+		at, ok := s.GetLastSSHAuth(sshSource, viewer)
+		require.Equal(t, keepAuth, ok)
+
+		if keepAuth {
+			require.Equal(t, auth, at)
+		}
+	}
+
+	check(allow, true)
+
+	onDisk := allow
+	for _, phase := range []struct {
+		name, replace, active           string
+		load, refuse, changed, keepAuth bool
+	}{
+		{name: "stage", replace: deny, active: allow, keepAuth: true},
+		{name: "stage malformed", replace: invalid, active: allow, keepAuth: true},
+		{name: "refuse malformed", active: allow, load: true, refuse: true, keepAuth: true},
+		{name: "refuse same file again", active: allow, load: true, refuse: true, keepAuth: true},
+		{name: "refuse valid syntax with failing policy test", replace: failingTest, active: allow, load: true, refuse: true, keepAuth: true},
+		{name: "recover", replace: deny, active: deny, load: true, changed: true},
+		{name: "restore", replace: allow, active: allow, load: true, changed: true},
+		{name: "reload identical file", active: allow, load: true},
+	} {
+		t.Log(phase.name)
+
+		before := s.Snapshot()
+
+		if phase.replace != "" {
+			stage(phase.replace)
+			onDisk = phase.replace
+		}
+
+		if phase.name == "reload identical file" {
+			s.SetLastSSHAuth(sshSource, viewer)
+			_, approved := s.GetLastSSHAuth(sshSource, viewer)
+			require.True(t, approved)
+		}
+
+		if phase.load {
+			err := s.ReloadPolicy()
+			if phase.refuse {
+				require.ErrorIs(t, err, state.ErrInvalidPolicy)
+
+				if onDisk == failingTest {
+					require.ErrorContains(t, err, "test(s) failed")
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		}
+
+		disk, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.Equal(t, onDisk, string(disk))
+
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+
+		after := s.Snapshot()
+		if phase.changed {
+			require.Equal(t, before.Rev()+1, after.Rev())
+		} else {
+			require.Equal(t, before.Rev(), after.Rev())
+		}
+
+		previous := client.nm
+
+		observe(before.Rev(), phase.changed)
+
+		if !phase.changed {
+			require.Same(t, previous, client.nm, "unchanged step delivered no frame to this session")
+		}
+
+		check(phase.active, phase.keepAuth)
+	}
 }
