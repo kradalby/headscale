@@ -1960,3 +1960,181 @@ func TestDeliverySSHDecisionsAcrossRevocationAndDeletion(t *testing.T) {
 		})
 	}
 }
+
+func TestDeliveryConcurrentReportsToSameNode(t *testing.T) {
+	for _, omission := range []string{"Hostinfo", "NetInfo", "identical"} {
+		t.Run(omission, func(t *testing.T) {
+			cfg, s, ids := streamTestState(t, ownUserOnly)
+			viewer, reporter := ids[0], ids[1]
+			s.Connect(reporter)
+			node := mustNode(t, s, reporter)
+			report := func(endpoint, os string, derp tailcfg.DERPRegionID) tailcfg.MapRequest {
+				return tailcfg.MapRequest{
+					NodeKey: node.NodeKey(), DiscoKey: key.NewDisco().Public(),
+					Endpoints: []netip.AddrPort{netip.MustParseAddrPort(endpoint)},
+					Hostinfo: &tailcfg.Hostinfo{
+						Hostname: node.Hostname(), OS: os,
+						Services: []tailcfg.Service{{Proto: "tcp", Port: uint16(derp), Description: os}}, //nolint:gosec // test values
+						NetInfo:  &tailcfg.NetInfo{PreferredDERP: derp, DERPLatency: map[string]float64{"1-v4": 0.1}},
+					},
+				}
+			}
+			base := report("192.0.2.1:41641", "linux", 1)
+			require.NoError(t, s.UpdateNodeFromMapRequest(reporter, base))
+			client, observe := observeDelivery(t, cfg, s, viewer)
+			before := s.Snapshot()
+			old := mustNode(t, s, reporter).AsStruct()
+			require.NotZero(t, old.ReportGen, "baseline was substantive")
+
+			oldRow, err := s.DB().GetNodeByID(reporter)
+			require.NoError(t, err)
+
+			a := report("192.0.2.2:41641", "windows", 2)
+			b := report("192.0.2.3:41641", "darwin", 3)
+
+			switch omission {
+			case "Hostinfo":
+				b.Hostinfo = nil
+			case "NetInfo":
+				b.Hostinfo.NetInfo = nil
+			case "identical":
+				b = a
+			}
+
+			// Each order applies both complete transitions, including omissions, to one record.
+			ab := expectedReport(expectedReport(old, a), b)
+
+			ba := expectedReport(expectedReport(old, b), a)
+			if omission == "identical" {
+				require.Equal(t, old.ReportGen+1, ab.ReportGen)
+				require.Equal(t, ab, ba)
+			} else {
+				require.Equal(t, old.ReportGen+2, ab.ReportGen)
+				require.Equal(t, old.ReportGen+2, ba.ReportGen)
+				require.NotEqual(t, ab, ba)
+
+				mixed := ab.Clone()
+				mixed.Endpoints = slices.Clone(ba.Endpoints)
+				require.Nil(t, matchingReport(mixed, ab, ba), "mixing endpoints and disco keys across orders must fail")
+			}
+
+			requests := [...]tailcfg.MapRequest{a, b}
+			submitted := requests
+			start := make(chan struct{})
+
+			var (
+				wg   sync.WaitGroup
+				errs [len(requests)]error
+			)
+
+			started := time.Now()
+
+			for i, req := range requests {
+				submitted[i].Hostinfo = req.Hostinfo.Clone()
+				submitted[i].Endpoints = slices.Clone(req.Endpoints)
+
+				wg.Go(func() {
+					<-start
+
+					errs[i] = s.UpdateNodeFromMapRequest(reporter, submitted[i])
+				})
+			}
+
+			close(start)
+			wg.Wait()
+
+			after := s.Snapshot()
+			require.GreaterOrEqual(t, after.Rev(), before.Rev()+1)
+			require.LessOrEqual(t, after.Rev(), before.Rev()+2)
+
+			for i, req := range requests {
+				require.NoError(t, errs[i])
+				require.Equal(t, req, submitted[i], "State changed the submitted report")
+				submitted[i].Endpoints[0] = netip.AddrPort{}
+
+				if hi := submitted[i].Hostinfo; hi != nil {
+					hi.OS = "caller mutation"
+					hi.Services[0].Description = "caller mutation"
+
+					if hi.NetInfo != nil {
+						hi.NetInfo.PreferredDERP = 99
+						clear(hi.NetInfo.DERPLatency)
+					}
+				}
+			}
+
+			got := mustNode(t, s, reporter).AsStruct()
+			require.NotNil(t, got.LastSeen)
+			require.WithinRange(t, *got.LastSeen, started, time.Now())
+			winner := matchingReport(got, ab, ba)
+			require.NotNil(t, winner, "whole report must match one order: got %v; AB %v; BA %v",
+				policymodel.JSON(got), policymodel.JSON(ab), policymodel.JSON(ba))
+
+			row, err := s.DB().GetNodeByID(reporter)
+			require.NoError(t, err)
+
+			oldRow.Hostinfo, oldRow.Endpoints, oldRow.DiscoKey = winner.Hostinfo, winner.Endpoints, winner.DiscoKey
+			oldRow.LastSeen, oldRow.UpdatedAt = row.LastSeen, row.UpdatedAt
+			require.Equal(t, oldRow, row, "durable record must match the same order as memory")
+
+			retained, ok := before.GetNode(reporter)
+			require.True(t, ok)
+			require.Equal(t, old, retained.AsStruct(), "older snapshot changed")
+			observe(before.Rev(), true)
+
+			i := slices.IndexFunc(client.nm.Peers, func(n tailcfg.NodeView) bool { return n.ID() == reporter.NodeID() })
+			require.GreaterOrEqual(t, i, 0)
+			peer := client.nm.Peers[i]
+			require.Equal(t, winner.DiscoKey, peer.DiscoKey())
+			require.Equal(t, winner.Endpoints.List(), peer.Endpoints().AsSlice())
+			require.Equal(t, winner.Hostinfo.NetInfo.PreferredDERP, peer.HomeDERP())
+			require.Equal(t, winner.Hostinfo.OS, peer.Hostinfo().OS())
+			fresh, _ := newFreshSession(t, cfg, after, viewer, capVer).client(t)
+			require.Empty(t, policymodel.NetmapDiff(client.nm, fresh, func() {}))
+
+			repeat := tailcfg.MapRequest{
+				NodeKey: node.NodeKey(), DiscoKey: winner.DiscoKey,
+				Endpoints: slices.Clone(winner.Endpoints), Hostinfo: winner.Hostinfo.Clone(),
+			}
+			repeat.Hostinfo.NetInfo = nil
+			require.NoError(t, s.UpdateNodeFromMapRequest(reporter, repeat))
+			require.NotNil(t, matchingReport(mustNode(t, s, reporter).AsStruct(), winner), "resend changed the record or ReportGen")
+			repeatedRow, err := s.DB().GetNodeByID(reporter)
+			require.NoError(t, err)
+			require.Equal(t, row, repeatedRow, "resend must leave the durable row unchanged")
+			observe(after.Rev(), false)
+		})
+	}
+}
+
+// expectedReport models only the inputs used in this history: one endpoint,
+// a fixed hostname, and no route or policy edits.
+func expectedReport(before *types.Node, req tailcfg.MapRequest) *types.Node {
+	next := before.Clone()
+	next.Endpoints, next.DiscoKey = slices.Clone(req.Endpoints), req.DiscoKey
+
+	if req.Hostinfo != nil {
+		next.Hostinfo = req.Hostinfo.Clone()
+		if req.Hostinfo.NetInfo == nil {
+			next.Hostinfo.NetInfo = before.Hostinfo.NetInfo.Clone()
+		}
+	}
+
+	if !reflect.DeepEqual(next, before) {
+		next.ReportGen++
+	}
+
+	return next
+}
+
+func matchingReport(got *types.Node, legal ...*types.Node) *types.Node {
+	probe := *got
+	for _, want := range legal {
+		probe.LastSeen = want.LastSeen
+		if reflect.DeepEqual(&probe, want) {
+			return want
+		}
+	}
+
+	return nil
+}
