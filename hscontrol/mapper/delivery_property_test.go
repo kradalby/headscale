@@ -1094,6 +1094,10 @@ func (dw *deliveryWorld) fresh(at string) map[types.NodeID]*netmap.NetworkMap {
 			// was shared (database only), a peer holding the viewer's own
 			// address that leaves its peers goes as a removal, which takes
 			// that address out of the client's index. Counted, not judged.
+			// The excuse is also what keeps the self half of
+			// evictsHeldAddress unjudgeable: a delta the clause did not
+			// refresh is this class's own shape, so a mutant dropping the
+			// self half diverges from production nowhere else.
 			var own tailcfg.NodeID
 			if dw.shared || policymodel.SharesAddress(dw.p.w) {
 				own = id.NodeID()
