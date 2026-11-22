@@ -764,7 +764,48 @@ func (r *scenarioRun) committed(before uint64) {
 	}
 
 	r.judgeRoute(len(r.commits) - 1)
+	r.judgeNewReaders(len(r.commits) - 1)
 	r.countWakes(len(r.commits) - 1)
+}
+
+// judgeNewReaders pins why Route's readers walk needs no new-reader half:
+// the peers cell and the readers it is asked for are one structure read
+// each way, so a node whose view gains a changed node is named by the same
+// change's PeerSets already, and a viewer PeerSets did not name is an old
+// reader, which the walk wakes. It fails once the two diverge — the point
+// where dropping the walk's new-reader half would leave a session stale.
+func (r *scenarioRun) judgeNewReaders(j int) {
+	c := r.commits[j].snap
+	x := r.commits[j-1].snap
+	change := c.Since(x)
+
+	if change.Global {
+		return
+	}
+
+	viewed := slices.Concat(change.Nodes, change.Primaries, change.Caps, change.Routers)
+	if change.AllRouters {
+		viewed = slices.Concat(viewed, x.RoutedNodes(), c.RoutedNodes())
+	}
+
+	for _, id := range viewed {
+		var old []types.NodeID
+
+		for _, l := range x.PeerReaders(id) {
+			old = append(old, l...)
+		}
+
+		for _, l := range c.PeerReaders(id) {
+			for _, v := range l {
+				if slices.Contains(old, v) || slices.Contains(change.PeerSets, v) {
+					continue
+				}
+
+				r.t.Errorf("r%d: n%d newly reads n%d, which changed, and the change names neither it nor its peers: Route's readers walk is its only cover",
+					c.Rev(), v, id)
+			}
+		}
+	}
 }
 
 // read has id's session render the latest snapshot, its first map if it
