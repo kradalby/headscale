@@ -17,6 +17,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/views"
@@ -271,12 +272,19 @@ func ReceiverFactsOf(n types.NodeView, caps tailcfg.NodeCapMap) ReceiverFacts {
 	}
 }
 
+// Direct benchmark clients receive filters without a data plane to apply them.
+var benchmarkAssumeOfficialClient = envknob.Bool("HEADSCALE_DEBUG_BENCHMARK_ASSUME_OFFICIAL_CLIENT")
+
 // officialClient reports whether hi is the Tailscale client's own, which
 // looks capability sources up: built with Go, a Tailscale release at or
 // past the oldest headscale serves, and not tailscale-rs. Anything else is
 // sent addresses: a client that parses cap: but looks nothing up drops
 // every such rule.
 func officialClient(hi tailcfg.HostinfoView) bool {
+	if benchmarkAssumeOfficialClient {
+		return true
+	}
+
 	if !hi.Valid() || strings.HasPrefix(hi.App(), "tailscale-rs") || !strings.HasPrefix(hi.GoVersion(), "go") {
 		return false
 	}
