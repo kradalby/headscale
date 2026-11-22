@@ -13,6 +13,7 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/netmap"
 )
 
@@ -275,8 +276,8 @@ type HeldJudge struct {
 	Clients, Filters, PeerSets, RoutePairs, Primaries int
 	SSHDecisions                                      int
 	// WireFlags counts the self and peer entries whose expiry flags
-	// were held.
-	WireFlags int
+	// were held, BaseCaps the entries whose baseline capabilities were.
+	WireFlags, BaseCaps int
 	// Steered counts the route pairs via steering decides, Unjudged the
 	// routes left unjudged, ByHistory those only the election history
 	// decides.
@@ -297,10 +298,10 @@ type HeldJudge struct {
 func (j *HeldJudge) String() string {
 	return fmt.Sprintf("reference: clients %d, filters compared %d, peer sets %d, route pairs %d (steered %d, routes left unjudged %d, "+
 		"decided by the election history %d, steered short to a viewer without addresses %d), self primaries %d, SSH decisions %d, "+
-		"expiry flags %d; skipped %v; "+
+		"expiry flags %d, baseline caps %d; skipped %v; "+
 		"peers contested %v, routes contested %v; filters: %v; form: %v",
 		j.Clients, j.Filters, j.PeerSets, j.RoutePairs, j.Steered, j.Unjudged, j.ByHistory, j.Addressless, j.Primaries, j.SSHDecisions,
-		j.WireFlags, j.Skipped,
+		j.WireFlags, j.BaseCaps, j.Skipped,
 		ContestedCounts(j.ContestedPeers), ContestedCounts(j.ContestedRoutes), &j.Verdicts, &j.Form)
 }
 
@@ -368,12 +369,13 @@ func (j *HeldJudge) At(m Moment) *Held {
 // packet filter, through its own client ([Verdicts], with the allowances
 // and contested clauses of the reference properties) and in the form
 // capSources says; the stamps it and its peers carry, none in address
-// mode; what it is told of expiry on the wire, itself and each peer. It
-// also checks bounded SSH login decisions against the policy inputs.
+// mode; what it is told of expiry on the wire, itself and each peer;
+// the baseline capabilities its own entry carries. It also checks
+// bounded SSH login decisions against the policy inputs.
 func (h *Held) Client(id types.NodeID, nm *netmap.NetworkMap, capSources bool) string {
 	h.j.Clients++
 
-	for _, judge := range []func(types.NodeID, *netmap.NetworkMap, bool) string{h.peers, h.routes, h.filter, h.stamps, h.flags, h.ssh} {
+	for _, judge := range []func(types.NodeID, *netmap.NetworkMap, bool) string{h.peers, h.routes, h.filter, h.stamps, h.flags, h.baseline, h.ssh} {
 		if d := judge(id, nm, capSources); d != "" {
 			return d
 		}
@@ -602,6 +604,29 @@ func (h *Held) flags(id types.NodeID, nm *netmap.NetworkMap, _ bool) string {
 		if m.Expired && (p.Endpoints().Len() > 0 || p.HomeDERP() != 0) {
 			return fmt.Sprintf("its client holds expired n%d with endpoints %v and home DERP %d", p.ID(), p.Endpoints().AsSlice(), p.HomeDERP())
 		}
+	}
+
+	return ""
+}
+
+// baseline holds the capabilities an entry carries whatever the policy
+// grants: headscale has no user roles, so every user counts as an
+// admin, and a node owned by its tags has no user to hold the role —
+// its own entry carries the admin capability exactly then.
+func (h *Held) baseline(id types.NodeID, nm *netmap.NetworkMap, _ bool) string {
+	if !nm.SelfNode.Valid() {
+		return ""
+	}
+
+	self, ok := h.m.World.Topology.Node(id)
+	if !ok {
+		return ""
+	}
+
+	h.j.BaseCaps++
+
+	if admin := nm.SelfNode.CapMap().Contains(nodecap.Admin); admin == self.Tagged() {
+		return fmt.Sprintf("its client holds itself with the admin capability %t, the model holds it %t", admin, !self.Tagged())
 	}
 
 	return ""
