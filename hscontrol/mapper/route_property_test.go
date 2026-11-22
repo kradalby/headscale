@@ -59,6 +59,9 @@ type pbtWorld struct {
 	elections *policymodel.Elections
 	// started is when the last run began, as the State stamped it.
 	started time.Time
+	// lastExpiryCheck is the expiry sweep's clock, as the server's task
+	// loop keeps it.
+	lastExpiryCheck time.Time
 	// made counts the writes [pbtWorld.session] made, by kind, and each
 	// node write by edit kind and the path it took.
 	made map[string]int

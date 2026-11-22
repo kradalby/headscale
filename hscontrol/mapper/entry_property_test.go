@@ -345,6 +345,12 @@ func admitted(tn *types.Node) []netip.Prefix {
 	return slices.DeleteFunc(slices.Clone(tn.ApprovedRoutes), func(r netip.Prefix) bool { return slices.Contains(tn.AutoApprovedRoutes, r) })
 }
 
+// expireSweep marks offline what expired since the last sweep, as the
+// server's task loop runs it after an expiry.
+func (p *pbtWorld) expireSweep() {
+	p.call(func() { p.lastExpiryCheck, _ = p.s.ExpireExpiredNodes(p.lastExpiryCheck) })
+}
+
 // settleIn finishes nc's registration into w: the admin approves the rest
 // before the client announces, so that what auto-approval then adds is
 // what the model counts as its own; the client's first map request; an
@@ -382,6 +388,7 @@ func (p *pbtWorld) settleIn(nc newcomer, w policymodel.World) {
 			_, err := p.s.SetNodeExpiry(id, &expiredAt)
 			return err
 		})
+		p.expireSweep()
 	}
 
 	p.online(n)
@@ -545,6 +552,7 @@ func (p *pbtWorld) change(cur policymodel.World, was, n policymodel.Node, tn *ty
 			_, err := p.s.SetNodeExpiry(id, at)
 			return err
 		})
+		p.expireSweep()
 	}
 
 	p.online(n)
