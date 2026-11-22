@@ -55,7 +55,7 @@ const preNetmapRemovalsVer = capver.FullNetmapRemovalsCapVer - 1
 
 // streamTestState returns a State with users u1, u2 and nodes n1, n1b
 // (u1) and n2 (u2), under policy (allow-all when empty).
-func streamTestState(tb testing.TB, policy string, configure ...func(*types.Config)) (*types.Config, *state.State, [3]types.NodeID) {
+func streamTestState(tb pbtT, policy string, configure ...func(*types.Config)) (*types.Config, *state.State, [3]types.NodeID) {
 	tb.Helper()
 
 	p4 := netip.MustParsePrefix("100.64.0.0/10")
@@ -63,7 +63,7 @@ func streamTestState(tb testing.TB, policy string, configure ...func(*types.Conf
 	cfg := &types.Config{
 		Database: types.DatabaseConfig{
 			Type:   types.DatabaseSqlite,
-			Sqlite: types.SqliteConfig{Path: tb.TempDir() + "/h.db"},
+			Sqlite: types.SqliteConfig{Path: streamTestDir(tb) + "/h.db"},
 		},
 
 		ServerURL: "https://headscale.test",
@@ -98,6 +98,24 @@ func streamTestState(tb testing.TB, policy string, configure ...func(*types.Conf
 	}
 
 	return cfg, s, [3]types.NodeID{n1.ID, n1b.ID, n2.ID}
+}
+
+func streamTestDir(tb pbtT) string {
+	tb.Helper()
+
+	if t, ok := tb.(testing.TB); ok {
+		return t.TempDir()
+	}
+
+	// Rapid cleans up each generated case, including a replay during shrinking.
+	dir, err := os.MkdirTemp(os.Getenv("GOTMPDIR"), "headscale-mapper-")
+	require.NoError(tb, err)
+	tb.Cleanup(func() {
+		err := os.RemoveAll(dir) //nolint:gosec // MkdirTemp created this directory.
+		require.NoError(tb, err)
+	})
+
+	return dir
 }
 
 const ownUserOnly = `{"acls":[
@@ -548,7 +566,7 @@ func TestStreamEndsWhenNodeDeleted(t *testing.T) {
 	require.ErrorIs(t, err, ErrNodeGone)
 }
 
-func mustNode(tb testing.TB, s *state.State, id types.NodeID) types.NodeView {
+func mustNode(tb pbtT, s *state.State, id types.NodeID) types.NodeView {
 	tb.Helper()
 
 	nv, ok := s.GetNodeByID(id)
