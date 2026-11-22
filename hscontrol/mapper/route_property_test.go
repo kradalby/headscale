@@ -18,6 +18,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/state/statemodel"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 	"pgregory.net/rapid"
 	"tailscale.com/envknob"
@@ -27,6 +28,7 @@ import (
 // pbtT is what the world driver needs of a test: a *testing.T or a
 // *rapid.T, so a property's failures stay rapid's to shrink.
 type pbtT interface {
+	require.TestingT
 	Helper()
 	Fatalf(format string, args ...any)
 	Logf(format string, args ...any)

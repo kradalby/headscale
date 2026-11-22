@@ -30,6 +30,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/require"
+	"go4.org/mem"
 	"pgregory.net/rapid"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
@@ -1799,7 +1800,7 @@ func (dw *deliveryWorld) judgeChurn(start *state.Snapshot, current, subjects map
 }
 
 // observeDelivery follows one session through the existing subscription and wire client.
-func observeDelivery(t *testing.T, cfg *types.Config, s *state.State, id types.NodeID) (*realClient, func(uint64, bool)) {
+func observeDelivery(t pbtT, cfg *types.Config, s *state.State, id types.NodeID) (*realClient, func(uint64, bool)) {
 	t.Helper()
 
 	hub := NewHub()
@@ -1965,147 +1966,179 @@ func TestDeliverySSHDecisionsAcrossRevocationAndDeletion(t *testing.T) {
 }
 
 func TestDeliveryConcurrentReportsToSameNode(t *testing.T) {
-	for _, omission := range []string{"Hostinfo", "NetInfo", "identical"} {
-		t.Run(omission, func(t *testing.T) {
-			cfg, s, ids := streamTestState(t, ownUserOnly)
-			viewer, reporter := ids[0], ids[1]
-			s.Connect(reporter)
-			node := mustNode(t, s, reporter)
-			report := func(endpoint, os string, derp tailcfg.DERPRegionID) tailcfg.MapRequest {
-				return tailcfg.MapRequest{
-					NodeKey: node.NodeKey(), DiscoKey: key.NewDisco().Public(),
-					Endpoints: []netip.AddrPort{netip.MustParseAddrPort(endpoint)},
-					Hostinfo: &tailcfg.Hostinfo{
-						Hostname: node.Hostname(), OS: os,
-						Services: []tailcfg.Service{{Proto: "tcp", Port: uint16(derp), Description: os}}, //nolint:gosec // test values
-						NetInfo:  &tailcfg.NetInfo{PreferredDERP: derp, DERPLatency: map[string]float64{"1-v4": 0.1}},
-					},
+	for _, shape := range []string{"complete", "Hostinfo", "NetInfo", "identical"} {
+		t.Run(shape, func(t *testing.T) {
+			rapid.Check(t, func(t *rapid.T) {
+				cfg, s, ids := streamTestState(t, ownUserOnly)
+				viewer, reporter := ids[0], ids[1]
+				s.Connect(reporter)
+				node := mustNode(t, s, reporter)
+				endpoints := []netip.Addr{
+					netip.MustParseAddr("192.0.2.1"),
+					netip.MustParseAddr("192.0.2.2"),
+					netip.MustParseAddr("192.0.2.3"),
 				}
-			}
-			base := report("192.0.2.1:41641", "linux", 1)
-			require.NoError(t, s.UpdateNodeFromMapRequest(reporter, base))
-			client, observe := observeDelivery(t, cfg, s, viewer)
-			before := s.Snapshot()
-			old := mustNode(t, s, reporter).AsStruct()
-			require.NotZero(t, old.ReportGen, "baseline was substantive")
+				systems := rapid.Permutation([]string{"linux", "windows", "darwin"}).Draw(t, "operating systems")
+				regions := rapid.Permutation([]tailcfg.DERPRegionID{1, 2, 3}).Draw(t, "DERP regions")
+				report := func(slot int, label, omit string) tailcfg.MapRequest {
+					endpointPort := rapid.Uint16Range(1, 65535).Draw(t, label+" endpoint port")
+					raw := [32]byte{endpoints[slot].As4()[3]}
+					binary.BigEndian.PutUint64(raw[1:], rapid.Uint64().Draw(t, label+" disco key"))
 
-			oldRow, err := s.DB().GetNodeByID(reporter)
-			require.NoError(t, err)
+					req := tailcfg.MapRequest{
+						NodeKey: node.NodeKey(), DiscoKey: key.DiscoPublicFromRaw32(mem.B(raw[:])),
+						Endpoints: []netip.AddrPort{netip.AddrPortFrom(endpoints[slot], endpointPort)},
+					}
+					if omit == "Hostinfo" {
+						return req
+					}
 
-			a := report("192.0.2.2:41641", "windows", 2)
-			b := report("192.0.2.3:41641", "darwin", 3)
+					req.Hostinfo = &tailcfg.Hostinfo{
+						Hostname: node.Hostname(), OS: systems[slot],
+						Services: []tailcfg.Service{{
+							Proto: "tcp", Description: systems[slot],
+							Port: rapid.Uint16Range(1, 65535).Draw(t, label+" service port"),
+						}},
+					}
+					if omit != "NetInfo" {
+						req.Hostinfo.NetInfo = &tailcfg.NetInfo{
+							PreferredDERP: regions[slot],
+							DERPLatency:   map[string]float64{"1-v4": rapid.Float64Range(0.001, 1).Draw(t, label+" DERP latency")},
+						}
+					}
 
-			switch omission {
-			case "Hostinfo":
-				b.Hostinfo = nil
-			case "NetInfo":
-				b.Hostinfo.NetInfo = nil
-			case "identical":
-				b = a
-			}
+					return req
+				}
 
-			// Each order applies both complete transitions, including omissions, to one record.
-			ab := expectedReport(expectedReport(old, a), b)
+				// Distinct endpoint addresses keep the mixed-record witness when ports shrink.
+				base := report(0, "baseline", "")
+				require.NoError(t, s.UpdateNodeFromMapRequest(reporter, base))
+				client, observe := observeDelivery(t, cfg, s, viewer)
+				before := s.Snapshot()
+				old := mustNode(t, s, reporter).AsStruct()
+				require.NotZero(t, old.ReportGen, "baseline was substantive")
 
-			ba := expectedReport(expectedReport(old, b), a)
-			if omission == "identical" {
-				require.Equal(t, old.ReportGen+1, ab.ReportGen)
-				require.Equal(t, ab, ba)
-			} else {
-				require.Equal(t, old.ReportGen+2, ab.ReportGen)
-				require.Equal(t, old.ReportGen+2, ba.ReportGen)
-				require.NotEqual(t, ab, ba)
+				oldRow, err := s.DB().GetNodeByID(reporter)
+				require.NoError(t, err)
 
-				mixed := ab.Clone()
-				mixed.Endpoints = slices.Clone(ba.Endpoints)
-				require.Nil(t, matchingReport(mixed, ab, ba), "mixing endpoints and disco keys across orders must fail")
-			}
+				a := report(1, "first", "")
+				b := a
 
-			requests := [...]tailcfg.MapRequest{a, b}
-			submitted := requests
-			start := make(chan struct{})
+				if shape != "identical" {
+					b = report(2, "second", shape)
 
-			var (
-				wg   sync.WaitGroup
-				errs [len(requests)]error
-			)
-
-			started := time.Now()
-
-			for i, req := range requests {
-				submitted[i].Hostinfo = req.Hostinfo.Clone()
-				submitted[i].Endpoints = slices.Clone(req.Endpoints)
-
-				wg.Go(func() {
-					<-start
-
-					errs[i] = s.UpdateNodeFromMapRequest(reporter, submitted[i])
-				})
-			}
-
-			close(start)
-			wg.Wait()
-
-			after := s.Snapshot()
-			require.GreaterOrEqual(t, after.Rev(), before.Rev()+1)
-			require.LessOrEqual(t, after.Rev(), before.Rev()+2)
-
-			for i, req := range requests {
-				require.NoError(t, errs[i])
-				require.Equal(t, req, submitted[i], "State changed the submitted report")
-				submitted[i].Endpoints[0] = netip.AddrPort{}
-
-				if hi := submitted[i].Hostinfo; hi != nil {
-					hi.OS = "caller mutation"
-					hi.Services[0].Description = "caller mutation"
-
-					if hi.NetInfo != nil {
-						hi.NetInfo.PreferredDERP = 99
-						clear(hi.NetInfo.DERPLatency)
+					if rapid.Bool().Draw(t, "swap reports") {
+						a, b = b, a
 					}
 				}
-			}
 
-			got := mustNode(t, s, reporter).AsStruct()
-			require.NotNil(t, got.LastSeen)
-			require.WithinRange(t, *got.LastSeen, started, time.Now())
-			winner := matchingReport(got, ab, ba)
-			require.NotNil(t, winner, "whole report must match one order: got %v; AB %v; BA %v",
-				policymodel.JSON(got), policymodel.JSON(ab), policymodel.JSON(ba))
+				// Each order applies both complete transitions, including omissions, to one record.
+				ab := expectedReport(expectedReport(old, a), b)
 
-			row, err := s.DB().GetNodeByID(reporter)
-			require.NoError(t, err)
+				ba := expectedReport(expectedReport(old, b), a)
+				if shape == "identical" {
+					require.Equal(t, old.ReportGen+1, ab.ReportGen)
+					require.Equal(t, ab, ba)
+				} else {
+					require.Equal(t, old.ReportGen+2, ab.ReportGen)
+					require.Equal(t, old.ReportGen+2, ba.ReportGen)
+					require.NotEqual(t, ab, ba)
 
-			oldRow.Hostinfo, oldRow.Endpoints, oldRow.DiscoKey = winner.Hostinfo, winner.Endpoints, winner.DiscoKey
-			oldRow.LastSeen, oldRow.UpdatedAt = row.LastSeen, row.UpdatedAt
-			require.Equal(t, oldRow, row, "durable record must match the same order as memory")
+					mixed := ab.Clone()
+					mixed.Endpoints = slices.Clone(ba.Endpoints)
+					require.Nil(t, matchingReport(mixed, ab, ba), "mixing endpoints and disco keys across orders must fail")
+				}
 
-			retained, ok := before.GetNode(reporter)
-			require.True(t, ok)
-			require.Equal(t, old, retained.AsStruct(), "older snapshot changed")
-			observe(before.Rev(), true)
+				requests := [...]tailcfg.MapRequest{a, b}
+				submitted := requests
+				start := make(chan struct{})
 
-			i := slices.IndexFunc(client.nm.Peers, func(n tailcfg.NodeView) bool { return n.ID() == reporter.NodeID() })
-			require.GreaterOrEqual(t, i, 0)
-			peer := client.nm.Peers[i]
-			require.Equal(t, winner.DiscoKey, peer.DiscoKey())
-			require.Equal(t, winner.Endpoints.List(), peer.Endpoints().AsSlice())
-			require.Equal(t, winner.Hostinfo.NetInfo.PreferredDERP, peer.HomeDERP())
-			require.Equal(t, winner.Hostinfo.OS, peer.Hostinfo().OS())
-			fresh, _ := newFreshSession(t, cfg, after, viewer, capVer).client(t)
-			require.Empty(t, policymodel.NetmapDiff(client.nm, fresh, func() {}))
+				var (
+					ready, wg sync.WaitGroup
+					errs      [len(requests)]error
+				)
 
-			repeat := tailcfg.MapRequest{
-				NodeKey: node.NodeKey(), DiscoKey: winner.DiscoKey,
-				Endpoints: slices.Clone(winner.Endpoints), Hostinfo: winner.Hostinfo.Clone(),
-			}
-			repeat.Hostinfo.NetInfo = nil
-			require.NoError(t, s.UpdateNodeFromMapRequest(reporter, repeat))
-			require.NotNil(t, matchingReport(mustNode(t, s, reporter).AsStruct(), winner), "resend changed the record or ReportGen")
-			repeatedRow, err := s.DB().GetNodeByID(reporter)
-			require.NoError(t, err)
-			require.Equal(t, row, repeatedRow, "resend must leave the durable row unchanged")
-			observe(after.Rev(), false)
+				started := time.Now()
+
+				ready.Add(len(requests))
+
+				for i, req := range requests {
+					submitted[i].Hostinfo = req.Hostinfo.Clone()
+					submitted[i].Endpoints = slices.Clone(req.Endpoints)
+
+					wg.Go(func() {
+						ready.Done()
+						<-start
+
+						errs[i] = s.UpdateNodeFromMapRequest(reporter, submitted[i])
+					})
+				}
+
+				ready.Wait()
+				close(start)
+				wg.Wait()
+
+				after := s.Snapshot()
+				require.GreaterOrEqual(t, after.Rev(), before.Rev()+1)
+				require.LessOrEqual(t, after.Rev(), before.Rev()+2)
+
+				for i, req := range requests {
+					require.NoError(t, errs[i])
+					require.Equal(t, req, submitted[i], "State changed the submitted report")
+					submitted[i].Endpoints[0] = netip.AddrPort{}
+
+					if hi := submitted[i].Hostinfo; hi != nil {
+						hi.OS = "caller mutation"
+						hi.Services[0].Description = "caller mutation"
+
+						if hi.NetInfo != nil {
+							hi.NetInfo.PreferredDERP = 99
+							clear(hi.NetInfo.DERPLatency)
+						}
+					}
+				}
+
+				got := mustNode(t, s, reporter).AsStruct()
+				require.NotNil(t, got.LastSeen)
+				require.WithinRange(t, *got.LastSeen, started, time.Now())
+				winner := matchingReport(got, ab, ba)
+				require.NotNil(t, winner, "whole report must match one order: got %v; AB %v; BA %v",
+					policymodel.JSON(got), policymodel.JSON(ab), policymodel.JSON(ba))
+
+				row, err := s.DB().GetNodeByID(reporter)
+				require.NoError(t, err)
+
+				oldRow.Hostinfo, oldRow.Endpoints, oldRow.DiscoKey = winner.Hostinfo, winner.Endpoints, winner.DiscoKey
+				oldRow.LastSeen, oldRow.UpdatedAt = row.LastSeen, row.UpdatedAt
+				require.Equal(t, oldRow, row, "durable record must match the same order as memory")
+
+				retained, ok := before.GetNode(reporter)
+				require.True(t, ok)
+				require.Equal(t, old, retained.AsStruct(), "older snapshot changed")
+				observe(before.Rev(), true)
+
+				i := slices.IndexFunc(client.nm.Peers, func(n tailcfg.NodeView) bool { return n.ID() == reporter.NodeID() })
+				require.GreaterOrEqual(t, i, 0)
+				peer := client.nm.Peers[i]
+				require.Equal(t, winner.DiscoKey, peer.DiscoKey())
+				require.Equal(t, winner.Endpoints.List(), peer.Endpoints().AsSlice())
+				require.Equal(t, winner.Hostinfo.NetInfo.PreferredDERP, peer.HomeDERP())
+				require.Equal(t, winner.Hostinfo.OS, peer.Hostinfo().OS())
+				fresh, _ := newFreshSession(t, cfg, after, viewer, capVer).client(t)
+				require.Empty(t, policymodel.NetmapDiff(client.nm, fresh, func() {}))
+
+				repeat := tailcfg.MapRequest{
+					NodeKey: node.NodeKey(), DiscoKey: winner.DiscoKey,
+					Endpoints: slices.Clone(winner.Endpoints), Hostinfo: winner.Hostinfo.Clone(),
+				}
+				repeat.Hostinfo.NetInfo = nil
+				require.NoError(t, s.UpdateNodeFromMapRequest(reporter, repeat))
+				require.NotNil(t, matchingReport(mustNode(t, s, reporter).AsStruct(), winner), "resend changed the record or ReportGen")
+				repeatedRow, err := s.DB().GetNodeByID(reporter)
+				require.NoError(t, err)
+				require.Equal(t, row, repeatedRow, "resend must leave the durable row unchanged")
+				observe(after.Rev(), false)
+			})
 		})
 	}
 }
@@ -2143,146 +2176,171 @@ func matchingReport(got *types.Node, legal ...*types.Node) *types.Node {
 }
 
 func TestDeliveryPolicyFileReplacementHistory(t *testing.T) {
-	const (
-		allow = `{
-			"grants":[{"src":["u2@"],"dst":["u1@"],"ip":["tcp:22"]}],
+	rapid.Check(t, func(t *rapid.T) {
+		proto := rapid.SampledFrom([]ipproto.Proto{ipproto.TCP, ipproto.UDP}).Draw(t, "protocol")
+		port := rapid.Uint16Range(1, 65535).Draw(t, "allowed port")
+		protocol, err := proto.MarshalText()
+		require.NoError(t, err)
+
+		exact := fmt.Sprintf("%s:%d", protocol, port)
+		allow := fmt.Sprintf(`{
+			"grants":[{"src":["u2@"],"dst":["u1@"],"ip":[%q]}],
 			"ssh":[{"action":"check","src":["u1@"],"dst":["autogroup:self"],"users":["alice"]}],
 			"autoApprovers":{"routes":{"10.28.0.0/24":["u2@"]}}
-		}`
-		deny        = `{"grants":[]}`
-		invalid     = `{"grants":`
-		failingTest = `{"grants":[],"tests":[{"src":"u2@","proto":"tcp","accept":["u1@:22"]}]}`
-	)
+		}`, exact)
 
-	path := filepath.Join(t.TempDir(), "policy.hujson")
-	stage := func(doc string) {
-		t.Helper()
-		require.NoError(t, os.WriteFile(path+".next", []byte(doc), 0o600))
-		require.NoError(t, os.Rename(path+".next", path))
-	}
+		const (
+			deny    = `{"grants":[]}`
+			invalid = `{"grants":`
+		)
 
-	stage(allow)
-
-	cfg, s, ids := streamTestState(t, "", func(cfg *types.Config) {
-		cfg.Policy.Mode, cfg.Policy.Path = types.PolicyModeFile, path
-	})
-	sshSource, viewer, router := ids[0], ids[1], ids[2]
-	prefix := netip.MustParsePrefix("10.28.0.0/24")
-	r := mustNode(t, s, router)
-	require.NoError(t, s.UpdateNodeFromMapRequest(router, tailcfg.MapRequest{
-		NodeKey: r.NodeKey(), DiscoKey: r.DiscoKey(),
-		Hostinfo: &tailcfg.Hostinfo{Hostname: r.Hostname(), RoutableIPs: []netip.Prefix{prefix}},
-	}))
-	s.SetLastSSHAuth(sshSource, viewer)
-	auth, ok := s.GetLastSSHAuth(sshSource, viewer)
-	require.True(t, ok)
-
-	client, observe := observeDelivery(t, cfg, s, viewer)
-
-	wantPacket := tailcfg.FilterRule{IPProto: []int{int(ipproto.TCP)}}
-	for _, addr := range r.IPs() {
-		wantPacket.SrcIPs = append(wantPacket.SrcIPs, addr.String())
-	}
-
-	for _, addr := range mustNode(t, s, viewer).IPs() {
-		wantPacket.DstPorts = append(wantPacket.DstPorts, tailcfg.NetPortRange{IP: addr.String(), Ports: tailcfg.PortRange{First: 22, Last: 22}})
-	}
-
-	check := func(active string, keepAuth bool) {
-		t.Helper()
-		require.Equal(t, active, string(s.Snapshot().PolicySource()))
-
-		var want []tailcfg.FilterRule
-		if active == allow {
-			want = []tailcfg.FilterRule{wantPacket}
+		failingTest := fmt.Sprintf(`{"grants":[],"tests":[{"src":"u2@","proto":%q,"accept":["u1@:%d"]}]}`, protocol, port)
+		refusals := rapid.IntRange(2, 4).Draw(t, "malformed reloads")
+		path := filepath.Join(streamTestDir(t), "policy.hujson")
+		stage := func(doc string) {
+			t.Helper()
+			require.NoError(t, os.WriteFile(path+".next", []byte(doc), 0o600))
+			require.NoError(t, os.Rename(path+".next", path))
 		}
 
-		nm := client.nm
-		require.Equal(t, active == allow, slices.ContainsFunc(nm.Peers, func(n tailcfg.NodeView) bool { return n.ID() == router.NodeID() }))
-		verdict := policymodel.Compare(want, nm.PacketFilterRules.AsSlice(), policymodel.ViewFromNetmap(nm))
-		require.True(t, verdict.Equivalent(), "%s", verdict)
-		require.NotNil(t, nm.SSHPolicy)
-		require.Equal(t, active == allow, len(nm.SSHPolicy.Rules) > 0)
+		stage(allow)
 
-		got := mustNode(t, s, router)
-		require.Equal(t, []netip.Prefix{prefix}, got.ApprovedRoutes().AsSlice())
-		require.Equal(t, []netip.Prefix{prefix}, got.AutoApprovedRoutes().AsSlice())
+		cfg, s, ids := streamTestState(t, "", func(cfg *types.Config) {
+			cfg.Policy.Mode, cfg.Policy.Path = types.PolicyModeFile, path
+		})
+		sshSource, viewer, router := ids[0], ids[1], ids[2]
+		prefix := netip.MustParsePrefix("10.28.0.0/24")
+		r := mustNode(t, s, router)
+		require.NoError(t, s.UpdateNodeFromMapRequest(router, tailcfg.MapRequest{
+			NodeKey: r.NodeKey(), DiscoKey: r.DiscoKey(),
+			Hostinfo: &tailcfg.Hostinfo{Hostname: r.Hostname(), RoutableIPs: []netip.Prefix{prefix}},
+		}))
+		s.SetLastSSHAuth(sshSource, viewer)
+		auth, ok := s.GetLastSSHAuth(sshSource, viewer)
+		require.True(t, ok)
 
-		at, ok := s.GetLastSSHAuth(sshSource, viewer)
-		require.Equal(t, keepAuth, ok)
+		client, observe := observeDelivery(t, cfg, s, viewer)
 
-		if keepAuth {
-			require.Equal(t, auth, at)
-		}
-	}
-
-	check(allow, true)
-
-	onDisk := allow
-	for _, phase := range []struct {
-		name, replace, active           string
-		load, refuse, changed, keepAuth bool
-	}{
-		{name: "stage", replace: deny, active: allow, keepAuth: true},
-		{name: "stage malformed", replace: invalid, active: allow, keepAuth: true},
-		{name: "refuse malformed", active: allow, load: true, refuse: true, keepAuth: true},
-		{name: "refuse same file again", active: allow, load: true, refuse: true, keepAuth: true},
-		{name: "refuse valid syntax with failing policy test", replace: failingTest, active: allow, load: true, refuse: true, keepAuth: true},
-		{name: "recover", replace: deny, active: deny, load: true, changed: true},
-		{name: "restore", replace: allow, active: allow, load: true, changed: true},
-		{name: "reload identical file", active: allow, load: true},
-	} {
-		t.Log(phase.name)
-
-		before := s.Snapshot()
-
-		if phase.replace != "" {
-			stage(phase.replace)
-			onDisk = phase.replace
+		wantPacket := tailcfg.FilterRule{IPProto: []int{int(proto)}}
+		for _, addr := range r.IPs() {
+			wantPacket.SrcIPs = append(wantPacket.SrcIPs, addr.String())
 		}
 
-		if phase.name == "reload identical file" {
-			s.SetLastSSHAuth(sshSource, viewer)
-			_, approved := s.GetLastSSHAuth(sshSource, viewer)
-			require.True(t, approved)
+		for _, addr := range mustNode(t, s, viewer).IPs() {
+			wantPacket.DstPorts = append(wantPacket.DstPorts, tailcfg.NetPortRange{IP: addr.String(), Ports: tailcfg.PortRange{First: port, Last: port}})
 		}
 
-		if phase.load {
-			err := s.ReloadPolicy()
-			if phase.refuse {
-				require.ErrorIs(t, err, state.ErrInvalidPolicy)
+		allowed := []tailcfg.FilterRule{wantPacket}
+		require.NotEmpty(t, policymodel.Compare(allowed, nil, policymodel.ViewFromNetmap(client.nm)).Verdicts,
+			"the generated permission must have a packet witness")
 
-				if onDisk == failingTest {
-					require.ErrorContains(t, err, "test(s) failed")
-				}
-			} else {
-				require.NoError(t, err)
+		check := func(active string, keepAuth bool) {
+			t.Helper()
+			require.Equal(t, active, string(s.Snapshot().PolicySource()))
+
+			var want []tailcfg.FilterRule
+			if active == allow {
+				want = allowed
+			}
+
+			nm := client.nm
+			require.Equal(t, active == allow, slices.ContainsFunc(nm.Peers, func(n tailcfg.NodeView) bool { return n.ID() == router.NodeID() }))
+			verdict := policymodel.Compare(want, nm.PacketFilterRules.AsSlice(), policymodel.ViewFromNetmap(nm))
+			require.True(t, verdict.Equivalent(), "%s", verdict)
+			require.NotNil(t, nm.SSHPolicy)
+			require.Equal(t, active == allow, len(nm.SSHPolicy.Rules) > 0)
+
+			got := mustNode(t, s, router)
+			require.Equal(t, []netip.Prefix{prefix}, got.ApprovedRoutes().AsSlice())
+			require.Equal(t, []netip.Prefix{prefix}, got.AutoApprovedRoutes().AsSlice())
+
+			at, ok := s.GetLastSSHAuth(sshSource, viewer)
+			require.Equal(t, keepAuth, ok)
+
+			if keepAuth {
+				require.Equal(t, auth, at)
 			}
 		}
 
-		disk, err := os.ReadFile(path)
-		require.NoError(t, err)
-		require.Equal(t, onDisk, string(disk))
+		check(allow, true)
 
-		info, err := os.Stat(path)
-		require.NoError(t, err)
-		require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
-
-		after := s.Snapshot()
-		if phase.changed {
-			require.Equal(t, before.Rev()+1, after.Rev())
-		} else {
-			require.Equal(t, before.Rev(), after.Rev())
+		type reloadPhase struct {
+			name, replace, active           string
+			load, refuse, changed, keepAuth bool
 		}
 
-		previous := client.nm
+		phases := make([]reloadPhase, 0, 2+refusals+4)
 
-		observe(before.Rev(), phase.changed)
-
-		if !phase.changed {
-			require.Same(t, previous, client.nm, "unchanged step delivered no frame to this session")
+		phases = append(phases,
+			reloadPhase{name: "stage", replace: deny, active: allow, keepAuth: true},
+			reloadPhase{name: "stage malformed", replace: invalid, active: allow, keepAuth: true},
+		)
+		for i := range refusals {
+			phases = append(phases, reloadPhase{name: fmt.Sprintf("refuse malformed file (%d)", i+1), active: allow, load: true, refuse: true, keepAuth: true})
 		}
 
-		check(phase.active, phase.keepAuth)
-	}
+		phases = append(phases,
+			reloadPhase{name: "refuse valid syntax with failing policy test", replace: failingTest, active: allow, load: true, refuse: true, keepAuth: true},
+			reloadPhase{name: "recover", replace: deny, active: deny, load: true, changed: true},
+			reloadPhase{name: "restore", replace: allow, active: allow, load: true, changed: true},
+			reloadPhase{name: "reload identical file", active: allow, load: true},
+		)
+
+		onDisk := allow
+
+		for _, phase := range phases {
+			t.Log(phase.name)
+
+			before := s.Snapshot()
+
+			if phase.replace != "" {
+				stage(phase.replace)
+				onDisk = phase.replace
+			}
+
+			if phase.name == "reload identical file" {
+				s.SetLastSSHAuth(sshSource, viewer)
+				_, approved := s.GetLastSSHAuth(sshSource, viewer)
+				require.True(t, approved)
+			}
+
+			if phase.load {
+				err := s.ReloadPolicy()
+				if phase.refuse {
+					require.ErrorIs(t, err, state.ErrInvalidPolicy)
+
+					if onDisk == failingTest {
+						require.ErrorContains(t, err, "test(s) failed")
+					}
+				} else {
+					require.NoError(t, err)
+				}
+			}
+
+			disk, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.Equal(t, onDisk, string(disk))
+
+			info, err := os.Stat(path)
+			require.NoError(t, err)
+			require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+
+			after := s.Snapshot()
+			if phase.changed {
+				require.Equal(t, before.Rev()+1, after.Rev())
+			} else {
+				require.Equal(t, before.Rev(), after.Rev())
+			}
+
+			previous := client.nm
+
+			observe(before.Rev(), phase.changed)
+
+			if !phase.changed {
+				require.Same(t, previous, client.nm, "unchanged step delivered no frame to this session")
+			}
+
+			check(phase.active, phase.keepAuth)
+		}
+	})
 }
