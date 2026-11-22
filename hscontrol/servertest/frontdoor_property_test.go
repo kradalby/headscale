@@ -90,6 +90,7 @@ const (
 	stepOwnership
 	stepIdentity
 	stepRace
+	stepClock
 	numSteps
 )
 
@@ -100,7 +101,7 @@ var fdJudges = []string{"stored", "client", "reference", "restart"}
 
 var stepNames = [numSteps]string{
 	"world", "burst", "flap", "poll restart", "client restart", "endpoints", "rename", "logout", "relogin", "server restart",
-	"ownership", "identity", "race",
+	"ownership", "identity", "race", "clock",
 }
 
 // fdNode is a model node's client and how it joined, which a login, a
@@ -150,6 +151,14 @@ type frontDoor struct {
 	// magicDNS names nodes in the tailnet's domain, so their names and the
 	// DNS config reach every map.
 	magicDNS bool
+	// clock is whether the ephemeral inactivity timeout is drawn small
+	// ([WithEphemeralTimeout]): an ephemeral node whose poll ends is
+	// deleted that long after, unless its own connect cancels the timer.
+	// A case running the small clock leaves out every step that would
+	// leave an ephemeral node sessionless with the model holding it:
+	// such a node is deleted grace and timeout later, which the model
+	// cannot see coming.
+	clock bool
 
 	w         policymodel.World
 	nodes     map[types.NodeID]*fdNode
@@ -245,10 +254,14 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 		chunks:     rapid.Bool().Draw(rt, "filter-chunks"),
 		patient:    rapid.IntRange(0, 3).Draw(rt, "patient") == 3,
 		magicDNS:   rapid.Bool().Draw(rt, "magic-dns"),
-		nodes:      map[types.NodeID]*fdNode{},
-		elections:  policymodel.NewElections(),
-		unheld:     map[netip.Prefix]bool{},
-		stacks:     make([]byte, 1<<20),
+		// The ephemeral inactivity clock, drawn small in a third of the
+		// cases, is what the clock step runs ([WithEphemeralTimeout]);
+		// the rest pin it where no timer can fire inside a case.
+		clock:     rapid.IntRange(0, 2).Draw(rt, "ephemeral-clock") == 0,
+		nodes:     map[types.NodeID]*fdNode{},
+		elections: policymodel.NewElections(),
+		unheld:    map[netip.Prefix]bool{},
+		stacks:    make([]byte, 1<<20),
 	}
 
 	start := policymodel.Worlds().Draw(rt, "start")
@@ -259,6 +272,10 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 	}
 
 	opts := []ServerOption{WithEphemeralTimeout(time.Hour), WithBatchDelay(20 * time.Millisecond)}
+	if fd.clock {
+		opts[0] = WithEphemeralTimeout(fdClock)
+	}
+
 	if fd.capSources {
 		opts = append(opts, WithCapabilitySources())
 	}
@@ -291,7 +308,7 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 	for i := range steps {
 		at := fmt.Sprintf("step %d", i+1)
 
-		kind := rapid.IntRange(0, 27).Draw(rt, "kind")
+		kind := rapid.IntRange(0, 28).Draw(rt, "kind")
 
 		switch {
 		case kind < 6:
@@ -318,8 +335,10 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 			fd.ownership(at)
 		case kind < 26:
 			fd.identity(at)
-		default:
+		case kind < 28:
 			fd.race(at)
+		case kind == 28:
+			fd.clockStep(at)
 		}
 
 		fd.settle(at)
@@ -503,26 +522,7 @@ func (fd *frontDoor) edit(at string, e policymodel.Edit, ids map[types.NodeID]ty
 		fd.made(kind, "API")
 		fd.apply(e)
 	case policymodel.SetOnline:
-		nd := fd.nodes[e.ID]
-
-		switch {
-		case nd.loggedOut && e.Online:
-			fd.made(kind, "left out (its client logged out)")
-
-			return
-		case e.Online:
-			fd.connect(at, e.ID)
-			fd.made(kind, "connect")
-		case !fd.patient:
-			fd.made(kind, "left out (a case that does not wait out the reconnect grace)")
-
-			return
-		default:
-			nd.tc.Disconnect(fd.tb)
-			fd.made(kind, "disconnect")
-		}
-
-		fd.apply(e)
+		fd.setOnline(at, kind, e)
 	case policymodel.SetAddr, policymodel.SwapAddrs:
 		fd.made(kind, "left out (database only)")
 	case policymodel.AddUser:
@@ -582,6 +582,38 @@ func (fd *frontDoor) edit(at string, e policymodel.Edit, ids map[types.NodeID]ty
 		fd.made("policy", "API")
 		fd.w = next
 	}
+}
+
+// setOnline brings e's client on or off its map session as the edit says:
+// a connect through its client, a disconnect only a patient case makes,
+// which a case running the small ephemeral clock leaves out of an
+// ephemeral node rather than have the collector delete it under the
+// model's back.
+func (fd *frontDoor) setOnline(at string, kind string, e policymodel.SetOnline) {
+	nd := fd.nodes[e.ID]
+
+	switch {
+	case nd.loggedOut && e.Online:
+		fd.made(kind, "left out (its client logged out)")
+
+		return
+	case e.Online:
+		fd.connect(at, e.ID)
+		fd.made(kind, "connect")
+	case !fd.patient:
+		fd.made(kind, "left out (a case that does not wait out the reconnect grace)")
+
+		return
+	case nd.Ephemeral && fd.clock:
+		fd.made(kind, "left out (the ephemeral clock would delete it)")
+
+		return
+	default:
+		nd.tc.Disconnect(fd.tb)
+		fd.made(kind, "disconnect")
+	}
+
+	fd.apply(e)
 }
 
 // nodeOf is the node a client report names.
@@ -871,18 +903,12 @@ func (fd *frontDoor) startedOver(at string, id types.NodeID, tc *TestClient, err
 	return err
 }
 
-// join registers n as its client and an admin bring it in, and applies to
-// the model what that made, in the order it happened: the registration,
-// at the ID and addresses the server handed out; an admin's tags, for a
-// node a login brought in; the admin's approvals, before the client
-// announces, so that auto-approval then adds what the model counts as its
-// own; an admin's expiry; the first map session. It returns n as
-// registered.
-func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
-	users := fd.w.Topology.Users
-	logins := slices.DeleteFunc(slices.Clone(users), func(u policymodel.User) bool { return !fd.loginUser(u) })
-	owner, _ := fd.w.Topology.User(n.User)
-
+// joinKind draws how n joins: with a pre-auth key, an ephemeral one, a
+// tagged key a user made, or a login. A node that starts offline never
+// polls, so its registration leaves the inactivity timer armed: a case
+// running the small clock joins it with a permanent key, which nothing
+// deletes under the model's back.
+func (fd *frontDoor) joinKind(n policymodel.Node, owner policymodel.User, users []policymodel.User, logins []policymodel.User) int {
 	var kinds []int
 
 	if n.Tagged() {
@@ -901,7 +927,26 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 		}
 	}
 
-	kind := kinds[rapid.IntRange(0, len(kinds)-1).Draw(fd.t, "join")]
+	if n.Offline && fd.clock {
+		kinds = slices.DeleteFunc(kinds, func(k int) bool { return k == joinEphemeral })
+	}
+
+	return kinds[rapid.IntRange(0, len(kinds)-1).Draw(fd.t, "join")]
+}
+
+// join registers n as its client and an admin bring it in, and applies to
+// the model what that made, in the order it happened: the registration,
+// at the ID and addresses the server handed out; an admin's tags, for a
+// node a login brought in; the admin's approvals, before the client
+// announces, so that auto-approval then adds what the model counts as its
+// own; an admin's expiry; the first map session. It returns n as
+// registered.
+func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
+	users := fd.w.Topology.Users
+	logins := slices.DeleteFunc(slices.Clone(users), func(u policymodel.User) bool { return !fd.loginUser(u) })
+	owner, _ := fd.w.Topology.User(n.User)
+
+	kind := fd.joinKind(n, owner, users, logins)
 	fd.run.tally.joins[joinNames[kind]]++
 
 	admitted := without(n.Approved, n.AutoApproved)
@@ -1181,7 +1226,11 @@ func (fd *frontDoor) leave(at string, id types.NodeID) {
 	nd := fd.nodes[id]
 	n, _ := fd.w.Topology.Node(id)
 
-	if nd.Ephemeral && !n.Expired && nd.tc.Polling() && rapid.Bool().Draw(fd.t, "ephemeral-logout") {
+	if nd.Ephemeral && !n.Expired && nd.tc.Polling() && !fd.clock && rapid.Bool().Draw(fd.t, "ephemeral-logout") {
+		// A case running the small clock never takes this path: the
+		// deletion a logged-out ephemeral node arms lands inside the
+		// case, while the model holds the node. The API delete below
+		// drops it at once instead.
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 
@@ -1309,7 +1358,10 @@ func (fd *frontDoor) pick(label string, ok func(policymodel.Node, *fdNode) bool)
 // do; the model does not change.
 func (fd *frontDoor) weather(at string, kind int) {
 	n, ok := fd.pick("weathered", func(n policymodel.Node, nd *fdNode) bool {
-		return !n.Offline && !n.Expired && nd.tc.Polling()
+		// An ephemeral node's poll ending arms the inactivity timer; the
+		// reconnects these steps make are quick, but a case running the
+		// small clock leaves them to it alone.
+		return !n.Offline && !n.Expired && nd.tc.Polling() && (!nd.Ephemeral || !fd.clock)
 	})
 	if !ok {
 		fd.run.tally.steps[stepNames[kind]+" (no node)"]++
@@ -1344,6 +1396,62 @@ func (fd *frontDoor) weather(at string, kind int) {
 
 	if err != nil {
 		fd.t.Fatalf("%s: n%d %s: %v", at, n.ID, stepNames[kind], err)
+	}
+}
+
+// fdClock is the ephemeral inactivity timeout a case drawing the small
+// clock runs the garbage collector on: long enough that the reconnects
+// the other steps make land well inside it, short enough that a case
+// waits it out.
+const fdClock = 8 * time.Second
+
+// clockStep exercises the inactivity clock the ephemeral garbage collector
+// runs on: an ephemeral node's poll ends, which arms its deletion timer,
+// and it polls again well inside the timeout, as a client on flapping
+// network weather does, without registering — the key it joined with may
+// be spent, revoked with its user, or refused; the map session its own
+// connect opens is what cancels the timer ([WithEphemeralTimeout]). The
+// step waits the timeout out: a timer its own connect leaves armed
+// deletes the node under its live session. Only a case that drew the
+// small clock runs it.
+func (fd *frontDoor) clockStep(at string) {
+	if !fd.clock {
+		fd.run.tally.steps[stepNames[stepClock]+" (no clock)"]++
+
+		return
+	}
+
+	n, ok := fd.pick("clocked", func(n policymodel.Node, nd *fdNode) bool {
+		if !nd.Ephemeral || n.Offline || n.Expired || !nd.tc.Polling() {
+			return false
+		}
+
+		// What the step breaks is the connect cancelling the timer, so the
+		// node must still be ephemeral in the server's eyes: a login may
+		// have taken it back as a user's device since.
+		nv, has := fd.srv.State().GetNodeByID(n.ID)
+
+		return has && nv.IsEphemeral()
+	})
+	if !ok {
+		fd.run.tally.steps[stepNames[stepClock]+" (no node)"]++
+
+		return
+	}
+
+	fd.run.tally.steps[stepNames[stepClock]]++
+
+	nd := fd.nodes[n.ID]
+
+	// The clock is wall time; nothing in the state tells the timer's
+	// position, so the step waits it out by sleeping.
+	nd.tc.Disconnect(fd.tb)
+	time.Sleep(fdClock / 8) //nolint:forbidigo // arming the timer mid-window
+	fd.connect(at, n.ID)
+	time.Sleep(fdClock + 4*time.Second) //nolint:forbidigo // the timer's own wait
+
+	if !nd.tc.Polling() {
+		fd.t.Fatalf("%s: n%d does not poll again after its reconnect", at, n.ID)
 	}
 }
 
@@ -1391,7 +1499,11 @@ var fdEndpoints = [][]tailcfg.Endpoint{
 // logout logs a client out, as `tailscale logout` does: its node expires,
 // an ephemeral one is deleted, and its session ends.
 func (fd *frontDoor) logout(at string) {
-	n, ok := fd.pick("logs-out", func(n policymodel.Node, nd *fdNode) bool { return !n.Expired && !nd.loggedOut })
+	n, ok := fd.pick("logs-out", func(n policymodel.Node, nd *fdNode) bool {
+		// A case running the small clock leaves an ephemeral node alone:
+		// its logout would arm a deletion the model cannot see coming.
+		return !n.Expired && !nd.loggedOut && (!nd.Ephemeral || !fd.clock)
+	})
 	if !ok {
 		fd.run.tally.steps[stepNames[stepLogout]+" (no node)"]++
 
@@ -2269,7 +2381,12 @@ func (fd *frontDoor) race(at string) {
 	case raceExpireLogin:
 		n, ok = fd.pick("racer", func(_ policymodel.Node, nd *fdNode) bool { return nd.Key != "" && nd.reusable })
 	default:
-		n, ok = fd.pick("racer", func(n policymodel.Node, nd *fdNode) bool { return !n.Expired && !nd.loggedOut })
+		n, ok = fd.pick("racer", func(n policymodel.Node, nd *fdNode) bool {
+			// A case running the small clock leaves an ephemeral node to
+			// this racer's expiry alone: its logout would arm a deletion
+			// the model cannot see coming.
+			return !n.Expired && !nd.loggedOut && (kind != raceExpireLogout || !fd.clock || !nd.Ephemeral)
+		})
 	}
 
 	if !ok {
@@ -2423,20 +2540,52 @@ func (fd *frontDoor) restart(at string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	for _, id := range slices.Sorted(maps.Keys(held)) {
+	ids := slices.Sorted(maps.Keys(held))
+
+	// A case running the small clock reconnects its ephemeral nodes
+	// first, with no quiet on the way: the restarted server schedules
+	// every ephemeral node's deletion when it comes up, so their
+	// reconnects must land inside the timeout, not behind other nodes'
+	// quiet waits.
+	if fd.clock {
+		for _, id := range ids {
+			nd := fd.nodes[id]
+			if !nd.Ephemeral {
+				continue
+			}
+
+			select {
+			case <-nd.tc.pollDone:
+			case <-ctx.Done():
+				fd.t.Fatalf("%s: n%d's map session outlived the server", at, id)
+			}
+
+			err := nd.tc.RestartPoll(ctx)
+			if err != nil {
+				fd.t.Fatalf("%s: n%d reconnects after the restart: %v", at, id, err)
+			}
+		}
+	}
+
+	for _, id := range ids {
 		nd := fd.nodes[id]
 
 		// The old server ended the session; the client sees the stream
-		// close, then polls the new one.
-		select {
-		case <-nd.tc.pollDone:
-		case <-ctx.Done():
-			fd.t.Fatalf("%s: n%d's map session outlived the server", at, id)
-		}
+		// close, then polls the new one. A node the clock pre-pass
+		// already reconnected holds a fresh session with this server:
+		// its pollDone is a new channel, so closing the old one again is
+		// not what it waits for.
+		if !nd.tc.Polling() {
+			select {
+			case <-nd.tc.pollDone:
+			case <-ctx.Done():
+				fd.t.Fatalf("%s: n%d's map session outlived the server", at, id)
+			}
 
-		err := nd.tc.RestartPoll(ctx)
-		if err != nil {
-			fd.t.Fatalf("%s: n%d reconnects after the restart: %v", at, id, err)
+			err := nd.tc.RestartPoll(ctx)
+			if err != nil {
+				fd.t.Fatalf("%s: n%d reconnects after the restart: %v", at, id, err)
+			}
 		}
 
 		fd.quiet(at)
