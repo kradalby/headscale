@@ -189,7 +189,7 @@ func TestAPIv2DeviceUpdateClientDuringDisconnectGrace(t *testing.T) {
 	h.Client(0).Disconnect(t)
 
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
-		assert.False(c, h.Server.App.MapBatcher().IsConnected(nodeID))
+		assert.False(c, h.Server.App.MapHub().IsConnected(nodeID))
 	}, 5*time.Second, 50*time.Millisecond)
 
 	nv, ok := h.Server.State().GetNodeByID(nodeID)

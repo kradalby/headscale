@@ -14,6 +14,7 @@ import (
 	"go4.org/netipx"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/views"
+	"tailscale.com/util/multierr"
 )
 
 // Tailscale's policy file `tests` block validates a policy against operator
@@ -321,10 +322,7 @@ func (pm *PolicyManager) RunTests() error {
 		return nil
 	}
 
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
-	results := runPolicyTests(pm.resolvedPol, pm.filter, pm.users, pm.nodes)
+	results := runPolicyTests(pm.pol, pm.filter, pm.users, pm.nodes)
 
 	return wrapTestResult(errPolicyTestsFailed, results.AllPassed, results)
 }
@@ -807,18 +805,25 @@ func CheckPolicy(b []byte) error {
 // against users and nodes. It runs the [PolicyManager.SetPolicy] write
 // boundary, `tests` and `sshTests` included, on a throwaway manager.
 func ValidatePolicy(b []byte, users types.Users, nodes views.Slice[types.NodeView]) error {
-	pm, err := NewPolicyManager(nil, users, nodes)
-	if err != nil {
-		return fmt.Errorf("creating policy manager: %w", err)
+	if len(b) == 0 {
+		return ErrPolicyEmpty
 	}
 
-	_, err = pm.SetPolicy(b)
+	pm, err := NewPolicyManagerFrom(nil, b, users, nodes)
 	if err != nil {
 		return err
 	}
 
-	// SSH rules compile per node, so without nodes this cannot catch every
-	// case. The base URL only fills check-action URLs, which nothing reads.
+	err = pm.ValidateUserReferences()
+	if err != nil {
+		return err
+	}
+
+	err = multierr.New(pm.RunTests(), pm.RunSSHTests())
+	if err != nil {
+		return err
+	}
+
 	if nodes.Len() > 0 {
 		_, err = pm.SSHPolicy("", nodes.At(0))
 		if err != nil {

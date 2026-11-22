@@ -8,6 +8,7 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go4.org/netipx"
 	"pgregory.net/rapid"
@@ -174,9 +175,6 @@ func peerMapPrefixReference(
 	pm *PolicyManager,
 	nodes types.Nodes,
 ) map[types.NodeID][]types.NodeID {
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
 	nodeMatchers := make(map[types.NodeID][]matcher.Match, len(nodes))
 	for _, n := range nodes {
 		if pm.needsPerNodeFilter {
@@ -267,6 +265,41 @@ func BenchmarkBuildPeerMapManyRoutes(b *testing.B) {
 					pm.BuildPeerMap(views)
 				}
 			})
+		}
+	}
+}
+
+func TestCanAccessWithRoutesMatchesCanAccess(t *testing.T) {
+	user := types.User{Name: "u"}
+
+	subnetRouter := node("subnet", "100.64.0.1", "fd7a:115c:a1e0::1", user)
+	subnetRouter.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}}
+	subnetRouter.ApprovedRoutes = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}
+
+	exitNode := node("exit", "100.64.0.2", "fd7a:115c:a1e0::2", user)
+	exitNode.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}}
+	exitNode.ApprovedRoutes = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}
+
+	plain := node("plain", "100.64.0.3", "fd7a:115c:a1e0::3", user)
+
+	matchers := matcher.MatchesFromFilterRules([]tailcfg.FilterRule{
+		{
+			SrcIPs:   []string{"*"},
+			DstPorts: []tailcfg.NetPortRange{{IP: "*", Ports: tailcfg.PortRangeAny}},
+		},
+	})
+
+	views := []types.NodeView{subnetRouter.View(), exitNode.View(), plain.View()}
+
+	for _, a := range views {
+		for _, b := range views {
+			if a.ID() == b.ID() {
+				continue
+			}
+
+			want := a.CanAccess(matchers, b)
+			got := a.CanAccessWithRoutes(matchers, b, types.RouteRanges(a.SubnetRoutes()), types.RouteRanges(b.SubnetRoutes()), b.IsExitNode())
+			assert.Equalf(t, want, got, "%s -> %s", a.Hostname(), b.Hostname())
 		}
 	}
 }

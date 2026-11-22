@@ -1,14 +1,21 @@
 package v2
 
 import (
+	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math/bits"
 	"math/rand/v2"
 	"net/netip"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go4.org/netipx"
 	"tailscale.com/tailcfg"
@@ -19,9 +26,6 @@ import (
 // global-filter path stopped evaluating every matcher for every pair. It is
 // kept as the reference the indexed build must reproduce exactly.
 func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) map[types.NodeID][]types.NodeID {
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
 	type nodeRoutes struct {
 		subnet []netipx.IPRange
 		isExit bool
@@ -528,14 +532,9 @@ func buildPeerMapSortedSlice(
 		return nil
 	}
 
-	pm.mu.RLock()
-
 	if pm.needsPerNodeFilter {
-		pm.mu.RUnlock()
-
 		return pm.BuildPeerMap(nodes)
 	}
-	defer pm.mu.RUnlock()
 
 	type nodeRoutes struct {
 		subnet []netip.Prefix
@@ -620,14 +619,9 @@ func buildPeerMapSliceMap(
 		return nil
 	}
 
-	pm.mu.RLock()
-
 	if pm.needsPerNodeFilter {
-		pm.mu.RUnlock()
-
 		return pm.BuildPeerMap(nodes)
 	}
-	defer pm.mu.RUnlock()
 
 	type nodeRoutes struct {
 		subnet []netip.Prefix
@@ -876,4 +870,2012 @@ func (pm *PolicyManager) peerRulesForNodeLocked(
 	node types.NodeView,
 ) []tailcfg.FilterRule {
 	return peerRulesForNode(pm.compiledGrants, node, pm.userNodeIdx)
+}
+
+func TestPeerClassesSparseSidesExceedJoinBudget(t *testing.T) {
+	nodes := scanManyRulesNodes(4)
+
+	rules := make([]tailcfg.FilterRule, 126, 126+len(nodes))
+	for i := range rules {
+		rules[i] = tailcfg.FilterRule{
+			SrcIPs:   []string{fmt.Sprintf("192.0.2.%d", i+1)},
+			DstPorts: []tailcfg.NetPortRange{{IP: "198.51.100.1", Ports: tailcfg.PortRange{First: 443, Last: 443}}},
+		}
+	}
+
+	for i := range 2 {
+		rules[i].SrcIPs = []string{"100.64.0.0/10"}
+		rules[i].DstPorts[0].IP = "100.64.0.0/10"
+	}
+
+	for _, node := range nodes {
+		rules = append(rules, tailcfg.FilterRule{
+			SrcIPs:   []string{node.IPv4.String()},
+			DstPorts: []tailcfg.NetPortRange{{IP: node.IPv4.String(), Ports: tailcfg.PortRange{First: 443, Last: 443}}},
+		})
+	}
+
+	pm := &PolicyManager{matchers: matcher.MatchesFromFilterRules(rules)}
+	srcs, dsts := matcherSides(pm.matchers, nodes.ViewSlice())
+	words, postings := 0, 0
+
+	for _, sides := range [][][]uint64{srcs, dsts} {
+		for _, mask := range sides {
+			words += len(mask)
+			for _, word := range mask {
+				postings += bits.OnesCount64(word)
+			}
+		}
+	}
+
+	require.Equal(t, 24, words)
+	require.Equal(t, 24, postings, "the density gate must admit transposition")
+
+	joins := 0
+
+	for _, rule := range pm.matchers {
+		sources, destinations := 0, 0
+
+		for _, node := range nodes {
+			if rule.SrcsContainsIPs(node.IPs()...) {
+				sources++
+			}
+
+			if rule.DestsContainsIP(node.IPs()...) {
+				destinations++
+			}
+		}
+
+		joins += sources * destinations
+	}
+
+	require.Equal(t, 36, joins)
+	require.Greater(t, joins, len(nodes)*len(nodes)/2, "the join budget must select the pair scan")
+
+	classes := pm.BuildPeerClasses(nodes.ViewSlice(), nil)
+	require.Len(t, classes.views, 4, "identity rules keep distinct classes despite identical peer output")
+	require.False(t, classes.joined, "the join budget must select the pair scan")
+
+	for _, built := range []*PeerClasses{classes, pm.BuildPeerClasses(nodes.ViewSlice(), classes)} {
+		for _, node := range nodes {
+			want := slices.DeleteFunc([]types.NodeID{1, 2, 3, 4}, func(id types.NodeID) bool { return id == node.ID })
+			require.Equal(t, want, built.Peers(node.ID))
+		}
+	}
+}
+
+func nilIfEmpty[T any](s []T) []T {
+	if len(s) == 0 {
+		return nil
+	}
+
+	return s
+}
+
+func TestBuildPeerClassesSharedMatchers(t *testing.T) {
+	nodes := types.Nodes{
+		ownRulesNode(1, &scanUsers[0], nil),
+		ownRulesNode(2, &scanUsers[0], nil),
+		ownRulesNode(3, &scanUsers[1], nil),
+		ownRulesNode(4, nil, []string{"tag:router"}, "10.1.0.0/24", "fd00:1::/64"),
+		ownRulesNode(5, nil, []string{"tag:exit"}, "0.0.0.0/0", "::/0"),
+		ownRulesNode(6, nil, []string{"tag:srv"}, "10.2.0.0/16"),
+	}
+	nodes[2].IPv4 = nil
+	nodes[3].IPv6 = nil
+
+	different := slices.Clone(nodes)
+	different[2] = nodes[2].Clone()
+	different[2].IPv6 = new(netip.MustParseAddr("fd7a:115c:a1e0::99"))
+	different = append(different, ownRulesNode(7, &scanUsers[1], nil))
+
+	const (
+		owners = `"tagOwners":{"tag:router":[],"tag:exit":[],"tag:srv":[]}`
+		shared = `{"src":["10.2.0.0/16"],"dst":["fd7a:115c:a1e0::3"],"ip":["tcp:443"]}`
+		self   = `{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["tcp:22"]}`
+		via    = `{"src":["u2@"],"dst":["10.1.0.0/24","fd00:1::/64"],"ip":["tcp:443"],"via":["tag:router"]}`
+		app    = `{"src":["u2@"],"dst":["tag:srv"],"app":{"example.com/cap/read":[{}]}}`
+	)
+
+	for name, policy := range map[string]string{
+		"nil":          "",
+		"default":      `{}`,
+		"empty ACLs":   `{"acls":[]}`,
+		"empty grants": `{"grants":[]}`,
+		"self only":    `{"grants":[` + self + `]}`,
+		"via only":     `{` + owners + `,"grants":[` + via + `]}`,
+		"app only":     `{` + owners + `,"grants":[` + app + `]}`,
+		"shared":       `{` + owners + `,"grants":[` + shared + `,` + app + `]}`,
+		"mixed": `{` + owners + `,"acls":[{"action":"accept","src":["u1@"],"dst":["autogroup:internet:*"]}],
+			"grants":[` + shared + `,` + self + `,` + via + `,` + app + `]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			original, err := NewPolicyManager([]byte(policy), scanUsers, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			previous := original.BuildPeerClasses(nodes.ViewSlice(), nil)
+			oldPeers := buildPeerMapPairScan(original, nodes.ViewSlice())
+			next, err := NewPolicyManagerFrom(original, []byte(policy), scanUsers, different.ViewSlice())
+			require.NoError(t, err)
+
+			for _, pm := range []*PolicyManager{original, next} {
+				for _, in := range []views.Slice[types.NodeView]{nodes.ViewSlice(), nodes[:4].ViewSlice(), different.ViewSlice(), {}} {
+					want := buildPeerMapPairScan(pm, in)
+					for _, prev := range []*PeerClasses{nil, previous} {
+						got := pm.BuildPeerClasses(in, prev)
+						for _, node := range in.All() {
+							require.Equal(t, nilIfEmpty(want[node.ID()]), nilIfEmpty(got.Peers(node.ID())), "node %d", node.ID())
+						}
+					}
+				}
+			}
+
+			for _, node := range nodes {
+				require.Equal(t, nilIfEmpty(oldPeers[node.ID]), nilIfEmpty(previous.Peers(node.ID)), "retained node %d", node.ID)
+			}
+		})
+	}
+}
+
+func BenchmarkPeerClassesSharedMatchers(b *testing.B) {
+	for _, ruleCount := range []int{0, 100, 500, 2000} {
+		for _, shape := range []string{"shared", "self", "via"} {
+			b.Run(fmt.Sprintf("rules=%d/%s", ruleCount, shape), func(b *testing.B) {
+				nodes, users, _ := diversePeerPolicy(20, "self")
+
+				grants := make([]map[string]any, 0, ruleCount+1)
+				for i := range ruleCount {
+					user := users[i%len(users)].Name + "@"
+					grants = append(grants, map[string]any{
+						"src": []string{user, fmt.Sprintf("10.255.%d.%d", i/256, i%256)},
+						"dst": []string{user}, "ip": []string{"tcp:443"},
+					})
+				}
+
+				switch shape {
+				case "self":
+					grants = append(grants, map[string]any{"src": []string{"autogroup:member"}, "dst": []string{"autogroup:self"}, "ip": []string{"tcp:22"}})
+				case "via":
+					nodes = append(nodes, ownRulesNode(21, nil, []string{"tag:router"}, "10.1.0.0/24"))
+					grants = append(grants, map[string]any{"src": []string{"autogroup:member"}, "dst": []string{"10.1.0.0/24"}, "ip": []string{"tcp:443"}, "via": []string{"tag:router"}})
+				}
+
+				policy, err := json.Marshal(map[string]any{"tagOwners": map[string][]string{"tag:router": {}}, "grants": grants})
+				require.NoError(b, err)
+
+				in := nodes.ViewSlice()
+				pm, err := NewPolicyManager(policy, users, in)
+				require.NoError(b, err)
+				require.Len(b, pm.matchers, ruleCount, "distinct source sets must keep every shared rule")
+				previous := pm.BuildPeerClasses(in, nil)
+
+				want := buildPeerMapPairScan(pm, in)
+				for _, node := range nodes {
+					require.Equal(b, nilIfEmpty(want[node.ID]), nilIfEmpty(previous.Peers(node.ID)))
+				}
+
+				for _, phase := range []string{"fresh", "reuse"} {
+					b.Run(phase, func(b *testing.B) {
+						var prev *PeerClasses
+						if phase == "reuse" {
+							prev = previous
+						}
+
+						b.ReportAllocs()
+
+						for b.Loop() {
+							pm.BuildPeerClasses(in, prev)
+						}
+
+						b.ReportMetric(float64(len(pm.matchers)), "shared-rules/op")
+					})
+				}
+			})
+		}
+	}
+}
+
+func TestAuditCatchesStaleMatchersAndVia(t *testing.T) {
+	u1, u2 := &scanUsers[0], &scanUsers[1]
+
+	t.Run("carried matchers", func(t *testing.T) {
+		pol := []byte(`{"acls":[{"action":"accept","src":["u1@"],"dst":["u1@:*"]}]}`)
+		nodes := types.Nodes{ownRulesNode(1, u1, nil), ownRulesNode(2, u1, nil)}.ViewSlice()
+
+		prev, err := NewPolicyManager(pol, scanUsers, nodes)
+		require.NoError(t, err)
+
+		inc, err := NewPolicyManagerFrom(prev, pol, scanUsers, nodes)
+		require.NoError(t, err)
+		require.NoError(t, inc.Audit(pol, scanUsers, nodes), "test sanity: intact matchers pass")
+
+		// Widen each carried matcher to an address no node has, so peers
+		// and filters stay as they are.
+		for k, m := range prev.matcherCache {
+			rule := tailcfg.FilterRule{DstPorts: []tailcfg.NetPortRange{{IP: "10.99.0.1", Ports: tailcfg.PortRangeAny}}}
+			for _, p := range m.Srcs().Prefixes() {
+				rule.SrcIPs = append(rule.SrcIPs, p.String())
+			}
+
+			for _, p := range m.Dests().Prefixes() {
+				rule.DstPorts = append(rule.DstPorts, tailcfg.NetPortRange{IP: p.String(), Ports: tailcfg.PortRangeAny})
+			}
+
+			prev.matcherCache[k] = matcher.MatchFromFilterRule(rule)
+		}
+
+		inc, err = NewPolicyManagerFrom(prev, pol, scanUsers, nodes)
+		require.NoError(t, err)
+		require.ErrorIs(t, inc.Audit(pol, scanUsers, nodes), errAuditMismatch)
+	})
+
+	t.Run("via", func(t *testing.T) {
+		pol := []byte(`{"tagOwners":{"tag:srv":["u1@"]},"grants":[{"src":["*"],"dst":["*"],"ip":["*"]},
+			{"src":["u2@"],"dst":["10.1.0.0/24"],"ip":["*"],"via":["tag:srv"]}]}`)
+		nodes := types.Nodes{
+			ownRulesNode(1, nil, []string{"tag:srv"}, "10.1.0.0/24"),
+			ownRulesNode(2, u2, nil),
+		}.ViewSlice()
+
+		pm, err := NewPolicyManager(pol, scanUsers, nodes)
+		require.NoError(t, err)
+		require.NotEmpty(t, pm.ViaRoutesForPeer(nodes.At(1), nodes.At(0)).Include, "test sanity: the via grant applies")
+		require.NoError(t, pm.Audit(pol, scanUsers, nodes), "test sanity: an intact via preparation passes")
+
+		// The grant's sources resolve to no one: only via routes change.
+		prep := pm.viaPrep()
+		for i := range prep.srcs {
+			prep.srcs[i] = &netipx.IPSet{}
+		}
+
+		require.ErrorIs(t, pm.Audit(pol, scanUsers, nodes), errAuditMismatch)
+	})
+}
+
+func diversePeerPolicy(n int, shape string) (types.Nodes, []types.User, []byte) {
+	nodes := scanManyRulesNodes(n)
+
+	var (
+		users  []types.User
+		grants []string
+		owners []string
+	)
+
+	switch shape {
+	case "pairs", "tag-pairs", "app-pairs", "overlapping-pairs", "cliques", "dense":
+		for i := 0; i < n; i += 2 {
+			src, dst := nodes[i].IPv4.String(), nodes[i+1].IPv4.String()
+			if shape == "tag-pairs" {
+				src, dst = nodes[i].Tags[0], nodes[i+1].Tags[0]
+				owners = append(owners, fmt.Sprintf(`%q:[],%q:[]`, src, dst))
+			}
+
+			if shape == "dense" {
+				dst = "*"
+			}
+
+			if shape == "cliques" {
+				src = netip.PrefixFrom(*nodes[i].IPv4, 31).String()
+				dst = src
+			}
+
+			access := `"ip":["*"]`
+			if shape == "app-pairs" {
+				access = `"app":{"example.com/cap/read":[{}]}`
+			}
+
+			grants = append(grants, fmt.Sprintf(`{"src":[%q],"dst":[%q],%s}`, src, dst, access))
+			if shape == "overlapping-pairs" {
+				grants = append(grants, fmt.Sprintf(`{"src":[%q],"dst":[%q],%s}`, nodes[i].IPv6.String(), nodes[i+1].IPv6.String(), access))
+			}
+		}
+	case "self":
+		users = make([]types.User, n/2)
+		for i := range users {
+			users[i] = types.User{ID: uint(i + 1), Name: fmt.Sprintf("u%d", i)} //nolint:gosec // bounded fixture
+		}
+
+		for i, node := range nodes {
+			node.Tags = nil
+			node.User = &users[i/2]
+			node.UserID = &users[i/2].ID
+		}
+
+		grants = append(grants, `{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["*"]}`)
+	case "allow-all":
+		return nodes, nil, nil
+	}
+
+	return nodes, users, []byte(`{"tagOwners":{` + strings.Join(owners, ",") + `},"grants":[` + strings.Join(grants, ",") + `]}`)
+}
+
+func BenchmarkPeerClassesDiversity(b *testing.B) {
+	for _, shape := range []string{"pairs", "tag-pairs", "dense", "self", "allow-all"} {
+		for _, n := range []int{100, 500, 1000, 2000} {
+			b.Run(fmt.Sprintf("%s/nodes=%d", shape, n), func(b *testing.B) {
+				nodes, users, pol := diversePeerPolicy(n, shape)
+				in := nodes.ViewSlice()
+				pm, err := NewPolicyManager(pol, users, in)
+				require.NoError(b, err)
+
+				prev := pm.BuildPeerClasses(in, nil)
+
+				for _, phase := range []string{"compile", "fresh", "reuse"} {
+					b.Run(phase, func(b *testing.B) {
+						b.ReportAllocs()
+
+						var built *PeerClasses
+
+						for b.Loop() {
+							switch phase {
+							case "compile":
+								_, err := NewPolicyManager(pol, users, in)
+								require.NoError(b, err)
+							case "fresh":
+								built = pm.BuildPeerClasses(in, nil)
+							case "reuse":
+								built = pm.BuildPeerClasses(in, prev)
+							}
+						}
+
+						if built != nil {
+							b.ReportMetric(float64(len(built.views)), "classes/op")
+						}
+
+						b.ReportMetric(float64(len(pm.matchers)), "matchers/op")
+					})
+				}
+			})
+		}
+	}
+}
+
+// TestMatcherKeyEquivalence compares the identity relation with the prefix-based
+// key, including canonical rewrites and destinations split across ports/caps.
+func TestMatcherKeyEquivalence(t *testing.T) {
+	t.Parallel()
+
+	prefixKey := func(m *matcher.Match) string {
+		var b strings.Builder
+		fmt.Fprintf(&b, "%t,%t|", m.DestsIsTheInternet(), m.CapDestsIsTheInternet())
+
+		for _, p := range m.Srcs().Prefixes() {
+			b.WriteString(p.String())
+			b.WriteByte(',')
+		}
+
+		b.WriteByte('>')
+
+		for _, p := range m.Dests().Prefixes() {
+			b.WriteString(p.String())
+			b.WriteByte(',')
+		}
+
+		return b.String()
+	}
+
+	addresses := []string{
+		"invalid", "10.0.0.0/25", "10.0.0.128/25", "10.0.0.0/24",
+		"2001:db8::/65", "2001:db8:0:0:8000::/65", "2001:db8::/64", "::ffff:10.0.0.1",
+		"10.0.0.1-10.0.0.3", "10.0.0.1", "0.0.0.0/0", "::/0", "*",
+	}
+	oldToNew, newToOld := map[string]string{}, map[string]string{}
+
+	for i := range 512 {
+		rule := tailcfg.FilterRule{}
+		for j := range i % 5 {
+			rule.SrcIPs = append(rule.SrcIPs, addresses[(i+j*7)%len(addresses)])
+			rule.DstPorts = append(rule.DstPorts, tailcfg.NetPortRange{IP: addresses[(i*3+j)%len(addresses)]})
+		}
+
+		if i%3 == 0 {
+			rule.CapGrant = []tailcfg.CapGrant{{Dsts: []netip.Prefix{
+				netip.MustParsePrefix("8.8.8.0/24"), netip.MustParsePrefix("2001:db8::/64"),
+			}}}
+		}
+
+		for range 2 {
+			m := matcher.MatchFromFilterRule(rule)
+
+			old, key := prefixKey(&m), matcherKey(&m)
+			if previous, ok := oldToNew[old]; ok {
+				require.Equal(t, previous, key, "canonical equality lost: rule %d", i)
+			}
+
+			if previous, ok := newToOld[key]; ok {
+				require.Equal(t, previous, old, "key collision: rule %d", i)
+			}
+
+			oldToNew[old], newToOld[key] = key, old
+
+			rule.SrcIPs = append(rule.SrcIPs, rule.SrcIPs...)
+			slices.Reverse(rule.SrcIPs)
+			rule.DstPorts = append(rule.DstPorts, rule.DstPorts...)
+			slices.Reverse(rule.DstPorts)
+		}
+	}
+}
+
+func BenchmarkMatcherKey(b *testing.B) {
+	for _, shape := range []string{"prefixes", "ranges"} {
+		for _, n := range []int{0, 1, 10, 100, 1000} {
+			b.Run(fmt.Sprintf("%s/ranges=%d", shape, n), func(b *testing.B) {
+				rule := tailcfg.FilterRule{}
+
+				for i := range n {
+					var first, last netip.Addr
+					if i%2 == 0 {
+						first = netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 1})
+						last = netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 254})
+					} else {
+						first = netip.AddrFrom16([16]byte{0x20, 1, 0xd, 0xb8, byte(i >> 8), byte(i), 15: 1})
+						last = netip.AddrFrom16([16]byte{0x20, 1, 0xd, 0xb8, byte(i >> 8), byte(i), 15: 254})
+					}
+
+					address := first.String()
+					if shape == "ranges" {
+						address += "-" + last.String()
+					}
+
+					rule.SrcIPs = append(rule.SrcIPs, address)
+					rule.DstPorts = append(rule.DstPorts, tailcfg.NetPortRange{IP: address})
+				}
+
+				m := matcher.MatchFromFilterRule(rule)
+				require.Len(b, m.Srcs().Ranges(), n)
+				require.Len(b, m.Dests().Ranges(), n)
+				b.ReportAllocs()
+
+				var key string
+				for b.Loop() {
+					key = matcherKey(&m)
+				}
+
+				require.NotEmpty(b, key)
+			})
+		}
+	}
+}
+
+func BenchmarkCachedMatcherSidesChanges(b *testing.B) {
+	for _, shape := range []string{"pairs", "tag-pairs", "dense", "self", "allow-all"} {
+		for _, n := range []int{100, 500, 1000, 2000} {
+			b.Run(fmt.Sprintf("%s/nodes=%d", shape, n), func(b *testing.B) {
+				nodes, users, pol := diversePeerPolicy(n, shape)
+				pm, err := NewPolicyManager(pol, users, nodes.ViewSlice())
+				require.NoError(b, err)
+
+				matchers := pm.matchers
+				if pm.needsPerNodeFilter {
+					matchers = matcher.MatchesFromFilterRules(sharedRules(pm.compiledGrants))
+				}
+
+				_, _, prev := cachedMatcherSides(matchers, nodes.ViewSlice(), nil)
+				changed := slices.Clone(nodes)
+				changed[0] = nodes[0].Clone()
+				ip := netip.MustParseAddr("100.127.255.254")
+				changed[0].IPv4, changed[0].IPv6 = &ip, nil
+				reordered := slices.Clone(matchers)
+				slices.Reverse(reordered)
+
+				for _, phase := range []string{"unchanged", "one-node", "reordered"} {
+					b.Run(phase, func(b *testing.B) {
+						in, ms := nodes.ViewSlice(), matchers
+
+						switch phase {
+						case "one-node":
+							in = changed.ViewSlice()
+						case "reordered":
+							ms = reordered
+						}
+
+						wantSrc, wantDst := matcherSides(ms, in)
+						src, dst, _ := cachedMatcherSides(ms, in, prev)
+						require.Equal(b, wantSrc, src)
+						require.Equal(b, wantDst, dst)
+						b.ReportAllocs()
+
+						for b.Loop() {
+							cachedMatcherSides(ms, in, prev)
+						}
+					})
+				}
+			})
+		}
+	}
+}
+
+func TestCachedMatcherSides(t *testing.T) {
+	nodes := scanManyRulesNodes(130)
+	nodes = append(nodes, ownRulesNode(131, nil, nil, "10.1.0.0/24"),
+		ownRulesNode(132, nil, nil, "0.0.0.0/0", "::/0"), &types.Node{ID: 133})
+
+	var rules []tailcfg.FilterRule
+	for i := 0; i < 130; i += 2 {
+		rules = append(rules, tailcfg.FilterRule{
+			SrcIPs:   []string{nodes[i].IPv4.String()},
+			DstPorts: []tailcfg.NetPortRange{{IP: nodes[i+1].IPv4.String(), Ports: tailcfg.PortRangeAny}},
+		})
+	}
+
+	rules = append(rules, tailcfg.FilterRule{
+		SrcIPs:   []string{"10.1.0.0/24"},
+		DstPorts: []tailcfg.NetPortRange{{IP: "10.2.0.0/24", Ports: tailcfg.PortRangeAny}},
+	}, tailcfg.FilterRule{
+		SrcIPs:   []string{nodes[0].IPv4.String()},
+		DstPorts: []tailcfg.NetPortRange{{IP: "0.0.0.0/0", Ports: tailcfg.PortRangeAny}},
+	}, rules[0])
+	ms := matcher.MatchesFromFilterRules(rules)
+	_, _, prev := cachedMatcherSides(ms, nodes.ViewSlice(), nil)
+
+	rewritten := slices.Clone(rules)
+	for i, rule := range rules {
+		rewritten[i].SrcIPs = append(slices.Clone(rule.SrcIPs), rule.SrcIPs...)
+		rewritten[i].DstPorts = append(slices.Clone(rule.DstPorts), rule.DstPorts...)
+		slices.Reverse(rewritten[i].SrcIPs)
+		slices.Reverse(rewritten[i].DstPorts)
+	}
+
+	frozen := &sideCache{keys: slices.Clone(prev.keys), nodes: make(map[types.NodeID]cachedSides)}
+	for id, old := range prev.nodes {
+		frozen.nodes[id] = cachedSides{node: old.node, src: slices.Clone(old.src), dst: slices.Clone(old.dst)}
+	}
+
+	reordered := slices.Clone(ms)
+	slices.Reverse(reordered)
+
+	added := matcher.MatchFromFilterRule(tailcfg.FilterRule{
+		SrcIPs:   []string{nodes[0].IPv4.String()},
+		DstPorts: []tailcfg.NetPortRange{{IP: nodes[2].IPv4.String(), Ports: tailcfg.PortRangeAny}},
+	})
+	changed := slices.Clone(nodes)
+	changed[0] = nodes[0].Clone()
+	ip := netip.MustParseAddr("100.127.255.254")
+	changed[0].IPv4, changed[0].IPv6 = &ip, nil
+	changed[130] = ownRulesNode(131, nil, nil, "10.2.0.0/24")
+	changed[131] = ownRulesNode(132, nil, nil)
+
+	for _, tc := range []struct {
+		name     string
+		matchers []matcher.Match
+		nodes    types.Nodes
+		share    bool
+	}{
+		{"unchanged", ms, nodes, true},
+		{"equivalent matchers", matcher.MatchesFromFilterRules(rules), nodes, true},
+		{"rewritten rules", matcher.MatchesFromFilterRules(rewritten), nodes, true},
+		{"reordered", reordered, nodes, false},
+		{"inserted", slices.Insert(slices.Clone(ms), 1, added), nodes, false},
+		{"deleted", ms[2:], nodes, false},
+		{"duplicates", append(slices.Clone(ms), ms[0]), nodes, false},
+		{"no matchers", nil, nodes, false},
+		{"no nodes", ms, nil, true},
+		{"changed addresses routes and exit", ms, changed, true},
+		{"node removed", ms, nodes[1:], true},
+		{"node added", ms, append(slices.Clone(nodes), ownRulesNode(134, nil, nil, "10.1.0.0/24")), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := tc.nodes.ViewSlice()
+			wantSrc, wantDst := matcherSides(tc.matchers, in)
+			src, dst, next := cachedMatcherSides(tc.matchers, in, prev)
+			require.Equal(t, wantSrc, src)
+			require.Equal(t, wantDst, dst)
+			require.Len(t, next.nodes, len(tc.nodes))
+			require.Equal(t, frozen, prev, "previous snapshot changed")
+
+			for i, node := range in.All() {
+				old, ok := prev.lookup(node)
+				if !tc.share || !ok {
+					continue
+				}
+
+				if len(old.src) > 0 {
+					require.Same(t, &old.src[0], &src[i][0], "source mask copied")
+				}
+
+				if len(old.dst) > 0 {
+					require.Same(t, &old.dst[0], &dst[i][0], "destination mask copied")
+				}
+			}
+
+			// A later reorder and insertion must never write shared masks.
+			cachedMatcherSides(append(slices.Clone(reordered), added), in, next)
+			require.Equal(t, frozen, prev, "later build changed previous snapshot")
+			require.Equal(t, wantSrc, src, "later build changed source masks")
+			require.Equal(t, wantDst, dst, "later build changed destination masks")
+		})
+	}
+
+	in := nodes.ViewSlice()
+	_, _, empty := cachedMatcherSides(nil, in, nil)
+	src, dst, _ := cachedMatcherSides([]matcher.Match{}, in, empty)
+	wantSrc, wantDst := matcherSides(nil, in)
+	require.Equal(t, wantSrc, src)
+	require.Equal(t, wantDst, dst)
+	src, dst, _ = cachedMatcherSides(ms, in, empty)
+	wantSrc, wantDst = matcherSides(ms, in)
+	require.Equal(t, wantSrc, src)
+	require.Equal(t, wantDst, dst)
+}
+
+// BenchmarkSelfRuleChurn includes the incremental compile and peer build after
+// one user's membership changes; users/grants is a non-self diversity control.
+func BenchmarkSelfRuleChurn(b *testing.B) {
+	for _, shape := range []string{"self", "users"} {
+		for _, size := range []int{100, 500, 1000, 2000} {
+			for _, change := range []string{"unchanged", "join", "leave"} {
+				b.Run(fmt.Sprintf("%s/nodes=%d/%s", shape, size, change), func(b *testing.B) {
+					nodes := scanManyRulesNodes(size)
+					users := make([]types.User, size/10)
+
+					var grants []string
+
+					for i := range users {
+						users[i] = types.User{ID: uint(i + 1), Name: fmt.Sprintf("u%d", i)} //nolint:gosec // bounded fixture
+						if shape == "users" {
+							grants = append(grants, fmt.Sprintf(`{"src":[%q],"dst":[%q],"ip":["tcp:443"]}`, users[i].Name+"@", users[i].Name+"@"))
+						}
+					}
+
+					for i, n := range nodes {
+						n.Tags = nil
+						n.User, n.UserID = &users[i/10], &users[i/10].ID
+					}
+
+					if shape == "self" {
+						grants = append(grants, `{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["tcp:443"]}`)
+					}
+
+					pol := []byte(`{"grants":[` + strings.Join(grants, ",") + `]}`)
+					before := nodes.ViewSlice()
+					prev, err := NewPolicyManager(pol, users, before)
+					require.NoError(b, err)
+
+					classes := prev.BuildPeerClasses(before, nil)
+					after := slices.Clone(nodes)
+
+					switch change {
+					case "join":
+						joined := nodes[0].Clone()
+						joined.ID = types.NodeID(size + 1) //nolint:gosec // bounded fixture
+						joined.IPv4, joined.IPv6 = ap("100.127.255.254"), ap("fd7a:115c:a1e0::ffff")
+						after = append(after, joined)
+					case "leave":
+						after = after[1:]
+					}
+
+					in := after.ViewSlice()
+
+					var builds int
+
+					b.ReportAllocs()
+
+					for b.Loop() {
+						pm, err := NewPolicyManagerFrom(prev, pol, users, in)
+						require.NoError(b, err)
+
+						carried := pm.selfRules.Size()
+						pm.BuildPeerClasses(in, classes)
+						builds += pm.selfRules.Size() - carried
+					}
+
+					b.ReportMetric(float64(builds)/float64(b.N), "self-builds/op")
+				})
+			}
+		}
+	}
+}
+
+func TestFilterChangedNodesWithoutACompile(t *testing.T) {
+	pm, err := NewPolicyManager([]byte(`{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`), scanUsers, views.Slice[types.NodeView]{})
+	require.NoError(t, err)
+
+	for name, pair := range map[string][2]*PolicyManager{
+		"no previous": {pm, nil},
+		"no next":     {nil, pm},
+		"neither":     {nil, nil},
+	} {
+		changed, all := pair[0].FilterChangedNodes(pair[1])
+		assert.True(t, all, name)
+		assert.Empty(t, changed, name)
+	}
+}
+
+func TestNewPolicyManagerFromMatchesFresh(t *testing.T) {
+	r := rand.New(rand.NewPCG(9, 10)) //nolint:gosec // reproducible test input
+
+	reused, narrowed, narrowedPerNode, narrowedDoc := 0, 0, 0, 0
+
+	for it := range 300 {
+		nodes := scanRandomNodes(r, 2+r.IntN(30))
+		polB := scanRandomPolicy(r)
+		nextID := len(nodes) + 1
+
+		var prev *PolicyManager
+
+		for step := range 8 {
+			fresh, err := NewPolicyManager(polB, scanUsers, nodes.ViewSlice())
+			if err != nil {
+				break
+			}
+
+			inc, err := NewPolicyManagerFrom(prev, polB, scanUsers, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			msg := fmt.Sprintf("iteration %d step %d, policy %s", it, step, polB)
+			require.Equal(t, fresh.compiledGrants, inc.compiledGrants, msg)
+			require.Equal(t, fresh.filter, inc.filter, msg)
+			require.Equal(t, fresh.BuildPeerMap(nodes.ViewSlice()), inc.BuildPeerMap(nodes.ViewSlice()), msg)
+			require.Equal(t, fresh.tagOwnerMap, inc.tagOwnerMap, msg)
+			require.Equal(t, fresh.autoApproveMap, inc.autoApproveMap, msg)
+			require.Equal(t, fresh.exitSet, inc.exitSet, msg)
+			require.Equal(t, fresh.nodeAttrsMap, inc.nodeAttrsMap, msg)
+
+			for _, n := range nodes {
+				want, err := fresh.FilterForNode(n.View())
+				require.NoError(t, err)
+
+				got, err := inc.FilterForNode(n.View())
+				require.NoError(t, err)
+				require.Equal(t, want, got, "%s, node %d", msg, n.ID)
+
+				wantSSH, err := fresh.SSHPolicy(scanServerURL, n.View())
+				require.NoError(t, err)
+
+				gotSSH, err := inc.SSHPolicy(scanServerURL, n.View())
+				require.NoError(t, err)
+				require.Equal(t, wantSSH, gotSSH, "%s, node %d SSH", msg, n.ID)
+			}
+
+			// Outside FilterChangedNodes, a node that did not change keeps
+			// its filter.
+			if changed, all := inc.FilterChangedNodes(prev); prev != nil && !all {
+				narrowed++
+
+				if inc.needsPerNodeFilter {
+					narrowedPerNode++
+				}
+
+				if !bytes.Equal(prev.src, inc.src) {
+					narrowedDoc++
+				}
+
+				for _, n := range nodes {
+					old, ok := prev.nodesByID[n.ID]
+					if !ok || old != n.View() || slices.Contains(changed, n.ID) {
+						continue
+					}
+
+					was, err := prev.FilterForNode(old)
+					require.NoError(t, err)
+
+					is, err := inc.FilterForNode(n.View())
+					require.NoError(t, err)
+					require.Equal(t, was, is, "%s, unchanged node %d", msg, n.ID)
+
+					wasSSH, err := prev.SSHPolicy(scanServerURL, old)
+					require.NoError(t, err)
+
+					isSSH, err := inc.SSHPolicy(scanServerURL, n.View())
+					require.NoError(t, err)
+					require.Equal(t, wasSSH, isSSH, "%s, unchanged node %d SSH", msg, n.ID)
+				}
+			}
+
+			if prev != nil {
+				for i := range inc.grantResults {
+					if i < len(prev.grantResults) && inc.grantResults[i].cg == prev.grantResults[i].cg && inc.grantResults[i].cg != nil {
+						reused++
+					}
+				}
+			}
+
+			prev = inc
+
+			// Now and then the document changes instead of a node.
+			if r.IntN(5) == 0 {
+				polB = scanRandomPolicy(r)
+
+				continue
+			}
+
+			switch r.IntN(4) {
+			case 0:
+				i := r.IntN(len(nodes))
+				c := nodes[i].Clone()
+				c.Tags = []string{scanTags[r.IntN(len(scanTags))]}
+				c.User, c.UserID = nil, nil
+				nodes[i] = c
+			case 1:
+				extra := scanRandomNodes(r, nextID)
+				nodes = append(slices.Clone(nodes), extra[nextID-1])
+				nextID++
+			case 2:
+				if len(nodes) > 2 {
+					i := r.IntN(len(nodes))
+					nodes = slices.Delete(slices.Clone(nodes), i, i+1)
+				}
+			default:
+				i := r.IntN(len(nodes))
+				c := nodes[i].Clone()
+				c.ApprovedRoutes = nil
+				nodes[i] = c
+			}
+		}
+	}
+
+	// The comparison is only worth something if grants were reused and
+	// recompiles narrowed.
+	require.Greater(t, reused, 100, "grants reused")
+	require.Greater(t, narrowed, 100, "recompiles narrowed")
+	require.Greater(t, narrowedPerNode, 50, "per-node recompiles narrowed")
+	require.Greater(t, narrowedDoc, 20, "document changes narrowed")
+}
+
+func TestInheritFiltersNodeIdentity(t *testing.T) {
+	pol := []byte(`{"tagOwners":{"tag:srv":["u1@"]},"acls":[{"action":"accept","src":["u2@"],"dst":["tag:srv:443"]}],
+		"ssh":[{"action":"check","src":["u2@"],"dst":["tag:srv"],"users":["root"]}]}`)
+
+	for _, change := range []string{"identical", "equal clone", "changed rules"} {
+		t.Run(change, func(t *testing.T) {
+			nodes := types.Nodes{ownRulesNode(1, nil, []string{"tag:srv"}), ownRulesNode(2, &scanUsers[1], nil), ownRulesNode(3, &scanUsers[2], nil)}
+			prev, err := NewPolicyManager(pol, scanUsers, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			oldRules, err := prev.FilterForNode(nodes[0].View())
+			require.NoError(t, err)
+			require.NotEmpty(t, oldRules)
+
+			urls := []string{scanServerURL, "https://other.example.com"}
+
+			oldSSH := make([]*tailcfg.SSHPolicy, len(urls))
+			for i, url := range urls {
+				oldSSH[i], err = prev.SSHPolicy(url, nodes[0].View())
+				require.NoError(t, err)
+				require.NotEmpty(t, oldSSH[i].Rules)
+			}
+
+			frozenRules, err := json.Marshal(oldRules)
+			require.NoError(t, err)
+			frozenSSH, err := json.Marshal(oldSSH)
+			require.NoError(t, err)
+
+			after, source := slices.Clone(nodes), pol
+
+			switch change {
+			case "equal clone":
+				after[0] = nodes[0].Clone()
+			case "changed rules":
+				source = bytes.ReplaceAll(pol, []byte("u2@"), []byte("u3@"))
+			}
+
+			next, err := NewPolicyManagerFrom(prev, source, scanUsers, after.ViewSlice())
+			require.NoError(t, err)
+
+			carried, ok := next.filterRulesMap.Load(nodes[0].ID)
+			require.Equal(t, change != "changed rules", ok)
+
+			if ok {
+				require.Equal(t, oldRules, carried)
+			}
+
+			for i, url := range urls {
+				ssh, ok := next.sshPolicyMap.Load(sshKey{url, nodes[0].ID})
+				require.Equal(t, change != "changed rules", ok)
+
+				if ok {
+					require.Same(t, oldSSH[i], ssh)
+				}
+			}
+
+			require.NoError(t, next.Audit(source, scanUsers, after.ViewSlice()))
+			require.NoError(t, prev.Audit(pol, scanUsers, nodes.ViewSlice()))
+
+			stillRules, err := json.Marshal(oldRules)
+			require.NoError(t, err)
+			stillSSH, err := json.Marshal(oldSSH)
+			require.NoError(t, err)
+			require.Equal(t, frozenRules, stillRules, "old packet filter is immutable")
+			require.Equal(t, frozenSSH, stillSSH, "old SSH policies are immutable")
+		})
+	}
+}
+
+// BenchmarkPolicyWarmCacheChurn includes compilation and inheritance from fixed,
+// warmed packet and SSH caches; it excludes peer construction and map delivery.
+func BenchmarkPolicyWarmCacheChurn(b *testing.B) {
+	for _, size := range []int{100, 6600} {
+		b.Run(fmt.Sprintf("nodes=%d", size), func(b *testing.B) {
+			policy, users, before := userAliasFixture(b, size, min(size, 402), 402, false)
+			prev, err := NewPolicyManager(policy, users, before.ViewSlice())
+			require.NoError(b, err)
+
+			for _, n := range before {
+				_, err := prev.FilterForNode(n.View())
+				require.NoError(b, err)
+				_, err = prev.SSHPolicy(scanServerURL, n.View())
+				require.NoError(b, err)
+			}
+
+			require.Equal(b, size, prev.filterRulesMap.Size())
+			require.Equal(b, size, prev.sshPolicyMap.Size())
+
+			for _, change := range []string{"unchanged", "endpoint", "address", "join", "leave", "equal-clones"} {
+				b.Run(change, func(b *testing.B) {
+					after := slices.Clone(before)
+
+					switch change {
+					case "endpoint", "address":
+						after[0] = before[0].Clone()
+						if change == "endpoint" {
+							after[0].Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:12345")}
+						} else {
+							after[0].IPv4 = ap("100.65.0.1")
+						}
+					case "join":
+						joined := before[0].Clone()
+						joined.ID = types.NodeID(size + 1) //nolint:gosec // bounded fixture
+						joined.IPv4 = ap("100.65.0.1")
+						after = append(after, joined)
+					case "leave":
+						after = after[1:]
+					case "equal-clones":
+						for i, n := range before {
+							after[i] = n.Clone()
+						}
+					}
+
+					in := after.ViewSlice()
+
+					b.ReportAllocs()
+
+					for b.Loop() {
+						_, err := NewPolicyManagerFrom(prev, policy, users, in)
+						if err != nil {
+							b.Fatal(err)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func ownRulesNode(id int, user *types.User, tags []string, routes ...string) *types.Node {
+	v4 := netip.AddrFrom4([4]byte{100, 64, 0, byte(id)})                               //nolint:gosec
+	v6 := netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 15: byte(id)}) //nolint:gosec
+
+	n := &types.Node{ID: types.NodeID(id), Hostname: fmt.Sprintf("n%d", id), IPv4: &v4, IPv6: &v6, Tags: tags} //nolint:gosec
+	if user != nil {
+		n.User, n.UserID = user, &user.ID
+	}
+
+	for _, r := range routes {
+		n.ApprovedRoutes = append(n.ApprovedRoutes, netip.MustParsePrefix(r))
+	}
+
+	n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: n.ApprovedRoutes}
+
+	return n
+}
+
+func TestFilterChangedNodesReachesOwnRules(t *testing.T) {
+	u1, u2 := &scanUsers[0], &scanUsers[1]
+
+	tests := []struct {
+		name          string
+		policy        string
+		before, after types.Nodes
+		want          []types.NodeID
+	}{
+		{
+			// a1 leaving u1 changes a2's self rules, and the exit node
+			// carries every user's.
+			name:   "self",
+			policy: `{"tagOwners":{"tag:x":["u1@"]},"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`,
+			before: types.Nodes{ownRulesNode(1, u1, nil), ownRulesNode(2, u1, nil), ownRulesNode(3, nil, []string{"tag:x"}, "0.0.0.0/0", "::/0")},
+			after:  types.Nodes{ownRulesNode(1, nil, []string{"tag:x"}), ownRulesNode(2, u1, nil), ownRulesNode(3, nil, []string{"tag:x"}, "0.0.0.0/0", "::/0")},
+			want:   []types.NodeID{2, 3},
+		},
+		{
+			// A new u2 node is a new source of the via rules r1 carries.
+			name: "via",
+			policy: `{"tagOwners":{"tag:router":["u1@"]},
+				"grants":[{"src":["u2@"],"dst":["10.1.0.0/24"],"ip":["*"],"via":["tag:router"]}]}`,
+			before: types.Nodes{ownRulesNode(1, nil, []string{"tag:router"}, "10.1.0.0/24"), ownRulesNode(2, u2, nil)},
+			after:  types.Nodes{ownRulesNode(1, nil, []string{"tag:router"}, "10.1.0.0/24"), ownRulesNode(2, u2, nil), ownRulesNode(4, u2, nil)},
+			want:   []types.NodeID{1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prev, err := NewPolicyManager([]byte(tt.policy), scanUsers, tt.before.ViewSlice())
+			require.NoError(t, err)
+
+			for _, n := range tt.before {
+				_, err := prev.FilterForNode(n.View())
+				require.NoError(t, err)
+			}
+
+			inc, err := NewPolicyManagerFrom(prev, []byte(tt.policy), scanUsers, tt.after.ViewSlice())
+			require.NoError(t, err)
+
+			fresh, err := NewPolicyManager([]byte(tt.policy), scanUsers, tt.after.ViewSlice())
+			require.NoError(t, err)
+
+			changed, all := inc.FilterChangedNodes(prev)
+			require.False(t, all)
+
+			for _, id := range tt.want {
+				assert.Contains(t, changed, id)
+
+				n := tt.after[slices.IndexFunc(tt.after, func(n *types.Node) bool { return n.ID == id })]
+
+				was, err := prev.FilterForNode(prev.nodesByID[id])
+				require.NoError(t, err)
+
+				want, err := fresh.FilterForNode(n.View())
+				require.NoError(t, err)
+
+				got, err := inc.FilterForNode(n.View())
+				require.NoError(t, err)
+
+				assert.NotEqual(t, want, was, "node %d's own rules must change", id)
+				assert.Equal(t, want, got, "node %d", id)
+			}
+		})
+	}
+}
+
+func TestBuildPeerClassesDiversity(t *testing.T) {
+	// More than 64 rules crosses matcher-word boundaries; empty, isolated,
+	// shared, and self classes are also covered by the pair-scan tests.
+	for _, shape := range []string{"pairs", "tag-pairs", "app-pairs", "overlapping-pairs", "cliques", "dense", "self", "allow-all"} {
+		t.Run(shape, func(t *testing.T) {
+			nodes, users, pol := diversePeerPolicy(130, shape)
+			pm, err := NewPolicyManager(pol, users, nodes.ViewSlice())
+			require.NoError(t, err)
+
+			fresh := pm.BuildPeerClasses(nodes.ViewSlice(), nil)
+
+			reused := pm.BuildPeerClasses(nodes.ViewSlice(), fresh)
+			for i, node := range nodes {
+				want := []types.NodeID{nodes[i^1].ID}
+				if shape == "dense" && i%2 == 1 {
+					want = nil
+					for j := 0; j < len(nodes); j += 2 {
+						want = append(want, nodes[j].ID)
+					}
+				} else if shape == "dense" || shape == "allow-all" {
+					want = nil
+
+					for _, other := range nodes {
+						if other.ID != node.ID {
+							want = append(want, other.ID)
+						}
+					}
+				}
+
+				require.Equal(t, want, fresh.Peers(node.ID))
+				require.Equal(t, want, reused.Peers(node.ID))
+			}
+
+			// The join only runs when it is the cheaper side of the same
+			// relation: sparse policies take it, dense ones the pair scan.
+			wantJoined := slices.Contains([]string{"pairs", "tag-pairs", "app-pairs", "overlapping-pairs", "cliques"}, shape)
+			require.Equal(t, wantJoined, fresh.joined, "shape %s took the wrong path", shape)
+
+			if strings.HasSuffix(shape, "pairs") {
+				matchers := len(nodes) / 2
+				if shape == "overlapping-pairs" {
+					matchers = len(nodes)
+				}
+
+				require.Len(t, pm.matchers, matchers)
+				require.Len(t, fresh.views, len(nodes))
+			}
+		})
+	}
+}
+
+func TestBuildPeerClassesReuseMatchesFresh(t *testing.T) {
+	r := rand.New(rand.NewPCG(7, 8)) //nolint:gosec // reproducible test input
+
+	for it := range 300 {
+		nodes := scanRandomNodes(r, 2+r.IntN(30))
+		polB := scanRandomPolicy(r)
+		nextID := len(nodes) + 1
+
+		var prev *PeerClasses
+
+		for step := range 8 {
+			pm, err := NewPolicyManager(polB, scanUsers, nodes.ViewSlice())
+			if err != nil {
+				break
+			}
+
+			classes := pm.BuildPeerClasses(nodes.ViewSlice(), prev)
+			want := buildPeerMapPairScan(pm, nodes.ViewSlice())
+
+			for _, n := range nodes {
+				require.Equalf(t, nilIfEmpty(slices.Sorted(slices.Values(want[n.ID]))), nilIfEmpty(classes.Peers(n.ID)),
+					"iteration %d step %d node %d, policy %s", it, step, n.ID, polB)
+			}
+
+			prev = classes
+
+			// Change the tailnet: one node's tags or user, a join, a
+			// leave, or the policy.
+			switch r.IntN(4) {
+			case 0:
+				i := r.IntN(len(nodes))
+				c := nodes[i].Clone()
+				c.Tags = []string{scanTags[r.IntN(len(scanTags))]}
+				c.User, c.UserID = nil, nil
+				nodes[i] = c
+			case 1:
+				// A fresh ID and so fresh addresses.
+				extra := scanRandomNodes(r, nextID)
+				nodes = append(slices.Clone(nodes), extra[nextID-1])
+				nextID++
+			case 2:
+				if len(nodes) > 2 {
+					i := r.IntN(len(nodes))
+					nodes = slices.Delete(slices.Clone(nodes), i, i+1)
+				}
+			default:
+				polB = scanRandomPolicy(r)
+			}
+		}
+	}
+}
+
+func TestBuildPeerClassesExplicitNodes(t *testing.T) {
+	pol := []byte(`{"tagOwners":{"tag:router":[],"tag:exit":[]},"grants":[
+		{"src":["autogroup:member"],"dst":["autogroup:self"],"ip":["tcp:443"]},
+		{"src":["u2@"],"dst":["10.1.0.0/24","fd00:1::/64"],"ip":["*"],"via":["tag:router"]},
+		{"src":["u1@"],"dst":["autogroup:internet"],"ip":["*"]}]}`)
+	nodes := types.Nodes{
+		ownRulesNode(1, &scanUsers[0], nil),
+		ownRulesNode(2, &scanUsers[0], nil),
+		ownRulesNode(3, &scanUsers[1], nil),
+		ownRulesNode(4, nil, []string{"tag:router"}, "10.1.0.0/24"),
+		ownRulesNode(5, nil, []string{"tag:router"}, "fd00:1::/64"),
+		ownRulesNode(6, nil, []string{"tag:exit"}, "0.0.0.0/0", "::/0"),
+	}
+	in := nodes.ViewSlice()
+	pm, err := NewPolicyManager(pol, scanUsers, in)
+	require.NoError(t, err)
+
+	retained := pm.BuildPeerClasses(in, nil)
+	index := pm.sideIndex()
+	wantIndex := sideIndex{byIP: slices.Clone(index.byIP), routers: slices.Clone(index.routers), exits: slices.Clone(index.exits)}
+
+	for _, change := range []string{"same", "copy", "clone", "order", "IPv4", "IPv6", "remove", "add", "router", "exit", "empty"} {
+		t.Run(change, func(t *testing.T) {
+			explicit := slices.Clone(nodes)
+
+			switch change {
+			case "clone":
+				for i, n := range explicit {
+					explicit[i] = n.Clone()
+				}
+			case "order":
+				slices.Reverse(explicit)
+			case "IPv4", "IPv6":
+				explicit[2] = explicit[2].Clone()
+				if change == "IPv4" {
+					explicit[2].IPv4 = ap("100.64.0.99")
+				} else {
+					explicit[2].IPv6 = ap("fd7a:115c:a1e0::99")
+				}
+			case "remove":
+				explicit = explicit[:3]
+			case "add":
+				explicit = append(explicit, ownRulesNode(7, nil, []string{"tag:router"}, "100.64.0.0/24", "fd7a:115c:a1e0::/64"))
+			case "router", "exit":
+				i := 3
+				if change == "exit" {
+					i = 5
+				}
+
+				explicit[i] = explicit[i].Clone()
+				explicit[i].ApprovedRoutes = nil
+			case "empty":
+				explicit = nil
+			}
+
+			input := explicit.ViewSlice()
+
+			switch change {
+			case "same":
+				input = in
+			case "copy":
+				input = views.SliceOf(in.AsSlice())
+			}
+
+			want := buildPeerMapPairScan(pm, input)
+			for _, classes := range []*PeerClasses{pm.BuildPeerClasses(input, nil), pm.BuildPeerClasses(input, retained)} {
+				for _, n := range input.All() {
+					require.Equal(t, nilIfEmpty(slices.Sorted(slices.Values(want[n.ID()]))), nilIfEmpty(classes.Peers(n.ID())), "node %d", n.ID())
+				}
+			}
+
+			next, err := NewPolicyManagerFrom(pm, pol, scanUsers, input)
+			require.NoError(t, err)
+			require.NoError(t, next.Audit(pol, scanUsers, input))
+			require.NoError(t, pm.AuditPeers(retained, in), "old snapshot must retain its original peers")
+			require.Equal(t, wantIndex, *index)
+		})
+	}
+}
+
+func TestSideIndexConcurrentReaders(t *testing.T) {
+	t.Parallel()
+
+	nodes, users, pol := diversePeerPolicy(20, "self")
+	in := nodes.ViewSlice()
+	pm, err := NewPolicyManager(pol, users, in)
+	require.NoError(t, err)
+
+	for reader := range 8 {
+		t.Run(strconv.Itoa(reader), func(t *testing.T) {
+			t.Parallel()
+
+			for range 10 {
+				classes := pm.BuildPeerClasses(in, nil)
+				idx := pm.sideIndex()
+				require.Len(t, idx.byIP, 2*len(nodes))
+
+				for i, n := range nodes {
+					require.Equal(t, []types.NodeID{nodes[i^1].ID}, classes.Peers(n.ID))
+				}
+			}
+		})
+	}
+}
+
+func TestSideIndexMissingAddresses(t *testing.T) {
+	n := ownRulesNode(1, nil, []string{"tag:exit"}, "0.0.0.0/0", "::/0")
+	n.IPv4, n.IPv6 = nil, nil
+	pm := &PolicyManager{nodes: views.SliceOf([]types.NodeView{{}, n.View()})}
+	idx := pm.sideIndex()
+	require.Empty(t, idx.byIP)
+	require.Empty(t, idx.routers)
+	require.Equal(t, []types.NodeID{1}, idx.exits)
+}
+
+func BenchmarkSideIndex(b *testing.B) {
+	for _, n := range []int{100, 1000, 5000, 10000} {
+		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) {
+			in := scanManyRulesNodes(n).ViewSlice()
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				newSideIndex(in)
+			}
+		})
+	}
+}
+
+func BenchmarkPeerClassesSideIndex(b *testing.B) {
+	for _, shape := range []string{"pairs", "self", "allow-all"} {
+		for _, n := range []int{100, 1000, 5000, 10000} {
+			b.Run(fmt.Sprintf("%s/nodes=%d", shape, n), func(b *testing.B) {
+				nodes, users, pol := diversePeerPolicy(n, shape)
+				in := nodes.ViewSlice()
+				pm, err := NewPolicyManager(pol, users, in)
+				require.NoError(b, err)
+				pm.sideIndex()
+				prev := pm.BuildPeerClasses(in, nil)
+
+				b.ReportAllocs()
+
+				for b.Loop() {
+					pm.BuildPeerClasses(in, prev)
+				}
+			})
+		}
+	}
+}
+
+func TestAuditPeersCatchesStaleCarriedSides(t *testing.T) {
+	u1 := &scanUsers[0]
+	pol := []byte(`{"acls":[{"action":"accept","src":["u1@"],"dst":["u2@:*"]}]}`)
+	nodes := types.Nodes{ownRulesNode(1, u1, nil), ownRulesNode(2, &scanUsers[1], nil)}.ViewSlice()
+
+	pm, err := NewPolicyManager(pol, scanUsers, nodes)
+	require.NoError(t, err)
+
+	prev := pm.BuildPeerClasses(nodes, nil)
+	require.NoError(t, pm.AuditPeers(pm.BuildPeerClasses(nodes, prev), nodes), "test sanity: intact sides pass")
+
+	stale := prev.sides.nodes[1]
+	stale.src, stale.dst = nil, nil
+	prev.sides.nodes[1] = stale
+
+	require.Error(t, pm.AuditPeers(pm.BuildPeerClasses(nodes, prev), nodes))
+	require.NoError(t, pm.Audit(pol, scanUsers, nodes), "a build from scratch never reads carried sides")
+}
+
+func TestNewPolicyManagerFromTransitions(t *testing.T) {
+	u1, u2 := scanUsers[0], scanUsers[1]
+
+	policies := map[string]string{
+		"users":  `{"acls":[{"action":"accept","src":["u1@"],"dst":["u1@:*"]},{"action":"accept","src":["u2@"],"dst":["u2@:22"]}]}`,
+		"groups": `{"groups":{"group:a":["u1@"]},"acls":[{"action":"accept","src":["group:a"],"dst":["*:*"]}]}`,
+		"member": `{"tagOwners":{"tag:srv":["u1@"]},"acls":[{"action":"accept","src":["autogroup:member"],"dst":["tag:srv:*"]}]}`,
+		"self":   `{"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`,
+		"tagged": `{"tagOwners":{"tag:srv":["u1@"]},"acls":[{"action":"accept","src":["autogroup:tagged"],"dst":["u1@:*"]}]}`,
+		"attrs": `{"tagOwners":{"tag:srv":["u1@"]},"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}],
+			"nodeAttrs":[{"target":["u1@"],"attr":["custom:u1"]},{"target":["autogroup:member"],"attr":["custom:m"]}]}`,
+		"ssh": `{"tagOwners":{"tag:srv":["u1@"]},"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}],
+			"ssh":[{"action":"accept","src":["autogroup:member"],"dst":["tag:srv"],"users":["root"]},
+			       {"action":"accept","src":["u1@"],"dst":["autogroup:self"],"users":["root"]}]}`,
+		"subnet": `{"acls":[{"action":"accept","src":["u2@"],"dst":["10.1.0.0/24:*"]}]}`,
+		"via": `{"tagOwners":{"tag:srv":["u1@"]},"grants":[{"src":["*"],"dst":["*"],"ip":["*"]},
+			{"src":["u1@"],"dst":["10.1.0.0/24"],"ip":["*"],"via":["tag:srv"]}]}`,
+	}
+
+	owned := func(id int, u *types.User) *types.Node {
+		n := ownRulesNode(id, nil, nil)
+		uu := *u
+		n.User, n.UserID = &uu, &uu.ID
+
+		return n
+	}
+
+	transitions := map[string]func(n *types.Node){
+		"owner reassigned": func(n *types.Node) {
+			uu := u2
+			n.User, n.UserID = &uu, &uu.ID
+		},
+		"address replaced": func(n *types.Node) {
+			v4 := netip.MustParseAddr("100.64.0.99")
+			n.IPv4 = &v4
+		},
+		"untagged": func(n *types.Node) {
+			n.Tags = nil
+			uu := u1
+			n.User, n.UserID = &uu, &uu.ID
+		},
+		"retagged": func(n *types.Node) {
+			n.Tags = []string{"tag:srv"}
+		},
+		"retagged without its User loaded": func(n *types.Node) {
+			n.User = nil
+			n.Tags = []string{"tag:srv"}
+		},
+		"user lost": func(n *types.Node) {
+			n.User, n.UserID = nil, nil
+		},
+		// No matcher changes, only which ones the node is a side of.
+		"route approved": func(n *types.Node) {
+			n.ApprovedRoutes = []netip.Prefix{netip.MustParsePrefix("10.1.0.0/24")}
+			n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: n.ApprovedRoutes}
+		},
+	}
+
+	for pname, pol := range policies {
+		for tname, change := range transitions {
+			t.Run(pname+"/"+tname, func(t *testing.T) {
+				before := types.Nodes{
+					owned(1, &u1), owned(2, &u1), owned(3, &u2),
+					ownRulesNode(4, nil, []string{"tag:srv"}, "10.1.0.0/24"),
+				}
+
+				// The untagging case starts from the tagged node.
+				target := 0
+				if tname == "untagged" {
+					target = 3
+				}
+
+				// A node whose User is not loaded: only UserID is set.
+				if tname == "retagged without its User loaded" {
+					before[target].User = nil
+				}
+
+				prev, err := NewPolicyManager([]byte(pol), scanUsers, before.ViewSlice())
+				require.NoError(t, err)
+
+				if pname == "via" {
+					require.NotEmpty(t, prev.ViaRoutesForPeer(before[1].View(), before[3].View()).Include,
+						"test sanity: the router serves u1 the via route")
+				}
+
+				prevClasses := prev.BuildPeerClasses(before.ViewSlice(), nil)
+
+				// Prepare per-node results, as live sessions do, so
+				// carried filters, matchers and SSH policies are exercised.
+				for _, n := range before {
+					_, err := prev.FilterForNode(n.View())
+					require.NoError(t, err)
+
+					_, err = prev.MatchersForNode(n.View())
+					require.NoError(t, err)
+
+					_, err = prev.SSHPolicy(scanServerURL, n.View())
+					require.NoError(t, err)
+				}
+
+				after := slices.Clone(before)
+				c := before[target].Clone()
+				change(c)
+				after[target] = c
+
+				inc, err := NewPolicyManagerFrom(prev, []byte(pol), scanUsers, after.ViewSlice())
+				require.NoError(t, err)
+				require.NoError(t, inc.Audit([]byte(pol), scanUsers, after.ViewSlice()))
+				require.NoError(t, inc.AuditPeers(inc.BuildPeerClasses(after.ViewSlice(), prevClasses), after.ViewSlice()),
+					"peer classes built from the previous ones")
+			})
+		}
+	}
+}
+
+const scanServerURL = "https://headscale.example.com"
+
+// userAliasFixture varies nodes, identities and rules independently. Groups overlap
+// so a change to one user reaches both groups containing that user.
+func userAliasFixture(tb testing.TB, nodeCount, userCount, ruleCount int, groups bool) ([]byte, types.Users, types.Nodes) {
+	tb.Helper()
+
+	users := make(types.Users, userCount)
+	for i := range users {
+		users[i] = types.User{ID: uint(i + 1), Name: fmt.Sprintf("alias-user-%d", i)} //nolint:gosec
+	}
+
+	nodes := make(types.Nodes, nodeCount)
+	ip := netip.MustParseAddr("100.64.0.1")
+
+	for i := range nodes {
+		u := &users[i%userCount]
+		nodes[i] = &types.Node{ID: types.NodeID(i + 1), Hostname: fmt.Sprintf("alias-node-%d", i), UserID: &u.ID, User: u, IPv4: new(ip)} //nolint:gosec
+		ip = ip.Next()
+	}
+
+	var policy strings.Builder
+	policy.WriteString(`{"groups":{`)
+
+	if groups {
+		for i := range users {
+			if i > 0 {
+				policy.WriteByte(',')
+			}
+
+			fmt.Fprintf(&policy, `"group:alias-%d":[%q,%q]`, i, users[i].Name+"@", users[(i+1)%userCount].Name+"@")
+		}
+	}
+
+	policy.WriteString(`},"grants":[`)
+
+	for i := range ruleCount {
+		if i > 0 {
+			policy.WriteByte(',')
+		}
+
+		alias := users[i%userCount].Name + "@"
+		if groups {
+			alias = fmt.Sprintf("group:alias-%d", i%userCount)
+		}
+
+		fmt.Fprintf(&policy, `{"src":[%q],"dst":[%q],"ip":["tcp:%d"]}`, alias, alias, 443+i)
+	}
+
+	policy.WriteString(`]}`)
+
+	return []byte(policy.String()), users, nodes
+}
+
+func TestUserAliasChangeReusesUnrelatedGrants(t *testing.T) {
+	for _, groups := range []bool{false, true} {
+		t.Run(fmt.Sprintf("groups=%t", groups), func(t *testing.T) {
+			policy, users, before := userAliasFixture(t, 100, 10, 10, groups)
+			prev, err := NewPolicyManager(policy, users, before.ViewSlice())
+			require.NoError(t, err)
+
+			oldFilter := slices.Clone(prev.filter)
+
+			after := slices.Clone(before)
+			after[0] = before[0].Clone()
+			after[0].IPv4 = ap("100.65.0.1")
+			inc, err := NewPolicyManagerFrom(prev, policy, users, after.ViewSlice())
+			require.NoError(t, err)
+			require.NoError(t, inc.Audit(policy, users, after.ViewSlice()))
+			require.Equal(t, oldFilter, prev.filter, "old snapshot is immutable")
+
+			recompiled := 0
+
+			for i, r := range inc.grantResults {
+				if r.cg != prev.grantResults[i].cg {
+					recompiled++
+				}
+			}
+
+			want := 1
+			if groups {
+				want = 2
+			}
+
+			require.Equal(t, want, recompiled, "only grants naming the changed user should recompile")
+		})
+	}
+}
+
+// BenchmarkUserAliasChurn separates fixed changed work from node/rule diversity.
+// It measures compilation only; it excludes peer construction and map delivery.
+func BenchmarkUserAliasChurn(b *testing.B) {
+	for _, groups := range []bool{false, true} {
+		shape := "users"
+		if groups {
+			shape = "groups"
+		}
+
+		for _, size := range []struct {
+			name                string
+			nodes, users, rules int
+		}{
+			{"growing/nodes=100", 100, 10, 10},
+			{"growing/nodes=500", 500, 50, 50},
+			{"growing/nodes=1000", 1000, 100, 100},
+			{"growing/nodes=2000", 2000, 200, 200},
+			{"fixed-rules/nodes=100", 100, 10, 10},
+			{"fixed-rules/nodes=500", 500, 10, 10},
+			{"fixed-rules/nodes=1000", 1000, 10, 10},
+			{"fixed-rules/nodes=2000", 2000, 10, 10},
+			{"fixed-nodes/rules=10", 1000, 100, 10},
+			{"fixed-nodes/rules=50", 1000, 100, 50},
+			{"fixed-nodes/rules=100", 1000, 100, 100},
+			{"fixed-nodes/rules=200", 1000, 100, 200},
+		} {
+			b.Run(shape+"/"+size.name, func(b *testing.B) {
+				policy, users, before := userAliasFixture(b, size.nodes, size.users, size.rules, groups)
+				prev, err := NewPolicyManager(policy, users, before.ViewSlice())
+				require.NoError(b, err)
+
+				joined := append(slices.Clone(before), before[0].Clone())
+				joined[len(before)].ID = types.NodeID(size.nodes + 1) //nolint:gosec
+				joined[len(before)].IPv4 = ap("100.65.0.1")
+				changed := slices.Clone(before)
+				changed[0] = before[0].Clone()
+				changed[0].IPv4 = ap("100.65.0.2")
+
+				for _, op := range []struct {
+					name  string
+					prev  *PolicyManager
+					nodes types.Nodes
+				}{
+					{"fresh", nil, before},
+					{"unchanged", prev, before},
+					{"join", prev, joined},
+					{"leave", prev, before[1:]},
+					{"address", prev, changed},
+				} {
+					b.Run(op.name, func(b *testing.B) {
+						nodes := op.nodes.ViewSlice()
+
+						b.ReportAllocs()
+
+						var next *PolicyManager
+						for b.Loop() {
+							next, err = NewPolicyManagerFrom(op.prev, policy, users, nodes)
+							if err != nil {
+								b.Fatal(err)
+							}
+						}
+
+						recompiled := 0
+
+						for i, r := range next.grantResults {
+							if op.prev == nil || r.cg != op.prev.grantResults[i].cg {
+								recompiled++
+							}
+						}
+
+						b.ReportMetric(float64(recompiled), "compiled-grants/op")
+					})
+				}
+			})
+		}
+	}
+}
+
+// TestUserAliasIncrementalIdentities keeps stale embedded user records on nodes:
+// token and domain membership must follow the current users, including collisions.
+func TestUserAliasIncrementalIdentities(t *testing.T) {
+	users := types.Users{
+		{ID: 1, Name: "alice", Email: "alice@allowed.example"},
+		{ID: 2, Name: "bob", Email: "bob@other.example", ProviderIdentifier: sql.NullString{String: "https://idp.example/bob", Valid: true}},
+		{ID: 3, Name: "alice@allowed.example"},
+		{ID: 4, Name: "duplicate"},
+		{ID: 5, Name: "duplicate"},
+		{ID: 6, Name: "https://idp.example/bob", Email: "duplicate-email@example.com"},
+		{ID: 7, Name: "seventh", Email: "duplicate-email@example.com"},
+		{ID: 8, Name: "folded", Email: "folded@ALLOWED.EXAMPLE"},
+	}
+
+	aliases := []string{"alice@", "alice@allowed.example", "bob@", "https://idp.example/bob@", "duplicate@", "duplicate-email@example.com", "missing@", "@", "user:*@allowed.example", "user:*@ALLOWED.EXAMPLE", "user:*@other.example", "group:a", "group:b", "group:overlap"}
+	policy := func(reverse bool) []byte {
+		grants := make([]string, 0, len(aliases))
+		for i, alias := range aliases {
+			grants = append(grants, fmt.Sprintf(`{"src":[%q],"dst":[%q],"ip":["tcp:%d"]}`, alias, alias, 443+i))
+		}
+
+		if reverse {
+			slices.Reverse(grants)
+		}
+
+		return []byte(`{"groups":{"group:a":["alice@","missing@"],"group:b":["bob@"],"group:overlap":["alice@","bob@","user:*@allowed.example"]},"grants":[` + strings.Join(grants, ",") + `],"ssh":[{"action":"accept","src":["group:a"],"dst":["autogroup:self"],"users":["root"]},{"action":"accept","src":["bob@"],"dst":["autogroup:self"],"users":["root"]}]}`)
+	}
+
+	for _, transition := range []string{"join", "leave", "address", "owner", "tag", "untag", "association-only", "association-lost", "rename", "delete-user", "recreate-user", "email-domain", "reorder-grants", "fresh-policy"} {
+		t.Run(transition, func(t *testing.T) {
+			before := make(types.Nodes, len(users))
+			for i, user := range users {
+				stale := user
+				stale.Name, stale.Email = "stale-name", "stale@invalid.example"
+				before[i] = ownRulesNode(i+1, &stale, nil)
+			}
+
+			if transition == "association-only" {
+				before[0].UserID = nil
+			}
+
+			if transition == "untag" {
+				before[0].Tags = []string{"tag:retained-creator"}
+			}
+
+			pol := policy(false)
+			prev, err := NewPolicyManagerFrom(nil, pol, users, before.ViewSlice())
+			require.NoError(t, err)
+
+			prevClasses := prev.BuildPeerClasses(before.ViewSlice(), nil)
+			for _, n := range before {
+				_, err := prev.FilterForNode(n.View())
+				require.NoError(t, err)
+				_, err = prev.SSHPolicy(scanServerURL, n.View())
+				require.NoError(t, err)
+			}
+
+			oldFilter, err := json.Marshal(prev.filter)
+			require.NoError(t, err)
+
+			after, nextUsers := slices.Clone(before), slices.Clone(users)
+			after[0] = before[0].Clone()
+
+			switch transition {
+			case "join":
+				joined := before[0].Clone()
+				joined.ID, joined.IPv4 = 99, ap("100.64.0.99")
+				after = append(after, joined)
+			case "leave":
+				after = after[1:]
+			case "address", "association-only":
+				after[0].IPv4 = ap("100.64.0.99")
+			case "owner":
+				after[0].User, after[0].UserID = &nextUsers[1], &nextUsers[1].ID
+			case "tag":
+				after[0].Tags = []string{"tag:retained-creator"}
+			case "untag":
+				after[0].Tags = nil
+			case "association-lost":
+				after[0].User = nil
+			case "rename":
+				nextUsers[0].Name = "renamed"
+			case "delete-user":
+				nextUsers = nextUsers[1:]
+			case "recreate-user":
+				nextUsers[0].ID = 99
+				after[0].User, after[0].UserID = &nextUsers[0], &nextUsers[0].ID
+			case "email-domain":
+				nextUsers[0].Email = "alice@removed.example"
+			case "reorder-grants":
+				pol = policy(true)
+			case "fresh-policy":
+				pol = bytes.ReplaceAll(pol, []byte("tcp:443"), []byte("tcp:8443"))
+			}
+
+			inc, err := NewPolicyManagerFrom(prev, pol, nextUsers, after.ViewSlice())
+			require.NoError(t, err)
+			require.NoError(t, inc.Audit(pol, nextUsers, after.ViewSlice()))
+			require.NoError(t, inc.AuditPeers(inc.BuildPeerClasses(after.ViewSlice(), prevClasses), after.ViewSlice()))
+
+			stillOld, err := json.Marshal(prev.filter)
+			require.NoError(t, err)
+			require.Equal(t, oldFilter, stillOld, "old snapshot filter is unchanged")
+			require.NoError(t, prev.Audit(policy(false), users, before.ViewSlice()))
+		})
+	}
+}
+
+// TestPeerClassesMixedSelfVia compares grouped peers with the per-node
+// reference, including user-owned routers with source-specific reachability.
+func TestPeerClassesMixedSelfVia(t *testing.T) {
+	for _, source := range []string{"autogroup:member", "u1@", "group:a"} {
+		for _, appOnly := range []bool{false, true} {
+			for _, reverse := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/app=%t/reverse=%t", source, appOnly, reverse), func(t *testing.T) {
+					traffic := `"ip":["tcp:443"]`
+					if appOnly {
+						traffic = `"app":{"example.com/via":[{}]}`
+					}
+
+					grants := []string{
+						fmt.Sprintf(`{"src":[%q],"dst":["autogroup:self"],"ip":["tcp:443"]}`, source),
+						`{"src":["u2@"],"dst":["autogroup:self"],"app":{"example.com/self":[{}]}}`,
+						fmt.Sprintf(`{"src":["u1@"],"dst":["10.2.0.0/24","fd00:2::/64"],"via":["tag:router"],%s}`, traffic),
+						`{"src":["100.64.0.2"],"dst":["10.2.0.0/25"],"via":["tag:router"],"ip":["tcp:80"]}`,
+					}
+					if reverse {
+						slices.Reverse(grants)
+					}
+
+					pol := []byte(`{"groups":{"group:a":["u1@"]},"tagOwners":{"tag:router":[],"tag:source":[],"tag:exit":[]},"grants":[` + strings.Join(grants, ",") + `]}`)
+					u1, u2 := &scanUsers[0], &scanUsers[1]
+					nodes := types.Nodes{
+						ownRulesNode(1, u1, nil, "100.64.0.3/32", "fd7a:115c:a1e0::3/128"),
+						ownRulesNode(2, u1, nil, "10.1.0.0/24"),
+						ownRulesNode(3, u2, nil),
+						ownRulesNode(4, u2, nil),
+						ownRulesNode(5, u1, []string{"tag:router"}, "10.2.0.0/24", "fd00:2::/64"),
+						ownRulesNode(6, u1, []string{"tag:router"}, "10.2.0.0/24", "fd00:2::/64"),
+						ownRulesNode(7, u2, []string{"tag:source"}, "100.64.0.2/32", "fd7a:115c:a1e0::2/128"),
+						ownRulesNode(8, u1, []string{"tag:exit"}, "0.0.0.0/0", "::/0"),
+						ownRulesNode(9, u1, nil),
+					}
+					nodes[8].User = nil // A creator ID alone does not carry self rules.
+
+					var (
+						previous *PolicyManager
+						classes  *PeerClasses
+					)
+
+					for step := range 7 {
+						pm, err := NewPolicyManagerFrom(previous, pol, scanUsers, nodes.ViewSlice())
+						require.NoError(t, err)
+
+						oldPeers := map[types.NodeID][]types.NodeID{}
+
+						if classes != nil {
+							for _, node := range previous.nodes.All() {
+								oldPeers[node.ID()] = slices.Clone(classes.Peers(node.ID()))
+							}
+						}
+
+						built := pm.BuildPeerClasses(nodes.ViewSlice(), classes)
+
+						want := buildPeerMapPairScan(pm, nodes.ViewSlice())
+						for _, node := range nodes {
+							require.Equalf(t, nilIfEmpty(slices.Sorted(slices.Values(want[node.ID]))), nilIfEmpty(built.Peers(node.ID)), "step %d node %d", step, node.ID)
+						}
+
+						if step == 0 {
+							require.Contains(t, built.Peers(1), types.NodeID(3), "the source router reaches u2")
+							require.NotContains(t, built.Peers(2), types.NodeID(3), "its sibling must not inherit that source route")
+							require.Equal(t, built.classOf[3], built.classOf[4], "u2 devices share one peer view")
+						}
+
+						require.NoError(t, pm.Audit(pol, scanUsers, nodes.ViewSlice()))
+						require.NoError(t, pm.AuditPeers(built, nodes.ViewSlice()))
+
+						for id, peers := range oldPeers {
+							require.Equal(t, peers, classes.Peers(id), "old peer snapshot")
+						}
+
+						previous, classes = pm, built
+						nodes = slices.Clone(nodes)
+
+						switch step {
+						case 0:
+							nodes = append(nodes, ownRulesNode(10, u1, nil))
+						case 1:
+							nodes = slices.Delete(nodes, 1, 2)
+						case 2:
+							nodes[3] = nodes[3].Clone()
+							nodes[3].Hostinfo = &tailcfg.Hostinfo{}
+						case 3:
+							nodes[0] = nodes[0].Clone()
+							nodes[0].Hostinfo = &tailcfg.Hostinfo{}
+						case 4:
+							nodes[0] = nodes[0].Clone()
+							nodes[0].Tags = []string{"tag:router"}
+						case 5:
+							nodes[1] = nodes[1].Clone()
+							nodes[1].User, nodes[1].UserID = u1, &u1.ID
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestCachedMatcherSidesRemapMasks compares arbitrary cached masks with the
+// original linear remap, including duplicate keys with different old bits.
+func TestCachedMatcherSidesRemapMasks(t *testing.T) {
+	t.Parallel()
+
+	nodes := scanManyRulesNodes(16).ViewSlice()
+
+	ms := make([]matcher.Match, 140)
+	for k := range ms {
+		ms[k] = matcher.MatchFromFilterRule(tailcfg.FilterRule{
+			SrcIPs:   []string{fmt.Sprintf("192.0.2.%d", k+1)},
+			DstPorts: []tailcfg.NetPortRange{{IP: "*", Ports: tailcfg.PortRangeAny}},
+		})
+	}
+
+	ms[70] = ms[0]
+	_, _, prev := cachedMatcherSides(ms, nodes, nil)
+	rng := rand.New(rand.NewPCG(7, 19)) //nolint:gosec // reproducible test input
+
+	for i, n := range nodes.All() {
+		old := prev.nodes[n.ID()]
+		if i%4 != 0 {
+			old.src, old.dst = make([]uint64, 3), make([]uint64, 3)
+
+			for k := range ms {
+				if i%4 == 3 || (i%4 == 2 && rng.IntN(20) == 0) {
+					old.src = setBit(old.src, 3, k)
+				}
+
+				if i%4 == 3 || (i%4 == 2 && rng.IntN(20) == 0) {
+					old.dst = setBit(old.dst, 3, k)
+				}
+			}
+		}
+
+		if i == 2 {
+			// Duplicate old slots disagree deliberately: only slot zero may be reused.
+			old.src, old.dst = []uint64{1, 0, 0}, []uint64{0, 1 << 6, 0}
+		}
+
+		prev.nodes[n.ID()] = old
+	}
+
+	frozen := &sideCache{keys: slices.Clone(prev.keys), nodes: make(map[types.NodeID]cachedSides)}
+	for id, old := range prev.nodes {
+		frozen.nodes[id] = cachedSides{node: old.node, src: slices.Clone(old.src), dst: slices.Clone(old.dst)}
+	}
+
+	reordered := slices.Clone(ms)
+	slices.Reverse(reordered)
+
+	fresh := matcher.MatchFromFilterRule(tailcfg.FilterRule{
+		SrcIPs:   []string{nodes.At(0).IPv4().String()},
+		DstPorts: []tailcfg.NetPortRange{{IP: nodes.At(1).IPv6().String(), Ports: tailcfg.PortRangeAny}},
+	})
+	for name, next := range map[string][]matcher.Match{
+		"same":       ms,
+		"reverse":    reordered,
+		"remove":     ms[65:],
+		"insert":     slices.Insert(slices.Clone(ms), 64, fresh),
+		"duplicates": {ms[70], ms[0], ms[0], ms[139], fresh},
+		"empty":      nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			// Include an invalid view and an unchanged node set in a different order.
+			in := []types.NodeView{{}}
+			for i := nodes.Len() - 1; i >= 0; i-- {
+				in = append(in, nodes.At(i))
+			}
+
+			input := views.SliceOf(in)
+			wantSrc, wantDst := matcherSides(next, input)
+
+			keys := make([]string, len(next))
+			for k := range next {
+				keys[k] = matcherKey(&next[k])
+			}
+
+			for i, node := range input.All() {
+				if !node.Valid() {
+					continue
+				}
+
+				old, ok := prev.lookup(node)
+				if !ok {
+					continue
+				}
+
+				if slices.Equal(keys, prev.keys) {
+					wantSrc[i], wantDst[i] = old.src, old.dst
+					continue
+				}
+
+				src, dst := wantSrc[i], wantDst[i]
+				wantSrc[i], wantDst[i] = nil, nil
+
+				for k, key := range keys {
+					o := slices.Index(prev.keys, key)
+
+					source, dest := bitSet(src, k), bitSet(dst, k)
+					if o >= 0 {
+						source, dest = bitSet(old.src, o), bitSet(old.dst, o)
+					}
+
+					if source {
+						wantSrc[i] = setBit(wantSrc[i], (len(next)+63)/64, k)
+					}
+
+					if dest {
+						wantDst[i] = setBit(wantDst[i], (len(next)+63)/64, k)
+					}
+				}
+			}
+
+			src, dst, _ := cachedMatcherSides(next, input, prev)
+			require.Equal(t, wantSrc, src)
+			require.Equal(t, wantDst, dst)
+			require.Equal(t, frozen, prev, "previous cache changed")
+		})
+	}
+}
+
+// BenchmarkMatcherSideRemap keeps old and new inputs fixed across iterations;
+// fresh keys match the same nodes but require evaluation rather than reuse.
+func BenchmarkMatcherSideRemap(b *testing.B) {
+	for _, size := range [][2]int{{100, 10}, {1000, 100}, {10000, 1000}, {10000, 100}, {1000, 1000}} {
+		for _, shape := range []string{"sparse", "dense"} {
+			b.Run(fmt.Sprintf("%s/nodes=%d/rules=%d", shape, size[0], size[1]), func(b *testing.B) {
+				nodes := scanManyRulesNodes(size[0]).ViewSlice()
+
+				rules := make([]tailcfg.FilterRule, size[1])
+				for k := range rules {
+					src := []string{nodes.At(k % nodes.Len()).IPv4().String(), fmt.Sprintf("2001:db8::%x", k+1)}
+
+					dst := nodes.At((k + 1) % nodes.Len()).IPv4().String()
+					if shape == "dense" {
+						src[0], dst = "100.64.0.0/10", "100.64.0.0/10"
+					}
+
+					rules[k] = tailcfg.FilterRule{SrcIPs: src, DstPorts: []tailcfg.NetPortRange{{IP: dst, Ports: tailcfg.PortRangeAny}}}
+				}
+
+				ms := matcher.MatchesFromFilterRules(rules)
+				_, _, prev := cachedMatcherSides(ms, nodes, nil)
+
+				for _, change := range []string{"same", "one", "few", "all", "reverse"} {
+					b.Run(change, func(b *testing.B) {
+						next := slices.Clone(ms)
+						count := 0
+
+						switch change {
+						case "one":
+							count = 1
+						case "few":
+							count = 3
+						case "all":
+							count = len(next)
+						case "reverse":
+							slices.Reverse(next)
+						}
+
+						for k := range count {
+							rule := rules[k]
+							rule.SrcIPs = append(slices.Clone(rule.SrcIPs), fmt.Sprintf("2001:db8:1::%x", k+1))
+							next[k] = matcher.MatchFromFilterRule(rule)
+						}
+
+						wantSrc, wantDst := matcherSides(next, nodes)
+						src, dst, _ := cachedMatcherSides(next, nodes, prev)
+						require.Equal(b, wantSrc, src)
+						require.Equal(b, wantDst, dst)
+						b.ReportAllocs()
+
+						for b.Loop() {
+							cachedMatcherSides(next, nodes, prev)
+						}
+					})
+				}
+			})
+		}
+	}
+}
+
+func bitSet(side []uint64, k int) bool {
+	return side != nil && side[k/64]&(1<<(k%64)) != 0 //nolint:mnd
 }

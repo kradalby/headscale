@@ -40,7 +40,12 @@ func registerConfig(api huma.API, b Backend) {
 			},
 		},
 	}, func(_ context.Context, in *getConfigInput) (*getConfigOutput, error) {
-		out, err := config.GenerateExample(b.Cfg, config.ExampleOptions{Docs: in.Docs, Redact: true, OmitClientOnly: true})
+		cfg := b.Cfg
+		if b.State != nil {
+			cfg = b.State.DebugConfig()
+		}
+
+		out, err := config.GenerateExample(cfg, config.ExampleOptions{Docs: in.Docs, Redact: true, OmitClientOnly: true})
 		if err != nil {
 			return nil, huma.Error500InternalServerError("rendering configuration", err)
 		}

@@ -222,6 +222,7 @@ func TestTailNode(t *testing.T) {
 					return slices.Concat(primaries[id], nv.ExitRoutes())
 				},
 				cfg,
+				cfg.DNSView(),
 				nil,
 			)
 
@@ -341,6 +342,7 @@ func TestTailNodeBaselineGates(t *testing.T) {
 				0,
 				func(types.NodeID) []netip.Prefix { return nil },
 				tt.cfg,
+				tt.cfg.DNSView(),
 				nil,
 			)
 			if err != nil {
@@ -428,6 +430,7 @@ func TestTailNodeDisableIPv4(t *testing.T) {
 					return tt.approved
 				},
 				&types.Config{Taildrop: types.TaildropConfig{Enabled: true}},
+				types.DNSView{},
 				selfCaps,
 			)
 			if err != nil {
@@ -499,6 +502,7 @@ func TestNodeExpiry(t *testing.T) {
 					return []netip.Prefix{}
 				},
 				&types.Config{Taildrop: types.TaildropConfig{Enabled: true}},
+				types.DNSView{},
 				nil,
 			)
 			if err != nil {

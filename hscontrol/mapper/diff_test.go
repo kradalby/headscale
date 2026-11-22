@@ -1,0 +1,900 @@
+package mapper
+
+import (
+	"encoding/json"
+	"net/netip"
+	"path/filepath"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/types/testcapture"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
+	"tailscale.com/types/opt"
+)
+
+func testPeer(id tailcfg.NodeID) *tailcfg.Node {
+	return &tailcfg.Node{
+		ID:        id,
+		Key:       key.NewNode().Public(),
+		HomeDERP:  1,
+		Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")},
+		Online:    new(true),
+		Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+	}
+}
+
+func cloneNode(n *tailcfg.Node) *tailcfg.Node { return n.Clone() }
+
+// TestBuildMapRequestChangeResponse ports the state's nine response-classifier
+// rows to the actual wire diff. Unlike the old event payload, a graph diff does
+// not repeat unchanged keys/endpoints. Clearing DERP needs a full peer list.
+func TestBuildMapRequestChangeResponse(t *testing.T) {
+	capturedKeys, capturedEndpoints := saasDiscoRotation(t)
+	require.True(t, capturedKeys, "SaaS repeats the node key alongside the rotated disco key")
+	require.True(t, capturedEndpoints, "SaaS repeats unchanged endpoints; the graph diff below omits them")
+
+	before := testPeer(7)
+	before.DiscoKey = key.NewDisco().Public()
+	before.Hostinfo = (&tailcfg.Hostinfo{Hostname: "peer", OS: "linux"}).View()
+	disco := key.NewDisco().Public()
+
+	endpoints := []netip.AddrPort{netip.MustParseAddrPort("203.0.113.9:41641")}
+	for _, tt := range []struct {
+		name  string
+		edit  func(*tailcfg.Node)
+		kind  string
+		patch *tailcfg.PeerChange
+	}{
+		{name: "nothing peer visible", edit: func(*tailcfg.Node) {}, kind: "none"},
+		{name: "peer visible hostinfo", edit: func(n *tailcfg.Node) {
+			n.Hostinfo = (&tailcfg.Hostinfo{Hostname: "peer", OS: "linux", Services: []tailcfg.Service{{Proto: tailcfg.PeerAPI4, Port: 4242}}}).View()
+		}, kind: "peer"},
+		{name: "derp clear to zero", edit: func(n *tailcfg.Node) { n.HomeDERP = 0 }, kind: "list"},
+		{name: "disco key and derp clear to zero", edit: func(n *tailcfg.Node) { n.DiscoKey, n.HomeDERP = disco, 0 }, kind: "list"},
+		{name: "disco key only", edit: func(n *tailcfg.Node) { n.DiscoKey = disco }, kind: "patch", patch: &tailcfg.PeerChange{NodeID: 7, DiscoKey: &disco}},
+		{name: "disco key and derp move", edit: func(n *tailcfg.Node) { n.DiscoKey, n.HomeDERP = disco, 2 }, kind: "patch", patch: &tailcfg.PeerChange{NodeID: 7, DiscoKey: &disco, DERPRegion: 2}},
+		{name: "useful endpoint only", edit: func(n *tailcfg.Node) { n.Endpoints = endpoints }, kind: "patch", patch: &tailcfg.PeerChange{NodeID: 7, Endpoints: endpoints}},
+		{name: "derp move only", edit: func(n *tailcfg.Node) { n.HomeDERP = 2 }, kind: "patch", patch: &tailcfg.PeerChange{NodeID: 7, DERPRegion: 2}},
+		{name: "endpoint and derp move", edit: func(n *tailcfg.Node) { n.Endpoints, n.HomeDERP = endpoints, 2 }, kind: "patch", patch: &tailcfg.PeerChange{NodeID: 7, Endpoints: endpoints, DERPRegion: 2}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			after := before.Clone()
+			tt.edit(after)
+
+			sent := testNetMap(before)
+
+			got := diff(sent, withPeers(sent, after), nil)
+			if tt.kind == "none" {
+				require.Empty(t, got)
+				return
+			}
+
+			want := &tailcfg.MapResponse{ControlTime: new(time.Time)}
+
+			switch tt.kind {
+			case "peer":
+				want.PeersChanged = []*tailcfg.Node{after}
+			case "list":
+				want.Peers = []*tailcfg.Node{after}
+			case "patch":
+				want.PeersChangedPatch = []*tailcfg.PeerChange{tt.patch}
+			}
+
+			require.Equal(t, []*tailcfg.MapResponse{want}, got, "all response and patch fields must match")
+		})
+	}
+}
+
+// TestReauthChange retains the four reauthentication response classes without
+// reconstructing a change.Change. A policy edit and keys share one exact diff.
+func TestReauthChange(t *testing.T) {
+	before := testPeer(7)
+	before.DiscoKey = key.NewDisco().Public()
+	after := before.Clone()
+	after.Key, after.DiscoKey = key.NewNode().Public(), key.NewDisco().Public()
+	patch := &tailcfg.PeerChange{NodeID: after.ID, Key: &after.Key, DiscoKey: &after.DiscoKey}
+
+	for _, tt := range []struct {
+		name string
+	}{
+		{name: "keys"},
+		{name: "unchanged"},
+		{name: "new node"},
+		{name: "policy and keys"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			sent := testNetMap(before)
+			next := withPeers(sent, after)
+			want := &tailcfg.MapResponse{ControlTime: new(time.Time)}
+
+			switch tt.name {
+			case "keys":
+				want.PeersChangedPatch = []*tailcfg.PeerChange{patch}
+			case "unchanged":
+				next = withPeers(sent, before.Clone())
+			case "new node":
+				sent = withPeers(sent)
+				want.PeersChanged = []*tailcfg.Node{after}
+			case "policy and keys":
+				sent.ssh = &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{{Action: &tailcfg.SSHAction{Accept: true}}}}
+				next.filter = []tailcfg.FilterRule{}
+				next.ssh = &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}}
+				want.PeersChangedPatch = []*tailcfg.PeerChange{patch}
+				want.PacketFilters = map[string][]tailcfg.FilterRule{"base": {}}
+				want.SSHPolicy = next.ssh
+			}
+
+			got := diff(sent, next, nil)
+			if tt.name == "unchanged" {
+				require.Empty(t, got)
+				return
+			}
+
+			require.Equal(t, []*tailcfg.MapResponse{want}, got)
+		})
+	}
+}
+
+// TestReloginChanged keeps all six original state classifier rows, checking the
+// peer's exact diff and the subject's complete self update through real streams.
+func TestReloginChanged(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		rotate    bool
+		past      bool
+		osVersion bool
+		service   bool
+		renew     bool
+		wholePeer bool
+	}{
+		{name: "keys", rotate: true},
+		{name: "hostinfo peers do not read", rotate: true, osVersion: true},
+		{name: "un-expired", rotate: true, past: true, wholePeer: true},
+		{name: "hostinfo peers read", rotate: true, service: true, wholePeer: true},
+		{name: "same keys"},
+		{name: "same keys, new expiry", renew: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, s, ids := streamTestState(t, "")
+			before := mustNode(t, s, ids[0]).AsStruct()
+			now := time.Now().UTC()
+			future := now.Add(time.Hour)
+
+			before.Expiry = new(future)
+			if tt.past {
+				before.Expiry = new(now.Add(-time.Minute))
+			}
+
+			before.Hostinfo = &tailcfg.Hostinfo{Hostname: "node", OS: "linux"}
+			s.PutNodeInStoreForTest(*before)
+
+			hub := NewHub()
+			t.Cleanup(hub.Close)
+			viewer := NewStream(cfg, hub, ids[2], capVer)
+			self := NewStream(cfg, hub, ids[0], capVer)
+			_, err := viewer.Initial(s.Snapshot())
+			require.NoError(t, err)
+			_, err = self.Initial(s.Snapshot())
+			require.NoError(t, err)
+
+			after := before.Clone()
+			if tt.rotate {
+				after.NodeKey, after.DiscoKey = key.NewNode().Public(), key.NewDisco().Public()
+			}
+
+			if tt.osVersion {
+				after.Hostinfo.OSVersion = "6.1"
+			}
+
+			if tt.service {
+				after.Hostinfo.Services = []tailcfg.Service{{Proto: tailcfg.PeerAPI4, Port: 4242}}
+			}
+
+			if tt.past {
+				after.Expiry = new(future)
+			}
+
+			if tt.renew {
+				after.Expiry = new(future.Add(time.Hour))
+			}
+
+			s.PutNodeInStoreForTest(*after)
+			snap := s.Snapshot()
+			got, err := viewer.Update(snap)
+			require.NoError(t, err)
+			own, err := self.Update(snap)
+			require.NoError(t, err)
+
+			if tt.name == "same keys" {
+				require.Empty(t, got)
+				require.Empty(t, own)
+
+				return
+			}
+
+			want := &tailcfg.MapResponse{ControlTime: new(snap.Time())}
+
+			if tt.wholePeer {
+				freshHub := NewHub()
+				defer freshHub.Close()
+
+				fresh, err := NewStream(cfg, freshHub, ids[2], capVer).Initial(snap)
+				require.NoError(t, err)
+
+				for _, peer := range fresh[0].Peers {
+					if peer.ID == ids[0].NodeID() {
+						want.PeersChanged = []*tailcfg.Node{peer}
+						assert.Equal(t, after.NodeKey, peer.Key)
+						assert.Equal(t, after.DiscoKey, peer.DiscoKey)
+						assert.Equal(t, *after.Expiry, peer.KeyExpiry)
+						assert.False(t, peer.Expired)
+						assert.Equal(t, after.Hostinfo.Services, peer.Hostinfo.Services().AsSlice())
+					}
+				}
+
+				require.Len(t, want.PeersChanged, 1)
+			} else {
+				patch := &tailcfg.PeerChange{NodeID: ids[0].NodeID()}
+				if tt.rotate {
+					patch.Key, patch.DiscoKey = &after.NodeKey, &after.DiscoKey
+				}
+
+				if tt.renew {
+					patch.KeyExpiry = after.Expiry
+				}
+
+				want.PeersChangedPatch = []*tailcfg.PeerChange{patch}
+			}
+
+			require.Equal(t, []*tailcfg.MapResponse{want}, got)
+
+			freshHub := NewHub()
+			defer freshHub.Close()
+
+			fresh, err := NewStream(cfg, freshHub, ids[0], capVer).Initial(snap)
+			require.NoError(t, err)
+			require.Equal(t, []*tailcfg.MapResponse{{Node: fresh[0].Node, ControlTime: new(snap.Time())}}, own)
+			assert.Equal(t, after.NodeKey, own[0].Node.Key)
+			assert.Equal(t, after.DiscoKey, own[0].Node.DiscoKey)
+			assert.Equal(t, *after.Expiry, own[0].Node.KeyExpiry)
+		})
+	}
+}
+
+func testNetMap(peers ...*tailcfg.Node) *netMap {
+	return &netMap{
+		self:     testPeer(1),
+		peers:    peerMapOf(peers...),
+		profiles: profileMapOf(tailcfg.UserProfile{ID: 1, LoginName: "a"}),
+		filter:   []tailcfg.FilterRule{{SrcIPs: []string{"*"}}},
+		ssh:      &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}},
+	}
+}
+
+func peerMapOf(peers ...*tailcfg.Node) *peerMap {
+	e := newPeerMap().Edit()
+	for _, p := range peers {
+		e.Set(p.ID, p)
+	}
+
+	return e.Done()
+}
+
+func profileMapOf(profiles ...tailcfg.UserProfile) *profileMap {
+	e := newProfileMap().Edit()
+	for _, p := range profiles {
+		e.Set(p.ID, p)
+	}
+
+	return e.Done()
+}
+
+// withPeers returns a copy of nm with its peers replaced.
+func withPeers(nm *netMap, peers ...*tailcfg.Node) *netMap {
+	c := *nm
+	c.peers = peerMapOf(peers...)
+
+	return &c
+}
+
+func TestDiffUnchangedSendsNothing(t *testing.T) {
+	p := testPeer(2)
+	sent := testNetMap(p)
+	// A fresh render of the same data holds new pointers.
+	next := withPeers(sent, cloneNode(p))
+	next.ssh = &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}}
+
+	if got := diff(sent, next, nil); got != nil {
+		t.Fatalf("diff of equal maps = %+v, want nil", got)
+	}
+}
+
+func TestDiffEndpointChangeIsPatch(t *testing.T) {
+	p := testPeer(2)
+	moved := cloneNode(p)
+	moved.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("198.51.100.7:41641")}
+
+	sent := testNetMap(p)
+
+	got := diff(sent, withPeers(sent, moved), nil)
+	if len(got) != 1 {
+		t.Fatalf("got %d responses, want 1", len(got))
+	}
+
+	r := got[0]
+	if len(r.PeersChangedPatch) != 1 || len(r.PeersChanged) != 0 || r.Peers != nil {
+		t.Fatalf("want one patch only, got %+v", r)
+	}
+
+	if r.Node != nil || r.SSHPolicy != nil || r.DNSConfig != nil || r.PacketFilters != nil {
+		t.Fatalf("patch-only change carried non-patch fields: %+v", r)
+	}
+}
+
+func TestDiffOnlineTransitions(t *testing.T) {
+	online := testPeer(2)
+
+	offline := cloneNode(online)
+	offline.Online = new(false)
+	seen := time.Unix(1700000000, 0)
+	offline.LastSeen = &seen
+
+	sent := testNetMap(online)
+
+	got := diff(sent, withPeers(sent, offline), nil)
+	if len(got) != 1 || len(got[0].PeersChangedPatch) != 1 {
+		t.Fatalf("offline: want one patch, got %+v", got)
+	}
+
+	if pc := got[0].PeersChangedPatch[0]; pc.Online == nil || *pc.Online || pc.LastSeen == nil {
+		t.Fatalf("offline patch = %+v, want Online=false with LastSeen", pc)
+	}
+
+	// Coming back online drops LastSeen, which a patch cannot clear; the
+	// Online patch is still sent rather than a full peer.
+	got = diff(withPeers(sent, offline), withPeers(sent, cloneNode(online)), nil)
+	if len(got) != 1 || len(got[0].PeersChangedPatch) != 1 || len(got[0].PeersChanged) != 0 {
+		t.Fatalf("online: want one patch, got %+v", got)
+	}
+
+	if pc := got[0].PeersChangedPatch[0]; pc.Online == nil || !*pc.Online {
+		t.Fatalf("online patch = %+v, want Online=true", pc)
+	}
+}
+
+func TestDiffUnpatchableFieldSendsWholePeer(t *testing.T) {
+	p := testPeer(2)
+	expired := cloneNode(p)
+	expired.Expired = true
+
+	sent := testNetMap(p)
+
+	got := diff(sent, withPeers(sent, expired), nil)
+	if len(got) != 1 || len(got[0].PeersChanged) != 1 || len(got[0].PeersChangedPatch) != 0 {
+		t.Fatalf("want one whole peer, got %+v", got)
+	}
+}
+
+func TestDiffDERPClearSendsPeerList(t *testing.T) {
+	p, q := testPeer(2), testPeer(3)
+	cleared := cloneNode(p)
+	cleared.HomeDERP = 0
+
+	sent := testNetMap(p, q)
+
+	got := diff(sent, withPeers(sent, cleared, q), nil)
+	if len(got) != 1 || len(got[0].Peers) != 2 {
+		t.Fatalf("want the whole peer list, got %+v", got)
+	}
+
+	if len(got[0].PeersChanged)+len(got[0].PeersChangedPatch) != 0 {
+		t.Fatalf("peer list combined with deltas: %+v", got[0])
+	}
+}
+
+func TestDiffRemovalLeadsOnItsOwn(t *testing.T) {
+	p, q := testPeer(2), testPeer(3)
+
+	sent := testNetMap(p, q)
+
+	got := diff(sent, withPeers(sent, q), nil)
+	if len(got) != 1 || len(got[0].PeersRemoved) != 1 || got[0].PeersRemoved[0] != 2 {
+		t.Fatalf("removal only: got %+v", got)
+	}
+
+	next := withPeers(sent, q)
+	next.ssh = &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{{Principals: []*tailcfg.SSHPrincipal{{Any: true}}}}}
+
+	got = diff(sent, next, nil)
+	if len(got) != 2 {
+		t.Fatalf("want removal then update, got %d responses", len(got))
+	}
+
+	if len(got[0].PeersRemoved) != 1 || got[0].SSHPolicy != nil {
+		t.Fatalf("first response = %+v, want only the removal", got[0])
+	}
+
+	if got[1].SSHPolicy == nil || len(got[1].PeersRemoved) != 0 {
+		t.Fatalf("second response = %+v, want the SSH policy only", got[1])
+	}
+}
+
+func TestDiffSendsOnlyChangedSections(t *testing.T) {
+	sent := testNetMap(testPeer(2))
+
+	self := cloneNode(sent.self)
+	self.Name = "renamed."
+	next := *sent
+	next.self = self
+	next.filter = []tailcfg.FilterRule{{SrcIPs: []string{"100.64.0.2/32"}}}
+
+	got := diff(sent, &next, nil)
+	if len(got) != 1 {
+		t.Fatalf("got %d responses, want 1", len(got))
+	}
+
+	r := got[0]
+	if r.Node == nil || r.PacketFilters == nil {
+		t.Fatalf("missing changed sections: %+v", r)
+	}
+
+	if r.SSHPolicy != nil || r.DNSConfig != nil || r.DERPMap != nil || len(r.UserProfiles) != 0 {
+		t.Fatalf("unchanged sections resent: %+v", r)
+	}
+}
+
+func TestDiffNewPeerCarriesItsProfile(t *testing.T) {
+	sent := testNetMap()
+	p := testPeer(2)
+	p.User = 2
+	next := withPeers(sent, p)
+	own, _ := sent.profiles.Get(1)
+	next.profiles = profileMapOf(own, tailcfg.UserProfile{ID: 2, LoginName: "b"})
+
+	got := diff(sent, next, nil)
+	if len(got) != 1 || len(got[0].PeersChanged) != 1 {
+		t.Fatalf("want the new peer, got %+v", got)
+	}
+
+	if len(got[0].UserProfiles) != 1 || got[0].UserProfiles[0].ID != 2 {
+		t.Fatalf("profiles = %+v, want only the new user's", got[0].UserProfiles)
+	}
+}
+
+// patchableFields are the [tailcfg.Node] fields [peerPatch] carries in a
+// [tailcfg.PeerChange]; every other field must be compared by
+// [peerRestEqual].
+var patchableFields = map[string]bool{
+	"HomeDERP": true, "Endpoints": true, "Key": true, "DiscoKey": true, "KeyExpiry": true,
+	"Online": true, "LastSeen": true, "KeySignature": true, "Cap": true, "CapMap": true,
+}
+
+// TestPeerRestEqualCoversEveryField changes each non-patchable field of a
+// peer in turn and requires peerRestEqual to see it, so a field added to
+// tailcfg.Node fails here instead of being silently patched away.
+func TestPeerRestEqualCoversEveryField(t *testing.T) {
+	base := testPeer(2)
+
+	typ := reflect.TypeFor[tailcfg.Node]()
+	for i := range typ.NumField() {
+		f := typ.Field(i)
+		// Unexported fields never reach the wire.
+		if patchableFields[f.Name] || !f.IsExported() {
+			continue
+		}
+
+		t.Run(f.Name, func(t *testing.T) {
+			changed := base.Clone()
+			v := reflect.ValueOf(changed).Elem().Field(i)
+
+			if !setDifferent(v) {
+				t.Fatalf("no way to change field %s of kind %s; teach setDifferent and peerRestEqual about it", f.Name, v.Kind())
+			}
+
+			if peerRestEqual(base, changed) {
+				t.Fatalf("peerRestEqual misses a change to %s", f.Name)
+			}
+		})
+	}
+}
+
+// setDifferent sets v to a value different from the testPeer default.
+func setDifferent(v reflect.Value) bool {
+	switch v.Type() {
+	case reflect.TypeFor[time.Time]():
+		v.Set(reflect.ValueOf(time.Unix(1, 0)))
+
+		return true
+	case reflect.TypeFor[tailcfg.HostinfoView]():
+		v.Set(reflect.ValueOf((&tailcfg.Hostinfo{Hostname: "changed"}).View()))
+
+		return true
+	case reflect.TypeFor[key.MachinePublic]():
+		v.Set(reflect.ValueOf(key.NewMachine().Public()))
+
+		return true
+	}
+
+	switch v.Kind() { //nolint:exhaustive // other kinds fail the test below
+	case reflect.String:
+		v.SetString(v.String() + "x")
+	case reflect.Bool:
+		v.SetBool(!v.Bool())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		v.SetInt(v.Int() + 1)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		v.SetUint(v.Uint() + 1)
+	case reflect.Slice:
+		v.Set(reflect.Append(v, reflect.New(v.Type().Elem()).Elem()))
+	case reflect.Pointer:
+		v.Set(reflect.New(v.Type().Elem()))
+	case reflect.Array:
+		// Keys are fixed-size arrays; flip a byte.
+		b := v.Index(v.Len() - 1)
+		b.SetUint(b.Uint() + 1)
+	default:
+		return false
+	}
+
+	return true
+}
+
+// TestWithRoutesMatchesTailNode checks that a shared render plus one
+// viewer's routes is exactly what rendering the peer with those routes
+// gives.
+func TestWithRoutesMatchesTailNode(t *testing.T) {
+	uid := uint(1)
+	v4 := netip.MustParseAddr("100.64.0.9")
+	v6 := netip.MustParseAddr("fd7a:115c:a1e0::9")
+	routes := []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/24"),
+		netip.MustParsePrefix("0.0.0.0/0"),
+		netip.MustParsePrefix("::/0"),
+	}
+
+	peer := (&types.Node{
+		ID:         9,
+		GivenName:  "peer",
+		Hostname:   "peer",
+		MachineKey: key.NewMachine().Public(),
+		NodeKey:    key.NewNode().Public(),
+		IPv4:       &v4,
+		IPv6:       &v6,
+		UserID:     &uid,
+		User:       &types.User{Name: "u"},
+		Hostinfo:   &tailcfg.Hostinfo{Hostname: "peer"},
+	}).View()
+
+	cfg := &types.Config{DNSConfig: types.DNSConfig{BaseDomain: "example.com"}}
+
+	want, err := peer.TailNode(capVer, func(types.NodeID) []netip.Prefix { return routes }, cfg, cfg.DNSView(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base, err := (&peerRenders{}).render(cfg, cfg.DNSView(), capVer, 1, 1, peer, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := withRoutes(base, routes)
+
+	// render sets the peer-view CapMap and strips NetInfo; align those.
+	want.CapMap = got.CapMap
+	if !reflect.DeepEqual(want, got) {
+		t.Fatalf("shared render differs:\nwant %+v\ngot  %+v", want, got)
+	}
+
+	if len(base.PrimaryRoutes) != 0 || len(base.AllowedIPs) != 2 {
+		t.Fatalf("withRoutes modified the shared base: %+v", base)
+	}
+}
+
+// TestSameProfileCoversEveryField fails when tailcfg.UserProfile gains a
+// field sameProfile does not compare.
+func TestSameProfileCoversEveryField(t *testing.T) {
+	typ := reflect.TypeFor[tailcfg.UserProfile]()
+	require.Equal(t, 5, typ.NumField(), "compare the new UserProfile field in sameProfile")
+
+	base := tailcfg.UserProfile{ID: 1, LoginName: "a", DisplayName: "A", ProfilePicURL: "p", Groups: []string{"g"}}
+	require.True(t, sameProfile(base, base))
+
+	for i := range typ.NumField() {
+		changed := base
+		v := reflect.ValueOf(&changed).Elem().Field(i)
+
+		switch v.Kind() { //nolint:exhaustive // other kinds fail the test
+		case reflect.String:
+			v.SetString("other")
+		case reflect.Int64:
+			v.SetInt(2)
+		case reflect.Slice:
+			v.Set(reflect.ValueOf([]string{"h"}))
+		default:
+			t.Fatalf("field %s: unhandled kind %s", typ.Field(i).Name, v.Kind())
+		}
+
+		require.False(t, sameProfile(base, changed), "field %s", typ.Field(i).Name)
+	}
+}
+
+// Ported from the state package, where the comparator lived before it
+// moved to the peer render.
+func TestPeerHostinfoEqual(t *testing.T) {
+	base := func() *tailcfg.Hostinfo {
+		return &tailcfg.Hostinfo{
+			Hostname:    "node",
+			OS:          "linux",
+			DeviceModel: "laptop",
+			NetInfo:     &tailcfg.NetInfo{PreferredDERP: 1, WorkingUDP: opt.NewBool(true)},
+		}
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*tailcfg.Hostinfo)
+		want   bool
+	}{
+		{name: "no change", mutate: func(*tailcfg.Hostinfo) {}, want: true},
+		{name: "device model", mutate: func(hi *tailcfg.Hostinfo) { hi.DeviceModel = "desktop" }, want: true},
+		{name: "shields up", mutate: func(hi *tailcfg.Hostinfo) { hi.ShieldsUp = true }, want: true},
+		{name: "ipn version", mutate: func(hi *tailcfg.Hostinfo) { hi.IPNVersion = "1.99" }, want: true},
+		{name: "netinfo udp", mutate: func(hi *tailcfg.Hostinfo) { hi.NetInfo.WorkingUDP = opt.NewBool(false) }, want: true},
+		{name: "netinfo dropped", mutate: func(hi *tailcfg.Hostinfo) { hi.NetInfo = nil }, want: true},
+		{name: "hostname", mutate: func(hi *tailcfg.Hostinfo) { hi.Hostname = "other" }, want: false},
+		{name: "os", mutate: func(hi *tailcfg.Hostinfo) { hi.OS = "windows" }, want: false},
+		{
+			name:   "services",
+			mutate: func(hi *tailcfg.Hostinfo) { hi.Services = []tailcfg.Service{{Proto: "peerapi4", Port: 1}} },
+			want:   false,
+		},
+		{name: "ssh host keys", mutate: func(hi *tailcfg.Hostinfo) { hi.SSH_HostKeys = []string{"ssh-ed25519 AAAA"} }, want: false},
+		{name: "location", mutate: func(hi *tailcfg.Hostinfo) { hi.Location = &tailcfg.Location{Priority: 5} }, want: false},
+		{name: "app connector", mutate: func(hi *tailcfg.Hostinfo) { hi.AppConnector = opt.NewBool(true) }, want: false},
+		{
+			name:   "routes",
+			mutate: func(hi *tailcfg.Hostinfo) { hi.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")} },
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			changed := base()
+			tt.mutate(changed)
+			require.Equal(t, tt.want, peerHostinfoEqual(base().View(), changed.View()))
+		})
+	}
+
+	require.True(t, peerHostinfoEqual(tailcfg.HostinfoView{}, tailcfg.HostinfoView{}))
+	require.False(t, peerHostinfoEqual(tailcfg.HostinfoView{}, base().View()))
+}
+
+// TestPeerHostinfoEqualSeesEveryField fails when tailscale adds a field to
+// [tailcfg.Service] or [tailcfg.Location] that servicesEqual or locationEqual
+// does not compare.
+func TestPeerHostinfoEqualSeesEveryField(t *testing.T) {
+	set := func(t *testing.T, f reflect.Value) {
+		t.Helper()
+
+		switch {
+		case f.Kind() == reflect.String:
+			f.SetString("x")
+		case f.CanInt():
+			f.SetInt(1)
+		case f.CanUint():
+			f.SetUint(1)
+		case f.CanFloat():
+			f.SetFloat(1)
+		default:
+			t.Fatalf("field kind %s not handled; compare it", f.Kind())
+		}
+	}
+
+	for _, field := range reflect.VisibleFields(reflect.TypeFor[tailcfg.Service]()) {
+		if !field.IsExported() {
+			continue
+		}
+
+		t.Run("Service."+field.Name, func(t *testing.T) {
+			var svc tailcfg.Service
+			set(t, reflect.ValueOf(&svc).Elem().FieldByIndex(field.Index))
+
+			a := &tailcfg.Hostinfo{Services: []tailcfg.Service{{}}}
+			b := &tailcfg.Hostinfo{Services: []tailcfg.Service{svc}}
+			assert.False(t, peerHostinfoEqual(a.View(), b.View()))
+		})
+	}
+
+	for _, field := range reflect.VisibleFields(reflect.TypeFor[tailcfg.Location]()) {
+		t.Run("Location."+field.Name, func(t *testing.T) {
+			var loc tailcfg.Location
+			set(t, reflect.ValueOf(&loc).Elem().FieldByIndex(field.Index))
+
+			a := &tailcfg.Hostinfo{Location: &tailcfg.Location{}}
+			b := &tailcfg.Hostinfo{Location: &loc}
+			assert.False(t, peerHostinfoEqual(a.View(), b.View()))
+		})
+	}
+}
+
+func TestDiffClearsPeerCapabilitiesOnWire(t *testing.T) {
+	before := testPeer(2)
+	before.CapMap = tailcfg.NodeCapMap{"example.com/cap": {}}
+	after := cloneNode(before)
+	after.CapMap = nil
+	responses := diff(testNetMap(before), testNetMap(after), nil)
+	require.Len(t, responses, 1)
+	data, err := Marshal(responses[0])
+	require.NoError(t, err)
+
+	var received tailcfg.MapResponse
+	require.NoError(t, json.Unmarshal(data, &received))
+	// A complete changed peer clears capabilities even when omitempty drops CapMap.
+	require.Len(t, received.PeersChanged, 1)
+	require.Equal(t, after.ID, received.PeersChanged[0].ID)
+	require.Empty(t, received.PeersChanged[0].CapMap)
+	require.Empty(t, received.PeersChangedPatch)
+}
+
+func TestDiffClearsPeerEndpointsOnWire(t *testing.T) {
+	before := testPeer(2)
+	after := cloneNode(before)
+	after.Endpoints = nil
+	responses := diff(testNetMap(before), testNetMap(after), nil)
+	require.Len(t, responses, 1)
+	data, err := Marshal(responses[0])
+	require.NoError(t, err)
+
+	var received tailcfg.MapResponse
+	require.NoError(t, json.Unmarshal(data, &received))
+	// The client converts PeersChanged to a patch, which also loses a nil clear.
+	require.Len(t, received.Peers, 1)
+	require.Empty(t, received.Peers[0].Endpoints)
+	require.Empty(t, received.PeersChanged)
+	require.Empty(t, received.PeersChangedPatch)
+}
+
+// TestPatchSendsExpiryInUTC pins that a patch carries the expiry in UTC.
+// The database's zone can put the latest accepted expiry past year 9999,
+// which encoding refuses for the whole response.
+func TestPatchSendsExpiryInUTC(t *testing.T) {
+	latest := time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC)
+	loaded := latest.In(time.FixedZone("", 60*60))
+
+	uid := uint(1)
+	v4 := netip.MustParseAddr("100.64.0.7")
+	node := &types.Node{
+		ID:         7,
+		GivenName:  "peer",
+		Hostname:   "peer",
+		MachineKey: key.NewMachine().Public(),
+		NodeKey:    key.NewNode().Public(),
+		IPv4:       &v4,
+		UserID:     &uid,
+		User:       &types.User{Name: "u"},
+		Hostinfo:   &tailcfg.Hostinfo{Hostname: "peer"},
+	}
+	cfg := &types.Config{DNSConfig: types.DNSConfig{BaseDomain: "example.com"}}
+
+	before, err := (&peerRenders{}).render(cfg, cfg.DNSView(), capVer, 1, 1, node.View(), nil)
+	require.NoError(t, err)
+
+	// A relogin rotates the key and sets the expiry.
+	node.NodeKey = key.NewNode().Public()
+	node.Expiry = &loaded
+
+	after, err := (&peerRenders{}).render(cfg, cfg.DNSView(), capVer, 2, 1, node.View(), nil)
+	require.NoError(t, err)
+
+	responses := diff(testNetMap(before), testNetMap(after), nil)
+	require.Len(t, responses, 1)
+	require.Len(t, responses[0].PeersChangedPatch, 1)
+
+	_, err = Marshal(responses[0])
+	require.NoError(t, err)
+	assert.True(t, latest.Equal(*responses[0].PeersChangedPatch[0].KeyExpiry))
+}
+
+func TestModelCapMapCanonicalizationPreservesKeysAndPayloads(t *testing.T) {
+	original := testNetMap(testPeer(2))
+	original.peers = peerMapOf(&tailcfg.Node{ID: 2, CapMap: tailcfg.NodeCapMap{"present": nil, "payload": {tailcfg.RawMessage(`{"value":1}`)}}})
+	client := newModelClient(fullResponse(&types.Config{}, original))
+	client.apply(&tailcfg.MapResponse{PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 2, CapMap: tailcfg.NodeCapMap{"present": nil, "payload": {tailcfg.RawMessage(`{"value":1}`)}}}}})
+
+	fresh := newModelClient(fullResponse(&types.Config{}, original))
+	require.Empty(t, client.sameAs(fresh), "nil and empty presence-only payloads use Node.Clone's full-map representation")
+	client.apply(&tailcfg.MapResponse{PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 2, CapMap: tailcfg.NodeCapMap{"payload": {tailcfg.RawMessage(`{"value":1}`)}}}}})
+	require.NotEmpty(t, client.sameAs(fresh), "a missing capability key must still fail convergence")
+	client.apply(&tailcfg.MapResponse{PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: 2, CapMap: tailcfg.NodeCapMap{"present": nil, "payload": {tailcfg.RawMessage(`{"value":2}`)}}}}})
+	require.NotEmpty(t, client.sameAs(fresh), "changed nonempty payloads must still fail convergence")
+}
+
+func TestDiffExpiryRemovalUsesWholePeerOnWire(t *testing.T) {
+	before := testPeer(2)
+	before.KeyExpiry = time.Now().Add(time.Hour).UTC()
+	after := before.Clone()
+	after.Key = key.NewNode().Public()
+	after.KeyExpiry = time.Time{}
+	sent := testNetMap(before)
+	next := withPeers(sent, after)
+	out := diff(sent, next, &frameCache{})
+	require.Len(t, out, 1)
+	require.Empty(t, out[0].PeersChangedPatch, "zero expiry is omitted from PeerChange even through a nonnil time pointer")
+	require.Len(t, out[0].PeersChanged, 1)
+	encoded, err := Marshal(out[0])
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "KeyExpiry", "the complete peer must clear expiry even when omitted on the wire")
+
+	var decoded tailcfg.MapResponse
+	require.NoError(t, json.Unmarshal(encoded, &decoded))
+	require.Equal(t, after.Key, decoded.PeersChanged[0].Key)
+	require.True(t, decoded.PeersChanged[0].KeyExpiry.IsZero())
+
+	client := newModelClient(fullResponse(&types.Config{}, sent))
+	client.apply(&decoded)
+	require.True(t, client.peers[after.ID].KeyExpiry.IsZero())
+	require.Equal(t, after.Key, client.peers[after.ID].Key)
+	require.Empty(t, client.sameAs(newModelClient(fullResponse(&types.Config{}, next))))
+}
+
+// saasDiscoRotation retains the original S2.2 input-control and captured
+// response assertions alongside the graph diff table that supersedes the event.
+func saasDiscoRotation(t *testing.T) (bool, bool) {
+	t.Helper()
+
+	c, err := testcapture.Read(filepath.Join("..", "servertest", "testdata", "steps", "map-delivery.hujson"))
+	require.NoError(t, err)
+
+	id := c.NodeIDs["laptop"]
+
+	var last *tailcfg.MapRequest
+
+	for _, step := range c.Steps {
+		if step.Name != "S2.2" {
+			for _, f := range step.Frames["laptop"] {
+				if f.Request != nil {
+					last = f.Request
+				}
+			}
+
+			continue
+		}
+
+		// The rotation's first report changes the disco key and nothing
+		// else this row looks at.
+		first := step.Frames["laptop"][0].Request
+		require.NotNil(t, first, "S2.2 starts with laptop's report")
+		require.NotNil(t, last, "laptop reported before S2.2")
+		require.NotEqual(t, last.DiscoKey, first.DiscoKey, "disco key rotated")
+		require.Equal(t, last.Endpoints, first.Endpoints, "endpoints kept")
+		require.Equal(t, last.Hostinfo.NetInfo.PreferredDERP, first.Hostinfo.NetInfo.PreferredDERP, "DERP home kept")
+
+		for _, f := range step.Frames["bystander"] {
+			if f.Response == nil {
+				continue
+			}
+
+			for _, n := range f.Response.PeersChanged {
+				if n.ID == id {
+					return !n.Key.IsZero() && n.DiscoKey == first.DiscoKey, len(n.Endpoints) > 0
+				}
+			}
+
+			for _, p := range f.Response.PeersChangedPatch {
+				if p.NodeID == id {
+					return p.Key != nil && p.DiscoKey != nil, p.Endpoints != nil
+				}
+			}
+		}
+	}
+
+	t.Fatal("no disco rotation reached bystander")
+
+	return false, false
+}

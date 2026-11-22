@@ -84,14 +84,12 @@ func registerAuth(api huma.API, b Backend) {
 			return nil, mapError("looking up user", err)
 		}
 
-		node, nodeChange, err := b.State.HandleNodeFromAuthPath(
+		node, err := b.State.HandleNodeFromAuthPath(
 			registrationID,
 			types.UserID(user.ID),
 			nil,
 			util.RegisterMethodCLI,
 		)
-		b.Change(nodeChange)
-
 		if err != nil {
 			return nil, mapError("registering node", err)
 		}

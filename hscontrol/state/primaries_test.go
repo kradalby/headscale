@@ -1,16 +1,20 @@
 package state
 
 import (
+	"fmt"
 	"net/netip"
 	"slices"
 	"testing"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/graph"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/views"
 )
 
 // mp wraps netip.MustParsePrefix.
@@ -23,7 +27,7 @@ func mp(prefix string) netip.Prefix {
 // driving the kinds of state transitions the algorithm cares about.
 type primariesFixture struct {
 	t  *testing.T
-	ns *NodeStore
+	ns *world
 
 	// clock orders the control sessions advertise and approveRoutes open.
 	clock time.Time
@@ -47,9 +51,7 @@ func (f *primariesFixture) session() func(*types.Node) {
 func newPrimariesFixture(t *testing.T, ids ...types.NodeID) *primariesFixture {
 	t.Helper()
 
-	ns := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
-	ns.Start()
-	t.Cleanup(ns.Stop)
+	ns := newTestWorld(t)
 
 	for _, id := range ids {
 		ns.PutNode(nodeForRapid(id))
@@ -88,7 +90,7 @@ func (f *primariesFixture) approveRoutes(id types.NodeID, prefs ...netip.Prefix)
 }
 
 // disconnect mirrors State.Disconnect: marks the node offline. The
-// snapshot rebuild treats an offline node as a non-advertiser.
+// the election can still keep its approved route as an unavailable fallback.
 func (f *primariesFixture) disconnect(id types.NodeID) {
 	f.t.Helper()
 	f.ns.UpdateNode(id, func(n *types.Node) {
@@ -115,7 +117,7 @@ func (f *primariesFixture) healthy(id types.NodeID) {
 // requirePrimary asserts that prefix has node id as its primary.
 func (f *primariesFixture) requirePrimary(prefix netip.Prefix, id types.NodeID) {
 	f.t.Helper()
-	got, ok := f.ns.PrimaryRouteFor(prefix)
+	got, ok := f.ns.snapshot().PrimaryRouteFor(prefix)
 	require.True(f.t, ok, "expected a primary for %s, got none", prefix)
 	require.Equal(f.t, id, got, "primary for %s", prefix)
 }
@@ -123,7 +125,7 @@ func (f *primariesFixture) requirePrimary(prefix netip.Prefix, id types.NodeID) 
 // requireNoPrimary asserts that prefix has no primary at all.
 func (f *primariesFixture) requireNoPrimary(prefix netip.Prefix) {
 	f.t.Helper()
-	_, ok := f.ns.PrimaryRouteFor(prefix)
+	_, ok := f.ns.snapshot().PrimaryRouteFor(prefix)
 	require.False(f.t, ok, "expected no primary for %s", prefix)
 }
 
@@ -131,7 +133,7 @@ func (f *primariesFixture) requireNoPrimary(prefix netip.Prefix) {
 // primary, regardless of order.
 func (f *primariesFixture) requireNodeRoutes(id types.NodeID, want ...netip.Prefix) {
 	f.t.Helper()
-	got := f.ns.PrimaryRoutesForNode(id)
+	got := f.ns.snapshot().PrimaryRoutesForNode(id)
 
 	gotSorted := slices.Clone(got)
 	wantSorted := slices.Clone(want)
@@ -382,7 +384,7 @@ func TestPrimaries_AllUnhealthyKeepsAPrimary(t *testing.T) {
 	f.unhealthy(1)
 	f.unhealthy(2)
 
-	_, ok := f.ns.PrimaryRouteFor(prefix)
+	_, ok := f.ns.snapshot().PrimaryRouteFor(prefix)
 	require.True(t, ok, "all-unhealthy must still produce some primary")
 }
 
@@ -414,7 +416,7 @@ func TestPrimaries_ExpiredRouterNotElected(t *testing.T) {
 	f.advertise(1, prefix)
 	f.advertise(2, prefix)
 	f.requirePrimary(prefix, 1)
-	_, ok := f.ns.RouterSession(1)
+	_, ok := f.ns.snapshot().RouterSession(1)
 	require.True(t, ok)
 
 	f.ns.UpdateNode(1, func(n *types.Node) {
@@ -422,10 +424,10 @@ func TestPrimaries_ExpiredRouterNotElected(t *testing.T) {
 	})
 
 	f.requirePrimary(prefix, 2)
-	_, ok = f.ns.RouterSession(1)
+	_, ok = f.ns.snapshot().RouterSession(1)
 	require.False(t, ok)
 
-	_, ok = f.ns.RouterSession(2)
+	_, ok = f.ns.snapshot().RouterSession(2)
 	require.True(t, ok)
 }
 
@@ -548,7 +550,7 @@ func TestPrimaries_HANodes(t *testing.T) {
 			f := newPrimariesFixture(t, 1, 2, 3)
 			tt.setup(f)
 
-			got := f.ns.HANodes()
+			got := f.ns.snapshot().HANodes()
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -602,6 +604,146 @@ func TestUndecidedHANodes(t *testing.T) {
 
 			got := undecidedHANodes(tt.haNodes, deferred)
 			assert.ElementsMatch(t, tt.want, got.Slice())
+		})
+	}
+}
+
+func TestViaElectionRestart(t *testing.T) {
+	dbPath := t.TempDir() + "/headscale.db"
+	cfg := persistTestConfig(dbPath)
+
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(t, err)
+
+	u1 := database.CreateUserForTest("u1")
+	u2 := database.CreateUserForTest("u2")
+	viewer := database.CreateRegisteredNodeForTest(u2, "viewer")
+	r1 := database.CreateRegisteredNodeForTest(u1, "r1")
+	r2 := database.CreateRegisteredNodeForTest(u1, "r2")
+
+	require.NoError(t, database.Close())
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+
+	closed := false
+
+	t.Cleanup(func() {
+		if !closed {
+			_ = s.Close()
+		}
+	})
+
+	pol := `{"tagOwners":{"tag:via":["u1@"]},"grants":[` +
+		`{"src":["u2@"],"dst":["10.2.0.0/24"],"ip":["*"],"via":["tag:via"]}]}`
+
+	_, err = s.SetPolicy([]byte(pol))
+	require.NoError(t, err)
+
+	// SetPolicy publishes to the world only; the reopened state reads
+	// the database, so the document must live there too.
+	_, err = s.SetPolicyInDB(pol)
+	require.NoError(t, err)
+
+	route := mp("10.2.0.0/24")
+
+	serve := func(st *State, id types.NodeID) {
+		t.Helper()
+
+		live, ok := st.GetNodeByID(id)
+		require.True(t, ok)
+
+		require.NoError(t, st.UpdateNodeFromMapRequest(id, tailcfg.MapRequest{
+			NodeKey:  live.NodeKey(),
+			DiscoKey: live.DiscoKey(),
+			Hostinfo: &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}},
+		}))
+
+		_, err := st.SetApprovedRoutes(id, []netip.Prefix{route})
+		require.NoError(t, err)
+	}
+
+	epochs := map[types.NodeID]uint64{}
+
+	for _, id := range []types.NodeID{r1.ID, r2.ID} {
+		_, err := s.SetNodeTags(id, []string{"tag:via"})
+		require.NoError(t, err)
+		serve(s, id)
+		epochs[id] = s.Connect(id)
+	}
+
+	s.Connect(viewer.ID)
+
+	winner := func(snap *Snapshot) types.NodeID {
+		t.Helper()
+
+		v, _ := snap.GetNode(viewer.ID)
+		matchers, err := snap.Policy().MatchersForNode(v)
+		require.NoError(t, err)
+
+		for _, id := range []types.NodeID{r1.ID, r2.ID} {
+			peer, _ := snap.GetNode(id)
+			if slices.Contains(snap.RoutesForPeer(v, peer, matchers), route) {
+				return id
+			}
+		}
+
+		return 0
+	}
+
+	require.Equal(t, r1.ID, winner(s.Snapshot()), "the lowest-ID healthy router wins")
+
+	// Fail over to the second router before the restart.
+	require.NoError(t, s.Disconnect(r1.ID, epochs[r1.ID]))
+	require.Equal(t, r2.ID, winner(s.Snapshot()), "failover moves the route to the surviving router")
+
+	// The reopen must not share the database with a live state.
+	closed = true
+
+	require.NoError(t, s.Close())
+
+	reopened, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	// Everything durable comes back from the database; only online state
+	// is new. One commit brings both routers back, so a restored
+	// incumbent (r2 held the route before the restart) would keep it;
+	// a fresh election gives it to the lowest-ID router.
+	reopened.world.UpdateNodes(map[types.NodeID]UpdateNodeFunc{
+		r1.ID: func(n *types.Node) { n.IsOnline = new(true) },
+		r2.ID: func(n *types.Node) { n.IsOnline = new(true) },
+	})
+
+	restarted := reopened.Snapshot()
+
+	// The via scope must be what elected: the reopened state read the
+	// persisted document, not the empty default.
+	via := restarted.s.Get(reopened.world.primaries).via
+	require.NotEmpty(t, via.ChangedNodes(nil), "the via scope elects at restart")
+	require.Equal(t, r1.ID, winner(restarted), "a restart restores no incumbent: both routers back in one commit elect the lowest ID")
+
+	reopened.Connect(viewer.ID)
+	require.Equal(t, r1.ID, winner(reopened.Snapshot()), "the viewer keeps seeing the elected router after it reconnects")
+}
+
+func TestUnavailableRouterFallbackByScope(t *testing.T) {
+	for _, lowUnhealthy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lowest-unhealthy=%t", lowUnhealthy), func(t *testing.T) {
+			first := nodeForRapid(1)
+			second := nodeForRapid(2)
+			first.IsOnline = new(false)
+			second.IsOnline = new(false)
+			first.Unhealthy = lowUnhealthy
+			nodes := graph.NewMap(graph.Same[*types.Node], map[types.NodeID]*types.Node{1: &first, 2: &second})
+			candidates := views.SliceOf([]types.NodeID{1, 2})
+			global, ok := electPrimary(nodes, candidates, 2)
+			require.True(t, ok)
+			assert.Equal(t, types.NodeID(2), global, "global fallback retains its approving incumbent")
+
+			via, ok := electViaPrimary(nodes, candidates, 2)
+			require.True(t, ok)
+			assert.Equal(t, types.NodeID(1), via, "via fallback uses the lowest approving ID regardless of incumbent")
 		})
 	}
 }

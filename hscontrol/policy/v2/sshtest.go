@@ -152,10 +152,7 @@ func (pm *PolicyManager) RunSSHTests() error {
 		return nil
 	}
 
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
-	results := runSSHPolicyTests(pm.resolvedPol, pm.users, pm.nodes)
+	results := runSSHPolicyTests(pm.pol, pm.users, pm.nodes)
 
 	return wrapTestResult(errSSHPolicyTestsFailed, results.AllPassed, results)
 }
@@ -185,7 +182,7 @@ func runSSHPolicyTests(
 ) SSHPolicyTestResults {
 	// baseURL is empty because reachability only checks for the presence
 	// of [tailcfg.SSHAction.HoldAndDelegate], not its value.
-	rules, err := pol.compileSSHRules("", users, nodes)
+	rules, err := pol.prepareSSH("", users, nodes)
 	cache := &sshTestCache{
 		rules:  rules,
 		err:    err,
@@ -621,7 +618,7 @@ func prefixesToIPSet(prefixes []netip.Prefix) (*netipx.IPSet, error) {
 // sshTestCache holds one sshTests pass's compiled SSH rules and, per dst,
 // the rules selected from them.
 type sshTestCache struct {
-	rules  []compiledSSHRule
+	rules  *sshPrep
 	err    error
 	byNode map[types.NodeID]sshRulesBySrc
 }
@@ -647,7 +644,7 @@ func compiledSSHPolicy(
 
 	rules := make(sshRulesBySrc)
 
-	for _, rule := range sshPolicyForNode(cache.rules, node).Rules {
+	for _, rule := range cache.rules.forNode(node).Rules {
 		for _, p := range rule.Principals {
 			if p == nil {
 				continue

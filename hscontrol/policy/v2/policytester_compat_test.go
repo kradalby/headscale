@@ -100,7 +100,7 @@ func runTesterCompatFor(
 
 	pm, err := NewPolicyManager(policyJSON, users, nodes.ViewSlice())
 	if err == nil {
-		_, err = pm.SetPolicy(policyJSON)
+		_, err = replacePolicy(&pm, policyJSON)
 	} else {
 		pm = nil
 	}

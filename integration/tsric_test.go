@@ -177,8 +177,10 @@ func TestTailscaleRustAxum(t *testing.T) {
 	t.Log("Verifying probe client sees tailscale-rs as a peer...")
 
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		status, err := probeClient.Status()
-		assert.NoError(c, err)
+		status := assertClientStatus(c, probeClient)
+		if status == nil {
+			return
+		}
 
 		found := false
 

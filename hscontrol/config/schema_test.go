@@ -104,16 +104,21 @@ func TestSchemaTypes(t *testing.T) {
 		{path: "listen_addr", want: typeInfo{Label: "listen address", Anchor: "#type-listen-address", Nix: "t.listenAddr"}, def: "0.0.0.0:8080"},
 		{path: "dns.magic_dns", want: typeInfo{Label: "boolean", Anchor: "#type-boolean", Nix: "lib.types.bool"}, def: true},
 		{
-			path:    "tuning.batcher_workers",
+			path:    "tuning.node_store_batch_size",
 			want:    typeInfo{Label: "integer", Anchor: "#type-integer", Nix: "lib.types.int"},
-			def:     0,
-			defText: "three quarters of the CPU cores, at least one",
+			def:     100,
+			defText: "chosen at start",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
 			k, ok := byPath[tt.path]
 			require.True(t, ok)
+
+			if tt.defText != "" {
+				k.Field.Tag += ` defaulttext:"chosen at start"`
+				require.NoError(t, k.describeLeaf(tt.def, nil))
+			}
 
 			if diff := gocmp.Diff(tt.want, k.Type); diff != "" {
 				t.Errorf("type (-want +got):\n%s", diff)
@@ -261,14 +266,18 @@ func TestExamples(t *testing.T) {
 
 			l, err := Load(writeConfig(t, string(file)), true, nil)
 			require.NoError(t, err)
+
 			require.Empty(t, l.Warnings)
+
 			require.JSONEq(t, example, jsonText(t, plainFields(l.Config, false)[k.Path]), "file layer:\n%s", file)
 
 			env := k.Env + "=" + envValue(k.Example)
 
 			l, err = Load(empty, true, []string{env})
 			require.NoError(t, err)
+
 			require.Empty(t, l.Warnings)
+
 			require.JSONEq(t, example, jsonText(t, plainFields(l.Config, false)[k.Path]), "env layer: %s", env)
 		})
 	}
@@ -322,7 +331,7 @@ func TestEnvValue(t *testing.T) {
 		{name: "empty list", v: []any{}, want: `[]`, keys: lists},
 		{name: "map", v: map[string]any{"b": "y", "a": "x"}, want: `{"a":"x","b":"y"}`, keys: []string{"oidc.extra_params"}},
 		{name: "bool", v: true, want: "true", keys: []string{"logtail.enabled"}},
-		{name: "int", v: 5, want: "5", keys: []string{"tuning.batcher_workers"}},
+		{name: "int", v: 5, want: "5", keys: []string{"tuning.node_store_batch_size"}},
 	}
 
 	empty := writeConfig(t, "")
@@ -335,7 +344,9 @@ func TestEnvValue(t *testing.T) {
 			for _, key := range tt.keys {
 				l, err := Load(empty, true, []string{configEnvName(key) + "=" + got})
 				require.NoError(t, err)
+
 				require.Empty(t, l.Warnings)
+
 				require.JSONEq(t, jsonText(t, tt.v), jsonText(t, plainFields(l.Config, false)[key]), key)
 			}
 		})

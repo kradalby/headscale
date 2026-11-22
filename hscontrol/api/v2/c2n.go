@@ -10,7 +10,6 @@ import (
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/rs/zerolog/log"
 	"tailscale.com/tailcfg"
@@ -50,12 +49,14 @@ func sendC2N(ctx context.Context, b Backend, nodeID types.NodeID, path string) (
 	callback.Path = "/machine/c2n-response"
 	callback.RawQuery = url.Values{"id": {c2nID}}.Encode()
 
-	b.Change(change.PingNode(nodeID, &tailcfg.PingRequest{
+	if b.Ping == nil || !b.Ping(nodeID, &tailcfg.PingRequest{
 		URL:     callback.String(),
 		Log:     true,
 		Types:   "c2n",
 		Payload: payload.Bytes(),
-	}))
+	}) {
+		return nil, huma.Error404NotFound("not found")
+	}
 
 	timer := time.NewTimer(c2nTimeout)
 	defer timer.Stop()

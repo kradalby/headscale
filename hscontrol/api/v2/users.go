@@ -145,7 +145,7 @@ func matchesMember(filter string) bool {
 
 // userFromView maps a Headscale user onto the Tailscale User through the
 // UserView accessors. deviceCount, lastSeen, and currentlyConnected are
-// aggregated from the user's nodes in the NodeStore.
+// aggregated from the user's nodes in the latest snapshot.
 func userFromView(b Backend, view types.UserView) User {
 	u := User{
 		ID:            strconv.FormatUint(uint64(view.ID()), 10),

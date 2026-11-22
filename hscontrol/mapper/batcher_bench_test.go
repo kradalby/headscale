@@ -1,947 +1,308 @@
 package mapper
 
-// Benchmarks for batcher components and full pipeline.
-//
-// Organized into three tiers:
-// - Component benchmarks: individual functions (connectionEntry.send, computePeerDiff, etc.)
-// - System benchmarks: batching mechanics (addToBatch, processBatchedChanges, broadcast)
-// - Full pipeline benchmarks: end-to-end with real DB (gated behind !testing.Short())
-//
-// All benchmarks use sub-benchmarks with 10/100/1000 node counts for scaling analysis.
-
 import (
 	"fmt"
-	"sync"
+	"net/netip"
 	"testing"
-	"time"
 
+	"github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
-	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
-	"github.com/puzpuzpuz/xsync/v4"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
+	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 )
 
-// ============================================================================
-// Component Benchmarks
-// ============================================================================
+// The old Batcher ingress/connection benchmarks now measure the Hub operations
+// that replace their queues. End-to-end rendering is BenchmarkScalingWrites.
+func BenchmarkHubOperations(b *testing.B) {
+	for _, n := range []types.NodeID{10, 1000, 10000} {
+		b.Run(fmt.Sprintf("N%d", n), func(b *testing.B) {
+			h := NewHub()
+			defer h.Close()
 
-// BenchmarkConnectionEntry_Send measures the throughput of sending a single
-// MapResponse through a connectionEntry with a buffered channel.
-func BenchmarkConnectionEntry_Send(b *testing.B) {
-	ch := make(chan *tailcfg.MapResponse, b.N+1)
-	entry := makeConnectionEntry("bench-conn", ch)
-	data := testMapResponse()
-
-	b.ResetTimer()
-
-	for range b.N {
-		_ = entry.send(data)
-	}
-}
-
-// BenchmarkMultiChannelSend measures broadcast throughput to multiple connections.
-func BenchmarkMultiChannelSend(b *testing.B) {
-	for _, connCount := range []int{1, 3, 10} {
-		b.Run(fmt.Sprintf("%dconn", connCount), func(b *testing.B) {
-			mc := newMultiChannelNodeConn(1, nil)
-
-			channels := make([]chan *tailcfg.MapResponse, connCount)
-			for i := range channels {
-				channels[i] = make(chan *tailcfg.MapResponse, b.N+1)
-				mc.addConnection(makeConnectionEntry(fmt.Sprintf("conn-%d", i), channels[i]))
+			for i := range n {
+				h.Join(i+1, func() {})
 			}
 
-			data := testMapResponse()
+			b.Run("connected", func(b *testing.B) {
+				b.ReportAllocs()
 
-			b.ResetTimer()
-
-			for range b.N {
-				_ = mc.send(data)
-			}
-		})
-	}
-}
-
-// BenchmarkEmptyMapResponse pins that the per-response emptiness check
-// does not allocate, on a frame it drops and on one it keeps.
-func BenchmarkEmptyMapResponse(b *testing.B) {
-	for _, tt := range []struct {
-		name string
-		resp *tailcfg.MapResponse
-	}{
-		{"empty", testMapResponse()},
-		{"peers", testMapResponseWithPeers(1, 2, 3)},
-	} {
-		b.Run(tt.name, func(b *testing.B) {
-			b.ReportAllocs()
-
-			for range b.N {
-				_ = emptyMapResponse(tt.resp)
-			}
-		})
-	}
-}
-
-// BenchmarkComputePeerDiff measures the cost of computing peer diffs at scale.
-func BenchmarkComputePeerDiff(b *testing.B) {
-	for _, peerCount := range []int{10, 100, 1000} {
-		b.Run(fmt.Sprintf("%dpeers", peerCount), func(b *testing.B) {
-			mc := newMultiChannelNodeConn(1, nil)
-
-			// Populate tracked peers: 1..peerCount
-			for i := 1; i <= peerCount; i++ {
-				mc.lastSentPeers.Store(tailcfg.NodeID(i), struct{}{})
-			}
-
-			// Current peers: remove ~10% (every 10th peer is missing)
-			current := make([]tailcfg.NodeID, 0, peerCount)
-			for i := 1; i <= peerCount; i++ {
-				if i%10 != 0 {
-					current = append(current, tailcfg.NodeID(i))
-				}
-			}
-
-			b.ResetTimer()
-
-			for range b.N {
-				_ = mc.computePeerDiff(current)
-			}
-		})
-	}
-}
-
-// BenchmarkUpdateSentPeers measures the cost of updating peer tracking state.
-func BenchmarkUpdateSentPeers(b *testing.B) {
-	for _, peerCount := range []int{10, 100, 1000} {
-		b.Run(fmt.Sprintf("%dpeers_full", peerCount), func(b *testing.B) {
-			mc := newMultiChannelNodeConn(1, nil)
-
-			// Pre-build response with full peer list
-			peerIDs := make([]tailcfg.NodeID, peerCount)
-			for i := range peerIDs {
-				peerIDs[i] = tailcfg.NodeID(i + 1)
-			}
-
-			resp := testMapResponseWithPeers(peerIDs...)
-
-			b.ResetTimer()
-
-			for range b.N {
-				mc.updateSentPeers(resp)
-			}
-		})
-
-		b.Run(fmt.Sprintf("%dpeers_incremental", peerCount), func(b *testing.B) {
-			mc := newMultiChannelNodeConn(1, nil)
-
-			// Pre-populate with existing peers
-			for i := 1; i <= peerCount; i++ {
-				mc.lastSentPeers.Store(tailcfg.NodeID(i), struct{}{})
-			}
-
-			// Build incremental response: add 10% new peers
-			addCount := peerCount / 10
-			if addCount == 0 {
-				addCount = 1
-			}
-
-			resp := testMapResponse()
-
-			resp.PeersChanged = make([]*tailcfg.Node, addCount)
-			for i := range addCount {
-				resp.PeersChanged[i] = &tailcfg.Node{ID: tailcfg.NodeID(peerCount + i + 1)}
-			}
-
-			b.ResetTimer()
-
-			for range b.N {
-				mc.updateSentPeers(resp)
-			}
-		})
-	}
-}
-
-// ============================================================================
-// System Benchmarks (no DB, batcher mechanics only)
-// ============================================================================
-
-// benchBatcher creates a lightweight batcher for benchmarks. Unlike the test
-// helper, it doesn't register cleanup and suppresses logging.
-func benchBatcher(nodeCount, bufferSize int) (*Batcher, map[types.NodeID]chan *tailcfg.MapResponse) {
-	b := &Batcher{
-		tick:    time.NewTicker(1 * time.Hour), // never fires during bench
-		workers: 4,
-		workCh:  make(chan work, 4*200),
-		nodes:   xsync.NewMap[types.NodeID, *multiChannelNodeConn](),
-		done:    make(chan struct{}),
-	}
-
-	channels := make(map[types.NodeID]chan *tailcfg.MapResponse, nodeCount)
-	for i := 1; i <= nodeCount; i++ {
-		id := types.NodeID(i) //nolint:gosec // benchmark with small controlled values
-		mc := newMultiChannelNodeConn(id, nil)
-		ch := make(chan *tailcfg.MapResponse, bufferSize)
-		entry := &connectionEntry{
-			done:    make(chan struct{}),
-			id:      fmt.Sprintf("conn-%d", i),
-			c:       ch,
-			version: tailcfg.CapabilityVersion(100),
-			created: time.Now(),
-		}
-		entry.lastUsed.Store(time.Now().Unix())
-		mc.addConnection(entry)
-		b.nodes.Store(id, mc)
-		channels[id] = ch
-	}
-
-	b.totalNodes.Store(int64(nodeCount))
-
-	return b, channels
-}
-
-// BenchmarkAddToBatch_Broadcast measures the cost of broadcasting a change
-// to all nodes via addToBatch (no worker processing, just queuing).
-func BenchmarkAddToBatch_Broadcast(b *testing.B) {
-	for _, nodeCount := range []int{10, 100, 1000} {
-		b.Run(fmt.Sprintf("%dnodes", nodeCount), func(b *testing.B) {
-			batcher, _ := benchBatcher(nodeCount, 10)
-
-			defer func() {
-				close(batcher.done)
-				batcher.tick.Stop()
-			}()
-
-			ch := change.DERPMap()
-
-			b.ResetTimer()
-
-			for range b.N {
-				batcher.addToBatch(ch)
-				// Clear pending to avoid unbounded growth
-				batcher.nodes.Range(func(_ types.NodeID, nc *multiChannelNodeConn) bool {
-					nc.drainPending()
-					return true
-				})
-			}
-		})
-	}
-}
-
-// BenchmarkAddToBatch_Targeted measures the cost of adding a targeted change
-// to a single node.
-func BenchmarkAddToBatch_Targeted(b *testing.B) {
-	for _, nodeCount := range []int{10, 100, 1000} {
-		b.Run(fmt.Sprintf("%dnodes", nodeCount), func(b *testing.B) {
-			batcher, _ := benchBatcher(nodeCount, 10)
-
-			defer func() {
-				close(batcher.done)
-				batcher.tick.Stop()
-			}()
-
-			b.ResetTimer()
-
-			for i := range b.N {
-				targetID := types.NodeID(1 + (i % nodeCount)) //nolint:gosec // benchmark
-				ch := change.Change{
-					Reason:     "bench-targeted",
-					TargetNode: targetID,
-					PeerPatches: []*tailcfg.PeerChange{
-						{NodeID: tailcfg.NodeID(targetID)}, //nolint:gosec // benchmark
-					},
-				}
-				batcher.addToBatch(ch)
-				// Clear pending periodically to avoid growth
-				if i%100 == 99 {
-					batcher.nodes.Range(func(_ types.NodeID, nc *multiChannelNodeConn) bool {
-						nc.drainPending()
-						return true
-					})
-				}
-			}
-		})
-	}
-}
-
-// BenchmarkAddToBatch_FullUpdate measures the cost of a FullUpdate broadcast.
-func BenchmarkAddToBatch_FullUpdate(b *testing.B) {
-	for _, nodeCount := range []int{10, 100, 1000} {
-		b.Run(fmt.Sprintf("%dnodes", nodeCount), func(b *testing.B) {
-			batcher, _ := benchBatcher(nodeCount, 10)
-
-			defer func() {
-				close(batcher.done)
-				batcher.tick.Stop()
-			}()
-
-			b.ResetTimer()
-
-			for range b.N {
-				batcher.addToBatch(change.FullUpdate())
-			}
-		})
-	}
-}
-
-// BenchmarkProcessBatchedChanges measures the cost of moving pending changes
-// to the work queue.
-func BenchmarkProcessBatchedChanges(b *testing.B) {
-	for _, nodeCount := range []int{10, 100, 1000} {
-		b.Run(fmt.Sprintf("%dpending", nodeCount), func(b *testing.B) {
-			batcher, _ := benchBatcher(nodeCount, 10)
-			// Use a very large work channel to avoid blocking
-			batcher.workCh = make(chan work, nodeCount*b.N+1)
-
-			defer func() {
-				close(batcher.done)
-				batcher.tick.Stop()
-			}()
-
-			b.ResetTimer()
-
-			for range b.N {
-				b.StopTimer()
-				// Seed pending changes
-				for i := 1; i <= nodeCount; i++ {
-					if nc, ok := batcher.nodes.Load(types.NodeID(i)); ok { //nolint:gosec // benchmark
-						nc.appendPending(change.DERPMap())
-					}
-				}
-
-				b.StartTimer()
-
-				batcher.processBatchedChanges()
-			}
-		})
-	}
-}
-
-// BenchmarkBroadcastToN measures end-to-end broadcast: addToBatch + processBatchedChanges
-// to N nodes. Does NOT include worker processing (MapResponse generation).
-func BenchmarkBroadcastToN(b *testing.B) {
-	for _, nodeCount := range []int{10, 100, 1000} {
-		b.Run(fmt.Sprintf("%dnodes", nodeCount), func(b *testing.B) {
-			batcher, _ := benchBatcher(nodeCount, 10)
-			batcher.workCh = make(chan work, nodeCount*b.N+1)
-
-			defer func() {
-				close(batcher.done)
-				batcher.tick.Stop()
-			}()
-
-			ch := change.DERPMap()
-
-			b.ResetTimer()
-
-			for range b.N {
-				batcher.addToBatch(ch)
-				batcher.processBatchedChanges()
-			}
-		})
-	}
-}
-
-// BenchmarkMultiChannelBroadcast measures the cost of sending a MapResponse
-// to N nodes each with varying connection counts.
-func BenchmarkMultiChannelBroadcast(b *testing.B) {
-	for _, nodeCount := range []int{10, 100, 1000} {
-		b.Run(fmt.Sprintf("%dnodes", nodeCount), func(b *testing.B) {
-			batcher, _ := benchBatcher(nodeCount, b.N+1)
-
-			defer func() {
-				close(batcher.done)
-				batcher.tick.Stop()
-			}()
-
-			// Add extra connections to every 3rd node
-			for i := 1; i <= nodeCount; i++ {
-				if i%3 == 0 {
-					if mc, ok := batcher.nodes.Load(types.NodeID(i)); ok { //nolint:gosec // benchmark
-						for j := range 2 {
-							ch := make(chan *tailcfg.MapResponse, b.N+1)
-							entry := &connectionEntry{
-								done:    make(chan struct{}),
-								id:      fmt.Sprintf("extra-%d-%d", i, j),
-								c:       ch,
-								version: tailcfg.CapabilityVersion(100),
-								created: time.Now(),
-							}
-							entry.lastUsed.Store(time.Now().Unix())
-							mc.addConnection(entry)
-						}
-					}
-				}
-			}
-
-			data := testMapResponse()
-
-			b.ResetTimer()
-
-			for range b.N {
-				batcher.nodes.Range(func(_ types.NodeID, mc *multiChannelNodeConn) bool {
-					_ = mc.send(data)
-					return true
-				})
-			}
-		})
-	}
-}
-
-// BenchmarkConcurrentAddToBatch measures addToBatch throughput under
-// concurrent access from multiple goroutines.
-func BenchmarkConcurrentAddToBatch(b *testing.B) {
-	for _, nodeCount := range []int{10, 100, 1000} {
-		b.Run(fmt.Sprintf("%dnodes", nodeCount), func(b *testing.B) {
-			batcher, _ := benchBatcher(nodeCount, 10)
-
-			defer func() {
-				close(batcher.done)
-				batcher.tick.Stop()
-			}()
-
-			// Background goroutine to drain pending periodically
-			drainDone := make(chan struct{})
-
-			go func() {
-				defer close(drainDone)
-
-				for {
-					select {
-					case <-batcher.done:
-						return
-					default:
-						batcher.nodes.Range(func(_ types.NodeID, nc *multiChannelNodeConn) bool {
-							nc.drainPending()
-							return true
-						})
-						time.Sleep(time.Millisecond) //nolint:forbidigo // benchmark drain loop
-					}
-				}
-			}()
-
-			ch := change.DERPMap()
-
-			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				for pb.Next() {
-					batcher.addToBatch(ch)
+				for b.Loop() {
+					_ = h.IsConnected(1)
 				}
 			})
-			b.StopTimer()
+			b.Run("connections", func(b *testing.B) {
+				b.ReportAllocs()
 
-			// Cleanup
-			close(batcher.done)
-			<-drainDone
-			// Re-open done so the defer doesn't double-close
-			batcher.done = make(chan struct{})
-		})
-	}
-}
+				for b.Loop() {
+					_ = h.Connected()
+				}
+			})
+			b.Run("targeted-wake", func(b *testing.B) {
+				wake := map[types.NodeID]struct{}{1: {}}
 
-// BenchmarkIsConnected measures the read throughput of IsConnected checks.
-func BenchmarkIsConnected(b *testing.B) {
-	for _, nodeCount := range []int{10, 100, 1000} {
-		b.Run(fmt.Sprintf("%dnodes", nodeCount), func(b *testing.B) {
-			batcher, _ := benchBatcher(nodeCount, 1)
+				b.ReportAllocs()
 
-			defer func() {
-				close(batcher.done)
-				batcher.tick.Stop()
-			}()
+				for b.Loop() {
+					h.wake(false, wake)
+				}
+			})
+			b.Run("broadcast-wake", func(b *testing.B) {
+				b.ReportAllocs()
 
-			b.ResetTimer()
+				for b.Loop() {
+					h.wake(true, nil)
+				}
+			})
+			b.Run("connection-churn", func(b *testing.B) {
+				b.ReportAllocs()
 
-			for i := range b.N {
-				id := types.NodeID(1 + (i % nodeCount)) //nolint:gosec // benchmark
-				_ = batcher.IsConnected(id)
-			}
-		})
-	}
-}
+				for b.Loop() {
+					sess := h.Join(n+1, func() {})
+					h.Leave(sess)
+				}
+			})
+			b.Run("ping", func(b *testing.B) {
+				sess := h.Join(1, func() {})
+				pr := &tailcfg.PingRequest{}
 
-// BenchmarkConnectedMap measures the cost of building the full connected map.
-func BenchmarkConnectedMap(b *testing.B) {
-	for _, nodeCount := range []int{10, 100, 1000} {
-		b.Run(fmt.Sprintf("%dnodes", nodeCount), func(b *testing.B) {
-			batcher, channels := benchBatcher(nodeCount, 1)
+				b.ReportAllocs()
 
-			defer func() {
-				close(batcher.done)
-				batcher.tick.Stop()
-			}()
-
-			// Disconnect 10% of nodes for a realistic mix
-			for i := 1; i <= nodeCount; i++ {
-				if i%10 == 0 {
-					id := types.NodeID(i) //nolint:gosec // benchmark
-					if mc, ok := batcher.nodes.Load(id); ok {
-						mc.removeConnectionByChannel(channels[id])
-						mc.markDisconnected()
+				for b.Loop() {
+					h.Ping(1, pr)
+					<-sess.Pings()
+				}
+			})
+			b.Run("concurrent-wake-and-churn", func(b *testing.B) {
+				b.ReportAllocs()
+				b.RunParallel(func(pb *testing.PB) {
+					for pb.Next() {
+						sess := h.Join(n+1, func() {})
+						h.wake(false, map[types.NodeID]struct{}{1: {}})
+						h.Leave(sess)
 					}
-				}
-			}
-
-			b.ResetTimer()
-
-			for range b.N {
-				_ = batcher.ConnectedMap()
-			}
+				})
+			})
 		})
 	}
 }
 
-// BenchmarkConnectionChurn measures the cost of add/remove connection cycling
-// which simulates client reconnection patterns.
-func BenchmarkConnectionChurn(b *testing.B) {
-	for _, nodeCount := range []int{10, 100, 1000} {
-		b.Run(fmt.Sprintf("%dnodes", nodeCount), func(b *testing.B) {
-			batcher, channels := benchBatcher(nodeCount, 10)
+// stunReportRun drains every report immediately, leaving no coalescing window.
+// Main's legacy gate emitted zero frames for this additional/replaced STUN
+// endpoint. The graph deliberately publishes its complete current raw set.
+type stunReportRun struct {
+	*scalingRun
 
-			defer func() {
-				close(batcher.done)
-				batcher.tick.Stop()
-			}()
+	reporter types.NodeID
+	req      tailcfg.MapRequest
+	frames   int
+	encodes  int
+	wire     int
+}
 
-			b.ResetTimer()
+func newSTUNReportRun(tb testing.TB, visible, unrelated int, router bool) *stunReportRun {
+	tb.Helper()
 
-			for i := range b.N {
-				id := types.NodeID(1 + (i % nodeCount)) //nolint:gosec // benchmark
+	p4 := netip.MustParsePrefix("100.64.0.0/10")
+	p6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+	cfg := &types.Config{
+		Database:  types.DatabaseConfig{Type: types.DatabaseSqlite, Sqlite: types.SqliteConfig{Path: tb.TempDir() + "/h.db"}},
+		ServerURL: "https://headscale.test", Policy: types.PolicyConfig{Mode: types.PolicyModeDB},
+		Prefixes:  types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential},
+		DNSConfig: types.DNSConfig{BaseDomain: "headscale.test"},
+	}
+	cfg.Database.Sqlite.WriteAheadLog = true
+	cfg.Database.Sqlite.WALAutoCheckPoint = 1000
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(tb, err)
 
-				mc, ok := batcher.nodes.Load(id)
-				if !ok {
-					continue
-				}
+	var mode string
 
-				// Remove old connection
-				oldCh := channels[id]
-				mc.removeConnectionByChannel(oldCh)
+	var synchronous int
 
-				// Add new connection
-				newCh := make(chan *tailcfg.MapResponse, 10)
-				entry := &connectionEntry{
-					done:    make(chan struct{}),
-					id:      fmt.Sprintf("churn-%d", i),
-					c:       newCh,
-					version: tailcfg.CapabilityVersion(100),
-					created: time.Now(),
-				}
-				entry.lastUsed.Store(time.Now().Unix())
-				mc.addConnection(entry)
+	require.NoError(tb, database.DB.Raw("PRAGMA journal_mode").Scan(&mode).Error)
+	require.Equal(tb, "wal", mode)
+	require.NoError(tb, database.DB.Raw("PRAGMA synchronous").Scan(&synchronous).Error)
+	require.Equal(tb, 1, synchronous)
 
-				channels[id] = newCh
+	owner := database.CreateUserForTest("endpoint-owner")
+
+	peers := database.CreateRegisteredNodesForTest(owner, visible+1, "visible")
+	if unrelated > 0 {
+		other := database.CreateUserForTest("unrelated-owner")
+		database.CreateRegisteredNodesForTest(other, unrelated, "hidden")
+	}
+
+	require.NoError(tb, database.Close())
+
+	s, err := state.NewState(cfg)
+	require.NoError(tb, err)
+	require.NoError(tb, s.DB().DB.Raw("PRAGMA journal_mode").Scan(&mode).Error)
+	require.Equal(tb, "wal", mode)
+	require.NoError(tb, s.DB().DB.Raw("PRAGMA synchronous").Scan(&synchronous).Error)
+	require.Equal(tb, 1, synchronous)
+	tb.Cleanup(func() { _ = s.Close() })
+
+	_, err = s.SetPolicy([]byte(ownUserOnly))
+	require.NoError(tb, err)
+
+	reporter := peers[0].ID
+	s.Connect(reporter)
+	node := mustNode(tb, s, reporter)
+
+	hi := &tailcfg.Hostinfo{Hostname: node.Hostname(), NetInfo: &tailcfg.NetInfo{PreferredDERP: 1}}
+	if router {
+		hi.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.42.0.0/24")}
+	}
+
+	req := tailcfg.MapRequest{
+		NodeKey: node.NodeKey(), DiscoKey: node.DiscoKey(), Hostinfo: hi,
+		Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")}, EndpointTypes: []tailcfg.EndpointType{tailcfg.EndpointLocal},
+	}
+	require.NoError(tb, s.UpdateNodeFromMapRequest(reporter, req))
+
+	if router {
+		_, err = s.SetApprovedRoutes(reporter, hi.RoutableIPs)
+		require.NoError(tb, err)
+	}
+
+	h := NewHub()
+	tb.Cleanup(h.Close)
+
+	streams := make([]*Stream, 0, visible+unrelated+1)
+
+	for _, nv := range s.ListNodes().All() {
+		st := NewStream(cfg, h, nv.ID(), capVer)
+		st.Attach(h.Join(nv.ID(), func() {}))
+		_, err = st.Initial(s.Snapshot())
+		require.NoError(tb, err)
+		st.Delivered()
+		streams = append(streams, st)
+	}
+
+	return &stunReportRun{scalingRun: newScalingRun(s, streams), reporter: reporter, req: req}
+}
+
+func (run *stunReportRun) report(tb testing.TB, iteration int) {
+	tb.Helper()
+	// Alternate a single STUN address; all reported sets include the same
+	// useful local endpoint, so the legacy gate remains false every time.
+	run.req.Endpoints = []netip.AddrPort{
+		netip.MustParseAddrPort("192.0.2.1:41641"),
+		netip.AddrPortFrom(netip.MustParseAddr("203.0.113.7"), uint16(20000+iteration%2)),
+	}
+	run.req.EndpointTypes = []tailcfg.EndpointType{tailcfg.EndpointLocal, tailcfg.EndpointSTUN}
+
+	err := run.s.UpdateNodeFromMapRequest(run.reporter, run.req)
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	snap := run.s.Snapshot()
+	all, wake := Route(run.last, snap, snap.Since(run.last))
+	run.last = snap
+
+	if all {
+		tb.Fatal("one ordinary endpoint report became a global broadcast")
+	}
+
+	h := run.streams[0].hub
+	h.wake(false, wake)
+
+	for id := range wake {
+		st := run.byNode[id]
+		if st == nil {
+			tb.Fatalf("unexpected recipient %d", id)
+		}
+
+		select {
+		case <-st.sess.Wakes():
+		default:
+			tb.Fatalf("recipient %d was not scheduled", id)
+		}
+
+		run.woken++
+		before := st.r.rendered
+
+		out, err := st.Update(snap)
+		if err != nil {
+			tb.Fatal(err)
+		}
+
+		if len(out) > 0 {
+			run.updates++
+		}
+
+		for _, response := range out {
+			run.frames++
+
+			wire, err := h.Encode(response, false, func(response *tailcfg.MapResponse, compress bool) ([]byte, error) {
+				run.encodes++
+				return benchEncode(response, compress)
+			})
+			if err != nil {
+				tb.Fatal(err)
 			}
-		})
+
+			run.wire += len(wire)
+		}
+
+		st.Delivered()
+		run.rendered += st.r.rendered - before
 	}
 }
 
-// BenchmarkConcurrentSendAndChurn measures the combined cost of sends happening
-// concurrently with connection churn - the hot path in production.
-func BenchmarkConcurrentSendAndChurn(b *testing.B) {
-	for _, nodeCount := range []int{10, 100} {
-		b.Run(fmt.Sprintf("%dnodes", nodeCount), func(b *testing.B) {
-			batcher, channels := benchBatcher(nodeCount, 100)
+func TestSTUNReportFastDrainWork(t *testing.T) {
+	const reports = 4
 
-			var mu sync.Mutex // protect channels map
-
-			stopChurn := make(chan struct{})
-			defer close(stopChurn)
-
-			// Background churn on 10% of nodes
-			go func() {
-				i := 0
-
-				for {
-					select {
-					case <-stopChurn:
-						return
-					default:
-						id := types.NodeID(1 + (i % nodeCount)) //nolint:gosec // benchmark
-						if i%10 == 0 {                          // only churn 10%
-							mc, ok := batcher.nodes.Load(id)
-							if ok {
-								mu.Lock()
-								oldCh := channels[id]
-								mu.Unlock()
-								mc.removeConnectionByChannel(oldCh)
-
-								newCh := make(chan *tailcfg.MapResponse, 100)
-								entry := &connectionEntry{
-									done:    make(chan struct{}),
-									id:      fmt.Sprintf("churn-%d", i),
-									c:       newCh,
-									version: tailcfg.CapabilityVersion(100),
-									created: time.Now(),
-								}
-								entry.lastUsed.Store(time.Now().Unix())
-								mc.addConnection(entry)
-								mu.Lock()
-								channels[id] = newCh
-								mu.Unlock()
-							}
-						}
-
-						i++
+	for _, visible := range []int{1, 4} {
+		for _, unrelated := range []int{0, 40} {
+			for _, router := range []bool{false, true} {
+				t.Run(fmt.Sprintf("visible=%d/unrelated=%d/router=%t", visible, unrelated, router), func(t *testing.T) {
+					run := newSTUNReportRun(t, visible, unrelated, router)
+					for i := range reports {
+						run.report(t, i)
 					}
-				}
-			}()
 
-			data := testMapResponse()
+					require.Equal(t, reports*(visible+1), run.woken)
+					require.Equal(t, run.woken, run.updates)
+					require.Equal(t, run.woken, run.frames)
+					require.Equal(t, reports*visible, run.rendered)
+					require.Equal(t, reports*2, run.encodes, "one shared peer patch plus one self frame per report")
+					require.Positive(t, run.wire)
+					run.requireSettled(t, "endpoint")
 
-			b.ResetTimer()
-
-			for range b.N {
-				batcher.nodes.Range(func(_ types.NodeID, mc *multiChannelNodeConn) bool {
-					_ = mc.send(data)
-					return true
+					for _, st := range run.streams {
+						require.Empty(t, st.sess.wakes, "unrelated sessions must accumulate no work")
+					}
 				})
 			}
-		})
+		}
 	}
 }
 
-// ============================================================================
-// Full Pipeline Benchmarks (with DB)
-// ============================================================================
+func BenchmarkSTUNEndpointReports(b *testing.B) {
+	for _, visible := range []int{1, 10, 100} {
+		for _, unrelated := range []int{0, 1000} {
+			for _, router := range []bool{false, true} {
+				b.Run(fmt.Sprintf("visible=%d/unrelated=%d/router=%t", visible, unrelated, router), func(b *testing.B) {
+					run := newSTUNReportRun(b, visible, unrelated, router)
+					b.ReportAllocs()
 
-// BenchmarkAddNode measures the cost of adding nodes to the batcher,
-// including initial MapResponse generation from a real database.
-func BenchmarkAddNode(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping full pipeline benchmark in short mode")
-	}
-
-	for _, nodeCount := range []int{10, 100} {
-		b.Run(fmt.Sprintf("%dnodes", nodeCount), func(b *testing.B) {
-			testData, cleanup := setupBatcherWithTestData(b, NewBatcherAndMapper, 1, nodeCount, largeBufferSize)
-			defer cleanup()
-
-			batcher := testData.Batcher
-			allNodes := testData.Nodes
-
-			// Start consumers
-			for i := range allNodes {
-				allNodes[i].start()
-			}
-
-			defer func() {
-				for i := range allNodes {
-					allNodes[i].cleanup()
-				}
-			}()
-
-			b.ResetTimer()
-
-			for range b.N {
-				// Connect all nodes (measuring AddNode cost)
-				for i := range allNodes {
-					node := &allNodes[i]
-					_ = batcher.AddNode(node.n.ID, node.ch, tailcfg.CapabilityVersion(100), nil)
-				}
-
-				b.StopTimer()
-				// Disconnect for next iteration
-				for i := range allNodes {
-					node := &allNodes[i]
-					batcher.RemoveNode(node.n.ID, node.ch)
-				}
-				// Drain channels
-				for i := range allNodes {
-					for {
-						select {
-						case <-allNodes[i].ch:
-						default:
-							goto drained
-						}
+					var reports int
+					for b.Loop() {
+						run.report(b, reports)
+						reports++
 					}
 
-				drained:
-				}
-
-				b.StartTimer()
-			}
-		})
-	}
-}
-
-// BenchmarkFullPipeline measures the full pipeline cost: addToBatch → processBatchedChanges
-// → worker → generateMapResponse → send, with real nodes from a database.
-func BenchmarkFullPipeline(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping full pipeline benchmark in short mode")
-	}
-
-	for _, nodeCount := range []int{10, 100} {
-		b.Run(fmt.Sprintf("%dnodes", nodeCount), func(b *testing.B) {
-			testData, cleanup := setupBatcherWithTestData(b, NewBatcherAndMapper, 1, nodeCount, largeBufferSize)
-			defer cleanup()
-
-			batcher := testData.Batcher
-			allNodes := testData.Nodes
-
-			// Start consumers
-			for i := range allNodes {
-				allNodes[i].start()
-			}
-
-			defer func() {
-				for i := range allNodes {
-					allNodes[i].cleanup()
-				}
-			}()
-
-			// Connect all nodes first
-			for i := range allNodes {
-				node := &allNodes[i]
-
-				err := batcher.AddNode(node.n.ID, node.ch, tailcfg.CapabilityVersion(100), nil)
-				if err != nil {
-					b.Fatalf("failed to add node %d: %v", i, err)
-				}
-			}
-
-			// Wait for initial maps to settle
-			time.Sleep(200 * time.Millisecond) //nolint:forbidigo // benchmark coordination
-
-			b.ResetTimer()
-
-			for range b.N {
-				batcher.AddWork(change.DERPMap())
-				// Allow workers to process (the batcher tick is what normally
-				// triggers processBatchedChanges, but for benchmarks we need
-				// to give the system time to process)
-				time.Sleep(20 * time.Millisecond) //nolint:forbidigo // benchmark coordination
-			}
-		})
-	}
-}
-
-// BenchmarkMapResponseFromChange measures the cost of synchronous
-// MapResponse generation for individual nodes.
-func BenchmarkMapResponseFromChange(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping full pipeline benchmark in short mode")
-	}
-
-	for _, nodeCount := range []int{10, 100} {
-		b.Run(fmt.Sprintf("%dnodes", nodeCount), func(b *testing.B) {
-			testData, cleanup := setupBatcherWithTestData(b, NewBatcherAndMapper, 1, nodeCount, largeBufferSize)
-			defer cleanup()
-
-			batcher := testData.Batcher
-			allNodes := testData.Nodes
-
-			// Start consumers
-			for i := range allNodes {
-				allNodes[i].start()
-			}
-
-			defer func() {
-				for i := range allNodes {
-					allNodes[i].cleanup()
-				}
-			}()
-
-			// Connect all nodes
-			for i := range allNodes {
-				node := &allNodes[i]
-
-				err := batcher.AddNode(node.n.ID, node.ch, tailcfg.CapabilityVersion(100), nil)
-				if err != nil {
-					b.Fatalf("failed to add node %d: %v", i, err)
-				}
-			}
-
-			time.Sleep(200 * time.Millisecond) //nolint:forbidigo // benchmark coordination
-
-			ch := change.DERPMap()
-
-			b.ResetTimer()
-
-			for i := range b.N {
-				nodeIdx := i % len(allNodes)
-				_, _ = batcher.MapResponseFromChange(allNodes[nodeIdx].n.ID, ch)
-			}
-		})
-	}
-}
-
-// Frozen from 1096abfc8; keep the body unchanged for differential tests and benchmarks.
-func baselineAddToBatch(b *Batcher, changes ...change.Change) {
-	// Clean up any nodes being permanently removed from the system.
-	//
-	// This handles the case where a node is deleted from state but the batcher
-	// still has it registered. By cleaning up here, we prevent "node not found"
-	// errors when workers try to generate map responses for deleted nodes.
-	//
-	// [change.Change.DeletedNodes] is an explicit internal lifecycle signal;
-	// [change.Change.PeersRemoved] remains only the protocol delta sent to clients
-	// when peers disappear from their view.
-	//
-	// See: https://github.com/juanfont/headscale/issues/2924
-	for _, ch := range changes {
-		for _, removedID := range ch.DeletedNodes {
-			if nc, existed := b.nodes.LoadAndDelete(removedID); existed {
-				b.totalNodes.Add(-1)
-
-				// Tear the node's map sessions down. Dropping the entry alone
-				// leaves [mapSession.serveLongPoll] streaming to a node that no
-				// longer exists: [Batcher.Close] ranges b.nodes and can no
-				// longer reach it, so shutdown blocks on clientStreamsOpen, and
-				// the client keeps polling a node it should be re-authenticating.
-				// See: https://github.com/juanfont/headscale/issues/3410
-				if nc != nil {
-					nc.close()
-				}
-
-				log.Debug().
-					Uint64(zf.NodeID, removedID.Uint64()).
-					Msg("removed deleted node from batcher")
-			}
-		}
-	}
-
-	// A full update supersedes every state change pending or in this call,
-	// but not the pings addressed to a node; those follow the full.
-	if change.HasFull(changes) {
-		b.nodes.Range(func(_ types.NodeID, nc *multiChannelNodeConn) bool {
-			if nc == nil {
-				return true
-			}
-
-			nc.collapsePendingToFull(changes)
-
-			return true
-		})
-
-		return
-	}
-
-	broadcast, targeted := change.SplitTargetedAndBroadcast(changes)
-
-	// Handle targeted changes - send only to the specific node
-	for _, ch := range targeted {
-		if nc, ok := b.nodes.Load(ch.TargetNode); ok && nc != nil {
-			nc.appendPending(ch)
-		}
-	}
-
-	// Handle broadcast changes - send to all nodes, filtering as needed
-	if len(broadcast) > 0 {
-		b.nodes.Range(func(nodeID types.NodeID, nc *multiChannelNodeConn) bool {
-			if nc == nil {
-				return true
-			}
-
-			filtered := change.FilterForNode(nodeID, broadcast)
-
-			if len(filtered) > 0 {
-				nc.appendPending(filtered...)
-			}
-
-			return true
-		})
-	}
-}
-
-var batchIngressImplementations = []struct {
-	name string
-	add  func(*Batcher, ...change.Change)
-}{
-	{"baseline", baselineAddToBatch},
-	{"candidate", (*Batcher).addToBatch},
-}
-
-// BenchmarkBatchIngressPaired measures enqueue work only; fixture construction,
-// delivery-count checks, and draining pending are outside the timer.
-func BenchmarkBatchIngressPaired(b *testing.B) {
-	level := zerolog.GlobalLevel()
-
-	zerolog.SetGlobalLevel(zerolog.Disabled)
-	defer zerolog.SetGlobalLevel(level)
-
-	for _, nodes := range []int{100, 1000, 10000} {
-		for _, batch := range []int{1, 8, 64} {
-			for _, mode := range []struct {
-				name  string
-				mixed bool
-				burst int
-			}{
-				{"broadcast", false, 1},
-				{"mixed", true, 1},
-				{"burst", false, 4},
-			} {
-				for _, impl := range batchIngressImplementations {
-					name := fmt.Sprintf(
-						"nodes=%d/batch=%d/%s/%s",
-						nodes,
-						batch,
-						mode.name,
-						impl.name,
-					)
-					b.Run(name, func(b *testing.B) {
-						b.StopTimer()
-
-						batcher, _ := benchBatcher(nodes, 1)
-						b.Cleanup(batcher.Close)
-
-						conns := make([]*multiChannelNodeConn, nodes)
-						for i := range conns {
-							conns[i], _ = batcher.nodes.Load(
-								types.NodeID(i + 1),
-							) //nolint:gosec // bounded benchmark
-						}
-
-						changes := make([]change.Change, 0, batch+2)
-						for i := range batch {
-							changes = append(
-								changes,
-								change.NodeOnline(types.NodeID(i+1)),
-							) //nolint:gosec // bounded benchmark
-						}
-
-						if mode.mixed {
-							changes = append(
-								changes,
-								change.SelfUpdate(1),
-								change.SelfUpdate(10001),
-							) //nolint:gosec // bounded benchmark
-						}
-
-						b.ReportAllocs()
-						b.ResetTimer()
-
-						for range b.N {
-							b.StartTimer()
-
-							for range mode.burst {
-								impl.add(batcher, changes...)
-							}
-
-							b.StopTimer()
-
-							for i, nc := range conns {
-								want := batch * mode.burst
-								if mode.mixed && i == 0 {
-									want += mode.burst
-								}
-
-								if got := len(nc.drainPending()); got != want {
-									b.Fatalf(
-										"node %d: got %d changes, want %d",
-										i+1,
-										got,
-										want,
-									)
-								}
-							}
-						}
-
-						b.ReportMetric(float64(mode.burst), "calls/op")
-					})
-				}
+					run.requireSettled(b, "endpoint")
+					b.ReportMetric(float64(run.woken)/float64(reports), "woken/op")
+					b.ReportMetric(float64(run.frames)/float64(reports), "frames/op")
+					b.ReportMetric(float64(run.encodes)/float64(reports), "encodes/op")
+					b.ReportMetric(float64(run.rendered)/float64(reports), "peer-renders/op")
+					b.ReportMetric(float64(run.wire)/float64(reports), "wire-B/op")
+					b.ReportMetric(0, "legacy-eager-frames/op")
+				})
 			}
 		}
 	}

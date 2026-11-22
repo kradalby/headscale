@@ -42,10 +42,10 @@ func newOAuthTestServer(t *testing.T) (*Headscale, string, string) {
 	require.NoError(t, err)
 	_, err = app.state.SetPolicyInDB(policy)
 	require.NoError(t, err)
-	_, err = app.state.ReloadPolicy()
+	err = app.state.ReloadPolicy()
 	require.NoError(t, err)
 
-	mux, _ := apiv2.Handler(apiv2.Backend{State: app.state, Change: app.Change, Cfg: app.cfg})
+	mux, _ := apiv2.Handler(apiv2.Backend{State: app.state, Cfg: app.cfg})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
@@ -322,7 +322,7 @@ func TestAPIv2OAuth_TaggedKeyCreator(t *testing.T) {
 	require.Equal(t, http.StatusOK, status)
 	assert.Contains(t, string(body), `"userId":"`+owner.StringID()+`"`)
 
-	node, _, err := app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+	node, err := app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
 		Auth:     &tailcfg.RegisterResponseAuth{AuthKey: key.Key},
 		NodeKey:  tskey.NewNode().Public(),
 		Hostinfo: &tailcfg.Hostinfo{Hostname: "made-by-odin"},
@@ -335,7 +335,7 @@ func TestAPIv2OAuth_TaggedKeyCreator(t *testing.T) {
 	assert.Empty(t, create(tok).UserID)
 
 	// The key and the node's copy of it outlive the creator.
-	_, err = app.state.DeleteUser(*owner.TypedID())
+	err = app.state.DeleteUser(*owner.TypedID())
 	require.NoError(t, err)
 
 	status, body = apiReq(t, http.MethodGet, baseURL+"/api/v2/tailnet/-/keys/"+key.ID, admin, nil)
@@ -372,7 +372,7 @@ func TestAPIv2OAuth_TaggedDeviceUser(t *testing.T) {
 		var key apiv2.Key
 		require.NoError(t, json.Unmarshal(body, &key))
 
-		node, _, err := app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+		node, err := app.state.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
 			Auth:     &tailcfg.RegisterResponseAuth{AuthKey: key.Key},
 			NodeKey:  tskey.NewNode().Public(),
 			Hostinfo: &tailcfg.Hostinfo{Hostname: "tagged"},
@@ -400,7 +400,7 @@ func TestAPIv2OAuth_TaggedDeviceUser(t *testing.T) {
 		}
 
 		// The creator's rename reaches the devices its keys made.
-		renamed, _, err := app.state.RenameUser(types.UserID(owner.ID), "thor")
+		renamed, err := app.state.RenameUser(types.UserID(owner.ID), "thor")
 		require.NoError(t, err)
 
 		status, body = apiReq(t, http.MethodGet, baseURL+"/api/v2/device/"+node.StringID(), admin, nil)
@@ -646,7 +646,7 @@ func TestAPIv2OAuth_TagOwnedBy(t *testing.T) {
 	require.NoError(t, err)
 	_, err = app.state.SetPolicyInDB(policy)
 	require.NoError(t, err)
-	_, err = app.state.ReloadPolicy()
+	err = app.state.ReloadPolicy()
 	require.NoError(t, err)
 
 	_, secret := createClient(t, baseURL, admin, []string{"auth_keys"}, []string{"tag:k8s-operator"})

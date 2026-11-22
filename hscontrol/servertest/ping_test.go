@@ -8,10 +8,10 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/netmap"
 )
 
 // TestPingNode verifies the full ping round-trip: the server sends a
@@ -35,10 +35,10 @@ func TestPingNode(t *testing.T) {
 	defer st.CancelPing(pingID)
 
 	callbackURL := h.Server.URL + "/machine/ping-response?id=" + pingID
-	h.Server.App.Change(change.PingNode(nodeID, &tailcfg.PingRequest{
+	require.True(t, h.Server.App.MapHub().Ping(nodeID, &tailcfg.PingRequest{
 		URL: callbackURL,
 		Log: true,
-	}))
+	}), "a connected node's session must take the ping")
 
 	select {
 	case latency := <-responseCh:
@@ -70,10 +70,10 @@ func TestPingDisconnectedNode(t *testing.T) {
 	defer st.CancelPing(pingID)
 
 	callbackURL := h.Server.URL + "/machine/ping-response?id=" + pingID
-	h.Server.App.Change(change.PingNode(nodeID, &tailcfg.PingRequest{
+	h.Server.App.MapHub().Ping(nodeID, &tailcfg.PingRequest{
 		URL: callbackURL,
 		Log: true,
-	}))
+	})
 
 	select {
 	case <-responseCh:
@@ -109,10 +109,10 @@ func TestPingTwoSameNode(t *testing.T) {
 	url1 := h.Server.URL + "/machine/ping-response?id=" + pingID1
 	url2 := h.Server.URL + "/machine/ping-response?id=" + pingID2
 
-	h.Server.App.Change(change.PingNode(nodeID, &tailcfg.PingRequest{
+	require.True(t, h.Server.App.MapHub().Ping(nodeID, &tailcfg.PingRequest{
 		URL: url1,
 	}))
-	h.Server.App.Change(change.PingNode(nodeID, &tailcfg.PingRequest{
+	require.True(t, h.Server.App.MapHub().Ping(nodeID, &tailcfg.PingRequest{
 		URL: url2,
 	}))
 
@@ -136,26 +136,30 @@ func TestPingTwoSameNode(t *testing.T) {
 	}
 }
 
-// TestPingSurvivesFullUpdate verifies that a full update queued alongside a
-// ping, in the same call or right after it, does not swallow the ping.
-func TestPingSurvivesFullUpdate(t *testing.T) {
+// TestPingSurvivesConcurrentUpdate verifies that a ping is delivered while
+// the node's view is also changing, whether the change lands just before
+// the ping or just after it.
+func TestPingSurvivesConcurrentUpdate(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name string
-		send func(h *servertest.TestHarness, ping change.Change)
+		send func(t *testing.T, h *servertest.TestHarness, id types.NodeID, pr *tailcfg.PingRequest)
 	}{
 		{
-			name: "same call",
-			send: func(h *servertest.TestHarness, ping change.Change) {
-				h.Server.App.Change(ping, change.UserRemoved())
+			name: "ping then update",
+			send: func(t *testing.T, h *servertest.TestHarness, id types.NodeID, pr *tailcfg.PingRequest) {
+				t.Helper()
+				require.True(t, h.Server.App.MapHub().Ping(id, pr))
+				expireInAnHour(t, h, id)
 			},
 		},
 		{
-			name: "full after pending ping",
-			send: func(h *servertest.TestHarness, ping change.Change) {
-				h.Server.App.Change(ping)
-				h.Server.App.Change(change.UserRemoved())
+			name: "update then ping",
+			send: func(t *testing.T, h *servertest.TestHarness, id types.NodeID, pr *tailcfg.PingRequest) {
+				t.Helper()
+				expireInAnHour(t, h, id)
+				require.True(t, h.Server.App.MapHub().Ping(id, pr))
 			},
 		},
 	}
@@ -176,19 +180,31 @@ func TestPingSurvivesFullUpdate(t *testing.T) {
 
 			defer st.CancelPing(pingID)
 
-			tt.send(h, change.PingNode(nodeID, &tailcfg.PingRequest{
+			tt.send(t, h, nodeID, &tailcfg.PingRequest{
 				URL: h.Server.URL + "/machine/ping-response?id=" + pingID,
 				Log: true,
-			}))
+			})
 
 			select {
 			case latency := <-responseCh:
 				assert.GreaterOrEqual(t, latency, time.Duration(0))
 			case <-time.After(15 * time.Second):
-				t.Fatal("ping lost to the full update")
+				t.Fatal("ping lost to the concurrent update")
 			}
+
+			h.Client(0).WaitForCondition(t, "update delivered", 10*time.Second,
+				func(nm *netmap.NetworkMap) bool { return !nm.SelfKeyExpiry().IsZero() })
 		})
 	}
+}
+
+// expireInAnHour sets a key expiry on id, a change its own client sees.
+func expireInAnHour(t *testing.T, h *servertest.TestHarness, id types.NodeID) {
+	t.Helper()
+
+	expiry := time.Now().Add(time.Hour)
+	_, err := h.Server.State().SetNodeExpiry(id, &expiry)
+	require.NoError(t, err)
 }
 
 // TestPingResolveByHostname verifies that [state.State.ResolveNode] can find a node
@@ -212,7 +228,7 @@ func TestPingResolveByHostname(t *testing.T) {
 	defer st.CancelPing(pingID)
 
 	callbackURL := h.Server.URL + "/machine/ping-response?id=" + pingID
-	h.Server.App.Change(change.PingNode(nodeID, &tailcfg.PingRequest{
+	require.True(t, h.Server.App.MapHub().Ping(nodeID, &tailcfg.PingRequest{
 		URL: callbackURL,
 		Log: true,
 	}))

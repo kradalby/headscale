@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"net"
 	"net/http"
 	"os"
+	"syscall"
+	"time"
 
 	clientv1 "github.com/juanfont/headscale/gen/client/v1"
 	"github.com/juanfont/headscale/hscontrol/config"
@@ -59,24 +63,78 @@ func validateLocalPolicy(d *db.HSDatabase, policyBytes []byte) error {
 
 // openBypassDB confirms the destructive bypass action and opens the database
 // directly. The caller is responsible for closing the returned handle.
+//
+// Only the mutating policy set guards against a running server; check and
+// get read the database directly against a live server by design — the
+// integration harness runs policy check --bypass --force non-interactively
+// against a running headscale.
 func openBypassDB(cmd *cobra.Command) (*db.HSDatabase, error) {
-	if !confirmAction(cmd, "DO NOT run this command if an instance of headscale is running, are you sure headscale is not running?") {
+	if !confirmAction(cmd, "This command opens the headscale database directly, bypassing the API. Only policy set refuses unless the configured unix socket shows no headscale runs; continue?") {
 		return nil, errAborted
 	}
 
 	return bypassDatabase()
 }
 
+// errBypassServerRunning is the refusal's wrapped static base: the probe
+// answers only this one question, so the refusal never invents a new error.
+var errBypassServerRunning = errors.New("headscale appears to be running")
+
+// refuseWhileServerRuns reports whether the mutating bypass must refuse: it
+// would race a live instance for the database. The probe fails closed: only
+// a configured socket that is gone, or that nothing is bound to, shows no
+// server answers on it; any other dial failure, such as a permission error
+// or a timeout, may front a live one. A config without a unix socket cannot
+// run a server at all (startup fails to listen), so there is nothing to
+// probe.
+func refuseWhileServerRuns() error {
+	loaded, err := loadConfig("")
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+
+	cfg := loaded.Config
+
+	err = config.Validate(cfg)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+
+	if cfg.UnixSocket == "" {
+		return nil
+	}
+
+	dialer := net.Dialer{Timeout: time.Second}
+
+	conn, err := dialer.DialContext(context.Background(), "unix", cfg.UnixSocket)
+	if err == nil {
+		conn.Close()
+
+		return fmt.Errorf("%w (unix socket %s answered); stop it before using %s", errBypassServerRunning, cfg.UnixSocket, bypassFlag)
+	}
+
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED) {
+		return nil
+	}
+
+	return fmt.Errorf("%w (unix socket %s: %w); stop it before using %s", errBypassServerRunning, cfg.UnixSocket, err, bypassFlag)
+}
+
 func init() {
 	rootCmd.AddCommand(policyCmd)
 
-	getPolicy.Flags().BoolP(bypassFlag, "", false, "Uses the headscale config to directly access the database, bypassing the API and does not require the server to be running")
+	getPolicy.Flags().BoolP(bypassFlag, "", false, "Uses the headscale config to directly access the database, bypassing the API and does not require the server to be running. Allowed while a server runs; only policy set refuses then.")
 	policyCmd.AddCommand(getPolicy)
 
 	setPolicy.Flags().StringP("file", "f", "", "Path to a policy file in HuJSON format")
-	setPolicy.Flags().BoolP(bypassFlag, "", false, "Uses the headscale config to directly access the database, bypassing the API and does not require the server to be running")
+	setPolicy.Flags().BoolP(bypassFlag, "", false, "Stores the policy after validating it against the persisted users and nodes; evaluates its tests and sshTests, and refuses unless the configured unix socket shows no headscale runs")
 	mustMarkRequired(setPolicy, "file")
 	policyCmd.AddCommand(setPolicy)
+
+	checkPolicy.Flags().StringP("file", "f", "", "Path to a policy file in HuJSON format")
+	checkPolicy.Flags().BoolP(bypassFlag, "", false, "Check against persisted users and nodes instead of the live server; both modes evaluate tests and sshTests. Allowed while a server runs; only policy set refuses then.")
+	mustMarkRequired(checkPolicy, "file")
+	policyCmd.AddCommand(checkPolicy)
 }
 
 var policyCmd = &cobra.Command{
@@ -133,12 +191,14 @@ var getPolicy = &cobra.Command{
 }
 
 var setPolicy = &cobra.Command{
-	Use:   "set",
-	Short: "Updates the ACL Policy",
+	Use:     "set",
+	Short:   "Updates the ACL Policy",
+	Aliases: []string{"put", "update"},
 	Long: `
 	Updates the existing ACL Policy with the provided policy. The policy must be a valid HuJSON object.
-	This command only works when the acl.policy_mode is set to "db", and the policy will be stored in the database.`,
-	Aliases: []string{"put", "update"},
+	This command stores the policy in the database. The policy's tests and sshTests are evaluated against
+	the persisted users and nodes before it is stored, and the bypass refuses unless the configured unix
+	socket shows no headscale runs. Updates through the running server require policy.mode to be set to "database".`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		policyPath, _ := cmd.Flags().GetString("file")
 
@@ -148,6 +208,16 @@ var setPolicy = &cobra.Command{
 		}
 
 		if bypass, _ := cmd.Flags().GetBool(bypassFlag); bypass {
+			// The write path refuses unless the configured unix socket
+			// shows no server (gone or nothing bound; any other probe
+			// failure counts as a server): it would race a live instance
+			// for the database and leave its in-memory policy stale. The
+			// prompt is force-skippable; this guard is not.
+			refusal := refuseWhileServerRuns()
+			if refusal != nil {
+				return refusal
+			}
+
 			d, err := openBypassDB(cmd)
 			if err != nil {
 				return err
@@ -156,7 +226,7 @@ var setPolicy = &cobra.Command{
 
 			err = validateLocalPolicy(d, policyBytes)
 			if err != nil {
-				return err
+				return fmt.Errorf("evaluating policy tests: %w", err)
 			}
 
 			_, err = d.SetPolicy(string(policyBytes))
@@ -186,6 +256,66 @@ var setPolicy = &cobra.Command{
 		}
 
 		fmt.Println("Policy updated.")
+
+		return nil
+	},
+}
+
+var checkPolicy = &cobra.Command{
+	Use:   "check",
+	Short: "Check the Policy file for errors",
+	Long: `
+	Check validates the policy against the server's live users and nodes,
+	running any "tests" or "sshTests" block. By default the command calls a
+	running headscale over its API; pass --` + bypassFlag + ` to
+	open the database directly; allowed while a server runs, only policy
+	set refuses then.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		policyPath, _ := cmd.Flags().GetString("file")
+
+		policyBytes, err := os.ReadFile(policyPath)
+		if err != nil {
+			return fmt.Errorf("reading policy file: %w", err)
+		}
+
+		if bypass, _ := cmd.Flags().GetBool(bypassFlag); bypass {
+			d, err := openBypassDB(cmd)
+			if err != nil {
+				return err
+			}
+			defer d.Close()
+
+			err = validateLocalPolicy(d, policyBytes)
+			if err != nil {
+				return err
+			}
+
+			fmt.Println("Policy is valid")
+
+			return nil
+		}
+
+		policyStr := string(policyBytes)
+
+		err = withClient(func(ctx context.Context, client *clientv1.ClientWithResponses) error {
+			resp, err := client.CheckPolicyWithResponse(ctx, clientv1.CheckPolicyJSONRequestBody{
+				Policy: &policyStr,
+			})
+			if err != nil {
+				return err
+			}
+
+			if resp.StatusCode() != http.StatusOK {
+				return apiError(resp.StatusCode(), resp.ApplicationproblemJSONDefault)
+			}
+
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+
+		fmt.Println("Policy is valid")
 
 		return nil
 	},

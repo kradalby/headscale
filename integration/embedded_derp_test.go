@@ -144,8 +144,10 @@ func derpServerScenario(
 
 	for _, client := range allClients {
 		assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(ct, err, "Failed to get status for client %s", client.Hostname())
+			status := assertClientStatus(ct, client)
+			if status == nil {
+				return
+			}
 
 			for _, health := range status.Health {
 				assert.NotContains(ct, health, "could not connect to any relay server",
@@ -165,8 +167,10 @@ func derpServerScenario(
 
 	for _, client := range allClients {
 		assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(ct, err, "Failed to get status for client %s", client.Hostname())
+			status := assertClientStatus(ct, client)
+			if status == nil {
+				return
+			}
 
 			for _, health := range status.Health {
 				assert.NotContains(ct, health, "could not connect to any relay server",
@@ -191,8 +195,10 @@ func derpServerScenario(
 
 	for _, client := range allClients {
 		assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(ct, err, "Failed to get status for client %s", client.Hostname())
+			status := assertClientStatus(ct, client)
+			if status == nil {
+				return
+			}
 
 			for _, health := range status.Health {
 				assert.NotContains(ct, health, "could not connect to any relay server",

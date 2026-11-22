@@ -152,6 +152,8 @@ type removedKey struct{ Old, New, Value, Since, Hint string }
 var removedKeys = []removedKey{
 	{Old: "derp.server.stun.enabled", Since: "0.30", Hint: "remove it: headscale never read it; the embedded DERP server always serves STUN on derp.server.stun_listen_addr"},
 	{Old: "tuning.notifier_send_timeout", Since: "0.30", Hint: "remove it: it had no effect"},
+	{Old: "tuning.batcher_workers", Since: "0.30", Hint: "remove it: graph map streams do not use worker counts"},
+	{Old: "tuning.node_mapsession_buffered_chan_size", Since: "0.30", Hint: "remove it: graph map streams do not use this queue size"},
 	{Old: "acl_policy_path", New: "policy.path", Since: "0.30"},
 	{Old: "dns_config", New: "dns", Since: "0.30", Hint: "move every dns_config.* key to dns (nameservers to dns.nameservers.global, restricted_nameservers to dns.nameservers.split, domains to dns.search_domains)"},
 	{Old: "dns_config.magic_dns", New: "dns.magic_dns", Since: "0.30"},

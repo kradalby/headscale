@@ -69,7 +69,7 @@ func TestPingAllByIP(t *testing.T) {
 		require.NoError(t, err, "failed to parse node ID")
 		expectedNodes = append(expectedNodes, types.NodeID(nodeID))
 	}
-	requireAllClientsOnline(t, hs, expectedNodes, true, "all clients should be online across all systems", integrationutil.ScaledTimeout(30*time.Second))
+	requireAllClientsOnline(t, hs, allClients, expectedNodes, true, "all clients should be online across all systems", integrationutil.ScaledTimeout(30*time.Second))
 
 	// assertClientsState(t, allClients)
 
@@ -83,7 +83,7 @@ func TestPingAllByIP(t *testing.T) {
 
 	// Test our DebugBatcher functionality
 	t.Logf("Testing DebugBatcher functionality...")
-	requireAllClientsOnline(t, headscale, expectedNodes, true, "all clients should be connected to the batcher", integrationutil.ScaledTimeout(30*time.Second))
+	requireAllClientsOnline(t, headscale, allClients, expectedNodes, true, "all clients should be connected to the batcher", integrationutil.ScaledTimeout(30*time.Second))
 
 	assertPingAll(t, allClients, allAddrs)
 }
@@ -867,8 +867,10 @@ func TestUpdateHostnameFromClient(t *testing.T) {
 
 		// Verify from each client's perspective
 		for _, client := range allClients {
-			status, err := client.Status()
-			assert.NoError(ct, err)
+			status := assertClientStatus(ct, client)
+			if status == nil {
+				return
+			}
 
 			// Check self node
 			selfID := string(status.Self.ID)
@@ -942,9 +944,9 @@ func TestUpdateHostnameFromClient(t *testing.T) {
 	}, time.Second, 50*time.Millisecond, "hostname updates should be reflected in node list with new suffix")
 }
 
-// peersMapResponseType is the [change.Change.Type] label that
-// headscale_mapresponse_generated_total carries for a whole-peer resend,
-// which is what [change.NodeAdded] produces.
+// peersMapResponseType is the response_type label that
+// headscale_mapresponse_generated_total carries for a response resending
+// whole peers.
 const peersMapResponseType = "peers"
 
 // mapResponseCountsByType reads headscale_mapresponse_generated_total keyed by
@@ -1034,9 +1036,9 @@ func quiescedMapResponseCounts(
 // never read should cost their peers nothing, while a field they do render has
 // to arrive. Shields-up and hostname sit on either side of that line.
 //
-// The observable is headscale_mapresponse_generated_total{response_type="peers"}:
-// [change.NodeAdded] is the whole-peer broadcast the map request path emits for
-// a Hostinfo edit peers read, and [change.Change.Type] labels it "peers".
+// The observable is headscale_mapresponse_generated_total{response_type="peers"},
+// counting responses that resend whole peers: a Hostinfo edit peers read is
+// one, an edit they never read sends nothing.
 func TestHostinfoChangeReachesPeersOnlyWhenPeerVisible(t *testing.T) {
 	IntegrationSkip(t)
 
@@ -1119,8 +1121,10 @@ func TestHostinfoChangeReachesPeersOnlyWhenPeerVisible(t *testing.T) {
 	require.NoErrorf(t, err, "failed to set hostname on %s", subject.Hostname())
 
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
-		status, err := observer.Status()
-		assert.NoError(ct, err)
+		status := assertClientStatus(ct, observer)
+		if status == nil {
+			return
+		}
 
 		var seen bool
 
@@ -1184,8 +1188,10 @@ func TestExpireNode(t *testing.T) {
 
 	for _, client := range allClients {
 		assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(ct, err)
+			status := assertClientStatus(ct, client)
+			if status == nil {
+				return
+			}
 
 			// Assert that we have the original count - self
 			assert.Len(ct, status.Peers(), spec.NodesPerUser-1, "Client %s should see correct number of peers", client.Hostname())
@@ -1388,8 +1394,10 @@ func TestSetNodeExpiryInFuture(t *testing.T) {
 
 		assert.EventuallyWithT(
 			t, func(ct *assert.CollectT) {
-				status, err := client.Status()
-				assert.NoError(ct, err)
+				status := assertClientStatus(ct, client)
+				if status == nil {
+					return
+				}
 
 				peerStatus, ok := status.Peer[nodeKey]
 				assert.True(ct, ok, "node key should be present in peer list")
@@ -1505,8 +1513,10 @@ func TestDisableNodeExpiry(t *testing.T) {
 
 		assert.EventuallyWithT(
 			t, func(ct *assert.CollectT) {
-				status, err := client.Status()
-				assert.NoError(ct, err)
+				status := assertClientStatus(ct, client)
+				if status == nil {
+					return
+				}
 
 				peerStatus, ok := status.Peer[nodeKey]
 				assert.True(ct, ok, "node key should be present in peer list")
@@ -1561,8 +1571,10 @@ func TestNodeOnlineStatus(t *testing.T) {
 
 	for _, client := range allClients {
 		assert.EventuallyWithT(t, func(c *assert.CollectT) {
-			status, err := client.Status()
-			assert.NoError(c, err)
+			status := assertClientStatus(c, client)
+			if status == nil {
+				return
+			}
 
 			// Assert that we have the original count - self
 			assert.Len(c, status.Peers(), len(MustTestVersions)-1)
@@ -1617,8 +1629,11 @@ func TestNodeOnlineStatus(t *testing.T) {
 		// Verify that all nodes report all nodes to be online
 		for _, client := range allClients {
 			assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-				status, err := client.Status()
-				assert.NoError(ct, err)
+				status := assertClientStatus(ct, client)
+				if status == nil {
+					return
+				}
+
 				if status == nil {
 					assert.Fail(ct, "status is nil")
 					return
@@ -1652,9 +1667,73 @@ func TestNodeOnlineStatus(t *testing.T) {
 	}
 }
 
+// TestNodeOfflineReachesViewers takes a node offline while two viewers are
+// connected and one is not: the live viewers must be told, and the viewer
+// that comes back, which last saw the node online, must get a map saying
+// it is offline.
+func TestNodeOfflineReachesViewers(t *testing.T) {
+	IntegrationSkip(t)
+
+	spec := ScenarioSpec{
+		NodesPerUser: 4,
+		Users:        []string{"user1"},
+	}
+
+	scenario, err := NewScenario(spec)
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("offlineview"))
+	requireNoErrHeadscaleEnv(t, err)
+
+	allClients, err := scenario.ListTailscaleClients()
+	requireNoErrListClients(t, err)
+
+	err = scenario.WaitForTailscaleSync()
+	requireNoErrSync(t, err)
+
+	headscale, err := scenario.Headscale()
+	requireNoErrGetHeadscale(t, err)
+
+	gone, away, live := allClients[0], allClients[1], allClients[2:]
+	goneKey := gone.MustStatus().Self.PublicKey
+	goneID := collectExpectedNodeIDs(t, []TailscaleClient{gone})
+
+	require.NoError(t, away.Down())
+	require.NoError(t, gone.Down())
+
+	requireAllClientsOnline(t, headscale, allClients, goneID, false,
+		"the node must be offline in headscale and in live viewers' maps",
+		integrationutil.ScaledTimeout(120*time.Second))
+
+	requireSeenOffline := func(viewers []TailscaleClient, msg string) {
+		t.Helper()
+
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			for _, viewer := range viewers {
+				status := assertClientStatus(c, viewer)
+				if status == nil {
+					continue
+				}
+
+				peer, ok := status.Peer[goneKey]
+				if assert.True(c, ok, "%s does not list %s", viewer.Hostname(), gone.Hostname()) {
+					assert.False(c, peer.Online, "%s sees %s online", viewer.Hostname(), gone.Hostname())
+				}
+			}
+		}, integrationutil.ScaledTimeout(30*time.Second), time.Second, msg)
+	}
+
+	requireSeenOffline(live, "live viewers must see the node offline")
+
+	require.NoError(t, away.Up())
+
+	requireSeenOffline([]TailscaleClient{away}, "a returning viewer must see the node offline")
+}
+
 // TestPingAllByIPManyUpDown is a variant of the PingAll
 // test which will take the tailscale node up and down
-// five times ensuring they are able to restablish connectivity.
+// repeatedly, ensuring they are able to reestablish connectivity.
 func TestPingAllByIPManyUpDown(t *testing.T) {
 	IntegrationSkip(t)
 
@@ -1701,7 +1780,7 @@ func TestPingAllByIPManyUpDown(t *testing.T) {
 		require.NoError(t, err)
 		expectedNodes = append(expectedNodes, types.NodeID(nodeID))
 	}
-	requireAllClientsOnline(t, headscale, expectedNodes, true, "all clients should be connected to batcher", integrationutil.ScaledTimeout(30*time.Second))
+	requireAllClientsOnline(t, headscale, allClients, expectedNodes, true, "all clients should be connected to batcher", integrationutil.ScaledTimeout(30*time.Second))
 
 	assertPingAll(t, allClients, allAddrs)
 
@@ -1726,7 +1805,13 @@ func TestPingAllByIPManyUpDown(t *testing.T) {
 		t.Logf("All nodes taken down at %s", time.Now().Format(TimestampFormat))
 
 		// After taking down all nodes, verify all systems show nodes offline
-		requireAllClientsOnline(t, headscale, expectedNodes, false, fmt.Sprintf("Run %d: all nodes should be offline after Down()", run+1), integrationutil.ScaledTimeout(120*time.Second))
+		requireAllClientsOnline(t, headscale, allClients, expectedNodes, false, fmt.Sprintf("Run %d: all nodes should be offline after Down()", run+1), integrationutil.ScaledTimeout(120*time.Second))
+
+		// A name changed while disconnected cannot come from a previous cycle's map.
+		markerID := expectedNodes[0].String()
+		marker := fmt.Sprintf("reconnect-%d", run+1)
+		_, err = headscale.Execute([]string{"headscale", "nodes", "rename", marker, "--identifier", markerID})
+		require.NoError(t, err)
 
 		for _, client := range allClients {
 			c := client
@@ -1741,8 +1826,30 @@ func TestPingAllByIPManyUpDown(t *testing.T) {
 		}
 		t.Logf("All nodes brought up at %s", time.Now().Format(TimestampFormat))
 
+		require.EventuallyWithT(t, func(c *assert.CollectT) {
+			for _, client := range allClients {
+				status, err := client.Status()
+				if !assert.NoError(c, err) || !assert.NotNil(c, status) || !assert.NotNil(c, status.Self) {
+					continue
+				}
+				marked := status.Self
+				if string(marked.ID) != markerID {
+					marked = nil
+					for _, peer := range status.Peer {
+						if peer != nil && string(peer.ID) == markerID {
+							marked = peer
+							break
+						}
+					}
+				}
+				if assert.NotNil(c, marked, "%s is missing marker node %s", client.Hostname(), markerID) {
+					assert.Equal(c, marker, strings.SplitN(marked.DNSName, ".", 2)[0], "%s has not received this reconnect's map", client.Hostname())
+				}
+			}
+		}, integrationutil.ScaledTimeout(30*time.Second), integrationutil.SlowPoll, "all clients must receive the post-disconnect marker")
+
 		// After bringing up all nodes, verify batcher shows all reconnected
-		requireAllClientsOnline(t, headscale, expectedNodes, true, fmt.Sprintf("Run %d: all nodes should be reconnected after Up()", run+1), integrationutil.ScaledTimeout(120*time.Second))
+		requireAllClientsOnline(t, headscale, allClients, expectedNodes, true, fmt.Sprintf("Run %d: all nodes should be reconnected after Up()", run+1), integrationutil.ScaledTimeout(120*time.Second))
 
 		// Wait for sync and successful pings after nodes come back up
 		err = scenario.WaitForTailscaleSync()
@@ -1750,7 +1857,7 @@ func TestPingAllByIPManyUpDown(t *testing.T) {
 
 		t.Logf("All nodes synced up %s", time.Now().Format(TimestampFormat))
 
-		requireAllClientsOnline(t, headscale, expectedNodes, true, fmt.Sprintf("Run %d: all systems should show nodes online after reconnection", run+1), integrationutil.ScaledTimeout(60*time.Second))
+		requireAllClientsOnline(t, headscale, allClients, expectedNodes, true, fmt.Sprintf("Run %d: all systems should show nodes online after reconnection", run+1), integrationutil.ScaledTimeout(60*time.Second))
 
 		assertPingAll(t, allClients, allAddrs)
 

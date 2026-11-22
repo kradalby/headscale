@@ -10,23 +10,14 @@ import (
 	"tailscale.com/tailcfg"
 )
 
-// TestEndpointStorageInNodeStore verifies that endpoints sent in MapRequest via ApplyPeerChange
-// are correctly stored in the NodeStore and can be retrieved for sending to peers.
+// TestEndpointStorage verifies that endpoints sent in MapRequest via ApplyPeerChange
+// are correctly stored and can be retrieved for sending to peers.
 // This test reproduces the issue reported in https://github.com/juanfont/headscale/issues/2846
-func TestEndpointStorageInNodeStore(t *testing.T) {
-	// Create two test nodes
+func TestEndpointStorage(t *testing.T) {
 	node1 := createTestNode(1, 1, "test-user", "node1")
 	node2 := createTestNode(2, 1, "test-user", "node2")
 
-	// Create NodeStore with allow-all peers function
-	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
-
-	store.Start()
-	defer store.Stop()
-
-	// Add both nodes to NodeStore
-	store.PutNode(node1)
-	store.PutNode(node2)
+	w := newTestWorld(t, node1, node2)
 
 	// Create a MapRequest with endpoints for node1
 	endpoints := []netip.AddrPort{
@@ -51,8 +42,8 @@ func TestEndpointStorageInNodeStore(t *testing.T) {
 	assert.Len(t, peerChange.Endpoints, len(endpoints),
 		"PeerChange should have same number of endpoints as MapRequest")
 
-	// Apply the PeerChange via NodeStore.UpdateNode
-	updatedNode, ok := store.UpdateNode(node1.ID, func(n *types.Node) {
+	// Apply the PeerChange via world.UpdateNode
+	updatedNode, ok := w.UpdateNode(node1.ID, func(n *types.Node) {
 		n.ApplyPeerChange(&peerChange)
 	})
 	require.True(t, ok, "UpdateNode should succeed")
@@ -61,7 +52,7 @@ func TestEndpointStorageInNodeStore(t *testing.T) {
 	// Verify endpoints are in the updated node view
 	storedEndpoints := updatedNode.Endpoints().AsSlice()
 	assert.Len(t, storedEndpoints, len(endpoints),
-		"NodeStore should have same number of endpoints as sent")
+		"stored node should have same number of endpoints as sent")
 
 	if len(storedEndpoints) == len(endpoints) {
 		for i, ep := range endpoints {
@@ -71,8 +62,8 @@ func TestEndpointStorageInNodeStore(t *testing.T) {
 	}
 
 	// Verify we can retrieve the node again and endpoints are still there
-	retrievedNode, found := store.GetNode(node1.ID)
-	require.True(t, found, "node1 should exist in NodeStore")
+	retrievedNode, found := w.snapshot().GetNode(node1.ID)
+	require.True(t, found, "node1 should exist")
 
 	retrievedEndpoints := retrievedNode.Endpoints().AsSlice()
 	assert.Len(t, retrievedEndpoints, len(endpoints),
@@ -80,7 +71,7 @@ func TestEndpointStorageInNodeStore(t *testing.T) {
 
 	// Verify that when we get node1 as a peer of node2, it has endpoints
 	// This is the critical part that was failing in the bug report
-	peers := store.ListPeers(node2.ID)
+	peers := w.snapshot().ListPeers(node2.ID)
 	require.Positive(t, peers.Len(), "node2 should have at least one peer")
 
 	// Find node1 in the peer list
@@ -109,107 +100,5 @@ func TestEndpointStorageInNodeStore(t *testing.T) {
 			assert.Equal(t, ep, peerEndpoints[i],
 				"Peer endpoint %d should match", i)
 		}
-	}
-}
-
-// TestEndpointBroadcastWorthy verifies the gate that decides whether an
-// endpoint-only delta is worth fanning out to peers as an incremental
-// PeersChangedPatch. A delta that only adds STUN-derived endpoints (or only
-// removes endpoints) is suppressed: it is churny and unlikely to be useful,
-// and disco's callMeMaybe re-derives STUN paths anyway. Only deltas that
-// introduce a genuinely useful (non-STUN) endpoint are broadcast-worthy.
-func TestEndpointBroadcastWorthy(t *testing.T) {
-	local := netip.MustParseAddrPort("192.168.1.5:41641")
-	local2 := netip.MustParseAddrPort("192.168.1.6:41641")
-	stun := netip.MustParseAddrPort("203.0.113.7:41641")
-	stun2 := netip.MustParseAddrPort("203.0.113.8:41641")
-	portmap := netip.MustParseAddrPort("198.51.100.9:41641")
-
-	tests := []struct {
-		name    string
-		stored  []netip.AddrPort
-		newEPs  []netip.AddrPort
-		newType []tailcfg.EndpointType
-		want    bool
-	}{
-		{
-			name:    "adds only a STUN endpoint - suppress",
-			stored:  []netip.AddrPort{local},
-			newEPs:  []netip.AddrPort{local, stun},
-			newType: []tailcfg.EndpointType{tailcfg.EndpointLocal, tailcfg.EndpointSTUN},
-			want:    false,
-		},
-		{
-			name:    "adds only STUN4LocalPort - suppress",
-			stored:  []netip.AddrPort{local},
-			newEPs:  []netip.AddrPort{local, stun},
-			newType: []tailcfg.EndpointType{tailcfg.EndpointLocal, tailcfg.EndpointSTUN4LocalPort},
-			want:    false,
-		},
-		{
-			name:    "adds a useful local endpoint - broadcast",
-			stored:  []netip.AddrPort{stun},
-			newEPs:  []netip.AddrPort{stun, local},
-			newType: []tailcfg.EndpointType{tailcfg.EndpointSTUN, tailcfg.EndpointLocal},
-			want:    true,
-		},
-		{
-			name:    "adds a useful portmapped endpoint - broadcast",
-			stored:  []netip.AddrPort{local},
-			newEPs:  []netip.AddrPort{local, portmap},
-			newType: []tailcfg.EndpointType{tailcfg.EndpointLocal, tailcfg.EndpointPortmapped},
-			want:    true,
-		},
-		{
-			name:    "pure shrink, no additions - suppress",
-			stored:  []netip.AddrPort{local, local2},
-			newEPs:  []netip.AddrPort{local},
-			newType: []tailcfg.EndpointType{tailcfg.EndpointLocal},
-			want:    false,
-		},
-		{
-			name:   "nil types (older client) adding endpoint - broadcast",
-			stored: []netip.AddrPort{local},
-			newEPs: []netip.AddrPort{local, local2},
-			want:   true,
-		},
-		{
-			name:    "only STUN endpoints churn (replace one STUN with another) - suppress",
-			stored:  []netip.AddrPort{local, stun},
-			newEPs:  []netip.AddrPort{local, stun2},
-			newType: []tailcfg.EndpointType{tailcfg.EndpointLocal, tailcfg.EndpointSTUN},
-			want:    false,
-		},
-		{
-			name:    "mixed add: one STUN and one useful - broadcast",
-			stored:  []netip.AddrPort{local},
-			newEPs:  []netip.AddrPort{local, stun, local2},
-			newType: []tailcfg.EndpointType{tailcfg.EndpointLocal, tailcfg.EndpointSTUN, tailcfg.EndpointLocal},
-			want:    true,
-		},
-		{
-			// Peers hold no endpoints for this node yet, and a
-			// suppressed delta is never resent, so the first set is
-			// the only one they would ever get.
-			name:    "first endpoints ever, STUN only - broadcast",
-			stored:  nil,
-			newEPs:  []netip.AddrPort{stun},
-			newType: []tailcfg.EndpointType{tailcfg.EndpointSTUN},
-			want:    true,
-		},
-		{
-			name:    "no stored and none announced - suppress",
-			stored:  nil,
-			newEPs:  nil,
-			newType: nil,
-			want:    false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := endpointBroadcastWorthy(tt.stored, tt.newEPs, tt.newType)
-			assert.Equal(t, tt.want, got)
-		})
 	}
 }
