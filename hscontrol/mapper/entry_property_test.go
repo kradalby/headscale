@@ -326,6 +326,8 @@ func (p *pbtWorld) enrol(nc newcomer, w policymodel.World, several bool) {
 	}
 
 	p.reg[id] = ri
+	// The keys its entry must carry on the wire ([policymodel.WireKeys]).
+	p.regkeys[id] = regKeys{node: tn.NodeKey, disco: tn.DiscoKey}
 
 	// The allocator's sequence, judged.
 	if got.IPv4().Get() != v4 || got.IPv6().Get() != v6 {
@@ -626,7 +628,9 @@ func (p *pbtWorld) untag(was, n policymodel.Node, tn *types.Node, users []policy
 		}
 
 		hi.Hostname = nv.Hostname()
-		p.loginWith(id, nv.MachineKey(), reauthKey(nv.NodeKey()), hi, n.User, method)
+		k := reauthKey(nv.NodeKey())
+		p.loginWith(id, nv.MachineKey(), k, hi, n.User, method)
+		p.regkeys[id] = regKeys{node: k, disco: nv.DiscoKey()}
 		p.reg[id] = statemodel.Joined{Method: method}
 
 		return
@@ -652,6 +656,13 @@ func reauthKey(k key.NodePublic) key.NodePublic {
 	raw[1]++
 
 	return key.NodePublicFromRaw32(mem.B(raw))
+}
+
+// registrationKeys is the tunnel keys n's client registered with, for
+// [policymodel.WireKeys].
+func (p *pbtWorld) registrationKeys(n types.NodeID) (key.NodePublic, key.DiscoPublic) {
+	k := p.regkeys[n]
+	return k.node, k.disco
 }
 
 // report has n's client report what tn announces and runs: a restart

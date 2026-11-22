@@ -14,6 +14,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 )
 
@@ -276,8 +277,10 @@ type HeldJudge struct {
 	Clients, Filters, PeerSets, RoutePairs, Primaries int
 	SSHDecisions                                      int
 	// WireFlags counts the self and peer entries whose expiry flags
-	// were held, BaseCaps the entries whose baseline capabilities were.
-	WireFlags, BaseCaps int
+	// were held, BaseCaps the entries whose baseline capabilities were,
+	// Entries the entries whose identity fields were (tags, owner,
+	// online, the routes a peer is primary for).
+	WireFlags, BaseCaps, Entries int
 	// Steered counts the route pairs via steering decides, Unjudged the
 	// routes left unjudged, ByHistory those only the election history
 	// decides.
@@ -298,10 +301,10 @@ type HeldJudge struct {
 func (j *HeldJudge) String() string {
 	return fmt.Sprintf("reference: clients %d, filters compared %d, peer sets %d, route pairs %d (steered %d, routes left unjudged %d, "+
 		"decided by the election history %d, steered short to a viewer without addresses %d), self primaries %d, SSH decisions %d, "+
-		"expiry flags %d, baseline caps %d; skipped %v; "+
+		"expiry flags %d, baseline caps %d, entries %d; skipped %v; "+
 		"peers contested %v, routes contested %v; filters: %v; form: %v",
 		j.Clients, j.Filters, j.PeerSets, j.RoutePairs, j.Steered, j.Unjudged, j.ByHistory, j.Addressless, j.Primaries, j.SSHDecisions,
-		j.WireFlags, j.BaseCaps, j.Skipped,
+		j.WireFlags, j.BaseCaps, j.Entries, j.Skipped,
 		ContestedCounts(j.ContestedPeers), ContestedCounts(j.ContestedRoutes), &j.Verdicts, &j.Form)
 }
 
@@ -375,7 +378,7 @@ func (j *HeldJudge) At(m Moment) *Held {
 func (h *Held) Client(id types.NodeID, nm *netmap.NetworkMap, capSources bool) string {
 	h.j.Clients++
 
-	for _, judge := range []func(types.NodeID, *netmap.NetworkMap, bool) string{h.peers, h.routes, h.filter, h.stamps, h.flags, h.baseline, h.ssh} {
+	for _, judge := range []func(types.NodeID, *netmap.NetworkMap, bool) string{h.peers, h.routes, h.filter, h.stamps, h.flags, h.baseline, h.entry, h.ssh} {
 		if d := judge(id, nm, capSources); d != "" {
 			return d
 		}
@@ -467,6 +470,21 @@ func (h *Held) routes(id types.NodeID, nm *netmap.NetworkMap, _ bool) string {
 		}
 
 		if slices.Equal(judged, want) {
+			// What a peer is primary for on the wire follows what it
+			// serves the viewer; nothing else says it. Held here only
+			// when no unjudged route muddies what that is.
+			if len(unjudged) == 0 {
+				prim := slices.DeleteFunc(slices.Clone(want), isExitRoute)
+
+				// The wire order follows the policy's iteration;
+				// what the client tracks is the set.
+				held := slices.SortedFunc(slices.Values(p.PrimaryRoutes().AsSlice()), netip.Prefix.Compare)
+
+				if !slices.Equal(held, slices.SortedFunc(slices.Values(prim), netip.Prefix.Compare)) {
+					return fmt.Sprintf("its client holds n%d primary for %v, its served routes say %v", pid, p.PrimaryRoutes().AsSlice(), prim)
+				}
+			}
+
 			continue
 		}
 
@@ -627,6 +645,131 @@ func (h *Held) baseline(id types.NodeID, nm *netmap.NetworkMap, _ bool) string {
 
 	if admin := nm.SelfNode.CapMap().Contains(nodecap.Admin); admin == self.Tagged() {
 		return fmt.Sprintf("its client holds itself with the admin capability %t, the model holds it %t", admin, !self.Tagged())
+	}
+
+	return ""
+}
+
+// entry holds the wire fields of the entries the model knows that no
+// other judge reads: what a node says of itself (its authorization, the
+// routes its client reported) and what a peer is (its tags, its owner,
+// its online bit). Expiry flags, addresses, served routes and caps are
+// held by flags, peers, routes, stamps and baseline.
+func (h *Held) entry(id types.NodeID, nm *netmap.NetworkMap, _ bool) string {
+	if !nm.SelfNode.Valid() {
+		return ""
+	}
+
+	self, ok := h.m.World.Topology.Node(id)
+	if !ok {
+		return ""
+	}
+
+	h.j.Entries++
+
+	if !nm.SelfNode.MachineAuthorized() {
+		return "its client holds itself unauthorized"
+	}
+
+	if have, want := nm.SelfNode.Hostinfo().RoutableIPs().AsSlice(), announcedOf(self); !equalPrefixes(have, want) {
+		return fmt.Sprintf("its client holds itself reporting %v, the model announces %v", have, want)
+	}
+
+	if have, want := nm.SelfNode.Tags().AsSlice(), tagStrings(self); !equalTags(have, want) {
+		return fmt.Sprintf("its client holds itself with tags %v, the model %v", have, want)
+	}
+
+	for _, p := range nm.Peers {
+		m, ok := h.m.World.Topology.Node(types.NodeID(p.ID())) //nolint:gosec // small
+		if !ok || m.Expired {
+			// An expired peer with a live session renders online,
+			// which the model cannot know; expiry itself is held
+			// by flags.
+			continue
+		}
+
+		h.j.Entries++
+
+		if have, want := p.Tags().AsSlice(), tagStrings(m); !equalTags(have, want) {
+			return fmt.Sprintf("its client holds n%d with tags %v, the model %v", p.ID(), have, want)
+		}
+
+		if want := expectedUser(m); p.User() != want {
+			return fmt.Sprintf("its client holds n%d owned by user %d, the model user %d", p.ID(), p.User(), want)
+		}
+
+		if online := !m.Offline; p.Online().GetOr(false) != online {
+			return fmt.Sprintf("its client holds n%d online %t, the model %t", p.ID(), p.Online().GetOr(false), online)
+		}
+	}
+
+	return ""
+}
+
+// tagStrings is the node's tags as the wire carries them, sorted.
+func tagStrings(n Node) []string {
+	out := make([]string, 0, len(n.Tags))
+	for _, t := range n.Tags {
+		out = append(out, Tags[t])
+	}
+
+	slices.Sort(out)
+
+	return out
+}
+
+// announcedOf is the routes the model has the node's client reporting.
+func announcedOf(n Node) []netip.Prefix {
+	out := make([]netip.Prefix, 0, len(n.Announced))
+	for _, r := range n.Announced {
+		out = append(out, Prefixes[r])
+	}
+
+	slices.SortFunc(out, netip.Prefix.Compare)
+
+	return out
+}
+
+// expectedUser is the owner an entry carries on the wire: tagged nodes
+// belong to the tagged-devices sentinel, the rest to their user.
+func expectedUser(n Node) tailcfg.UserID {
+	if n.Tagged() {
+		//nolint:gosec // the sentinel user ID fits
+		return wireUserID(int64(types.TaggedDevices.ID))
+	}
+
+	//nolint:gosec // user IDs are small
+	return wireUserID(int64(n.User))
+}
+
+// wireUserID is [tailcfg.UserID], named apart so its conversion does not
+// read as a call of the node view's method of the same name.
+type wireUserID = tailcfg.UserID
+
+func equalTags(have, want []string) bool {
+	return slices.Equal(slices.Sorted(slices.Values(have)), want)
+}
+
+func equalPrefixes(have, want []netip.Prefix) bool {
+	return slices.Equal(slices.SortedFunc(slices.Values(have), netip.Prefix.Compare), want)
+}
+
+// WireKeys holds every entry's tunnel keys to keys, which the level
+// registered each node with — its own inputs, written through the
+// registration it drove and never read back from production. A client
+// holding a peer under other keys, or none, cannot reach it.
+func WireKeys(nm *netmap.NetworkMap, keys func(types.NodeID) (key.NodePublic, key.DiscoPublic)) string {
+	for _, nv := range append([]tailcfg.NodeView{nm.SelfNode}, nm.Peers...) {
+		if !nv.Valid() {
+			continue
+		}
+
+		nk, dk := keys(types.NodeID(nv.ID())) //nolint:gosec // small
+
+		if nv.Key() != nk || nv.DiscoKey() != dk {
+			return fmt.Sprintf("n%d's entry carries node key %s and disco key %s, its registration %s and %s",
+				nv.ID(), nv.Key(), nv.DiscoKey(), nk, dk)
+		}
 	}
 
 	return ""

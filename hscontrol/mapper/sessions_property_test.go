@@ -394,6 +394,8 @@ func (p *pbtWorld) sessionAt(n *types.Node, sw sessionWrite) string {
 		disco := key.DiscoPublicFromRaw32(mem.B(raw))
 
 		p.mapRequest(n, func(_ *tailcfg.Hostinfo, req *tailcfg.MapRequest) { req.DiscoKey = disco })
+		// The entry's keys follow the client's last report.
+		p.regkeys[id] = regKeys{node: p.regkeys[id].node, disco: disco}
 
 		return "disco key " + disco.ShortString()
 	case writeGivenName:

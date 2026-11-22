@@ -23,7 +23,15 @@ import (
 	"pgregory.net/rapid"
 	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 )
+
+// regKeys is a node's tunnel keys as its client presented them when it
+// registered; re-authentication rotates the node key.
+type regKeys struct {
+	node  key.NodePublic
+	disco key.DiscoPublic
+}
 
 // pbtT is what the world driver needs of a test: a *testing.T or a
 // *rapid.T, so a property's failures stay rapid's to shrink.
@@ -69,6 +77,7 @@ type pbtWorld struct {
 	// reg is how each node registered; alloc the allocator's last
 	// addresses, as predicted; reports counts the client reports made.
 	reg     map[types.NodeID]statemodel.Joined
+	regkeys map[types.NodeID]regKeys
 	alloc   [2]netip.Addr
 	reports int
 	// kind is the edit being written; cur counts the node write in
@@ -121,7 +130,8 @@ func newPBTWorld(t pbtT, w policymodel.World, configure ...func(*types.Config)) 
 
 	p := &pbtWorld{
 		t: t, cfg: cfg, s: s, conns: map[types.NodeID][]uint64{}, elections: policymodel.NewElections(), made: map[string]int{},
-		reg: map[types.NodeID]statemodel.Joined{}, alloc: [2]netip.Addr{cfg.Prefixes.V4.Masked().Addr(), cfg.Prefixes.V6.Masked().Addr()},
+		reg: map[types.NodeID]statemodel.Joined{}, regkeys: map[types.NodeID]regKeys{},
+		alloc: [2]netip.Addr{cfg.Prefixes.V4.Masked().Addr(), cfg.Prefixes.V6.Masked().Addr()},
 	}
 
 	p.kind = "start"

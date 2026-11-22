@@ -1127,6 +1127,10 @@ func (dw *deliveryWorld) fresh(at string) map[types.NodeID]*netmap.NetworkMap {
 			dw.failf(judgeClient, "%s: n%d's client, last rendered r%d, differs from a fresh session's of r%d: %s", at, id, s.rev, snap.Rev(), d)
 		}
 
+		if d := policymodel.WireKeys(have, dw.p.registrationKeys); d != "" {
+			dw.failf(judgeClient, "%s: n%d's client holds an entry whose tunnel keys differ from its registration: %s", at, id, d)
+		}
+
 		if !s.held.Equal(chunks) {
 			dw.failf(judgeClient, "%s: n%d's client holds chunks %v, a fresh session's %v", at, id, s.held.Names(), chunks.Names())
 		}
