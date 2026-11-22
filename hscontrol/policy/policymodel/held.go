@@ -1,6 +1,7 @@
 package policymodel
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -8,6 +9,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
@@ -271,6 +273,7 @@ type HeldJudge struct {
 	// either side, Primaries the routes a client's own primaries were
 	// held on.
 	Clients, Filters, PeerSets, RoutePairs, Primaries int
+	SSHDecisions                                      int
 	// Steered counts the route pairs via steering decides, Unjudged the
 	// routes left unjudged, ByHistory those only the election history
 	// decides.
@@ -290,9 +293,9 @@ type HeldJudge struct {
 
 func (j *HeldJudge) String() string {
 	return fmt.Sprintf("reference: clients %d, filters compared %d, peer sets %d, route pairs %d (steered %d, routes left unjudged %d, "+
-		"decided by the election history %d, steered short to a viewer without addresses %d), self primaries %d; skipped %v; "+
+		"decided by the election history %d, steered short to a viewer without addresses %d), self primaries %d, SSH decisions %d; skipped %v; "+
 		"peers contested %v, routes contested %v; filters: %v; form: %v",
-		j.Clients, j.Filters, j.PeerSets, j.RoutePairs, j.Steered, j.Unjudged, j.ByHistory, j.Addressless, j.Primaries, j.Skipped,
+		j.Clients, j.Filters, j.PeerSets, j.RoutePairs, j.Steered, j.Unjudged, j.ByHistory, j.Addressless, j.Primaries, j.SSHDecisions, j.Skipped,
 		ContestedCounts(j.ContestedPeers), ContestedCounts(j.ContestedRoutes), &j.Verdicts, &j.Form)
 }
 
@@ -321,6 +324,7 @@ type Held struct {
 	// the whole of it where a contested clause decided, else every node's
 	// addresses.
 	world, known string
+	sshKnown     map[netip.Addr]bool
 }
 
 // At is the reference for m, or nil, counted, when m is out of its
@@ -359,11 +363,11 @@ func (j *HeldJudge) At(m Moment) *Held {
 // packet filter, through its own client ([Verdicts], with the allowances
 // and contested clauses of the reference properties) and in the form
 // capSources says; and the stamps it and its peers carry, none in address
-// mode.
+// mode. It also checks bounded SSH login decisions against the policy inputs.
 func (h *Held) Client(id types.NodeID, nm *netmap.NetworkMap, capSources bool) string {
 	h.j.Clients++
 
-	for _, judge := range []func(types.NodeID, *netmap.NetworkMap, bool) string{h.peers, h.routes, h.filter, h.stamps} {
+	for _, judge := range []func(types.NodeID, *netmap.NetworkMap, bool) string{h.peers, h.routes, h.filter, h.stamps, h.ssh} {
 		if d := judge(id, nm, capSources); d != "" {
 			return d
 		}
@@ -549,4 +553,249 @@ func (h *Held) stamps(_ types.NodeID, nm *netmap.NetworkMap, capSources bool) st
 	}
 
 	return ""
+}
+
+type sshAction uint8
+
+const (
+	sshDeny sshAction = iota
+	sshAccept
+	sshCheck
+)
+
+func (a sshAction) String() string { return [...]string{"deny", "accept", "check"}[a] }
+
+// ssh compares decisions, including those for sources that SSH alone doesn't make peers.
+func (h *Held) ssh(id types.NodeID, nm *netmap.NetworkMap, _ bool) string {
+	// See TODO(kradalby): policy/stale-under-shared-address in the delivery judge.
+	if h.m.Shared {
+		return ""
+	}
+
+	w := h.m.World
+
+	dst, ok := w.Topology.Node(id)
+	if !ok {
+		return ""
+	}
+
+	var rules []*tailcfg.SSHRule
+	if nm.SSHPolicy != nil {
+		rules = nm.SSHPolicy.Rules
+	}
+
+	if len(w.Policy.SSH) == 0 && len(rules) == 0 {
+		return ""
+	}
+
+	now := time.Now()
+
+	for _, source := range h.sshSources(rules) {
+		src, addr := source.node, source.addr
+		user, _ := w.Topology.User(src.User)
+
+		userLogin := cmp.Or(user.Email, user.Name, user.Provider)
+		if src.Tagged() {
+			userLogin = types.TaggedDevices.Name
+		}
+
+		for _, login := range []string{"root", "alice", "headscale-ssh-probe"} {
+			want, possible := h.sshIntent(src, dst, login)
+			if want != possible {
+				continue
+			}
+
+			h.j.SSHDecisions++
+
+			got, local := sshWireDecision(rules, now, src.ID, addr, userLogin, login)
+			if got != want || (got != sshDeny && local != login) {
+				return fmt.Sprintf("SSH decision from %s for %q: got %s as %q, want %s", addr, login, got, local, want)
+			}
+		}
+	}
+
+	return ""
+}
+
+type sshSource struct {
+	node Node
+	addr netip.Addr
+}
+
+// sshSources samples large worlds across IDs and reserves probes for stale principals.
+func (h *Held) sshSources(rules []*tailcfg.SSHRule) []sshSource {
+	const maxSources = 8
+
+	nodes := h.m.World.Topology.Nodes
+	if h.sshKnown == nil {
+		h.sshKnown = make(map[netip.Addr]bool, len(nodes))
+
+		for _, src := range nodes {
+			for _, addr := range src.Addrs() {
+				h.sshKnown[addr] = true
+			}
+		}
+	}
+
+	var sources []sshSource
+
+	count := min(len(nodes), maxSources)
+	for i := range count {
+		src := nodes[i*(len(nodes)-1)/max(1, count-1)]
+		for _, addr := range src.Addrs() {
+			sources = append(sources, sshSource{src, addr})
+		}
+	}
+
+	stale := make(map[netip.Addr]bool)
+
+	for _, rule := range rules {
+		if rule == nil {
+			continue
+		}
+
+		for _, p := range rule.Principals {
+			if p == nil {
+				continue
+			}
+
+			addr, err := netip.ParseAddr(p.NodeIP)
+			if err != nil || h.sshKnown[addr] || stale[addr] {
+				continue
+			}
+
+			sources = append(sources, sshSource{addr: addr})
+			stale[addr] = true
+
+			if len(stale) == maxSources {
+				return sources
+			}
+		}
+	}
+
+	return sources
+}
+
+// sshIntent bounds the decision when an unsupported selector or login might
+// overlap this probe. A possible check can shadow an explicit accept.
+func (h *Held) sshIntent(src, dst Node, login string) (sshAction, sshAction) {
+	if src.ID == 0 {
+		return sshDeny, sshDeny
+	}
+
+	var certain, possible sshAction
+
+	for _, r := range h.m.World.Policy.SSH {
+		srcMatch, srcPossible := h.sshSelectors(r.Src, src, Node{})
+		if !srcPossible {
+			continue
+		}
+
+		dstMatch, dstPossible := h.sshSelectors(r.Dst, dst, src)
+
+		action := sshAccept
+		if r.Check {
+			action = sshCheck
+		}
+
+		var explicit, nonroot, localpart bool
+
+		for _, u := range r.Users {
+			switch name := SSHUsers[u]; {
+			case name == login:
+				explicit = true
+			case name == "autogroup:nonroot":
+				nonroot = login != "root"
+			case strings.HasPrefix(name, "localpart:"):
+				localpart = true
+			}
+		}
+
+		if srcMatch && dstMatch && explicit {
+			certain = max(certain, action)
+		}
+
+		// Localpart rules can also grant self access outside their destinations.
+		if (dstPossible && (explicit || nonroot || localpart)) ||
+			(localpart && (sshSameOwner(src, dst) || src.ID == dst.ID)) {
+			possible = max(possible, action)
+		}
+	}
+
+	return certain, possible
+}
+
+func sshSameOwner(a, b Node) bool {
+	return a.User != 0 && a.User == b.User && !a.Tagged() && !b.Tagged()
+}
+
+func (h *Held) sshSelectors(sels []Sel, n, src Node) (bool, bool) {
+	hasAddress := n.V4.IsValid() || n.V6.IsValid()
+
+	var certain, possible bool
+
+	for _, sel := range sels {
+		switch sel.Kind {
+		case SelSelf:
+			certain = certain || sshSameOwner(src, n)
+		case SelUser:
+			certain = certain || (hasAddress && !n.Tagged() && slices.Contains(h.plain.usersOf(sel.String()), n.User))
+		case SelTag:
+			certain = certain || (hasAddress && slices.Contains(n.Tags, sel.I))
+		case SelGroup, SelMember:
+			possible = possible || (hasAddress && !n.Tagged())
+		case SelTagged:
+			possible = possible || (hasAddress && n.Tagged())
+		case SelAll, SelHost, SelPrefix, SelInternet, SelDangerAll:
+			possible = possible || hasAddress
+		}
+	}
+
+	return certain, certain || possible
+}
+
+// sshWireDecision reads first-match wire rules for a probe with a local
+// account. The model supplies the SSH source identity even without a peer.
+func sshWireDecision(rules []*tailcfg.SSHRule, now time.Time, src types.NodeID, addr netip.Addr, userLogin, login string) (sshAction, string) {
+	for _, r := range rules {
+		if r == nil || r.Action == nil || (r.RuleExpires != nil && !now.Before(*r.RuleExpires)) {
+			continue
+		}
+
+		if !slices.ContainsFunc(r.Principals, func(p *tailcfg.SSHPrincipal) bool {
+			return p != nil && (p.Any || p.NodeIP == addr.String() ||
+				(!p.Node.IsZero() && src != 0 && p.Node == src.StableID()) ||
+				(p.UserLogin != "" && p.UserLogin == userLogin))
+		}) {
+			continue
+		}
+
+		if r.Action.Reject {
+			break
+		}
+
+		local, ok := r.SSHUsers[login]
+		if !ok {
+			local = r.SSHUsers["*"]
+		}
+
+		if local == "=" && login != "root" {
+			local = login
+		}
+
+		if local == "" || local == "=" {
+			continue
+		}
+
+		switch {
+		case r.Action.Accept:
+			return sshAccept, local
+		case r.Action.HoldAndDelegate != "":
+			return sshCheck, local
+		default:
+			return sshDeny, ""
+		}
+	}
+
+	return sshDeny, ""
 }

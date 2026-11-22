@@ -27,6 +27,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/state/statemodel"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
@@ -1792,4 +1793,170 @@ func (dw *deliveryWorld) judgeChurn(start *state.Snapshot, current, subjects map
 	}
 
 	dw.deliver(plan, ids)
+}
+
+// observeDelivery follows one session through the existing subscription and wire client.
+func observeDelivery(t *testing.T, cfg *types.Config, s *state.State, id types.NodeID) (*realClient, func(uint64, bool)) {
+	t.Helper()
+
+	hub := NewHub()
+	watcher := newSteppedWatcher(t, hub, s)
+	session := hub.Join(id, func() {})
+	stream := NewStream(cfg, hub, id, capVer)
+	stream.Attach(session)
+
+	client := newRealClient(t)
+
+	responses, err := stream.Initial(s.Snapshot())
+	require.NoError(t, err)
+	require.Len(t, responses, 1)
+	client.apply(t, responses[0])
+	stream.Delivered()
+
+	return client, func(before uint64, changed bool) {
+		t.Helper()
+		watcher.committed(before)
+		watcher.settle()
+
+		after := s.Snapshot()
+		require.Equal(t, after.Rev(), watcher.routed.Rev(), "watcher must catch up before checking wakes")
+
+		select {
+		case <-session.Wakes():
+			require.True(t, changed, "unchanged client view woke its session")
+		default:
+			require.False(t, changed, "changed client view received no wake")
+		}
+
+		responses, err := stream.Update(after)
+		require.NoError(t, err)
+		require.Equal(t, changed, len(responses) != 0, "response must agree with the expected view change")
+
+		for _, response := range responses {
+			client.apply(t, response)
+		}
+
+		stream.Delivered()
+	}
+}
+
+func TestDeliverySSHDecisionsAcrossRevocationAndDeletion(t *testing.T) {
+	alice := policymodel.Sel{Kind: policymodel.SelUser}
+	tag := policymodel.Sel{Kind: policymodel.SelTag}
+	self := policymodel.Sel{Kind: policymodel.SelSelf}
+
+	for _, tc := range []struct {
+		name     string
+		src, dst policymodel.Sel
+		check    bool
+	}{
+		{"user-to-self", alice, self, false},
+		{"user-to-user", alice, alice, true},
+		{"user-to-tag", alice, tag, true},
+		{"tag-to-tag", tag, tag, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rule := policymodel.SSHRule{Src: []policymodel.Sel{tc.src}, Dst: []policymodel.Sel{tc.dst}, Check: tc.check, Users: []int{0, 3}}
+			w := policymodel.World{
+				Policy: policymodel.Policy{AllowAll: true, SSH: []policymodel.SSHRule{rule}},
+				Topology: policymodel.Topology{
+					Users: []policymodel.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob", Email: "bob@example.com"}},
+					Nodes: []policymodel.Node{
+						{ID: 1, User: 1, V4: netip.MustParseAddr("100.64.0.1"), V6: netip.MustParseAddr("fd7a:115c:a1e0::1")},
+						{ID: 2, User: 1, V4: netip.MustParseAddr("100.64.0.2"), V6: netip.MustParseAddr("fd7a:115c:a1e0::2")},
+						{ID: 3, User: 2, V4: netip.MustParseAddr("100.64.0.3"), V6: netip.MustParseAddr("fd7a:115c:a1e0::3")},
+					},
+				},
+			}
+
+			if tc.src == tag {
+				w.Topology.Nodes[0].User, w.Topology.Nodes[0].Tags = 0, []int{0}
+			}
+
+			if tc.dst == tag {
+				w.Topology.Nodes[1].User, w.Topology.Nodes[1].Tags = 0, []int{0}
+			}
+
+			w.Policy.Defined[0] = true
+			w.Policy.Groups[0] = []int{0, 1}
+			p := newPBTWorld(t, w)
+			client, observe := observeDelivery(t, p.cfg, p.s, 2)
+
+			var judge policymodel.HeldJudge
+
+			hold := func(nm *netmap.NetworkMap) string {
+				t.Helper()
+
+				ref := judge.At(statemodel.Moment(p))
+				require.NotNil(t, ref)
+
+				return ref.Client(2, nm, p.s.Snapshot().CapabilitySources())
+			}
+			edit := func(e policymodel.Edit) {
+				t.Helper()
+
+				before := p.s.Snapshot().Rev()
+				p.write(p.w.Apply(e))
+				observe(before, true)
+				require.Empty(t, hold(client.nm))
+			}
+			replaceSSH := func(pol *tailcfg.SSHPolicy) string {
+				t.Helper()
+
+				corrupt := *client.nm
+				corrupt.SSHPolicy = pol
+
+				return hold(&corrupt)
+			}
+
+			require.Empty(t, hold(client.nm))
+			allowed := client.nm.SSHPolicy
+			require.NotEmpty(t, allowed.Rules)
+			require.Contains(t, replaceSSH(nil), "SSH decision", "missing grant must fail Held.Client")
+
+			wrongAction := allowed.Clone()
+
+			wrongAction.Rules[0].Action = &tailcfg.SSHAction{Accept: tc.check, HoldAndDelegate: "https://headscale.test/check"}
+			if tc.check {
+				wrongAction.Rules[0].Action.HoldAndDelegate = ""
+			}
+
+			require.Contains(t, replaceSSH(wrongAction), "SSH decision", "check and accept must differ")
+
+			overgrant := allowed.Clone()
+			overgrant.Rules[0].Principals = append(overgrant.Rules[0].Principals, &tailcfg.SSHPrincipal{NodeIP: w.Topology.Nodes[2].V4.String()})
+			require.Contains(t, replaceSSH(overgrant), "SSH decision", "unrelated source must be denied")
+
+			if tc.dst == self {
+				check := rule
+				check.Check, check.Users = true, []int{3}
+				edit(policymodel.SetSSH{Rules: []policymodel.SSHRule{rule, check}})
+
+				swapped := client.nm.SSHPolicy.Clone()
+				require.Len(t, swapped.Rules, 2)
+				swapped.Rules[0], swapped.Rules[1] = swapped.Rules[1], swapped.Rules[0]
+				require.Contains(t, replaceSSH(swapped), `for "alice": got accept as "alice", want check`)
+
+				// A group check may shadow the explicit accept for alice.
+				broad := policymodel.SSHRule{Src: []policymodel.Sel{{Kind: policymodel.SelGroup}}, Dst: rule.Dst, Check: true, Users: []int{1}}
+				disjoint := policymodel.SSHRule{Src: broad.Src, Dst: []policymodel.Sel{tag}, Check: true, Users: []int{0}}
+				edit(policymodel.SetSSH{Rules: []policymodel.SSHRule{rule, broad, disjoint}})
+				require.NotEmpty(t, client.nm.SSHPolicy.Rules[0].Action.HoldAndDelegate)
+
+				missingRoot := client.nm.SSHPolicy.Clone()
+				for _, r := range missingRoot.Rules {
+					delete(r.SSHUsers, "root")
+				}
+
+				require.Contains(t, replaceSSH(missingRoot), `for "root"`, "overlap on alice must leave root judged")
+				edit(policymodel.SetSSH{Rules: []policymodel.SSHRule{rule}})
+			}
+
+			edit(policymodel.SetSSH{})
+			require.Contains(t, replaceSSH(allowed), "SSH decision", "stale rules after revocation must fail Held.Client")
+			edit(policymodel.SetSSH{Rules: []policymodel.SSHRule{rule}})
+			edit(policymodel.Leave{ID: 1})
+			require.Contains(t, replaceSSH(allowed), "SSH decision", "stale address after deletion must fail Held.Client")
+		})
+	}
 }
