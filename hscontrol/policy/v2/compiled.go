@@ -935,11 +935,11 @@ func viaDstsForNode(
 	for _, dstPrefix := range cg.via.resolvedDsts {
 		// Equality would reject any broader or narrower dst relative
 		// to the advertised route. Containment in either direction
-		// matches the operator's authorisation: a broader dst restricts
-		// traffic to the subset the router serves; a narrower dst rides
-		// on a router covering more than the operator asked for. The
-		// rule emits the literal dst either way because that is what
-		// the policy authorised.
+		// matches the operator's authorisation: the rule emits the
+		// literal dst either way, so a broader dst is served whole
+		// rather than cut to what the router serves, and a narrower
+		// dst rides on a router covering more than the operator
+		// asked for.
 		// TODO(kradalby): policy/via-own-address: the literal dst also covers
 		// the router's own address, which a broader dst does not restrict
 		// (fails open); cutVia in expand.go does the same. See
