@@ -455,52 +455,6 @@ func flipSourceMovesFlipBack(vs []*View, steps []Step) bool {
 	return false
 }
 
-// selfNamed reports whether a self rule's sources hold an address of n:
-// the compile then names n among its owner's sources.
-func (v *View) selfNamed(n Node) bool {
-	return v.anyRule(func(r Rule, _ bool) bool { return r.selfRule() && v.holds(r.Src, n) })
-}
-
-// selfSourceSharerMoved reports whether a step left a node as it was but
-// moved whether a self rule's sources name it, while it shares an address
-// the step left alone with another node: the node's side facts move, and
-// with them the sides of the one sharing it.
-func selfSourceSharerMoved(b, a *View, _ Step) bool {
-	for _, x := range b.nodes {
-		now, ok := a.World.Topology.Node(x.ID)
-		if x.Tagged() || !ok || !reflect.DeepEqual(x, now) || b.selfNamed(x) == a.selfNamed(now) {
-			continue
-		}
-
-		if slices.ContainsFunc(now.Addrs(), func(o netip.Addr) bool { return a.heldByOther(now, o) && untouched(b, a, o) }) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// untouched reports whether every node holding o before or after a step
-// is there on both sides and the same.
-func untouched(b, a *View, o netip.Addr) bool {
-	for _, v := range []*View{b, a} {
-		for _, n := range v.nodes {
-			if !slices.Contains(n.Addrs(), o) {
-				continue
-			}
-
-			was, okb := b.World.Topology.Node(n.ID)
-			is, oka := a.World.Topology.Node(n.ID)
-
-			if !okb || !oka || !reflect.DeepEqual(was, is) {
-				return false
-			}
-		}
-	}
-
-	return true
-}
-
 // readAt reports whether node id's session reads after step i (0 is the
 // start, which every session reads).
 func readAt(steps []Step, i int, id types.NodeID) bool {
@@ -515,10 +469,6 @@ func readAt(steps []Step, i int, id types.NodeID) bool {
 // that at the coverage sample's size has none.
 var Required = append([]Shape{
 	// Topology.
-	{Name: "unaddressed", Why: "a node no address set holds (database only)", Min: 0.15, World: func(v *View) bool {
-		return v.anyNode(func(n Node) bool { return len(n.Addrs()) == 0 })
-	}},
-	{Name: "shared-address", Why: "the client asks one node per address (database only)", Min: 0.02, World: (*View).sharedAddr},
 	{Name: "single-family", Why: "rules that reach a node in one family only", Min: 0.3, World: func(v *View) bool {
 		return v.anyNode(func(n Node) bool { return len(n.Addrs()) == 1 })
 	}},
@@ -697,15 +647,6 @@ var Required = append([]Shape{
 	}},
 
 	// Pairs.
-	{Name: "tag-all-unaddressed", Why: "a tag destination resolving to no address", Min: 0.004, World: func(v *View) bool {
-		return v.anyRule(func(r Rule, _ bool) bool {
-			return slices.ContainsFunc(r.Dst, func(d Dest) bool {
-				ms := v.MembersOf(d.Sel)
-
-				return d.Sel.Kind == SelTag && len(ms) > 0 && !slices.ContainsFunc(ms, func(n Node) bool { return len(n.Addrs()) > 0 })
-			})
-		})
-	}},
 	{Name: "self-from-star-outside-owner", Why: "* as a self source names owners by range", Min: 0, World: func(v *View) bool {
 		star := slices.ContainsFunc(v.World.Policy.ACLs, func(r Rule) bool {
 			return r.selfRule() && slices.ContainsFunc(r.Src, func(s Sel) bool { return s.Kind == SelAll })
@@ -713,19 +654,7 @@ var Required = append([]Shape{
 
 		return star && v.anyNode(func(n Node) bool { return !n.Tagged() && slices.ContainsFunc(n.Addrs(), Outside) })
 	}},
-	{Name: "addressless-owner-routes-own-node", Why: "an owner with no address reaching its own node by route", Min: 0.015, World: func(v *View) bool {
-		return v.anyNode(func(r Node) bool {
-			return !r.Tagged() && len(r.Addrs()) == 0 && v.anyNode(func(n Node) bool {
-				return n.ID != r.ID && !n.Tagged() && n.User == r.User && slices.ContainsFunc(r.Approved, func(rt int) bool {
-					return slices.ContainsFunc(n.Addrs(), Prefixes[rt].Contains)
-				})
-			})
-		})
-	}},
 	{Name: "outside-address-exit", Why: "exit visibility with addresses outside the tailnet", Min: 0.001, World: func(v *View) bool { return v.outsideAddr() && v.exitPresent() }},
-	{Name: "shared-address-cap-receiver", Why: "sharing decides capability form for eligible receivers", Min: 0.02, World: func(v *View) bool {
-		return v.sharedAddr() && v.anyNode(v.Eligible)
-	}},
 	{Name: "cap-to-internet-with-exit", Why: "the inputs of one-way visibility: a member's app grant to public space, and an exit", Min: 0.015, World: func(v *View) bool {
 		return v.exitPresent() && slices.ContainsFunc(v.World.Policy.Grants, func(r Rule) bool {
 			return len(r.App) > 0 && len(v.MembersOf(r.Src...)) > 0 &&
@@ -850,22 +779,6 @@ var Required = append([]Shape{
 	{Name: "address-lost-v6", Why: "a node loses its IPv6 address", Min: 0.02, Step: func(b, a *View, _ Step) bool { return addrMoves(b, a, 6, lost) }},
 	{Name: "address-moved-v4", Why: "a node moves to another IPv4 address", Min: 0.07, Step: func(b, a *View, _ Step) bool { return addrMoves(b, a, 4, moved) }},
 	{Name: "address-moved-v6", Why: "a node moves to another IPv6 address", Min: 0.03, Step: func(b, a *View, _ Step) bool { return addrMoves(b, a, 6, moved) }},
-	{Name: "address-onto-shared", Why: "a node moving onto an address another holds (database only)", Min: 0, Step: func(b, a *View, _ Step) bool {
-		for _, n := range a.nodes {
-			o, ok := b.World.Topology.Node(n.ID)
-			if !ok {
-				continue
-			}
-
-			for _, f := range []int{4, 6} {
-				if n.Addr(f) != o.Addr(f) && a.heldByOther(n, n.Addr(f)) {
-					return true
-				}
-			}
-		}
-
-		return false
-	}},
 	{Name: "delete-and-reuse-address", Why: "an address freed and handed out again in one commit", Min: 0.1, Step: func(b, _ *View, st Step) bool {
 		for _, l := range edits[Leave](st) {
 			gone, _ := b.World.Topology.Node(l.ID)
@@ -918,7 +831,6 @@ var Required = append([]Shape{
 		return false
 	}},
 	{Name: "merge-anchor-moved", Why: "an anchor's key moves while an address-form receiver of its merged rule reads", Min: 0.013, Step: anchorMoved},
-	{Name: "self-source-sharer-moved", Why: "whether a self rule names a node moves, and another node shares an address the step left alone (database only)", Min: 0.002, Step: selfSourceSharerMoved},
 	{Name: "partial-read", Why: "some sessions read a commit, others do not", Min: 0.25, Step: func(_, a *View, st Step) bool {
 		return len(st.Reads) > 0 && len(st.Reads) < len(a.nodes)
 	}},

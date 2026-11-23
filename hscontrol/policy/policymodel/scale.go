@@ -50,21 +50,15 @@ const (
 	// at a receiver.
 	mergeFans = 16
 
-	// shareChains is one scenario in how many that starts with the share
-	// chain script (database only).
-	shareChains = 30
-
 	// anyOf bounds a draw picking among what the world decides, so that
 	// every node of a large world can be picked.
 	anyOf = 63
 
-	// Database-only addresses are drawn rarely, and in small worlds: the
-	// reference properties skip a world holding one whole. One small world
-	// in outsideWorlds may hold addresses outside the tailnet, one in
-	// sharedWorlds shared ones, and one address edit in strayAddrs may move
-	// onto either.
+	// Addresses outside the tailnet are drawn rarely, and in small worlds:
+	// the reference properties skip a world holding one whole. One small
+	// world in outsideWorlds may hold them, and one address edit in
+	// strayAddrs may move onto one.
 	outsideWorlds = 32
-	sharedWorlds  = 32
 	strayAddrs    = 24
 )
 
@@ -194,10 +188,6 @@ func mergeFan(w *World, who int) {
 
 	n := &w.Topology.Nodes[who%len(w.Topology.Nodes)]
 	n.User, n.Tags = 1, nil
-
-	if len(n.Addrs()) == 0 {
-		n.V4, n.V6 = ownAddr(4, uint64(n.ID)), ownAddr(6, uint64(n.ID))
-	}
 }
 
 // focus is what a run of steps keeps working on: the node, the rule and
@@ -272,7 +262,7 @@ func drawFocused(t *rapid.T, w World, f focus) []Edit {
 
 		switch {
 		case kind == editJoin:
-			if n, ok := drawJoiner(t, w, nodes); ok {
+			if n, ok := drawJoiner(t, w); ok {
 				return []Edit{Join{n}}
 			}
 		case len(nodes) > 0:

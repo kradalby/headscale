@@ -10,6 +10,7 @@ package state
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net/netip"
@@ -35,6 +36,45 @@ import (
 // worldSteps is how long a drawn scenario may be: the length the
 // generator's coverage is certified at.
 const worldSteps = 10
+
+// TestGeneratedWorldsStart holds the generators to what a started server
+// holds: every world a scenario passes through passes the startup check,
+// and a drawn node made to hold no address, or another's, fails it. That
+// NewState runs the check is TestNewStateChecksNodeAddresses.
+func TestGeneratedWorldsStart(t *testing.T) {
+	t.Parallel()
+
+	rapid.Check(t, func(t *rapid.T) {
+		s := policymodel.Scenarios(worldSteps).Draw(t, "scenario")
+
+		for i, w := range s.Worlds() {
+			_, nodes := w.Topology.Build()
+
+			err := checkNodeAddresses(nodes)
+			if err != nil {
+				t.Fatalf("world %d: %v", i, err)
+			}
+		}
+
+		_, nodes := s.Start.Topology.Build()
+		i := rapid.IntRange(0, len(nodes)-1).Draw(t, "node")
+		n := nodes[i]
+
+		n.IPv4, n.IPv6 = nil, nil
+		if err := checkNodeAddresses(nodes); !errors.Is(err, ErrNodeAddressMissing) { //nolint:noinlineerr
+			t.Fatalf("n%d without addresses: %v", n.ID, err)
+		}
+
+		if len(nodes) > 1 {
+			o := nodes[(i+1)%len(nodes)]
+
+			n.IPv4, n.IPv6 = o.IPv4, o.IPv6
+			if err := checkNodeAddresses(nodes); !errors.Is(err, ErrNodeAddressShared) { //nolint:noinlineerr
+				t.Fatalf("n%d on n%d's addresses: %v", n.ID, o.ID, err)
+			}
+		}
+	})
+}
 
 // modelWorld is a world driven from a scenario: each step committed as
 // one transaction, or through the world's write methods one kind at a

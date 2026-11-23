@@ -160,7 +160,10 @@ not: fix that clause's restatement, never the judge.
 ## Changing the generators
 
 - Draw only what the API and the client protocol can produce. Database-only
-  states (shared or missing addresses) stay rare and labelled.
+  states (addresses outside the tailnet or moved) stay rare and labelled.
+  What the server refuses at startup (two nodes on one address, a node
+  without one) is never drawn; `TestGeneratedWorldsStart` in `state` holds
+  that.
 - Build from rapid's primitives, not `Filter`: cases must shrink.
   `TestShrinksToSmallCases` holds that.
 - Every draw moves every later one. After a change, rerun `TestCoverage` and

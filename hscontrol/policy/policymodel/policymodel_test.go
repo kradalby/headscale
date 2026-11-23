@@ -1078,7 +1078,7 @@ func TestShrinksToSmallCases(t *testing.T) {
 	// seeds, not all. Database-only shapes are rare, so a property may
 	// need more than the default checks to fail. Flags are process-wide:
 	// not parallel.
-	settings := map[string]string{"rapid.nofailfile": "true", "rapid.seed": "1", "rapid.checks": "1000"}
+	settings := map[string]string{"rapid.nofailfile": "true", "rapid.seed": "5", "rapid.checks": "1000"}
 
 	for name, value := range settings {
 		old := flag.Lookup(name).Value.String()
@@ -1109,14 +1109,6 @@ func TestShrinksToSmallCases(t *testing.T) {
 			}
 		})
 	}
-
-	worldCase("a shared address", func(v *View) string {
-		if v.sharedAddr() {
-			return "two nodes share an address"
-		}
-
-		return ""
-	}, "node", "shared", "shared")
 
 	worldCase("a served route covering a node", func(v *View) string {
 		for _, r := range v.nodes {
@@ -1222,16 +1214,12 @@ func leftovers(s Scenario, needs []string) []string {
 		got = append(got, "node")
 	}
 
-	v := NewView(w)
-
 	for _, n := range w.Topology.Nodes {
 		plainNode := Node{ID: n.ID, User: n.User, V4: ownAddr(4, uint64(n.ID)), V6: ownAddr(6, uint64(n.ID))}
 
 		switch {
 		case slices.ContainsFunc(n.Addrs(), Outside):
 			got = append(got, "outside")
-		case slices.ContainsFunc(n.Addrs(), func(a netip.Addr) bool { return v.heldByOther(n, a) }):
-			got = append(got, "shared")
 		case len(n.Addrs()) == 1:
 			got = append(got, "single-family")
 		case n.V4 != plainNode.V4 || n.V6 != plainNode.V6:

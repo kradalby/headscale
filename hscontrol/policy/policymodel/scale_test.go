@@ -46,7 +46,7 @@ func TestScale(t *testing.T) {
 
 			reads += n
 
-			if v := NewView(w); v.outsideAddr() || v.sharedAddr() {
+			if NewView(w).outsideAddr() {
 				skip += n
 			}
 		}

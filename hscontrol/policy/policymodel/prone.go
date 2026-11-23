@@ -118,12 +118,6 @@ func viaInternetWorld(w *World, who int, d viaInternet) {
 	first := 1 + who%(len(nodes)-1)
 	second := 1 + first%(len(nodes)-1)
 
-	addressed := func(n *Node) {
-		if len(n.Addrs()) == 0 {
-			n.V4, n.V6 = ownAddr(4, uint64(n.ID)), ownAddr(6, uint64(n.ID))
-		}
-	}
-
 	serve := func(n *Node, routes ...int) {
 		n.Announced, n.Approved = addRoutes(n.Announced, routes), addRoutes(n.Approved, routes)
 	}
@@ -139,7 +133,6 @@ func viaInternetWorld(w *World, who int, d viaInternet) {
 	r.Announced = dropRoutes(r.Announced, []int{exit4, exit6})
 	r.Approved = dropRoutes(r.Approved, []int{exit4, exit6})
 	serve(r, viaInternetExits[d.family]...)
-	addressed(r)
 
 	if d.ownPublic {
 		serve(r, map[int]int{0: publicPrefix, 1: publicPrefix6, 2: publicPrefix}[d.family])
@@ -157,7 +150,6 @@ func viaInternetWorld(w *World, who int, d viaInternet) {
 
 	p := &nodes[second]
 	serve(p, public)
-	addressed(p)
 
 	if d.approvedOnly {
 		p.Announced, p.Approved = dropRoutes(p.Announced, []int{0}), addRoutes(p.Approved, []int{0})
@@ -233,9 +225,8 @@ const (
 // node is retagged onto the tag, logs in as the user, or announces a
 // further route, and every session reads. Auto-approval runs on the last
 // step alone, if at all. Or the other way off an approver
-// ([approverAwayScript]). None when no node of w is addressed or no route
-// is left to approve, or w holds a token users made ambiguous, which no
-// policy write gets past.
+// ([approverAwayScript]). None when no route is left to approve, or w
+// holds a token users made ambiguous, which no policy write gets past.
 func approverScript(w World, who, way int) []Step {
 	v := NewView(w)
 	nodes := w.Topology.Nodes
@@ -251,7 +242,7 @@ func approverScript(w World, who, way int) []Step {
 
 	for k := range nodes {
 		n := nodes[(who+k)%len(nodes)]
-		if len(n.Addrs()) == 0 || way == approverLogin && !n.Tagged() {
+		if way == approverLogin && !n.Tagged() {
 			continue
 		}
 

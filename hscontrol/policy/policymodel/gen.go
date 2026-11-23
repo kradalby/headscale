@@ -19,8 +19,9 @@ import (
 //
 // What is drawn is what headscale's own writes produce, with two
 // exceptions it reaches only through its database: addresses outside the
-// tailnet, shared between nodes, missing, or changed after registration.
-// They stay, rarely, because headscale's code handles them.
+// tailnet, or changed after registration. They stay, rarely, because
+// headscale starts on them. A node without addresses, or two holding one,
+// it refuses at startup, so neither is drawn.
 
 // Policies draws a policy: at least one rule, or rarely none, allowing
 // everything.
@@ -46,14 +47,11 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 
 		// Scripts begin some scenarios with sequences no run of single
 		// draws reaches: an anchor's key moving, where the start holds
-		// one; a node stopping being named through an address it shares,
-		// where the start shares addresses; a node's form flipping, its
-		// address moving and its form flipping back, unread until the
-		// end; and the same with a source of its rules moving instead; and,
-		// last, a node moving onto an identity that auto-approves a route
-		// it announces.
+		// one; a node's form flipping, its address moving and its form
+		// flipping back, unread until the end; and the same with a source
+		// of its rules moving instead; and, last, a node moving onto an
+		// identity that auto-approves a route it announces.
 		move := chance(t, 2, "anchor-move")
-		chain := chance(t, shareChains, "share-chain")
 		script := chance(t, 8, "flip-script")
 		elsewhere := chance(t, 8, "flip-elsewhere")
 		down := chance(t, 4, "primary-down")
@@ -67,14 +65,10 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 
 		var scripted []Step
 
-		if chain {
-			s.Start, scripted = shareChain(s.Start, who)
-		}
-
 		w := s.Start
 
 		if move {
-			scripted = append(anchorMove(w), scripted...)
+			scripted = anchorMove(w)
 		}
 
 		for _, st := range scripted {
@@ -331,53 +325,6 @@ func anchorMove(w World) []Step {
 	return []Step{st}
 }
 
-// shareChain has a node of the second user hold one address of a node of
-// alice's and the other of a third node (database only), and puts alice's
-// self rule in front of the ACLs, whose source names the node by the
-// address it shares with hers. The step deletes her node, which unnames
-// it, and every session reads: the node's side facts move though nothing
-// wrote it, and the third node's sides with them. w as it was, and no
-// step, with fewer than three nodes or two users, or where two users
-// answer to alice@.
-func shareChain(w World, who int) (World, []Step) {
-	if v := NewView(w); len(w.Topology.Nodes) < 3 || len(w.Topology.Users) < 2 || v.Ambiguous(0) {
-		return w, nil
-	}
-
-	w = w.clone()
-	nodes := w.Topology.Nodes
-	second := w.Topology.Users[1].ID
-
-	d := &nodes[0]
-	x := &nodes[1+who%(len(nodes)-1)]
-	y := &nodes[1+(who+1)%(len(nodes)-1)]
-
-	d.User, d.Tags = 1, nil
-	if !d.V6.IsValid() {
-		d.V6 = ownAddr(6, uint64(d.ID))
-	}
-
-	// On an address her node does not hold, and not hers either: her
-	// source would name x by it too.
-	y.V4 = ownAddr(4, uint64(y.ID))
-	if y.User == 1 {
-		y.User = second
-	}
-
-	x.User, x.Tags, x.V4, x.V6 = second, nil, y.V4, d.V6
-
-	self := Rule{Src: []Sel{{Kind: SelUser}}, Dst: []Dest{{Sel: Sel{Kind: SelSelf}}}}
-	w.Policy.ACLs, w.Policy.AllowAll = append([]Rule{self}, w.Policy.ACLs...), false
-	w = settle(w)
-
-	st := Step{Edits: []Edit{Leave{d.ID}}}
-	for _, n := range w.Topology.Nodes[1:] {
-		st.Reads = append(st.Reads, n.ID)
-	}
-
-	return w, []Step{st}
-}
-
 // Steps draws one step valid against w, for a state machine that takes
 // its steps as it goes: one edit mostly; sometimes several committed
 // together, a node deleted and another registered at its address, or a
@@ -402,16 +349,14 @@ var (
 		w := World{Policy: policies.Draw(t, "policy"), Topology: topologies.Draw(t, "topology")}
 
 		// Shapes a policy and a topology make only together, each in one
-		// world in eight to sixteen: a tag a rule's destination names whose nodes
-		// lose their addresses; an own rule that reaches nothing on its
-		// receiver yet places a merged rule; an app grant to public space
+		// world in eight to sixteen: an own rule that reaches nothing on
+		// its receiver yet places a merged rule; an app grant to public space
 		// that exits see one way; three rules merging into one; a merged
 		// rule placed by an earlier rule its receiver does not get; a via
 		// grant to autogroup:internet at an exit node among its sources,
 		// beside public routes; a router meeting three contested clauses.
 		// The merges go in last, as the first of them takes every ACL
 		// away.
-		hide := chance(t, 12, "hidden-tag")
 		merge := chance(t, 14, "merge-anchor")
 		anchor := chance(t, 8, "own-anchor")
 		oneWay := chance(t, 8, "one-way-world")
@@ -436,10 +381,6 @@ var (
 			stackedRouter(&w, who+2)
 		}
 
-		if hide {
-			hideTag(&w, who)
-		}
-
 		if anchor {
 			ownAnchor(&w, who)
 		}
@@ -461,10 +402,12 @@ var (
 )
 
 // ownAnchor puts in front of w's ACLs a self rule and a shared rule of one
-// key, alice's to port 22, with a rule of another key between, and makes
-// a node of w alice's router of 10.0.0.0/24 without addresses: its own
-// self rule reaches nothing on it, yet places where the shared rule,
-// which reaches its route, merges.
+// key, alice's to port 22, with a rule of another key between; makes a
+// node of w, not alice's, a router of 10.0.0.0/24 and an IPv6 exit node;
+// and leaves alice's nodes IPv4 only. An exit node takes every owner's
+// self rules, and alice's reaches nothing on it, yet places where the
+// shared rule, which reaches its route, merges. A world of one node, or
+// without a tag or a second user to give the router, gets the rules alone.
 func ownAnchor(w *World, who int) {
 	alice := Sel{Kind: SelUser}
 	ssh := slices.Index(Ports, "22")
@@ -475,22 +418,32 @@ func ownAnchor(w *World, who int) {
 	}
 	w.Policy.ACLs, w.Policy.AllowAll = append(rules, w.Policy.ACLs...), false
 
-	nodes := w.Topology.Nodes
+	nodes, users := w.Topology.Nodes, w.Topology.Users
 	if len(nodes) < 2 {
 		return
 	}
 
-	// The rules' sources: an alice node with its addresses.
-	a := &nodes[0]
-	a.User, a.Tags = 1, nil
+	n := &nodes[1+who%(len(nodes)-1)]
 
-	if len(a.Addrs()) == 0 {
-		a.V4, a.V6 = ownAddr(4, uint64(a.ID)), ownAddr(6, uint64(a.ID))
+	switch tag := ownedTag(w.Policy); {
+	case tag >= 0:
+		n.User, n.Tags = 0, []int{tag}
+	case len(users) > 1:
+		n.User, n.Tags = users[1].ID, nil
+	default:
+		return
 	}
 
-	n := &nodes[1+who%(len(nodes)-1)]
-	n.User, n.Tags, n.V4, n.V6 = 1, nil, netip.Addr{}, netip.Addr{}
-	n.Announced, n.Approved = []int{0}, []int{0}
+	n.Announced, n.Approved = addRoutes(n.Announced, []int{0, exit6}), addRoutes(n.Approved, []int{0, exit6})
+
+	// The rules' sources: alice's nodes, which the exit route misses.
+	nodes[0].User, nodes[0].Tags = 1, nil
+
+	for i := range nodes {
+		if a := &nodes[i]; a.User == 1 && !a.Tagged() {
+			a.V4, a.V6 = ownAddr(4, uint64(a.ID)), netip.Addr{}
+		}
+	}
 }
 
 // mergeAnchor puts in front of w's ACLs two UDP rules from the members,
@@ -512,27 +465,19 @@ func mergeAnchor(w *World, who int) {
 	// A node to receive them, joining a world of one.
 	if t := &w.Topology; len(t.Nodes) == 1 {
 		id := t.nextID()
-		t.Nodes, t.NextID = append(t.Nodes, Node{ID: id}), id+1
+		t.Nodes, t.NextID = append(t.Nodes, Node{ID: id, V4: ownAddr(4, uint64(id)), V6: ownAddr(6, uint64(id))}), id+1
 	}
 
 	nodes := w.Topology.Nodes
 
-	// The members' rules reach a member with addresses.
+	// The members' rules reach a member.
 	m := &nodes[0]
 	m.User, m.Tags = 1, nil
-
-	if len(m.Addrs()) == 0 {
-		m.V4, m.V6 = ownAddr(4, uint64(m.ID)), ownAddr(6, uint64(m.ID))
-	}
 
 	// Not a router: those are recut whenever any rule moves.
 	r := &nodes[1+who%(len(nodes)-1)]
 	r.User, r.Tags, r.Client = 0, []int{tag.I}, Unknown
 	r.Announced, r.Approved, r.AutoApproved = nil, nil, nil
-
-	if len(r.Addrs()) == 0 {
-		r.V4, r.V6 = ownAddr(4, uint64(r.ID)), ownAddr(6, uint64(r.ID))
-	}
 }
 
 // oneWayWorld leaves w one rule, alice's app grant to public space, and
@@ -591,16 +536,10 @@ func viaRouters(w *World, who int, down, covered bool) {
 	w.Policy.Grants = []Rule{{Src: []Sel{{Kind: SelUser}}, Dst: []Dest{{Sel: Sel{Kind: SelPrefix}}}, IP: []IP{{}}, Via: []int{tag}}}
 
 	nodes := t.Nodes
-	addressed := func(n *Node) {
-		if len(n.Addrs()) == 0 {
-			n.V4, n.V6 = ownAddr(4, uint64(n.ID)), ownAddr(6, uint64(n.ID))
-		}
-	}
 
-	// The source: an alice node with its addresses.
+	// The source: an alice node.
 	a := &nodes[0]
 	a.User, a.Tags = 1, nil
-	addressed(a)
 
 	first := 1 + who%(len(nodes)-1)
 	second := 1 + (first % (len(nodes) - 1))
@@ -616,7 +555,6 @@ func viaRouters(w *World, who int, down, covered bool) {
 		r := &nodes[i]
 		r.User, r.Tags, r.Offline, r.Expired = 0, []int{tag}, down && i == first && r.Offline && first < second, false
 		r.Announced, r.Approved = addRoutes(r.Announced, []int{0}), addRoutes(r.Approved, []int{0})
-		addressed(r)
 	}
 
 	r := &nodes[first]
@@ -650,36 +588,6 @@ func coverOf(n Node) (int, bool) {
 	}
 
 	return best, best >= 0
-}
-
-// hideTag takes the addresses of every node carrying a tag a rule's
-// destination names, tagging one first if none carries it.
-func hideTag(w *World, who int) {
-	tag := -1
-
-	for _, r := range slices.Concat(w.Policy.ACLs, w.Policy.Grants) {
-		for _, d := range r.Dst {
-			if d.Sel.Kind == SelTag && tag < 0 {
-				tag = d.Sel.I
-			}
-		}
-	}
-
-	nodes := w.Topology.Nodes
-	if tag < 0 || len(nodes) == 0 {
-		return
-	}
-
-	if !slices.ContainsFunc(nodes, func(n Node) bool { return slices.Contains(n.Tags, tag) }) {
-		n := &nodes[who%len(nodes)]
-		n.Tags, n.User = []int{tag}, 0
-	}
-
-	for i := range nodes {
-		if slices.Contains(nodes[i].Tags, tag) {
-			nodes[i].V4, nodes[i].V6 = netip.Addr{}, netip.Addr{}
-		}
-	}
 }
 
 // settle makes w a world headscale can hold: its policy accepted for its
@@ -1172,15 +1080,14 @@ func drawTopology(t *rapid.T) Topology {
 		return u
 	}), 1, sz.users).Draw(t, "users")
 
-	// A world holds addresses outside the tailnet, or shared, rarely and
-	// then several; most worlds are what headscale hands out. A large one
+	// A world holds addresses outside the tailnet rarely and then
+	// several; most worlds are what headscale hands out. A large one
 	// never: a reference property skips it whole.
 	outside := chance(t, outsideWorlds, "outside-world") && !sz.large
-	shared := chance(t, sharedWorlds, "shared-world") && !sz.large
 
 	// Nodes come in runs, so that a large topology grows to dozens.
 	runsOf(t, rapid.Custom(func(t *rapid.T) Node {
-		n := drawNode(t, types.NodeID(len(nodes)+1), users, nodes, allTags, outside, shared) //nolint:gosec // small
+		n := drawNode(t, types.NodeID(len(nodes)+1), users, allTags, outside) //nolint:gosec // small
 		nodes = append(nodes, n)
 
 		return n
@@ -1216,10 +1123,10 @@ func drawTopology(t *rapid.T) Topology {
 
 var allTags = []int{0, 1, 2}
 
-// drawNode draws node id joining others: owned by a user, or by tags from
-// tags. With outside or shared, its addresses may be outside the tailnet
-// or another node's; registration never hands those out.
-func drawNode(t *rapid.T, id types.NodeID, users []User, others []Node, tags []int, outside, shared bool) Node {
+// drawNode draws node id: owned by a user, or by tags from tags. With
+// outside, its addresses may be outside the tailnet, which registration
+// never hands out.
+func drawNode(t *rapid.T, id types.NodeID, users []User, tags []int, outside bool) Node {
 	n := Node{ID: id}
 
 	tagged := chance(t, 5, "tagged")
@@ -1233,19 +1140,11 @@ func drawNode(t *rapid.T, id types.NodeID, users []User, others []Node, tags []i
 		n.User = users[owner%len(users)].ID
 	}
 
-	// A tagged node goes without addresses more often, so that a tag all
-	// of whose members lack them comes up.
-	unaddressed := 12
-	if n.Tagged() {
-		unaddressed = 6
-	}
-
-	none := chance(t, unaddressed, "unaddressed")
-	v4 := drawAddr(t, 4, id, others, outside, shared)
-	v6 := drawAddr(t, 6, id, others, outside, shared)
-
-	if !none {
-		n.V4, n.V6 = v4, v6
+	// One family may be missing, not both: the server refuses a node
+	// without addresses at startup.
+	n.V4, n.V6 = drawAddr(t, 4, id, outside), drawAddr(t, 6, id, outside)
+	if !n.V4.IsValid() && !n.V6.IsValid() {
+		n.V4 = ownAddr(4, uint64(id))
 	}
 
 	if chance(t, 3, "routes") {
@@ -1288,21 +1187,15 @@ func drawTags(t *rapid.T, tags []int) []int {
 }
 
 // drawAddr draws node id's address in family: its own, or rarely none;
-// in a world that has them, another node's, or one outside the tailnet.
-func drawAddr(t *rapid.T, family int, id types.NodeID, others []Node, outside, shared bool) netip.Addr {
+// in a world that has them, one outside the tailnet.
+func drawAddr(t *rapid.T, family int, id types.NodeID, outside bool) netip.Addr {
 	none := chance(t, 8, "no-addr")
-	share := chance(t, 2, "shared")
-	of := rapid.IntRange(0, anyOf).Draw(t, "of")
 	away := chance(t, 2, "outside")
 	where := rapid.IntRange(0, 15).Draw(t, "where")
-
-	held := heldAddrs(family, others, netip.Addr{})
 
 	switch {
 	case none:
 		return netip.Addr{}
-	case shared && share && len(held) > 0:
-		return held[of%len(held)]
 	case outside && away:
 		pool := outsideAddrs(family, uint64(id))
 
@@ -1310,19 +1203,6 @@ func drawAddr(t *rapid.T, family int, id types.NodeID, others []Node, outside, s
 	}
 
 	return ownAddr(family, uint64(id))
-}
-
-// heldAddrs is the addresses nodes hold in family, but not.
-func heldAddrs(family int, nodes []Node, not netip.Addr) []netip.Addr {
-	var out []netip.Addr
-
-	for _, n := range nodes {
-		if a := n.Addr(family); a.IsValid() && a != not && !slices.Contains(out, a) {
-			out = append(out, a)
-		}
-	}
-
-	return out
 }
 
 // routeChoices is what a node may route: every rule prefix, then an exit
@@ -1413,10 +1293,9 @@ func drawEdits(t *rapid.T, w World) []Edit {
 // allocator hands the freed address.
 func drawReuse(t *rapid.T, w World) []Edit {
 	x := pick(t, w.Topology.Nodes, "leaves")
-	rest := slices.DeleteFunc(slices.Clone(w.Topology.Nodes), func(n Node) bool { return n.ID == x.ID })
 
 	v6 := chance(t, 3, "v6")
-	n, ok := drawJoiner(t, w, rest)
+	n, ok := drawJoiner(t, w)
 
 	if !ok {
 		return []Edit{Leave{x.ID}}
@@ -1427,7 +1306,6 @@ func drawReuse(t *rapid.T, w World) []Edit {
 	n.Announced, n.Client, n.Offline = nil, Official, false
 
 	switch {
-	case len(x.Addrs()) == 0:
 	case !x.V6.IsValid() || x.V4.IsValid() && !v6:
 		n.V4 = x.V4
 	default:
@@ -1441,7 +1319,7 @@ func drawReuse(t *rapid.T, w World) []Edit {
 // fresh addresses, or tagged with tags the policy defines, which leaves
 // it without a user; nothing approved but what auto-approval approves.
 // False when nobody could register it.
-func drawJoiner(t *rapid.T, w World, others []Node) (Node, bool) {
+func drawJoiner(t *rapid.T, w World) (Node, bool) {
 	var defined []int
 
 	for i := range numTags {
@@ -1450,7 +1328,7 @@ func drawJoiner(t *rapid.T, w World, others []Node) (Node, bool) {
 		}
 	}
 
-	n := drawNode(t, w.Topology.nextID(), w.Topology.Users, others, defined, false, false)
+	n := drawNode(t, w.Topology.nextID(), w.Topology.Users, defined, false)
 	n.Approved, n.AutoApproved, n.Expired = nil, nil, false
 
 	return n, len(w.Topology.Users) > 0 || len(defined) > 0
@@ -1539,7 +1417,7 @@ func drawNodeEdit(t *rapid.T, w World) Edit {
 	}
 
 	if kind == editJoin {
-		n, ok := drawJoiner(t, w, tp.Nodes)
+		n, ok := drawJoiner(t, w)
 		if !ok {
 			return drawUserEdit(t, w)
 		}
@@ -1550,8 +1428,13 @@ func drawNodeEdit(t *rapid.T, w World) Edit {
 	if kind == editSwap && len(tp.Nodes) >= 2 {
 		a := index(t, len(tp.Nodes), "a")
 		b := other(t, len(tp.Nodes), a, "b")
+		e := SwapAddrs{min(tp.Nodes[a].ID, tp.Nodes[b].ID), max(tp.Nodes[a].ID, tp.Nodes[b].ID), drawFamily(t)}
 
-		return SwapAddrs{min(tp.Nodes[a].ID, tp.Nodes[b].ID), max(tp.Nodes[a].ID, tp.Nodes[b].ID), drawFamily(t)}
+		// Swapped with a node lacking the family, an address moves over,
+		// which must not leave its holder without one.
+		if after := w.Apply(e); len(after.mustNode(e.A).Addrs()) > 0 && len(after.mustNode(e.B).Addrs()) > 0 {
+			return e
+		}
 	}
 
 	// Newest first: the simplest draw keeps naming the node a join made
@@ -1563,8 +1446,6 @@ func drawNodeEdit(t *rapid.T, w World) Edit {
 
 // drawNodeEditOn draws an edit of kind, other than a join, of node n of w.
 func drawNodeEditOn(t *rapid.T, w World, kind int, n Node) Edit {
-	tp := w.Topology
-
 	switch kind {
 	case editLeave:
 		return Leave{n.ID}
@@ -1607,7 +1488,7 @@ func drawNodeEditOn(t *rapid.T, w World, kind int, n Node) Edit {
 	case editOnline:
 		return SetOnline{n.ID, n.Offline}
 	case editAddr, editSwap:
-		return drawSetAddr(t, n, tp.Nodes)
+		return drawSetAddr(t, n)
 	}
 
 	return SetClient{n.ID, Client(other(t, numClients, int(n.Client), "client"))} //nolint:gosec // a few clients
@@ -1669,23 +1550,33 @@ func drawHeld(t *rapid.T, held []int) []int {
 }
 
 // drawSetAddr moves n in one family: back to its own address, to none,
-// to a tailnet address nobody owns; rarely outside the tailnet, or onto
-// an address another node holds.
-func drawSetAddr(t *rapid.T, n Node, nodes []Node) Edit {
+// to a tailnet address nobody owns; rarely outside the tailnet.
+func drawSetAddr(t *rapid.T, n Node) Edit {
 	family := drawFamily(t)
 	cur := n.Addr(family)
 
-	rare := chance(t, strayAddrs, "out-of-domain")
+	rare := chance(t, strayAddrs, "outside-addr")
 
 	to := []netip.Addr{ownAddr(family, uint64(n.ID)), {}, movedAddr(family, uint64(n.ID))}
 	if rare {
 		to = append(to, outsideAddrs(family, uint64(n.ID))...)
-		to = append(to, heldAddrs(family, nodes, cur)...)
 	}
 
 	to = slices.DeleteFunc(to, func(a netip.Addr) bool { return a == cur })
+	e := SetAddr{n.ID, family, pickAny(t, to, "to")}
 
-	return SetAddr{n.ID, family, pickAny(t, to, "to")}
+	// None in its only family would leave n without addresses, which the
+	// server refuses at startup: it gains the other family instead.
+	if !e.Addr.IsValid() && len(n.Addrs()) == 1 {
+		e.Family = 4
+		if family == 4 {
+			e.Family = 6
+		}
+
+		e.Addr = ownAddr(e.Family, uint64(n.ID))
+	}
+
+	return e
 }
 
 func drawUserEdit(t *rapid.T, w World) Edit {
