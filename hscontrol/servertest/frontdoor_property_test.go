@@ -32,6 +32,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 )
 
 // The front-door property plays generated scenarios against a server
@@ -118,6 +119,12 @@ type fdNode struct {
 	loggedOut bool
 }
 
+// fdKeys is a node's tunnel keys as its client last registered with.
+type fdKeys struct {
+	node  key.NodePublic
+	disco key.DiscoPublic
+}
+
 // fdRun is what the cases of one run share.
 type fdRun struct {
 	steps int
@@ -167,6 +174,12 @@ type frontDoor struct {
 	// who held them last is history the election history missed, so the
 	// routes go unjudged until a router can take them again.
 	unheld map[netip.Prefix]bool
+
+	// keys are the tunnel keys each node's client registered with, as
+	// its entry must carry them on the wire ([policymodel.WireKeys]):
+	// the level's own inputs, recorded at each registration and never
+	// read back from the server.
+	keys map[types.NodeID]fdKeys
 
 	// stacks is reused by every quiet wait.
 	stacks []byte
@@ -261,6 +274,7 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 		nodes:     map[types.NodeID]*fdNode{},
 		elections: policymodel.NewElections(),
 		unheld:    map[netip.Prefix]bool{},
+		keys:      map[types.NodeID]fdKeys{},
 		stacks:    make([]byte, 1<<20),
 	}
 
@@ -1115,6 +1129,9 @@ func (fd *frontDoor) answered(at string, id types.NodeID, tc *TestClient) {
 		owner = nv.UserID().Get()
 	}
 
+	// The keys its entry must carry on the wire ([policymodel.WireKeys]).
+	fd.keys[nv.ID()] = fdKeys{node: p.PrivateNodeKey.Public(), disco: tc.discoKey}
+
 	if got := uint(p.UserProfile.ID); got != owner && (!nv.IsTagged() || got != types.TaggedDevicesUserID+1+uint(nv.ID())) { //nolint:gosec // small
 		fd.t.Fatalf("%s: n%d's client was told it logs in as user %d; the server stored its node as user %d's", at, nv.ID(), got, owner)
 	}
@@ -1265,6 +1282,14 @@ func (fd *frontDoor) drop(id types.NodeID) {
 	}
 
 	delete(fd.nodes, id)
+	delete(fd.keys, id)
+}
+
+// registrationKeys is the tunnel keys id's client registered with, for
+// [policymodel.WireKeys].
+func (fd *frontDoor) registrationKeys(id types.NodeID) (key.NodePublic, key.DiscoPublic) {
+	k := fd.keys[id]
+	return k.node, k.disco
 }
 
 // untag makes tagged node e.ID user e.User's, as that user's interactive
@@ -1388,6 +1413,12 @@ func (fd *frontDoor) weather(at string, kind int) {
 		err = nd.tc.RestartPoll(ctx)
 	case stepClientRestart:
 		err = nd.tc.Restart(ctx, fd.hostinfo(n, true))
+
+		// The restart gave its client a new disco key, which its entry
+		// must carry once its registration lands.
+		keys := fd.keys[n.ID]
+		keys.disco = nd.tc.discoKey
+		fd.keys[n.ID] = keys
 	case stepEndpoints:
 		eps := fdEndpoints[rapid.IntRange(0, len(fdEndpoints)-1).Draw(fd.t, "endpoints")]
 		nd.tc.Direct().SetEndpoints(eps)

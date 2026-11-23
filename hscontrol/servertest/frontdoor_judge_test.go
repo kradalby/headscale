@@ -262,6 +262,10 @@ func (fd *frontDoor) judgeClients(at string) {
 			if d := policymodel.NetmapDiff(nm, fresh, func() { fd.run.tally.unseen++ }); d != "" {
 				fd.t.Fatalf("%s: n%d's client, the server quiet, holds other than a fresh session of r%d is given: %s", at, n.ID, snap.Rev(), d)
 			}
+
+			if d := policymodel.WireKeys(nm, fd.registrationKeys); d != "" {
+				fd.t.Fatalf("%s: n%d's client holds an entry whose keys differ from its registration: %s", at, n.ID, d)
+			}
 		}
 
 		if ref == nil {
