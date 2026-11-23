@@ -607,8 +607,7 @@ type sideFacts struct {
 	touch                          RoleSet
 }
 
-func (f *sideFacts) addressed() bool { return len(f.ips) > 0 }
-func (f *sideFacts) routed() bool    { return len(f.routes) > 0 }
+func (f *sideFacts) routed() bool { return len(f.routes) > 0 }
 
 // coverAtoms are the atoms of the touch sets of the nodes with an address
 // inside one subnet route, router atoms aside, each with how many of them
@@ -1674,10 +1673,6 @@ func (s Sides) touchOf(id types.NodeID, f *sideFacts) RoleSet {
 // node by one of its own addresses, as the compile picks the owner's nodes
 // a self rule's source holds.
 func (s Sides) namedBy(f *sideFacts, grants [][]Role) bool {
-	if !f.addressed() {
-		return false
-	}
-
 	for _, srcs := range grants {
 		for _, a := range srcs {
 			switch a.kind { //nolint:exhaustive // only these atoms name an address
@@ -1864,9 +1859,7 @@ func (s Sides) setOf(id types.NodeID, f *sideFacts) RoleSet {
 		roles = append(roles, literalRole(lit))
 	}
 
-	if f.addressed() || f.routed() {
-		roles = append(roles, atomAll)
-	}
+	roles = append(roles, atomAll)
 
 	if f.approvedAddr || f.routed() {
 		roles = append(roles, atomApproved)
@@ -1919,11 +1912,7 @@ func (s Sides) setOf(id types.NodeID, f *sideFacts) RoleSet {
 		onSrc := false
 
 		for _, g := range f.targets {
-			// NewState refuses a node without addresses, so every via
-			// router is shown.
-			if f.addressed() {
-				roles = append(roles, Role{kind: roleViaSeen, value: uint64(g)}) //nolint:gosec // a grant index
-			}
+			roles = append(roles, Role{kind: roleViaSeen, value: uint64(g)}) //nolint:gosec // a grant index
 
 			onSrc = onSrc || slices.ContainsFunc(s.plan.grants[g].src, func(r Role) bool {
 				_, ok := slices.BinarySearchFunc(held, r, compareRoles)
@@ -3304,18 +3293,16 @@ type SidesReport struct {
 	// Fresh counts audits whose oracle was compiled afresh.
 	Fresh int
 
-	Unaddressed, SharedAddress, Covering, Covered int
-	SingleFamily, ExitOneFamily, Exit             int
-	Public, PublicRoute, InsideApproved           int
-	TaggedWithUser, ViaTargets, ViaRouterOnSrc    int
-	NamedByAddressOnly, Steered, RoutesKept       int
-	AsymmetricPeers                               int
+	Covering, Covered                          int
+	SingleFamily, ExitOneFamily, Exit          int
+	Public, PublicRoute, InsideApproved        int
+	TaggedWithUser, ViaTargets, ViaRouterOnSrc int
+	Steered, RoutesKept                        int
+	AsymmetricPeers                            int
 	// WildcardSteerOutside counts steering pairs under a via plan with a
 	// "*" source whose viewer has an address outside the tailnet ranges;
-	// UnaddressedCoveringOwn nodes without addresses routing over a node
-	// of their own user; PublicNamedApp public nodes an app self grant
-	// names.
-	WildcardSteerOutside, UnaddressedCoveringOwn, PublicNamedApp int
+	// PublicNamedApp public nodes an app self grant names.
+	WildcardSteerOutside, PublicNamedApp int
 }
 
 // Add adds o's counts to r.
@@ -3325,8 +3312,6 @@ func (r *SidesReport) Add(o SidesReport) {
 	r.RoutePairs += o.RoutePairs
 	r.ViaPairs += o.ViaPairs
 	r.Fresh += o.Fresh
-	r.Unaddressed += o.Unaddressed
-	r.SharedAddress += o.SharedAddress
 	r.Covering += o.Covering
 	r.Covered += o.Covered
 	r.SingleFamily += o.SingleFamily
@@ -3338,12 +3323,10 @@ func (r *SidesReport) Add(o SidesReport) {
 	r.TaggedWithUser += o.TaggedWithUser
 	r.ViaTargets += o.ViaTargets
 	r.ViaRouterOnSrc += o.ViaRouterOnSrc
-	r.NamedByAddressOnly += o.NamedByAddressOnly
 	r.Steered += o.Steered
 	r.RoutesKept += o.RoutesKept
 	r.AsymmetricPeers += o.AsymmetricPeers
 	r.WildcardSteerOutside += o.WildcardSteerOutside
-	r.UnaddressedCoveringOwn += o.UnaddressedCoveringOwn
 	r.PublicNamedApp += o.PublicNamedApp
 }
 
@@ -3578,19 +3561,12 @@ func countShapes(a SidesAudit, rep *SidesReport) {
 	for id, f := range s.facts.All() {
 		n, _ := a.Nodes.Get(id)
 
-		switch {
-		case len(f.ips) == 0:
-			rep.Unaddressed++
-		case len(f.ips) == 1:
+		if len(f.ips) == 1 {
 			rep.SingleFamily++
 		}
 
-		if slices.ContainsFunc(f.share, func(m types.NodeID) bool { return m != id }) {
-			rep.SharedAddress++
-		}
-
 		// Routing over another node's address, as D4 decides it.
-		covering, own := false, false
+		covering := false
 
 		for _, r := range f.routes {
 			s.nodesIn(r, func(m types.NodeID) {
@@ -3600,19 +3576,11 @@ func countShapes(a SidesAudit, rep *SidesReport) {
 
 				covering = true
 				rep.Covered++
-
-				if mf, ok := s.facts.Get(m); ok && f.cliqued && mf.cliqued && mf.clique == f.clique {
-					own = true
-				}
 			})
 		}
 
 		if covering {
 			rep.Covering++
-		}
-
-		if own && !f.addressed() {
-			rep.UnaddressedCoveringOwn++
 		}
 
 		if f.exit {
@@ -3644,14 +3612,6 @@ func countShapes(a SidesAudit, rep *SidesReport) {
 		rs, _ := s.sets.Get(id)
 		if rs.Has(Role{kind: roleRouterOnSrc, value: uint64(id)}) {
 			rep.ViaRouterOnSrc++
-		}
-
-		// Named by an address it shares, not by a role of its own.
-		if f.namedPort || f.namedApp {
-			plain := &sideFacts{ips: f.ips, share: []types.NodeID{id}, addrLit: f.addrLit}
-			if !s.namedBy(plain, slices.Concat(s.plan.selfPort, s.plan.selfApp)) {
-				rep.NamedByAddressOnly++
-			}
 		}
 
 		if f.namedApp && f.pub {
