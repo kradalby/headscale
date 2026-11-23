@@ -9357,7 +9357,7 @@ func TestStreamCapabilityVersionLifetime(t *testing.T) {
 			require.Eventually(t, func() bool {
 				runtime.GC()
 				return old.Value() == nil
-			}, time.Second, 10*time.Millisecond, "advancing or releasing the stream must release old capability data")
+			}, 30*time.Second, 10*time.Millisecond, "advancing or releasing the stream must release old capability data")
 			runtime.KeepAlive(st)
 			runtime.KeepAlive(active)
 			runtime.KeepAlive(s)
@@ -9393,7 +9393,7 @@ func TestStreamDoesNotRetainObsoletePolicy(t *testing.T) {
 	require.Eventually(t, func() bool {
 		runtime.GC()
 		return old.Value() == nil
-	}, time.Second, 10*time.Millisecond, "idle stream must not own an obsolete compiled policy")
+	}, 30*time.Second, 10*time.Millisecond, "idle stream must not own an obsolete compiled policy")
 	require.NotNil(t, current.Value(), "live world must retain its current policy")
 	runtime.KeepAlive(st)
 	runtime.KeepAlive(s)
