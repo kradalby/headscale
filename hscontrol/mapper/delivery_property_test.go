@@ -438,9 +438,8 @@ type deliveryReach struct {
 	churnJudged, crossFamily, combosCompared, keptCleared                           int
 	overlapped, indexed                                                             int
 	// unseen counts offline peers a client holds without the LastSeen a
-	// fresh session shows (see [policymodel.NetmapDiff]), and unindexed the clients
-	// whose index lost their own address after a shared one.
-	unseen, unindexed int
+	// fresh session shows (see [policymodel.NetmapDiff]).
+	unseen int
 	// laggedFlips counts lagged renders across a delivery flip, and
 	// laggedForms across a flip of the form the node is served.
 	laggedFlips, laggedForms int
@@ -457,11 +456,11 @@ func (r deliveryReach) String() string {
 	return fmt.Sprintf("sessions held to a fresh one %d, lagged renders %d, failed writes %d, reconnects %d, delivery flips %d, "+
 		"clears %d, chunks added %d and deleted %d, whole filters sent %d, membership-churn receivers judged %d, "+
 		"nodes held across the four combinations %d (cross-family ICMP refused %d), kept chunks cleared %d, overlapping reconnects %d, "+
-		"address indexes held %d (own address lost after a shared one %d), offline peers held without LastSeen %d, "+
+		"address indexes held %d, offline peers held without LastSeen %d, "+
 		"lagged renders across a delivery flip %d and across a form flip %d; writes through production entry points %v "+
 		"(node writes that reached one %d of %d), scripts %v; renders that sent something: %s",
 		r.compared, r.lagged, r.failed, r.reconnected, r.flips, r.clears, r.added, r.deleted, r.wholeSent,
-		r.churnJudged, r.combosCompared, r.crossFamily, r.keptCleared, r.overlapped, r.indexed, r.unindexed, r.unseen,
+		r.churnJudged, r.combosCompared, r.crossFamily, r.keptCleared, r.overlapped, r.indexed, r.unseen,
 		r.laggedFlips, r.laggedForms, r.writes, prod, all, r.scripts, r.wakes)
 }
 
@@ -579,9 +578,6 @@ type deliveryWorld struct {
 	probes probeCache
 	judges *[numJudges]bool
 	reach  *deliveryReach
-	// shared is whether the start or any commit had two nodes share an
-	// address: a write of several nodes commits them one at a time.
-	shared bool
 	// kind names the step being delivered, for what woke its renders.
 	kind string
 	// dropped is Route's answers with each part taken out, by pair.
@@ -604,15 +600,10 @@ func newDeliveryWorld(t *rapid.T, r *deliveryRun, c deliveryCombo, w policymodel
 		t.Fatalf("test sanity: %s built a world with capability_sources=%t/filter_chunks=%t", c, snap.CapabilitySources(), snap.FilterChunks())
 	}
 
-	dw.shared, _ = heldAddresses(dw.p.s.Snapshot())
-
 	dw.h = NewHub()
 	dw.w = newSteppedWatcher(t, dw.h, dw.p.s)
 	dw.p.committed = func(before uint64) {
 		dw.w.committed(before)
-
-		shared, _ := heldAddresses(dw.p.s.Snapshot())
-		dw.shared = dw.shared || shared
 
 		if !dw.coalesce && dw.p.s.Snapshot().Rev() != before {
 			dw.w.settle()
@@ -1090,23 +1081,8 @@ func (dw *deliveryWorld) fresh(at string) map[types.NodeID]*netmap.NetworkMap {
 		if dw.combo.capSources {
 			dw.reach.indexed++
 
-			// TODO(kradalby): render/self-address-evicted: once an address
-			// was shared (database only), a peer holding the viewer's own
-			// address that leaves its peers goes as a removal, which takes
-			// that address out of the client's index. Counted, not judged.
-			// The excuse is also what keeps the self half of
-			// evictsHeldAddress unjudgeable: a delta the clause did not
-			// refresh is this class's own shape, so a mutant dropping the
-			// self half diverges from production nowhere else.
-			var own tailcfg.NodeID
-			if dw.shared || policymodel.SharesAddress(dw.p.w) {
-				own = id.NodeID()
-			}
-
-			if a, holder, ok := s.index.forgotten(have, own); ok {
+			if a, holder, ok := s.index.forgotten(have); ok {
 				dw.failf(judgeIndex, "%s: n%d's client, last rendered r%d, indexes nobody at %s, which n%d holds", at, id, s.rev, a, holder)
-			} else if _, _, ok := s.index.forgotten(have, 0); ok {
-				dw.reach.unindexed++
 			}
 		}
 
@@ -1287,19 +1263,16 @@ func (rt *referenceTally) require(t *testing.T, deep bool) {
 // from scratch's. Oracle: the reference and the client's filter, and for
 // SSH a compile that inherits nothing. Worlds out of the reference's
 // domain are skipped, as the reference properties skip them.
-func (r *deliveryRun) holdToReference(t *rapid.T, at string, worlds []*deliveryWorld, held []map[types.NodeID]*netmap.NetworkMap, shared bool) {
+func (r *deliveryRun) holdToReference(t *rapid.T, at string, worlds []*deliveryWorld, held []map[types.NodeID]*netmap.NetworkMap) {
 	if !r.judges[judgeReference] {
 		return
 	}
 
-	// Elections read the history the State was driven through: when each
-	// node connected, the prober's marks, who held each route last.
 	w := worlds[0].p.w
 
-	m := statemodel.Moment(worlds[0].p)
-	m.Shared = shared
-
-	ref := r.ref.At(m)
+	// Elections read the history the State was driven through: when each
+	// node connected, the prober's marks, who held each route last.
+	ref := r.ref.At(statemodel.Moment(worlds[0].p))
 	if ref == nil {
 		return
 	}
@@ -1615,8 +1588,6 @@ func playDelivery(t *rapid.T, r *deliveryRun) {
 
 	agreed := map[[2]*netmap.NetworkMap]bool{}
 
-	shared := false
-
 	judge := func(at string) {
 		held := make([]map[types.NodeID]*netmap.NetworkMap, len(worlds))
 		for i, dw := range worlds {
@@ -1625,8 +1596,7 @@ func playDelivery(t *rapid.T, r *deliveryRun) {
 
 		combosAgree(t, at, r, worlds, held, agreed)
 
-		shared = shared || slices.ContainsFunc(worlds, func(dw *deliveryWorld) bool { return dw.shared }) || policymodel.SharesAddress(worlds[0].p.w)
-		r.holdToReference(t, at, worlds, held, shared)
+		r.holdToReference(t, at, worlds, held)
 	}
 
 	for _, dw := range worlds {

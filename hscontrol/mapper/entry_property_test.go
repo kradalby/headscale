@@ -218,7 +218,7 @@ func (p *pbtWorld) register(fresh []newcomer, w policymodel.World) {
 	for i := range fresh {
 		fresh[i].w = &nodeWrite{}
 		p.cur = fresh[i].w
-		p.enrol(fresh[i], w, len(fresh) > 1)
+		p.enrol(fresh[i], w)
 	}
 
 	for i := range fresh {
@@ -231,9 +231,8 @@ func (p *pbtWorld) register(fresh []newcomer, w policymodel.World) {
 
 // enrol registers nc as its client does, steered to the model's ID and
 // holding the allocator to its sequence: without the routes it announces
-// where its addresses, the admin's approvals or nodes sharing its
-// addresses must come first.
-func (p *pbtWorld) enrol(nc newcomer, w policymodel.World, several bool) {
+// where its addresses or the admin's approvals must come first.
+func (p *pbtWorld) enrol(nc newcomer, w policymodel.World) {
 	p.t.Helper()
 
 	n, tn, id := nc.n, nc.tn, nc.n.ID
@@ -246,11 +245,10 @@ func (p *pbtWorld) enrol(nc newcomer, w policymodel.World, several bool) {
 	bare.RoutableIPs = nil
 
 	// Auto-approvers are matched by address: what the node announces waits
-	// for the model's addresses where registration hands out others, and,
-	// where nodes share addresses, for the others registering beside it.
+	// for the model's addresses where registration hands out others.
 	v4, v6 := nextAddr(p.alloc[0]), nextAddr(p.alloc[1])
 	moved := n.V4 != v4 || n.V6 != v6
-	alone := !moved && len(admitted(tn)) == 0 && (!several || !policymodel.SharesAddress(w))
+	alone := !moved && len(admitted(tn)) == 0
 
 	oidc := false
 

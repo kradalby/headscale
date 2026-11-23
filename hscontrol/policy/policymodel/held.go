@@ -314,9 +314,6 @@ func (j *HeldJudge) String() string {
 type Moment struct {
 	World     World
 	Elections *Elections
-	// Shared is set once two nodes of the case shared an address
-	// (database only): the addresses a client is shown go unjudged.
-	Shared bool
 	// Unheld are subnet routes whose last holder is history the election
 	// history missed: unjudged.
 	Unheld map[netip.Prefix]bool
@@ -400,7 +397,7 @@ func (h *Held) peers(id types.NodeID, nm *netmap.NetworkMap, _ bool) string {
 			addrs = append(addrs, p.Addr())
 		}
 
-		if want := ShownAddrs(h.m.World, id, types.NodeID(nv.ID())); !h.m.Shared && !slices.Equal(addrs, want) { //nolint:gosec // small
+		if want := ShownAddrs(h.m.World, id, types.NodeID(nv.ID())); !slices.Equal(addrs, want) { //nolint:gosec // small
 			return fmt.Sprintf("its client is shown n%d at %v, the model at %v", nv.ID(), addrs, want)
 		}
 	}

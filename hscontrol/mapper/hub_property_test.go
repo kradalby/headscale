@@ -577,31 +577,23 @@ func runHubMachine(t *rapid.T, reach *hubPropertyReach, audits *auditLines) {
 // saw notes what the State and the model now hold for the audits' known
 // false alarms.
 func (m *hubMachine) saw() {
-	_, apart := heldAddresses(m.p.s.Snapshot())
+	apart := heldAddresses(m.p.s.Snapshot())
 	m.apart = m.apart || apart
 	m.self = m.self || policymodel.SelfDestination(m.p.w.Policy)
 }
 
-// heldAddresses reports whether two nodes snap holds share an address, and
-// whether the addresses of one user's untagged nodes sort apart
-// ([policymodel.SortsApart]).
-func heldAddresses(snap *state.Snapshot) (bool, bool) {
-	seen := map[netip.Addr]bool{}
+// heldAddresses reports whether the addresses of one user's untagged nodes
+// snap holds sort apart ([policymodel.SortsApart]).
+func heldAddresses(snap *state.Snapshot) bool {
 	byUser := map[uint][]netip.Addr{}
-	shared := false
 
 	for _, n := range snap.ListNodes().All() {
-		for _, a := range n.IPs() {
-			shared = shared || seen[a]
-			seen[a] = true
-		}
-
 		if !n.IsTagged() && n.UserID().Valid() {
 			byUser[n.UserID().Get()] = append(byUser[n.UserID().Get()], n.IPs()...)
 		}
 	}
 
-	return shared, slices.ContainsFunc(slices.Collect(maps.Values(byUser)), policymodel.SortsApart)
+	return slices.ContainsFunc(slices.Collect(maps.Values(byUser)), policymodel.SortsApart)
 }
 
 // admit opens a session of id, its first map to be rendered.
@@ -1402,7 +1394,7 @@ func stressConverges(t *testing.T, seed, run uint64, writes int, audit, chunks b
 	h.reach.apart = map[uint64]bool{}
 	h.p.committed = func(before uint64) {
 		snap := h.p.s.Snapshot()
-		if _, sorted := heldAddresses(snap); sorted && policymodel.SelfDestination(h.p.w.Policy) {
+		if heldAddresses(snap) && policymodel.SelfDestination(h.p.w.Policy) {
 			for rev := before + 1; rev <= snap.Rev(); rev++ {
 				h.reach.apart[rev] = true
 			}
