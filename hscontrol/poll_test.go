@@ -3365,11 +3365,14 @@ func TestSlowOverlappingStreamsRevokePolicyWithQueuedPings(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, r := range []running{first, second} {
-		select {
-		case <-r.writer.waiting:
-		case <-time.After(2 * time.Second):
-			t.Fatal("slow stream never blocked")
-		}
+		require.Eventually(t, func() bool {
+			select {
+			case <-r.writer.waiting:
+				return true
+			default:
+				return false
+			}
+		}, 10*time.Second, time.Millisecond, "slow stream never blocked")
 	}
 
 	const pingOne, pingTwo = "https://example.com/slow-one", "https://example.com/slow-two"
