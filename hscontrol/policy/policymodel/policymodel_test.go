@@ -962,8 +962,6 @@ func nodeTouch(e Edit) []string {
 		return node(e.ID, "Tags", "User", "Approved", "AutoApproved")
 	case SetAddr:
 		return node(e.ID, family(e.Family))
-	case SwapAddrs:
-		return slices.Concat(node(e.A, family(e.Family)), node(e.B, family(e.Family)))
 	case Announce:
 		return node(e.ID, "Announced", "Approved", "AutoApproved")
 	case Withdraw:

@@ -530,7 +530,7 @@ func (fd *frontDoor) edit(at string, e policymodel.Edit, ids map[types.NodeID]ty
 		fd.apply(e)
 	case policymodel.SetOnline:
 		fd.setOnline(at, kind, e)
-	case policymodel.SetAddr, policymodel.SwapAddrs:
+	case policymodel.SetAddr:
 		fd.made(kind, "left out (database only)")
 	case policymodel.AddUser:
 		fd.addUser(e.User)

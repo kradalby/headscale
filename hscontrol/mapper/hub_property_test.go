@@ -1490,8 +1490,7 @@ func allocatorAddresses(w policymodel.World) bool {
 // that exception goes. The rest of the limit is the filter audit's.
 func audited(w policymodel.World, st policymodel.Step) bool {
 	for _, e := range st.Edits {
-		switch e.(type) {
-		case policymodel.SetAddr, policymodel.SwapAddrs:
+		if _, ok := e.(policymodel.SetAddr); ok {
 			return false
 		}
 	}

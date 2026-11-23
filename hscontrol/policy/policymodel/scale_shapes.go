@@ -235,8 +235,6 @@ func writtenNodes(e Edit) []types.NodeID {
 		return []types.NodeID{e.ID}
 	case SetAddr:
 		return []types.NodeID{e.ID}
-	case SwapAddrs:
-		return []types.NodeID{e.A, e.B}
 	case Announce:
 		return []types.NodeID{e.ID}
 	case Withdraw:

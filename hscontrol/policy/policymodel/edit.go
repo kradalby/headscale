@@ -521,29 +521,6 @@ func (e SetAddr) String() string {
 	return fmt.Sprintf("n%d v%d=%s", e.ID, e.Family, a)
 }
 
-// SwapAddrs exchanges two nodes' addresses in one family.
-type SwapAddrs struct {
-	A, B   types.NodeID
-	Family int
-}
-
-func (e SwapAddrs) apply(w *World) {
-	a, b := nodeIn(w, e.A), nodeIn(w, e.B)
-	if a == nil || b == nil {
-		return
-	}
-
-	x, y := a.Addr(e.Family), b.Addr(e.Family)
-	setAddr(a, e.Family, y)
-	setAddr(b, e.Family, x)
-}
-
-func (e SwapAddrs) undo(World) (Edit, bool) { return e, true }
-
-func (e SwapAddrs) String() string {
-	return fmt.Sprintf("swap v%d of n%d and n%d", e.Family, e.A, e.B)
-}
-
 // Announce adds routes a node advertises; auto-approval runs.
 type Announce struct {
 	ID     types.NodeID

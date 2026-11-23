@@ -1400,7 +1400,6 @@ const (
 	editApprove
 	editWithdraw
 	editUnapprove
-	editSwap
 	editClient
 	editExpire
 	editOnline
@@ -1423,18 +1422,6 @@ func drawNodeEdit(t *rapid.T, w World) Edit {
 		}
 
 		return Join{n}
-	}
-
-	if kind == editSwap && len(tp.Nodes) >= 2 {
-		a := index(t, len(tp.Nodes), "a")
-		b := other(t, len(tp.Nodes), a, "b")
-		e := SwapAddrs{min(tp.Nodes[a].ID, tp.Nodes[b].ID), max(tp.Nodes[a].ID, tp.Nodes[b].ID), drawFamily(t)}
-
-		// Swapped with a node lacking the family, an address moves over,
-		// which must not leave its holder without one.
-		if after := w.Apply(e); len(after.mustNode(e.A).Addrs()) > 0 && len(after.mustNode(e.B).Addrs()) > 0 {
-			return e
-		}
 	}
 
 	// Newest first: the simplest draw keeps naming the node a join made
@@ -1487,7 +1474,7 @@ func drawNodeEditOn(t *rapid.T, w World, kind int, n Node) Edit {
 		return SetExpired{n.ID, !n.Expired}
 	case editOnline:
 		return SetOnline{n.ID, n.Offline}
-	case editAddr, editSwap:
+	case editAddr:
 		return drawSetAddr(t, n)
 	}
 

@@ -803,7 +803,7 @@ func (p *pbtWorld) requireStored(after string) {
 // storeKinds are the node writes the share leaves out: addresses, which no
 // production path moves once registration handed them out, and endpoints,
 // no part of a node's lifecycle.
-var storeKinds = []string{"SetAddr", "SwapAddrs", "Endpoint"}
+var storeKinds = []string{"SetAddr", "Endpoint"}
 
 // entryCalls are the production calls a deep run must make each of.
 var entryCalls = []string{

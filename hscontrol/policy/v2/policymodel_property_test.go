@@ -217,7 +217,7 @@ func policyOnly(st policymodel.Step) bool {
 
 	for _, e := range st.Edits {
 		switch e.(type) {
-		case policymodel.Join, policymodel.Leave, policymodel.Retag, policymodel.SetAddr, policymodel.SwapAddrs,
+		case policymodel.Join, policymodel.Leave, policymodel.Retag, policymodel.SetAddr,
 			policymodel.Announce, policymodel.Withdraw, policymodel.Approve, policymodel.Unapprove,
 			policymodel.SetClient, policymodel.SetExpired, policymodel.SetOnline,
 			policymodel.AddUser, policymodel.DeleteUser, policymodel.RenameUser, policymodel.SetEmail:
