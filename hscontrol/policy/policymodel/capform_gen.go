@@ -218,6 +218,69 @@ func tourFlip(w World, n Node, ref RuleRef, target Sel, stop int) [][]Edit {
 	return nil
 }
 
+// doubleGrants: one scenario in so many ends with [doubleGrant].
+const doubleGrants = 2
+
+// doubleGrant is steps on an online node of w that holds its own IPv4
+// address and its own IPv6 one: a grant with two app capabilities, one
+// key carrying two values, whose two destinations both name the
+// receiver but differently — one whole, one its IPv4 address alone — so
+// the rule its filter is cut from carries two CapGrant entries that
+// differ; then the second destination moves to the receiver's IPv6
+// alone and back, and the values change past the first, the receiver
+// reading after every step. A chunk name that encodes only the first
+// CapGrant of a rule keeps its name across the destination move while
+// the rule changes. None when w holds a token users made ambiguous, or
+// no online node holds both of its own addresses.
+func doubleGrant(w World, who int) []Step {
+	v := NewView(w)
+	if len(v.AmbiguousRefs()) > 0 {
+		return nil
+	}
+
+	var online []Node
+
+	for _, n := range w.Topology.Nodes {
+		// The receiver's own addresses, which 100.64.0.0/30 and
+		// fd7a:115c:a1e0::/120 hold for the first nodes.
+		if !n.Offline && n.V4 == ownAddr(4, uint64(n.ID)) && n.V6 == ownAddr(6, uint64(n.ID)) {
+			online = append(online, n)
+		}
+	}
+
+	if len(online) == 0 {
+		return nil
+	}
+
+	n := online[who%len(online)]
+
+	// dst names the receiver whole; part names its IPv4 address alone,
+	// and part6 its IPv6 one: the receiver's cut of the rule carries one
+	// whole CapGrant entry and one partial, either family.
+	dst := Sel{Kind: SelMember}
+	if n.Tagged() {
+		dst = Sel{Kind: SelTag, I: n.Tags[0]}
+	}
+
+	part := Sel{Kind: SelPrefix, I: 2}
+
+	src := tourSources(v, n, who/len(online)%4)
+	if len(src) == 0 {
+		src = []Sel{{Kind: SelMember}}
+	}
+
+	apps := []App{{Cap: 0, Value: appSingles}, {Cap: 1, Value: appSingles}}
+	ref := RuleRef{Grant: true, I: len(w.Policy.Grants)}
+	read := []types.NodeID{n.ID}
+
+	return []Step{
+		{Edits: []Edit{AddRule{ref, Rule{Src: src, Dst: []Dest{{Sel: dst}, {Sel: part}}, App: apps}}}, Reads: read},
+		{Edits: []Edit{SetSel{ref, true, 1, Sel{Kind: SelPrefix, I: 5}}}, Reads: read},
+		{Edits: []Edit{SetSel{ref, true, 1, part}}, Reads: read},
+		{Edits: []Edit{SetApp{ref, valuesTail(apps)}}, Reads: read},
+	}
+}
+
 // valuesTail is apps with each capability's values traded for the list
 // as long and alike in the first value, differing past it, where there is
 // one.

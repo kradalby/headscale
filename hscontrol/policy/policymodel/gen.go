@@ -62,6 +62,8 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 		stops := tourStops.Draw(t, "tour-stops")
 		approver := chance(t, approverScripts, "approver-script")
 		way := index(t, numApproverWays, "approver-way")
+		// Drawn after the other scripts' draws, so it moves none of them.
+		twice := chance(t, doubleGrants, "double-grant")
 
 		var scripted []Step
 
@@ -96,6 +98,13 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 
 		if tour {
 			for _, st := range formTour(w, who, stops) {
+				w = w.Apply(st.Edits...)
+				s.Steps = append(s.Steps, st)
+			}
+		}
+
+		if twice {
+			for _, st := range doubleGrant(w, who) {
 				w = w.Apply(st.Edits...)
 				s.Steps = append(s.Steps, st)
 			}

@@ -771,6 +771,23 @@ var Required = append([]Shape{
 	{Name: "selector-list-length-changed", Why: "a rule gains or loses a source or destination", Min: 0.06, Step: func(b, a *View, st Step) bool {
 		return len(edits[AddSel](st)) > 0 || slices.ContainsFunc(edits[RemoveSel](st), func(e RemoveSel) bool { return ruleChanged(b, a, e.Rule) })
 	}},
+	{Name: "app-destination-moved", Why: "one of a grant's two app destinations moves, one CapGrant entry of its rule unchanged", Min: 0.35, Step: func(b, a *View, st Step) bool {
+		return slices.ContainsFunc(edits[SetSel](st), func(e SetSel) bool {
+			if !e.Dst {
+				return false
+			}
+
+			bl, al := b.World.Policy.List(e.Rule.Grant), a.World.Policy.List(e.Rule.Grant)
+
+			if len(bl) != len(al) || e.Rule.I >= len(bl) {
+				return false
+			}
+
+			r := bl[e.Rule.I]
+
+			return len(r.App) > 0 && len(r.Dst) == 2
+		})
+	}},
 	{Name: "ip-list-changed", Why: "a grant's protocols and ports move in place", Min: 0.02, Step: func(b, a *View, st Step) bool {
 		return slices.ContainsFunc(edits[SetIP](st), func(e SetIP) bool { return ruleChanged(b, a, e.Rule) })
 	}},
