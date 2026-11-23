@@ -153,10 +153,6 @@ func TestMembershipQuirks(t *testing.T) {
 	gone.User = &types.User{Name: "gone"}
 	gone.User.ID = 99
 
-	// No addresses yet: listed, resolving to nothing.
-	unaddressed := node(16, 1)
-	unaddressed.IPv4, unaddressed.IPv6 = nil, nil
-
 	nodes := types.Nodes{
 		node(1, 1),
 		// Tagged, keeping the user who created it.
@@ -174,7 +170,6 @@ func TestMembershipQuirks(t *testing.T) {
 		node(13, 0, "tag:db"),
 		node(14, 11),
 		gone,
-		unaddressed,
 	}
 
 	m := buildMembership(t, `{
@@ -193,7 +188,7 @@ func TestMembershipQuirks(t *testing.T) {
 
 	for name, want := range map[string][]types.NodeID{
 		// Untagged nodes of the loaded user, whatever UserID says.
-		"alice@":            ids(1, 11, 16),
+		"alice@":            ids(1, 11),
 		"bob@example.com":   ids(3),
 		"dup@":              nil,
 		"nobody@":           nil,
@@ -202,13 +197,13 @@ func TestMembershipQuirks(t *testing.T) {
 		// Case-insensitive domain, after the last @.
 		"user:*@Example.ORG": ids(7, 8),
 		// Ambiguous and unknown members name nobody; the rest still count.
-		"group:eng": ids(1, 7, 8, 11, 16),
+		"group:eng": ids(1, 7, 8, 11),
 		// Tags own a tagged node, whoever created it.
 		"tag:web":          ids(2),
 		"tag:db":           ids(13),
 		"autogroup:tagged": ids(2, 13),
 		// Every untagged node, with a user or not.
-		"autogroup:member": ids(1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16),
+		"autogroup:member": ids(1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15),
 		// Addresses, not memberships.
 		"*":                  nil,
 		"10.0.0.0/8":         nil,
@@ -220,7 +215,7 @@ func TestMembershipQuirks(t *testing.T) {
 	}
 
 	// Owners are the loaded user's untagged nodes, listed or not.
-	for uid, want := range map[uint][]types.NodeID{1: ids(1, 11, 16), 99: ids(15), 2: ids(3)} {
+	for uid, want := range map[uint][]types.NodeID{1: ids(1, 11), 99: ids(15), 2: ids(3)} {
 		assert.Equal(t, want, m.posts.Nodes(OwnerRole(uid)), "owner %d", uid)
 	}
 

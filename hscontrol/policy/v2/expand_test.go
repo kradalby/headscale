@@ -534,7 +534,7 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 
 				nodes := make(types.Nodes, 0, 10)
 				for i := range 3 + g.r.IntN(6) {
-					nodes = append(nodes, g.node(types.NodeID(i+1))) //nolint:gosec // bounded
+					nodes = append(nodes, g.node(types.NodeID(i+1), nodes)) //nolint:gosec // bounded
 				}
 
 				pm, err := NewPolicyManager(pol, sideUsers, nodes.ViewSlice())

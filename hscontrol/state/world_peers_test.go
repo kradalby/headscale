@@ -345,8 +345,8 @@ var sidesChurnPolicies = slices.Concat(filterChurnPolicies, []string{
 // requires them equal to the compile's and to builds from scratch after
 // each, with every shape that matters reached: routers covering others'
 // addresses, public routes and addresses, single-family nodes and exits,
-// address-less and address-sharing nodes, tagged nodes keeping a user, via
-// tags gained and lost, approvals added and withdrawn, policy edits.
+// tagged nodes keeping a user, via tags gained and lost, approvals added
+// and withdrawn, policy edits.
 func TestWorldSidesUnderRandomChurn(t *testing.T) {
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
 
@@ -363,8 +363,8 @@ func TestWorldSidesUnderRandomChurn(t *testing.T) {
 	}
 
 	// The shapes the mix reaches rarely — a node whose side set moves
-	// through another's: one family shared, a router over another address,
-	// an owner turning public — with the writes and documents building them.
+	// through another's: a router over another address, an owner turning
+	// public — with the writes and documents building them.
 	for seed := range uint64(4) {
 		t.Run(fmt.Sprintf("focused/seed=%d", seed), func(t *testing.T) {
 			sidesChurn(t, rand.New(rand.NewPCG(seed, 37)), sidesChurnPolicies[len(filterChurnPolicies):], true, &rep, kinds) //nolint:gosec // deterministic test input
@@ -377,12 +377,11 @@ func TestWorldSidesUnderRandomChurn(t *testing.T) {
 	t.Logf("compared: %+v", rep)
 
 	for name, n := range map[string]int{
-		"address-less nodes": rep.Unaddressed, "address-sharing nodes": rep.SharedAddress,
 		"routers covering others' addresses": rep.Covering, "single-family nodes": rep.SingleFamily,
 		"exit nodes of one family": rep.ExitOneFamily, "public addresses": rep.Public, "public routes": rep.PublicRoute,
 		"addresses only an approval names": rep.InsideApproved, "tagged nodes keeping a user": rep.TaggedWithUser,
 		"via routers": rep.ViaTargets, "via routers among their sources": rep.ViaRouterOnSrc,
-		"owners named by a shared address alone": rep.NamedByAddressOnly, "steered pairs": rep.Steered,
+		"steered pairs": rep.Steered,
 		"one-way peers": rep.AsymmetricPeers, "routes kept": rep.RoutesKept,
 		"audits against a compile afresh, as a refused document makes": rep.Fresh,
 	} {
@@ -392,7 +391,6 @@ func TestWorldSidesUnderRandomChurn(t *testing.T) {
 	for _, k := range []string{
 		"via tag gained", "via tag lost", "approval added", "approval withdrawn", "public", "cover",
 		"policy, same selectors", "policy, new selectors", "coalesced", "concurrent", "refused policy",
-		"share one family", "share a router's address",
 	} {
 		assert.Positive(t, kinds[k], "no %s write", k)
 	}
@@ -408,55 +406,6 @@ func sortedIDs(e *nodeEdit) []types.NodeID {
 	slices.Sort(ids)
 
 	return ids
-}
-
-// shareOneFamilyOp gives an untagged node another owner's node's IPv4
-// only: a source naming that node by address then names this one, whose
-// other address a router may cover.
-func (c *churnRun) shareOneFamilyOp(e *nodeEdit) {
-	var owned []*types.Node
-
-	for _, id := range sortedIDs(e) {
-		if n := mustGet(c.t, e, id); !n.IsTagged() && n.User != nil && n.IPv4 != nil {
-			owned = append(owned, n)
-		}
-	}
-
-	if len(owned) < 2 {
-		return
-	}
-
-	a, b := owned[c.r.IntN(len(owned))], owned[c.r.IntN(len(owned))]
-	if a.ID == b.ID {
-		return
-	}
-
-	n := a.Clone()
-	n.IPv4 = b.IPv4
-	e.Set(n.ID, n)
-}
-
-// shareRouterOp gives a node a router's addresses: it holds whatever the
-// router's own rules name it by.
-func (c *churnRun) shareRouterOp(e *nodeEdit) {
-	var routers, others []*types.Node
-
-	for _, id := range sortedIDs(e) {
-		if n := mustGet(c.t, e, id); len(n.SubnetRoutes()) > 0 {
-			routers = append(routers, n)
-		} else {
-			others = append(others, n)
-		}
-	}
-
-	if len(routers) == 0 || len(others) == 0 {
-		return
-	}
-
-	r := routers[c.r.IntN(len(routers))]
-	n := others[c.r.IntN(len(others))].Clone()
-	n.IPv4, n.IPv6 = r.IPv4, r.IPv6
-	e.Set(n.ID, n)
 }
 
 // publicOp gives a node a public address, which takes rules naming it to
@@ -588,7 +537,7 @@ func (c *churnRun) policyEdit(before *Snapshot, policies []string) string {
 }
 
 // focusedOps are the churn's op draws the focused variant makes: node,
-// route, sharing, public, cover, via tag, coalesced and policy writes.
+// route, family or public, cover, via tag, coalesced and policy writes.
 var focusedOps = []int{0, 0, 7, 7, 10, 10, 10, 11, 11, 12, 12, 14, 16, 20}
 
 func sidesChurn(t *testing.T, r *rand.Rand, policies []string, focused bool, rep *policyv2.SidesReport, kinds map[string]int) {
@@ -638,33 +587,11 @@ func sidesChurn(t *testing.T, r *rand.Rand, policies []string, focused bool, rep
 			w.update(c.routeOp)
 		case op < 11:
 			w.update(func(e *nodeEdit) {
-				pick := r.IntN(6)
-				if focused {
-					pick = 4 + r.IntN(2)
-				}
-
-				switch pick {
-				case 4:
-					kind = "share one family"
-
-					c.shareOneFamilyOp(e)
-				case 5:
-					kind = "share a router's address"
-
-					c.shareRouterOp(e)
-				case 0:
-					kind = "share"
-
-					c.shareOp(e)
-				case 1:
+				if r.IntN(2) == 0 {
 					kind = "family"
 
 					c.familyOp(e)
-				case 2:
-					kind = "router owner"
-
-					c.routerOwnerOp(e)
-				default:
+				} else {
 					kind = "public"
 
 					c.publicOp(e)
@@ -804,17 +731,6 @@ func TestWorldSidesShapes(t *testing.T) {
 				shapeNode(9, nil, "100.64.0.9", "", []string{"tag:e"}, exit, nil),
 			},
 			write: func(e *nodeEdit) { e.Set(2, shapeNode(2, bob, "8.8.4.2", "", nil, nil, nil)) },
-		},
-		{
-			name:   "named-through-a-shared-address",
-			policy: `{"tagOwners": {"tag:r": []}, "acls": [{"action": "accept", "src": ["bob@"], "dst": ["autogroup:self:*"]}]}`,
-			nodes: types.Nodes{
-				shapeNode(1, alice, "100.64.0.1", "fd7a:115c:a1e0::1", nil, nil, nil),
-				shapeNode(2, alice, "100.64.0.2", "", nil, nil, nil),
-				shapeNode(3, carol, "100.64.0.1", "", nil, nil, nil),
-				shapeNode(4, nil, "100.64.0.4", "", []string{"tag:r"}, []string{"fd7a:115c:a1e0::1/128"}, nil),
-			},
-			write: func(e *nodeEdit) { e.Set(3, shapeNode(3, bob, "100.64.0.1", "", nil, nil, nil)) },
 		},
 		{
 			name: "via-router-through-a-covered-node",

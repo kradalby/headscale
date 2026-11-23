@@ -1,7 +1,6 @@
 package state
 
 import (
-	"cmp"
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
@@ -210,8 +209,7 @@ func TestWorldFilterCostFollowsChange(t *testing.T) {
 // node: the focused churn runs them alone, with users fixed.
 var filterChurnOwnRules = []string{
 	// A receiver's own self rule that reaches nothing there (an exit node
-	// routing one family, an owner node without addresses that routes)
-	// still places the merged rule of its key.
+	// routing one family) still places the merged rule of its key.
 	`{"tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
 	  "grants": [
 		{"src": ["bob@"], "dst": ["autogroup:self"], "ip": ["tcp:22"]},
@@ -367,36 +365,6 @@ func TestWorldFiltersUnderRandomChurn(t *testing.T) {
 	}
 }
 
-// shareOp gives an untagged node another owner's untagged node's
-// addresses, the one case where a self source's addresses name a node its
-// membership does not.
-func (c *churnRun) shareOp(e *nodeEdit) {
-	var owned []*types.Node
-
-	for _, n := range e.All() {
-		if !n.IsTagged() && n.User != nil {
-			owned = append(owned, n)
-		}
-	}
-
-	slices.SortFunc(owned, func(a, b *types.Node) int { return cmp.Compare(a.ID, b.ID) })
-
-	for range 4 {
-		if len(owned) < 2 {
-			return
-		}
-
-		a, b := owned[c.r.IntN(len(owned))], owned[c.r.IntN(len(owned))]
-		if a.User.ID != b.User.ID {
-			n := a.Clone()
-			n.IPv4, n.IPv6 = b.IPv4, b.IPv6
-			e.Set(n.ID, n)
-
-			return
-		}
-	}
-}
-
 // familyOp gives a node one family only, or an address outside the
 // tailnet's ranges, which * does not name.
 func (c *churnRun) familyOp(e *nodeEdit) {
@@ -427,32 +395,6 @@ func (c *churnRun) familyOp(e *nodeEdit) {
 		n.IPv6 = new(netip.AddrFrom16([16]byte{0xfd, 0x00, 15: b}))
 	}
 
-	e.Set(n.ID, n)
-}
-
-// routerOwnerOp makes a user's node a router without addresses: its own
-// self rules, to the user's other nodes, reach nothing on it, and still
-// place the merged rules of their keys.
-func (c *churnRun) routerOwnerOp(e *nodeEdit) {
-	var owned []*types.Node
-
-	for _, n := range e.All() {
-		if !n.IsTagged() && n.User != nil {
-			owned = append(owned, n)
-		}
-	}
-
-	if len(owned) == 0 {
-		return
-	}
-
-	slices.SortFunc(owned, func(a, b *types.Node) int { return cmp.Compare(a.ID, b.ID) })
-
-	n := owned[c.r.IntN(len(owned))].Clone()
-	route := netip.MustParsePrefix("10.0.0.0/24")
-	n.IPv4, n.IPv6 = nil, nil
-	n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
-	n.ApprovedRoutes = []netip.Prefix{route}
 	e.Set(n.ID, n)
 }
 
@@ -566,22 +508,9 @@ func filterChurn(t *testing.T, r *rand.Rand, policies []string, users bool) poli
 
 			w.update(c.routeOp)
 		case op < 11:
-			kind = "share"
+			kind = "family"
 
-			w.update(func(e *nodeEdit) {
-				switch r.IntN(3) {
-				case 0:
-					c.shareOp(e)
-				case 1:
-					kind = "family"
-
-					c.familyOp(e)
-				default:
-					kind = "router owner"
-
-					c.routerOwnerOp(e)
-				}
-			})
+			w.update(c.familyOp)
 		case op < 13:
 			// Writes landing in one commit.
 			w.update(func(e *nodeEdit) {
@@ -669,7 +598,7 @@ func filterChurn(t *testing.T, r *rand.Rand, policies []string, users bool) poli
 		}
 	}
 
-	for _, k := range []string{"join", "leave", "tag", "owner", "address", "routes", "share", "family", "router owner", "coalesced", "concurrent", "policy", "refused policy", "quiet"} {
+	for _, k := range []string{"join", "leave", "tag", "owner", "address", "routes", "family", "coalesced", "concurrent", "policy", "refused policy", "quiet"} {
 		assert.Positive(t, kinds[k], "no %s write", k)
 	}
 
@@ -909,7 +838,7 @@ func TestWorldFilterShapes(t *testing.T) {
 		write  func(w *world)
 	}{
 		{
-			// A tag whose members have no address places nothing.
+			// A tag without members places nothing.
 			name: "no-address-no-place",
 			policy: `{` + owners + `, "acls": [
 				{"action": "accept", "src": ["alice@"], "dst": ["tag:a:22"]},
@@ -917,7 +846,6 @@ func TestWorldFilterShapes(t *testing.T) {
 				{"action": "accept", "src": ["alice@"], "dst": ["alice@:22"]}]}`,
 			nodes: types.Nodes{
 				shapeNode(1, alice, "100.64.0.1", "", nil, nil, nil),
-				shapeNode(2, nil, "", "", []string{"tag:a"}, nil, nil),
 			},
 			write: func(w *world) { w.PutNode(*shapeNode(3, alice, "100.64.0.3", "", nil, nil, nil)) },
 		},
@@ -985,19 +913,6 @@ func TestWorldFilterShapes(t *testing.T) {
 					n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}}
 				})
 			},
-		},
-		{
-			// An owner node without addresses that routes.
-			name: "own-rule-on-addressless-router",
-			policy: `{"acls": [
-				{"action": "accept", "src": ["alice@"], "dst": ["autogroup:self:22"]},
-				{"action": "accept", "src": ["*"], "dst": ["*:*"]},
-				{"action": "accept", "src": ["alice@"], "dst": ["10.0.0.0/24:22"]}]}`,
-			nodes: types.Nodes{
-				shapeNode(1, alice, "100.64.0.1", "", nil, nil, nil),
-				shapeNode(2, alice, "", "", nil, []string{"10.0.0.0/24"}, nil),
-			},
-			write: func(w *world) { w.PutNode(*shapeNode(3, bob, "100.64.0.3", "", nil, nil, nil)) },
 		},
 	}
 

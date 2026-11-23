@@ -1508,7 +1508,7 @@ func TestRouteLeavesNoSessionStale(t *testing.T) {
 		t.Run(fmt.Sprintf("policy=%d", pi), func(t *testing.T) {
 			r := rand.New(rand.NewPCG(uint64(pi), 11)) //nolint:gosec // deterministic test input
 			// Draws of its own for what happens between coalesced commits,
-			// and for the receiver facts and shared addresses it moves, so the
+			// and for the receiver facts and addresses it moves, so the
 			// writes are those of the stream above.
 			between := rand.New(rand.NewPCG(uint64(pi), 12)) //nolint:gosec // deterministic test input
 
@@ -1603,8 +1603,8 @@ func TestRouteLeavesNoSessionStale(t *testing.T) {
 					nv := nodes.At(r.IntN(nodes.Len()))
 					o.writeOp(op, step, nodes, nv, nv.ID())
 
-					// Now and then a receiver fact or a shared address moves
-					// with the write.
+					// Now and then a receiver fact or an address moves with
+					// the write.
 					if between.IntN(3) == 0 {
 						moveReceiver(t, between, o)
 					}
@@ -1658,7 +1658,9 @@ func TestRouteLeavesNoSessionStale(t *testing.T) {
 
 	if fallbacks["mode"] > 0 {
 		for _, label := range policyv2.FallbackReasons() {
-			if label != "address-mode" {
+			// shared-address needs two nodes holding one address, which
+			// NewState refuses.
+			if label != "address-mode" && label != "shared-address" {
 				require.NotZerof(t, fallbacks[label], "capability mode reached the %s fallback", label)
 			}
 		}
@@ -1671,9 +1673,9 @@ func TestRouteLeavesNoSessionStale(t *testing.T) {
 		reach.between, reach.betweenStale, reach.transient)
 }
 
-// moveReceiver moves a random node's receiver facts or addresses: its
+// moveReceiver moves a random node's receiver facts or address: its
 // client turns unknown or known again, it becomes an app connector or
-// stops, or it takes another node's address or one of its own again.
+// stops, or it takes an address no node held.
 func moveReceiver(t *testing.T, r *rand.Rand, o *oracleRun) {
 	t.Helper()
 
@@ -1695,12 +1697,8 @@ func moveReceiver(t *testing.T, r *rand.Rand, o *oracleRun) {
 	case 1:
 		n.Hostinfo.AppConnector.Set(!n.Hostinfo.AppConnector.EqualBool(true))
 	default:
-		if other := nodes.At(r.IntN(nodes.Len())); other.ID() != n.ID && other.IPv4().Valid() && r.IntN(2) == 0 {
-			n.IPv4 = new(other.IPv4().Get())
-		} else {
-			o.addrs++
-			n.IPv4 = new(netip.MustParseAddr(fmt.Sprintf("100.64.%d.%d", 4+o.addrs/250, o.addrs%250)))
-		}
+		o.addrs++
+		n.IPv4 = new(netip.MustParseAddr(fmt.Sprintf("100.64.%d.%d", 4+o.addrs/250, o.addrs%250)))
 	}
 
 	o.s.PutNodeInStoreForTest(*n)

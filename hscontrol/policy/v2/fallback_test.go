@@ -424,7 +424,7 @@ func (r capReach) require(t *testing.T) {
 	want := []string{
 		"receivers: capability", "receivers: client", "receivers: local-nets",
 		"rules with capabilities", "owner capabilities",
-		"rules: cap-grant", "rules: literal", "rules: shared-address",
+		"rules: cap-grant", "rules: literal",
 		"cross-family ICMP refused", "rules: portless", "app connectors", "exit nodes", "subnet routers",
 		"chunk probes", "chunks assembled in another order",
 	}

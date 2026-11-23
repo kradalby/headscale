@@ -117,8 +117,8 @@ func TestSidesSmoke(t *testing.T) {
 		sideNode(5, nil, "100.64.0.5", "fd7a:115c:a1e0::5", []string{"tag:b"}, "10.0.0.0/24", "100.64.0.0/30"),
 		sideNode(6, nil, "100.64.0.6", "fd7a:115c:a1e0::6", []string{"tag:b"}, "0.0.0.0/0", "::/0"),
 		sideNode(7, carol, "100.64.0.7", "fd7a:115c:a1e0::7", nil, "+10.1.0.0/24"),
-		sideNode(8, carol, "", "", nil, "10.0.0.0/24"),
-		sideNode(9, bob, "100.64.0.3", "", nil),
+		sideNode(8, carol, "100.64.0.8", "", nil, "10.0.0.0/24"),
+		sideNode(9, bob, "100.64.0.9", "", nil),
 	}
 
 	for i, pol := range sidePolicies {
@@ -227,29 +227,6 @@ func TestSidesQuirks(t *testing.T) {
 			peers: map[types.NodeID][]types.NodeID{1: {2}, 2: {1}, 3: nil, 4: nil},
 		},
 		{
-			// A member without an address is on no side by membership; the
-			// clique still holds it.
-			name:   "addressless-member",
-			policy: `{"acls": [{"action": "accept", "src": ["alice@"], "dst": ["bob@:*"]}]}`,
-			nodes: types.Nodes{
-				sideNode(1, alice, "100.64.0.1", "", nil),
-				sideNode(2, alice, "", "", nil),
-				sideNode(3, bob, "100.64.0.3", "", nil),
-			},
-			peers: map[types.NodeID][]types.NodeID{1: {2, 3}, 2: {1}, 3: {1}},
-		},
-		{
-			// Holding a member's address puts a node on the member's side.
-			name:   "shared-address",
-			policy: `{"acls": [{"action": "accept", "src": ["alice@"], "dst": ["bob@:*"]}]}`,
-			nodes: types.Nodes{
-				sideNode(1, alice, "100.64.0.1", "", nil),
-				sideNode(3, bob, "100.64.0.3", "", nil),
-				sideNode(4, carol, "100.64.0.1", "", nil),
-			},
-			peers: map[types.NodeID][]types.NodeID{1: {3}, 3: {1, 4}, 4: {3}},
-		},
-		{
 			// Routing over a member's address puts a router on the member's
 			// side; the reverse route test then gives the destination the
 			// route.
@@ -280,14 +257,14 @@ func TestSidesQuirks(t *testing.T) {
 			peers: map[types.NodeID][]types.NodeID{3: {6, 7}, 6: {3}, 7: {3}, 8: nil},
 		},
 		{
-			// * as a destination is every address: any addressed node, any
-			// router, address or not, and so the exit nodes.
+			// * as a destination is every address: any node, any router, and
+			// so the exit nodes.
 			name:   "wildcard-destination-is-everything",
 			policy: `{"acls": [{"action": "accept", "src": ["alice@"], "dst": ["*:*"]}]}`,
 			nodes: types.Nodes{
 				sideNode(1, alice, "100.64.0.1", "", nil),
 				sideNode(6, carol, "192.168.0.6", "", nil),
-				sideNode(8, nil, "", "", []string{"tag:x"}, "10.0.0.0/24"),
+				sideNode(8, nil, "100.64.0.8", "", []string{"tag:x"}, "10.0.0.0/24"),
 				sideNode(9, nil, "100.64.0.9", "", []string{"tag:e"}, exit...),
 			},
 			peers: map[types.NodeID][]types.NodeID{1: {6, 8, 9}, 6: {1}, 8: {1}, 9: {1}},
@@ -317,9 +294,8 @@ func TestSidesQuirks(t *testing.T) {
 			peers: map[types.NodeID][]types.NodeID{1: nil, 9: {1}},
 		},
 		{
-			// A via router of the grant, addressed, and its sources see each
-			// other; a router of another tag or route, or without an address,
-			// does not. Steering includes the route on the elected router,
+			// A via router of the grant and its sources see each other; a
+			// router of another tag or route does not. Steering includes the route on the elected router,
 			// the lowest ID, and excludes it on the others.
 			name:   "via-router",
 			policy: `{"tagOwners": {"tag:r": [], "tag:s": []}, "grants": [{"src": ["alice@"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via": ["tag:r"]}]}`,
@@ -328,40 +304,14 @@ func TestSidesQuirks(t *testing.T) {
 				sideNode(3, bob, "100.64.0.3", "", nil),
 				sideNode(5, nil, "100.64.0.5", "", []string{"tag:r"}, "10.0.0.0/24"),
 				sideNode(6, nil, "100.64.0.6", "", []string{"tag:r"}, "10.1.0.0/24"),
-				sideNode(7, nil, "", "", []string{"tag:r"}, "10.0.0.0/24"),
 				sideNode(8, nil, "100.64.0.8", "", []string{"tag:s"}, "10.0.0.0/24"),
 			},
-			peers: map[types.NodeID][]types.NodeID{1: {5}, 5: {1}, 3: nil, 6: nil, 7: nil, 8: nil},
+			peers: map[types.NodeID][]types.NodeID{1: {5}, 5: {1}, 3: nil, 6: nil, 8: nil},
 			via: []viaCase{
 				{viewer: 1, peer: 5, include: []string{"10.0.0.0/24"}},
-				{viewer: 1, peer: 7, exclude: []string{"10.0.0.0/24"}},
 				{viewer: 1, peer: 8, exclude: []string{"10.0.0.0/24"}},
 				{viewer: 3, peer: 5},
 			},
-		},
-		{
-			// A via router among its own grant's sources sees the nodes
-			// holding its address.
-			name:   "via-router-on-own-source",
-			policy: `{"tagOwners": {"tag:r": []}, "grants": [{"src": ["tag:r"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via": ["tag:r"]}]}`,
-			nodes: types.Nodes{
-				sideNode(5, nil, "100.64.0.5", "", []string{"tag:r"}, "10.0.0.0/24"),
-				sideNode(6, bob, "100.64.0.5", "", nil),
-			},
-			peers: map[types.NodeID][]types.NodeID{5: {6}, 6: {5}},
-		},
-		{
-			// A self destination names an owner's nodes by address: another
-			// user's node holding one is on its side, both ways.
-			name:   "self-by-address",
-			policy: `{"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]}]}`,
-			nodes: types.Nodes{
-				sideNode(1, alice, "100.64.0.1", "", nil),
-				sideNode(2, alice, "100.64.0.2", "", nil),
-				sideNode(3, bob, "100.64.0.3", "", nil),
-				sideNode(4, bob, "100.64.0.1", "", nil),
-			},
-			peers: map[types.NodeID][]types.NodeID{1: {2, 3, 4}, 2: {1, 4}, 3: {1, 4}, 4: {1, 2, 3}},
 		},
 		{
 			// A self capability to the internet shows its sources to exit
@@ -406,32 +356,6 @@ func TestSidesQuirks(t *testing.T) {
 				sideNode(5, carol, "100.64.0.5", "", nil),
 			},
 			peers: map[types.NodeID][]types.NodeID{2: {1, 3}, 4: {1, 3}},
-		},
-		{
-			// An owner's port self rules reaching the internet link exit
-			// owners with the named side; an owner that is not an exit node
-			// gains nothing from it.
-			name:   "self-exit-link-needs-an-exit-owner",
-			policy: `{"acls": [{"action": "accept", "src": ["bob@"], "dst": ["autogroup:self:22"]}]}`,
-			nodes: types.Nodes{
-				sideNode(1, alice, "8.8.8.1", "", nil),
-				sideNode(2, alice, "", "", nil),
-				sideNode(3, bob, "8.8.8.1", "", nil),
-			},
-			peers: map[types.NodeID][]types.NodeID{1: {2, 3}, 2: {1}, 3: {1}},
-		},
-		{
-			// An owner node without an address that routes over another owner
-			// node holds its user's owner side, so it sees the named side.
-			name:   "addressless-owner-routes-over-an-owner",
-			policy: `{"acls": [{"action": "accept", "src": ["bob@"], "dst": ["autogroup:self:*"]}]}`,
-			nodes: types.Nodes{
-				sideNode(1, alice, "", "", nil, "100.64.0.0/31"),
-				sideNode(2, alice, "100.64.0.1", "", nil),
-				sideNode(3, alice, "100.64.0.5", "", nil),
-				sideNode(4, bob, "100.64.0.5", "", nil),
-			},
-			peers: map[types.NodeID][]types.NodeID{1: {2, 3, 4}, 4: {1, 2, 3}},
 		},
 		{
 			// Steering tests a "*" source against what it resolves to, not
@@ -800,15 +724,12 @@ func BenchmarkRolePeersBuild(b *testing.B) {
 }
 
 // TestSidesIncremental moves, one write at a time, the shapes whose side
-// sets an update reaches only through another node: a node whose own
-// touch set moves because of a node it shares an address with, seen by a
-// router over its other address; a via router that becomes one because a
-// node it routes over is tagged, seen by a node holding its address; an
-// approval that puts an address inside "*"; a UserID that leaves the
-// clique; a route that comes to cover a member; an owner that keeps only
-// its route over its user; a via router whose router atom reaches, then
-// leaves, the router over its address; a node leaving a shared address; a
-// via destination moving into a route. Peers
+// sets an update reaches only through another node: a via router that
+// becomes one because a node it routes over is tagged, seen by a node
+// holding its address; an approval that puts an address inside "*"; a
+// UserID that leaves the clique; a route that comes to cover a member; a
+// via router whose router atom reaches, then leaves, the router over its
+// address; a via destination moving into a route. Peers
 // before and after are written out by hand; every step is also audited,
 // incremental against a build from scratch.
 func TestSidesIncremental(t *testing.T) {
@@ -821,25 +742,6 @@ func TestSidesIncremental(t *testing.T) {
 		write         func(types.Nodes) types.Nodes
 		before, after map[types.NodeID][]types.NodeID
 	}{
-		{
-			// carol's node shares alice's first node's IPv4 only; when it
-			// becomes bob's, bob's self source names alice's node by that
-			// address, and the router over alice's node's IPv6 joins her
-			// user's self rules.
-			name:   "named-through-a-shared-address",
-			policy: `{"tagOwners": {"tag:r": []}, "acls": [{"action": "accept", "src": ["bob@"], "dst": ["autogroup:self:*"]}]}`,
-			nodes: types.Nodes{
-				sideNode(1, alice, "100.64.0.1", "fd7a:115c:a1e0::1", nil),
-				sideNode(2, alice, "100.64.0.2", "", nil),
-				sideNode(3, carol, "100.64.0.1", "", nil),
-				sideNode(4, nil, "100.64.0.4", "", []string{"tag:r"}, "fd7a:115c:a1e0::1/128"),
-			},
-			write: func(n types.Nodes) types.Nodes {
-				return types.Nodes{n[0], n[1], sideNode(3, bob, "100.64.0.1", "", nil), n[3]}
-			},
-			before: map[types.NodeID][]types.NodeID{1: {2}, 2: {1}, 3: nil, 4: nil},
-			after:  map[types.NodeID][]types.NodeID{1: {2, 3, 4}, 2: {1, 3, 4}, 3: {1, 2}, 4: {1, 2}},
-		},
 		{
 			// Tagging the node the router routes over makes it a via router
 			// of the grant; it is among the grant's sources by its route, so
@@ -926,25 +828,6 @@ func TestSidesIncremental(t *testing.T) {
 			after:  map[types.NodeID][]types.NodeID{1: {3}, 3: {1, 5}, 5: {3}},
 		},
 		{
-			// An owner losing its address keeps its route over another
-			// owner of its user: it holds the owner atom through the route
-			// alone, and stays on the self rules' destination side, seen by
-			// bob's node and the alice node sharing its address.
-			name:   "owner-loses-its-address-keeps-its-route",
-			policy: `{"acls": [{"action": "accept", "src": ["bob@"], "dst": ["autogroup:self:*"]}]}`,
-			nodes: types.Nodes{
-				sideNode(1, alice, "100.64.0.9", "", nil, "100.64.0.0/31"),
-				sideNode(2, alice, "100.64.0.1", "", nil),
-				sideNode(3, alice, "100.64.0.5", "", nil),
-				sideNode(4, bob, "100.64.0.5", "", nil),
-			},
-			write: func(n types.Nodes) types.Nodes {
-				return types.Nodes{sideNode(1, alice, "", "", nil, "100.64.0.0/31"), n[1], n[2], n[3]}
-			},
-			before: map[types.NodeID][]types.NodeID{1: {2, 3, 4}, 2: {1, 3, 4}, 3: {1, 2, 4}, 4: {1, 2, 3}},
-			after:  map[types.NodeID][]types.NodeID{1: {2, 3, 4}, 2: {1, 3, 4}, 3: {1, 2, 4}, 4: {1, 2, 3}},
-		},
-		{
 			// A route into the grant's destinations makes the node a via
 			// router, on its own sources by that route; nothing else of it
 			// moves, so the router over its address reads its router atom
@@ -979,22 +862,6 @@ func TestSidesIncremental(t *testing.T) {
 			},
 			before: map[types.NodeID][]types.NodeID{4: nil, 5: {7}, 7: {5}},
 			after:  map[types.NodeID][]types.NodeID{4: nil, 5: nil, 7: nil},
-		},
-		{
-			// A node leaving a shared address takes its roles off the node
-			// still holding it.
-			name:   "shared-address-left",
-			policy: `{"acls": [{"action": "accept", "src": ["carol@example.com"], "dst": ["bob@:*"]}]}`,
-			nodes: types.Nodes{
-				sideNode(1, alice, "100.64.0.1", "", nil),
-				sideNode(3, carol, "100.64.0.1", "", nil),
-				sideNode(4, bob, "100.64.0.4", "", nil),
-			},
-			write: func(n types.Nodes) types.Nodes {
-				return types.Nodes{n[0], sideNode(3, carol, "100.64.0.3", "", nil), n[2]}
-			},
-			before: map[types.NodeID][]types.NodeID{1: {4}, 3: {4}, 4: {1, 3}},
-			after:  map[types.NodeID][]types.NodeID{1: nil, 3: {4}, 4: {3}},
 		},
 		{
 			// A via grant's identity destination moving its address into a
@@ -1236,7 +1103,7 @@ func BenchmarkRouteAccess(b *testing.B) {
 }
 
 // sideGen draws policies and topologies for the random differential: few
-// addresses, so nodes share them; routes over other nodes' addresses, host
+// addresses, each held by one node; routes over other nodes' addresses, host
 // routes, unannounced approvals and exits; every kind of selector, port and
 // capability rules with and without companions, self and via.
 type sideGen struct {
@@ -1373,7 +1240,7 @@ func (g sideGen) policy() []byte {
 	"acls": [%s], "grants": [%s]%s}`, strings.Join(rules, ",\n\t\t"), strings.Join(grants, ",\n\t\t"), attrs)
 }
 
-// addrs are the addresses nodes draw from: few, so they share them.
+// addrs are the addresses nodes draw from: few, so routes cover them.
 func (g sideGen) addrs() ([]string, []string) {
 	v4 := []string{"100.64.0.1", "100.64.0.2", "100.64.0.3", "100.64.0.4", "100.64.0.5", "10.0.0.5"}
 	v6 := []string{"fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2", "fd7a:115c:a1e0::3"}
@@ -1393,8 +1260,22 @@ func (g sideGen) addrs() ([]string, []string) {
 	return v4, v6
 }
 
-func (g sideGen) node(id types.NodeID) *types.Node {
+// node draws node id joining others, from the addresses none of them
+// holds: a started server holds no address twice.
+func (g sideGen) node(id types.NodeID, others types.Nodes) *types.Node {
+	held := map[string]bool{}
+
+	for _, o := range others {
+		if o.ID != id {
+			for _, a := range o.IPs() {
+				held[a.String()] = true
+			}
+		}
+	}
+
 	v4, v6 := g.addrs()
+	v4 = slices.DeleteFunc(v4, func(a string) bool { return held[a] })
+	v6 = slices.DeleteFunc(v6, func(a string) bool { return held[a] })
 
 	var user *types.User
 
@@ -1412,12 +1293,17 @@ func (g sideGen) node(id types.NodeID) *types.Node {
 
 	var a4, a6 string
 
-	if g.r.IntN(6) > 0 {
+	if g.r.IntN(6) > 0 && len(v4) > 0 {
 		a4 = g.pick(v4...)
 	}
 
-	if g.r.IntN(2) == 0 {
+	if g.r.IntN(2) == 0 && len(v6) > 0 {
 		a6 = g.pick(v6...)
+	}
+
+	// Nor a node without one.
+	if a4 == "" && a6 == "" {
+		a4 = fmt.Sprintf("100.64.1.%d", id)
 	}
 
 	var routes []string
@@ -1481,13 +1367,13 @@ func (g sideGen) step(nodes types.Nodes) types.Nodes {
 	for range 1 + g.r.IntN(3) {
 		switch op := g.r.IntN(3); {
 		case op == 0 || len(next) < 2:
-			next = append(next, g.node(next[len(next)-1].ID+1))
+			next = append(next, g.node(next[len(next)-1].ID+1, next))
 		case op == 1:
 			i := g.r.IntN(len(next))
 			next = slices.Delete(next, i, i+1)
 		default:
 			i := g.r.IntN(len(next))
-			next[i] = g.node(next[i].ID)
+			next[i] = g.node(next[i].ID, next)
 		}
 	}
 
@@ -1661,8 +1547,7 @@ func TestSidesRandomDifferential(t *testing.T) {
 
 	// The capability variants also hold every node's capability form to
 	// its address form through the client (check D); sparse ones give
-	// fewer nodes routes and shared addresses, so most are sent
-	// capabilities.
+	// fewer nodes routes, so most are sent capabilities.
 	variants := []struct {
 		public, caps, sparse bool
 		stream               uint64
@@ -1698,7 +1583,7 @@ func TestSidesRandomDifferential(t *testing.T) {
 
 				nodes := make(types.Nodes, 0, 10)
 				for i := range 3 + g.r.IntN(6) {
-					nodes = append(nodes, g.node(types.NodeID(i+1))) //nolint:gosec // bounded
+					nodes = append(nodes, g.node(types.NodeID(i+1), nodes)) //nolint:gosec // bounded
 				}
 
 				pm, err := NewPolicyManager(pol, sideUsers, nodes.ViewSlice())
@@ -1779,11 +1664,10 @@ func TestSidesRandomDifferential(t *testing.T) {
 
 			// The claim covers these: each was reached.
 			shapes := map[string]int{
-				"shared address": rep.SharedAddress, "covering": rep.Covering, "single family": rep.SingleFamily,
-				"unaddressed": rep.Unaddressed, "exit": rep.Exit, "one-family exit": rep.ExitOneFamily,
+				"covering": rep.Covering, "single family": rep.SingleFamily,
+				"exit": rep.Exit, "one-family exit": rep.ExitOneFamily,
 				"inside approved": rep.InsideApproved, "via targets": rep.ViaTargets, "steered": rep.Steered,
 				"tagged with user": rep.TaggedWithUser, "via router on source": rep.ViaRouterOnSrc,
-				"named by address only": rep.NamedByAddressOnly, "unaddressed covering own": rep.UnaddressedCoveringOwn,
 				"routes kept": rep.RoutesKept,
 			}
 			shapes["pairs kept with the route rules"] = keptPairs

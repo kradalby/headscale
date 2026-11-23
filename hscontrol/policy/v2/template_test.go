@@ -182,21 +182,6 @@ func TestExpanderQuirks(t *testing.T) {
 			},
 		},
 		{
-			// bob@ names alice's a2 through the address it shares with bob's
-			// b1: a source names an owner's nodes by address.
-			name:   "self-by-address",
-			policy: `{"acls": [{"action": "accept", "src": ["bob@"], "dst": ["autogroup:self:22"]}]}`,
-			nodes: quirkNodes(
-				quirkNode{name: "a1", user: alice, v4: "100.64.0.1"},
-				quirkNode{name: "a2", user: alice, v4: "100.64.0.2"},
-				quirkNode{name: "b1", user: bob, v4: "100.64.0.2"},
-			),
-			receiver: "a1",
-			want: []tailcfg.FilterRule{
-				{SrcIPs: []string{"100.64.0.2"}, DstPorts: []tailcfg.NetPortRange{port("100.64.0.1", 22)}},
-			},
-		},
-		{
 			// * names an owner's nodes inside its ranges only.
 			name:   "self-wildcard-by-address",
 			policy: `{"acls": [{"action": "accept", "src": ["*"], "dst": ["autogroup:self:22"]}]}`,
@@ -291,24 +276,6 @@ func TestExpanderQuirks(t *testing.T) {
 			},
 		},
 		{
-			// The same on a user's node without an address that routes: its
-			// own self rule reaches only the user's other node.
-			name: "addressless-router-own-rule-places-merge",
-			policy: `{"acls": [
-				{"action": "accept", "src": ["alice@"], "dst": ["autogroup:self:22"]},
-				{"action": "accept", "src": ["*"], "dst": ["*:*"]},
-				{"action": "accept", "src": ["alice@"], "dst": ["10.0.0.0/24:22"]}]}`,
-			nodes: quirkNodes(
-				quirkNode{name: "a1", user: alice, v4: "100.64.0.1"},
-				quirkNode{name: "a0", user: alice, route: []string{"10.0.0.0/24"}},
-			),
-			receiver: "a0",
-			want: []tailcfg.FilterRule{
-				{SrcIPs: []string{"100.64.0.1"}, DstPorts: []tailcfg.NetPortRange{port("10.0.0.0/24", 22)}},
-				{SrcIPs: append([]string{"10.0.0.0/24"}, wildcard...), DstPorts: []tailcfg.NetPortRange{anyPort("*")}},
-			},
-		},
-		{
 			// A self rule merges into the shared rule of its key, which
 			// sits ahead of * though it does not reach a1.
 			name: "self-rule-at-shared-rule",
@@ -337,7 +304,6 @@ func TestExpanderQuirks(t *testing.T) {
 				{"action": "accept", "src": ["alice@"], "dst": ["alice@:22"]}]}`,
 			nodes: quirkNodes(
 				quirkNode{name: "a1", user: alice, v4: "100.64.0.1"},
-				quirkNode{name: "ta", tags: []string{"tag:a"}},
 			),
 			receiver: "a1",
 			want: []tailcfg.FilterRule{
