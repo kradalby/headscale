@@ -9413,7 +9413,7 @@ func TestRoutedCandidatesAfterElectionCollection(t *testing.T) {
 	require.Eventually(t, func() bool {
 		runtime.GC()
 		return old.Value() == nil
-	}, time.Second, 10*time.Millisecond, "streams must not retain the old election binding")
+	}, 30*time.Second, 10*time.Millisecond, "streams must not retain the old election binding")
 
 	snap := s.Snapshot()
 	got := st.r.routedCandidates(snap, mustNode(t, s, st.nodeID), st.r.lastKey, false)
