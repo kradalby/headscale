@@ -14,13 +14,9 @@ func scopeGen() *rapid.Generator[Scope] {
 	known := Known()
 
 	return rapid.Custom(func(t *rapid.T) Scope {
-		// TODO(kradalby): policy/scope-junk-rate: weaker than it reads.
-		// rapid.Float64 draws from the whole float64 range, negatives
-		// included, and shrinks toward 0, so this branch fires
-		// far more often than one in five, most scopes are junk, and
-		// failures shrink toward junk. Draw the choice from
-		// rapid.IntRange(0, 4) instead (policymodel's chance).
-		if rapid.Float64().Draw(t, "junkP") < 0.2 {
+		// One time in five (policymodel's chance): junk stays rare
+		// enough that failures shrink into the real vocabulary.
+		if rapid.IntRange(0, 4).Draw(t, "junkP") == 0 {
 			return Scope(rapid.StringMatching(`[a-z_]{1,12}(:read)?`).Draw(t, "junk"))
 		}
 
