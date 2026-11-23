@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -136,8 +135,6 @@ type fdRun struct {
 	// outside counts the cases it dropped.
 	slice   policymodel.Slice
 	outside int
-	// a37 lists the logins auth/followup-lookup-race started over.
-	a37 []string
 }
 
 // frontDoor is one case: a server, its clients, and the model of what
@@ -214,10 +211,6 @@ func TestFrontDoorClientsFollowTheModel(t *testing.T) {
 
 	t.Log(run.tally)
 	t.Log(&run.held)
-
-	for _, l := range run.a37 {
-		t.Logf("auth/followup-lookup-race: %s", l)
-	}
 
 	if !run.slice.Whole() {
 		t.Logf("slice: %v; %d cases outside it", run.slice, run.outside)
@@ -809,7 +802,7 @@ func (fd *frontDoor) approver(u policymodel.User) func(authID string) error {
 
 // approverAt is approver at a drawn moment: mostly once the client's
 // follow-up waits, as a person approves; one login in four at once,
-// racing the follow-up on its way (auth/followup-lookup-race).
+// racing the follow-up on its way.
 func (fd *frontDoor) approverAt(u policymodel.User) func(authID string) error {
 	if rapid.IntRange(0, 3).Draw(fd.t, "approve-at") < 3 {
 		return fd.approver(u)
@@ -841,15 +834,6 @@ func (fd *frontDoor) approveNow(u policymodel.User) func(authID string) error {
 // awaitFollowup waits until the client's follow-up request for authID is
 // waiting for its verdict, as it is by the time a person approves the URL
 // the client shows.
-//
-// TODO(kradalby): auth/followup-lookup-race: a follow-up that arrives as
-// the approval runs can look its node key up before the approval makes
-// the node, and the pending login up after the approval removed it; it is
-// then told to start a new login, and its client never learns it is
-// logged in. A follow-up re-sent after a network drop, or an approval
-// scripted to fire as the URL appears, meets it. The property approves
-// around it, counted; TestAFollowupAcrossAnApprovalIsToldToStartOver
-// (package hscontrol) holds it to production.
 func (fd *frontDoor) awaitFollowup(authID string) {
 	deadline := time.Now().Add(20 * time.Second)
 
@@ -861,7 +845,7 @@ func (fd *frontDoor) awaitFollowup(authID string) {
 
 		switch {
 		case waiting:
-			fd.run.tally.edits["login approved once its follow-up waits (auth/followup-lookup-race)"]++
+			fd.run.tally.edits["login approved once its follow-up waits"]++
 
 			return
 		case !inFlight:
@@ -890,31 +874,6 @@ func (fd *frontDoor) followupState() (bool, bool) {
 	}
 
 	return waiting, inFlight
-}
-
-// startedOver carries a login past auth/followup-lookup-race: when the
-// server answered the client's follow-up with a new login although the
-// approval had registered the node, the property approves the new one, as
-// the person shown its URL would, and counts it. It returns err otherwise,
-// nil once the client is logged in.
-func (fd *frontDoor) startedOver(at string, id types.NodeID, tc *TestClient, err error, u policymodel.User) error {
-	var so *loginStartedOverError
-	if !errors.As(err, &so) {
-		return err
-	}
-
-	fd.run.tally.edits["login started over though approved (auth/followup-lookup-race)"]++
-	fd.run.a37 = append(fd.run.a37, fmt.Sprintf("%s: n%d: %v; its exchanges %s", at, id, err, policymodel.JSON(tc.RegisterAttempts())))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	err = tc.waitLogin(ctx, so.url, fd.approver(u))
-	if err == nil {
-		err = tc.direct.SendUpdate(ctx)
-	}
-
-	return err
 }
 
 // joinKind draws how n joins: with a pre-auth key, an ephemeral one, a
@@ -1025,10 +984,6 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 	}
 
 	tc, err := TryNewClient(fd.tb, fd.srv, fmt.Sprintf("n%d", n.ID), opts...)
-	if kind == joinLogin || kind == joinLoginTagged {
-		err = fd.startedOver(at, n.ID, tc, err, as)
-	}
-
 	if err != nil {
 		fd.t.Fatalf("%s: n%d does not register (%s): %v; its exchanges %s", at, n.ID, joinNames[kind], err, policymodel.JSON(tc.RegisterAttempts()))
 	}
@@ -1339,13 +1294,7 @@ func (fd *frontDoor) login(at string, id types.NodeID, u policymodel.User, n pol
 
 	err := nd.tc.Login(ctx, nd.tc.Persist(), "", controlclient.LoginInteractive, fd.hostinfo(n, true), fd.approverAt(u))
 	if err != nil {
-		err = fd.startedOver(at, id, nd.tc, err, u)
-		if err != nil {
-			fd.t.Fatalf("%s: n%d logs in as u%d: %v", at, id, u.ID, err)
-		}
-
-		nd.tc.resetNetmapState()
-		nd.tc.startPollLoop()
+		fd.t.Fatalf("%s: n%d logs in as u%d: %v", at, id, u.ID, err)
 	}
 
 	fd.answered(at, id, nd.tc)
@@ -2009,13 +1958,7 @@ func (fd *frontDoor) reauthTags(at string) bool {
 	}
 
 	if err != nil {
-		err = fd.startedOver(at, n.ID, nd.tc, err, a.u)
-		if err != nil {
-			fd.t.Fatalf("%s: n%d logs in as u%d requesting %v: %v", at, n.ID, a.u.ID, tagNames(a.tags), err)
-		}
-
-		nd.tc.resetNetmapState()
-		nd.tc.startPollLoop()
+		fd.t.Fatalf("%s: n%d logs in as u%d requesting %v: %v", at, n.ID, a.u.ID, tagNames(a.tags), err)
 	}
 
 	fd.answered(at, n.ID, nd.tc)

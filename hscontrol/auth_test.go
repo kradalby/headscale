@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
-	"runtime"
 	"runtime/pprof"
 	"slices"
 	"strconv"
@@ -22,7 +21,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
@@ -5576,86 +5574,4 @@ func TestFollowupURLLength(t *testing.T) {
 			assert.NotEmpty(t, resp.AuthURL)
 		})
 	}
-}
-
-// TestAFollowupAcrossAnApprovalIsToldToStartOver pins
-// auth/followup-lookup-race: a follow-up looks its node key up
-// ([Headscale.handleRegister]) before it looks its pending login up
-// ([Headscale.waitForFollowup]). An approval that stores the node after the
-// first lookup and removes the login before the second leaves the follow-up
-// finding neither, and it is answered with a fresh auth URL though the login
-// succeeded. One follow-up at a time is sent while each approval runs, so the
-// verdict has no second reader; the window is a few microseconds, so the test
-// approves until a follow-up lands in it, and skips when none does: a loaded
-// machine can miss it. Once production closes the window, turn this into a
-// test that no follow-up is told to start over, and drop the exception from
-// the front-door property.
-func TestAFollowupAcrossAnApprovalIsToldToStartOver(t *testing.T) {
-	if runtime.GOMAXPROCS(0) < 2 || util.RaceEnabled {
-		// On one P the follow-up lands in the window only when preempted
-		// there; under the race detector an approval takes ten times longer
-		// and the window is hit less often, so the loop costs seconds.
-		t.Skip("needs the follow-up and the approval running at once, at full speed")
-	}
-
-	app := createTestApp(t)
-	user := app.state.CreateUserForTest("followup-lookups")
-
-	// A follow-up that parks returns at once, so the next one follows it.
-	cancelled, cancel := context.WithCancel(t.Context())
-	cancel()
-
-	for range 200 {
-		machineKey := key.NewMachine().Public()
-		req := tailcfg.RegisterRequest{
-			NodeKey:  key.NewNode().Public(),
-			Hostinfo: &tailcfg.Hostinfo{Hostname: "followup-lookups"},
-		}
-
-		first, err := app.handleRegister(t.Context(), req, machineKey)
-		require.NoError(t, err)
-
-		authID, err := extractRegistrationIDFromAuthURL(first.AuthURL)
-		require.NoError(t, err)
-
-		req.Followup = first.AuthURL
-
-		var startedOver bool
-
-		stop, done := make(chan struct{}), make(chan struct{})
-
-		go func() {
-			defer close(done)
-
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-
-				resp, err := app.handleRegister(cancelled, req, machineKey)
-				if err == nil && resp != nil && resp.AuthURL != "" {
-					startedOver = true
-				}
-			}
-		}()
-
-		node, err := app.state.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, "cli")
-
-		close(stop)
-		<-done
-
-		require.NoError(t, err)
-
-		if startedOver {
-			got, ok := app.state.GetNodeByNodeKey(req.NodeKey)
-			require.True(t, ok, "the approval stored the node")
-			assert.Equal(t, node.ID(), got.ID())
-
-			return
-		}
-	}
-
-	t.Skip("no follow-up across 200 approvals landed in the window")
 }

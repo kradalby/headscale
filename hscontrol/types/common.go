@@ -303,12 +303,6 @@ func (rn *AuthRequest) PendingConfirmation() *PendingRegistrationConfirmation {
 
 // FinishAuth decides the request. Only the first verdict counts.
 func (rn *AuthRequest) FinishAuth(verdict AuthVerdict) {
-	// TODO(kradalby): auth/followup-lookup-race: this hands out one verdict
-	// then closes the channel, so a reader must take it with the channel's
-	// ok flag; one that does not (waitForFollowup, auth.go) reads the zero
-	// verdict as an expired registration on its second read. The SSH path
-	// guards with verdictOK (noise.go). Pinned by
-	// TestAFollowupAcrossAnApprovalIsToldToStartOver (package hscontrol).
 	if rn.closed.Swap(true) {
 		return
 	}

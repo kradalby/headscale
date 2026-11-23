@@ -873,11 +873,6 @@ func (r *stepReplay) apply(t *testing.T, step testcapture.Step) map[string]error
 				opts = append(opts, servertest.WithAuthKey(r.keys[a.Key]))
 			}
 
-			// A step that follows a started-over login, such as a
-			// keyless restart, must find the client logged in: the
-			// captures all completed their logins.
-			opts = append(opts, servertest.WithStartOverRecovery())
-
 			cl, err := servertest.TryNewClient(t, r.srv, a.Node, opts...)
 			r.clients[a.Node] = cl
 
