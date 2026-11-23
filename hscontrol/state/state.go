@@ -642,13 +642,52 @@ func (s *State) ReloadPolicy() error {
 	return nil
 }
 
-// CreateUser creates a new user and refreshes the users the policy reads.
-func (s *State) CreateUser(user types.User) (*types.User, error) {
-	if err := s.db.DB.Save(&user).Error; err != nil { //nolint:noinlineerr
-		return nil, fmt.Errorf("creating user: %w", err)
+// refuseHeldName refuses a name another user already holds. It runs inside
+// the write transaction that adopts the name, so two concurrent renames
+// (or a rename and a create) cannot both pass and both commit.
+func refuseHeldName(tx *gorm.DB, name string, exclude types.UserID) error {
+	var holders int64
+
+	err := tx.Model(&types.User{}).Where("name = ?", name).Where("id <> ?", uint(exclude)).Count(&holders).Error
+	if err != nil {
+		return err
 	}
 
-	err := s.refreshUsers()
+	if holders > 0 {
+		return hsdb.ErrUserExists
+	}
+
+	return nil
+}
+
+// CreateUser creates a new user and refreshes the users the policy reads.
+//
+// A user without a provider identifier may not take a name any user
+// already holds: as the schema's own indexes make the name unique among
+// such users, the API and the CLI, which create them, enforce it here
+// too. A user with a provider identifier shares a name as the schema
+// allows, so a login through the identity provider is not affected.
+func (s *State) CreateUser(user types.User) (*types.User, error) {
+	_, err := hsdb.Write(s.db.DB, func(tx *gorm.DB) (types.User, error) {
+		if !user.ProviderIdentifier.Valid {
+			err := refuseHeldName(tx, user.Name, 0)
+			if err != nil {
+				return user, err
+			}
+		}
+
+		err := tx.Save(&user).Error
+		if err != nil {
+			return user, fmt.Errorf("creating user: %w", err)
+		}
+
+		return user, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	err = s.refreshUsers()
 	if err != nil {
 		return &user, fmt.Errorf("updating policy manager after user creation: %w", err)
 	}
@@ -660,6 +699,17 @@ func (s *State) CreateUser(user types.User) (*types.User, error) {
 
 // UpdateUser modifies an existing user using the provided update function within a transaction.
 func (s *State) UpdateUser(userID types.UserID, updateFn func(*types.User) error) (*types.User, error) {
+	return s.writeUser(userID, updateFn, nil)
+}
+
+// writeUser is [State.UpdateUser] with a check that runs inside the same
+// write transaction, after the user is loaded, so it cannot race the
+// write it guards.
+func (s *State) writeUser(
+	userID types.UserID,
+	updateFn func(*types.User) error,
+	inTx func(*gorm.DB, *types.User) error,
+) (*types.User, error) {
 	s.userUpdateMu.Lock()
 	defer s.userUpdateMu.Unlock()
 
@@ -667,6 +717,13 @@ func (s *State) UpdateUser(userID types.UserID, updateFn func(*types.User) error
 		user, err := hsdb.GetUserByID(tx, userID)
 		if err != nil {
 			return nil, err
+		}
+
+		if inTx != nil {
+			err = inTx(tx, user)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		if err := updateFn(user); err != nil { //nolint:noinlineerr
@@ -712,9 +769,10 @@ func (s *State) DeleteUser(userID types.UserID) error {
 	return nil
 }
 
-// RenameUser changes a user's name. The new name must be unique.
+// RenameUser changes a user's name. The new name must be unique and a valid
+// username. OIDC users are refused: their name comes from the identity provider.
 func (s *State) RenameUser(userID types.UserID, newName string) (*types.User, error) {
-	return s.UpdateUser(userID, func(user *types.User) error {
+	return s.writeUser(userID, func(user *types.User) error {
 		err := util.ValidateUsername(newName)
 		if err != nil {
 			return err
@@ -727,6 +785,12 @@ func (s *State) RenameUser(userID types.UserID, newName string) (*types.User, er
 		user.Name = newName
 
 		return nil
+	}, func(tx *gorm.DB, user *types.User) error {
+		if user.ProviderIdentifier.Valid {
+			return nil
+		}
+
+		return refuseHeldName(tx, newName, userID)
 	})
 }
 
