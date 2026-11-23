@@ -643,9 +643,8 @@ func (fd *frontDoor) apply(e policymodel.Edit) { fd.w = fd.w.Apply(e) }
 // made counts an edit of kind by the path it took.
 func (fd *frontDoor) made(kind, path string) { fd.run.tally.edits[kind+": "+path]++ }
 
-// addUser creates u: through the API, or as the identity provider's first
-// login does for an OIDC user; also through the State for an API user
-// whose name an OIDC user already holds, which the API refuses.
+// addUser creates u: through the API for an API user, or as the identity
+// provider's first login does for an OIDC one.
 func (fd *frontDoor) addUser(u policymodel.User) {
 	users, _ := policymodel.Topology{Users: []policymodel.User{u}}.Build()
 	want := users[0]
@@ -655,17 +654,9 @@ func (fd *frontDoor) addUser(u policymodel.User) {
 		path string
 	)
 
-	taken := slices.ContainsFunc(fd.w.Topology.Users, func(o policymodel.User) bool { return o.Name == u.Name })
-
 	switch {
-	case u.OIDC() || taken:
+	case u.OIDC():
 		path = "identity provider"
-		if !u.OIDC() {
-			// TODO(kradalby): policymodel/api-user-name: the model
-			// creates an API user with a name an OIDC user holds, which
-			// the API refuses ("user already exists"). Counted.
-			path = "State (the API refuses a name an OIDC user holds)"
-		}
 
 		created, err := fd.srv.State().CreateUser(types.User{Name: want.Name, Email: want.Email, Provider: want.Provider, ProviderIdentifier: want.ProviderIdentifier})
 		if err != nil {
@@ -705,23 +696,10 @@ func (fd *frontDoor) addUser(u policymodel.User) {
 func (fd *frontDoor) renameUser(at string, e policymodel.RenameUser) {
 	u, _ := fd.w.Topology.User(e.ID)
 
-	shared := slices.ContainsFunc(fd.w.Topology.Users, func(o policymodel.User) bool { return o.OIDC() && o.Name == e.Name })
-
 	switch {
 	case u.OIDC():
 		fd.updateUser(at, e.ID, func(u *types.User) { u.Name = e.Name })
 		fd.made("RenameUser", "identity provider")
-	case shared:
-		// TODO(kradalby): api/rename-to-shared-name: renaming an API user
-		// to a name an OIDC user holds renames it, then the handler's
-		// lookup by the new name finds two users and answers 500. Counted;
-		// the stored judge holds that the rename happened.
-		err := fd.api(http.MethodPost, fmt.Sprintf("/api/v1/user/%d/rename/%s", e.ID, e.Name), nil, nil)
-		if err == nil || !strings.Contains(err.Error(), "expected exactly one user") {
-			fd.t.Fatalf("%s: renaming u%d to %q, which an OIDC user holds: %v", at, e.ID, e.Name, err)
-		}
-
-		fd.made("RenameUser", "API, answered 500 (api/rename-to-shared-name)")
 	default:
 		fd.mustAPI(at, http.MethodPost, fmt.Sprintf("/api/v1/user/%d/rename/%s", e.ID, e.Name), nil, nil)
 		fd.made("RenameUser", "API")
@@ -2212,36 +2190,21 @@ func (fd *frontDoor) identityOIDC() string {
 func (fd *frontDoor) identityCreate(at string) string {
 	nm, em := fd.drawName("api-name"), fd.drawEmail("api-email")
 	hold := fd.holders(nm, 0)
-	api := slices.ContainsFunc(hold, func(u policymodel.User) bool { return !u.OIDC() })
 	err := fd.api(http.MethodPost, "/api/v1/user", map[string]any{"name": nm, "email": em}, nil)
 
-	switch {
-	case len(hold) == 1:
+	if len(hold) > 0 {
 		if err == nil || !strings.Contains(err.Error(), "409") {
 			fd.t.Fatalf("%s: creating API user %q, which u%d holds: %v", at, nm, hold[0].ID, err)
 		}
 
 		return " (refused: the name is held)"
-	case api:
-		if err == nil {
-			fd.t.Fatalf("%s: creating API user %q, which an API user and others hold, is let through", at, nm)
-		}
+	}
 
-		return " (refused: an API user holds the name)"
-	case err != nil:
+	if err != nil {
 		fd.t.Fatalf("%s: creating API user %q: %v", at, nm, err)
 	}
 
 	fd.apply(policymodel.AddUser{User: policymodel.User{ID: fd.nextUserID(), Name: nm, Email: em}})
-
-	if len(hold) > 1 {
-		// TODO(kradalby): api/create-name-oidc-holders: the API refuses a
-		// user name one OIDC user holds ("user already exists") and
-		// creates one several OIDC users hold: its check is a lookup
-		// expecting one user, and the database keeps only API users'
-		// names apart. Counted.
-		return " (created though OIDC users hold the name: api/create-name-oidc-holders)"
-	}
 
 	return ""
 }
@@ -2266,20 +2229,16 @@ func (fd *frontDoor) identityRename(at string) string {
 	switch {
 	case nm == a.Name:
 		return " (its own name)"
-	case slices.ContainsFunc(hold, func(u policymodel.User) bool { return !u.OIDC() }):
+	case len(hold) > 0:
 		err := fd.api(http.MethodPost, fmt.Sprintf("/api/v1/user/%d/rename/%s", a.ID, nm), nil, nil)
-		if err == nil {
-			fd.t.Fatalf("%s: u%d is renamed %q, which another API user holds", at, a.ID, nm)
+		if err == nil || !strings.Contains(err.Error(), "409") {
+			fd.t.Fatalf("%s: renaming u%d to %q, which u%d holds: %v", at, a.ID, nm, hold[0].ID, err)
 		}
 
-		return " (refused: another API user holds the name)"
+		return " (refused: the name is held)"
 	}
 
 	fd.renameUser(at, policymodel.RenameUser{ID: a.ID, Name: nm})
-
-	if len(hold) > 0 {
-		return " (onto an OIDC user's name)"
-	}
 
 	return ""
 }
@@ -2778,13 +2737,11 @@ func (t *fdTally) require(tb testing.TB, held *policymodel.HeldJudge) {
 	}
 }
 
-// TestRenameToANameAnOIDCUserHoldsAnswers500 pins
-// api/rename-to-shared-name: the v1 API renames an API user to a name an
-// OIDC user holds, then answers 500, its lookup of the renamed user by
-// name finding two. It fails once the rename is refused, or answered with
-// the user; then drop the exception in the front-door property's
-// renameUser.
-func TestRenameToANameAnOIDCUserHoldsAnswers500(t *testing.T) {
+// TestRenamingToANameAnOIDCUserHoldsAnswers409 pins the decision: an API
+// rename never produces a name another user already holds, so renaming an
+// API user onto a name an OIDC user holds answers 409 and changes
+// nothing.
+func TestRenamingToANameAnOIDCUserHoldsAnswers409(t *testing.T) {
 	srv := NewServer(t)
 
 	_, err := srv.State().CreateUser(types.User{
@@ -2796,21 +2753,17 @@ func TestRenameToANameAnOIDCUserHoldsAnswers500(t *testing.T) {
 	fd := &frontDoor{srv: srv, apiKey: srv.CreateAPIKey(t, nil), http: &http.Client{Transport: &http.Transport{DialContext: srv.MemNet().Dial, DisableKeepAlives: true}}}
 
 	err = fd.api(http.MethodPost, fmt.Sprintf("/api/v1/user/%d/rename/alice", bob.ID), nil, nil)
-
-	// TODO(kradalby): api/rename-to-shared-name: the rename happened.
-	require.ErrorContains(t, err, "500")
+	require.ErrorContains(t, err, "409")
 
 	renamed, err := srv.State().GetUserByID(types.UserID(bob.ID))
 	require.NoError(t, err)
-	assert.Equal(t, "alice", renamed.Name, "the API answered 500, and the user is renamed")
+	assert.Equal(t, "bob", renamed.Name, "the refused rename changes nothing")
 }
 
-// TestCreatingANameOIDCUsersHoldDependsOnHowMany pins
-// api/create-name-oidc-holders: the v1 API refuses an API user whose name
-// one OIDC user holds, and creates one whose name two OIDC users hold. It
-// fails once both are answered alike; then drop the exception in the
-// front-door property's identity step.
-func TestCreatingANameOIDCUsersHoldDependsOnHowMany(t *testing.T) {
+// TestCreatingANameOIDCUsersHoldAnswers409 pins the decision: an API
+// create never produces a name another user already holds, however many
+// OIDC users hold it.
+func TestCreatingANameOIDCUsersHoldAnswers409(t *testing.T) {
 	srv := NewServer(t)
 
 	for i, name := range []string{"alice", "alice", "bob"} {
@@ -2823,9 +2776,7 @@ func TestCreatingANameOIDCUsersHoldDependsOnHowMany(t *testing.T) {
 	fd := &frontDoor{srv: srv, apiKey: srv.CreateAPIKey(t, nil), http: &http.Client{Transport: &http.Transport{DialContext: srv.MemNet().Dial, DisableKeepAlives: true}}}
 
 	require.ErrorContains(t, fd.api(http.MethodPost, "/api/v1/user", map[string]any{"name": "bob"}, nil), "409", "one OIDC user holds bob")
-
-	// TODO(kradalby): api/create-name-oidc-holders: two hold alice.
-	assert.NoError(t, fd.api(http.MethodPost, "/api/v1/user", map[string]any{"name": "alice"}, nil), "two OIDC users hold alice, and the API creates a third")
+	require.ErrorContains(t, fd.api(http.MethodPost, "/api/v1/user", map[string]any{"name": "alice"}, nil), "409", "two OIDC users hold alice")
 }
 
 // TestAWildcardTagOwnerNamesDevicesNotUsers pins

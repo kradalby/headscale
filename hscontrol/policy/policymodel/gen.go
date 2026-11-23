@@ -1059,20 +1059,15 @@ func drawTopology(t *rapid.T) Topology {
 	rapid.SliceOfN(rapid.Custom(func(t *rapid.T) User {
 		u := identities[len(users)]
 
-		// Only an OIDC user shares a name with another user, and API
-		// users' names stay unique among them.
+		// Only an OIDC user shares a name: the API refuses a name
+		// another user already holds, so an API user's stays unique.
 		same := chance(t, 8, "same-name")
 		as := rapid.IntRange(0, anyOf).Draw(t, "as")
 		email := chance(t, 8, "email")
 		e := pick(t, userEmails, "email")
 
-		if same && len(users) > 0 {
-			o := users[as%len(users)]
-			taken := slices.ContainsFunc(users, func(x User) bool { return !x.OIDC() && x.Name == o.Name })
-
-			if u.OIDC() || o.OIDC() && !taken {
-				u.Name = o.Name
-			}
+		if same && len(users) > 0 && u.OIDC() {
+			u.Name = users[as%len(users)].Name
 		}
 
 		if email {
@@ -1631,7 +1626,9 @@ func drawUserEditOn(t *rapid.T, w World, kind int, u User) Edit {
 	name, email := pick(t, userNames, "name"), pick(t, userEmails, "email")
 	nu := User{ID: id, Name: name, Email: email}
 
-	if oidc || slices.ContainsFunc(users, func(o User) bool { return !o.OIDC() && o.Name == name }) {
+	// An API user never takes a name another user already holds: the
+	// server refuses it, so the user lands as an OIDC one instead.
+	if oidc || slices.ContainsFunc(users, func(o User) bool { return o.Name == name }) {
 		nu.Provider = providerPrefix + strconv.FormatUint(uint64(id), 10)
 	}
 
@@ -1639,10 +1636,10 @@ func drawUserEditOn(t *rapid.T, w World, kind int, u User) Edit {
 }
 
 // renames is what u can be renamed to: for an API user, a name no other
-// API user has; for an OIDC user, whatever the provider says.
+// user has; for an OIDC user, whatever the provider says.
 func renames(users []User, u User) []string {
 	return slices.DeleteFunc(slices.Clone(userNames), func(n string) bool {
-		return n == u.Name || !u.OIDC() && slices.ContainsFunc(users, func(o User) bool { return !o.OIDC() && o.ID != u.ID && o.Name == n })
+		return n == u.Name || !u.OIDC() && slices.ContainsFunc(users, func(o User) bool { return o.ID != u.ID && o.Name == n })
 	})
 }
 
