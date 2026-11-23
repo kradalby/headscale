@@ -104,15 +104,11 @@ func TestTaggedReauthKeepsNilExpiry(t *testing.T) {
 		"tagged node must keep nil key expiry (tagged nodes never expire)")
 }
 
-// TestLoginUntagLeavesEmptyTags pins what a login that takes a tagged node
-// back stores as its tags: an empty list, where every other path stores
-// none. The render carries either and treats them as equal, so a session
-// can hold nil while a fresh one gets [], which no client sees.
-//
-// TODO(kradalby): state/untag-empty-tags: flip once the login stores nil;
-// until then the mapper's property client folds [] to nil
-// (clientAddresses).
-func TestLoginUntagLeavesEmptyTags(t *testing.T) {
+// TestUntaggingLoginStoresNilTags pins that a login which takes a tagged
+// node back stores no tags, like every other untagging path: a session
+// rendered before the change holds nil, and a fresh one must not see a
+// different empty list.
+func TestUntaggingLoginStoresNilTags(t *testing.T) {
 	dbPath := t.TempDir() + "/headscale.db"
 	cfg := persistTestConfig(dbPath)
 
@@ -145,8 +141,7 @@ func TestLoginUntagLeavesEmptyTags(t *testing.T) {
 	require.False(t, got.IsTagged())
 
 	tags := got.AsStruct().Tags
-	assert.NotNil(t, tags, "the login stores an empty list")
-	assert.Empty(t, tags)
+	assert.Nil(t, tags, "the login stores no tags, like every other untagging path")
 }
 
 // TestTaggedReauthWithReusedUserPAK reproduces issue #3312: a containerized

@@ -3098,13 +3098,7 @@ func (s *State) processReauthTags(
 				Bool(zf.WasAuthKeyTagged, wasAuthKeyTagged).
 				Msg("Reauth: removing all tags, returning node ownership to user")
 
-			// TODO(kradalby): state/untag-empty-tags: this path stores an
-			// empty list where every other untagging path stores nil, and
-			// the render carries either, so a session can hold nil where a
-			// fresh one gets []. No client sees it: no empty list survives
-			// the wire. Pinned by TestLoginUntagLeavesEmptyTags; delete
-			// once this stores nil.
-			node.Tags = []string{}
+			node.Tags = nil
 			node.UserID = &user.ID
 			node.User = user
 
