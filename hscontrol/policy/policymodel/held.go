@@ -315,9 +315,7 @@ type Moment struct {
 	World     World
 	Elections *Elections
 	// Shared is set once two nodes of the case shared an address
-	// (database only): node attributes may be stale (TODO(kradalby):
-	// policy/stale-under-shared-address), so the addresses a client is
-	// shown go unjudged and the form allows for it.
+	// (database only): the addresses a client is shown go unjudged.
 	Shared bool
 	// Unheld are subnet routes whose last holder is history the election
 	// history missed: unjudged.
@@ -517,7 +515,7 @@ func (h *Held) filter(id types.NodeID, nm *netmap.NetworkMap, capSources bool) s
 	n, _ := h.m.World.Topology.Node(id)
 	rules := nm.PacketFilterRules.AsSlice()
 
-	if msg := h.j.Form.Check(h.m.World, h.ref, id, rules, capSources, h.m.Shared); msg != "" {
+	if msg := h.j.Form.Check(h.m.World, h.ref, id, rules, capSources); msg != "" {
 		return fmt.Sprintf("its client's filter is in the wrong form: %s\nheadscale %v", msg, rules)
 	}
 
@@ -787,11 +785,6 @@ func (a sshAction) String() string { return [...]string{"deny", "accept", "check
 
 // ssh compares decisions, including those for sources that SSH alone doesn't make peers.
 func (h *Held) ssh(id types.NodeID, nm *netmap.NetworkMap, _ bool) string {
-	// See TODO(kradalby): policy/stale-under-shared-address in the delivery judge.
-	if h.m.Shared {
-		return ""
-	}
-
 	w := h.m.World
 
 	dst, ok := w.Topology.Node(id)

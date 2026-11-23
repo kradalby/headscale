@@ -455,7 +455,7 @@ func TestWorldMatchesScratchWorld(t *testing.T) {
 			}
 
 			w := s.Start
-			shared, sorted := sharesAddress(w), policymodel.MergesApart(w)
+			sorted := policymodel.MergesApart(w)
 			scr := scratchOf(t, s.Start, capSources)
 
 			if msg := servedDiffers(snap, scr, all); msg != "" {
@@ -470,7 +470,7 @@ func TestWorldMatchesScratchWorld(t *testing.T) {
 				t.Fatalf("capability sources %t, at the start: %s", capSources, msg)
 			}
 
-			if msg := audits.judge(shared, sorted, known); msg != "" {
+			if msg := audits.judge(sorted, known); msg != "" {
 				t.Fatalf("capability sources %t, at the start: %s", capSources, msg)
 			}
 
@@ -478,40 +478,13 @@ func TestWorldMatchesScratchWorld(t *testing.T) {
 				next, change := w.Commit(st)
 				snap = m.commit(t, next, change, apart[i])
 				scr := scratchOf(t, next, capSources)
-				shared = shared || sharesAddress(next)
 				sorted = sorted || policymodel.MergesApart(next)
-
-				if policyCapsDiffer(snap, scr) && shared {
-					// Found by the policy/v2 properties on the tree this was
-					// written for: the compile reuses an unchanged node's
-					// attributes, though under a shared address another
-					// node's change moves which targets hold its address, and
-					// the attribute stays once the address is no longer
-					// shared. Database-only; counted, and judged no further.
-					//
-					// TODO(kradalby): policy/stale-under-shared-address:
-					// delete this exception with the one in
-					// TestPipelineIncrementalMatchesScratch
-					// (policy/v2/incremental_property_test.go).
-					known["node attributes stale under a shared address"]++
-
-					break
-				}
 
 				if msg := servedDiffers(snap, scr, readsOf(st, next)); msg != "" {
 					t.Fatalf("capability sources %t, after step %d (%s): %s", capSources, i+1, st, msg)
 				}
 
 				if msg := sshDiffers(snap, scr); msg != "" {
-					if shared {
-						// TODO(kradalby): policy/stale-under-shared-address: the
-						// SSH half of the exception above, pinned by
-						// TestSSHPolicyForgetsALeaverWhoSharedAnAddress.
-						known["SSH policies stale under a shared address"]++
-
-						break
-					}
-
 					t.Fatalf("capability sources %t, after step %d (%s): %s", capSources, i+1, st, msg)
 				}
 
@@ -519,17 +492,11 @@ func TestWorldMatchesScratchWorld(t *testing.T) {
 					t.Fatalf("capability sources %t, after step %d (%s): %s", capSources, i+1, st, msg)
 				}
 
-				if msg := audits.judge(shared, sorted, known); msg != "" {
+				if msg := audits.judge(sorted, known); msg != "" {
 					t.Fatalf("capability sources %t, after step %d (%s): %s", capSources, i+1, st, msg)
 				}
 
 				w = next
-			}
-
-			// A step the exceptions above stop at is judged for its other
-			// lines.
-			if msg := audits.judge(shared, sorted, known); msg != "" {
-				t.Fatalf("capability sources %t, at the last step judged: %s", capSources, msg)
 			}
 		}
 	})
@@ -637,17 +604,11 @@ func (a *auditLines) take() []auditLine {
 }
 
 // judge returns the first line logged since the last judge that is no
-// known false alarm, counting those in known: the compile's node
-// attributes and SSH policies once the case shared an address, and the
-// filter audit's merge order once it held a user whose addresses sort
-// apart.
-func (a *auditLines) judge(shared, sorted bool, known tally) string {
+// known false alarm, counting those in known: the filter audit's merge
+// order once the case held a user whose addresses sort apart.
+func (a *auditLines) judge(sorted bool, known tally) string {
 	for _, l := range a.take() {
 		switch {
-		case shared && l.Message == "policy audit" && (strings.Contains(l.Error, "node attributes") || strings.Contains(l.Error, "SSH policy of node")):
-			// TODO(kradalby): policy/stale-under-shared-address: the
-			// exceptions above, as the audit reports them.
-			known["audit: stale under a shared address"]++
 		case sorted && l.Message == "policy audit: filter" && strings.Contains(l.Error, "capability form expands otherwise than address form"):
 			// TODO(kradalby): policy/merge-order: see
 			// policymodel.MergesApart.
@@ -658,40 +619,6 @@ func (a *auditLines) judge(shared, sorted bool, known tally) string {
 	}
 
 	return ""
-}
-
-// policyCapsDiffer reports whether the compile's node capabilities of a
-// and b differ.
-func policyCapsDiffer(a, b *Snapshot) bool {
-	ca, cb := a.s.Get(a.w.nodeCaps), b.s.Get(b.w.nodeCaps)
-
-	for _, n := range b.ListNodes().All() {
-		x, _ := ca.Get(n.ID())
-		y, _ := cb.Get(n.ID())
-
-		if !x.Equal(y) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// sharesAddress reports whether two of w's nodes hold one address.
-func sharesAddress(w policymodel.World) bool {
-	seen := map[netip.Addr]bool{}
-
-	for _, n := range w.Topology.Nodes {
-		for _, a := range n.Addrs() {
-			if seen[a] {
-				return true
-			}
-
-			seen[a] = true
-		}
-	}
-
-	return false
 }
 
 // sinceMisses returns a served value that differs between a and c and
@@ -960,10 +887,9 @@ func TestSinceSoundOverAnyPair(t *testing.T) {
 
 			worlds := s.Worlds()
 
-			shared := slices.ContainsFunc(worlds, sharesAddress)
 			sorted := slices.ContainsFunc(worlds, policymodel.MergesApart)
 
-			if msg := audits.judge(shared, sorted, counts); msg != "" {
+			if msg := audits.judge(sorted, counts); msg != "" {
 				t.Fatalf("capability sources %t: %s", capSources, msg)
 			}
 		}
@@ -1183,46 +1109,4 @@ func TestServedAuditAgreesWhateverTheMergeOrder(t *testing.T) {
 	_, err = w.snapshot().FilterForNode(28)
 	require.NoError(t, err)
 	require.Equal(t, failures, PolicyAuditFailures(), "the audit found no disagreement")
-}
-
-// TestSSHPolicyForgetsALeaverWhoSharedAnAddress holds a tagged node's SSH
-// policy, after a node sharing its address leaves, to a compile from
-// scratch: autogroup:tagged resolves by address, so the leaver's other
-// address was a principal while it shared one with the tagged node.
-//
-// TODO(kradalby): policy/stale-under-shared-address: fails open: the
-// carried SSH policy keeps the leaver's address as a principal (it may be
-// handed to another node next) until a document edit. Database-only: State
-// shares no address. Unskip with the shared-address exceptions of the
-// properties.
-func TestSSHPolicyForgetsALeaverWhoSharedAnAddress(t *testing.T) {
-	if os.Getenv("HEADSCALE_PBT_KNOWN_BUGS") == "" {
-		t.Skip("TODO(kradalby): policy/stale-under-shared-address; HEADSCALE_PBT_KNOWN_BUGS=1 runs it")
-	}
-
-	users := []types.User{{ID: 1, Name: "alice"}}
-	pol := `{"tagOwners": {"tag:a": []}, "ssh": [{"action": "accept", "src": ["autogroup:tagged"], "dst": ["tag:a"], "users": ["root"]}]}`
-
-	sharer := capWorldNode(2, &users[0], "100.64.0.1")
-	v6 := netip.MustParseAddr("fd7a:115c:a1e0::2")
-	sharer.IPv6 = &v6
-
-	w, err := newWorldMode(types.Nodes{capWorldNode(1, nil, "100.64.0.1", "tag:a"), sharer}, users, []byte(pol), types.DNSView{}, pinSources(true))
-	require.NoError(t, err)
-
-	tagged, _ := w.snapshot().GetNode(1)
-	_, err = w.snapshot().SSHPolicy("https://headscale.test", tagged)
-	require.NoError(t, err)
-
-	s := w.update(func(e *nodeEdit) { e.Delete(2) })
-
-	got, err := s.SSHPolicy("https://headscale.test", tagged)
-	require.NoError(t, err)
-
-	fresh, err := policyv2.NewPolicyManager([]byte(pol), users, s.ListNodes())
-	require.NoError(t, err)
-
-	want, err := fresh.SSHPolicy("https://headscale.test", tagged)
-	require.NoError(t, err)
-	require.Equal(t, want, got)
 }

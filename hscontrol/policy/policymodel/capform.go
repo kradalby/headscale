@@ -147,14 +147,11 @@ type FormJudge struct {
 	// Shared counts the source capabilities held to addresses because a
 	// node outside them holds a member's address.
 	Shared int
-	// Stale counts the service hosts held to neither form, their node
-	// attributes possibly stale (Check).
-	Stale int
 }
 
 func (j *FormJudge) String() string {
-	return fmt.Sprintf("filters by receiver %v (address mode %d); with a cap: source %d, required %d; rules mixed %d, with several caps %d; held by rule %v; shared stamps %d; stale service hosts %d",
-		j.Filters, j.Address, j.WithCaps, j.Required, j.Mixed, j.MultiCap, j.ByRule, j.Shared, j.Stale)
+	return fmt.Sprintf("filters by receiver %v (address mode %d); with a cap: source %d, required %d; rules mixed %d, with several caps %d; held by rule %v; shared stamps %d",
+		j.Filters, j.Address, j.WithCaps, j.Required, j.Mixed, j.MultiCap, j.ByRule, j.Shared)
 }
 
 // Check returns what is wrong with the form of rules, node id's filter in
@@ -165,10 +162,8 @@ func (j *FormJudge) String() string {
 // address only, holds none; every cap: source is in the reserved
 // namespace and names an identity or an owner no node outside shares an
 // address with; and, where ref speaks for w, every capability
-// [Ref.CapSources] lists is among the sources. stale says node attributes
-// may be stale, an address having been shared in the case: a service host
-// is then held to neither form.
-func (j *FormJudge) Check(w World, ref *Ref, id types.NodeID, rules []tailcfg.FilterRule, capMode, stale bool) string {
+// [Ref.CapSources] lists is among the sources.
+func (j *FormJudge) Check(w World, ref *Ref, id types.NodeID, rules []tailcfg.FilterRule, capMode bool) string {
 	n, ok := w.Topology.Node(id)
 	if !ok {
 		return ""
@@ -186,14 +181,14 @@ func (j *FormJudge) Check(w World, ref *Ref, id types.NodeID, rules []tailcfg.Fi
 		return ""
 	}
 
-	why := j.receiver(NewView(w), n, stale)
+	why := j.receiver(NewView(w), n)
 
 	held, msg := j.sources(ref, id, why, rules)
 	if msg != "" {
 		return msg
 	}
 
-	if ref.OutOfDomain() != "" || why != "" || stale {
+	if ref.OutOfDomain() != "" || why != "" {
 		j.countShared(ref, w)
 
 		return ""
@@ -216,7 +211,7 @@ func (j *FormJudge) Check(w World, ref *Ref, id types.NodeID, rules []tailcfg.Fi
 
 // receiver counts n's filter by why n must be sent addresses and returns
 // the reason [Check] holds it to.
-func (j *FormJudge) receiver(v *View, n Node, stale bool) string {
+func (j *FormJudge) receiver(v *View, n Node) string {
 	why := v.AddressFormReason(n)
 
 	if j.Filters == nil {
@@ -224,18 +219,6 @@ func (j *FormJudge) receiver(v *View, n Node, stale bool) string {
 	}
 
 	j.Filters[why]++
-
-	// TODO(kradalby): policy/stale-under-shared-address: node attributes
-	// grant by address and an unchanged node keeps its own, so another
-	// holder of its address moving leaves service-host stale on it, and
-	// its filter form with it, also once the address is no longer shared
-	// (database-only). Delete this exception with the properties' siblings
-	// once the compile recomputes every holder of a moved node's addresses.
-	if stale && why == "service-host" {
-		j.Stale++
-
-		return ""
-	}
 
 	return why
 }

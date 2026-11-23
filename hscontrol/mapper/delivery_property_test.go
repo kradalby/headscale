@@ -1254,14 +1254,6 @@ type referenceTally struct {
 	ssh int
 }
 
-func (rt *referenceTally) skip(why string) {
-	if rt.Skipped == nil {
-		rt.Skipped = map[string]int{}
-	}
-
-	rt.Skipped[why]++
-}
-
 func (rt *referenceTally) String() string {
 	return fmt.Sprintf("%v; SSH policies %d", &rt.HeldJudge, rt.ssh)
 }
@@ -1312,24 +1304,14 @@ func (r *deliveryRun) holdToReference(t *rapid.T, at string, worlds []*deliveryW
 		return
 	}
 
-	// TODO(kradalby): policy/stale-under-shared-address: SSH policies
-	// carried across a commit keep an address another node shared, until a
-	// document edit (TestSSHPolicyForgetsALeaverWhoSharedAnAddress in
-	// state); once a case shared one, its SSH goes unjudged.
-	var fresh *policyv2.PolicyManager
+	users, err := worlds[0].p.s.ListAllUsers()
+	if err != nil {
+		t.Fatalf("reference: %s: users: %v", at, err)
+	}
 
-	if !shared {
-		users, err := worlds[0].p.s.ListAllUsers()
-		if err != nil {
-			t.Fatalf("reference: %s: users: %v", at, err)
-		}
-
-		fresh, err = policyv2.NewPolicyManager(w.Policy.HuJSON(), users, worlds[0].p.s.Snapshot().ListNodes())
-		if err != nil {
-			t.Fatalf("reference: %s: the policy compiled from scratch: %v", at, err)
-		}
-	} else {
-		r.ref.skip("SSH after a shared address")
+	fresh, err := policyv2.NewPolicyManager(w.Policy.HuJSON(), users, worlds[0].p.s.Snapshot().ListNodes())
+	if err != nil {
+		t.Fatalf("reference: %s: the policy compiled from scratch: %v", at, err)
 	}
 
 	for i, dw := range worlds {
@@ -1339,9 +1321,7 @@ func (r *deliveryRun) holdToReference(t *rapid.T, at string, worlds []*deliveryW
 				dw.failf(judgeReference, "%s: n%d: %s", at, id, d)
 			}
 
-			if fresh != nil {
-				dw.ssh(t, at, id, nm, fresh, &r.ref)
-			}
+			dw.ssh(t, at, id, nm, fresh, &r.ref)
 		}
 	}
 }

@@ -786,11 +786,7 @@ func TestCapabilityFormFollowsReference(t *testing.T) {
 	)
 
 	rapid.Check(t, func(t *rapid.T) {
-		shared := false
-
 		drive(t, func(step int, sv *served, reads []types.NodeID) {
-			shared = shared || policymodel.SharesAddress(sv.w)
-
 			for _, id := range reads {
 				got, err := sv.cap.ForNode(id, sv.recv.Of(id))
 				if err != nil {
@@ -799,7 +795,7 @@ func TestCapabilityFormFollowsReference(t *testing.T) {
 
 				// The form is judged out of the reference's domain too:
 				// it reads no address the domain leaves unsaid.
-				if msg := form.Check(sv.w, sv.ref, id, got, true, shared); msg != "" {
+				if msg := form.Check(sv.w, sv.ref, id, got, true); msg != "" {
 					t.Fatalf("after step %d n%d's capability-form filter is in the wrong form: %s\nheadscale %v", step, id, msg, got)
 				}
 

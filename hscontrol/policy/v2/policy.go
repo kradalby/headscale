@@ -356,8 +356,7 @@ func NewPolicyManagerFrom(prev *PolicyManager, b []byte, users []types.User, nod
 	// TODO(capsrc/owners): lift when tag owners and auto-approvers are read off the role cells
 	// TODO(kradalby): capsrc/owners: both are resolved to address sets at
 	// every compile, and the compile runs at every policy-fact commit, so
-	// a join costs the size of every owner and approver it resolves; they
-	// also decide by address, not identity (policy/approvers-by-address).
+	// a join costs the size of every owner and approver it resolves.
 	// No client dependency: headscale's own compile.
 	tagMap, err := resolveTagOwners(indexed, users, nodes)
 	if err != nil {
@@ -1534,11 +1533,8 @@ func (pm *PolicyManager) NodeCanApproveRoute(node types.NodeView, route netip.Pr
 		return false
 	}
 
-	// TODO(kradalby): policy/approvers-by-address: approvers are matched by the
-	// node's addresses, not its identity, so a node sharing an approver's address
-	// gets its routes approved (fails open) and an approver without addresses
-	// approves nothing. Only a hand-edited database gives two nodes one address.
-	// Same mechanism as policy/nodeattrs-by-address; lift by matching on roles.
+	// Approvers match by address, each held by one node: NewState refuses a
+	// shared or missing one.
 
 	// If the route to-be-approved is an exit route, then we need to check
 	// if the node is in allowed to approve it. This is treated differently

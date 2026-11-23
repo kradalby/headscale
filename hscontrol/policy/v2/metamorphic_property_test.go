@@ -236,11 +236,9 @@ func TestEditThenInverseRestoresServedState(t *testing.T) {
 		}
 
 		w := s.Start
-		shared := sharesAddress(w)
 
 		for i, step := range s.Steps {
 			next, change := w.Commit(step)
-			shared = shared || sharesAddress(next)
 
 			after, err := stageAt(st, next, change)
 			if err != nil {
@@ -256,19 +254,6 @@ func TestEditThenInverseRestoresServedState(t *testing.T) {
 				}
 
 				tally.add("inverted")
-
-				if nodeCapsDiffer(restored, st) != "" && shared {
-					// The compile's stale node attributes under a shared
-					// address (TestPipelineIncrementalMatchesScratch): a
-					// document edit compiles them afresh.
-					//
-					// TODO(kradalby): policy/stale-under-shared-address:
-					// delete this exception with the one in
-					// TestPipelineIncrementalMatchesScratch.
-					tally.add("node attributes stale under a shared address")
-
-					return
-				}
 
 				if msg := firstDiff(fingerprintOf(restored, restored.ip.Fresh(), restored.cap.Fresh()), fingerprintOf(st, st.ip.Fresh(), st.cap.Fresh())); msg != "" {
 					t.Fatalf("step %d (%s), then its inverse (%s), leave (restored, before): %s", i+1, step, inv, msg)

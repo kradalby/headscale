@@ -1102,9 +1102,8 @@ func (pol *Policy) compileNodeAttrsFrom(
 
 		ips := n.IPs()
 
-		// TODO(kradalby): policy/nodeattrs-by-address: a target naming an
-		// identity grants every holder of its addresses, and nothing to an
-		// address-less member; see View.ServiceHosts in policymodel.
+		// Targets resolve to addresses, each held by one node: NewState
+		// refuses a shared or missing one.
 		for _, t := range targets {
 			if slices.ContainsFunc(ips, t.ips.Contains) {
 				for _, attr := range t.attrs {
@@ -1119,11 +1118,8 @@ func (pol *Policy) compileNodeAttrsFrom(
 	result := make(map[types.NodeID]tailcfg.NodeCapMap, len(prev))
 
 	for _, n := range nodes.All() {
-		// TODO(kradalby): policy/stale-under-shared-address: targets resolve
-		// to addresses, so another holder of n's address moving changes n's
-		// attributes though n did not; reused, they stay stale until a
-		// document edit (database-only: State shares no address). Tolerated,
-		// with what lifts it, by TestPipelineIncrementalMatchesScratch.
+		// An unchanged node keeps its attributes: they read only its own
+		// addresses, which no other node holds.
 		if old, ok := prevNodes[n.ID()]; ok && prev != nil && old == n {
 			if c, ok := prev[n.ID()]; ok {
 				result[n.ID()] = c

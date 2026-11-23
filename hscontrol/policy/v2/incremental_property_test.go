@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
-	"net/netip"
 	"reflect"
 	"slices"
 	"sort"
@@ -612,10 +611,7 @@ func tableDiffersFromModel(table *SelectorTable, p policymodel.Policy) string {
 func TestPipelineIncrementalMatchesScratch(t *testing.T) {
 	t.Parallel()
 
-	var (
-		shapes shapeTally
-		known  changeTally
-	)
+	var shapes shapeTally
 
 	rapid.Check(t, func(t *rapid.T) {
 		s := policymodel.Scenarios(propertySteps).Draw(t, "scenario")
@@ -627,11 +623,9 @@ func TestPipelineIncrementalMatchesScratch(t *testing.T) {
 		}
 
 		w := s.Start
-		shared := sharesAddress(w)
 
 		for i, st := range s.Steps {
 			next, change := w.Commit(st)
-			shared = shared || sharesAddress(next)
 
 			prev := inc
 
@@ -646,37 +640,6 @@ func TestPipelineIncrementalMatchesScratch(t *testing.T) {
 			}
 
 			if msg := nodeCapsDiffer(inc, scr); msg != "" {
-				if shared {
-					// Found by this property on the tree it was written for:
-					// the compile reuses an unchanged node's attributes,
-					// though under a shared address another node's change
-					// moves which targets hold its address, and the
-					// attribute stays once the address is no longer shared.
-					// Database-only; counted, and the scenario judged no
-					// further.
-					//
-					// TODO(kradalby): policy/stale-under-shared-address:
-					// fails open or closed, by attribute.
-					// compileNodeAttrsFrom in compiled.go reuses an
-					// unchanged node's attributes, but targets resolve to
-					// addresses (policy/nodeattrs-by-address), so another
-					// holder of its address joining, leaving or retagging
-					// moves them:
-					// with nodeAttrs autogroup:tagged service-host and n1,
-					// n2 sharing an IPv6, retagging n1 leaves n2 without
-					// service-host until a document edit. SSH policies
-					// go stale alike (TestSSHPolicyForgetsALeaverWhoSharedAnAddress
-					// in state). Database-only: State
-					// shares no address. Delete this exception, its
-					// siblings and the address limit of audited in
-					// mapper/hub_property_test.go once the compile
-					// recomputes every holder of a moved node's addresses,
-					// or reuses nothing while an address is shared.
-					known.add("node attributes stale under a shared address")
-
-					return
-				}
-
 				t.Fatalf("after step %d (%s): %s", i+1, st, msg)
 			}
 
@@ -704,7 +667,6 @@ func TestPipelineIncrementalMatchesScratch(t *testing.T) {
 		}
 	})
 
-	t.Logf("known divergences: %v", &known)
 	shapes.log(t, "incremental matches scratch")
 }
 
@@ -721,23 +683,6 @@ func nodeCapsDiffer(inc, scr *stage) string {
 	}
 
 	return ""
-}
-
-// sharesAddress reports whether two of w's nodes hold one address.
-func sharesAddress(w policymodel.World) bool {
-	seen := map[netip.Addr]bool{}
-
-	for _, n := range w.Topology.Nodes {
-		for _, a := range n.Addrs() {
-			if seen[a] {
-				return true
-			}
-
-			seen[a] = true
-		}
-	}
-
-	return false
 }
 
 // receiverKindsDiffer returns how r's count of nodes per kind of facts,

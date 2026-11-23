@@ -360,12 +360,11 @@ type hubMachine struct {
 	// must hold no session it did not wake to the routing's end in vain.
 	audit   bool
 	audited uint64
-	// audits holds what every audit logs while audit is set; shared,
-	// apart and self are whether any commit of the case had two nodes
-	// share an address or a user's addresses sort apart, and any document
-	// a self destination (see [auditLines.judge]).
-	audits              *auditLines
-	shared, apart, self bool
+	// audits holds what every audit logs while audit is set; apart and
+	// self are whether any commit of the case had a user's addresses sort
+	// apart, and any document a self destination (see [auditLines.judge]).
+	audits      *auditLines
+	apart, self bool
 	// kind names the last commit's write, for what woke renders after it.
 	kind string
 	// script holds the acts of the script in progress (see [drawScript]),
@@ -570,17 +569,16 @@ func runHubMachine(t *rapid.T, reach *hubPropertyReach, audits *auditLines) {
 
 	m.saw()
 
-	if msg := m.audits.judge(m.shared, m.self && m.apart, m.reach.known); msg != "" {
+	if msg := m.audits.judge(m.self && m.apart, m.reach.known); msg != "" {
 		t.Fatalf("settled: an audit objects: %s", msg)
 	}
 }
 
 // saw notes what the State and the model now hold for the audits' known
-// false alarms. A write of several nodes commits them one at a time, so
-// the State can share an address no model world shares.
+// false alarms.
 func (m *hubMachine) saw() {
-	shared, apart := heldAddresses(m.p.s.Snapshot())
-	m.shared, m.apart = m.shared || shared, m.apart || apart
+	_, apart := heldAddresses(m.p.s.Snapshot())
+	m.apart = m.apart || apart
 	m.self = m.self || policymodel.SelfDestination(m.p.w.Policy)
 }
 
@@ -1102,7 +1100,7 @@ func (m *hubMachine) check(t *rapid.T) {
 
 	m.saw()
 
-	if msg := m.audits.judge(m.shared, m.self && m.apart, m.reach.known); msg != "" {
+	if msg := m.audits.judge(m.self && m.apart, m.reach.known); msg != "" {
 		t.Fatalf("an audit objects at r%d: %s", m.p.s.Snapshot().Rev(), msg)
 	}
 
@@ -1457,37 +1455,20 @@ func (h *stressRun) next() int {
 }
 
 // allocatorAddresses reports whether w's addresses are what the allocator
-// hands out: one in each family, inside the tailnet's ranges, each held
-// by one node.
+// hands out: one in each family, inside the tailnet's ranges.
 func allocatorAddresses(w policymodel.World) bool {
-	held := map[netip.Addr]bool{}
-
 	for _, n := range w.Topology.Nodes {
-		if len(n.Addrs()) != 2 {
+		if len(n.Addrs()) != 2 || slices.ContainsFunc(n.Addrs(), policymodel.Outside) {
 			return false
-		}
-
-		for _, a := range n.Addrs() {
-			if held[a] || policymodel.Outside(a) {
-				return false
-			}
-
-			held[a] = true
 		}
 	}
 
 	return true
 }
 
-// audited reports whether st, from w, is a write the policy audits agree
+// audited reports whether st, from w, is a write the filter audit agrees
 // on: addresses stay the allocator's, none moves, and none sorts apart
 // ([policymodel.MergesApart]).
-//
-// TODO(kradalby): policy/stale-under-shared-address: keeping each
-// address to one node here stands in for the compile's stale attributes
-// and SSH policies under a shared address (see the exception in
-// TestPipelineIncrementalMatchesScratch); let addresses be shared when
-// that exception goes. The rest of the limit is the filter audit's.
 func audited(w policymodel.World, st policymodel.Step) bool {
 	for _, e := range st.Edits {
 		if _, ok := e.(policymodel.SetAddr); ok {
@@ -1870,18 +1851,16 @@ func (a *auditLines) take() []auditLine {
 }
 
 // judge returns the first line logged since the last judge that is no
-// known false alarm, counting those in known: the compile's node
-// attributes and SSH policies once the case shared an address, and the
-// filter audit's merge order once it held a user whose addresses sort
-// apart.
-func (a *auditLines) judge(shared, sorted bool, known map[string]int) string {
-	return a.judgeWith(shared, func(auditLine) bool { return sorted }, known)
+// known false alarm, counting those in known: the filter audit's merge
+// order once the case held a user whose addresses sort apart.
+func (a *auditLines) judge(sorted bool, known map[string]int) string {
+	return a.judgeWith(func(auditLine) bool { return sorted }, known)
 }
 
-// judgeAt is judge for a case that shared no address, excusing the merge
-// order only in a line of a commit sortedAt names.
+// judgeAt is judge excusing the merge order only in a line of a commit
+// sortedAt names.
 func (a *auditLines) judgeAt(sortedAt func(rev uint64) bool, known map[string]int) string {
-	return a.judgeWith(false, func(l auditLine) bool {
+	return a.judgeWith(func(l auditLine) bool {
 		m := auditCommit.FindStringSubmatch(l.Error)
 		if m == nil {
 			return false
@@ -1896,13 +1875,9 @@ func (a *auditLines) judgeAt(sortedAt func(rev uint64) bool, known map[string]in
 // auditCommit finds the commit a filter audit line names.
 var auditCommit = regexp.MustCompile(`at commit (\d+):`)
 
-func (a *auditLines) judgeWith(shared bool, sorted func(auditLine) bool, known map[string]int) string {
+func (a *auditLines) judgeWith(sorted func(auditLine) bool, known map[string]int) string {
 	for _, l := range a.take() {
 		switch {
-		case shared && l.Message == "policy audit" && (strings.Contains(l.Error, "node attributes") || strings.Contains(l.Error, "SSH policy of node")):
-			// TODO(kradalby): policy/stale-under-shared-address: see the
-			// exception in TestPipelineIncrementalMatchesScratch.
-			known["stale under a shared address"]++
 		case l.Message == "policy audit: filter" && strings.Contains(l.Error, "capability form expands otherwise than address form") && sorted(l):
 			// TODO(kradalby): policy/merge-order: see
 			// policymodel.MergesApart.
