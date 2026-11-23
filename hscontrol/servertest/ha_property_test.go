@@ -12,7 +12,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/servertest"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
 	"tailscale.com/tailcfg"
@@ -368,21 +367,6 @@ func snapshotPrimaries(
 // inside the rapid body, which would dominate the per-check budget
 // for little extra coverage.
 func TestHAProberProperty(t *testing.T) {
-	// Per-check wall-cost is ~15-25s (real Noise handshake on each
-	// reconnect), so the default 100-check rapid budget blows past
-	// the 10-minute go test timeout used by the Tests workflow.
-	// Skip on CI by default so the everyday sweep stays fast; runs
-	// locally so seed shrinking works without an opt-in flag.
-	//
-	// TODO(kradalby): policy/ha-prober-skipped: skipped in CI, so nothing
-	// holds its invariants but a deliberate local run of many minutes.
-	// Move the election logic it exercises into the world-level property
-	// in state/primaries_property_test.go, and keep here only what needs a
-	// real Noise session, sized to run in CI.
-	if util.IsCI() {
-		t.Skip("skipping HA prober property test in CI; runs locally")
-	}
-
 	if testing.Short() {
 		t.Skip("skipping property test in short mode")
 	}
