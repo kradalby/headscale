@@ -204,9 +204,12 @@ type State struct {
 	// ipAlloc manages IP address allocation for nodes
 	ipAlloc *hsdb.IPAllocator
 
-	// authCache holds pending Web, OIDC and SSH authentication requests.
-	// Admission preserves unexpired entries at capacity. Expiry resolves the
-	// verdict with ErrRegistrationExpired so waiting goroutines wake.
+	// authCache holds Web, OIDC and SSH authentication requests. A decided
+	// request stays until it expires or a new request needs its slot, so a
+	// follow-up that comes late still reads its verdict. Admission preserves
+	// pending entries at capacity.
+	// Expiry resolves the verdict with ErrRegistrationExpired so waiting
+	// goroutines wake.
 	authCache *expirable.LRU[types.AuthID, *types.AuthRequest]
 
 	authCacheMaxEntries     int
@@ -2296,16 +2299,29 @@ func (s *State) DeleteExpiredAccessTokens(cutoff time.Time) (int64, error) {
 	return s.db.DeleteExpiredAccessTokens(cutoff)
 }
 
-// GetAuthCacheEntry retrieves a pending auth request from the cache.
+// GetAuthCacheEntry retrieves an auth request still waiting for its verdict,
+// so a decided login or SSH check is never decided again.
 func (s *State) GetAuthCacheEntry(id types.AuthID) (*types.AuthRequest, bool) {
+	rn, ok := s.GetAuthCacheEntryForFollowup(id)
+	if !ok || rn.IsFinished() {
+		return nil, false
+	}
+
+	return rn, true
+}
+
+// GetAuthCacheEntryForFollowup retrieves an auth request whether or not it
+// has been decided, for the follow-up that waits for its verdict.
+func (s *State) GetAuthCacheEntryForFollowup(id types.AuthID) (*types.AuthRequest, bool) {
 	// Preserve insertion order so admission can reclaim expired entries from
 	// the oldest end without scanning every pending authentication.
 	return s.authCache.Peek(id)
 }
 
-// DeleteAuthCacheEntry releases a consumed authentication transaction.
-func (s *State) DeleteAuthCacheEntry(id types.AuthID) {
-	s.authCache.Remove(id)
+// DeleteAuthCacheEntry releases a consumed authentication transaction and
+// reports whether this call removed it.
+func (s *State) DeleteAuthCacheEntry(id types.AuthID) bool {
+	return s.authCache.Remove(id)
 }
 
 // SetAuthCacheEntry admits a pending authentication without displacing
@@ -2348,8 +2364,7 @@ func (s *State) SetAuthCacheEntry(id types.AuthID, entry *types.AuthRequest) err
 		s.authCache.Remove(oldest)
 	}
 
-	if (!entry.IsSSHCheck() && s.authCacheRegularEntries.Load() >= int64(s.authCacheMaxEntries)) ||
-		s.authCache.Len() >= s.authCacheMaxEntries+authCacheSSHReserve {
+	if s.authCacheFullFor(entry) && !s.reclaimFinishedFor(entry) {
 		return ErrAuthCacheFull
 	}
 
@@ -2365,6 +2380,29 @@ func (s *State) SetAuthCacheEntry(id types.AuthID, entry *types.AuthRequest) err
 	s.authCache.Add(id, entry)
 
 	return nil
+}
+
+// authCacheFullFor is called with authCacheMu held.
+func (s *State) authCacheFullFor(entry *types.AuthRequest) bool {
+	return (!entry.IsSSHCheck() && s.authCacheRegularEntries.Load() >= int64(s.authCacheMaxEntries)) ||
+		s.authCache.Len() >= s.authCacheMaxEntries+authCacheSSHReserve
+}
+
+// reclaimFinishedFor removes decided requests, oldest first, until entry fits.
+// A decided request only waits for a late follow-up, which must not cost a new
+// login its admission. Called with authCacheMu held.
+func (s *State) reclaimFinishedFor(entry *types.AuthRequest) bool {
+	for _, id := range s.authCache.Keys() {
+		if rn, ok := s.authCache.Peek(id); ok && rn.IsFinished() {
+			s.authCache.Remove(id)
+
+			if !s.authCacheFullFor(entry) {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // DeleteAuthCacheEntryForTest drops a pending auth request from the cache,
@@ -3219,11 +3257,9 @@ func (s *State) HandleNodeFromAuthPath(
 		}
 	}
 
-	// Signal to waiting clients
+	// The entry stays cached so a follow-up that looks it up after this
+	// still reads the verdict.
 	regEntry.FinishAuth(types.AuthVerdict{Node: finalNode})
-
-	// Remove from registration cache
-	s.authCache.Remove(authID)
 
 	// The login may have created the user (OIDC), which the policy must see.
 	s.refreshUsersAfterRegistration(finalNode, types.UserID(user.ID))
