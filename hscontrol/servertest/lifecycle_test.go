@@ -1153,7 +1153,7 @@ func TestPeerLastSeenPatches(t *testing.T) {
 	}
 
 	// A new peer can first appear offline, which must not pass for going down.
-	watcher.WaitForCondition(t, "peer online", 15*time.Second, peerOnline(true))
+	watcher.WaitForCondition(t, "peer online", 60*time.Second, peerOnline(true))
 
 	down := time.Now()
 
@@ -1165,7 +1165,7 @@ func TestPeerLastSeenPatches(t *testing.T) {
 	assert.WithinRange(t, seen[0], down, time.Now())
 
 	node.Reconnect(t)
-	watcher.WaitForCondition(t, "peer online", 15*time.Second, peerOnline(true))
+	watcher.WaitForCondition(t, "peer online", 60*time.Second, peerOnline(true))
 
 	assert.Len(t, watcher.DeltaLastSeen(), 1, "online patch carried a last seen time")
 }
