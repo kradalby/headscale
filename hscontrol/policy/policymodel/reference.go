@@ -456,22 +456,6 @@ const (
 	// policy/v2/expand.go. Delete the clause once one reading is chosen:
 	// fix production, or make headscale's reading the reference's own.
 	ViaReach
-	// ViaRouterAddress: a via router routing a via grant's destination is
-	// on its destinations' side whether or not it has an address.
-	// Headscale shows only one that has, so the grant's sources do not see
-	// an address-less one (a database-only node). Fails closed.
-	//
-	// TODO(kradalby): policy/via-router-address: fails closed, and only
-	// for a node without addresses, a database-only shape. With
-	// `* -> * via tag:a`, an address-less tag:a router serving
-	// 100.64.0.0/30 is not shown to the grant's sources. No capture or
-	// document decides it. The properties in policy/v2/reference_test.go
-	// count it under "via router without address". Production: Sides.setOf
-	// in policy/v2/visibility.go gives the via role to addressed nodes
-	// only (viaPeerRule in compiled.go names the router's own addresses).
-	// Delete the clause once one reading is chosen, or once such nodes
-	// leave the reference's domain.
-	ViaRouterAddress
 	// ViaSelf: a via grant to autogroup:self reaches each user's devices
 	// through the via routers routing their addresses. Headscale gives it
 	// no rule. Fails closed.
@@ -603,13 +587,9 @@ const (
 	// whole internet: it is given every peer's exit routes and every
 	// peer's subnet route reaching a public address, as a rule without
 	// via to the internet would give them. Steering takes back the exit
-	// routes of peers without a via tag, not the subnet routes — from a
-	// viewer it can see: the steering grants resolve * by address, so a
-	// viewer holding no address (a database-only shape) is on none of
-	// their sources, and nothing is taken back from it; the restatement
-	// leaves it every route the fail-open rule hands it, exits included.
-	// Fails open in route access, closed in effect: the peer's filter
-	// carries nothing from the router, which sends it the traffic.
+	// routes of peers without a via tag, not the subnet routes. Fails open
+	// in route access, closed in effect: the peer's filter carries nothing
+	// from the router, which sends it the traffic.
 	//
 	// TODO(kradalby): policy/via-exit-source-routes: fails open in route
 	// access, closed in effect. With `autogroup:tagged ->
@@ -625,9 +605,8 @@ const (
 	// does. Production: Sides.viaRules in policy/v2/visibility.go gives
 	// the router the rule sources -> util.TheInternet, which
 	// Sides.RouteAccess reads with the router on its source side;
-	// ViaPlan.Steer steers autogroup:internet through exit routes alone,
-	// and reads the viewer's side set, which a viewer holding no address
-	// is not on. Delete the clause once route access leaves a via
+	// ViaPlan.Steer steers autogroup:internet through exit routes alone.
+	// Delete the clause once route access leaves a via
 	// router's own rule to its destination side, or steering takes those
 	// routes back.
 	ViaExitSourceRoutes
@@ -637,7 +616,7 @@ const (
 // tries them.
 var ContestedClauses = []Contested{
 	OthersSelf, StarApprovedRoutes, InternetAtSubnetRouters,
-	ViaOwnAddress, ViaReach, ViaRouterAddress, ViaSelf, ExitDestinationRoutes, AppWildcard, ViaRouterCover, ViaExitInternet,
+	ViaOwnAddress, ViaReach, ViaSelf, ExitDestinationRoutes, AppWildcard, ViaRouterCover, ViaExitInternet,
 	ViaRouterExitRoutes, ViaExitSourceRoutes,
 }
 
@@ -650,7 +629,7 @@ func (c Contested) FailsOpen() bool {
 func (c Contested) String() string {
 	names := []string{
 		"others' self rules", "* adds approved routes", "internet at subnet routers",
-		"via own address", "via reach", "via router without address", "via to self", "exit routes as destination", "* as app destination",
+		"via own address", "via reach", "via to self", "exit routes as destination", "* as app destination",
 		"via router covered", "via exit internet", "via router exit routes", "via exit source routes",
 	}
 
@@ -1351,7 +1330,7 @@ func (r *Ref) coversSourceRouter(rl refRule, router, n RefNode) bool {
 // viaRouter reports whether n is one of via rule rl's routers: it carries
 // a via tag and routes one of rl's destinations.
 func (r *Ref) viaRouter(rl refRule, n RefNode) bool {
-	if !n.hasTag(rl.via) || r.without&ViaRouterAddress != 0 && len(n.Addrs) == 0 {
+	if !n.hasTag(rl.via) {
 		return false
 	}
 

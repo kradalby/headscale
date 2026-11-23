@@ -139,15 +139,13 @@ func (r *Ref) ServedRoutes(viewer, peer types.NodeID) ([]netip.Prefix, []netip.P
 				continue
 			}
 
-			if r.blindSteer(v, q) {
-				want = append(want, q)
-			} else if id, decided := r.Primary(q); !decided {
+			if id, decided := r.Primary(q); !decided {
 				unjudged = append(unjudged, q)
 			} else if id == peer {
 				want = append(want, q)
 			}
 		case isExitRoute(q):
-			if slices.ContainsFunc(via, func(rl refRule) bool { return p.hasTag(rl.via) }) || r.internetWithoutVia(v) || r.blindSteer(v, q) {
+			if slices.ContainsFunc(via, func(rl refRule) bool { return p.hasTag(rl.via) }) || r.internetWithoutVia(v) {
 				want = append(want, q)
 			}
 		case has || !sameVia(via):
@@ -163,19 +161,6 @@ func (r *Ref) ServedRoutes(viewer, peer types.NodeID) ([]netip.Prefix, []netip.P
 	slices.SortFunc(unjudged, netip.Prefix.Compare)
 
 	return want, unjudged
-}
-
-// blindSteer reports whether the ViaExitSourceRoutes restatement carries q
-// at v alone: headscale's steering reads the viewer's side set against the
-// steering grants' sources, which resolve * by address, so a viewer holding
-// no address is on none of them and no route is taken back from it — a via
-// exit router among its own grant's sources keeps every route the clause's
-// fail-open rule hands it, the primary election's word included.
-func (r *Ref) blindSteer(v RefNode, q netip.Prefix) bool {
-	return r.without&ViaExitSourceRoutes != 0 && len(v.Addrs) == 0 &&
-		slices.ContainsFunc(r.rules, func(rl refRule) bool {
-			return viaExitSource(rl, v) && (isExitRoute(q) || internet.OverlapsPrefix(q))
-		})
 }
 
 // internetWithoutVia reports whether a port rule without via lets v reach

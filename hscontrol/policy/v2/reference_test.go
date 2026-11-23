@@ -1207,19 +1207,15 @@ func TestViaRouterExitRoutesIsHeadscalesReading(t *testing.T) {
 // leaves alone, and no other node is. On each world every node is given of
 // the peer the subnet routes the reference with the clause gives, and the
 // reference without it differs exactly where the world says the clause
-// decides. A viewer holding no address (a database-only shape) pins the
-// clause's take-back half too: steering reads the viewer's side set
-// against the steering grants' sources, which resolve * by address, so it
-// decides nothing there and the fail-open routes stand whole, exits
-// included — while an addressed viewer has the non-via peer's exit routes
-// taken back. It fails once production changes the reading.
+// decides, and steering takes the non-via peer's exit routes back. It
+// fails once production changes the reading.
 func TestViaExitSourceRoutesIsHeadscalesReading(t *testing.T) {
 	t.Parallel()
 
 	addr := netip.MustParseAddr
 	// Prefixes 0, 4 and 8 are 10.0.0.0/24, 8.8.8.0/24 and 2001:4860::/32;
 	// 9 and 10 the exit routes. Tag 0 is the via tag.
-	world := func(src policymodel.Sel, tag int, exits, routerSubnets []int, peerTagged bool, peerExits []int, viewerAddr bool, routes ...int) policymodel.World {
+	world := func(src policymodel.Sel, tag int, exits, routerSubnets []int, peerTagged bool, peerExits []int, routes ...int) policymodel.World {
 		var w policymodel.World
 
 		w.Topology.Users = []policymodel.User{{ID: 1, Name: "alice"}}
@@ -1235,16 +1231,11 @@ func TestViaExitSourceRoutesIsHeadscalesReading(t *testing.T) {
 		}
 
 		router := policymodel.Node{
-			ID: 1, Tags: []int{tag},
+			ID: 1, Tags: []int{tag}, V4: addr("100.64.0.1"), V6: addr("fd7a:115c:a1e0::1"),
 			Announced: append(slices.Clone(exits), routerSubnets...), Approved: append(slices.Clone(exits), routerSubnets...),
 		}
 		slices.Sort(router.Announced)
 		slices.Sort(router.Approved)
-
-		router.V4, router.V6 = addr("100.64.0.1"), addr("fd7a:115c:a1e0::1")
-		if !viewerAddr {
-			router.V4, router.V6 = netip.Addr{}, netip.Addr{}
-		}
 
 		w.Topology.Nodes = []policymodel.Node{
 			router, peer,
@@ -1268,21 +1259,19 @@ func TestViaExitSourceRoutesIsHeadscalesReading(t *testing.T) {
 		w       policymodel.World
 		decides bool
 		// steerExits: the peer carries exit routes, which steering takes
-		// back from an addressed router among the grant's sources and
-		// leaves at one holding no address.
+		// back from a router among the grant's sources.
 		steerExits bool
 	}{
-		{"a via exit router among the sources, a public IPv4 route", world(tagged, 0, both, nil, false, nil, true, 4), true, false},
-		{"a via exit router among the sources, a public IPv6 route", world(tagged, 0, both, nil, false, nil, true, 8), true, false},
-		{"a via exit router of IPv4 alone, a public IPv6 route", world(tagged, 0, []int{9}, nil, false, nil, true, 8), true, false},
-		{"a via exit router of IPv6 alone, a public IPv4 route", world(tagged, 0, []int{10}, nil, false, nil, true, 4), true, false},
-		{"the peer carrying the via tag", world(tagged, 0, both, nil, true, nil, true, 4), true, false},
-		{"a via exit router among the sources, a private route", world(tagged, 0, both, nil, false, nil, true, 0), false, false},
-		{"a via exit router not among the sources", world(member, 0, both, nil, false, nil, true, 4), false, false},
-		{"an exit node without the via tag", world(tagged, 1, both, nil, false, nil, true, 4), false, false},
-		{"a via-tagged node without an exit route", world(tagged, 0, nil, nil, false, nil, true, 4), false, false},
-		{"a via exit router among the sources, the peer's exit routes steered back", world(wild, 0, both, []int{8}, false, both, true, 4), true, true},
-		{"a via exit router among the sources holding no address, the peer's exit routes kept", world(wild, 0, both, []int{8}, false, both, false, 4), true, true},
+		{"a via exit router among the sources, a public IPv4 route", world(tagged, 0, both, nil, false, nil, 4), true, false},
+		{"a via exit router among the sources, a public IPv6 route", world(tagged, 0, both, nil, false, nil, 8), true, false},
+		{"a via exit router of IPv4 alone, a public IPv6 route", world(tagged, 0, []int{9}, nil, false, nil, 8), true, false},
+		{"a via exit router of IPv6 alone, a public IPv4 route", world(tagged, 0, []int{10}, nil, false, nil, 4), true, false},
+		{"the peer carrying the via tag", world(tagged, 0, both, nil, true, nil, 4), true, false},
+		{"a via exit router among the sources, a private route", world(tagged, 0, both, nil, false, nil, 0), false, false},
+		{"a via exit router not among the sources", world(member, 0, both, nil, false, nil, 4), false, false},
+		{"an exit node without the via tag", world(tagged, 1, both, nil, false, nil, 4), false, false},
+		{"a via-tagged node without an exit route", world(tagged, 0, nil, nil, false, nil, 4), false, false},
+		{"a via exit router among the sources, the peer's exit routes steered back", world(wild, 0, both, []int{8}, false, both, 4), true, true},
 	} {
 		sv, err := serve(nil, c.w, policymodel.Change{})
 		require.NoError(t, err, c.name)
@@ -1329,14 +1318,7 @@ func TestViaExitSourceRoutesIsHeadscalesReading(t *testing.T) {
 				continue
 			}
 
-			blind := !v.V4.IsValid() && !v.V6.IsValid()
-			exits := sorted(peer.View().ExitRoutes())
-
-			if blind {
-				require.Emptyf(t, slices.Concat(steer.Include, steer.Exclude), "%s: steering decides n%d's routes of the peer: %+v", c.name, v.ID, steer)
-			} else {
-				require.Equalf(t, exits, sorted(steer.Exclude), "%s: steering takes n%d's exit routes of the peer back", c.name, v.ID)
-			}
+			require.Equalf(t, sorted(peer.View().ExitRoutes()), sorted(steer.Exclude), "%s: steering takes n%d's exit routes of the peer back", c.name, v.ID)
 
 			want, unjudged := headscale.ServedRoutes(v.ID, 2)
 			require.Equalf(t, sorted(slices.DeleteFunc(slices.Clone(want), func(p netip.Prefix) bool { return slices.Contains(unjudged, p) })), held(viewer.View(), steer), "%s: the reference less the clause gives n%d what the client holds", c.name, v.ID)

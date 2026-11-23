@@ -1919,9 +1919,8 @@ func (s Sides) setOf(id types.NodeID, f *sideFacts) RoleSet {
 		onSrc := false
 
 		for _, g := range f.targets {
-			// TODO(kradalby): policy/via-router-address: an address-less via
-			// router is not shown to the grant's sources (fails closed,
-			// database-only); see policymodel.ViaRouterAddress.
+			// NewState refuses a node without addresses, so every via
+			// router is shown.
 			if f.addressed() {
 				roles = append(roles, Role{kind: roleViaSeen, value: uint64(g)}) //nolint:gosec // a grant index
 			}

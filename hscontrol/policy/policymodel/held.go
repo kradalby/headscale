@@ -285,9 +285,6 @@ type HeldJudge struct {
 	// routes left unjudged, ByHistory those only the election history
 	// decides.
 	Steered, Unjudged, ByHistory int
-	// Addressless counts the peers whose via-steered routes a viewer
-	// holding no address is given fewer of than the reference gives.
-	Addressless int
 	// ContestedPeers and ContestedRoutes count what a named clause
 	// forgave, Skipped the moments out of the reference's domain, by why.
 	ContestedPeers, ContestedRoutes map[Contested]int
@@ -300,10 +297,10 @@ type HeldJudge struct {
 
 func (j *HeldJudge) String() string {
 	return fmt.Sprintf("reference: clients %d, filters compared %d, peer sets %d, route pairs %d (steered %d, routes left unjudged %d, "+
-		"decided by the election history %d, steered short to a viewer without addresses %d), self primaries %d, SSH decisions %d, "+
+		"decided by the election history %d), self primaries %d, SSH decisions %d, "+
 		"expiry flags %d, baseline caps %d, entries %d; skipped %v; "+
 		"peers contested %v, routes contested %v; filters: %v; form: %v",
-		j.Clients, j.Filters, j.PeerSets, j.RoutePairs, j.Steered, j.Unjudged, j.ByHistory, j.Addressless, j.Primaries, j.SSHDecisions,
+		j.Clients, j.Filters, j.PeerSets, j.RoutePairs, j.Steered, j.Unjudged, j.ByHistory, j.Primaries, j.SSHDecisions,
 		j.WireFlags, j.BaseCaps, j.Entries, j.Skipped,
 		ContestedCounts(j.ContestedPeers), ContestedCounts(j.ContestedRoutes), &j.Verdicts, &j.Form)
 }
@@ -437,8 +434,6 @@ func (h *Held) peers(id types.NodeID, nm *netmap.NetworkMap, _ bool) string {
 // routes holds what each peer carries in the client's AllowedIPs beyond
 // its addresses to [Ref.ServedRoutes].
 func (h *Held) routes(id types.NodeID, nm *netmap.NetworkMap, _ bool) string {
-	viewer, _ := h.m.World.Topology.Node(id)
-
 	for _, p := range nm.Peers {
 		pid := types.NodeID(p.ID()) //nolint:gosec // small
 		routes := slices.DeleteFunc(p.AllowedIPs().AsSlice(), func(q netip.Prefix) bool { return slices.Contains(p.Addresses().AsSlice(), q) })
@@ -484,20 +479,11 @@ func (h *Held) routes(id types.NodeID, nm *netmap.NetworkMap, _ bool) string {
 		}
 
 		k, ok := ContestedServedRoutes(h.ref, id, pid, routes)
-
-		switch {
-		case ok:
-			h.j.ContestedRoutes[k]++
-		case h.ref.Steered(id, pid) && len(viewer.Addrs()) == 0 && !slices.ContainsFunc(judged, func(q netip.Prefix) bool { return !slices.Contains(want, q) }):
-			// TODO(kradalby): policy/via-addressless-viewer: a viewer
-			// holding no address (database only) is on a via grant's
-			// sources by the routes it serves under *, so the reference
-			// steers it the routers' routes; headscale steers it none.
-			// It can send nothing either way. Counted, not judged.
-			h.j.Addressless++
-		default:
+		if !ok {
 			return fmt.Sprintf("its client is given %v of n%d's routes, the reference %v (%v unjudged)", routes, pid, want, unjudged)
 		}
+
+		h.j.ContestedRoutes[k]++
 	}
 
 	return ""
