@@ -1576,7 +1576,7 @@ func (fd *frontDoor) relogin(at string) {
 	n, ok := fd.pick("logs-in", func(n policymodel.Node, nd *fdNode) bool {
 		owner, _ := fd.w.Topology.User(n.User)
 
-		return (n.Expired || nd.loggedOut) && (nd.Key != "" && nd.reusable || !n.Tagged() && fd.loginUser(owner))
+		return (n.Expired || nd.loggedOut) && (nd.Key != "" && nd.reusable && nd.keySpeaksFor(n) || !n.Tagged() && fd.loginUser(owner))
 	})
 	if !ok {
 		fd.run.tally.steps[stepNames[stepRelogin]+" (no node)"]++
@@ -1621,12 +1621,14 @@ func (fd *frontDoor) keyLogin(n policymodel.Node, key string) error {
 
 // keyLoginEdits is what a login with n's key makes of n: a user's own key
 // presented for a node an admin tagged since takes it back as that user's
-// device (preAuthKeyClaimsTaggedNode); any other renews it. It connects,
-// and the server runs auto-approval (see autoApprove).
+// device (preAuthKeyClaimsTaggedNode), but only while its registration by
+// the key still stands — an interactive login that re-registered the node
+// left no key that claims it (ClaimableBy); any other login renews it. It
+// connects, and the server runs auto-approval (see autoApprove).
 func (fd *frontDoor) keyLoginEdits(n policymodel.Node) []policymodel.Edit {
 	var out []policymodel.Edit
 
-	if nd := fd.nodes[n.ID]; n.Tagged() && !nd.Tagged {
+	if nd := fd.nodes[n.ID]; n.Tagged() && !nd.Tagged && nd.Method == util.RegisterMethodAuthKey {
 		out = append(out, policymodel.Retag{ID: n.ID, User: nd.KeyUser})
 	}
 
@@ -1646,12 +1648,22 @@ func (fd *frontDoor) keyLoggedIn(at string, n policymodel.Node) {
 
 	fd.answered(at, n.ID, nd.tc)
 	nd.loggedOut = false
+	prior := nd.Method
 	nd.Method = util.RegisterMethodAuthKey
 
-	if n.Tagged() && !nd.Tagged {
+	if n.Tagged() && !nd.Tagged && prior == util.RegisterMethodAuthKey {
 		nd.Ephemeral = false
 		fd.run.tally.edits["a user's key takes a tagged node back"]++
 	}
+}
+
+// keySpeaksFor reports whether nd's key still speaks for n, as production
+// decides it ([PreAuthKey.CanReauthenticate]): a tagged node an
+// interactive login re-registered records no key that claims it, so a
+// login with the key adds a device beside it — a shape the model does
+// not carry, which the steps that log in with a key leave alone.
+func (nd *fdNode) keySpeaksFor(n policymodel.Node) bool {
+	return !n.Tagged() || nd.Method == util.RegisterMethodAuthKey
 }
 
 // The ownership scripts: where a node changes hands.
@@ -1769,7 +1781,7 @@ func (fd *frontDoor) claimByLogin(at string) bool {
 }
 
 func (fd *frontDoor) loginWithKey(at string) bool {
-	n, ok := fd.pick("key-login", func(_ policymodel.Node, nd *fdNode) bool { return nd.Key != "" && nd.reusable })
+	n, ok := fd.pick("key-login", func(n policymodel.Node, nd *fdNode) bool { return nd.Key != "" && nd.reusable && nd.keySpeaksFor(n) })
 	if !ok {
 		return false
 	}
@@ -2410,7 +2422,7 @@ func (fd *frontDoor) race(at string) {
 
 	switch kind {
 	case raceExpireLogin:
-		n, ok = fd.pick("racer", func(_ policymodel.Node, nd *fdNode) bool { return nd.Key != "" && nd.reusable })
+		n, ok = fd.pick("racer", func(n policymodel.Node, nd *fdNode) bool { return nd.Key != "" && nd.reusable && nd.keySpeaksFor(n) })
 	default:
 		n, ok = fd.pick("racer", func(n policymodel.Node, nd *fdNode) bool {
 			// A case running the small clock leaves an ephemeral node to
@@ -2911,4 +2923,75 @@ func TestAWildcardTagOwnerNamesDevicesNotUsers(t *testing.T) {
 	// TODO(kradalby): policy/owner-wildcard-user-half: the same user, refused.
 	assert.ErrorContains(t, tagged.Login(ctx, tagged.Persist(), "", controlclient.LoginInteractive, requestA("tagged"), approve),
 		"not permitted", "bob logging in on a tagged node: the wildcard owner names no user")
+}
+
+// TestAKeyClaimsOnlyWhatItRegistered pins the front door's claim model to
+// production: a user's key takes a tagged node back only while its
+// registration by the key still stands (preAuthKeyClaimsTaggedNode behind
+// ClaimableBy); an interactive login that re-registered the node leaves no
+// key that claims it, and a login with the key adds a device beside it.
+func TestAKeyClaimsOnlyWhatItRegistered(t *testing.T) {
+	tagged := policymodel.Node{ID: 5, Tags: []int{1}}
+	fd := &frontDoor{nodes: map[types.NodeID]*fdNode{5: {KeyUser: 2}}}
+
+	claims := func(method string) bool {
+		fd.nodes[5].Method = method
+
+		return slices.ContainsFunc(fd.keyLoginEdits(tagged), func(e policymodel.Edit) bool {
+			_, ok := e.(policymodel.Retag)
+			return ok
+		})
+	}
+
+	require.True(t, claims(util.RegisterMethodAuthKey), "the key takes back a node an admin tagged since")
+	require.False(t, claims(util.RegisterMethodCLI), "a login re-registered the node: the key claims nothing")
+}
+
+// TestAKeyDoesNotClaimWhatALoginReRegistered pins the shape the front
+// door's keyLoginEdits models: after an interactive login re-registered
+// a tagged node, keeping its tags, the node records no key that claims it
+// (ClaimableBy), and a login with the key that joined it adds a device
+// beside it rather than taking it back (preAuthKeyClaimsTaggedNode).
+func TestAKeyDoesNotClaimWhatALoginReRegistered(t *testing.T) {
+	srv := NewServer(t)
+
+	_, err := srv.State().SetPolicy([]byte(`{"tagOwners": {"tag:a": ["bob@example.com"]}, "acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]}`))
+	require.NoError(t, err)
+
+	bob, err := srv.State().CreateUser(types.User{Name: "bob", Email: "bob@example.com"})
+	require.NoError(t, err)
+	authKey := srv.CreatePreAuthKey(t, types.UserID(bob.ID))
+	client := NewClient(t, srv, "n", WithAuthKey(authKey), WithoutPoll())
+
+	nv, ok := srv.State().GetNodeByNodeKey(client.Persist().PrivateNodeKey.Public())
+	require.True(t, ok)
+
+	id := nv.ID()
+
+	_, err = srv.State().SetNodeTags(id, []string{"tag:a"})
+	require.NoError(t, err)
+
+	approve := func(authID string) error { return srv.ApproveAuth(t.Context(), authID, "bob") }
+	requestA := &tailcfg.Hostinfo{BackendLogID: "servertest-claim", Hostname: "claim", RequestTags: []string{"tag:a"}}
+	plain := &tailcfg.Hostinfo{BackendLogID: "servertest-claim", Hostname: "claim"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	require.NoError(t, client.Login(ctx, client.Persist(), "", controlclient.LoginInteractive, requestA, approve),
+		"bob re-logs in on his tagged node, requesting its tag")
+
+	nodes := srv.State().GetNodesByMachineKeyAllUsers(client.MachineKey())
+	require.Len(t, nodes, 1, "the interactive login keeps the node")
+
+	require.NoError(t, client.Login(ctx, client.Persist(), authKey, controlclient.LoginInteractive, plain, nil),
+		"the key that joined the node logs in again")
+
+	nodes = srv.State().GetNodesByMachineKeyAllUsers(client.MachineKey())
+	require.Len(t, nodes, 2, "the key claims nothing: it adds a device beside the node")
+
+	still, ok := srv.State().GetNodeByID(id)
+	require.True(t, ok)
+	assert.True(t, still.IsTagged(), "the tagged node keeps its tags")
+	assert.Equal(t, util.RegisterMethodCLI, still.RegisterMethod(), "and its interactive registration")
 }
