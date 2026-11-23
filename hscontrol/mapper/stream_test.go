@@ -1695,7 +1695,7 @@ func moveReceiver(t *testing.T, r *rand.Rand, o *oracleRun) {
 	case 1:
 		n.Hostinfo.AppConnector.Set(!n.Hostinfo.AppConnector.EqualBool(true))
 	default:
-		if other := nodes.At(r.IntN(nodes.Len())); !o.unshared && other.ID() != n.ID && other.IPv4().Valid() && r.IntN(2) == 0 {
+		if other := nodes.At(r.IntN(nodes.Len())); other.ID() != n.ID && other.IPv4().Valid() && r.IntN(2) == 0 {
 			n.IPv4 = new(other.IPv4().Get())
 		} else {
 			o.addrs++
@@ -2423,8 +2423,6 @@ type oracleRun struct {
 	reach      *oracleReach
 	// addrs counts the addresses address changes handed out.
 	addrs int
-	// unshared keeps every address to one node, as the allocator does.
-	unshared bool
 }
 
 // oracleWrites is how many kinds of write [oracleRun.writeOp] makes.
