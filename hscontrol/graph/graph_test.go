@@ -1103,6 +1103,69 @@ func TestCursorPinsNoEntries(t *testing.T) {
 	}
 }
 
+// TestMapOfNonIntegerKeys holds the hasher's promise — any comparable
+// key, hashed the way the runtime's maps do — against the integer keys
+// every other test uses: a string and a struct key go through the whole
+// Map API, edits, cursors and log included.
+func TestMapOfNonIntegerKeys(t *testing.T) {
+	base := NewMap(Same[int], map[string]int{"a": 1, "b": 2})
+
+	e := base.Edit()
+	e.Set("c", 3)
+	e.Delete("b")
+	e.Set("a", 10)
+	next := e.Done()
+
+	if got, ok := next.Get("a"); !ok || got != 10 {
+		t.Fatalf(`Get("a") = %d, %t`, got, ok)
+	}
+
+	if _, ok := next.Get("b"); ok {
+		t.Fatal(`deleted "b" still there`)
+	}
+
+	if next.Len() != 2 {
+		t.Fatalf("Len = %d", next.Len())
+	}
+
+	keys, _ := next.ChangedSince(base)
+	slices.Sort(keys)
+
+	if !slices.Equal(keys, []string{"a", "b", "c"}) {
+		t.Fatalf("ChangedSince = %v", keys)
+	}
+
+	if keys, _ := next.ChangedSince(base.Cursor()); !slices.Equal(slices.Sorted(slices.Values(keys)), []string{"a", "b", "c"}) {
+		t.Fatalf("ChangedSince from a cursor = %v", keys)
+	}
+
+	sorted := func(keys []string) []string {
+		out := slices.Clone(keys)
+		slices.Sort(out)
+
+		return out
+	}
+
+	if got := sorted(Changes(base, next)); !slices.Equal(got, []string{"a", "b", "c"}) {
+		t.Fatalf("Changes = %v", got)
+	}
+
+	type point struct{ x, y int }
+
+	pbase := NewMap(Same[int], map[point]int{{1, 2}: 1})
+	pe := pbase.Edit()
+	pe.Set(point{3, 4}, 2)
+	pnext := pe.Done()
+
+	if keys, _ := pnext.ChangedSince(pbase); !slices.Equal(keys, []point{{3, 4}}) {
+		t.Fatalf("ChangedSince of struct keys = %v", keys)
+	}
+
+	if got, ok := pnext.Get(point{1, 2}); !ok || got != 1 {
+		t.Fatalf("Get of a struct key = %d, %t", got, ok)
+	}
+}
+
 // BenchmarkGroupByEdit moves one key into a group of n: one copy of the
 // group's list, at its length, is what the edit should cost.
 func BenchmarkGroupByEdit(b *testing.B) {
