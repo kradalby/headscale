@@ -241,8 +241,11 @@ func approverScript(w World, who, way int) []Step {
 	}
 
 	for k := range nodes {
+		// An offline node is left to drawn steps, as a primary goes down
+		// last: a failure that needs one then shrinks to a drawn retag,
+		// not to the script, which the shrinker cannot cut.
 		n := nodes[(who+k)%len(nodes)]
-		if way == approverLogin && !n.Tagged() {
+		if way == approverLogin && !n.Tagged() || n.Offline {
 			continue
 		}
 
