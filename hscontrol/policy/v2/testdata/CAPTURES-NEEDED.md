@@ -260,6 +260,24 @@ in its answer; the default named below then stands.
 - **Headscale:** the peer keeps the old endpoints.
 - **Default if not answerable:** keep and document.
 
+### B4 `map-oversized-hostinfo-routes` — `ValidateHostinfo` in `hscontrol/types/node.go`
+
+- **Question:** what does the hosted service do with a client report (map request
+  Hostinfo) that is far larger than a real client sends and that newly advertises routes?
+- **How:** a hand-built map request, as for B3. A node with a live session and no routes
+  sends one non-streaming request whose Hostinfo advertises 10.77.0.0/24 and is padded
+  (a free-text field) well past 64 KiB; repeat with a normal-sized Hostinfo advertising
+  several thousand routes. An auto-approver in the policy covers 10.77.0.0/16.
+- **Look at:** the HTTP status of each request; whether the admin API then lists the
+  route as advertised, and as approved; whether peers get it in the node's `AllowedIPs`;
+  whether the node's own filter changes.
+- **Headscale:** answers 413 and keeps nothing from the report (64 KiB of Hostinfo, a
+  capped number of routes). A change that still keeps the advertised routes (capped) and
+  the app-connector flag from a refused report, making them approvable, is written and
+  waits on this answer.
+- **Default if not answerable:** the maintainer decides between keeping the routes as
+  advertised and keeping nothing.
+
 ## Already settled (no capture needed)
 
 - Nodes sharing an address, nodes without any address, nodes outside the service's
