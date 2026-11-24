@@ -39,10 +39,11 @@ const (
 )
 
 var (
-	errInvalidPKCEMethod         = errors.New("pkce.method must be either 'plain' or 'S256'")
-	errURLSyntax                 = errors.New("invalid URL syntax")
-	ErrNoPrefixConfigured        = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
-	ErrInvalidAllocationStrategy = errors.New("invalid prefix allocation strategy")
+	errInvalidPKCEMethod            = errors.New("pkce.method must be either 'plain' or 'S256'")
+	errURLSyntax                    = errors.New("invalid URL syntax")
+	ErrNoPrefixConfigured           = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
+	ErrInvalidAllocationStrategy    = errors.New("invalid prefix allocation strategy")
+	ErrPrefixOutsideTailscaleRanges = errors.New("prefix outside the Tailscale ranges")
 )
 
 // DefaultBaseDomain is dns.base_domain's default. `.internal` is reserved
