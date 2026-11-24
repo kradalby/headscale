@@ -68,7 +68,11 @@ type Derived[T any] struct{ idx int }
 func (d Derived[T]) ref() cellRef[T] { return cellRef[T](d.idx) }
 
 // NewInput registers an input cell with an initial value. equal decides
-// whether a set value is a change.
+// whether a set value is a change: a value it calls equal to the one the
+// cell holds is dropped and the cell keeps that value, which is what makes
+// a write that changes nothing free — no snapshot, no wake. A derived cell
+// instead stores each value it computes, so the state it carries rides on
+// under one revision.
 func (g *Graph) NewInput[T any](name string, initial T, equal func(a, b T) bool) Input[T] {
 	return Input[T]{idx: g.register(cellDef{
 		name:    name,
@@ -312,10 +316,6 @@ func (g *Graph) commit(prev *Snapshot, sets map[int]any) (*Snapshot, bool) {
 			continue
 		}
 
-		// TODO(kradalby): graph/input-equal-kept: an input set to a value
-		// its equality calls equal keeps the value it held, where a
-		// derived cell below stores the new one; NewInput's doc does not
-		// say which. Pinned by TestInputKeepsAValueItsEqualityCallsEqual.
 		if first || !c.equal(next.values[i], v) {
 			next.values[i] = v
 			next.changed[i] = next.rev

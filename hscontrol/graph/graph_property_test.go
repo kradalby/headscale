@@ -1028,8 +1028,8 @@ func TestConcurrentWritersPublishWholeSnapshots(t *testing.T) {
 	})
 }
 
-// TestInputKeepsAValueItsEqualityCallsEqual pins graph/input-equal-kept:
-// an input set to a value its equality calls equal keeps the value it held,
+// TestInputKeepsAValueItsEqualityCallsEqual pins NewInput's rule: an
+// input set to a value its equality calls equal keeps the value it held,
 // even when the commit publishes for another input, where a derived cell
 // computing a value its equality calls equal stores it.
 func TestInputKeepsAValueItsEqualityCallsEqual(t *testing.T) {
@@ -1057,7 +1057,7 @@ func TestInputKeepsAValueItsEqualityCallsEqual(t *testing.T) {
 	}
 
 	if s.Get(a) != 1 {
-		t.Fatalf("input holds %d: it now stores a value its equality calls equal; see graph/input-equal-kept", s.Get(a))
+		t.Fatalf("input holds %d: it now stores a value its equality calls equal", s.Get(a))
 	}
 }
 

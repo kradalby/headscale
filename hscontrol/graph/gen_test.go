@@ -857,7 +857,7 @@ func TestScenarioCoverage(t *testing.T) {
 		"never cell recomputes its value": 0.01, "sticky keeps its incumbent": 0.004,
 		"cell-panic": 0.05, "read-ahead": 0.02, "reads itself": 0.01, "armed cell skipped": 0.05,
 		"refused": 0.05, "refusal unchecked": 0.01, "fn-error": 0.05, "fn-panic": 0.05, "checked": 0.1, "first commit fails": 0.05,
-		excInputEqualKept: 0.01,
+		shapeInputEqualKept: 0.01,
 	})
 }
 

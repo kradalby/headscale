@@ -22,10 +22,13 @@ var (
 // and counts the case; each is pinned by a hand test that fails once the
 // package changes.
 const (
-	excInputEqualKept  = "graph/input-equal-kept"
 	excPeekFirstZero   = "graph/peek-first-zero"
 	excChangedAtValues = "graph/changedat-values"
 )
+
+// Shapes the model names for the coverage floors though the behaviour they
+// mark is documented, so the floors stay meaningful.
+const shapeInputEqualKept = "input set to an equal value"
 
 // graphModel is a graph as the package doc describes it, recomputed from
 // scratch at every commit: every derived cell is evaluated from what it
@@ -126,13 +129,10 @@ func (m graphModel) step(c commitPlan) commitOutcome {
 			continue
 		}
 
-		// TODO(kradalby): graph/input-equal-kept: an input set to a value
-		// its equality calls equal keeps the value it held, where a derived
-		// cell stores the new one; NewInput's doc does not say which. The
-		// model keeps it, as the package does. Delete with
-		// TestInputKeepsAValueItsEqualityCallsEqual once the doc says.
+		// An input set to a value its equality calls equal keeps the
+		// value it held, as NewInput's doc says; counted for coverage.
 		if v != vals[i] {
-			out.excepts = append(out.excepts, excInputEqualKept)
+			out.excepts = append(out.excepts, shapeInputEqualKept)
 		}
 	}
 
