@@ -2876,6 +2876,41 @@ func (s *Snapshot) PrimaryRoutesForNode(id types.NodeID) []netip.Prefix {
 	return slices.Clone(s.s.Get(s.w.primaries).byNode[id])
 }
 
+// PrimariesVersion is the primary routes of a snapshot, which a reader keeps
+// to ask a later snapshot whose primaries moved. It holds one election's
+// assignment, which the snapshots of that election share.
+type PrimariesVersion struct {
+	byNode map[types.NodeID][]netip.Prefix
+}
+
+// PrimariesVersion returns the version of the primary routes of s.
+func (s *Snapshot) PrimariesVersion() PrimariesVersion {
+	return PrimariesVersion{byNode: s.s.Get(s.w.primaries).byNode}
+}
+
+// PrimariesMovedSince returns the nodes among ids whose primary routes
+// differ between v and s.
+func (s *Snapshot) PrimariesMovedSince(v PrimariesVersion, ids []types.NodeID) []types.NodeID {
+	byNode := s.s.Get(s.w.primaries).byNode
+
+	var out []types.NodeID
+
+	for _, id := range ids {
+		if !sameNodePrimaries(v.byNode[id], byNode[id]) {
+			out = append(out, id)
+		}
+	}
+
+	return out
+}
+
+// sameNodePrimaries compares one node's primaries in two elections. A patched
+// election shares every slice it did not move, so an identical slice is
+// equal without walking its prefixes.
+func sameNodePrimaries(a, b []netip.Prefix) bool {
+	return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0] || slices.Equal(a, b))
+}
+
 // HANodes returns the prefixes with two or more online advertisers.
 func (s *Snapshot) HANodes() map[netip.Prefix][]types.NodeID {
 	out := make(map[netip.Prefix][]types.NodeID)
@@ -3140,15 +3175,7 @@ func (s *Snapshot) Since(old *Snapshot) Change {
 	}
 
 	if s.PrimariesRev() != old.PrimariesRev() {
-		// A patched election shares every slice it did not move, so an
-		// identical slice is equal without walking its prefixes.
-		c.Primaries = changedKeys(
-			old.s.Get(old.w.primaries).byNode,
-			s.s.Get(s.w.primaries).byNode,
-			func(a, b []netip.Prefix) bool {
-				return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0] || slices.Equal(a, b))
-			},
-		)
+		c.Primaries = changedKeys(old.s.Get(old.w.primaries).byNode, s.s.Get(s.w.primaries).byNode, sameNodePrimaries)
 
 		was, now := old.s.Get(old.w.primaries).via, s.s.Get(s.w.primaries).via
 		c.Primaries = append(c.Primaries, now.ChangedNodes(was)...)

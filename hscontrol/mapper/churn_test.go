@@ -907,8 +907,9 @@ func TestScalingWriteWorkChurn(t *testing.T) {
 	// of the nodes holding the addresses that came or went, so a tag:tN
 	// node's join leaves the other tag:tN nodes' filters alone. A routed
 	// peer renders again only for a viewer whose side set moved, or when
-	// its routes' cover or what every route reads did: a join or a group
-	// edit elsewhere moves neither for the routers' subnets.
+	// its routes' cover or what every route reads did, and then only when
+	// the routes it gives differ: a join or a group edit elsewhere moves
+	// neither for the routers' subnets.
 	ceilings := map[string][4]int{
 		"group/group-all": {400, 400, 1600, 360},
 		"group/routers":   {112, 112, 640, 80},
@@ -936,7 +937,7 @@ func TestScalingWriteWorkChurn(t *testing.T) {
 		"tag/routers":     {400, 400, 0, 396},
 		"tag/selectors":   {308, 308, 120, 244},
 		"tag/tags":        {80, 80, 72, 40},
-		"tag/via":         {400, 400, 416, 40},
+		"tag/via":         {400, 400, 396, 40},
 	}
 
 	for _, kind := range slices.Sorted(maps.Keys(churnWrites)) {
@@ -1024,7 +1025,7 @@ func TestScalingWriteWorkChurnCapability(t *testing.T) {
 		"tag/routers":     {400, 400, 0, 80, 84, 8, 472, 0},
 		"tag/selectors":   {308, 308, 120, 0, 4, 0, 0, 0},
 		"tag/tags":        {80, 80, 72, 0, 4, 0, 0, 0},
-		"tag/via":         {400, 400, 416, 40, 44, 8, 400, 0},
+		"tag/via":         {400, 400, 396, 40, 44, 8, 400, 0},
 	}
 
 	for _, kind := range slices.Sorted(maps.Keys(churnWrites)) {

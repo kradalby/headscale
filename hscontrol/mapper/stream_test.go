@@ -1063,6 +1063,136 @@ func TestStreamRouteOverlaySurvivesRerenderedPeer(t *testing.T) {
 	require.Empty(t, client.sameAs(newModelClient(fresh[0])))
 }
 
+// TestViewersGivenTheSameRoutesShareRoutedPeers holds what a session keeps
+// for its routed peers to what it is given: the sessions given the same
+// routes of a router hold one render of it, and the sessions of a class
+// given the same routes of every router hold one peer map. So a session
+// costs the same however many routers it shares with the others, where a
+// copy of every routed peer per session would cost the control plane
+// sessions × routers.
+func TestViewersGivenTheSameRoutesShareRoutedPeers(t *testing.T) {
+	const nodes, extra = 160, 40
+
+	perSession := map[int]int64{}
+
+	for _, routers := range []int{4, 64} {
+		cfg, s := benchState(t, nodes, 4)
+		all := s.ListNodes()
+
+		for i := range routers {
+			n := all.At(i).AsStruct()
+			p := netip.PrefixFrom(netip.AddrFrom4([4]byte{10, 0, byte(i), 0}), 24)
+			n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{p}}
+			n.ApprovedRoutes = []netip.Prefix{p}
+			s.PutNodeInStoreForTest(*n)
+			s.Connect(n.ID)
+		}
+
+		snap := s.Snapshot()
+		hub := NewHub()
+
+		streams := make([]*Stream, 0, nodes)
+
+		for _, nv := range all.All() {
+			st := NewStream(cfg, hub, nv.ID(), capVer)
+			_, err := st.Initial(snap)
+			require.NoError(t, err)
+
+			streams = append(streams, st)
+		}
+
+		// The most renders any router is held in beyond the routes it gives.
+		worst, held := 0, 0
+
+		for i := range routers {
+			router := mustNode(t, s, all.At(i).ID())
+			answers, copies := map[string]struct{}{}, map[*tailcfg.Node]struct{}{}
+
+			for _, st := range streams {
+				if st.nodeID == router.ID() {
+					continue
+				}
+
+				routes := snap.RoutesForPeer(mustNode(t, s, st.nodeID), router)
+				require.NotEmpty(t, routes, "test sanity: every viewer is given router %d's route", i)
+				answers[fmt.Sprint(routes)] = struct{}{}
+
+				p, ok := st.sent.peer(router.ID().NodeID())
+				require.True(t, ok)
+				require.Contains(t, p.AllowedIPs, routes[0])
+
+				copies[p] = struct{}{}
+			}
+
+			if extra := len(copies) - len(answers); extra > worst {
+				worst, held = extra, len(copies)
+			}
+		}
+
+		assert.Zero(t, worst, "%d routers: %d viewers given one route of a router hold %d renders of it", routers, nodes-1, held)
+
+		peerMaps := map[*peerMap]struct{}{}
+		for _, st := range streams {
+			peerMaps[st.sent.peers] = struct{}{}
+		}
+
+		assert.Equal(t, 1, len(peerMaps), "%d routers: the sessions of one class given the same routes share one peer map", routers) //nolint:testifylint // the count is the message
+
+		// The cost of a session is what it adds to the heap kept: more
+		// sessions of members, which share every router with the rest. The
+		// cleanups earlier tests leave run after a collection and free more,
+		// so the heap is read once a collection frees nothing more, and the
+		// median of three batches is taken.
+		heap := func() int64 {
+			var last int64
+
+			for i := range 20 {
+				runtime.GC()
+
+				var ms runtime.MemStats
+				runtime.ReadMemStats(&ms)
+
+				h := int64(ms.HeapAlloc) //nolint:gosec // a heap fits
+				if i > 0 && h-last < 1024 && last-h < 1024 {
+					return h
+				}
+
+				last = h
+
+				runtime.Gosched()
+			}
+
+			return last
+		}
+
+		batches, added := make([]int64, 0, 3), make([]*Stream, 0, 3*extra)
+
+		for range 3 {
+			before := heap()
+
+			for k := range extra {
+				st := NewStream(cfg, hub, all.At(routers+k).ID(), capVer)
+				_, err := st.Initial(snap)
+				require.NoError(t, err)
+
+				added = append(added, st)
+			}
+
+			batches = append(batches, (heap()-before)/extra)
+		}
+
+		slices.Sort(batches)
+		perSession[routers] = batches[1]
+
+		runtime.KeepAlive(added)
+		runtime.KeepAlive(streams)
+	}
+
+	t.Logf("heap kept per session: %d B with 4 routers, %d B with 64", perSession[4], perSession[64])
+	assert.Less(t, perSession[64]-perSession[4], int64(2048),
+		"sixty more routers shared with every other session must not grow a session")
+}
+
 // BenchmarkRoutedRender measures one endpoint update with unrelated routers,
 // including invisible routers whose routes never belong to the viewer.
 func BenchmarkRoutedRender(b *testing.B) {
@@ -1173,6 +1303,10 @@ func benchState(tb testing.TB, n, users int) (*types.Config, *state.State) {
 
 	database, err := db.NewHeadscaleDatabase(cfg)
 	require.NoError(tb, err)
+
+	// As in scalingTailnet: the fixture's fsyncs are its cost on disk, and
+	// the state reopens the file with its own settings.
+	require.NoError(tb, database.DB.Exec("PRAGMA synchronous = OFF").Error)
 
 	for i, u := range database.CreateUsersForTest(users, "u") {
 		database.CreateRegisteredNodesForTest(u, n/users+min(1, max(0, n%users-i)), u.Name)
@@ -3561,11 +3695,12 @@ func TestScalingWriteWork(t *testing.T) {
 	// wakes its viewers is above need.
 	//
 	// The via shape sees what allow-all does, plus routes that differ per
-	// viewer: a routed peer renders again for a viewer when what every
-	// route reads moved, as the policy rows' first write does, when the
+	// viewer: a routed peer's routes are read again for a viewer when what
+	// every route reads moved, as at the policy rows' writes, when the
 	// viewer's side set did, as the rejoined node's does, or when the
-	// peer's routes' cover did. A via election move renders only the
-	// routers the election steers to or from. The first online write also
+	// peer's routes' cover did, and it renders again only when they differ:
+	// viewers given the same routes of a render share one. A via election
+	// move renders only the routers the election steers to or from. The first online write also
 	// changes the router's own PrimaryRoutes. Rejoin restores its original
 	// SessionStart, so final wire state is unchanged.
 	//
@@ -3620,12 +3755,12 @@ func TestScalingWriteWork(t *testing.T) {
 		"policy/allow-all":         {500, 500, 0},
 		"policy/group-all":         {500, 500, 2000},
 		"policy/mesh":              {500, 500, 0},
-		"policy/routers":           {500, 500, 2780},
+		"policy/routers":           {500, 500, 1980},
 		"policy/selectors":         {500, 500, 1860},
 		"policy/self":              {500, 500, 9000},
 		"policy/tags":              {500, 500, 8900},
 		"policy/users":             {500, 500, 9000},
-		"policy/via":               {500, 500, 495},
+		"policy/via":               {500, 500, 0},
 		"rejoin/allow-all":         {400, 0, 396},
 		"rejoin/group-all":         {400, 0, 396},
 		"rejoin/mesh":              {400, 0, 396},
@@ -3634,7 +3769,7 @@ func TestScalingWriteWork(t *testing.T) {
 		"rejoin/self":              {40, 0, 36},
 		"rejoin/tags":              {44, 0, 40},
 		"rejoin/users":             {40, 0, 36},
-		"rejoin/via":               {400, 0, 792},
+		"rejoin/via":               {400, 0, 396},
 		"rename/allow-all":         {400, 400, 396},
 		"rename/group-all":         {400, 400, 396},
 		"rename/mesh":              {400, 400, 396},
@@ -3736,12 +3871,12 @@ func TestScalingWriteWorkCapability(t *testing.T) {
 		"policy/allow-all":         {500, 500, 0, 400, 0, 0, 0},
 		"policy/group-all":         {500, 500, 6950, 400, 0, 0, 0},
 		"policy/mesh":              {500, 500, 9900, 400, 0, 0, 0},
-		"policy/routers":           {500, 500, 9900, 400, 0, 0, 0},
+		"policy/routers":           {500, 500, 9100, 400, 0, 0, 0},
 		"policy/selectors":         {500, 500, 9348, 400, 0, 0, 0},
 		"policy/self":              {500, 500, 9900, 400, 0, 0, 0},
 		"policy/tags":              {500, 500, 9900, 400, 0, 0, 0},
 		"policy/users":             {500, 500, 9900, 400, 0, 0, 0},
-		"policy/via":               {500, 500, 495, 400, 0, 0, 0},
+		"policy/via":               {500, 500, 0, 400, 0, 0, 0},
 		"rejoin/allow-all":         {400, 0, 396, 0, 0, 0, 0},
 		"rejoin/group-all":         {400, 0, 396, 0, 0, 0, 0},
 		"rejoin/mesh":              {400, 0, 396, 0, 0, 0, 0},
@@ -3750,7 +3885,7 @@ func TestScalingWriteWorkCapability(t *testing.T) {
 		"rejoin/self":              {40, 0, 36, 0, 0, 0, 0},
 		"rejoin/tags":              {44, 0, 40, 0, 0, 0, 0},
 		"rejoin/users":             {40, 0, 36, 0, 0, 0, 0},
-		"rejoin/via":               {400, 0, 792, 0, 0, 0, 0},
+		"rejoin/via":               {400, 0, 396, 0, 0, 0, 0},
 		"rename/allow-all":         {400, 400, 396, 0, 0, 0, 0},
 		"rename/group-all":         {400, 400, 396, 0, 0, 0, 0},
 		"rename/mesh":              {400, 400, 396, 0, 0, 0, 0},
@@ -4866,7 +5001,13 @@ func TestRendererForgetsRoutersItNoLongerRenders(t *testing.T) {
 	_, err = st.Initial(s.Snapshot())
 	require.NoError(t, err)
 
-	routed := func() int { return len(st.r.routedPrimaries) }
+	routed := func() int {
+		if st.r.set == nil {
+			return 0
+		}
+
+		return len(st.r.set.routes)
+	}
 
 	for i := range 12 {
 		n := s.CreateRegisteredNodeForTest(u1, fmt.Sprintf("churn-%d", i))
