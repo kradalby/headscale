@@ -15,6 +15,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"go4.org/mem"
+	"go4.org/netipx"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -186,11 +187,17 @@ func (p *pbtWorld) steerID(id types.NodeID) {
 }
 
 // nextAddr is the address a sequential allocator hands out after prev:
-// the next one Tailscale does not reserve.
+// the next one Tailscale does not reserve, past the via range whole.
 func nextAddr(prev netip.Addr) netip.Addr {
 	a := prev.Next()
 	for tsaddr.ChromeOSVMRange().Contains(a) || a == tsaddr.TailscaleServiceIP() || a == tsaddr.TailscaleServiceIPv6() {
 		a = a.Next()
+	}
+
+	// The via range's addresses are routes, never node addresses, so the
+	// allocator skips the whole /64 (db/ip.go).
+	if r := tsaddr.TailscaleViaRange(); r.Contains(a) {
+		a = netipx.RangeOfPrefix(r).To().Next()
 	}
 
 	return a
