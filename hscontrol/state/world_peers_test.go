@@ -378,9 +378,9 @@ func TestWorldSidesUnderRandomChurn(t *testing.T) {
 
 	for name, n := range map[string]int{
 		"routers covering others' addresses": rep.Covering, "single-family nodes": rep.SingleFamily,
-		"exit nodes of one family": rep.ExitOneFamily, "public addresses": rep.Public, "public routes": rep.PublicRoute,
-		"addresses only an approval names": rep.InsideApproved, "tagged nodes keeping a user": rep.TaggedWithUser,
-		"via routers": rep.ViaTargets, "via routers among their sources": rep.ViaRouterOnSrc,
+		"exit nodes of one family": rep.ExitOneFamily, "public routes": rep.PublicRoute,
+		"tagged nodes keeping a user": rep.TaggedWithUser,
+		"via routers":                 rep.ViaTargets, "via routers among their sources": rep.ViaRouterOnSrc,
 		"steered pairs": rep.Steered,
 		"one-way peers": rep.AsymmetricPeers, "routes kept": rep.RoutesKept,
 		"audits against a compile afresh, as a refused document makes": rep.Fresh,
@@ -389,7 +389,7 @@ func TestWorldSidesUnderRandomChurn(t *testing.T) {
 	}
 
 	for _, k := range []string{
-		"via tag gained", "via tag lost", "approval added", "approval withdrawn", "public", "cover",
+		"via tag gained", "via tag lost", "approval added", "approval withdrawn", "cover",
 		"policy, same selectors", "policy, new selectors", "coalesced", "concurrent", "refused policy",
 	} {
 		assert.Positive(t, kinds[k], "no %s write", k)
@@ -406,29 +406,6 @@ func sortedIDs(e *nodeEdit) []types.NodeID {
 	slices.Sort(ids)
 
 	return ids
-}
-
-// publicOp gives a node a public address, which takes rules naming it to
-// the internet.
-func (c *churnRun) publicOp(e *nodeEdit) {
-	ids := sortedIDs(e)
-
-	// Mostly an owner's node, whose user's self rules it takes along.
-	if owned := slices.DeleteFunc(slices.Clone(ids), func(id types.NodeID) bool {
-		n := mustGet(c.t, e, id)
-
-		return n.IsTagged() || n.User == nil
-	}); len(owned) > 0 && c.r.IntN(3) > 0 {
-		ids = owned
-	}
-
-	if len(ids) == 0 {
-		return
-	}
-
-	n := mustGet(c.t, e, ids[c.r.IntN(len(ids))]).Clone()
-	n.IPv4 = new(netip.AddrFrom4([4]byte{8, 8, 4, byte(n.ID)})) //nolint:gosec // a few hundred nodes
-	e.Set(n.ID, n)
 }
 
 // coverOp makes a node route over other nodes' addresses, a via router of
@@ -586,21 +563,9 @@ func sidesChurn(t *testing.T, r *rand.Rand, policies []string, focused bool, rep
 
 			w.update(c.routeOp)
 		case op < 11:
-			w.update(func(e *nodeEdit) {
-				if r.IntN(2) == 0 {
-					kind = "family"
+			kind = "family"
 
-					c.familyOp(e)
-				} else {
-					kind = "public"
-
-					c.publicOp(e)
-				}
-			})
-		case op < 12:
-			kind = "public"
-
-			w.update(c.publicOp)
+			w.update(c.familyOp)
 		case op < 14:
 			kind = "cover"
 
@@ -712,7 +677,6 @@ func TestWorldSidesShapes(t *testing.T) {
 
 	users := []types.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}, {ID: 3, Name: "carol"}}
 	alice, bob, carol := &users[0], &users[1], &users[2]
-	exit := []string{"0.0.0.0/0", "::/0"}
 
 	tests := []struct {
 		name   string
@@ -720,18 +684,6 @@ func TestWorldSidesShapes(t *testing.T) {
 		nodes  types.Nodes
 		write  func(e *nodeEdit)
 	}{
-		{
-			// A user's first public owner address takes its self rules to the
-			// internet; its other owners' side sets move with it.
-			name:   "owner-address-goes-public",
-			policy: `{"tagOwners": {"tag:e": []}, "acls": [{"action": "accept", "src": ["bob@"], "dst": ["autogroup:self:22"]}]}`,
-			nodes: types.Nodes{
-				shapeNode(1, bob, "100.64.0.1", "", nil, nil, nil),
-				shapeNode(2, bob, "100.64.0.2", "", nil, nil, nil),
-				shapeNode(9, nil, "100.64.0.9", "", []string{"tag:e"}, exit, nil),
-			},
-			write: func(e *nodeEdit) { e.Set(2, shapeNode(2, bob, "8.8.4.2", "", nil, nil, nil)) },
-		},
 		{
 			name: "via-router-through-a-covered-node",
 			policy: `{"tagOwners": {"tag:r": [], "tag:x": []}, "grants": [

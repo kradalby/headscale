@@ -281,9 +281,9 @@ func fingerprintSides(f fingerprint, s Sides, table *SelectorTable) {
 
 	for id, sf := range s.facts.All() {
 		f.set(fmt.Sprintf("side facts n%d", id), fmt.Sprintf(
-			"roles=%s ips=%v routes=%v share=%v addrLit=%s routeLit=%s approvedAddr=%t exit=%t pub=%t clique=%d/%t owner=%d/%t named=%t/%t/%t targets=%v touch=%s",
+			"roles=%s ips=%v routes=%v share=%v addrLit=%s routeLit=%s approvedAddr=%t exit=%t clique=%d/%t owner=%d/%t named=%t/%t targets=%v touch=%s",
 			roleNames(table, sf.roles), sf.ips, sf.routes, sf.share, selNames(table, sf.addrLit), selNames(table, sf.routeLit),
-			sf.approvedAddr, sf.exit, sf.pub, sf.clique, sf.cliqued, sf.owner, sf.owned, sf.namedPort, sf.namedApp, sf.namedComp,
+			sf.approvedAddr, sf.exit, sf.clique, sf.cliqued, sf.owner, sf.owned, sf.namedPort, sf.namedApp,
 			sf.targets, roleNames(table, sf.touch)))
 	}
 
@@ -309,9 +309,6 @@ func fingerprintSides(f fingerprint, s Sides, table *SelectorTable) {
 	}
 
 	f.set("targeted", s.targeted)
-	f.set("public nodes", s.pub)
-	f.set("public selectors", selNames(table, s.pubSel))
-	f.set("public owners", slices.Sorted(maps.Keys(s.owners)))
 }
 
 func fingerprintVia(f fingerprint, v *ViaPlan) {

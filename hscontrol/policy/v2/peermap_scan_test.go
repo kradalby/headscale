@@ -1718,33 +1718,3 @@ func TestPeerClassesMixedSelfVia(t *testing.T) {
 		}
 	}
 }
-
-// TestPeerClassesListOwnCapabilitySourcesOnExit pins that an exit node
-// lists the sources of a node's own capability to the internet, as the pair
-// scan does: a self app grant whose owner holds a public address gives the
-// owner's self rules a capability to the internet, and those rules are the
-// owner's own, not the shared ones.
-func TestPeerClassesListOwnCapabilitySourcesOnExit(t *testing.T) {
-	alice := &scanUsers[0]
-	exit := []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}
-	public, private := netip.MustParseAddr("8.8.8.1"), netip.MustParseAddr("100.64.0.2")
-	nodes := types.Nodes{
-		{ID: 1, IPv4: &public, User: alice, UserID: &alice.ID, Hostinfo: &tailcfg.Hostinfo{}},
-		{ID: 2, IPv4: &private, User: alice, UserID: &alice.ID, Hostinfo: &tailcfg.Hostinfo{}},
-		{ID: 3, IPv4: new(netip.MustParseAddr("100.64.0.3")), Tags: []string{"tag:exit"}, Hostinfo: &tailcfg.Hostinfo{RoutableIPs: exit}, ApprovedRoutes: exit},
-	}
-
-	pol := []byte(`{"tagOwners": {"tag:exit": []}, "grants": [
-		{"src": ["autogroup:member"], "dst": ["autogroup:self"], "app": {"example.com/cap/x": [{}]}}]}`)
-
-	pm, err := NewPolicyManager(pol, scanUsers, nodes.ViewSlice())
-	require.NoError(t, err)
-
-	m := newSideModel(t, pm, scanUsers, nodes)
-	require.Equal(t, []types.NodeID{1, 2}, m.peers.Peers(3), "the exit node lists the owner nodes its own rule's capability reaches the internet from")
-	require.Equal(t, []types.NodeID{2}, m.peers.Peers(1), "the listing is one-way")
-	require.Equal(t, []types.NodeID{1, 2}, pm.BuildPeerMap(nodes.ViewSlice())[3], "as the pair scan does")
-
-	_, err = m.audit()
-	require.NoError(t, err)
-}

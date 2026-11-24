@@ -314,50 +314,6 @@ func TestSidesQuirks(t *testing.T) {
 			},
 		},
 		{
-			// A self capability to the internet shows its sources to exit
-			// nodes; without a companion there is no rule from the owner's
-			// other nodes, so node 2 is not among them.
-			name:   "self-capability-to-internet-without-companion",
-			policy: `{"tagOwners": {"tag:e": []}, "grants": [{"src": ["bob@"], "dst": ["autogroup:self"], "app": {"example.com/cap/x": [{}]}}]}`,
-			nodes: types.Nodes{
-				sideNode(1, alice, "8.8.8.1", "", nil),
-				sideNode(2, alice, "100.64.0.2", "", nil),
-				sideNode(3, bob, "8.8.8.1", "", nil),
-				sideNode(4, nil, "100.64.0.4", "", []string{"tag:e"}, exit...),
-			},
-			peers: map[types.NodeID][]types.NodeID{1: {2, 3}, 2: {1, 3}, 3: {1, 2}, 4: {1, 3}},
-		},
-		{
-			// With a companion, the owner's nodes are the companion rule's
-			// sources and the named public address its destination: exits
-			// list them all.
-			name:   "self-capability-to-internet-with-companion",
-			policy: `{"tagOwners": {"tag:e": []}, "grants": [{"src": ["bob@"], "dst": ["autogroup:self"], "app": {"tailscale.com/cap/relay": [{}]}}]}`,
-			nodes: types.Nodes{
-				sideNode(1, alice, "8.8.8.1", "", nil),
-				sideNode(2, alice, "100.64.0.2", "", nil),
-				sideNode(3, bob, "8.8.8.1", "", nil),
-				sideNode(4, nil, "100.64.0.4", "", []string{"tag:e"}, exit...),
-			},
-			peers: map[types.NodeID][]types.NodeID{1: {2, 3}, 2: {1, 3}, 3: {1, 2}, 4: {1, 2, 3}},
-		},
-		{
-			// A companion-bearing grant that names none of alice's nodes does
-			// not lend its companion to the one that names the public owner.
-			name: "self-companion-from-another-grant",
-			policy: `{"tagOwners": {"tag:e": []}, "grants": [
-				{"src": ["bob@"], "dst": ["autogroup:self"], "app": {"example.com/cap/x": [{}]}},
-				{"src": ["carol@example.com"], "dst": ["autogroup:self"], "app": {"tailscale.com/cap/relay": [{}]}}]}`,
-			nodes: types.Nodes{
-				sideNode(1, alice, "8.8.8.1", "", nil),
-				sideNode(2, alice, "100.64.0.2", "", nil),
-				sideNode(3, bob, "8.8.8.1", "", nil),
-				sideNode(4, nil, "100.64.0.4", "", []string{"tag:e"}, exit...),
-				sideNode(5, carol, "100.64.0.5", "", nil),
-			},
-			peers: map[types.NodeID][]types.NodeID{2: {1, 3}, 4: {1, 3}},
-		},
-		{
 			// Steering tests a "*" source against what it resolves to, not
 			// the approved routes the filter's "*" adds: a viewer whose only
 			// address an approval covers takes no regular grant's primary.
@@ -778,23 +734,6 @@ func TestSidesIncremental(t *testing.T) {
 			after:  map[types.NodeID][]types.NodeID{3: {6, 7}, 6: {3}, 7: {3}},
 		},
 		{
-			// An owner address going public takes its user's self rules to
-			// the internet: exits join their destinations, though no node
-			// they show changed.
-			name:   "owner-address-goes-public",
-			policy: `{"tagOwners": {"tag:e": []}, "acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:22"]}]}`,
-			nodes: types.Nodes{
-				sideNode(1, alice, "100.64.0.1", "", nil),
-				sideNode(2, alice, "100.64.0.2", "", nil),
-				sideNode(9, nil, "100.64.0.9", "", []string{"tag:e"}, "0.0.0.0/0", "::/0"),
-			},
-			write: func(n types.Nodes) types.Nodes {
-				return types.Nodes{n[0], sideNode(2, alice, "8.8.4.2", "", nil), n[2]}
-			},
-			before: map[types.NodeID][]types.NodeID{1: {2}, 2: {1}, 9: nil},
-			after:  map[types.NodeID][]types.NodeID{1: {2, 9}, 2: {1, 9}, 9: {1, 2}},
-		},
-		{
 			// The clique follows the UserID, which a write can move alone.
 			name:   "user-id-leaves-the-clique",
 			policy: `{"acls": []}`,
@@ -1107,8 +1046,7 @@ func BenchmarkRouteAccess(b *testing.B) {
 // routes, unannounced approvals and exits; every kind of selector, port and
 // capability rules with and without companions, self and via.
 type sideGen struct {
-	r      *rand.Rand
-	public bool
+	r *rand.Rand
 
 	// facts, when set, draws what each node's client reports beyond the
 	// policy: its client, app connector and announced routes; sparse
@@ -1244,11 +1182,6 @@ func (g sideGen) policy() []byte {
 func (g sideGen) addrs() ([]string, []string) {
 	v4 := []string{"100.64.0.1", "100.64.0.2", "100.64.0.3", "100.64.0.4", "100.64.0.5", "10.0.0.5"}
 	v6 := []string{"fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2", "fd7a:115c:a1e0::3"}
-
-	if g.public {
-		v4 = append(v4, "8.8.8.1", "8.8.8.2", "8.8.8.9", "192.168.0.6")
-		v6 = append(v6, "2606:4700::1")
-	}
 
 	if g.sparse {
 		for i := 6; i < 40; i++ {
@@ -1463,22 +1396,6 @@ func TestRouteRulesCarryViaDestinations(t *testing.T) {
 		routes []netip.Prefix
 	}{
 		{
-			// A public address in the router's route gives it the internet
-			// through the grant, so the exit node's routes; no via scope
-			// moves either.
-			name: "public-destination-reaches-internet",
-			nodes: types.Nodes{
-				// 10.0.0.0/7 holds private 10/8 and public 11/8.
-				sideNode(1, nil, "100.64.0.1", "", []string{"tag:r"}, "10.0.0.0/7"),
-				sideNode(2, &sideUsers[0], "100.64.0.2", "", nil, "0.0.0.0/0", "::/0"),
-				// Inside the route already, so the joiner brings it no atom;
-				// public by its IPv6, so tag:a's public selector stays.
-				sideNode(3, nil, "10.0.0.6", "2606:4700::1", tagA),
-			},
-			join:   sideNode(4, nil, "11.0.0.9", "", tagA),
-			routes: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
-		},
-		{
 			// Tailnet addresses only: the joiner's address becomes a
 			// destination inside router 2's route, whose cover already
 			// holds tag:a through node 5.
@@ -1525,8 +1442,7 @@ func TestRouteRulesCarryViaDestinations(t *testing.T) {
 // random and holds the role-based visibility, route access and steering,
 // built from scratch and then moved by coalesced joins, leaves and
 // replacements, against the compile's pair scan and classes, its matchers
-// and its via inspection, at every pair: once with tailnet addresses, once
-// from a pool with public ones. HEADSCALE_SIDES_SEED replays a run; a
+// and its via inspection, at every pair. HEADSCALE_SIDES_SEED replays a run; a
 // failure names the seed, the policy and the nodes.
 func TestSidesRandomDifferential(t *testing.T) {
 	seed := uint64(time.Now().UnixNano()) //nolint:gosec // any seed
@@ -1549,22 +1465,17 @@ func TestSidesRandomDifferential(t *testing.T) {
 	// its address form through the client (check D); sparse ones give
 	// fewer nodes routes, so most are sent capabilities.
 	variants := []struct {
-		public, caps, sparse bool
-		stream               uint64
+		caps, sparse bool
+		stream       uint64
 	}{
 		{stream: 0},
-		{public: true, stream: 1},
 		{caps: true, stream: 10},
 		{caps: true, sparse: true, stream: 11},
-		{public: true, caps: true, stream: 12},
-		{public: true, caps: true, sparse: true, stream: 13},
 	}
 
 	for _, v := range variants {
-		public := v.public
-
-		t.Run(fmt.Sprintf("public=%t/caps=%t/sparse=%t", v.public, v.caps, v.sparse), func(t *testing.T) {
-			g := sideGen{r: rand.New(rand.NewPCG(seed, v.stream)), public: public, sparse: v.sparse} //nolint:gosec // reproducible
+		t.Run(fmt.Sprintf("caps=%t/sparse=%t", v.caps, v.sparse), func(t *testing.T) {
+			g := sideGen{r: rand.New(rand.NewPCG(seed, v.stream)), sparse: v.sparse} //nolint:gosec // reproducible
 			if v.caps {
 				g.facts = rand.New(rand.NewPCG(seed, v.stream+100)) //nolint:gosec // reproducible
 			}
@@ -1601,13 +1512,13 @@ func TestSidesRandomDifferential(t *testing.T) {
 						was, wasList, wasVia := m.sides, m.list, m.via.Plan
 						m.step(t, us, g.step(m.list))
 						keptPairs += requireRouteRulesSame(t, was, m.sides, wasList, m.list, wasVia, m.via.Plan,
-							"seed", seed, "public", public, "round", round, "step", step)
+							"seed", seed, "round", round, "step", step)
 					}
 
 					got, err := m.audit()
 					if err != nil {
-						t.Fatalf("HEADSCALE_SIDES_SEED=%d public=%t round %d step %d: %v\npolicy:\n%s\nnodes:\n%s",
-							seed, public, round, step, err, pol, describeNodes(m.list))
+						t.Fatalf("HEADSCALE_SIDES_SEED=%d round %d step %d: %v\npolicy:\n%s\nnodes:\n%s",
+							seed, round, step, err, pol, describeNodes(m.list))
 					}
 
 					rep.Add(got)
@@ -1623,12 +1534,12 @@ func TestSidesRandomDifferential(t *testing.T) {
 						require.NoError(t, err)
 
 						if !reflect.DeepEqual(want, served) {
-							t.Fatalf("HEADSCALE_SIDES_SEED=%d public=%t round %d step %d: node %d served %v, the compile %v\npolicy:\n%s\nnodes:\n%s",
-								seed, public, round, step, n.ID, served, want, pol, describeNodes(m.list))
+							t.Fatalf("HEADSCALE_SIDES_SEED=%d round %d step %d: node %d served %v, the compile %v\npolicy:\n%s\nnodes:\n%s",
+								seed, round, step, n.ID, served, want, pol, describeNodes(m.list))
 						}
 					}
 
-					requireServedAgreesWithGlobal(t, filters, m.list.ViewSlice(), "seed", seed, "public", public, "round", round, "step", step)
+					requireServedAgreesWithGlobal(t, filters, m.list.ViewSlice(), "seed", seed, "round", round, "step", step)
 
 					if v.caps {
 						cm := newCapModel(t, m)
@@ -1672,12 +1583,8 @@ func TestSidesRandomDifferential(t *testing.T) {
 			}
 			shapes["pairs kept with the route rules"] = keptPairs
 
-			if public {
-				shapes["public"] = rep.Public
-				shapes["public route"] = rep.PublicRoute
-				shapes["public named by app"] = rep.PublicNamedApp
-				shapes["wildcard steering outside"] = rep.WildcardSteerOutside
-			}
+			shapes["public route"] = rep.PublicRoute
+			shapes["wildcard steering outside"] = rep.WildcardSteerOutside
 
 			for name, n := range shapes {
 				assert.Positive(t, n, "shape %q reached", name)

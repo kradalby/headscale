@@ -499,10 +499,10 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 	// The capability variants serve capability form, with client facts
 	// drawn and flipped; sparse ones send most nodes capabilities.
 	variants := []struct {
-		public, caps, sparse bool
-		stream               uint64
+		caps, sparse bool
+		stream       uint64
 	}{
-		{stream: 2}, {public: true, stream: 3}, {caps: true, stream: 12}, {caps: true, sparse: true, stream: 13},
+		{stream: 2}, {caps: true, stream: 12}, {caps: true, sparse: true, stream: 13},
 	}
 
 	// The shapes only address-form naming reaches, over both capability
@@ -510,10 +510,8 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 	addressOnly := map[string]int{}
 
 	for _, v := range variants {
-		public := v.public
-
-		t.Run(fmt.Sprintf("public=%t/caps=%t/sparse=%t", v.public, v.caps, v.sparse), func(t *testing.T) {
-			g := sideGen{r: rand.New(rand.NewPCG(seed, v.stream)), public: public, sparse: v.sparse} //nolint:gosec // reproducible
+		t.Run(fmt.Sprintf("caps=%t/sparse=%t", v.caps, v.sparse), func(t *testing.T) {
+			g := sideGen{r: rand.New(rand.NewPCG(seed, v.stream)), sparse: v.sparse} //nolint:gosec // reproducible
 			if v.caps {
 				g.facts = rand.New(rand.NewPCG(seed, v.stream+100)) //nolint:gosec // reproducible
 			}
@@ -588,8 +586,8 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 
 					fail := func(format string, args ...any) {
 						t.Helper()
-						t.Fatalf("HEADSCALE_SIDES_SEED=%d public=%t round %d step %d: %s\npolicy:\n%s\nbefore:\n%s\nafter:\n%s",
-							seed, public, round, step, fmt.Sprintf(format, args...), m.pm.src, describeNodes(was), describeNodes(m.list))
+						t.Fatalf("HEADSCALE_SIDES_SEED=%d round %d step %d: %s\npolicy:\n%s\nbefore:\n%s\nafter:\n%s",
+							seed, round, step, fmt.Sprintf(format, args...), m.pm.src, describeNodes(was), describeNodes(m.list))
 					}
 
 					freshOld, freshNew := prev.Uncached(), next.Uncached()

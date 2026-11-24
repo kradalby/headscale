@@ -133,28 +133,6 @@ func containing[V any](groups *graph.Map[netip.Prefix, V], lens prefixLens, a ne
 	}
 }
 
-// inetTest decides whether a rule side's addresses reach the internet: the
-// literals decide once, identity selectors by whether a member has a
-// public address.
-type inetTest struct {
-	always bool
-	sels   []SelectorID
-}
-
-func (it inetTest) eval(pubSel []SelectorID) bool {
-	if it.always {
-		return true
-	}
-
-	for _, id := range it.sels {
-		if _, ok := slices.BinarySearch(pubSel, id); ok {
-			return true
-		}
-	}
-
-	return false
-}
-
 // grantSides is one grant template as rule sides of atoms: its port rules,
 // its capability rule and the companions, which run the other way. A via
 // grant keeps what decides its routers.
@@ -162,7 +140,7 @@ type grantSides struct {
 	port, capg, comp bool
 
 	src, portDst, capDst, compSrc, compDst []Role
-	portInet, capInet, compInet            inetTest
+	portInet, capInet, compInet            bool
 
 	// self grants: the sources, as atoms of the addresses they hold.
 	selfAddr []Role
@@ -211,11 +189,10 @@ type sidePlan struct {
 	litInet []bool
 
 	grants []grantSides
-	// selfPort, selfApp and selfComp hold, per self grant with port rules,
-	// with a capability and with a capability that has a companion, its
-	// sources by address.
-	selfPort, selfApp, selfComp [][]Role
-	vias                        []int
+	// selfPort and selfApp hold, per self grant with port rules and with a
+	// capability, its sources by address.
+	selfPort, selfApp [][]Role
+	vias              []int
 
 	steer  []steerGrant
 	hasVia bool
@@ -287,31 +264,25 @@ func (p *sidePlan) atoms(id SelectorID, ctx atomCtx, out []Role) []Role {
 	return out
 }
 
-// inet returns the internet test of ids written in ctx.
-func (p *sidePlan) inet(ids []SelectorID, ctx atomCtx) inetTest {
-	var it inetTest
-
+// inet reports whether ids, written in ctx, reach the internet: only
+// literals can, as NewState refuses a node address outside the tailnet.
+func (p *sidePlan) inet(ids []SelectorID, ctx atomCtx) bool {
 	for _, id := range ids {
 		s := p.table.Selector(id)
 
 		switch {
-		case s.Kind.HoldsNodes():
-			it.sels = append(it.sels, id)
+		case s.Kind.HoldsNodes(), s.Kind == SelectorSelf, s.Kind == SelectorUnresolvable:
 		case s.Kind == SelectorDangerAll, s.Kind == SelectorWildcard && ctx == ctxPortDst:
-			it.always = true
-		case s.Kind == SelectorSelf, s.Kind == SelectorUnresolvable:
+			return true
 		default:
 			l := p.t.literals[id]
 			if l.res != nil && (ctx != ctxResolveOK || l.err == nil) && p.litInet[id] {
-				it.always = true
+				return true
 			}
 		}
 	}
 
-	slices.Sort(it.sels)
-	it.sels = slices.Compact(it.sels)
-
-	return it
+	return false
 }
 
 func (p *sidePlan) atomsOf(ids []SelectorID, ctx atomCtx) []Role {
@@ -437,10 +408,6 @@ func newSidePlan(t *Templates) *sidePlan {
 
 			if gt.app != nil {
 				p.selfApp = append(p.selfApp, gs.selfAddr)
-
-				if hasCompanion(gt.app) {
-					p.selfComp = append(p.selfComp, gs.selfAddr)
-				}
 			}
 		}
 	}
@@ -594,17 +561,16 @@ type sideFacts struct {
 
 	addrLit, routeLit []SelectorID
 	approvedAddr      bool
-	exit, pub         bool
+	exit              bool
 	clique            uint64
 	cliqued           bool
 	owner             uint
 	owned             bool
-	// namedPort, namedApp and namedComp report that a self grant with port
-	// rules, one with a capability, and one whose capability has a
-	// companion names the node by one of its addresses.
-	namedPort, namedApp, namedComp bool
-	targets                        []int
-	touch                          RoleSet
+	// namedPort and namedApp report that a self grant with port rules, and
+	// one with a capability, names the node by one of its addresses.
+	namedPort, namedApp bool
+	targets             []int
+	touch               RoleSet
 }
 
 func (f *sideFacts) routed() bool { return len(f.routes) > 0 }
@@ -717,13 +683,6 @@ type sidesState struct {
 	// out.
 	cover    *graph.Map[netip.Prefix, coverAtoms]
 	targeted []types.NodeID
-
-	// pub lists the nodes with a public address; pubSel the identity
-	// selectors with such a member; owners the users with a public owner
-	// node, as pubOwners gives them. All are empty in a supported setup.
-	pub    []types.NodeID
-	pubSel []SelectorID
-	owners map[uint]bool
 
 	rules *ruleCache
 
@@ -885,15 +844,12 @@ func (s Sides) ViewersMovedSince(old Sides) []types.NodeID {
 }
 
 // RouteRules is what the routes a viewer is sent read besides the viewer,
-// the peer and the cover of the peer's routes: the rules, the identity
-// selectors with a public member, the users with a public owner node, and
-// the via plan. The rules are the templates' and read no membership; the
-// rest moves with it, and the cover and side sets are followed apart.
+// the peer and the cover of the peer's routes: the rules and the via plan.
+// The rules are the templates' and read no membership; the cover and side
+// sets are followed apart.
 type RouteRules struct {
-	plan   *sidePlan
-	pubSel []SelectorID
-	owners map[uint]bool
-	via    *ViaPlan
+	plan *sidePlan
+	via  *ViaPlan
 }
 
 // RouteRules returns s's, with via the plan steering reads.
@@ -902,14 +858,14 @@ func (s Sides) RouteRules(via *ViaPlan) RouteRules {
 		return RouteRules{via: via}
 	}
 
-	return RouteRules{plan: s.plan, pubSel: s.pubSel, owners: s.owners, via: via}
+	return RouteRules{plan: s.plan, via: via}
 }
 
 // Same reports whether r and o route every viewer alike, given the same
 // viewer, peer and cover: the same rules, by content, as a document edit
 // builds new ones even where it changes none.
 func (r RouteRules) Same(o RouteRules) bool {
-	return r.plan.sameRoutes(o.plan) && r.via.sameRoutes(o.via) && slices.Equal(r.pubSel, o.pubSel) && maps.Equal(r.owners, o.owners)
+	return r.plan.sameRoutes(o.plan) && r.via.sameRoutes(o.via)
 }
 
 // sameRoutes reports whether p and o hold the same rules for route access
@@ -925,7 +881,7 @@ func (p *sidePlan) sameRoutes(o *sidePlan) bool {
 	}
 
 	return reflect.DeepEqual(p.grants, o.grants) && reflect.DeepEqual(p.selfPort, o.selfPort) &&
-		reflect.DeepEqual(p.selfApp, o.selfApp) && reflect.DeepEqual(p.selfComp, o.selfComp) &&
+		reflect.DeepEqual(p.selfApp, o.selfApp) &&
 		slices.Equal(p.vias, o.vias) && p.hasVia == o.hasVia && reflect.DeepEqual(p.steer, o.steer) &&
 		slices.Equal(p.viaReads, o.viaReads) && slices.Equal(p.viaIdents, o.viaIdents) &&
 		reflect.DeepEqual(p.lit, o.lit) && slices.Equal(p.litInet, o.litInet) &&
@@ -973,21 +929,12 @@ func UpdateSides(prev Sides, t *Templates, roles Roles, posts Postings, approval
 
 	l1 := u.reached(dirty, approvalsMoved)
 	ids := slices.Sorted(maps.Keys(l1))
-	pubMoved := u.refreshFacts(ids)
+	u.refreshFacts(ids)
 	moved := u.moveCounts(ids)
 	retargeted, routerMoved := u.retarget(ids, moved)
 	l3 := u.touchers(l1, slices.Concat(ids, retargeted), moved, routerMoved)
 
-	if pubMoved {
-		u.refreshPublic(l1, l3)
-	}
-
-	u.next.pubSel = pubSelectors(u.next.pub, roles, prev.pubSel)
 	u.refreshSets(l3)
-
-	if !slices.Equal(u.next.pubSel, prev.pubSel) {
-		u.next.rules = &ruleCache{}
-	}
 
 	return u.next
 }
@@ -1095,34 +1042,24 @@ func (u *sidesUpdate) reached(dirty []types.NodeID, approvalsMoved bool) map[typ
 	return l1
 }
 
-// refreshFacts recomputes the facts of l1, reporting whether a public node
-// is among them. A router's targets read the cover counts, which moveCounts
-// brings up to date after it: retarget computes them again.
-func (u *sidesUpdate) refreshFacts(l1 []types.NodeID) bool {
+// refreshFacts recomputes the facts of l1. A router's targets read the
+// cover counts, which moveCounts brings up to date after it: retarget
+// computes them again.
+func (u *sidesUpdate) refreshFacts(l1 []types.NodeID) {
 	facts := u.prev.facts.Edit()
-	pubMoved := false
 
 	for _, id := range l1 {
-		old, had := u.prev.facts.Get(id)
-
 		n, ok := u.next.from.Get(id)
 		if !ok {
 			facts.Delete(id)
 
-			pubMoved = pubMoved || had && old.pub
-
 			continue
 		}
 
-		f := u.next.factsOf(id, n)
-		facts.Set(id, f)
-
-		pubMoved = pubMoved || f.pub || had && old.pub
+		facts.Set(id, u.next.factsOf(id, n))
 	}
 
 	u.next.facts = facts.Done()
-
-	return pubMoved
 }
 
 // moveCounts brings the cover counts up to date with the facts of l1 and
@@ -1348,33 +1285,8 @@ func (u *sidesUpdate) touchers(l1 map[types.NodeID]struct{}, refreshed []types.N
 	return l3
 }
 
-// refreshPublic brings the public nodes up to date and adds to l3 the
-// owners of every user whose public facts moved: their side sets read
-// them.
-func (u *sidesUpdate) refreshPublic(l1, l3 map[types.NodeID]struct{}) {
-	before := pubOwners(u.prev.pub, u.prev.facts)
-	u.next.pub = publicNodes(u.prev.pub, u.next.facts, l1)
-	after := pubOwners(u.next.pub, u.next.facts)
-
-	for uid := range unionKeys(before, after) {
-		wasComp, was := before[uid]
-		isComp, is := after[uid]
-
-		if was == is && wasComp == isComp {
-			continue
-		}
-
-		for _, posts := range []Postings{u.prev.posts, u.next.posts} {
-			for _, id := range posts.Nodes(OwnerRole(uid)) {
-				l3[id] = struct{}{}
-			}
-		}
-	}
-}
-
 // refreshSets recomputes the side sets of l3 and the holders of what moved.
 func (u *sidesUpdate) refreshSets(l3 map[types.NodeID]struct{}) {
-	u.next.owners = pubOwners(u.next.pub, u.next.facts)
 	sets := u.prev.sets.Edit()
 
 	for _, id := range slices.Sorted(maps.Keys(l3)) {
@@ -1398,19 +1310,6 @@ func mustFacts(m *graph.Map[types.NodeID, *sideFacts], id types.NodeID) *sideFac
 	f, _ := m.Get(id)
 
 	return f
-}
-
-func unionKeys[K comparable, V any](a, b map[K]V) map[K]struct{} {
-	out := make(map[K]struct{}, len(a)+len(b))
-	for k := range a {
-		out[k] = struct{}{}
-	}
-
-	for k := range b {
-		out[k] = struct{}{}
-	}
-
-	return out
 }
 
 // buildSides computes every node's sides from scratch.
@@ -1455,16 +1354,9 @@ func buildSides(plan *sidePlan, roles Roles, posts Postings, approvals SubnetApp
 		if len(f.targets) > 0 {
 			s.targeted = append(s.targeted, id)
 		}
-
-		if f.pub {
-			s.pub = append(s.pub, id)
-		}
 	}
 
 	slices.Sort(s.targeted)
-	slices.Sort(s.pub)
-	s.pubSel = pubSelectors(s.pub, roles, nil)
-	s.owners = pubOwners(s.pub, s.facts)
 
 	sets := make(map[types.NodeID]RoleSet, len(facts))
 	for id, f := range facts {
@@ -1619,8 +1511,6 @@ func (s Sides) factsOf(id types.NodeID, n *types.Node) *sideFacts {
 		if !f.approvedAddr {
 			containing(s.approvals.byRoute.Groups, s.approvedLens, ip, func(netip.Prefix, []types.NodeID) { f.approvedAddr = true })
 		}
-
-		f.pub = f.pub || util.TheInternet().Contains(ip)
 	}
 
 	slices.Sort(f.share)
@@ -1638,7 +1528,6 @@ func (s Sides) factsOf(id types.NodeID, n *types.Node) *sideFacts {
 	if f.owned {
 		f.namedPort = s.namedBy(f, p.selfPort)
 		f.namedApp = s.namedBy(f, p.selfApp)
-		f.namedComp = s.namedBy(f, p.selfComp)
 	}
 
 	f.targets = s.targetsOf(f)
@@ -1743,69 +1632,6 @@ func (s Sides) routesOverlap(f *sideFacts, dsts []SelectorID) bool {
 	return false
 }
 
-// pubOwners returns, per user with a public owner node, whether a public
-// one is named by a self grant whose capability has a companion: the
-// companion rule then reaches the internet from the owners.
-func pubOwners(pub []types.NodeID, facts *graph.Map[types.NodeID, *sideFacts]) map[uint]bool {
-	if len(pub) == 0 {
-		return nil
-	}
-
-	out := map[uint]bool{}
-
-	for _, id := range pub {
-		if f, ok := facts.Get(id); ok && f.owned {
-			out[f.owner] = out[f.owner] || f.namedComp
-		}
-	}
-
-	return out
-}
-
-// publicNodes returns prev with the public nodes among ids brought up to
-// date from facts.
-func publicNodes(prev []types.NodeID, facts *graph.Map[types.NodeID, *sideFacts], ids map[types.NodeID]struct{}) []types.NodeID {
-	out := slices.DeleteFunc(slices.Clone(prev), func(id types.NodeID) bool {
-		_, moved := ids[id]
-
-		return moved
-	})
-
-	for id := range ids {
-		if f, ok := facts.Get(id); ok && f.pub {
-			out = append(out, id)
-		}
-	}
-
-	slices.Sort(out)
-
-	return out
-}
-
-// pubSelectors returns the identity selectors with a public member, prev
-// when they are the same.
-func pubSelectors(pub []types.NodeID, roles Roles, prev []SelectorID) []SelectorID {
-	var out []SelectorID
-
-	for _, id := range pub {
-		rs, _ := roles.Of(id)
-		for r := range rs.All() {
-			if sel, ok := r.Selector(); ok {
-				out = append(out, sel)
-			}
-		}
-	}
-
-	slices.Sort(out)
-	out = slices.Compact(out)
-
-	if slices.Equal(out, prev) {
-		return prev
-	}
-
-	return out
-}
-
 // touchedBy returns, sorted, the atoms of the touch sets of the nodes f's
 // node holds an address of or routes over.
 func (s Sides) touchedBy(f *sideFacts) []Role {
@@ -1878,7 +1704,6 @@ func (s Sides) setOf(id types.NodeID, f *sideFacts) RoleSet {
 		named := has(Role{kind: roleNamedPort, value: u})
 		namedApp := has(Role{kind: roleNamedApp, value: u})
 		owner := has(OwnerRole(f.owner))
-		pubNamedComp, pubOwner := s.owners[f.owner]
 
 		if named || namedApp {
 			roles = append(roles, Role{kind: roleHeldNamed, value: u})
@@ -1886,22 +1711,6 @@ func (s Sides) setOf(id types.NodeID, f *sideFacts) RoleSet {
 
 		if owner {
 			roles = append(roles, Role{kind: roleHeldOwner, value: u})
-		}
-
-		if f.exit && pubOwner {
-			roles = append(roles, Role{kind: roleExitHolder, value: u})
-		}
-
-		if named && pubOwner {
-			roles = append(roles, Role{kind: roleSelfExitLink})
-		}
-
-		// Exits list the sources of a self capability that reaches the
-		// internet: the named nodes when an owner is public, and, through
-		// the companion rule, the owners when a node a grant with a
-		// companion names is public.
-		if namedApp && pubOwner || owner && pubNamedComp {
-			roles = append(roles, Role{kind: roleCapExitSeen})
 		}
 	}
 
@@ -1923,10 +1732,6 @@ func (s Sides) setOf(id types.NodeID, f *sideFacts) RoleSet {
 
 		if onSrc {
 			roles = append(roles, Role{kind: roleRouterOnSrc, value: uint64(id)})
-
-			if f.pub {
-				roles = append(roles, Role{kind: rolePubRouterOnSrc})
-			}
 		}
 	}
 
@@ -1938,15 +1743,14 @@ func (s Sides) setOf(id types.NodeID, f *sideFacts) RoleSet {
 // shows its sources to exit nodes. The per-user and per-router links of
 // self and via rules hold between atoms of the same value.
 type sideAdjacency struct {
-	plan   *sidePlan
-	pubSel []SelectorID
-	links  map[Role][]Role
+	plan  *sidePlan
+	links map[Role][]Role
 	// readers is links inverted: whose view reads an atom's holders.
 	readers map[Role][]Role
 }
 
-func newSideAdjacency(plan *sidePlan, pubSel []SelectorID) *sideAdjacency {
-	a := &sideAdjacency{plan: plan, pubSel: pubSel, links: map[Role][]Role{}, readers: map[Role][]Role{}}
+func newSideAdjacency(plan *sidePlan) *sideAdjacency {
+	a := &sideAdjacency{plan: plan, links: map[Role][]Role{}, readers: map[Role][]Role{}}
 
 	see := func(from, to []Role) {
 		for _, f := range from {
@@ -1969,7 +1773,7 @@ func newSideAdjacency(plan *sidePlan, pubSel []SelectorID) *sideAdjacency {
 
 		if gs.port {
 			dst := gs.portDst
-			if gs.portInet.eval(pubSel) {
+			if gs.portInet {
 				dst = append(slices.Clone(dst), atomExit)
 			}
 
@@ -1979,7 +1783,7 @@ func newSideAdjacency(plan *sidePlan, pubSel []SelectorID) *sideAdjacency {
 		if gs.capg {
 			both(gs.src, gs.capDst)
 
-			if gs.capInet.eval(pubSel) {
+			if gs.capInet {
 				see(exit, gs.src)
 			}
 		}
@@ -1987,7 +1791,7 @@ func newSideAdjacency(plan *sidePlan, pubSel []SelectorID) *sideAdjacency {
 		if gs.comp {
 			both(gs.compSrc, gs.compDst)
 
-			if gs.compInet.eval(pubSel) {
+			if gs.compInet {
 				see(exit, gs.compSrc)
 			}
 		}
@@ -1996,10 +1800,6 @@ func newSideAdjacency(plan *sidePlan, pubSel []SelectorID) *sideAdjacency {
 	for _, g := range plan.vias {
 		both(plan.grants[g].src, []Role{{kind: roleViaSeen, value: uint64(g)}}) //nolint:gosec // a grant index
 	}
-
-	both(exit, []Role{{kind: rolePubRouterOnSrc}})
-	both(exit, []Role{{kind: roleSelfExitLink}})
-	see(exit, []Role{{kind: roleCapExitSeen}})
 
 	for r, ls := range a.links {
 		slices.SortFunc(ls, compareRoles)
@@ -2029,11 +1829,9 @@ func pairs(r Role) []Role {
 	case roleHeldOwner:
 		return []Role{{kind: roleNamedPort, value: v}, {kind: roleNamedApp, value: v}}
 	case roleNamedPort:
-		return []Role{{kind: roleHeldOwner, value: v}, {kind: roleExitHolder, value: v}}
+		return []Role{{kind: roleHeldOwner, value: v}}
 	case roleNamedApp:
 		return []Role{{kind: roleHeldOwner, value: v}}
-	case roleExitHolder:
-		return []Role{{kind: roleNamedPort, value: v}}
 	case roleRouter:
 		return []Role{{kind: roleRouterOnSrc, value: v}}
 	case roleRouterOnSrc:
@@ -2075,7 +1873,7 @@ func RolePeers(prev *PeerClasses, s Sides) *PeerClasses {
 		kc = prev.keyed
 	}
 
-	if kc == nil || kc.sides.plan != s.plan || !slices.Equal(kc.adj.pubSel, s.pubSel) {
+	if kc == nil || kc.sides.plan != s.plan {
 		next := buildKeyed(s, kc)
 		if kc != nil {
 			next.total += kc.total
@@ -2189,7 +1987,7 @@ func RolePeers(prev *PeerClasses, s Sides) *PeerClasses {
 // side set keeps prev's identity: an edit that names the same selectors
 // keeps the side sets.
 func buildKeyed(s Sides, prev *keyedClasses) *keyedClasses {
-	kc := &keyedClasses{sides: s, adj: newSideAdjacency(s.plan, s.pubSel)}
+	kc := &keyedClasses{sides: s, adj: newSideAdjacency(s.plan)}
 	kc.members = graph.GroupBy(graph.Grouped[types.NodeID, RoleSet, RoleSet]{}, s.sets,
 		func(_ types.NodeID, rs RoleSet) []RoleSet { return []RoleSet{rs} }, graph.Same[RoleSet])
 	kc.seen = graph.NewMap[Role, []types.NodeID](slices.Equal[[]types.NodeID], nil)
@@ -2463,8 +2261,7 @@ func (s Sides) RouteAccess(viewer types.NodeID, routes []netip.Prefix) []netip.P
 	key := accessKey{set: vs}
 
 	if vf != nil && vf.owned {
-		_, pub := s.owners[vf.owner]
-		key.owner, key.owned, key.pubOwner = vf.owner, true, pub
+		key.owner, key.owned = vf.owner, true
 	}
 
 	rules := s.rules.of(s, key)
@@ -2509,17 +2306,15 @@ type accessRule struct {
 }
 
 // accessKey is what a viewer's shared and self rules depend on beyond the
-// templates and the public selectors: its side set, and the user it owns a
-// node of with whether an owner node of that user is public.
+// templates: its side set, and the user it owns a node of.
 type accessKey struct {
-	set             RoleSet
-	owner           uint
-	owned, pubOwner bool
+	set   RoleSet
+	owner uint
+	owned bool
 }
 
 // ruleCache holds the rules each accessKey reads routes by. They follow the
-// templates and the public selectors otherwise, so a state that keeps both
-// keeps the cache.
+// templates otherwise, so a state that keeps them keeps the cache.
 type ruleCache struct {
 	mu     sync.Mutex
 	rules  map[accessKey][]accessRule
@@ -2574,7 +2369,7 @@ func (s Sides) sharedRules(vs RoleSet) []accessRule {
 		gs := &s.plan.grants[g]
 
 		if gs.port {
-			out = addRule(out, vs, accessRule{src: gs.src, dst: gs.portDst, inet: gs.portInet.eval(s.pubSel)})
+			out = addRule(out, vs, accessRule{src: gs.src, dst: gs.portDst, inet: gs.portInet})
 		}
 
 		if gs.capg {
@@ -2600,7 +2395,7 @@ func (s Sides) selfRules(out []accessRule, k accessKey) []accessRule {
 	owner := []Role{OwnerRole(k.owner)}
 
 	if len(s.plan.selfPort) > 0 {
-		out = addRule(out, k.set, accessRule{src: []Role{{kind: roleNamedPort, value: u}}, dst: owner, inet: k.pubOwner})
+		out = addRule(out, k.set, accessRule{src: []Role{{kind: roleNamedPort, value: u}}, dst: owner})
 	}
 
 	// The companion rule runs the other way between the same sides, which
@@ -3036,13 +2831,7 @@ func (st *steerGrant) regular(s Sides, result *types.ViaRouteResult) {
 
 	result.Exclude = slices.DeleteFunc(result.Exclude, covers)
 
-	public := func(id SelectorID) bool {
-		_, ok := slices.BinarySearch(s.pubSel, id)
-
-		return ok
-	}
-
-	if st.inetLit || !st.appOnly && slices.ContainsFunc(st.idents, public) {
+	if st.inetLit {
 		result.Exclude = slices.DeleteFunc(result.Exclude, tsaddr.IsExitRoute)
 	}
 }
@@ -3291,14 +3080,13 @@ type SidesReport struct {
 
 	Covering, Covered                          int
 	SingleFamily, ExitOneFamily, Exit          int
-	Public, PublicRoute, InsideApproved        int
+	PublicRoute, InsideApproved                int
 	TaggedWithUser, ViaTargets, ViaRouterOnSrc int
 	Steered, RoutesKept                        int
 	AsymmetricPeers                            int
 	// WildcardSteerOutside counts steering pairs under a via plan with a
-	// "*" source whose viewer has an address outside the tailnet ranges;
-	// PublicNamedApp public nodes an app self grant names.
-	WildcardSteerOutside, PublicNamedApp int
+	// "*" source whose viewer has an address outside the tailnet ranges.
+	WildcardSteerOutside int
 }
 
 // Add adds o's counts to r.
@@ -3313,7 +3101,6 @@ func (r *SidesReport) Add(o SidesReport) {
 	r.SingleFamily += o.SingleFamily
 	r.ExitOneFamily += o.ExitOneFamily
 	r.Exit += o.Exit
-	r.Public += o.Public
 	r.PublicRoute += o.PublicRoute
 	r.InsideApproved += o.InsideApproved
 	r.TaggedWithUser += o.TaggedWithUser
@@ -3323,7 +3110,6 @@ func (r *SidesReport) Add(o SidesReport) {
 	r.RoutesKept += o.RoutesKept
 	r.AsymmetricPeers += o.AsymmetricPeers
 	r.WildcardSteerOutside += o.WildcardSteerOutside
-	r.PublicNamedApp += o.PublicNamedApp
 }
 
 // AuditSides checks a's sides, classes and via plan against builds from
@@ -3425,10 +3211,6 @@ func sameSides(got, want Sides) error {
 
 	if d := mapDiff(want.held.Groups, got.held.Groups, slices.Equal[[]types.NodeID]); len(d) > 0 {
 		return fmt.Errorf("%w: holders of atoms %v", errSidesAudit, d)
-	}
-
-	if !slices.Equal(got.pub, want.pub) || !slices.Equal(got.pubSel, want.pubSel) || !maps.Equal(got.owners, want.owners) {
-		return fmt.Errorf("%w: public nodes %v / %v, from scratch %v / %v", errSidesAudit, got.pub, got.pubSel, want.pub, want.pubSel)
 	}
 
 	return nil
@@ -3587,10 +3369,6 @@ func countShapes(a SidesAudit, rep *SidesReport) {
 			}
 		}
 
-		if f.pub {
-			rep.Public++
-		}
-
 		if slices.ContainsFunc(f.routes, func(p netip.Prefix) bool { return util.HasInternetDestination(prefixSet(p)) }) {
 			rep.PublicRoute++
 		}
@@ -3608,10 +3386,6 @@ func countShapes(a SidesAudit, rep *SidesReport) {
 		rs, _ := s.sets.Get(id)
 		if rs.Has(Role{kind: roleRouterOnSrc, value: uint64(id)}) {
 			rep.ViaRouterOnSrc++
-		}
-
-		if f.namedApp && f.pub {
-			rep.PublicNamedApp++
 		}
 	}
 }
