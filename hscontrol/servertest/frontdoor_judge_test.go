@@ -1,8 +1,6 @@
 package servertest
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -21,7 +19,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/state/statemodel"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"tailscale.com/control/controlclient"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/netmap"
@@ -281,31 +278,12 @@ func (fd *frontDoor) judgeClients(at string) {
 // freshNetmap is what a fresh session of id is given at snap, as its
 // client builds it off the wire.
 func freshNetmap(fd *frontDoor, snap *state.Snapshot, id types.NodeID, p persist.Persist) *netmap.NetworkMap {
-	st := mapper.NewStream(fd.srv.cfg, mapper.NewHub(), id, tailcfg.CurrentCapabilityVersion)
-
-	resps, err := st.Initial(snap)
-	if err != nil || len(resps) != 1 {
-		fd.t.Fatalf("n%d: a fresh session of r%d: %d responses, %v", id, snap.Rev(), len(resps), err)
-	}
-
-	// The time it is sent at is the one field two sessions of a snapshot
-	// do not share.
-	resp := *resps[0]
-	resp.ControlTime = nil
-
-	b, err := mapper.Marshal(&resp)
+	wire, _, err := mapper.FirstMapForTest(fd.srv.cfg, snap, id, tailcfg.CurrentCapabilityVersion)
 	if err != nil {
-		fd.t.Fatalf("encoding a first map: %v", err)
+		fd.t.Fatalf("n%d: a fresh session of r%d: %v", id, snap.Rev(), err)
 	}
 
-	var wire tailcfg.MapResponse
-
-	err = json.Unmarshal(b, &wire)
-	if err != nil {
-		fd.t.Fatalf("decoding a first map: %v", err)
-	}
-
-	nm, err := controlclient.NetmapFromMapResponseForDebug(context.Background(), p.View(), &wire)
+	nm, err := mapper.ClientNetmapForTest(wire, p.View())
 	if err != nil {
 		fd.t.Fatalf("n%d: the client refuses a fresh first map: %v", id, err)
 	}

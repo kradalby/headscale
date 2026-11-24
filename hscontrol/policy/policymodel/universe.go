@@ -31,6 +31,7 @@ package policymodel
 import (
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 )
 
@@ -246,6 +247,12 @@ func selStrings(sels []Sel) []string {
 }
 
 func joinSels(sels []Sel) string { return "[" + strings.Join(selStrings(sels), " ") + "]" }
+
+// Without is from less rs, in from's order: what of a node's routes or
+// tags another list does not hold.
+func Without(from, rs []int) []int {
+	return slices.DeleteFunc(slices.Clone(from), func(r int) bool { return slices.Contains(rs, r) })
+}
 
 func routeStrings(idx []int) []string {
 	out := make([]string, len(idx))

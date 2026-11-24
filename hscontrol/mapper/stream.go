@@ -2,6 +2,7 @@ package mapper
 
 import (
 	"container/list"
+	"context"
 	jsonv1 "encoding/json"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
@@ -25,7 +26,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog/log"
+	"tailscale.com/control/controlclient"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/netmap"
+	"tailscale.com/types/persist"
 )
 
 // Stream turns world snapshots into the map responses one map session
@@ -1855,6 +1859,58 @@ func (h *Hub) Encode(
 // made once for all the maps that carry it.
 func Marshal(resp *tailcfg.MapResponse) ([]byte, error) {
 	return jsonv2.Marshal(resp, jsonv1.DefaultOptionsV1(), nodeMarshalers)
+}
+
+// FirstMapForTest is the first map a fresh session of node id is given at
+// snap: the bytes the wire carries and the filter the session cut for the
+// client. The time it is sent at is the one field two sessions of a
+// snapshot do not share, so it is left out of the bytes. The properties
+// hold every session to this one shape.
+func FirstMapForTest(
+	cfg *types.Config,
+	snap *state.Snapshot,
+	id types.NodeID,
+	cv tailcfg.CapabilityVersion,
+) ([]byte, []tailcfg.FilterRule, error) {
+	st := NewStream(cfg, NewHub(), id, cv)
+
+	resps, err := st.Initial(snap)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if len(resps) != 1 {
+		return nil, nil, fmt.Errorf("%w: a fresh session of r%d opens with %d responses", errNotOneResponse, snap.Rev(), len(resps))
+	}
+
+	resp := *resps[0]
+	resp.ControlTime = nil
+
+	wire, err := Marshal(&resp)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return wire, st.sent.filter, nil
+}
+
+// errNotOneResponse is a first map that opened with other than the one
+// response a first map is.
+var errNotOneResponse = errors.New("not one response")
+
+// ClientNetmapForTest is the netmap a client builds off the wire bytes of
+// a first map, reading its own node key from p: what every held map is
+// held to. Kept apart from [FirstMapForTest] so a caller reusing a
+// judged first map builds no second netmap.
+func ClientNetmapForTest(wire []byte, p persist.PersistView) (*netmap.NetworkMap, error) {
+	var onWire tailcfg.MapResponse
+
+	err := jsonv1.Unmarshal(wire, &onWire)
+	if err != nil {
+		return nil, err
+	}
+
+	return controlclient.NetmapFromMapResponseForDebug(context.Background(), p, &onWire)
 }
 
 // MarshalTo writes the same JSON as [Marshal] to w, which may receive partial

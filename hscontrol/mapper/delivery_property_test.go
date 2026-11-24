@@ -212,28 +212,12 @@ type freshSession struct {
 func newFreshSession(t pbtT, cfg *types.Config, snap *state.Snapshot, id types.NodeID, cv tailcfg.CapabilityVersion) freshSession {
 	t.Helper()
 
-	st := NewStream(cfg, NewHub(), id, cv)
-
-	resps, err := st.Initial(snap)
+	wire, served, err := FirstMapForTest(cfg, snap, id, cv)
 	if err != nil {
 		t.Fatalf("n%d: a fresh session of r%d: %v", id, snap.Rev(), err)
 	}
 
-	if len(resps) != 1 {
-		t.Fatalf("n%d: a fresh session of r%d opens with %d responses", id, snap.Rev(), len(resps))
-	}
-
-	// The time it is sent at is the one field two sessions of a snapshot
-	// do not share.
-	resp := *resps[0]
-	resp.ControlTime = nil
-
-	b, err := Marshal(&resp)
-	if err != nil {
-		t.Fatalf("encoding a first map: %v", err)
-	}
-
-	return freshSession{wire: b, served: st.sent.filter}
+	return freshSession{wire: wire, served: served}
 }
 
 // client is what the client holds after the first map: the netmap its own
@@ -245,17 +229,15 @@ func (f freshSession) client(t pbtT) (*netmap.NetworkMap, policyv2.FilterChunks)
 
 	err := json.Unmarshal(f.wire, &resp)
 	if err != nil {
-		t.Fatalf("decoding a first map: %v", err)
+		t.Fatalf("decoding a fresh first map: %v", err)
 	}
 
-	chunks := policyv2.FilterChunks{}.ApplyResponse(&resp)
-
-	nm, err := controlclient.NetmapFromMapResponseForDebug(context.Background(), debugPersist(), &resp)
+	nm, err := ClientNetmapForTest(f.wire, debugPersist())
 	if err != nil {
 		t.Fatalf("the client refuses a fresh first map: %v", err)
 	}
 
-	return nm, chunks
+	return nm, policyv2.FilterChunks{}.ApplyResponse(&resp)
 }
 
 // TestCanaryClientMapSessionAcrossResponses pins, through [realClient],
@@ -806,7 +788,7 @@ func (dw *deliveryWorld) lose(s *deliverySess, resps []*tailcfg.MapResponse) {
 type probeCache map[string]policymodel.Report
 
 func (pc probeCache) compare(ref []tailcfg.FilterRule, refNM *netmap.NetworkMap, cand []tailcfg.FilterRule, candNM *netmap.NetworkMap) policymodel.Report {
-	k := policymodel.RuleList(ref) + clientViewKey(refNM) + "\x00" + policymodel.RuleList(cand) + clientViewKey(candNM)
+	k := policymodel.RuleList(ref) + policymodel.NetmapViewKey(refNM) + "\x00" + policymodel.RuleList(cand) + policymodel.NetmapViewKey(candNM)
 	if rep, ok := pc[k]; ok {
 		return rep
 	}
@@ -819,22 +801,6 @@ func (pc probeCache) compare(ref []tailcfg.FilterRule, refNM *netmap.NetworkMap,
 	pc[k] = rep
 
 	return rep
-}
-
-// clientViewKey is what [policymodel.ViewFromNetmap] reads of nm.
-func clientViewKey(nm *netmap.NetworkMap) string {
-	type peer struct {
-		Addresses []netip.Prefix
-		CapMap    tailcfg.NodeCapMap
-		Unsigned  bool
-	}
-
-	peers := make([]peer, 0, len(nm.Peers))
-	for _, p := range nm.Peers {
-		peers = append(peers, peer{p.Addresses().AsSlice(), p.AsStruct().CapMap, p.UnsignedPeerAPIOnly()})
-	}
-
-	return policymodel.JSON(nm.SelfNode) + policymodel.JSON(peers)
 }
 
 // render has s take its wake and render the latest snapshot; its write

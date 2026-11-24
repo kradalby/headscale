@@ -900,7 +900,7 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 	kind := fd.joinKind(n, owner, users, logins)
 	fd.run.tally.joins[joinNames[kind]]++
 
-	admitted := without(n.Approved, n.AutoApproved)
+	admitted := policymodel.Without(n.Approved, n.AutoApproved)
 	full := kind != joinLoginTagged && len(admitted) == 0
 
 	nd := &fdNode{Ephemeral: kind == joinEphemeral}
@@ -1071,10 +1071,6 @@ func (fd *frontDoor) answered(at string, id types.NodeID, tc *TestClient) {
 }
 
 // without is from less rs.
-func without(from, rs []int) []int {
-	return slices.DeleteFunc(slices.Clone(from), func(r int) bool { return slices.Contains(rs, r) })
-}
-
 // approve sets id's approved routes through the API, the whole list as
 // an admin does, adding add and dropping drop. The API takes one exit
 // route in the list for both: an edit of one family is written, and
@@ -1099,7 +1095,7 @@ func (fd *frontDoor) approve(at string, id types.NodeID, add, drop []int) {
 
 	add, drop = widen(slices.Clone(add)), widen(slices.Clone(drop))
 
-	want := without(n.Approved, drop)
+	want := policymodel.Without(n.Approved, drop)
 	for _, r := range add {
 		if !slices.Contains(want, r) {
 			want = append(want, r)
@@ -2032,7 +2028,7 @@ func (fd *frontDoor) retagApprover(at string) bool {
 		return false
 	}
 
-	pending := without(n.Announced, n.Approved)
+	pending := policymodel.Without(n.Announced, n.Approved)
 	if len(pending) == 0 {
 		var routes []int
 
@@ -2049,7 +2045,7 @@ func (fd *frontDoor) retagApprover(at string) bool {
 		r := routes[rapid.IntRange(0, len(routes)-1).Draw(fd.t, "announced")]
 		fd.edit(at, policymodel.Announce{ID: n.ID, Routes: []int{r}}, nil)
 		n, _ = fd.w.Topology.Node(n.ID)
-		pending = without(n.Announced, n.Approved)
+		pending = policymodel.Without(n.Announced, n.Approved)
 	}
 
 	if len(pending) == 0 {

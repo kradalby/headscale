@@ -454,11 +454,11 @@ func (p *pbtWorld) change(cur policymodel.World, was, n policymodel.Node, tn *ty
 	}
 
 	var reports []policymodel.Edit
-	if add := without(n.Announced, was.Announced); len(add) > 0 {
+	if add := policymodel.Without(n.Announced, was.Announced); len(add) > 0 {
 		reports = append(reports, policymodel.Announce{ID: id, Routes: add})
 	}
 
-	if drop := without(was.Announced, n.Announced); len(drop) > 0 {
+	if drop := policymodel.Without(was.Announced, n.Announced); len(drop) > 0 {
 		reports = append(reports, policymodel.Withdraw{ID: id, Routes: drop})
 	}
 
@@ -480,7 +480,7 @@ func (p *pbtWorld) change(cur policymodel.World, was, n policymodel.Node, tn *ty
 		approveNone
 	)
 
-	before := without(n.Approved, n.AutoApproved)
+	before := policymodel.Without(n.Approved, n.AutoApproved)
 	plan := approveNone
 
 	for pl := range approveNone {
@@ -583,11 +583,6 @@ func sameRoutes(a, b policymodel.Node) bool {
 	a.Expired, a.Offline, b.Expired, b.Offline = false, false, false, false
 
 	return reflect.DeepEqual(a, b)
-}
-
-// without is from less rs, in from's order.
-func without(from, rs []int) []int {
-	return slices.DeleteFunc(slices.Clone(from), func(r int) bool { return slices.Contains(rs, r) })
 }
 
 // prefixes is rs as prefixes, sorted.

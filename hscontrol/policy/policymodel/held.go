@@ -234,8 +234,10 @@ func NetmapView(n Node, w World, nm *netmap.NetworkMap) ClientView {
 	return ModelView(n, w, &caps, NotShown(w, slices.Concat(nm.Peers, []tailcfg.NodeView{nm.SelfNode})))
 }
 
-// netmapViewKey is what [NetmapView] reads of nm.
-func netmapViewKey(nm *netmap.NetworkMap) string {
+// NetmapViewKey is what the client's view reads of nm: what
+// [NetmapView] builds its capabilities from, so a comparison may be
+// cached under it.
+func NetmapViewKey(nm *netmap.NetworkMap) string {
 	type node struct {
 		Addresses []netip.Prefix
 		CapMap    tailcfg.NodeCapMap
@@ -480,7 +482,7 @@ func (h *Held) filter(id types.NodeID, nm *netmap.NetworkMap, capSources bool) s
 		return fmt.Sprintf("its client's filter is in the wrong form: %s\nheadscale %v", msg, rules)
 	}
 
-	k := fmt.Sprint(n, capSources, h.ref.Served(id).Prefixes()) + RuleList(h.ref.Rules(id)) + h.known + RuleList(rules) + netmapViewKey(nm)
+	k := fmt.Sprint(n, capSources, h.ref.Served(id).Prefixes()) + RuleList(h.ref.Rules(id)) + h.known + RuleList(rules) + NetmapViewKey(nm)
 	if h.j.passed[k] || h.j.passed[h.world+k] {
 		return ""
 	}
