@@ -21,10 +21,7 @@ var (
 // say. Where one applies, the model or the property follows the package
 // and counts the case; each is pinned by a hand test that fails once the
 // package changes.
-const (
-	excPeekFirstZero   = "graph/peek-first-zero"
-	excChangedAtValues = "graph/changedat-values"
-)
+const excPeekFirstZero = "graph/peek-first-zero"
 
 // Shapes the model names for the coverage floors though the behaviour they
 // mark is documented, so the floors stay meaningful.

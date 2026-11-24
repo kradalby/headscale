@@ -167,7 +167,9 @@ func (s *Snapshot) Get[T any](n Node[T]) T {
 }
 
 // ChangedAt returns the revision at which n last changed in s. Two
-// snapshots that report the same revision hold the same value of n.
+// snapshots that report the same revision hold values n's equality calls
+// equal, not the identical value: a derived cell stores each value it
+// computes, so the state it carries rides on under one revision.
 func ChangedAt[T any](s *Snapshot, n Node[T]) uint64 {
 	return s.changed[int(n.ref())]
 }
@@ -340,11 +342,6 @@ func (g *Graph) commit(prev *Snapshot, sets map[int]any) (*Snapshot, bool) {
 
 		// An equal value is still stored, so the next computation sees
 		// the latest state it carried, but is not a change.
-		// TODO(kradalby): graph/changedat-values: storing each new value
-		// without moving the revision means two snapshots reporting the
-		// same revision hold values the equality calls equal, not the
-		// same value, as ChangedAt's doc says. Pinned by
-		// TestChangedAtSpansValuesItsEqualityCallsEqual.
 		if first || !c.equal(next.values[i], v) {
 			next.changed[i] = next.rev
 		}

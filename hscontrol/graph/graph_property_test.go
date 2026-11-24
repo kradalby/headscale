@@ -473,16 +473,6 @@ func (r *graphRun) finish() string {
 			if v != w && !eq.equal(v, w) {
 				return fmt.Sprintf("cell %d holds %d at rev %d and %d at rev %d, both changed at %d", i, w, rev-1, v, rev, ChangedAt(s, n))
 			}
-
-			// TODO(kradalby): graph/changedat-values: ChangedAt's doc says
-			// two snapshots reporting the same revision hold the same value;
-			// they hold values the cell's equality calls equal, and a
-			// derived cell stores each new one. Counted here; delete with
-			// TestChangedAtSpansValuesItsEqualityCallsEqual once the doc
-			// says equal.
-			if v != w {
-				r.tl[excChangedAtValues]++
-			}
 		}
 	}
 
@@ -1084,10 +1074,10 @@ func TestPeekInTheFirstUpdateSeesZero(t *testing.T) {
 	}
 }
 
-// TestChangedAtSpansValuesItsEqualityCallsEqual pins graph/changedat-values:
-// a derived cell stores a new value its equality calls equal without moving
+// TestChangedAtSpansValuesItsEqualityCallsEqual pins ChangedAt's rule: a
+// derived cell stores a new value its equality calls equal without moving
 // its change revision, so two snapshots reporting the same revision hold
-// different values.
+// values the equality calls equal, not the identical value.
 func TestChangedAtSpansValuesItsEqualityCallsEqual(t *testing.T) {
 	g := New()
 	a := g.NewInput("a", 0, Same[int])
@@ -1101,6 +1091,6 @@ func TestChangedAtSpansValuesItsEqualityCallsEqual(t *testing.T) {
 	}
 
 	if s1.Get(d) == s2.Get(d) {
-		t.Fatalf("both hold %d: see graph/changedat-values", s1.Get(d))
+		t.Fatalf("both hold %d: the cell stores the newer equal value it computed", s1.Get(d))
 	}
 }
