@@ -2531,6 +2531,16 @@ func (s *State) reclaimFinishedFor(entry *types.AuthRequest) bool {
 	return false
 }
 
+// releaseAuth returns a login whose approval failed to pending. An expiry
+// dropped while the approval held it is delivered now.
+func (s *State) releaseAuth(id types.AuthID, rn *types.AuthRequest) {
+	rn.Release()
+
+	if _, ok := s.authCache.Peek(id); !ok {
+		rn.FinishAuth(types.AuthVerdict{Err: ErrRegistrationExpired})
+	}
+}
+
 // DeleteAuthCacheEntryForTest drops a pending auth request from the cache,
 // exposed for testing so a test can reproduce a session that was lost
 // (expired, evicted, or dropped on a control-plane restart) without faking an
@@ -3262,11 +3272,20 @@ func (s *State) HandleNodeFromAuthPath(
 		expiry = &utc
 	}
 
-	// Get the registration entry from cache
+	// Claimed, the login is this approval's to decide: another approval is
+	// refused, and expiry no longer decides it.
 	regEntry, ok := s.GetAuthCacheEntry(authID)
-	if !ok {
+	if !ok || !regEntry.Claim() {
 		return types.NodeView{}, hsdb.ErrNodeNotFoundRegistrationCache
 	}
+
+	delivered := false
+
+	defer func() {
+		if !delivered {
+			s.releaseAuth(authID, regEntry)
+		}
+	}()
 
 	// Get the user
 	user, err := s.db.GetUserByID(userID)
@@ -3295,12 +3314,6 @@ func (s *State) HandleNodeFromAuthPath(
 	// Serialise registration for this machine so concurrent auth callbacks
 	// resolve to a single node rather than racing the find-then-create section.
 	defer s.lockRegistration(machineKey)()
-
-	// An approval that held the lock first may have decided the login since
-	// it was looked up.
-	if regEntry.IsFinished() {
-		return types.NodeView{}, hsdb.ErrNodeNotFoundRegistrationCache
-	}
 
 	all := s.Snapshot().GetNodesByMachineKeyAllUsers(machineKey)
 
@@ -3385,7 +3398,9 @@ func (s *State) HandleNodeFromAuthPath(
 
 	// The entry stays cached so a follow-up that looks it up after this
 	// still reads the verdict.
-	regEntry.FinishAuth(types.AuthVerdict{Node: finalNode})
+	regEntry.Deliver(types.AuthVerdict{Node: finalNode})
+
+	delivered = true
 
 	// The login may have created the user (OIDC), which the policy must see.
 	s.refreshUsersAfterRegistration(finalNode, types.UserID(user.ID))
