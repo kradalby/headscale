@@ -231,6 +231,15 @@ func (i *IPAllocator) next(prev netip.Addr, prefix *netip.Prefix) (*netip.Addr, 
 		ip = prefix.Masked().Addr()
 	}
 
+	// The via range is a /64 the client reads as IPv4 routes mapped into
+	// IPv6, never as a node's address: start past it, and cross it whole
+	// when the walk reaches it, as one address at a time would never get
+	// across.
+	ip = pastVia(ip)
+	if !prefix.Contains(ip) {
+		ip = prefix.Masked().Addr()
+	}
+
 	start := ip
 	for {
 		if !set.Contains(ip) && !isTailscaleReservedIP(ip) {
@@ -239,7 +248,7 @@ func (i *IPAllocator) next(prev netip.Addr, prefix *netip.Prefix) (*netip.Addr, 
 			return &ip, nil
 		}
 
-		ip = ip.Next()
+		ip = pastVia(ip.Next())
 
 		// Wrap so addresses freed behind the cursor can be reused.
 		if !prefix.Contains(ip) {
@@ -250,6 +259,18 @@ func (i *IPAllocator) next(prev netip.Addr, prefix *netip.Prefix) (*netip.Addr, 
 			return nil, ErrCouldNotAllocateIP
 		}
 	}
+}
+
+// pastVia is ip, unless it is inside the via range, in which case it is
+// the first address after it. A walk that lands in the range jumps over
+// it whole; a start inside it begins past it, so the walk's termination
+// on its start still holds.
+func pastVia(ip netip.Addr) netip.Addr {
+	if r := tsaddr.TailscaleViaRange(); r.Contains(ip) {
+		return netipx.RangeOfPrefix(r).To().Next()
+	}
+
+	return ip
 }
 
 func randomNext(pfx netip.Prefix) (netip.Addr, error) {
@@ -302,7 +323,8 @@ func randomNext(pfx netip.Prefix) (netip.Addr, error) {
 func isTailscaleReservedIP(ip netip.Addr) bool {
 	return tsaddr.ChromeOSVMRange().Contains(ip) ||
 		tsaddr.TailscaleServiceIP() == ip ||
-		tsaddr.TailscaleServiceIPv6() == ip
+		tsaddr.TailscaleServiceIPv6() == ip ||
+		tsaddr.TailscaleViaRange().Contains(ip)
 }
 
 // BackfillNodeIPs will take a database transaction, and

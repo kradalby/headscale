@@ -560,6 +560,15 @@ func TestIPAllocatorNextNoReservedIPs(t *testing.T) {
 	t.Logf("chrome: %s", nextChrome.String())
 	require.NoError(t, err)
 	assert.Equal(t, na("100.115.94.0"), *nextChrome)
+
+	// Validate that we do not give out the via range: the client reads
+	// its addresses as IPv4 routes mapped into IPv6, never as a node's.
+	nextVia, err := alloc.next(
+		na("fd7a:115c:a1e0:b19:ffff:ffff:ffff:ffff"),
+		new(tsaddr.TailscaleULARange()),
+	)
+	require.NoError(t, err)
+	assert.Equal(t, na("fd7a:115c:a1e0:b1b::"), *nextVia)
 }
 
 // TestIPAllocatorNextIPv6OnlyExhausted pins that an IPv6 failure with no IPv4
