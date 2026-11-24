@@ -249,10 +249,6 @@ in its answer; the default named below then stands.
 
 ## Already settled (no capture needed)
 
-- `policy/exit-destination-routes`: capture
-  `issue_3212/routes-b18-autogroup-internet-wildcard-src-with-exit-autoapprover` shows the
-  service gives an exit node the subnet routes behind an internet rule's sources.
-  Headscale will be fixed to match.
 - Nodes sharing an address, nodes without any address, nodes outside the service's
   ranges: cannot exist on the hosted service. Decided without captures.
 

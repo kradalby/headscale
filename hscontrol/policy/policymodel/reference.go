@@ -471,24 +471,6 @@ const (
 	// reading is chosen: fix production, or make headscale's reading the
 	// reference's own.
 	ViaSelf
-	// ExitDestinationRoutes: an exit node serving an internet-reaching
-	// rule, through via or not, is on its destinations' side for route
-	// access too, and gets the routes overlapping its sources, so that
-	// hosts behind a subnet router can use it. Captured: routes-b18 gives
-	// the exit node those routes. Headscale gives it none (believed
-	// wrong). Fails closed.
-	//
-	// TODO(kradalby): policy/exit-destination-routes: fails closed,
-	// believed wrong. With `* -> autogroup:internet:*`, n1 an exit node and
-	// n2 routing 10.0.0.0/24, n1 is not given 10.0.0.0/24, so hosts behind
-	// n2 cannot use n1; through via the same. The hosted service gives it:
-	// capture issue_3212/routes-b18-autogroup-internet-wildcard-src-with-exit-autoapprover
-	// (juanfont/headscale#3212), held by TestReferenceAgreesWithCaptures.
-	// TestPeersAndRoutesFollowReference counts it under "exit routes as
-	// destination". Production: Sides.RouteAccess in
-	// policy/v2/visibility.go. Delete the clause, and its branch in
-	// Routes, once route access takes such an exit node as a destination.
-	ExitDestinationRoutes
 	// AppWildcard: * in an app grant is everything as a destination, as
 	// it is for the grant's ports: a viewer among its sources gets subnet
 	// routes by it as by an app grant to the subnet (captured, via golden
@@ -616,7 +598,7 @@ const (
 // tries them.
 var ContestedClauses = []Contested{
 	OthersSelf, StarApprovedRoutes, InternetAtSubnetRouters,
-	ViaOwnAddress, ViaReach, ViaSelf, ExitDestinationRoutes, AppWildcard, ViaRouterCover, ViaExitInternet,
+	ViaOwnAddress, ViaReach, ViaSelf, AppWildcard, ViaRouterCover, ViaExitInternet,
 	ViaRouterExitRoutes, ViaExitSourceRoutes,
 }
 
@@ -629,7 +611,7 @@ func (c Contested) FailsOpen() bool {
 func (c Contested) String() string {
 	names := []string{
 		"others' self rules", "* adds approved routes", "internet at subnet routers",
-		"via own address", "via reach", "via to self", "exit routes as destination", "* as app destination",
+		"via own address", "via reach", "via to self", "* as app destination",
 		"via router covered", "via exit internet", "via router exit routes", "via exit source routes",
 	}
 
@@ -1382,22 +1364,7 @@ func (r *Ref) Routes(viewer, peer types.NodeID) []netip.Prefix {
 				return on(v, rl.src) && len(rl.ip) > 0 && rl.reachesInternet()
 			}
 
-			dstSide := r.onDst(rl, v)
-
-			switch {
-			case r.without&ExitDestinationRoutes == 0:
-			case via:
-				// A via router is on the side of its own part of the
-				// grant: what its subnet routes overlap, and the internet
-				// at an exit node.
-				dstSide = v.hasTag(rl.via) && slices.ContainsFunc(v.subnets(), func(s netip.Prefix) bool {
-					return rl.dst.OverlapsPrefix(s) || rl.internet && v.exit() && internet.OverlapsPrefix(s)
-				})
-			default:
-				dstSide = on(v, rl.dst)
-			}
-
-			return !via && on(v, rl.src) && rl.dst.OverlapsPrefix(q) || dstSide && rl.src.OverlapsPrefix(q)
+			return !via && on(v, rl.src) && rl.dst.OverlapsPrefix(q) || r.onDst(rl, v) && rl.src.OverlapsPrefix(q)
 		})
 		if keep {
 			out = append(out, q)

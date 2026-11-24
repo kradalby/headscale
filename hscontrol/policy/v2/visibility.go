@@ -2452,12 +2452,6 @@ func (kc *keyedClasses) changedSince(old *keyedClasses) []types.NodeID {
 // matchers. An exit route needs a rule from the viewer to the internet; a
 // subnet route a rule with the viewer on one side and the route
 // overlapping the other side's addresses.
-//
-// TODO(kradalby): policy/exit-destination-routes: an exit node serving an
-// internet-reaching rule is no destination here, so it gets none of the
-// subnet routes behind the rule's sources, which the hosted service gives
-// it (capture issue_3212/routes-b18-autogroup-internet-wildcard-src-with-exit-autoapprover; fails closed, believed wrong). See
-// policymodel.ExitDestinationRoutes.
 func (s Sides) RouteAccess(viewer types.NodeID, routes []netip.Prefix) []netip.Prefix {
 	vs, ok := s.sets.Get(viewer)
 	if !ok || len(routes) == 0 {
@@ -2560,7 +2554,9 @@ func addRule(out []accessRule, vs RoleSet, r accessRule) []accessRule {
 	hit := func(atoms []Role) bool { return slices.ContainsFunc(atoms, vs.Has) }
 
 	r.isSrc = r.isSrc || hit(r.src)
-	r.isDst = r.isDst || hit(r.dst)
+	// An exit node serves a rule's internet destinations, so it is on that
+	// side too, as visibility has it.
+	r.isDst = r.isDst || hit(r.dst) || r.inet && vs.Has(atomExit)
 
 	if r.isSrc || r.isDst {
 		out = append(out, r)
