@@ -39,8 +39,9 @@ const worldSteps = 10
 
 // TestGeneratedWorldsStart holds the generators to what a started server
 // holds: every world a scenario passes through passes the startup check,
-// and a drawn node made to hold no address, or another's, fails it. That
-// NewState runs the check is TestNewStateChecksNodeAddresses.
+// and a drawn node made to hold no address, another's, or one outside the
+// Tailscale ranges fails it. That NewState runs the check is
+// TestNewStateChecksNodeAddresses.
 func TestGeneratedWorldsStart(t *testing.T) {
 	t.Parallel()
 
@@ -72,6 +73,11 @@ func TestGeneratedWorldsStart(t *testing.T) {
 			if err := checkNodeAddresses(nodes); !errors.Is(err, ErrNodeAddressShared) { //nolint:noinlineerr
 				t.Fatalf("n%d on n%d's addresses: %v", n.ID, o.ID, err)
 			}
+		}
+
+		n.IPv4, n.IPv6 = new(netip.AddrFrom4([4]byte{192, 0, 2, byte(n.ID)})), nil    //nolint:gosec // any outside address
+		if err := checkNodeAddresses(nodes); !errors.Is(err, ErrNodeAddressOutside) { //nolint:noinlineerr
+			t.Fatalf("n%d on %s: %v", n.ID, n.IPv4, err)
 		}
 	})
 }
