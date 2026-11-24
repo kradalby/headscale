@@ -982,6 +982,127 @@ func TestGroupByListsHoldNoSpareRoom(t *testing.T) {
 	}
 }
 
+// TestMapEditCostFollowsTheEditNotTheMap holds the Map's cost promise
+// where no machine load can touch it: an edit allocates the paths it
+// replaces — O(k log n) — never the Map's size, and a bigger Map adds only
+// its depth. A structural-sharing bug turns these counts into the size of
+// the Map.
+func TestMapEditCostFollowsTheEditNotTheMap(t *testing.T) {
+	build := func(n int) *Map[int, int] {
+		entries := make(map[int]int, n)
+		for i := range n {
+			entries[i] = i
+		}
+
+		return NewMap(Same[int], entries)
+	}
+
+	small, big := build(16), build(1<<16)
+
+	oneSmall := testing.AllocsPerRun(200, func() {
+		e := small.Edit()
+		e.Set(0, -1)
+		_ = e.Done()
+	})
+
+	oneBig := testing.AllocsPerRun(200, func() {
+		e := big.Edit()
+		e.Set(0, -1)
+		_ = e.Done()
+	})
+
+	// A whole-map copy of 65536 entries allocates as many times; one
+	// path of its tree is a handful.
+	if oneBig > 32 {
+		t.Fatalf("a one-key edit of 65536 entries allocates %.0f times", oneBig)
+	}
+
+	if oneBig > oneSmall+8 {
+		t.Fatalf("a one-key edit allocates %.0f times on 65536 entries, %.0f on 16; the depth of the tree must be all the size adds", oneBig, oneSmall)
+	}
+
+	sixteen := testing.AllocsPerRun(200, func() {
+		e := big.Edit()
+		for i := range 16 {
+			e.Set(i, -i)
+		}
+
+		_ = e.Done()
+	})
+
+	if sixteen > 16*oneBig {
+		t.Fatalf("an edit of 16 keys allocates %.0f times, over 16 times the %.0f of one", sixteen, oneBig)
+	}
+}
+
+// TestMapLogStaysBounded holds the Map's memory promise for the edit log:
+// a chain grows to twice mapLog, then its older half is dropped, so a
+// lineage however long holds at most 2*mapLog edits, and the half kept is
+// the newest one.
+func TestMapLogStaysBounded(t *testing.T) {
+	m := NewMap(Same[int], map[int]int{})
+
+	// ids[i] is the id of the Map edit i started from; version i+1's log
+	// entry for edit i+1 records ids[i].
+	ids := make([]uint64, 0, 3*mapLog)
+
+	for i := range 3 * mapLog {
+		base := m
+		e := base.Edit()
+		e.Set(i, 1)
+		m = e.Done()
+
+		ids = append(ids, base.id)
+
+		if m.log.depth > 2*mapLog {
+			t.Fatalf("edit %d holds a log of depth %d", i+1, m.log.depth)
+		}
+
+		if i+1 == 2*mapLog && m.log.depth != 2*mapLog {
+			t.Fatalf("edit %d holds a log of depth %d, want exactly 2*mapLog before the trim", i+1, m.log.depth)
+		}
+
+		if i+1 == 2*mapLog+1 && m.log.depth != mapLog {
+			t.Fatalf("edit %d holds a log of depth %d, want the older half dropped to mapLog", i+1, m.log.depth)
+		}
+
+		// Past the first trim the chain must reach mapLog back, never
+		// less, and hold exactly its depth in entries, the newest ones.
+		chain := 0
+
+		for e := m.log; e != nil; e = e.prev {
+			if want := ids[i-chain]; e.from != want {
+				t.Fatalf("edit %d: entry %d of the log names edit %d", i+1, chain, i-chain)
+			}
+
+			chain++
+		}
+
+		if chain != m.log.depth {
+			t.Fatalf("edit %d: the log holds %d entries, its depth says %d", i+1, chain, m.log.depth)
+		}
+
+		if i+1 > 2*mapLog && m.log.depth < mapLog {
+			t.Fatalf("edit %d holds a log of depth %d, short of mapLog", i+1, m.log.depth)
+		}
+	}
+}
+
+// TestCursorPinsNoEntries holds the Cursor's memory promise at its root:
+// the token holds neither entries nor a log, so a reader keeping one pins
+// nothing of the Map it stands for.
+func TestCursorPinsNoEntries(t *testing.T) {
+	m := NewMap(Same[int], map[int]int{1: 1, 2: 2})
+
+	e := m.Edit()
+	e.Set(3, 3)
+	next := e.Done()
+
+	if cur := next.Cursor(); cur.items != nil || cur.log != nil {
+		t.Fatal("a cursor holds what it must only stand for")
+	}
+}
+
 // BenchmarkGroupByEdit moves one key into a group of n: one copy of the
 // group's list, at its length, is what the edit should cost.
 func BenchmarkGroupByEdit(b *testing.B) {
