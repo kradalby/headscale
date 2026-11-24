@@ -1388,6 +1388,36 @@ func TestAgreesWithAddressFormCatchesMissingStamp(t *testing.T) {
 	require.ErrorIs(t, AgreesWithAddressForm(capForm, ip, withDB), errCapForm, "db1 stamped")
 }
 
+// TestAgreesWithAddressFormMergesBySourceSet pins what the audit's
+// comparison asks: rules over one source set, merged in one form and kept
+// apart in the other, agree, while a rule missing, or a destination
+// widened, is still reported — the merge is not blind.
+func TestAgreesWithAddressFormMergesBySourceSet(t *testing.T) {
+	t.Parallel()
+
+	pass := func(nodecap.Cap) []netip.Addr { return nil }
+
+	d22 := tailcfg.NetPortRange{IP: "100.64.0.3", Ports: tailcfg.PortRange{First: 22, Last: 22}}
+	d80 := tailcfg.NetPortRange{IP: "100.64.0.28", Ports: tailcfg.PortRange{First: 80, Last: 80}}
+
+	// Two rules over one source set, the compile's own merge key: the
+	// audit's expansion merges them, and address form, whose other rule's
+	// sources read in another order, keeps them apart.
+	apart := []tailcfg.FilterRule{
+		{SrcIPs: []string{"100.64.0.28", "100.64.0.3"}, DstPorts: []tailcfg.NetPortRange{d22}},
+		{SrcIPs: []string{"100.64.0.28", "100.64.0.3"}, DstPorts: []tailcfg.NetPortRange{d80}},
+	}
+
+	require.NoError(t, AgreesWithAddressForm(apart, apart, pass), "one source set's rules merged and apart")
+
+	require.ErrorIs(t, AgreesWithAddressForm(apart, apart[1:], pass), errCapForm, "a rule missing")
+
+	d22Elsewhere := tailcfg.NetPortRange{IP: "100.64.0.28", Ports: tailcfg.PortRange{First: 22, Last: 22}}
+	widened := slices.Clone(apart)
+	widened[0].DstPorts = []tailcfg.NetPortRange{d22, d22Elsewhere}
+	require.ErrorIs(t, AgreesWithAddressForm(apart, widened, pass), errCapForm, "a destination widened")
+}
+
 // TestFilterDeliveryByClient holds the per-client decision: named chunks go
 // only to Tailscale's own client at or past the oldest release headscale
 // serves; a release before it, a Go client reporting no Tailscale release,

@@ -424,8 +424,7 @@ func readsOf(st policymodel.Step, w policymodel.World) []types.NodeID {
 // serves to a world built from nothing for the same users, document and
 // nodes (servedDiffers), every node's SSH policy to that world's
 // (sshDiffers), and its stamps to the reference model (stampsDiffer).
-// Under the policy audit, no audit may log anything but its known false
-// alarms ([auditLines.judge]).
+// Under the policy audit, no audit may log anything.
 //
 // Oracles: the world from scratch, the same cells (it sees what updating
 // cells, their cut-offs and carried values get wrong) and a compile that
@@ -434,7 +433,6 @@ func readsOf(st policymodel.Step, w policymodel.World) []types.NodeID {
 func TestWorldMatchesScratchWorld(t *testing.T) {
 	var shapes shapeTally
 
-	known := tally{}
 	audits := watchAudits(t)
 
 	rapid.Check(t, func(t *rapid.T) {
@@ -455,7 +453,6 @@ func TestWorldMatchesScratchWorld(t *testing.T) {
 			}
 
 			w := s.Start
-			sorted := policymodel.MergesApart(w)
 			scr := scratchOf(t, s.Start, capSources)
 
 			if msg := servedDiffers(snap, scr, all); msg != "" {
@@ -470,7 +467,7 @@ func TestWorldMatchesScratchWorld(t *testing.T) {
 				t.Fatalf("capability sources %t, at the start: %s", capSources, msg)
 			}
 
-			if msg := audits.judge(sorted, known); msg != "" {
+			if msg := audits.judge(); msg != "" {
 				t.Fatalf("capability sources %t, at the start: %s", capSources, msg)
 			}
 
@@ -478,7 +475,6 @@ func TestWorldMatchesScratchWorld(t *testing.T) {
 				next, change := w.Commit(st)
 				snap = m.commit(t, next, change, apart[i])
 				scr := scratchOf(t, next, capSources)
-				sorted = sorted || policymodel.MergesApart(next)
 
 				if msg := servedDiffers(snap, scr, readsOf(st, next)); msg != "" {
 					t.Fatalf("capability sources %t, after step %d (%s): %s", capSources, i+1, st, msg)
@@ -492,7 +488,7 @@ func TestWorldMatchesScratchWorld(t *testing.T) {
 					t.Fatalf("capability sources %t, after step %d (%s): %s", capSources, i+1, st, msg)
 				}
 
-				if msg := audits.judge(sorted, known); msg != "" {
+				if msg := audits.judge(); msg != "" {
 					t.Fatalf("capability sources %t, after step %d (%s): %s", capSources, i+1, st, msg)
 				}
 
@@ -501,7 +497,6 @@ func TestWorldMatchesScratchWorld(t *testing.T) {
 		}
 	})
 
-	t.Logf("known divergences: %v", known)
 	shapes.log(t, "world matches scratch")
 }
 
@@ -603,19 +598,11 @@ func (a *auditLines) take() []auditLine {
 	return out
 }
 
-// judge returns the first line logged since the last judge that is no
-// known false alarm, counting those in known: the filter audit's merge
-// order once the case held a user whose addresses sort apart.
-func (a *auditLines) judge(sorted bool, known tally) string {
+// judge returns the first line logged since the last judge: no audit
+// line is a known false alarm.
+func (a *auditLines) judge() string {
 	for _, l := range a.take() {
-		switch {
-		case sorted && l.Message == "policy audit: filter" && strings.Contains(l.Error, "capability form expands otherwise than address form"):
-			// TODO(kradalby): policy/merge-order: see
-			// policymodel.MergesApart.
-			known["audit: merge order"]++
-		default:
-			return fmt.Sprintf("%s: %s", l.Message, l.Error)
-		}
+		return fmt.Sprintf("%s: %s", l.Message, l.Error)
 	}
 
 	return ""
@@ -832,7 +819,7 @@ func filtersNameAll(a, c *Snapshot) bool {
 // more than one commit apart are what the hub's render log asks. Oracle:
 // the served values at both ends, the world's own accessors; it sees what
 // Since's deltas miss, not what the cells serve. Under the policy audit,
-// no audit may log anything but its known false alarms.
+// no audit may log anything.
 func TestSinceSoundOverAnyPair(t *testing.T) {
 	var shapes shapeTally
 
@@ -885,11 +872,7 @@ func TestSinceSoundOverAnyPair(t *testing.T) {
 				}
 			}
 
-			worlds := s.Worlds()
-
-			sorted := slices.ContainsFunc(worlds, policymodel.MergesApart)
-
-			if msg := audits.judge(sorted, counts); msg != "" {
+			if msg := audits.judge(); msg != "" {
 				t.Fatalf("capability sources %t: %s", capSources, msg)
 			}
 		}
@@ -1082,19 +1065,12 @@ func mapStrings[E any](in []E, f func(E) string) []string {
 // TestServedAuditAgreesWhateverTheMergeOrder holds the served filter audit
 // to a capability-form filter that says what address form says, over two
 // rules alice's nodes reach 100.64.0.28 by: alice@'s and a self rule.
-//
-// TODO(kradalby): policy/merge-order: the compile writes a self rule's
-// sources in address order and every other rule's as text, and merges
-// rules only on equal text; for these addresses address form keeps the
-// two rules apart, the audit's expansion of capability form merges them,
-// and AgreesWithAddressForm, comparing rule multisets, logs a mismatch.
-// Unskip once the audit compares rules merged by source set, or the
-// compile writes one order.
+// The compile writes a self rule's sources in address order and every
+// other rule's as text, and merges rules only on equal text, so address
+// form keeps the two rules apart while the audit's expansion of
+// capability form merges them: the audit must compare the forms with
+// rules merged by source set, or it calls that a disagreement.
 func TestServedAuditAgreesWhateverTheMergeOrder(t *testing.T) {
-	if os.Getenv("HEADSCALE_PBT_KNOWN_BUGS") == "" {
-		t.Skip("TODO(kradalby): policy/merge-order; HEADSCALE_PBT_KNOWN_BUGS=1 runs it")
-	}
-
 	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
 
 	users := []types.User{{ID: 1, Name: "alice"}}

@@ -1518,8 +1518,12 @@ func (x *Expansion) selfCount(uid uint) reasonCounts {
 // AgreesWithAddressForm returns how capForm, a receiver's filter in
 // capability form, differs from ipForm, the same receiver's address form,
 // once its capabilities are written as the addresses of their holders:
-// compared as rule multisets, each rule's lists as sets, since capability
-// form keeps each grant's rules apart where address form merges them.
+// compared with plain rules merged by source and protocol set — the
+// compile merges rules that way whenever their sources read the same, so
+// forms that merge one source set's rules in one order and keep them
+// apart in the other still admit the same thing — each group's lists as
+// sets, since capability form keeps each grant's rules apart where
+// address form merges them.
 func AgreesWithAddressForm(capForm, ipForm []tailcfg.FilterRule, holders func(nodecap.Cap) []netip.Addr) error {
 	if slices.EqualFunc(capForm, ipForm, func(a, b tailcfg.FilterRule) bool { return reflect.DeepEqual(a, b) }) {
 		return nil
@@ -1537,39 +1541,50 @@ func AgreesWithAddressForm(capForm, ipForm []tailcfg.FilterRule, holders func(no
 
 var errCapForm = errors.New("capability form expands otherwise than address form")
 
-// ruleMultiset writes rules as a multiset: each rule's lists sorted, app
-// capability values as JSON, the rules in any order.
+// ruleMultiset writes rules as a multiset with plain rules merged by
+// source and protocol set, their destinations and grants unioned: the
+// compile merges rules that way whenever their sources read the same, so
+// two forms can merge one source set's rules in one order and keep them
+// apart in the other while admitting the same thing, and the audit must
+// not call that a disagreement. App capability values are JSON with their
+// keys sorted; the groups are in any order.
 func ruleMultiset(rules []tailcfg.FilterRule) []string {
-	out := make([]string, 0, len(rules))
+	type merged struct {
+		dst    []string
+		grants []string
+	}
+
+	groups := map[string]*merged{}
 
 	for _, r := range rules {
 		// Sets: two nodes holding one address list it twice in address
 		// form, once in capability form.
 		srcs := slices.Compact(slices.Sorted(slices.Values(r.SrcIPs)))
-
-		dsts := make([]string, 0, len(r.DstPorts))
-		for _, d := range r.DstPorts {
-			dsts = append(dsts, fmt.Sprintf("%s:%d-%d", d.IP, d.Ports.First, d.Ports.Last))
-		}
-
-		slices.Sort(dsts)
-		dsts = slices.Compact(dsts)
-
 		protos := slices.Compact(slices.Sorted(slices.Values(r.IPProto)))
 
-		grants := make([]string, 0, len(r.CapGrant))
+		key := fmt.Sprintf("src=%v proto=%v", srcs, protos)
 
-		for _, g := range r.CapGrant {
-			ds := make([]string, 0, len(g.Dsts))
-			for _, p := range g.Dsts {
+		g := groups[key]
+		if g == nil {
+			g = &merged{}
+			groups[key] = g
+		}
+
+		for _, d := range r.DstPorts {
+			g.dst = append(g.dst, fmt.Sprintf("%s:%d-%d", d.IP, d.Ports.First, d.Ports.Last))
+		}
+
+		for _, gr := range r.CapGrant {
+			ds := make([]string, 0, len(gr.Dsts))
+			for _, p := range gr.Dsts {
 				ds = append(ds, p.String())
 			}
 
 			slices.Sort(ds)
 			ds = slices.Compact(ds)
 
-			caps := make([]string, 0, len(g.CapMap))
-			for c, vs := range g.CapMap {
+			caps := make([]string, 0, len(gr.CapMap))
+			for c, vs := range gr.CapMap {
 				vals := make([]string, 0, len(vs))
 				for _, v := range vs {
 					vals = append(vals, compactJSON(v))
@@ -1579,12 +1594,19 @@ func ruleMultiset(rules []tailcfg.FilterRule) []string {
 			}
 
 			slices.Sort(caps)
-			grants = append(grants, strings.Join(ds, ",")+" "+strings.Join(caps, ";"))
+			g.grants = append(g.grants, strings.Join(ds, ",")+" "+strings.Join(caps, ";"))
 		}
+	}
 
-		slices.Sort(grants)
-		grants = slices.Compact(grants)
-		out = append(out, fmt.Sprintf("src=%v dst=%v proto=%v caps=%v", srcs, dsts, protos, grants))
+	out := make([]string, 0, len(groups))
+
+	for key, g := range groups {
+		slices.Sort(g.dst)
+		g.dst = slices.Compact(g.dst)
+		slices.Sort(g.grants)
+		g.grants = slices.Compact(g.grants)
+
+		out = append(out, fmt.Sprintf("%s dst=%v caps=%v", key, g.dst, g.grants))
 	}
 
 	slices.Sort(out)

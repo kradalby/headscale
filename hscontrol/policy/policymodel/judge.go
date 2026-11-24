@@ -6,7 +6,6 @@ import (
 	"math/bits"
 	"net/netip"
 	"slices"
-	"strings"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"go4.org/netipx"
@@ -388,45 +387,4 @@ func ContestedRoutes(ref *Ref, viewer, peer types.NodeID, got []netip.Prefix) (C
 
 		return slices.Equal(got, want)
 	})
-}
-
-// MergesApart reports whether w has a self destination and a user whose
-// nodes' addresses sort otherwise as text than as addresses.
-//
-// TODO(kradalby): policy/merge-order: the compile writes a self rule's
-// sources in address order and every other rule's as text, and merges
-// rules only on equal text, so the filter audit takes two forms that
-// merged one source set's rules apart for a disagreement (see
-// TestServedAuditAgreesWhateverTheMergeOrder in state). Drop this when
-// that test runs unskipped.
-func MergesApart(w World) bool {
-	if !SelfDestination(w.Policy) {
-		return false
-	}
-
-	byUser := map[uint][]netip.Addr{}
-
-	for _, n := range w.Topology.Nodes {
-		if len(n.Tags) == 0 {
-			byUser[n.User] = append(byUser[n.User], n.Addrs()...)
-		}
-	}
-
-	return slices.ContainsFunc(slices.Collect(maps.Values(byUser)), SortsApart)
-}
-
-// SelfDestination reports whether a rule of p has autogroup:self among its
-// destinations.
-func SelfDestination(p Policy) bool {
-	self := func(d Dest) bool { return d.Sel.Kind == SelSelf }
-
-	return slices.ContainsFunc(slices.Concat(p.ACLs, p.Grants), func(r Rule) bool { return slices.ContainsFunc(r.Dst, self) })
-}
-
-// SortsApart reports whether addrs sort otherwise as text than as
-// addresses: one user's, the merge order's other half.
-func SortsApart(addrs []netip.Addr) bool {
-	text := slices.SortedFunc(slices.Values(addrs), func(a, b netip.Addr) int { return strings.Compare(a.String(), b.String()) })
-
-	return !slices.IsSortedFunc(text, netip.Addr.Compare)
 }

@@ -10,10 +10,8 @@ import (
 	"math/rand/v2"
 	"net/netip"
 	"os"
-	"regexp"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -360,11 +358,9 @@ type hubMachine struct {
 	// must hold no session it did not wake to the routing's end in vain.
 	audit   bool
 	audited uint64
-	// audits holds what every audit logs while audit is set; apart and
-	// self are whether any commit of the case had a user's addresses sort
-	// apart, and any document a self destination (see [auditLines.judge]).
-	audits      *auditLines
-	apart, self bool
+	// audits holds what every audit logs while audit is set (see
+	// [auditLines.judge]).
+	audits *auditLines
 	// kind names the last commit's write, for what woke renders after it.
 	kind string
 	// script holds the acts of the script in progress (see [drawScript]),
@@ -379,15 +375,13 @@ type hubMachine struct {
 type hubPropertyReach struct {
 	coalesced, logWoke, endWoke, endedPast, endedMidRouting, retried, firstNewer, decidedRouting int
 	events                                                                                       map[string]int
-	// known counts the audit lines excused as known false alarms.
-	known map[string]int
 	// wakes counts what woke each render that sent something.
 	wakes *wakeTally
 }
 
 func (r hubPropertyReach) String() string {
-	return fmt.Sprintf("coalesced routings %d, render-log wakes by a routing %d, by a render's end %d, renders ended past a routing %d, ended mid-routing %d, failures retried %d, first maps of a newer snapshot %d; events %v; audit lines excused %v; renders that sent something: %s",
-		r.coalesced, r.logWoke, r.endWoke, r.endedPast, r.endedMidRouting, r.retried, r.firstNewer, r.events, r.known, r.wakes)
+	return fmt.Sprintf("coalesced routings %d, render-log wakes by a routing %d, by a render's end %d, renders ended past a routing %d, ended mid-routing %d, failures retried %d, first maps of a newer snapshot %d; events %v; renders that sent something: %s",
+		r.coalesced, r.logWoke, r.endWoke, r.endedPast, r.endedMidRouting, r.retried, r.firstNewer, r.events, r.wakes)
 }
 
 // TestHubSessionsConvergeUnderDrawnSchedules drives the real hub — its
@@ -421,8 +415,7 @@ func (r hubPropertyReach) String() string {
 // With the policy audit on (one subtest, capability mode), the hub's own
 // route audit runs after every routing and must find no session it holds
 // to the routing's end stale: a session the render log woke again is due.
-// No audit may log anything else either, but the known false alarms
-// [auditLines.judge] names, where the case reached their shape.
+// No audit may log anything else either.
 //
 // What it cannot see: data races (the handoffs order everything; the
 // stress test runs under -race); preemption inside a render or between a
@@ -438,7 +431,7 @@ func TestHubSessionsConvergeUnderDrawnSchedules(t *testing.T) {
 			envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", strconv.FormatBool(mode.audit))
 			t.Setenv(state.TestCapabilitySourcesEnv, strconv.FormatBool(mode.capSources))
 
-			reach := hubPropertyReach{events: map[string]int{}, known: map[string]int{}, wakes: newWakeTally()}
+			reach := hubPropertyReach{events: map[string]int{}, wakes: newWakeTally()}
 
 			var audits *auditLines
 			if mode.audit {
@@ -484,12 +477,10 @@ func runHubMachine(t *rapid.T, reach *hubPropertyReach, audits *auditLines) {
 
 	m := &hubMachine{t: t, mixed: mixed, reach: reach, audit: audits != nil, audited: RouteAuditFailures(), audits: audits, dropped: droppedWakes{}}
 	m.p = newDrawnWorld(t, world)
-	m.saw()
 	m.h = NewHub()
 	m.w = newSteppedWatcher(t, m.h, m.p.s)
 	m.p.committed = func(before uint64) {
 		m.w.committed(before)
-		m.saw()
 	}
 	m.w.decided = func(*renderShard) {
 		// Only a render deciding outside its shard's lock gets here, and
@@ -567,33 +558,9 @@ func runHubMachine(t *rapid.T, reach *hubPropertyReach, audits *auditLines) {
 		}
 	}
 
-	m.saw()
-
-	if msg := m.audits.judge(m.self && m.apart, m.reach.known); msg != "" {
+	if msg := m.audits.judge(); msg != "" {
 		t.Fatalf("settled: an audit objects: %s", msg)
 	}
-}
-
-// saw notes what the State and the model now hold for the audits' known
-// false alarms.
-func (m *hubMachine) saw() {
-	apart := heldAddresses(m.p.s.Snapshot())
-	m.apart = m.apart || apart
-	m.self = m.self || policymodel.SelfDestination(m.p.w.Policy)
-}
-
-// heldAddresses reports whether the addresses of one user's untagged nodes
-// snap holds sort apart ([policymodel.SortsApart]).
-func heldAddresses(snap *state.Snapshot) bool {
-	byUser := map[uint][]netip.Addr{}
-
-	for _, n := range snap.ListNodes().All() {
-		if !n.IsTagged() && n.UserID().Valid() {
-			byUser[n.UserID().Get()] = append(byUser[n.UserID().Get()], n.IPs()...)
-		}
-	}
-
-	return slices.ContainsFunc(slices.Collect(maps.Values(byUser)), policymodel.SortsApart)
 }
 
 // admit opens a session of id, its first map to be rendered.
@@ -1090,9 +1057,7 @@ func (m *hubMachine) check(t *rapid.T) {
 		t.Fatalf("the route audit held a session to r%d that is stale or due", m.w.routed.Rev())
 	}
 
-	m.saw()
-
-	if msg := m.audits.judge(m.self && m.apart, m.reach.known); msg != "" {
+	if msg := m.audits.judge(); msg != "" {
 		t.Fatalf("an audit objects at r%d: %s", m.p.s.Snapshot().Rev(), msg)
 	}
 
@@ -1267,9 +1232,7 @@ func TestHubSessionsConvergeUnderConcurrency(t *testing.T) {
 	// compile's incremental node attributes and SSH policies differ from
 	// its compile from scratch after an address moves, and the filter
 	// audit's two forms differ for nodes outside the tailnet's ranges or
-	// without addresses. A run whose own commits held a user whose
-	// addresses sort apart under a self destination may log the filter
-	// audit's merge order, counted (see [auditLines.judge]).
+	// without addresses.
 	for _, capSources := range []bool{false, true} {
 		t.Run(fmt.Sprintf("audit/capability=%t", capSources), func(t *testing.T) {
 			t.Setenv(state.TestCapabilitySourcesEnv, strconv.FormatBool(capSources))
@@ -1283,16 +1246,13 @@ func TestHubSessionsConvergeUnderConcurrency(t *testing.T) {
 				run := stressConverges(t, seed, 100, writes, true, chunks)
 				reach.add(run)
 
-				known := map[string]int{}
-				if msg := audits.judgeAt(func(rev uint64) bool { return run.apart[rev] }, known); msg != "" {
-					t.Errorf("filter_chunks=%t: an audit logged a line no known false alarm explains: %s", chunks, msg)
+				if msg := audits.judge(); msg != "" {
+					t.Errorf("filter_chunks=%t: an audit logged a line: %s", chunks, msg)
 				}
 
 				assert.Equal(t, failures, RouteAuditFailures(), "filter_chunks=%t: the route audit found no stale session", chunks)
-				assert.Equal(t, policy+uint64(known["merge order"]), state.PolicyAuditFailures(), "filter_chunks=%t: no other audit line", chunks) //nolint:gosec // a count
+				assert.Equal(t, policy, state.PolicyAuditFailures(), "filter_chunks=%t: no other audit line", chunks)
 				assert.Greater(t, RouteAuditRuns(), audited, "filter_chunks=%t: test sanity: the route audit rendered sessions afresh", chunks)
-
-				reach.mergeOrder += known["merge order"]
 			}
 		})
 	}
@@ -1308,13 +1268,6 @@ func TestHubSessionsConvergeUnderConcurrency(t *testing.T) {
 // reached; it depends on the schedule.
 type stressReach struct {
 	compared, coalesced, between, reconnected, undone, straddled int
-	// apart holds the commits that held a user whose addresses sort apart
-	// under a self destination: production's own commits between two
-	// model worlds can, a registration at the allocator's addresses before
-	// the model's land, or a user's node before an admin tags it.
-	apart map[uint64]bool
-	// mergeOrder counts the filter audit's merge-order lines excused.
-	mergeOrder int
 }
 
 func (r *stressReach) add(o stressReach) {
@@ -1324,7 +1277,6 @@ func (r *stressReach) add(o stressReach) {
 	r.between += o.between
 	r.reconnected += o.reconnected
 	r.undone += o.undone
-	r.mergeOrder += o.mergeOrder
 }
 
 // stressSession is a session on a goroutine of its own.
@@ -1385,21 +1337,11 @@ func stressConverges(t *testing.T, seed, run uint64, writes int, audit, chunks b
 
 	// A world of a few nodes at least, so several sessions render at once.
 	world := policymodel.Worlds().Example(h.next())
-	for len(world.Topology.Nodes) < 5 || audit && (!allocatorAddresses(world) || policymodel.MergesApart(world)) {
+	for len(world.Topology.Nodes) < 5 || audit && !allocatorAddresses(world) {
 		world = policymodel.Worlds().Example(h.next())
 	}
 
 	h.p = newPBTWorld(t, world, func(cfg *types.Config) { cfg.Policy.FilterChunks = chunks })
-
-	h.reach.apart = map[uint64]bool{}
-	h.p.committed = func(before uint64) {
-		snap := h.p.s.Snapshot()
-		if heldAddresses(snap) && policymodel.SelfDestination(h.p.w.Policy) {
-			for rev := before + 1; rev <= snap.Rev(); rev++ {
-				h.reach.apart[rev] = true
-			}
-		}
-	}
 
 	h.hub = NewHub()
 	t.Cleanup(h.hub.Close)
@@ -1459,8 +1401,7 @@ func allocatorAddresses(w policymodel.World) bool {
 }
 
 // audited reports whether st, from w, is a write the filter audit agrees
-// on: addresses stay the allocator's, none moves, and none sorts apart
-// ([policymodel.MergesApart]).
+// on: addresses stay the allocator's and none moves.
 func audited(w policymodel.World, st policymodel.Step) bool {
 	for _, e := range st.Edits {
 		if _, ok := e.(policymodel.SetAddr); ok {
@@ -1472,7 +1413,7 @@ func audited(w policymodel.World, st policymodel.Step) bool {
 	// audits see.
 	for _, e := range st.Edits {
 		w = w.Apply(e)
-		if !allocatorAddresses(w) || policymodel.MergesApart(w) {
+		if !allocatorAddresses(w) {
 			return false
 		}
 	}
@@ -1663,9 +1604,6 @@ func (h *stressRun) straddle() bool {
 	nodes := p.s.Snapshot().ListNodes()
 
 	joiner := transientNode(p.w, nodes.At(r.IntN(nodes.Len())).ID())
-	if h.audit && policymodel.MergesApart(p.w.Apply(policymodel.Join{Node: joiner})) {
-		return false
-	}
 
 	p.endpoint(nodes.At(r.IntN(nodes.Len())).ID(), []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.2"), uint16(r.IntN(1<<16)))}) //nolint:gosec // any port
 
@@ -1842,41 +1780,11 @@ func (a *auditLines) take() []auditLine {
 	return out
 }
 
-// judge returns the first line logged since the last judge that is no
-// known false alarm, counting those in known: the filter audit's merge
-// order once the case held a user whose addresses sort apart.
-func (a *auditLines) judge(sorted bool, known map[string]int) string {
-	return a.judgeWith(func(auditLine) bool { return sorted }, known)
-}
-
-// judgeAt is judge excusing the merge order only in a line of a commit
-// sortedAt names.
-func (a *auditLines) judgeAt(sortedAt func(rev uint64) bool, known map[string]int) string {
-	return a.judgeWith(func(l auditLine) bool {
-		m := auditCommit.FindStringSubmatch(l.Error)
-		if m == nil {
-			return false
-		}
-
-		rev, err := strconv.ParseUint(m[1], 10, 64)
-
-		return err == nil && sortedAt(rev)
-	}, known)
-}
-
-// auditCommit finds the commit a filter audit line names.
-var auditCommit = regexp.MustCompile(`at commit (\d+):`)
-
-func (a *auditLines) judgeWith(sorted func(auditLine) bool, known map[string]int) string {
+// judge returns the first line logged since the last judge: no audit
+// line is a known false alarm.
+func (a *auditLines) judge() string {
 	for _, l := range a.take() {
-		switch {
-		case l.Message == "policy audit: filter" && strings.Contains(l.Error, "capability form expands otherwise than address form") && sorted(l):
-			// TODO(kradalby): policy/merge-order: see
-			// policymodel.MergesApart.
-			known["merge order"]++
-		default:
-			return fmt.Sprintf("%s: %s%s", l.Message, l.Error, l.Diff)
-		}
+		return fmt.Sprintf("%s: %s%s", l.Message, l.Error, l.Diff)
 	}
 
 	return ""
