@@ -182,11 +182,6 @@ func movedAddr(family int, id uint64) netip.Addr {
 	return netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 13: 1, 14: byte(id >> 8), 15: byte(id)}) //nolint:gosec // as above
 }
 
-// Outside reports whether a lies outside the tailnet's ranges.
-func Outside(a netip.Addr) bool {
-	return a.IsValid() && !tailnetV4.Contains(a) && !tailnetV6.Contains(a)
-}
-
 // SelKind is what a selector names. The order is simplest first, since
 // shrinking lowers it.
 type SelKind uint8

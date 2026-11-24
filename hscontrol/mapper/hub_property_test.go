@@ -1230,9 +1230,7 @@ func TestHubSessionsConvergeUnderConcurrency(t *testing.T) {
 	// counted or only logged.
 	// The writes are those the other audits agree on (see [audited]): the
 	// compile's incremental node attributes and SSH policies differ from
-	// its compile from scratch after an address moves, and the filter
-	// audit's two forms differ for nodes outside the tailnet's ranges or
-	// without addresses.
+	// its compile from scratch after an address moves.
 	for _, capSources := range []bool{false, true} {
 		t.Run(fmt.Sprintf("audit/capability=%t", capSources), func(t *testing.T) {
 			t.Setenv(state.TestCapabilitySourcesEnv, strconv.FormatBool(capSources))
@@ -1337,7 +1335,7 @@ func stressConverges(t *testing.T, seed, run uint64, writes int, audit, chunks b
 
 	// A world of a few nodes at least, so several sessions render at once.
 	world := policymodel.Worlds().Example(h.next())
-	for len(world.Topology.Nodes) < 5 || audit && !allocatorAddresses(world) {
+	for len(world.Topology.Nodes) < 5 {
 		world = policymodel.Worlds().Example(h.next())
 	}
 
@@ -1388,32 +1386,11 @@ func (h *stressRun) next() int {
 	return h.example
 }
 
-// allocatorAddresses reports whether w's addresses are what the allocator
-// hands out: one in each family, inside the tailnet's ranges.
-func allocatorAddresses(w policymodel.World) bool {
-	for _, n := range w.Topology.Nodes {
-		if len(n.Addrs()) != 2 || slices.ContainsFunc(n.Addrs(), policymodel.Outside) {
-			return false
-		}
-	}
-
-	return true
-}
-
 // audited reports whether st, from w, is a write the filter audit agrees
-// on: addresses stay the allocator's and none moves.
-func audited(w policymodel.World, st policymodel.Step) bool {
+// on: no address moves.
+func audited(st policymodel.Step) bool {
 	for _, e := range st.Edits {
 		if _, ok := e.(policymodel.SetAddr); ok {
-			return false
-		}
-	}
-
-	// Each edit commits on its own, so every world on the way is one the
-	// audits see.
-	for _, e := range st.Edits {
-		w = w.Apply(e)
-		if !allocatorAddresses(w) {
 			return false
 		}
 	}
@@ -1552,7 +1529,7 @@ func (h *stressRun) write(undo func()) func() {
 		from := p.w
 
 		st := policymodel.Steps(from).Example(h.next())
-		for h.audit && !audited(from, st) {
+		for h.audit && !audited(st) {
 			st = policymodel.Steps(from).Example(h.next())
 		}
 
