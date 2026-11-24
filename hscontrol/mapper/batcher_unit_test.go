@@ -23,7 +23,7 @@ func TestAddConnectionWithLimit_StopsOldest(t *testing.T) {
 	h.wake(true, nil)
 
 	for i, sess := range sessions {
-		_, retained := h.sessions[1][sess]
+		_, retained := h.core.sessions[1][sess]
 		require.Equal(t, i >= 3, retained, "newest streams are retained in deterministic admission order")
 		require.Equal(t, i < 3, sess.left)
 

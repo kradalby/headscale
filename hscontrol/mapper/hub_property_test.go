@@ -566,7 +566,7 @@ func runHubMachine(t *rapid.T, reach *hubPropertyReach, audits *auditLines) {
 // admit opens a session of id, its first map to be rendered.
 func (m *hubMachine) admit(id types.NodeID) *hubSess {
 	m.h.mu.Lock()
-	next := m.h.admitted + 1
+	next := m.h.core.admitted + 1
 	m.h.mu.Unlock()
 
 	// Keep the first and last shard free of sessions, see [steppedWatcher].

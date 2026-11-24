@@ -241,15 +241,54 @@ func responseType(r *tailcfg.MapResponse) string {
 // Hub tracks every live map session so the server can tell whether a node
 // is connected, deliver pings to it and end its sessions on shutdown.
 type Hub struct {
-	mu         sync.Mutex
-	sessions   map[types.NodeID]map[*Session]struct{}
-	admitted   uint64
+	mu sync.Mutex
+	// core holds the hub's sessions and peer history, under mu.
+	core       hubCore
 	latest     *state.Snapshot
 	watchState *state.State
 
 	// firstMaps bounds the first maps rendering at once: after a restart
 	// every node reconnects and asks for a full map together.
 	firstMaps chan struct{}
+
+	// versions indexes the render caches by the version they render for,
+	// weakly: they live as long as a renderer of the version does.
+	versions map[tailcfg.CapabilityVersion]weak.Pointer[versionCache]
+	// rev and peersRev are the newest snapshot the watcher advanced the
+	// caches to. A new cache starts there, so a render of an older
+	// snapshot cannot admit a node or class cleanup already dropped.
+	rev, peersRev uint64
+
+	// frames is shared by every session's encoder.
+	frames frameCache
+
+	// renders are what sessions rendered and failed to since the last
+	// routing, for the commits a routing compares end to end.
+	renders renderLog
+
+	// done ends [Hub.Watch].
+	done chan struct{}
+
+	now func() time.Time
+
+	// beforeRoute and routed are test hooks, set before [Hub.Watch].
+	// beforeRoute runs before the watcher takes a commit's snapshot, so a
+	// slow one lets commits coalesce; routed runs once the watcher woke what
+	// a routing from revision from to revision to reached, with how many of
+	// those only the render log named.
+	beforeRoute func()
+	routed      func(from, to uint64, between int)
+}
+
+// hubCore is what the hub decides sessions and peer history with. Its
+// fields are read and written only under [Hub.mu], by its own methods and
+// the hub's queries. Its methods take no lock and read no clock, and reach
+// a session's channels only through what the hub passes them: the hub
+// carries out what they return.
+type hubCore struct {
+	sessions map[types.NodeID]map[*Session]struct{}
+	admitted uint64
+	closed   bool
 
 	// sentPeers is the peer view each node was last sent, kept across its
 	// sessions so a reconnect can announce peers removed in between. Views
@@ -259,14 +298,6 @@ type Hub struct {
 	// are bounded (see offline): a node back after its entry was dropped
 	// gets the full map alone.
 	sentPeers map[types.NodeID]sentView
-
-	// versions indexes the render caches by the version they render for,
-	// weakly: they live as long as a renderer of the version does.
-	versions map[tailcfg.CapabilityVersion]weak.Pointer[versionCache]
-	// rev and peersRev are the newest snapshot the watcher advanced the
-	// caches to. A new cache starts there, so a render of an older
-	// snapshot cannot admit a node or class cleanup already dropped.
-	rev, peersRev uint64
 
 	// offline lists, oldest first, the nodes whose history outlived their
 	// last session, and offlineAt indexes it. Their history is dropped
@@ -283,27 +314,7 @@ type Hub struct {
 	// no snapshot shares.
 	retained int
 
-	// frames is shared by every session's encoder.
-	frames frameCache
-
-	// renders are what sessions rendered and failed to since the last
-	// routing, for the commits a routing compares end to end.
-	renders renderLog
-
-	closed bool
-	// done ends [Hub.Watch].
-	done chan struct{}
-
-	now           func() time.Time
 	maxHistoryIDs int
-
-	// beforeRoute and routed are test hooks, set before [Hub.Watch].
-	// beforeRoute runs before the watcher takes a commit's snapshot, so a
-	// slow one lets commits coalesce; routed runs once the watcher woke what
-	// a routing from revision from to revision to reached, with how many of
-	// those only the render log named.
-	beforeRoute func()
-	routed      func(from, to uint64, between int)
 }
 
 // peerHistoryTTL is how long a node's peer history outlives its last
@@ -338,62 +349,60 @@ func (h *Hub) expireHistory() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	h.expireLocked()
+	h.core.expire(h.now())
 }
 
-func (h *Hub) expireLocked() {
-	now := h.now()
-	for e := h.offline.Front(); e != nil; e = h.offline.Front() {
+func (c *hubCore) expire(now time.Time) {
+	for e := c.offline.Front(); e != nil; e = c.offline.Front() {
 		o, _ := e.Value.(*offlineHistory)
 		if now.Sub(o.since) < peerHistoryTTL {
 			return
 		}
 
-		h.dropHistoryLocked(o.id)
+		c.dropHistory(o.id)
 	}
 }
 
-// offlineLocked starts bounding nodeID's history: its last session left.
-func (h *Hub) offlineLocked(nodeID types.NodeID) {
-	h.expireLocked()
+// offlineNode starts bounding nodeID's history: its last session left.
+func (c *hubCore) offlineNode(nodeID types.NodeID, now time.Time) {
+	c.expire(now)
 
-	cur, ok := h.sentPeers[nodeID]
-	if _, listed := h.offlineAt[nodeID]; !ok || listed {
+	cur, ok := c.sentPeers[nodeID]
+	if _, listed := c.offlineAt[nodeID]; !ok || listed {
 		return
 	}
 
 	// Its folded attempts are counted as a view now.
-	h.retained -= foldedCost(cur)
+	c.retained -= foldedCost(cur)
 
-	o := &offlineHistory{id: nodeID, since: h.now(), views: append([][]types.NodeID{cur.ids}, cur.attempts...)}
+	o := &offlineHistory{id: nodeID, since: now, views: append([][]types.NodeID{cur.ids}, cur.attempts...)}
 	for _, v := range o.views {
-		h.holdView(v, 1)
+		c.holdView(v, 1)
 	}
 
 	// The entry itself costs, so histories with no IDs are bounded too.
-	h.retained++
-	h.offlineAt[nodeID] = h.offline.PushBack(o)
+	c.retained++
+	c.offlineAt[nodeID] = c.offline.PushBack(o)
 
-	h.boundLocked(nodeID)
+	c.bound(nodeID)
 }
 
-// boundLocked drops histories, oldest offline first, while retained is
-// over the cap; when none is offline, nodeID's goes, as the node whose
-// history just grew. A node whose history is dropped gets its next full
-// map alone.
-func (h *Hub) boundLocked(nodeID types.NodeID) {
-	for h.retained > h.maxHistoryIDs {
-		e := h.offline.Front()
+// bound drops histories, oldest offline first, while retained is over the
+// cap; when none is offline, nodeID's goes, as the node whose history just
+// grew. A node whose history is dropped gets its next full map alone.
+func (c *hubCore) bound(nodeID types.NodeID) {
+	for c.retained > c.maxHistoryIDs {
+		e := c.offline.Front()
 		if e == nil {
-			if _, ok := h.sentPeers[nodeID]; ok {
-				h.dropHistoryLocked(nodeID)
+			if _, ok := c.sentPeers[nodeID]; ok {
+				c.dropHistory(nodeID)
 			}
 
 			return
 		}
 
 		oldest, _ := e.Value.(*offlineHistory)
-		h.dropHistoryLocked(oldest.id)
+		c.dropHistory(oldest.id)
 	}
 }
 
@@ -407,51 +416,51 @@ func foldedCost(v sentView) int {
 	return cap(v.ids)
 }
 
-// onlineLocked stops bounding nodeID's history: it has a session again,
-// or its history goes.
-func (h *Hub) onlineLocked(nodeID types.NodeID) {
-	e, ok := h.offlineAt[nodeID]
+// onlineNode stops bounding nodeID's history: it has a session again, or
+// its history goes.
+func (c *hubCore) onlineNode(nodeID types.NodeID) {
+	e, ok := c.offlineAt[nodeID]
 	if !ok {
 		return
 	}
 
-	h.offline.Remove(e)
-	delete(h.offlineAt, nodeID)
+	c.offline.Remove(e)
+	delete(c.offlineAt, nodeID)
 
 	o, _ := e.Value.(*offlineHistory)
 	for _, v := range o.views {
-		h.holdView(v, -1)
+		c.holdView(v, -1)
 	}
 
-	h.retained--
-	h.retained += foldedCost(h.sentPeers[nodeID])
+	c.retained--
+	c.retained += foldedCost(c.sentPeers[nodeID])
 }
 
-func (h *Hub) dropHistoryLocked(nodeID types.NodeID) {
-	h.onlineLocked(nodeID)
-	h.retained -= foldedCost(h.sentPeers[nodeID])
-	delete(h.sentPeers, nodeID)
+func (c *hubCore) dropHistory(nodeID types.NodeID) {
+	c.onlineNode(nodeID)
+	c.retained -= foldedCost(c.sentPeers[nodeID])
+	delete(c.sentPeers, nodeID)
 }
 
 // holdView adds delta offline holders to v, counting its backing array in
 // retained while it has any: a view pins all of it.
-func (h *Hub) holdView(v []types.NodeID, delta int) {
+func (c *hubCore) holdView(v []types.NodeID, delta int) {
 	if len(v) == 0 {
 		return
 	}
 
 	k := viewKey{first: &v[0], n: len(v)}
-	before := h.views[k]
+	before := c.views[k]
 
 	switch after := before + delta; {
 	case after == 0:
-		delete(h.views, k)
-		h.retained -= cap(v)
+		delete(c.views, k)
+		c.retained -= cap(v)
 	case before == 0:
-		h.views[k] = after
-		h.retained += cap(v)
+		c.views[k] = after
+		c.retained += cap(v)
 	default:
-		h.views[k] = after
+		c.views[k] = after
 	}
 }
 
@@ -757,16 +766,18 @@ func (s *Session) wake() {
 // NewHub returns an empty hub.
 func NewHub() *Hub {
 	return &Hub{
-		sessions:  make(map[types.NodeID]map[*Session]struct{}),
-		sentPeers: make(map[types.NodeID]sentView),
+		core: hubCore{
+			sessions:      make(map[types.NodeID]map[*Session]struct{}),
+			sentPeers:     make(map[types.NodeID]sentView),
+			offlineAt:     make(map[types.NodeID]*list.Element),
+			views:         make(map[viewKey]int),
+			maxHistoryIDs: maxPeerHistoryIDs,
+		},
 		versions:  make(map[tailcfg.CapabilityVersion]weak.Pointer[versionCache]),
-		offlineAt: make(map[types.NodeID]*list.Element),
-		views:     make(map[viewKey]int),
 		done:      make(chan struct{}),
 		firstMaps: make(chan struct{}, runtime.GOMAXPROCS(0)),
 
-		now:           time.Now,
-		maxHistoryIDs: maxPeerHistoryIDs,
+		now: time.Now,
 	}
 }
 
@@ -799,7 +810,7 @@ func (h *Hub) Watch(s *state.State) {
 	first := s.Snapshot()
 
 	h.mu.Lock()
-	if h.closed {
+	if h.core.closed {
 		h.mu.Unlock()
 		return
 	}
@@ -863,11 +874,11 @@ func (h *Hub) watch(s *state.State, sub *graph.Subscription, last *state.Snapsho
 			// The edit log can no longer name transient deleted nodes.
 			// Check only state retained by the hub, not the whole tailnet.
 			h.mu.Lock()
-			for id := range h.sessions {
+			for id := range h.core.sessions {
 				change.Nodes = append(change.Nodes, id)
 			}
 
-			for id := range h.sentPeers {
+			for id := range h.core.sentPeers {
 				change.Nodes = append(change.Nodes, id)
 			}
 			h.mu.Unlock()
@@ -1146,12 +1157,15 @@ func (h *Hub) wake(all bool, ids map[types.NodeID]struct{}) { h.wakeAt(all, ids,
 func (h *Hub) rewake(s *Session, rev uint64) {
 	if state.PolicyAudit() {
 		h.mu.Lock()
-		s.woken = max(s.woken, rev)
+		h.core.woke(s, rev)
 		h.mu.Unlock()
 	}
 
 	s.wake()
 }
+
+// woke records, for the route audit, that s is due to render rev.
+func (c *hubCore) woke(s *Session, rev uint64) { s.woken = max(s.woken, rev) }
 
 // wakeAt is [Hub.wake] for commit rev, which the route audit tells the
 // sessions still to render it by; zero, as without the audit, records
@@ -1160,16 +1174,22 @@ func (h *Hub) wakeAt(all bool, ids map[types.NodeID]struct{}, rev uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	h.core.wake(all, ids, rev, (*Session).wake)
+}
+
+// wake rings, through ring, every session or the sessions of the nodes in
+// ids, recording rev for the route audit unless it is zero.
+func (c *hubCore) wake(all bool, ids map[types.NodeID]struct{}, rev uint64, ring func(*Session)) {
 	woke := func(s *Session) {
 		if rev != 0 {
-			s.woken = max(s.woken, rev)
+			c.woke(s, rev)
 		}
 
-		s.wake()
+		ring(s)
 	}
 
 	if all {
-		for _, set := range h.sessions {
+		for _, set := range c.sessions {
 			for s := range set {
 				woke(s)
 			}
@@ -1179,7 +1199,7 @@ func (h *Hub) wakeAt(all bool, ids map[types.NodeID]struct{}, rev uint64) {
 	}
 
 	for id := range ids {
-		for s := range h.sessions[id] {
+		for s := range c.sessions[id] {
 			woke(s)
 		}
 	}
@@ -1212,27 +1232,8 @@ func RouteAuditFailures() uint64 { return routeAuditFailures.Load() }
 // is immutable once recorded, and the renders run on the hub's goroutine,
 // after waking, under no lock commits wait on.
 func (h *Hub) auditRoutes(snap *state.Snapshot, woken map[types.NodeID]struct{}) {
-	type held struct {
-		id  types.NodeID
-		rec *sentRecord
-	}
-
-	var todo []held
-
 	h.mu.Lock()
-
-	for id, set := range h.sessions {
-		if _, ok := woken[id]; ok {
-			continue
-		}
-
-		for s := range set {
-			if rec := s.sent.Load(); !s.left && rec != nil && rec.rev >= s.woken && rec.rev <= snap.Rev() {
-				todo = append(todo, held{id: id, rec: rec})
-			}
-		}
-	}
-
+	todo := h.core.unwoken(snap.Rev(), woken)
 	h.mu.Unlock()
 
 	if len(todo) == 0 {
@@ -1267,6 +1268,32 @@ func (h *Hub) auditRoutes(snap *state.Snapshot, woken map[types.NodeID]struct{})
 				Str("diff", describeResponses(out)).Msg("policy audit: route: a session routing did not wake holds a stale map")
 		}
 	}
+}
+
+// auditHeld is what a session the route audit renders afresh held.
+type auditHeld struct {
+	id  types.NodeID
+	rec *sentRecord
+}
+
+// unwoken returns what the sessions routing to rev did not wake hold, of
+// those that rendered no earlier than they were last woken.
+func (c *hubCore) unwoken(rev uint64, woken map[types.NodeID]struct{}) []auditHeld {
+	var todo []auditHeld
+
+	for id, set := range c.sessions {
+		if _, ok := woken[id]; ok {
+			continue
+		}
+
+		for s := range set {
+			if rec := s.sent.Load(); !s.left && rec != nil && rec.rev >= s.woken && rec.rev <= rev {
+				todo = append(todo, auditHeld{id: id, rec: rec})
+			}
+		}
+	}
+
+	return todo
 }
 
 // freshDiff renders node's map from snap with caches of its own, vc, and
@@ -1338,16 +1365,7 @@ func peerIDsOf(nodes []*tailcfg.Node) []tailcfg.NodeID {
 // forget ends the sessions of a deleted node and drops its hub state.
 func (h *Hub) forget(id types.NodeID) {
 	h.mu.Lock()
-
-	stops := make([]func(), 0, len(h.sessions[id]))
-	for s := range h.sessions[id] {
-		s.left = true
-		stops = append(stops, s.stop)
-	}
-
-	delete(h.sessions, id)
-
-	h.dropHistoryLocked(id)
+	stops := h.core.forget(id)
 	h.mu.Unlock()
 
 	for _, vc := range h.caches() {
@@ -1359,6 +1377,22 @@ func (h *Hub) forget(id types.NodeID) {
 	}
 }
 
+// forget ends the sessions of a deleted node and drops its history; it
+// returns the sessions' stops.
+func (c *hubCore) forget(id types.NodeID) []func() {
+	stops := make([]func(), 0, len(c.sessions[id]))
+	for s := range c.sessions[id] {
+		s.left = true
+		stops = append(stops, s.stop)
+	}
+
+	delete(c.sessions, id)
+
+	c.dropHistory(id)
+
+	return stops
+}
+
 // maxConcurrentMapSessionsPerNode bounds overlapping authenticated map requests.
 const maxConcurrentMapSessionsPerNode = 4
 
@@ -1367,43 +1401,7 @@ const maxConcurrentMapSessionsPerNode = 4
 // the hub calls it on shutdown. It returns nil once the hub is closed.
 func (h *Hub) Join(nodeID types.NodeID, stop func()) *Session {
 	h.mu.Lock()
-
-	if h.closed {
-		h.mu.Unlock()
-		return nil
-	}
-
-	// Expired first: a node back after the TTL must not replay it.
-	h.expireLocked()
-	h.onlineLocked(nodeID)
-
-	h.admitted++
-	s := &Session{
-		NodeID:   nodeID,
-		admitted: h.admitted,
-		pings:    make(chan *tailcfg.PingRequest, 8), //nolint:mnd
-		wakes:    make(chan struct{}, 1),
-		stop:     stop,
-	}
-
-	if h.sessions[nodeID] == nil {
-		h.sessions[nodeID] = make(map[*Session]struct{})
-	}
-
-	var evicted *Session
-
-	if len(h.sessions[nodeID]) >= maxConcurrentMapSessionsPerNode {
-		for current := range h.sessions[nodeID] {
-			if evicted == nil || current.admitted < evicted.admitted {
-				evicted = current
-			}
-		}
-
-		delete(h.sessions[nodeID], evicted)
-		evicted.left = true
-	}
-
-	h.sessions[nodeID][s] = struct{}{}
+	s, evicted := h.core.join(nodeID, stop, h.now())
 	h.mu.Unlock()
 
 	if evicted != nil {
@@ -1413,20 +1411,66 @@ func (h *Hub) Join(nodeID types.NodeID, stop func()) *Session {
 	return s
 }
 
+// join admits a session of nodeID, or none once closed, and returns the
+// session it evicted past the limit, if any, for its stop.
+func (c *hubCore) join(nodeID types.NodeID, stop func(), now time.Time) (*Session, *Session) {
+	if c.closed {
+		return nil, nil
+	}
+
+	// Expired first: a node back after the TTL must not replay it.
+	c.expire(now)
+	c.onlineNode(nodeID)
+
+	c.admitted++
+	s := &Session{
+		NodeID:   nodeID,
+		admitted: c.admitted,
+		pings:    make(chan *tailcfg.PingRequest, 8), //nolint:mnd
+		wakes:    make(chan struct{}, 1),
+		stop:     stop,
+	}
+
+	if c.sessions[nodeID] == nil {
+		c.sessions[nodeID] = make(map[*Session]struct{})
+	}
+
+	var evicted *Session
+
+	if len(c.sessions[nodeID]) >= maxConcurrentMapSessionsPerNode {
+		for current := range c.sessions[nodeID] {
+			if evicted == nil || current.admitted < evicted.admitted {
+				evicted = current
+			}
+		}
+
+		delete(c.sessions[nodeID], evicted)
+		evicted.left = true
+	}
+
+	c.sessions[nodeID][s] = struct{}{}
+
+	return s, evicted
+}
+
 // Leave unregisters s and reports whether the node still has other
 // sessions.
 func (h *Hub) Leave(s *Session) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	return h.core.leave(s, h.now())
+}
+
+func (c *hubCore) leave(s *Session, now time.Time) bool {
 	s.left = true
 
-	set := h.sessions[s.NodeID]
+	set := c.sessions[s.NodeID]
 	delete(set, s)
 
 	if len(set) == 0 {
-		delete(h.sessions, s.NodeID)
-		h.offlineLocked(s.NodeID)
+		delete(c.sessions, s.NodeID)
+		c.offlineNode(s.NodeID, now)
 
 		return false
 	}
@@ -1440,7 +1484,7 @@ func (h *Hub) HasPeerHistoryForTest(nodeID types.NodeID) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	_, ok := h.sentPeers[nodeID]
+	_, ok := h.core.sentPeers[nodeID]
 
 	return ok
 }
@@ -1450,7 +1494,7 @@ func (h *Hub) IsConnected(nodeID types.NodeID) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	return len(h.sessions[nodeID]) > 0
+	return len(h.core.sessions[nodeID]) > 0
 }
 
 // Connected returns the nodes with a live session and how many each has.
@@ -1458,8 +1502,8 @@ func (h *Hub) Connected() map[types.NodeID]int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	out := make(map[types.NodeID]int, len(h.sessions))
-	for id, set := range h.sessions {
+	out := make(map[types.NodeID]int, len(h.core.sessions))
+	for id, set := range h.core.sessions {
 		out[id] = len(set)
 	}
 
@@ -1474,7 +1518,7 @@ func (h *Hub) Ping(nodeID types.NodeID, pr *tailcfg.PingRequest) bool {
 
 	sent := false
 
-	for s := range h.sessions[nodeID] {
+	for s := range h.core.sessions[nodeID] {
 		select {
 		case s.pings <- pr:
 			sent = true
@@ -1491,24 +1535,14 @@ func (h *Hub) Done() <-chan struct{} { return h.done }
 // Close ends every session and refuses new ones.
 func (h *Hub) Close() {
 	h.mu.Lock()
-	if h.closed {
+	if h.core.closed {
 		h.mu.Unlock()
 		return
 	}
 
 	close(h.done)
-	h.closed = true
 
-	var stops []func()
-
-	for _, set := range h.sessions {
-		for s := range set {
-			s.left = true
-			stops = append(stops, s.stop)
-		}
-	}
-
-	h.sessions = make(map[types.NodeID]map[*Session]struct{})
+	stops := h.core.close()
 	h.mu.Unlock()
 
 	for _, stop := range stops {
@@ -1516,11 +1550,30 @@ func (h *Hub) Close() {
 	}
 }
 
+// close ends every session and refuses new ones; it returns the sessions'
+// stops.
+func (c *hubCore) close() []func() {
+	c.closed = true
+
+	var stops []func()
+
+	for _, set := range c.sessions {
+		for s := range set {
+			s.left = true
+			stops = append(stops, s.stop)
+		}
+	}
+
+	c.sessions = make(map[types.NodeID]map[*Session]struct{})
+
+	return stops
+}
+
 // lastPeers returns the peer view nodeID was last sent; it may hold the
 // node itself.
 func (h *Hub) lastPeers(nodeID types.NodeID) []types.NodeID {
 	h.mu.Lock()
-	cur := h.sentPeers[nodeID]
+	cur := h.core.sentPeers[nodeID]
 	h.mu.Unlock()
 
 	if len(cur.attempts) == 0 {
@@ -1548,7 +1601,7 @@ func (h *Hub) initialState(nodeID types.NodeID, snap *state.Snapshot) (*state.Sn
 		snap = h.latest
 	}
 
-	cur := h.sentPeers[nodeID]
+	cur := h.core.sentPeers[nodeID]
 	h.mu.Unlock()
 
 	if len(cur.attempts) == 0 {
@@ -1578,6 +1631,10 @@ func (h *Hub) setLastPeers(by *Session, nodeID types.NodeID, v sentView) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	h.core.setLastPeers(by, nodeID, v)
+}
+
+func (c *hubCore) setLastPeers(by *Session, nodeID types.NodeID, v sentView) {
 	if by != nil && by.left {
 		return
 	}
@@ -1585,13 +1642,13 @@ func (h *Hub) setLastPeers(by *Session, nodeID types.NodeID, v sentView) {
 	// Only an older render is refused. Two renders of one revision carry
 	// the same view (a snapshot's views are fixed), so an equal one is the
 	// same history, and its delivery must still clear the attempts.
-	cur, ok := h.sentPeers[nodeID]
+	cur, ok := c.sentPeers[nodeID]
 	if ok && cur.rev > v.rev {
 		return
 	}
 
-	h.retained -= foldedCost(cur)
-	h.sentPeers[nodeID] = v
+	c.retained -= foldedCost(cur)
+	c.sentPeers[nodeID] = v
 }
 
 // mayHavePeers widens nodeID's history by v, a view about to be written:
@@ -1604,11 +1661,15 @@ func (h *Hub) mayHavePeers(by *Session, nodeID types.NodeID, v sentView) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	h.core.mayHavePeers(by, nodeID, v)
+}
+
+func (c *hubCore) mayHavePeers(by *Session, nodeID types.NodeID, v sentView) {
 	if by != nil && by.left {
 		return
 	}
 
-	cur := h.sentPeers[nodeID]
+	cur := c.sentPeers[nodeID]
 	cur.attempts = append(slices.Clip(cur.attempts), v.ids)
 	cur.rev = max(cur.rev, v.rev)
 
@@ -1616,16 +1677,16 @@ func (h *Hub) mayHavePeers(by *Session, nodeID types.NodeID, v sentView) {
 	// union is its own and only grows while nothing is delivered, though
 	// the node never leaves, so it counts against the cap.
 	if len(cur.attempts) > maxPeerAttempts {
-		h.retained -= foldedCost(cur)
+		c.retained -= foldedCost(cur)
 		cur.ids, cur.attempts, cur.folded = mergeViews(cur), nil, true
-		h.retained += foldedCost(cur)
-		h.sentPeers[nodeID] = cur
-		h.boundLocked(nodeID)
+		c.retained += foldedCost(cur)
+		c.sentPeers[nodeID] = cur
+		c.bound(nodeID)
 
 		return
 	}
 
-	h.sentPeers[nodeID] = cur
+	c.sentPeers[nodeID] = cur
 }
 
 // maxPeerAttempts bounds the unconfirmed views kept per node.

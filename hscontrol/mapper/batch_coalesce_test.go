@@ -31,7 +31,7 @@ func TestProcessBatchedChangesSkipsNodesWithoutConnection(t *testing.T) {
 	h.Leave(sess)
 	h.wake(false, map[types.NodeID]struct{}{1: {}})
 	require.Empty(t, sess.wakes, "an offline node accumulates no work")
-	require.Empty(t, h.sessions)
+	require.Empty(t, h.core.sessions)
 }
 
 func TestAppendPendingStaysBoundedWhileInFlight(t *testing.T) {
@@ -53,7 +53,7 @@ func TestAppendPendingStaysBoundedWhileInFlight(t *testing.T) {
 	}
 
 	require.Len(t, sess.wakes, 1)
-	require.LessOrEqual(t, len(h.sentPeers[ids[0]].attempts), maxPeerAttempts)
+	require.LessOrEqual(t, len(h.core.sentPeers[ids[0]].attempts), maxPeerAttempts)
 	_, err = s.RenameNode(ids[1], "coalesced")
 	require.NoError(t, err)
 	out, err := st.Update(s.Snapshot())
@@ -72,7 +72,7 @@ func TestAppendPendingBoundsFoldedPatches(t *testing.T) {
 	h := NewHub()
 	defer h.Close()
 
-	h.maxHistoryIDs = 64
+	h.core.maxHistoryIDs = 64
 
 	sess := h.Join(1, func() {})
 	for i := range 3000 {
@@ -80,9 +80,9 @@ func TestAppendPendingBoundsFoldedPatches(t *testing.T) {
 		h.wake(true, nil)
 	}
 
-	require.LessOrEqual(t, h.retained, h.maxHistoryIDs)
+	require.LessOrEqual(t, h.core.retained, h.core.maxHistoryIDs)
 	require.Len(t, sess.wakes, 1)
-	require.LessOrEqual(t, len(h.lastPeers(1)), h.maxHistoryIDs+maxPeerAttempts)
+	require.LessOrEqual(t, len(h.lastPeers(1)), h.core.maxHistoryIDs+maxPeerAttempts)
 	// Pings remain separate from coalesced snapshot work.
 	require.True(t, h.Ping(1, &tailcfg.PingRequest{}))
 	require.Len(t, sess.pings, 1)

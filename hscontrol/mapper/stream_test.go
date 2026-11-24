@@ -3703,7 +3703,7 @@ func (sc *scalingRun) requireSettled(tb testing.TB, kind string) {
 
 	for _, st := range sc.streams {
 		require.Nil(tb, st.pending, "successful writes confirm delivery even when attempts would fold")
-		require.Empty(tb, st.hub.sentPeers[st.nodeID].attempts, "successful writes leave no failed-write history")
+		require.Empty(tb, st.hub.core.sentPeers[st.nodeID].attempts, "successful writes leave no failed-write history")
 	}
 
 	// A policy write that repeats the previous port rewrites the identical
@@ -5607,7 +5607,7 @@ func TestFirstMapDeliveryAfterFoldedAttempts(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	require.Empty(t, hub.sentPeers[ids[0]].attempts, "folding does not mean a reconnect was delivered")
+	require.Empty(t, hub.core.sentPeers[ids[0]].attempts, "folding does not mean a reconnect was delivered")
 	require.Nil(t, setup.pending, "the setup stream cannot report reconnect delivery")
 	require.NotNil(t, last.pending)
 
@@ -6193,7 +6193,7 @@ func benchFirstMap(b *testing.B, n int, shape string, sized *sizedEncoder) {
 				require.Nil(b, first.pending, "successful reconnects confirm delivery even when attempts would fold")
 
 				if cache == "warm-hub" {
-					require.Empty(b, st.hub.sentPeers[st.nodeID].attempts, "successful reconnects leave no failed-write history")
+					require.Empty(b, st.hub.core.sentPeers[st.nodeID].attempts, "successful reconnects leave no failed-write history")
 				}
 
 				b.ReportMetric(float64(size), "encoded-bytes/op")
@@ -7198,9 +7198,9 @@ func TestSTUNReportsCoalesceWhileInitialWriteIsBlocked(t *testing.T) {
 	require.Eventually(t, func() bool { return len(sess.wakes) == 1 }, time.Second, time.Millisecond)
 	require.Empty(t, hiddenSession.wakes)
 	h.mu.Lock()
-	retained, attempts := h.retained, len(h.sentPeers[viewer].attempts)
+	retained, attempts := h.core.retained, len(h.core.sentPeers[viewer].attempts)
 	h.mu.Unlock()
-	require.LessOrEqual(t, retained, h.maxHistoryIDs)
+	require.LessOrEqual(t, retained, h.core.maxHistoryIDs)
 	require.LessOrEqual(t, attempts, maxPeerAttempts)
 
 	old := <-written
@@ -8078,7 +8078,7 @@ func TestTwoRendersOfARevisionCarryTheSameView(t *testing.T) {
 	b.Delivered()
 
 	hub.mu.Lock()
-	attempts := hub.sentPeers[ids[0]].attempts
+	attempts := hub.core.sentPeers[ids[0]].attempts
 	hub.mu.Unlock()
 	assert.Empty(t, attempts, "a delivery at the same revision clears its attempt")
 }
@@ -8100,7 +8100,7 @@ func TestHubFoldsUnconfirmedViews(t *testing.T) {
 	assert.Equal(t, want, h.lastPeers(1), "every attempted peer stays announceable")
 
 	h.mu.Lock()
-	attempts := len(h.sentPeers[1].attempts)
+	attempts := len(h.core.sentPeers[1].attempts)
 	h.mu.Unlock()
 	assert.LessOrEqual(t, attempts, maxPeerAttempts, "attempts fold instead of growing")
 }
@@ -8182,7 +8182,7 @@ func TestHubForgetIsNotUndoneByAWriteInFlight(t *testing.T) {
 			}
 
 			hub.mu.Lock()
-			v, kept := hub.sentPeers[ids[0]]
+			v, kept := hub.core.sentPeers[ids[0]]
 			hub.mu.Unlock()
 
 			if slices.Contains(order, "forget") {
@@ -8569,7 +8569,7 @@ func TestOfflinePeerHistorySurvivesPartialReconnect(t *testing.T) {
 
 	generations := make([]uint64, 0, len(clients))
 	for id := range clients {
-		generations = append(generations, hub.sentPeers[id].rev)
+		generations = append(generations, hub.core.sentPeers[id].rev)
 	}
 	hub.mu.Unlock()
 
@@ -8665,7 +8665,7 @@ func historyCost(hub *Hub) int {
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
 
-	return cost + len(hub.offlineAt)
+	return cost + len(hub.core.offlineAt)
 }
 
 // historyArrays returns the distinct views hub's histories retain, by
@@ -8674,9 +8674,9 @@ func historyArrays(hub *Hub) map[*types.NodeID][]types.NodeID {
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
 
-	arrays := make(map[*types.NodeID][]types.NodeID, len(hub.sentPeers))
+	arrays := make(map[*types.NodeID][]types.NodeID, len(hub.core.sentPeers))
 
-	for _, history := range hub.sentPeers {
+	for _, history := range hub.core.sentPeers {
 		for _, view := range append([][]types.NodeID{history.ids}, history.attempts...) {
 			if len(view) > 0 {
 				arrays[&view[0]] = view
@@ -8737,7 +8737,7 @@ func TestHubDropsOfflinePeerHistoryAfterTTL(t *testing.T) {
 func TestHubCapsOfflinePeerHistory(t *testing.T) {
 	cfg, s, _ := streamTestState(t, "")
 	hub := NewHub()
-	hub.maxHistoryIDs = 40
+	hub.core.maxHistoryIDs = 40
 
 	u1, err := s.GetUserByName("u1")
 	require.NoError(t, err)
@@ -8754,10 +8754,10 @@ func TestHubCapsOfflinePeerHistory(t *testing.T) {
 		left = append(left, n.ID)
 
 		retained := historyCost(hub)
-		require.LessOrEqual(t, retained, hub.maxHistoryIDs, "after %d leaves", i+1)
+		require.LessOrEqual(t, retained, hub.core.maxHistoryIDs, "after %d leaves", i+1)
 
 		hub.mu.Lock()
-		counted := hub.retained
+		counted := hub.core.retained
 		hub.mu.Unlock()
 		require.Equal(t, retained, counted, "the hub counts what its histories hold")
 	}
@@ -8773,7 +8773,7 @@ func leaveWithHistory(t *testing.T, hub *Hub, id types.NodeID, v sentView) {
 	t.Helper()
 
 	hub.mu.Lock()
-	hub.sentPeers[id] = v
+	hub.core.sentPeers[id] = v
 	hub.mu.Unlock()
 
 	require.False(t, hub.Leave(hub.Join(id, func() {})))
@@ -8783,7 +8783,7 @@ func retainedOf(hub *Hub) int {
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
 
-	return hub.retained
+	return hub.core.retained
 }
 
 // TestHubCapsEmptyOfflineHistories disconnects more isolated nodes, whose
@@ -8791,16 +8791,16 @@ func retainedOf(hub *Hub) int {
 // oldest first.
 func TestHubCapsEmptyOfflineHistories(t *testing.T) {
 	hub := NewHub()
-	hub.maxHistoryIDs = 4
+	hub.core.maxHistoryIDs = 4
 
 	for i := range 12 {
 		leaveWithHistory(t, hub, types.NodeID(100+i), sentView{rev: uint64(i + 1)})
 
 		hub.mu.Lock()
-		entries := len(hub.offlineAt)
+		entries := len(hub.core.offlineAt)
 		hub.mu.Unlock()
 
-		require.LessOrEqual(t, entries, hub.maxHistoryIDs, "after %d leaves", i+1)
+		require.LessOrEqual(t, entries, hub.core.maxHistoryIDs, "after %d leaves", i+1)
 		require.Equal(t, historyCost(hub), retainedOf(hub), "the hub counts what its histories hold")
 	}
 
@@ -8813,14 +8813,14 @@ func TestHubCapsEmptyOfflineHistories(t *testing.T) {
 // like delivered ones.
 func TestHubCapsFailedAttemptsOfOfflineNodes(t *testing.T) {
 	hub := NewHub()
-	hub.maxHistoryIDs = 20
+	hub.core.maxHistoryIDs = 20
 
 	for i := range 10 {
 		id := types.NodeID(100 + i)
 		attempt := []types.NodeID{id + 1, id + 2, id + 3, id + 4}
 		leaveWithHistory(t, hub, id, sentView{rev: uint64(i + 1), attempts: [][]types.NodeID{attempt}})
 
-		require.LessOrEqual(t, historyCost(hub), hub.maxHistoryIDs, "after %d leaves", i+1)
+		require.LessOrEqual(t, historyCost(hub), hub.core.maxHistoryIDs, "after %d leaves", i+1)
 		require.Equal(t, historyCost(hub), retainedOf(hub))
 	}
 
@@ -8874,7 +8874,7 @@ func TestHubBoundsFailedHistoryOfAConnectedNode(t *testing.T) {
 	for _, delivered := range []bool{false, true} {
 		t.Run(fmt.Sprintf("delivered=%v", delivered), func(t *testing.T) {
 			hub := NewHub()
-			hub.maxHistoryIDs = 8
+			hub.core.maxHistoryIDs = 8
 
 			const id = types.NodeID(1)
 
@@ -8890,8 +8890,8 @@ func TestHubBoundsFailedHistoryOfAConnectedNode(t *testing.T) {
 					hub.setLastPeers(by, id, v)
 				}
 
-				require.LessOrEqual(t, retainedOf(hub), hub.maxHistoryIDs, "after %d attempts", i+1)
-				require.LessOrEqual(t, len(hub.lastPeers(id)), hub.maxHistoryIDs+maxPeerAttempts,
+				require.LessOrEqual(t, retainedOf(hub), hub.core.maxHistoryIDs, "after %d attempts", i+1)
+				require.LessOrEqual(t, len(hub.lastPeers(id)), hub.core.maxHistoryIDs+maxPeerAttempts,
 					"after %d attempts: peers of failed writes accumulate", i+1)
 			}
 
@@ -8921,7 +8921,7 @@ func TestFoldedHistoryIsRightSized(t *testing.T) {
 	}
 
 	hub.mu.Lock()
-	cur := hub.sentPeers[id]
+	cur := hub.core.sentPeers[id]
 	hub.mu.Unlock()
 
 	require.True(t, cur.folded, "test sanity: the attempts folded")
@@ -9055,7 +9055,7 @@ func BenchmarkOfflinePeerHistory(b *testing.B) {
 						b.StopTimer()
 
 						hub.mu.Lock()
-						histories := len(hub.sentPeers)
+						histories := len(hub.core.sentPeers)
 						hub.mu.Unlock()
 
 						arrays := historyArrays(hub)
