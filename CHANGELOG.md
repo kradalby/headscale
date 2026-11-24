@@ -211,6 +211,7 @@ See [the routes reference](docs/ref/routes.md) for the failover rules.
 - `app` grants never offer exit routes. Exit nodes list the sources of an `app` grant to an internet address, as on Tailscale SaaS. [#3656](https://github.com/juanfont/headscale/pull/3656)
 - HA and `via` groups choose the healthy, online router with the oldest control session. Reconnecting routers become standby. Routers that keep their session can regain routes. [#3619](https://github.com/juanfont/headscale/pull/3619)
 - Startup adds suffixes to duplicate names. The lowest node ID keeps its name. These changes stay in memory. Check MagicDNS names. Registrations and renames avoid extra DNS record names. Collision names fit 63 bytes. [#3619](https://github.com/juanfont/headscale/pull/3619)
+- Startup refuses a node that has no address, or whose address another node also holds, instead of serving peers an ambiguous one; give each node an unused address from the configured prefixes in the nodes table
 - Peers see a disconnected node as offline after 15 seconds, not 10. HA failover starts 5 seconds later. [#3649](https://github.com/juanfont/headscale/pull/3649)
 
 #### OIDC
@@ -368,6 +369,12 @@ See [the routes reference](docs/ref/routes.md) for the failover rules.
 - Peers are rendered for at most the server's current capability version, so a client newer than the server sees each peer's `Cap` as the server's current version, not its own [#37](https://github.com/kradalby/headscale/pull/37)
 - MagicDNS reverse zones for IPv4 prefixes whose configured address has host bits set, and for IPv6 prefixes whose mask is not nibble-aligned, are enumerated from the masked prefix, so tailnets with such custom prefixes advertise the correct set of reverse zones [#40](https://github.com/kradalby/headscale/pull/40)
 - Split-DNS zones with an empty resolver list are now sent as an empty route — handled by the client's built-in resolver — instead of `null` [#40](https://github.com/kradalby/headscale/pull/40)
+- The v1 API returns `409 Conflict`, not `500`, when a user create or rename asks for a name another user already has; a rename to a taken name always returned `500`. This includes a name held only by users from an identity provider, where a create used to succeed and a rename to answer `500`
+- Exit nodes are given the subnet routes behind the sources of a rule to `autogroup:internet`, as on Tailscale SaaS: traffic to a source's own subnet goes through the exit node as well
+- `/api/v1/auth/approve` approves only an SSH check and answers `400` for a pending node registration; approving one used to finish the login without creating its node, so its client started over
+- An approval of a login another approval already decided is refused, so two approvals can no longer both register one login
+- A login the client follows up on late, or twice, is answered with the verdict the interaction already reached instead of starting over; a follow-up whose node is gone starts the login over
+- The IP allocators never hand out an address in `fd7a:115c:a1e0:b1a::/64`, the range the Tailscale client reads as IPv4 routes mapped into IPv6 (4via6); the random strategy could draw one, and a node given it was unusable as itself
 
 ## 0.29.7 (2026-10-30)
 
