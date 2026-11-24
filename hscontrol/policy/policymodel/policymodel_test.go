@@ -1062,7 +1062,9 @@ func listName(grant bool) string {
 // TestShrinksToSmallCases runs properties that fail on purpose and
 // requires rapid to minimise each to a case a person can read, with
 // nothing in it the failure does not need. The last is what a builder's
-// failing property prints. RAPID_SEED picks another seed.
+// failing property prints. The seed is the fixed one below, whatever seed
+// the properties were given: shrinking reaches the smallest case from
+// some seeds, not all.
 func TestShrinksToSmallCases(t *testing.T) {
 	// The race detector slows the shrinker past its time budget, which
 	// leaves cases half shrunk; shrinking runs on one goroutine and gains
