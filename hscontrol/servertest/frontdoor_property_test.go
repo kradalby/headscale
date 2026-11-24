@@ -94,6 +94,7 @@ const (
 	stepClock
 	stepRecords
 	stepSecond
+	stepSSHCheck
 	numSteps
 )
 
@@ -104,7 +105,7 @@ var fdJudges = []string{"stored", "client", "reference", "restart"}
 
 var stepNames = [numSteps]string{
 	"world", "burst", "flap", "poll restart", "client restart", "endpoints", "rename", "logout", "relogin", "server restart",
-	"ownership", "identity", "race", "clock", "records", "second session",
+	"ownership", "identity", "race", "clock", "records", "second session", "ssh check",
 }
 
 // fdNode is a model node's client and how it joined, which a login, a
@@ -337,7 +338,7 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 	for i := range steps {
 		at := fmt.Sprintf("step %d", i+1)
 
-		kind := rapid.IntRange(0, 30).Draw(rt, "kind")
+		kind := rapid.IntRange(0, 31).Draw(rt, "kind")
 
 		switch {
 		case kind < 6:
@@ -372,6 +373,8 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 			fd.recordsStep(at)
 		case kind == 30:
 			fd.sessionsStep(at)
+		case kind == 31:
+			fd.sshCheckStep(at)
 		}
 
 		fd.settle(at)
@@ -1641,6 +1644,317 @@ func (fd *frontDoor) sessionsStep(at string) {
 
 		fd.quiet(at)
 	}
+}
+
+// sshPair is a source node and the destination login a check rule lets
+// a connection claim.
+type sshPair struct {
+	src   policymodel.Node
+	login string
+}
+
+// checkPairs is the source nodes and destination logins the served check
+// rules cover, and the sources no check rule covers at all.
+func (fd *frontDoor) checkPairs(rules []*tailcfg.SSHRule) ([]sshPair, map[types.NodeID]bool) {
+	var covered []sshPair
+
+	uncovered := make(map[types.NodeID]bool, len(fd.w.Topology.Nodes))
+
+	for _, m := range fd.w.Topology.Nodes {
+		uncovered[m.ID] = true
+	}
+
+	for _, r := range rules {
+		if r == nil || r.Action == nil || r.Action.HoldAndDelegate == "" {
+			continue
+		}
+
+		for _, p := range r.Principals {
+			if p == nil {
+				continue
+			}
+
+			// The rule names its sources by address, as the wire
+			// serves them; a principal naming none stands for any
+			// source.
+			var srcs []policymodel.Node
+
+			switch p.NodeIP {
+			case "":
+				// A principal naming no address stands for any
+				// source: every node is one.
+				srcs = fd.w.Topology.Nodes
+
+				clear(uncovered)
+			default:
+				addr, err := netip.ParseAddr(p.NodeIP)
+				if err != nil {
+					continue
+				}
+
+				for _, m := range fd.w.Topology.Nodes {
+					if m.V4 == addr || m.V6 == addr {
+						srcs = []policymodel.Node{m}
+
+						break
+					}
+				}
+			}
+
+			for _, src := range srcs {
+				if p.NodeIP != "" {
+					delete(uncovered, src.ID)
+				}
+
+				// The logins the rule's served map lets the connection
+				// claim: root when granted, any non-root login when the
+				// wildcard grants it (the source user's own name), and
+				// any literal user the rule names.
+				if r.SSHUsers["root"] == "root" {
+					covered = append(covered, sshPair{src, "root"})
+				}
+
+				if r.SSHUsers["*"] == "=" && !src.Tagged() {
+					if u, _ := fd.w.Topology.User(src.User); u.Name != "" {
+						covered = append(covered, sshPair{src, u.Name})
+					}
+				}
+
+				for login, local := range r.SSHUsers {
+					if login != "root" && login != "*" && local != "" {
+						covered = append(covered, sshPair{src, login})
+					}
+				}
+			}
+		}
+	}
+
+	return covered, uncovered
+}
+
+// makeCheckPair leaves the world holding a check rule covering a root
+// login between dst's user's nodes, as an admin writes one, reporting
+// whether it did: it needs a reference naming the user alone, a
+// user-owned destination and a policy the tokens of which are
+// unambiguous. A literal login is only allowed within one user, so the
+// rule stays on that user's both sides.
+func (fd *frontDoor) makeCheckPair(dst policymodel.Node) bool {
+	v := policymodel.NewView(fd.w)
+
+	if len(v.AmbiguousRefs()) > 0 {
+		return false
+	}
+
+	dstUser, _ := fd.w.Topology.User(dst.User)
+
+	ref := soloRef(v, dstUser)
+	if dst.Tagged() || dstUser.ID == 0 || ref < 0 {
+		return false
+	}
+
+	p := fd.w.Policy
+	p.SSH = append(slices.Clone(p.SSH), policymodel.SSHRule{
+		Check: true,
+		Src:   []policymodel.Sel{{Kind: policymodel.SelUser, I: ref}},
+		Dst:   []policymodel.Sel{{Kind: policymodel.SelUser, I: ref}},
+		Users: []int{0}, // root
+	})
+
+	fd.setPolicy(p)
+	fd.made("policy", "a check rule for the ssh step")
+
+	return true
+}
+
+// soloRef is a user reference naming u alone, or -1.
+func soloRef(v *policymodel.View, u policymodel.User) int {
+	if u.ID == 0 {
+		return -1
+	}
+
+	for r := range policymodel.UserRefs {
+		if us := v.RefUsers(r); len(us) == 1 && us[0] == u.ID && !v.Ambiguous(r) {
+			return r
+		}
+	}
+
+	return -1
+}
+
+// sshCheckStep drives the SSH check action end to end, as tailscaled
+// runs it: the destination node polls its served policy's check rule
+// over its Noise connection, the answer holds and delegates, the check
+// is approved or rejected through the auth endpoints the hardening made
+// SSH-check-only, and the follow-up is given the verdict the approval
+// left. A follow-up for a verdict a check has already spent is decided
+// again, never replayed, and a poll for a connection no check rule
+// covers is refused at once, never held.
+func (fd *frontDoor) sshCheckStep(at string) {
+	fd.run.tally.steps[stepNames[stepSSHCheck]]++
+
+	// The destination: a live node whose client polls, its served rules
+	// what the client itself has.
+	n, ok := fd.pick("ssh-dst", func(n policymodel.Node, nd *fdNode) bool {
+		return !n.Offline && !nd.loggedOut && nd.tc.Polling() && nd.tc.Netmap() != nil
+	})
+	if !ok {
+		fd.run.tally.steps[stepNames[stepSSHCheck]+" (no node)"]++
+
+		return
+	}
+
+	nd := fd.nodes[n.ID]
+
+	var rules []*tailcfg.SSHRule
+	if p := nd.tc.Netmap().SSHPolicy; p != nil {
+		rules = p.Rules
+	}
+
+	covered, uncovered := fd.checkPairs(rules)
+
+	kind := rapid.IntRange(0, 2).Draw(fd.t, "ssh-check")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if kind < 2 && len(covered) == 0 {
+		// The drawn policy drew no check rule a concrete pair and login
+		// answer to; write one, so the approve and reject shapes run
+		// wherever the step is drawn. The re-read rules then name the
+		// pair; the uncovered set the refusal shape reads is stale, and
+		// that shape was not drawn.
+		if fd.makeCheckPair(n) {
+			fd.settle(at)
+
+			rules = nil
+			if p := nd.tc.Netmap().SSHPolicy; p != nil {
+				rules = p.Rules
+			}
+
+			covered, _ = fd.checkPairs(rules)
+		}
+	}
+
+	if kind == 2 {
+		// A poll no check rule covers: refused at once, never held.
+		sources := slices.Sorted(maps.Keys(uncovered))
+		if len(sources) == 0 {
+			fd.run.tally.steps[stepNames[stepSSHCheck]+": every source checked (no refusal to drive)"]++
+
+			return
+		}
+
+		src := sources[rapid.IntRange(0, len(sources)-1).Draw(fd.t, "uncovered")]
+		login := fdSSHLogins[rapid.IntRange(0, len(fdSSHLogins)-1).Draw(fd.t, "login")]
+
+		// The poll comes from the destination's own client, as tailssh
+		// polls over the machine the connection lands on.
+		action, err := nd.tc.SSHAction(ctx, src, n.ID, login, "")
+		if err != nil {
+			fd.t.Fatalf("%s: n%d's check of n%d as %s: %v", at, src, n.ID, login, err)
+		}
+
+		if action.HoldAndDelegate != "" || action.Accept {
+			fd.t.Fatalf("%s: n%d's connection to n%d as %s, which no check rule covers, is held or accepted: %+v", at, src, n.ID, login, action)
+		}
+
+		fd.run.tally.steps[stepNames[stepSSHCheck]+": no rule, refused"]++
+
+		return
+	}
+
+	if kind < 2 {
+		if len(covered) == 0 {
+			fd.run.tally.steps[stepNames[stepSSHCheck]+" (no check rule with a concrete login)"]++
+
+			return
+		}
+
+		p := covered[rapid.IntRange(0, len(covered)-1).Draw(fd.t, "checked")]
+
+		action, err := nd.tc.SSHAction(ctx, p.src.ID, n.ID, p.login, "")
+		if err != nil {
+			fd.t.Fatalf("%s: n%d's check of n%d as %s: %v", at, p.src.ID, n.ID, p.login, err)
+		}
+
+		if action.Accept {
+			// Checked recently within the check period: the connection
+			// is allowed without a new check.
+			fd.run.tally.steps[stepNames[stepSSHCheck]+": auto-approved within the period"]++
+
+			return
+		}
+
+		if action.HoldAndDelegate == "" {
+			fd.t.Fatalf("%s: n%d's check of n%d as %s is neither held nor accepted: %+v", at, p.src.ID, n.ID, p.login, action)
+		}
+
+		spent, err := authIDOfHoldURL(action.HoldAndDelegate)
+		if err != nil {
+			fd.t.Fatalf("%s: n%d's check of n%d as %s holds a URL with no auth id: %v", at, p.src.ID, n.ID, p.login, err)
+		}
+
+		// The first round approves; a check vouches for one connection,
+		// so a second follow-up for the spent verdict is decided again,
+		// never replayed, and the fresh check it is given rejects.
+		fd.mustAPI(at, http.MethodPost, "/api/v1/auth/approve", map[string]any{"authId": spent.String()}, nil)
+		fd.run.tally.steps[stepNames[stepSSHCheck]+": approved"]++
+
+		follow, err := nd.tc.SSHAction(ctx, p.src.ID, n.ID, p.login, spent.String())
+		if err != nil {
+			fd.t.Fatalf("%s: n%d's follow-up of n%d as %s: %v", at, p.src.ID, n.ID, p.login, err)
+		}
+
+		if !follow.Accept {
+			fd.t.Fatalf("%s: n%d's approved check of n%d as %s is not accepted: %+v", at, p.src.ID, n.ID, p.login, follow)
+		}
+
+		again, err := nd.tc.SSHAction(ctx, p.src.ID, n.ID, p.login, spent.String())
+		if err != nil {
+			fd.t.Fatalf("%s: n%d's replayed follow-up of n%d as %s: %v", at, p.src.ID, n.ID, p.login, err)
+		}
+
+		if again.Accept || again.Reject {
+			fd.t.Fatalf("%s: n%d's spent check of n%d as %s is replayed to a second follow-up: %+v", at, p.src.ID, n.ID, p.login, again)
+		}
+
+		fresh, err := authIDOfHoldURL(again.HoldAndDelegate)
+		if err != nil {
+			fd.t.Fatalf("%s: n%d's re-decided check of n%d as %s holds no new auth id: %v", at, p.src.ID, n.ID, p.login, err)
+		}
+
+		if fresh == spent {
+			fd.t.Fatalf("%s: n%d's re-decided check of n%d as %s reuses the spent auth id", at, p.src.ID, n.ID, p.login)
+		}
+
+		fd.run.tally.steps[stepNames[stepSSHCheck]+": re-decided"]++
+
+		// The second round rejects through the fresh check.
+		fd.mustAPI(at, http.MethodPost, "/api/v1/auth/reject", map[string]any{"authId": fresh.String()}, nil)
+		fd.run.tally.steps[stepNames[stepSSHCheck]+": rejected"]++
+
+		last, err := nd.tc.SSHAction(ctx, p.src.ID, n.ID, p.login, fresh.String())
+		if err != nil {
+			fd.t.Fatalf("%s: n%d's rejected follow-up of n%d as %s: %v", at, p.src.ID, n.ID, p.login, err)
+		}
+
+		if !last.Reject {
+			fd.t.Fatalf("%s: n%d's rejected check of n%d as %s is not rejected: %+v", at, p.src.ID, n.ID, p.login, last)
+		}
+	}
+}
+
+// fdSSHLogins are the concrete destination logins a check rule may map.
+var fdSSHLogins = []string{"root", "alice"}
+
+// authIDOfHoldURL is the auth id a HoldAndDelegate URL carries.
+func authIDOfHoldURL(holdURL string) (types.AuthID, error) {
+	u, err := url.Parse(holdURL)
+	if err != nil {
+		return types.AuthID(""), fmt.Errorf("parsing the hold URL: %w", err)
+	}
+
+	return types.AuthIDFromString(u.Query().Get("auth_id"))
 }
 
 // secondClient opens a further map session of node n on the same device
@@ -3321,6 +3635,18 @@ func (t *fdTally) require(tb testing.TB, held *policymodel.HeldJudge) {
 	} {
 		if t.steps[kind] == 0 {
 			tb.Errorf("no case wrote through the v2 form: %s", kind)
+		}
+	}
+
+	// The SSH check's shapes: the approval and the rejection it hands the
+	// follow-up, and the refusal no rule covers. A deep run must have
+	// driven each.
+	for _, kind := range []string{
+		stepNames[stepSSHCheck] + ": approved", stepNames[stepSSHCheck] + ": rejected",
+		stepNames[stepSSHCheck] + ": no rule, refused",
+	} {
+		if t.steps[kind] == 0 {
+			tb.Errorf("no case took the ssh shape: %s", kind)
 		}
 	}
 

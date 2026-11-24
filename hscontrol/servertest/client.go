@@ -1,10 +1,14 @@
 package servertest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"runtime"
 	"slices"
@@ -1368,6 +1372,49 @@ func (c *TestClient) MachineKey() key.MachinePublic {
 // advanced operations like [controlclient.Direct.SetHostinfo] or SendUpdate.
 func (c *TestClient) Direct() *controlclient.Direct {
 	return c.direct
+}
+
+// SSHAction is the SSH check action the node's tailscaled is given for a
+// connection src→dst as localUser, polled over the client's real Noise
+// connection, as tailssh does. An empty authID is the initial poll the
+// client makes; a non-empty one is the follow-up it parks on. The poll
+// blocks until the verdict is in, as the client's does.
+func (c *TestClient) SSHAction(ctx context.Context, srcID, dstID types.NodeID, localUser, authID string) (*tailcfg.SSHAction, error) {
+	u := fmt.Sprintf("%s/machine/ssh/action/%d/to/%d?local_user=%s", c.server.URL, srcID, dstID, url.QueryEscape(localUser))
+	if authID != "" {
+		u += "&auth_id=" + authID
+	}
+
+	// Noise requests are addressed with the https scheme; the control
+	// client routes them over the established Noise connection.
+	u = strings.Replace(u, "http://", "https://", 1)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.direct.DoNoiseRequest(req)
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(resp.Body)
+
+		return nil, fmt.Errorf("servertest: SSHAction(%s): %d: %s", c.Name, resp.StatusCode, bytes.TrimSpace(msg)) //nolint:err113
+	}
+
+	var action tailcfg.SSHAction
+
+	err = json.NewDecoder(resp.Body).Decode(&action)
+	if err != nil {
+		return nil, fmt.Errorf("servertest: SSHAction(%s): %w", c.Name, err)
+	}
+
+	return &action, nil
 }
 
 // String implements [fmt.Stringer] for debug output.
