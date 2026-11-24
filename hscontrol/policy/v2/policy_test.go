@@ -5756,41 +5756,6 @@ func TestViaPrepInternetReachabilityMatchesGrantSemantics(t *testing.T) {
 	require.Empty(t, pm.ViaRoutesForPeer(nodes[0].View(), nodes[2].View()).Exclude, "an ACL to a public subnet is sufficient to permit exit defaults")
 }
 
-func TestViaPrepInternetReachabilityFollowsChangedAliases(t *testing.T) {
-	users := types.Users{{ID: 1, Name: "viewer"}, {ID: 2, Name: "destination"}}
-	exits := []netip.Prefix{mp("0.0.0.0/0"), mp("::/0")}
-	nodes := types.Nodes{
-		{ID: 1, IPv4: ap("100.64.0.1"), UserID: new(users[0].ID), User: new(users[0])},
-		{ID: 2, IPv4: ap("100.64.0.2"), Tags: []string{"tag:via"}, Hostinfo: &tailcfg.Hostinfo{RoutableIPs: exits}, ApprovedRoutes: exits},
-		{ID: 3, IPv4: ap("100.64.0.3"), Tags: []string{"tag:other"}, Hostinfo: &tailcfg.Hostinfo{RoutableIPs: exits}, ApprovedRoutes: exits},
-		{ID: 4, IPv4: ap("100.64.0.4"), UserID: new(users[1].ID), User: new(users[1]), Tags: []string{"tag:destination"}},
-	}
-	pol := []byte(`{"tagOwners":{"tag:via":["viewer@"],"tag:other":["viewer@"],"tag:destination":["viewer@"]},"grants":[{"src":["100.64.0.1"],"dst":["autogroup:internet"],"ip":["*"],"via":["tag:via"]},{"src":["100.64.0.1"],"dst":["tag:destination"],"ip":["*"]}]}`)
-	original, err := NewPolicyManager(pol, users, nodes.ViewSlice())
-	require.NoError(t, err)
-
-	before := original.viaPrep()
-	require.False(t, before.reachesInternet[1])
-
-	changed := slices.Clone(nodes)
-	changed[3] = nodes[3].Clone()
-	changed[3].IPv4 = ap("8.8.8.8")
-	public, err := NewPolicyManagerFrom(original, pol, users, changed.ViewSlice())
-	require.NoError(t, err)
-	require.True(t, public.viaPrep().reachesInternet[1])
-	require.Empty(t, public.ViaRoutesForPeer(changed[0].View(), changed[2].View()).Exclude)
-	require.False(t, before.reachesInternet[1])
-	require.ElementsMatch(t, exits, original.ViaRoutesForPeer(nodes[0].View(), nodes[2].View()).Exclude, "new aliases cannot mutate the older compiled snapshot")
-
-	changed[3] = changed[3].Clone()
-	changed[3].Tags = nil
-	removed, err := NewPolicyManagerFrom(public, pol, users, changed.ViewSlice())
-	require.NoError(t, err)
-	require.False(t, removed.viaPrep().reachesInternet[1])
-	require.ElementsMatch(t, exits, removed.ViaRoutesForPeer(changed[0].View(), changed[2].View()).Exclude)
-	require.True(t, public.viaPrep().reachesInternet[1], "tag-membership invalidation creates a new immutable preparation")
-}
-
 // TestViaDestinationOverlapReference compares steering with the original prefix
 // scan, including result order, per-grant elections and regular-grant overrides.
 func TestViaDestinationOverlapReference(t *testing.T) {

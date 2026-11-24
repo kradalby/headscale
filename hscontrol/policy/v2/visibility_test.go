@@ -244,26 +244,13 @@ func TestSidesQuirks(t *testing.T) {
 			},
 		},
 		{
-			// * as a source holds every approved subnet route, announced or
-			// not: an address only an approval holds is a source.
-			name:   "wildcard-source-holds-approvals",
-			policy: `{"acls": [{"action": "accept", "src": ["*"], "dst": ["bob@:22"]}]}`,
-			nodes: types.Nodes{
-				sideNode(3, bob, "100.64.0.3", "", nil),
-				sideNode(6, carol, "192.168.0.6", "", nil),
-				sideNode(7, nil, "100.64.0.7", "", []string{"tag:r"}, "+192.168.0.0/24"),
-				sideNode(8, alice, "192.168.1.8", "", nil),
-			},
-			peers: map[types.NodeID][]types.NodeID{3: {6, 7}, 6: {3}, 7: {3}, 8: nil},
-		},
-		{
 			// * as a destination is every address: any node, any router, and
 			// so the exit nodes.
 			name:   "wildcard-destination-is-everything",
 			policy: `{"acls": [{"action": "accept", "src": ["alice@"], "dst": ["*:*"]}]}`,
 			nodes: types.Nodes{
 				sideNode(1, alice, "100.64.0.1", "", nil),
-				sideNode(6, carol, "192.168.0.6", "", nil),
+				sideNode(6, carol, "100.64.0.6", "", nil),
 				sideNode(8, nil, "100.64.0.8", "", []string{"tag:x"}, "10.0.0.0/24"),
 				sideNode(9, nil, "100.64.0.9", "", []string{"tag:e"}, exit...),
 			},
@@ -312,21 +299,6 @@ func TestSidesQuirks(t *testing.T) {
 				{viewer: 1, peer: 8, exclude: []string{"10.0.0.0/24"}},
 				{viewer: 3, peer: 5},
 			},
-		},
-		{
-			// Steering tests a "*" source against what it resolves to, not
-			// the approved routes the filter's "*" adds: a viewer whose only
-			// address an approval covers takes no regular grant's primary.
-			name: "steering-wildcard-source-by-resolution",
-			policy: `{"tagOwners": {"tag:r": [], "tag:x": []}, "grants": [
-				{"src": ["alice@"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via": ["tag:r"]},
-				{"src": ["*"], "dst": ["10.0.0.0/24"], "ip": ["*"]}]}`,
-			nodes: types.Nodes{
-				sideNode(1, alice, "10.9.0.1", "", nil),
-				sideNode(5, nil, "100.64.0.5", "", []string{"tag:r"}, "10.0.0.0/24"),
-				sideNode(6, nil, "100.64.0.6", "", []string{"tag:x"}, "+10.9.0.0/24"),
-			},
-			via: []viaCase{{viewer: 1, peer: 5, include: []string{"10.0.0.0/24"}}},
 		},
 		{
 			// SSH rules make nobody a peer.
@@ -716,22 +688,6 @@ func TestSidesIncremental(t *testing.T) {
 			},
 			before: map[types.NodeID][]types.NodeID{1: nil, 5: nil, 6: nil, 8: nil},
 			after:  map[types.NodeID][]types.NodeID{1: {5}, 5: {1, 6, 8}, 6: {5}, 8: {5}},
-		},
-		{
-			// An approval of an announced route puts the address inside it
-			// among "*"'s sources.
-			name:   "approval-puts-an-address-in-wildcard",
-			policy: `{"tagOwners": {"tag:r": []}, "acls": [{"action": "accept", "src": ["*"], "dst": ["bob@:22"]}]}`,
-			nodes: types.Nodes{
-				sideNode(3, bob, "100.64.0.3", "", nil),
-				sideNode(6, carol, "192.168.0.6", "", nil),
-				sideNode(7, nil, "100.64.0.7", "", []string{"tag:r"}, "~192.168.0.0/24"),
-			},
-			write: func(n types.Nodes) types.Nodes {
-				return types.Nodes{n[0], n[1], sideNode(7, nil, "100.64.0.7", "", []string{"tag:r"}, "192.168.0.0/24")}
-			},
-			before: map[types.NodeID][]types.NodeID{3: {7}, 6: nil, 7: {3}},
-			after:  map[types.NodeID][]types.NodeID{3: {6, 7}, 6: {3}, 7: {3}},
 		},
 		{
 			// The clique follows the UserID, which a write can move alone.
@@ -1180,7 +1136,7 @@ func (g sideGen) policy() []byte {
 
 // addrs are the addresses nodes draw from: few, so routes cover them.
 func (g sideGen) addrs() ([]string, []string) {
-	v4 := []string{"100.64.0.1", "100.64.0.2", "100.64.0.3", "100.64.0.4", "100.64.0.5", "10.0.0.5"}
+	v4 := []string{"100.64.0.1", "100.64.0.2", "100.64.0.3", "100.64.0.4", "100.64.0.5"}
 	v6 := []string{"fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2", "fd7a:115c:a1e0::3"}
 
 	if g.sparse {
@@ -1278,7 +1234,7 @@ func (g sideGen) node(id types.NodeID, others types.Nodes) *types.Node {
 // itself: mostly the official client; else tailscale-rs, a client that
 // says nothing, or an app connector.
 // requireStartable fails when nodes hold what NewState refuses: a node
-// without an address, or two nodes holding one.
+// without an address, two nodes holding one, or one outside the tailnet.
 func requireStartable(t *testing.T, nodes types.Nodes) {
 	t.Helper()
 
@@ -1288,6 +1244,10 @@ func requireStartable(t *testing.T, nodes types.Nodes) {
 		require.NotEmpty(t, n.IPs(), "node %d holds no address", n.ID)
 
 		for _, a := range n.IPs() {
+			if !asterixResolved().Contains(a) {
+				t.Fatalf("node %d holds %s, outside the tailnet", n.ID, a)
+			}
+
 			if o, ok := holder[a]; ok {
 				t.Fatalf("nodes %d and %d both hold %s", o, n.ID, a)
 			}
@@ -1616,14 +1576,13 @@ func TestSidesRandomDifferential(t *testing.T) {
 			shapes := map[string]int{
 				"covering": rep.Covering, "single family": rep.SingleFamily,
 				"exit": rep.Exit, "one-family exit": rep.ExitOneFamily,
-				"inside approved": rep.InsideApproved, "via targets": rep.ViaTargets, "steered": rep.Steered,
+				"via targets": rep.ViaTargets, "steered": rep.Steered,
 				"tagged with user": rep.TaggedWithUser, "via router on source": rep.ViaRouterOnSrc,
 				"routes kept": rep.RoutesKept,
 			}
 			shapes["pairs kept with the route rules"] = keptPairs
 
 			shapes["public route"] = rep.PublicRoute
-			shapes["wildcard steering outside"] = rep.WildcardSteerOutside
 
 			for name, n := range shapes {
 				assert.Positive(t, n, "shape %q reached", name)

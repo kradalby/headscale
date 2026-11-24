@@ -871,16 +871,6 @@ func TestWorldFilterShapes(t *testing.T) {
 			write: func(w *world) { w.PutNode(*shapeNode(3, alice, "100.64.0.3", "", nil, nil, nil)) },
 		},
 		{
-			// * as a self source names only nodes inside its ranges.
-			name:   "self-wildcard-out-of-range",
-			policy: `{"acls": [{"action": "accept", "src": ["*"], "dst": ["autogroup:self:22"]}]}`,
-			nodes: types.Nodes{
-				shapeNode(1, alice, "100.64.0.1", "", nil, nil, nil),
-				shapeNode(2, alice, "192.168.0.2", "", nil, nil, nil),
-			},
-			write: func(w *world) { w.PutNode(*shapeNode(3, alice, "192.168.0.3", "fd00::3", nil, nil, nil)) },
-		},
-		{
 			// * next to an identity source adds the approved routes.
 			name:   "wildcard-with-identity",
 			policy: `{` + owners + `, "acls": [{"action": "accept", "src": ["*", "alice@"], "dst": ["tag:a:22"]}]}`,

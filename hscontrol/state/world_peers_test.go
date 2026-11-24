@@ -656,15 +656,6 @@ func sidesChurn(t *testing.T, r *rand.Rand, policies []string, focused bool, rep
 	}
 }
 
-// announcing returns n announcing routes it has no approval for.
-func announcing(n *types.Node, routes ...string) *types.Node {
-	for _, r := range routes {
-		n.Hostinfo.RoutableIPs = append(n.Hostinfo.RoutableIPs, netip.MustParsePrefix(r))
-	}
-
-	return n
-}
-
 // TestWorldSidesShapes drives, through the world's own cells and writes,
 // the shapes an update reaches only through another node, which the random
 // churn reaches rarely: each world is audited as built and after the one
@@ -695,20 +686,6 @@ func TestWorldSidesShapes(t *testing.T) {
 				shapeNode(8, carol, "100.64.0.8", "", nil, nil, nil),
 			},
 			write: func(e *nodeEdit) { e.Set(8, shapeNode(8, nil, "100.64.0.8", "", []string{"tag:x"}, nil, nil)) },
-		},
-		{
-			name:   "approval-puts-an-address-in-wildcard",
-			policy: `{"tagOwners": {"tag:r": []}, "acls": [{"action": "accept", "src": ["*"], "dst": ["bob@:22"]}]}`,
-			nodes: types.Nodes{
-				shapeNode(3, bob, "100.64.0.3", "", nil, nil, nil),
-				shapeNode(6, carol, "192.168.0.6", "", nil, nil, nil),
-				announcing(shapeNode(7, nil, "100.64.0.7", "", []string{"tag:r"}, nil, nil), "192.168.0.0/24"),
-			},
-			write: func(e *nodeEdit) {
-				n := mustGet(t, e, 7).Clone()
-				n.ApprovedRoutes = []netip.Prefix{netip.MustParsePrefix("192.168.0.0/24")}
-				e.Set(7, n)
-			},
 		},
 	}
 
