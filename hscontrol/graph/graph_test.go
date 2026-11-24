@@ -229,6 +229,35 @@ func TestGetPanicsOnAnotherGraphsHandle(t *testing.T) {
 	s.Get(n)
 }
 
+// TestGetReadsAnotherGraphsHandleOfTheSameType pins today's answer for a
+// handle of another graph whose cell holds the same type: Get cannot see
+// the handle is foreign and reads this graph's cell at its index,
+// silently. Only a handle of another type fails the assertion and panics
+// (TestGetPanicsOnAnotherGraphsHandle). The day the package learns to
+// tell graphs apart, this pin is the test that changes.
+func TestGetReadsAnotherGraphsHandleOfTheSameType(t *testing.T) {
+	g, other := New(), New()
+	a := g.NewInput("a", 42, Same[int])
+	b := other.NewInput("b", 7, Same[int])
+
+	s, err := g.Update(func(*Tx) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := s.Get(a); got != 42 {
+		t.Fatalf("own handle reads %d, want 42", got)
+	}
+
+	if got := s.Get(b); got != 42 {
+		t.Fatalf("a foreign handle of the same type reads %d, want this graph's cell", got)
+	}
+
+	if rev := ChangedAt(s, b); rev != s.Rev() {
+		t.Fatalf("ChangedAt reads revision %d for a foreign handle", rev)
+	}
+}
+
 // TestConcurrentUpdatesAndReaders commits from several writers while
 // readers and subscribers come and go: no snapshot may mix revisions of
 // its cells, and every subscriber must reach the last commit.
