@@ -1100,42 +1100,6 @@ func (r *Ref) node(id types.NodeID) (RefNode, bool) {
 	return r.nodes[i], true
 }
 
-// What the reference leaves out of its domain: configurations headscale
-// does not hand out, where its behaviour follows from how the code is
-// built rather than from what a policy means. A property skips and counts
-// them.
-const (
-	// OutsideAddress: a node holds an address outside the tailnet's
-	// ranges. * then means one thing for ports, another for app
-	// capabilities, and a third as an autogroup:self source.
-	OutsideAddress = "a node holds an address outside the tailnet"
-	// SharedAddress: two nodes hold one address. Which node a packet for
-	// it reaches is not the policy's to say, and no capture holds one.
-	SharedAddress = "two nodes share an address"
-)
-
-// OutOfDomain returns why the reference does not speak for this world, or
-// "" when it does.
-func (r *Ref) OutOfDomain() string {
-	seen := map[netip.Addr]bool{}
-
-	for _, n := range r.nodes {
-		for _, a := range n.Addrs {
-			if !tailnetRanges.Contains(a) {
-				return OutsideAddress
-			}
-
-			if seen[a] {
-				return SharedAddress
-			}
-
-			seen[a] = true
-		}
-	}
-
-	return ""
-}
-
 // Serves reports whether node id takes packets for a: one of its own
 // addresses, or inside one of its routes.
 func (r *Ref) Serves(id types.NodeID, a netip.Addr) bool {

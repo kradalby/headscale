@@ -195,9 +195,6 @@ func threeClauses(v *View) bool {
 	}
 
 	ref := RefOf(v.World)
-	if ref.OutOfDomain() != "" {
-		return false
-	}
 
 	withouts := make([]*Ref, len(ks))
 	for i, k := range ks {

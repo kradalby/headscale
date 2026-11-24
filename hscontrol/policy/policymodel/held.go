@@ -276,9 +276,8 @@ type HeldJudge struct {
 	// decides.
 	Steered, Unjudged, ByHistory int
 	// ContestedPeers and ContestedRoutes count what a named clause
-	// forgave, Skipped the moments out of the reference's domain, by why.
+	// forgave.
 	ContestedPeers, ContestedRoutes map[Contested]int
-	Skipped                         map[string]int
 
 	// passed holds the filters held already, by everything the
 	// comparison reads.
@@ -288,10 +287,10 @@ type HeldJudge struct {
 func (j *HeldJudge) String() string {
 	return fmt.Sprintf("reference: clients %d, filters compared %d, peer sets %d, route pairs %d (steered %d, routes left unjudged %d, "+
 		"decided by the election history %d), self primaries %d, SSH decisions %d, "+
-		"expiry flags %d, baseline caps %d, entries %d; skipped %v; "+
+		"expiry flags %d, baseline caps %d, entries %d; "+
 		"peers contested %v, routes contested %v; filters: %v; form: %v",
 		j.Clients, j.Filters, j.PeerSets, j.RoutePairs, j.Steered, j.Unjudged, j.ByHistory, j.Primaries, j.SSHDecisions,
-		j.WireFlags, j.BaseCaps, j.Entries, j.Skipped,
+		j.WireFlags, j.BaseCaps, j.Entries,
 		ContestedCounts(j.ContestedPeers), ContestedCounts(j.ContestedRoutes), &j.Verdicts, &j.Form)
 }
 
@@ -318,21 +317,10 @@ type Held struct {
 	sshKnown     map[netip.Addr]bool
 }
 
-// At is the reference for m, or nil, counted, when m is out of its
-// domain.
+// At is the reference for m.
 func (j *HeldJudge) At(m Moment) *Held {
 	plain := RefOf(m.World)
 	ref := plain.WithElections(m.Elections)
-
-	if why := ref.OutOfDomain(); why != "" {
-		if j.Skipped == nil {
-			j.Skipped = map[string]int{}
-		}
-
-		j.Skipped[why]++
-
-		return nil
-	}
 
 	if j.passed == nil {
 		j.passed = map[string]bool{}

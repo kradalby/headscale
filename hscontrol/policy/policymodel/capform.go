@@ -161,8 +161,8 @@ func (j *FormJudge) String() string {
 // granting app capabilities, or naming a protocol the client matches by
 // address only, holds none; every cap: source is in the reserved
 // namespace and names an identity or an owner no node outside shares an
-// address with; and, where ref speaks for w, every capability
-// [Ref.CapSources] lists is among the sources.
+// address with; and every capability [Ref.CapSources] lists is among the
+// sources.
 func (j *FormJudge) Check(w World, ref *Ref, id types.NodeID, rules []tailcfg.FilterRule, capMode bool) string {
 	n, ok := w.Topology.Node(id)
 	if !ok {
@@ -188,7 +188,7 @@ func (j *FormJudge) Check(w World, ref *Ref, id types.NodeID, rules []tailcfg.Fi
 		return msg
 	}
 
-	if ref.OutOfDomain() != "" || why != "" {
+	if why != "" {
 		j.countShared(ref, w)
 
 		return ""

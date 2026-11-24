@@ -358,11 +358,6 @@ func TestReservedNamespaceOnlyStamped(t *testing.T) {
 
 		tally.add(fmt.Sprintf("accepted %q app=%t", c, app))
 
-		ref := policymodel.RefOf(w)
-		if ref.OutOfDomain() != "" {
-			return
-		}
-
 		for _, n := range w.Topology.Nodes {
 			if msg := stampDefect(sv, n.ID); msg != "" {
 				t.Fatalf("document %s: %s", doc, msg)

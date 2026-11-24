@@ -106,10 +106,6 @@ func (fr *formReach) read(v *View, ref *Ref, n Node, last map[types.NodeID]strin
 
 	lastRules[n.ID] = rules
 
-	if ref.OutOfDomain() != "" {
-		return
-	}
-
 	caps := ref.CapSources(n.ID)
 	if len(caps) == 0 {
 		return

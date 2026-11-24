@@ -1273,9 +1273,6 @@ func (r *deliveryRun) holdToReference(t *rapid.T, at string, worlds []*deliveryW
 	// Elections read the history the State was driven through: when each
 	// node connected, the prober's marks, who held each route last.
 	ref := r.ref.At(statemodel.Moment(worlds[0].p))
-	if ref == nil {
-		return
-	}
 
 	users, err := worlds[0].p.s.ListAllUsers()
 	if err != nil {
@@ -1849,10 +1846,7 @@ func TestDeliverySSHDecisionsAcrossRevocationAndDeletion(t *testing.T) {
 			hold := func(nm *netmap.NetworkMap) string {
 				t.Helper()
 
-				ref := judge.At(statemodel.Moment(p))
-				require.NotNil(t, ref)
-
-				return ref.Client(2, nm, p.s.Snapshot().CapabilitySources())
+				return judge.At(statemodel.Moment(p)).Client(2, nm, p.s.Snapshot().CapabilitySources())
 			}
 			edit := func(e policymodel.Edit) {
 				t.Helper()

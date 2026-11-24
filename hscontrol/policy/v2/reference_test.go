@@ -732,12 +732,6 @@ func TestServedFiltersFollowReference(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		drive(t, func(step int, sv *served, reads []types.NodeID) {
 			for _, id := range reads {
-				if why := sv.ref.OutOfDomain(); why != "" {
-					counts.skip(why)
-
-					continue
-				}
-
 				n, _ := sv.w.Topology.Node(id)
 
 				got, err := sv.ip.ForNode(id, ReceiverFacts{})
@@ -793,16 +787,8 @@ func TestCapabilityFormFollowsReference(t *testing.T) {
 					t.Fatalf("after step %d n%d: %v", step, id, err)
 				}
 
-				// The form is judged out of the reference's domain too:
-				// it reads no address the domain leaves unsaid.
 				if msg := form.Check(sv.w, sv.ref, id, got, true); msg != "" {
 					t.Fatalf("after step %d n%d's capability-form filter is in the wrong form: %s\nheadscale %v", step, id, msg, got)
-				}
-
-				if why := sv.ref.OutOfDomain(); why != "" {
-					counts.skip(why)
-
-					continue
 				}
 
 				n, _ := sv.w.Topology.Node(id)
@@ -872,14 +858,6 @@ func TestPeersAndRoutesFollowReference(t *testing.T) {
 
 	rapid.Check(t, func(t *rapid.T) {
 		drive(t, func(step int, sv *served, _ []types.NodeID) {
-			if why := sv.ref.OutOfDomain(); why != "" {
-				for range sv.w.Topology.Nodes {
-					peerCounts.skip(why)
-				}
-
-				return
-			}
-
 			for _, n := range sv.w.Topology.Nodes {
 				got, want := sv.peersOf(n.ID), sv.ref.Peers(n.ID)
 				slices.Sort(got)
