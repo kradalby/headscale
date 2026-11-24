@@ -331,13 +331,6 @@ type Expansion struct {
 	list     views.Slice[types.NodeView]
 	capsOnce sync.Once
 	caps     *capInfo
-
-	// diagnose turns on byAddress, which counts owner nodes an identity
-	// source names by an address alone, not being its member, and owner
-	// nodes * leaves out: a test's evidence that it reached the case, not
-	// work a filter needs.
-	diagnose  bool
-	byAddress int
 }
 
 // grantExpansion is what a grant template comes to under one membership.
@@ -2470,9 +2463,6 @@ type FilterShapes struct {
 	// Shared, Self and Via count rules cut; CapGrant and Companion the
 	// capability rules among them; Capped those with sources by cap.
 	Shared, Self, Via, CapGrant, Companion, Capped int
-	// SelfByAddress counts owner nodes a self rule's source names, or
-	// leaves out, by address where membership would decide otherwise.
-	SelfByAddress int
 	// Anchored counts merged rules placed where a rule that does not reach
 	// the receiver sits, ahead of every rule of theirs that does; OwnAnchored
 	// those of them placed by one of the receiver's own rules. OwnUnreached
@@ -2491,7 +2481,6 @@ func (s *FilterShapes) Add(o FilterShapes) {
 	s.CapGrant += o.CapGrant
 	s.Companion += o.Companion
 	s.Capped += o.Capped
-	s.SelfByAddress += o.SelfByAddress
 	s.Anchored += o.Anchored
 	s.OwnAnchored += o.OwnAnchored
 	s.OwnUnreached += o.OwnUnreached
@@ -2961,23 +2950,12 @@ func (x *Expansion) buildSelfRules(gt *GrantTemplate, ge *grantExpansion, uid ui
 	for i, set := range ge.srcSets {
 		var named netipx.IPSetBuilder
 
-		kind := x.table.Selector(ge.srcIDs[i]).Kind
 		own.named[i] = naming(nodes, set)
 
 		for _, n := range nodes {
-			in := slices.ContainsFunc(n.IPs(), set.Contains)
-			if in {
+			if slices.ContainsFunc(n.IPs(), set.Contains) {
 				n.AppendToIPSet(&named)
 				n.AppendToIPSet(&all)
-			}
-
-			if x.diagnose && len(n.IPs()) > 0 {
-				_, member := slices.BinarySearch(x.posts.Nodes(SelectorRole(ge.srcIDs[i])), n.ID())
-
-				// A node without addresses gives no rule either way.
-				if kind.HoldsNodes() && in != member || kind == SelectorWildcard && !in {
-					x.byAddress++
-				}
 			}
 		}
 
@@ -3510,8 +3488,6 @@ func AuditFilters(a FilterAudit) (FilterReport, error) {
 		return rep, err
 	}
 
-	x.diagnose = true
-
 	for _, n := range a.Nodes.All() {
 		want, err := oracle.FilterForNode(n)
 		if err != nil {
@@ -3530,8 +3506,6 @@ func AuditFilters(a FilterAudit) (FilterReport, error) {
 	if want, _ := oracle.Filter(); !reflect.DeepEqual(want, x.Filter()) {
 		return rep, fmt.Errorf("%w: global filter:\ncompile  %v\nexpanded %v", errFilterAudit, want, x.Filter())
 	}
-
-	rep.Shapes.SelfByAddress = x.byAddress
 
 	return rep, nil
 }

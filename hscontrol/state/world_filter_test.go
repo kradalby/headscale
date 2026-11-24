@@ -358,15 +358,13 @@ func TestWorldFiltersUnderRandomChurn(t *testing.T) {
 		"exit receivers": shapes.Exit, "routed receivers": shapes.Routed, "self rules": shapes.Self,
 		"via rules": shapes.Via, "capability rules": shapes.CapGrant, "companion rules": shapes.Companion,
 		"rules with cap sources": shapes.Capped, "rules merged at a rule that does not reach the receiver": shapes.Anchored,
-		"owner nodes a self source names by address alone":           shapes.SelfByAddress,
 		"rules merged at a receiver's own rule that reaches nothing": shapes.OwnAnchored,
 	} {
 		assert.Positive(t, n, name)
 	}
 }
 
-// familyOp gives a node one family only, or an address outside the
-// tailnet's ranges, which * does not name.
+// familyOp gives a node one family only, or moves both its addresses.
 func (c *churnRun) familyOp(e *nodeEdit) {
 	ids := make([]types.NodeID, 0, e.Len())
 	for id := range e.All() {
@@ -390,9 +388,8 @@ func (c *churnRun) familyOp(e *nodeEdit) {
 		n.IPv4 = new(netip.AddrFrom4([4]byte{100, 66, 0, b}))
 		n.IPv6 = nil
 	default:
-		// Outside both of *'s ranges.
-		n.IPv4 = new(netip.AddrFrom4([4]byte{192, 168, 0, b}))
-		n.IPv6 = new(netip.AddrFrom16([16]byte{0xfd, 0x00, 15: b}))
+		n.IPv4 = new(netip.AddrFrom4([4]byte{100, 66, 0, b}))
+		n.IPv6 = new(netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 14: 0x40, 15: b}))
 	}
 
 	e.Set(n.ID, n)

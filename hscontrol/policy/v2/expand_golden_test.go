@@ -45,8 +45,6 @@ func expansionOf(t *testing.T, pm *PolicyManager, users types.Users, nodes *Node
 	x, err := NewExpansion(BuildTemplates(nil, sel), posts, SubnetApprovals{}.Update(nodes).Strings(), lookupIn(nodes))
 	require.NoError(t, err)
 
-	x.diagnose = true
-
 	return x, roles
 }
 
@@ -109,8 +107,6 @@ func requireExpandsLikeCompile(t *testing.T, x *Expansion, pm *PolicyManager, no
 
 	f := NewFilters(x.t, x.posts, SubnetApprovals{strs: x.routes}, list.ViewSlice())
 	requireServedAgreesWithGlobal(t, f, list.ViewSlice(), msgAndArgs...)
-
-	shapes.SelfByAddress = x.byAddress
 
 	return rules, shapes
 }
