@@ -432,6 +432,17 @@ func withoutIPv4Identity(base *tailcfg.Node) *tailcfg.Node {
 	})
 	tn.Addresses = slices.DeleteFunc(slices.Clone(base.Addresses), func(p netip.Prefix) bool { return p.Addr().Is4() })
 
+	// A peer left without an address renders like one that never held
+	// any: nil, not an empty list, so a session comparing what it sent
+	// with slices.Equal keeps one form.
+	if len(tn.Addresses) == 0 {
+		tn.Addresses = nil
+	}
+
+	if len(tn.AllowedIPs) == 0 {
+		tn.AllowedIPs = nil
+	}
+
 	return &tn
 }
 

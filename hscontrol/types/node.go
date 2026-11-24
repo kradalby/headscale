@@ -1486,6 +1486,11 @@ func (nv NodeView) TailNode(
 	addresses := nv.Prefixes()
 	if ipv4Disabled {
 		addresses = filterIPv4(addresses)
+		if len(addresses) == 0 {
+			// One form with a node that holds no address: a session
+			// compares what it sent with slices.Equal.
+			addresses = nil
+		}
 	}
 
 	// routeFunc returns ALL routes (subnet + exit) for this node.

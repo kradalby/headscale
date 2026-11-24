@@ -43,16 +43,6 @@ func ClientPeer(n tailcfg.NodeView) string {
 		p.LastSeen = nil
 	}
 
-	// TODO(kradalby): render/addresses-nil: a peer with no address is
-	// rendered as nil or as an empty list; the client reads both alike.
-	if p.Addresses == nil {
-		p.Addresses = []netip.Prefix{}
-	}
-
-	if p.AllowedIPs == nil {
-		p.AllowedIPs = p.Addresses
-	}
-
 	return JSON(p)
 }
 
