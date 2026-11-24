@@ -254,6 +254,7 @@ See [the routes reference](docs/ref/routes.md) for the failover rules.
 - A `derp.paths` file that decodes to neither regions nor `homeparams` now fails to load instead of being silently ignored
 - A `derp.paths` file with a key `tailcfg.DERPMap` has no field for (e.g. a misspelt `regionscore`) fails to load instead of the key being ignored, as Tailscale SaaS rejects such a policy `derpMap` [#2932](https://github.com/juanfont/headscale/pull/2932)
 - A DERP map from `derp.paths` or `derp.urls` must meet the region rules Tailscale SaaS applies to a policy `derpMap`: each region's `regionid` matches its key, each node's `regionid` matches its region, and a region has at least one node. A map that breaks one fails to load. Clients count latency by `regionid`, so a mismatch made them pick a home region the map did not have [#2932](https://github.com/juanfont/headscale/pull/2932)
+- `prefixes.v4` must lie inside `100.64.0.0/10` and `prefixes.v6` inside `fd7a:115c:a1e0::/48`; headscale refuses any other prefix, and a `prefixes.v4` inside `100.115.92.0/23`, which Tailscale reserves for ChromeOS VMs. It also refuses to start while a node holds an address outside these ranges or inside `100.115.92.0/23`. Other prefixes were unsupported, and the policy's `*` did not treat their addresses the same everywhere. A deployment with custom prefixes must give its nodes new addresses before upgrading: see [How can I migrate back to the recommended IP prefixes?](https://headscale.net/stable/about/faq/#how-can-i-migrate-back-to-the-recommended-ip-prefixes)
 - `database.sqlite.path` names the file literally. Before, SQLite cut the path at `?` or `#` and decoded `%XX`, so headscale opened another file. A path with `%`, `?` or `#` now opens a different file than before: move the database to the configured path before upgrading, or headscale starts with an empty one
 - `unix_socket_permission` must be a quoted octal string no higher than `"0777"`, e.g. `"0770"`; an unquoted number or an invalid value now stops headscale from starting instead of silently using `0700` [#3540](https://github.com/juanfont/headscale/pull/3540)
 - `tls_cert_path`, `tls_key_path`, `tls_letsencrypt_*`, `acme_url` and `acme_email` are deprecated in favour of `tls.cert_path`, `tls.key_path` and `tls.acme.*` [#3554](https://github.com/juanfont/headscale/pull/3554)
@@ -714,11 +715,10 @@ connected" routers that maintain their control session but cannot route packets.
 
 #### ACL Policy
 
-- Wildcard (`*`) in ACL sources and destinations now resolves to Tailscale's CGNAT range (`100.64.0.0/10`) and ULA range (`fd7a:115c:a1e0::/48`) instead of all IPs (`0.0.0.0/0` and `::/0`) [#3036](https://github.com/juanfont/headscale/pull/3036)
+- Wildcard (`*`) in ACL sources now resolves to Tailscale's CGNAT range (`100.64.0.0/10`) and ULA range (`fd7a:115c:a1e0::/48`) instead of all IPs (`0.0.0.0/0` and `::/0`) [#3036](https://github.com/juanfont/headscale/pull/3036)
   - This better matches Tailscale's security model where `*` means "any node in the tailnet" rather than "any IP address"
-  - Policies that need to match all IP addresses including non-Tailscale IPs should use `autogroup:danger-all` as a source, or explicit CIDR ranges as destinations [#2180](https://github.com/juanfont/headscale/pull/2180)
+  - Policies that need to match all IP addresses including non-Tailscale IPs should use `autogroup:danger-all` as a source [#2180](https://github.com/juanfont/headscale/pull/2180)
   - `autogroup:danger-all` can only be used as a source; it cannot be used as a destination
-  - **Note**: Users with non-standard IP ranges configured in `prefixes.ipv4` or `prefixes.ipv6` (which is unsupported and produces a warning) will need to explicitly specify their CIDR ranges in ACL rules instead of using `*`
 - Validate `autogroup:self` source restrictions matching Tailscale behavior - tags, hosts, and IPs are rejected as sources for `autogroup:self` destinations [#3036](https://github.com/juanfont/headscale/pull/3036)
   - Policies using tags, hosts, or IP addresses as sources for `autogroup:self` destinations will now fail validation
 - The `proto:icmp` protocol name now only includes ICMPv4 (protocol 1), matching Tailscale behavior [#3036](https://github.com/juanfont/headscale/pull/3036)
