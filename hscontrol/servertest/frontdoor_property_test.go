@@ -11,6 +11,7 @@ import (
 	"maps"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -180,6 +181,13 @@ type frontDoor struct {
 	// records is what the records step published last; a restart serves
 	// the configured ones alone, which is none here.
 	records []tailcfg.DNSRecord
+	// v2 is whether this case's admin writes go through the v2 API: an
+	// OAuth client minted in process ([frontDoor.v2Token]), its writes
+	// the property's v1 paths translated to ([frontDoor.translate2]).
+	v2 bool
+	// v2token is the case's v2 bearer, minted at the first translated
+	// write.
+	v2token string
 	// unheld are the subnet routes a burst left with no router available:
 	// who held them last is history the election history missed, so the
 	// routes go unjudged until a router can take them again.
@@ -271,6 +279,7 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 		t: rt, tb: tb, run: run,
 		capSources: rapid.Bool().Draw(rt, "capability-sources"),
 		chunks:     rapid.Bool().Draw(rt, "filter-chunks"),
+		v2:         rapid.Bool().Draw(rt, "v2-api"),
 		patient:    rapid.IntRange(0, 3).Draw(rt, "patient") == 3,
 		magicDNS:   rapid.Bool().Draw(rt, "magic-dns"),
 		// The ephemeral inactivity clock, drawn small in a third of the
@@ -2928,6 +2937,12 @@ func (fd *frontDoor) restart(at string) {
 
 // api calls the v1 API as an admin.
 func (fd *frontDoor) api(method, path string, body, out any) error {
+	if fd.v2 {
+		if kind, m2, p2, b2, ctype, raw, ok := fd.translate2(method, path, body); ok {
+			return fd.api2(kind, m2, p2, b2, ctype, raw, out)
+		}
+	}
+
 	var r io.Reader
 
 	if body != nil {
@@ -2970,6 +2985,195 @@ func (fd *frontDoor) api(method, path string, body, out any) error {
 	}
 
 	return nil
+}
+
+// fdV2Scopes are the scopes of the case's v2 OAuth client: every write
+// the property translates.
+var fdV2Scopes = []string{"devices:core", "devices:routes", "policy_file"}
+
+// fdV2Tags are the client's tags: the policy's own three, so the v2 tag
+// write's grant check — which no v1 write has — is always satisfied.
+var fdV2Tags = []string{"tag:a", "tag:b", "tag:c"}
+
+// translate2 is the v2 form of one of the property's admin writes, with
+// the reach tally of its kind. ok reports that the write has a v2 form
+// at all: the users' writes do not (the hosted API manages users
+// through the identity provider, and v2 has no user write), and neither
+// do the reads. Where the two APIs differ it is the shape that differs —
+// the name in the body, the expiry as a key switch, the policy as a raw
+// document — each in the handler it belongs to.
+func (fd *frontDoor) translate2(method, path string, body any) (string, string, string, any, string, bool, bool) {
+	tally := func(kind string) {
+		fd.run.tally.steps["v2 write: "+kind]++
+	}
+
+	switch method {
+	case http.MethodDelete:
+		if id, found := strings.CutPrefix(path, "/api/v1/node/"); found {
+			tally("device deleted")
+
+			return "device deleted", http.MethodDelete, "/api/v2/device/" + id, nil, "", false, true
+		}
+	case http.MethodPost:
+		rest, found := strings.CutPrefix(path, "/api/v1/node/")
+		if !found {
+			return "", "", "", nil, "", false, false
+		}
+
+		id, sub, _ := strings.Cut(rest, "/")
+
+		switch sub {
+		case "tags":
+			tally("tags")
+
+			return "tags", http.MethodPost, "/api/v2/device/" + id + "/tags", body, "", false, true
+		case "expire":
+			// v1: disableExpiry => a nil expiry; absent body => now.
+			// v2: the key switch is the renewal, the expire path now.
+			if body, isMap := body.(map[string]any); isMap && body["disableExpiry"] == true {
+				tally("key renewed")
+
+				return "key renewed", http.MethodPost, "/api/v2/device/" + id + "/key",
+					map[string]any{"keyExpiryDisabled": true}, "", false, true
+			}
+
+			tally("expired")
+
+			return "expired", http.MethodPost, "/api/v2/device/" + id + "/expire", nil, "", false, true
+		case "approve_routes":
+			tally("routes")
+
+			return "routes", http.MethodPost, "/api/v2/device/" + id + "/routes", body, "", false, true
+		default:
+			if name, found := strings.CutPrefix(sub, "rename/"); found {
+				tally("renamed")
+
+				return "renamed", http.MethodPost, "/api/v2/device/" + id + "/name",
+					map[string]any{"name": name}, "", false, true
+			}
+		}
+	case http.MethodPut:
+		if path == "/api/v1/policy" {
+			tally("policy")
+
+			doc, _ := body.(map[string]any)["policy"].(string)
+
+			return "policy", http.MethodPost, "/api/v2/tailnet/-/acl", doc, "application/hujson", true, true
+		}
+	}
+
+	return "", "", "", nil, "", false, false
+}
+
+// api2 is [frontDoor.api] for the v2 form of a write: the case's OAuth
+// token, the content type the translated write needs.
+func (fd *frontDoor) api2(kind, method, path string, body any, ctype string, raw bool, out any) error {
+	var r io.Reader
+
+	if raw {
+		r = strings.NewReader(body.(string)) //nolint:forcetypeassert // translate2 made it
+	} else if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+
+		r = bytes.NewReader(b)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, method, fd.srv.URL+path, r)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+fd.v2Token())
+
+	if ctype != "" {
+		req.Header.Set("Content-Type", ctype)
+	} else {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := fd.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	msg, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode/100 != 2 {
+		// A refused write is the answer the step or edit expects, named
+		// by the v2 form it came through.
+		fd.run.tally.steps["v2 write: "+kind+" (refused)"]++
+
+		return fmt.Errorf("%s %s: %d: %s", method, path, resp.StatusCode, bytes.TrimSpace(msg)) //nolint:err113
+	}
+
+	fd.run.tally.steps["v2 write: "+kind+" (done)"]++
+
+	if out != nil {
+		return json.Unmarshal(msg, out)
+	}
+
+	return nil
+}
+
+// v2Token is the case's v2 bearer: an OAuth client minted in process,
+// its scopes every write the property translates, its tags the policy's
+// own three.
+func (fd *frontDoor) v2Token() string {
+	fd.tb.Helper()
+
+	if fd.v2token != "" {
+		return fd.v2token
+	}
+
+	secret, _, err := fd.srv.State().CreateOAuthClient(fdV2Scopes, fdV2Tags, "front door", nil)
+	if err != nil {
+		fd.t.Fatalf("minting the v2 OAuth client: %v", err)
+	}
+
+	form := url.Values{"grant_type": {"client_credentials"}, "client_secret": {secret}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fd.srv.URL+"/api/v2/oauth/token", strings.NewReader(form.Encode()))
+	if err != nil {
+		fd.t.Fatalf("the v2 token request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := fd.http.Do(req)
+	if err != nil {
+		fd.t.Fatalf("the v2 token request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var tok struct {
+		AccessToken string `json:"access_token"`
+	}
+
+	err = json.NewDecoder(resp.Body).Decode(&tok)
+	if err != nil {
+		fd.t.Fatalf("the v2 token: %v", err)
+	}
+
+	if tok.AccessToken == "" {
+		fd.t.Fatal("the v2 token is empty")
+	}
+
+	fd.v2token = tok.AccessToken
+
+	return fd.v2token
 }
 
 // mustAPI is api, failing the case on an error.
@@ -3107,6 +3311,17 @@ func (t *fdTally) require(tb testing.TB, held *policymodel.HeldJudge) {
 	// (C31) lives exactly here, so a deep run must have taken it.
 	if t.steps[stepNames[stepOwnership]+": a login renews an expired tagged node"] == 0 {
 		tb.Errorf("no case renewed an expired tagged node at a login")
+	}
+
+	// Every kind of write the v2 translation routes must have gone
+	// through it somewhere in a deep run.
+	for _, kind := range []string{
+		"v2 write: tags", "v2 write: expired", "v2 write: key renewed",
+		"v2 write: routes", "v2 write: renamed", "v2 write: device deleted", "v2 write: policy",
+	} {
+		if t.steps[kind] == 0 {
+			tb.Errorf("no case wrote through the v2 form: %s", kind)
+		}
 	}
 
 	for name, n := range map[string]int{
