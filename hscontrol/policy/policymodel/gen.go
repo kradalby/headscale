@@ -1408,8 +1408,12 @@ const (
 	editExpire
 	editOnline
 	editAddr
-	numNodeEdits
+	numNodeEdits = editAddr + addrShares
 )
+
+// addrShares is how many shares of the node edits move an address: each
+// family has its own lost, gained and moved shapes to reach.
+const addrShares = 3
 
 func drawNodeEdit(t *rapid.T, w World) Edit {
 	tp := w.Topology
@@ -1437,6 +1441,10 @@ func drawNodeEdit(t *rapid.T, w World) Edit {
 
 // drawNodeEditOn draws an edit of kind, other than a join, of node n of w.
 func drawNodeEditOn(t *rapid.T, w World, kind int, n Node) Edit {
+	if kind >= editAddr {
+		return drawSetAddr(t, n)
+	}
+
 	switch kind {
 	case editLeave:
 		return Leave{n.ID}
@@ -1478,8 +1486,6 @@ func drawNodeEditOn(t *rapid.T, w World, kind int, n Node) Edit {
 		return SetExpired{n.ID, !n.Expired}
 	case editOnline:
 		return SetOnline{n.ID, n.Offline}
-	case editAddr:
-		return drawSetAddr(t, n)
 	}
 
 	return SetClient{n.ID, Client(other(t, numClients, int(n.Client), "client"))} //nolint:gosec // a few clients
