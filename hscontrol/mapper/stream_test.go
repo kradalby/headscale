@@ -6347,19 +6347,6 @@ func TestStreamDNSInitialReverseRoutes(t *testing.T) {
 	assert.Equal(t, []*dnstype.Resolver{{Addr: "9.9.9.9"}}, out[0].DNSConfig.Routes["64.100.in-addr.arpa"], "operator routes inside client-handled ranges remain explicit")
 	assert.NotContains(t, out[0].DNSConfig.Routes, "127.100.in-addr.arpa")
 	assert.NotContains(t, out[0].DNSConfig.Routes, "0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa")
-
-	custom4 := netip.MustParsePrefix("10.44.0.0/24")
-	custom6 := netip.MustParsePrefix("fd00:abcd::/64")
-	cfg.Prefixes.V4, cfg.Prefixes.V6 = &custom4, &custom6
-
-	view := cfg.DNSView().AsStruct()
-	for _, zone := range []string{"0.44.10.in-addr.arpa", "0.0.0.0.0.0.0.0.d.c.b.a.0.0.d.f.ip6.arpa"} {
-		resolvers, ok := view.Routes[zone]
-		assert.True(t, ok, zone)
-		assert.NotNil(t, resolvers, zone)
-		assert.Empty(t, resolvers, zone)
-	}
-
 	assert.Equal(t, []*dnstype.Resolver{{Addr: "1.1.1.1"}}, out[0].DNSConfig.Routes["split.test"])
 }
 

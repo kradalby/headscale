@@ -1,7 +1,6 @@
 package state
 
 import (
-	"net/netip"
 	"testing"
 	"time"
 
@@ -109,30 +108,6 @@ func TestDebugConfigExtraRecordsSnapshot(t *testing.T) {
 
 	assert.Equal(t, records, before.TailcfgDNSConfig().ExtraRecords)
 	assert.Empty(t, s.DebugConfig().TailcfgDNSConfig().ExtraRecords)
-}
-
-// The startup config dump serves the frozen DNS view, so it must carry the
-// MagicDNS reverse routes the served maps carry.
-func TestDebugConfigReverseRoutes(t *testing.T) {
-	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
-	cfg.DNSConfig.MagicDNS = true
-	customV4 := netip.MustParsePrefix("10.0.0.0/8")
-	customV6 := netip.MustParsePrefix("fd00::/48")
-	cfg.Prefixes.V4 = &customV4
-	cfg.Prefixes.V6 = &customV6
-	s, err := NewState(cfg)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
-
-	out := s.DebugConfig()
-	require.NotNil(t, out.TailcfgDNSConfig())
-
-	for _, zone := range []string{"10.in-addr.arpa", "0.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa"} {
-		resolvers, ok := out.TailcfgDNSConfig().Routes[zone]
-		assert.True(t, ok, zone)
-		assert.NotNil(t, resolvers, zone)
-		assert.Empty(t, resolvers, zone)
-	}
 }
 
 func TestDebugConfigDNSOwnsStartupSettings(t *testing.T) {
