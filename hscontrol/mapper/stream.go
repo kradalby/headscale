@@ -491,6 +491,9 @@ type renderLog struct {
 	// shard named, so a test can put a routing, or a render's end, exactly
 	// there.
 	hook func(renderPoint, *renderShard)
+	// route, set by tests, answers in Route's place for two snapshots, so a
+	// test can drive the hub against a model.
+	route func(old, cur *state.Snapshot) (bool, map[types.NodeID]struct{})
 }
 
 // reachSet is [Route] over a pair of snapshots, worked out once. ok is set
@@ -580,7 +583,7 @@ func (l *renderLog) end(s *Session, snap *state.Snapshot, ok bool) (uint64, bool
 		return 0, false
 	}
 
-	return routed.Rev(), !ok || l.set(snap.Rev(), routed.Rev()).has(snap, routed, s.NodeID)
+	return routed.Rev(), !ok || l.set(snap.Rev(), routed.Rev()).has(l, snap, routed, s.NodeID)
 }
 
 // end records that id rendered snap, or failed to, unless a routing went
@@ -647,9 +650,18 @@ func (l *renderLog) routing(a, c *state.Snapshot, all bool, wake map[types.NodeI
 	l.reach[[2]uint64{a.Rev(), c.Rev()}] = r
 }
 
-func (r *reachSet) has(old, cur *state.Snapshot, id types.NodeID) bool {
+// answer is Route over old and cur, whose change is c.
+func (l *renderLog) answer(old, cur *state.Snapshot, c state.Change) (bool, map[types.NodeID]struct{}) {
+	if l.route != nil {
+		return l.route(old, cur)
+	}
+
+	return Route(old, cur, c)
+}
+
+func (r *reachSet) has(l *renderLog, old, cur *state.Snapshot, id types.NodeID) bool {
 	r.once.Do(func() {
-		r.all, r.wake = Route(old, cur, cur.Since(old))
+		r.all, r.wake = l.answer(old, cur, cur.Since(old))
 		r.ok = true
 	})
 
@@ -687,7 +699,7 @@ func (l *renderLog) between(from, to *state.Snapshot, all bool) []types.NodeID {
 			sets[d.snap.Rev()] = r
 		}
 
-		if r.has(d.snap, to, d.id) {
+		if r.has(l, d.snap, to, d.id) {
 			out = append(out, d.id)
 		}
 	}
@@ -945,7 +957,7 @@ func (h *Hub) watch(s *state.State, sub *graph.Subscription, last *state.Snapsho
 // snapshot in between is woken again when the rest reaches it.
 func (h *Hub) route(last, snap *state.Snapshot) (state.Change, bool, map[types.NodeID]struct{}, int) {
 	change := snap.Since(last)
-	all, wake := Route(last, snap, change)
+	all, wake := h.renders.answer(last, snap, change)
 
 	h.renders.routing(last, snap, all, wake)
 	between := h.renders.between(last, snap, all)

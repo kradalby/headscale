@@ -12,6 +12,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1765,4 +1766,735 @@ func (a *auditLines) judge() string {
 	}
 
 	return ""
+}
+
+// TestHubCoreInterleavings drives the hub's decisions one event at a time on
+// the test goroutine, against a model: a node's map at a commit is a value the
+// model holds, and Route over two commits names the nodes whose value moved,
+// or every node across a commit every map reads. The hub's own code makes
+// every decision: a routing (Hub.route, the render log and its memo), a
+// render's end and the wake it may owe (Stream.rendered), a first map's
+// snapshot (Hub.initialState), peer history, sessions. Spelled out here are
+// only the watcher's loop body and a stream's calls into the hub; no map is
+// rendered, and the snapshots are minted once from one State.
+//
+// It judges, after every event (a routing runs whole here): every session
+// that is idle, has no wake pending and last rendered a commit before the
+// one routed to must have succeeded and hold that commit's value; once
+// nothing is left to do, every session holds the latest commit's value, one
+// more commit retrying a failure; a deleted node's history is gone once the
+// hub forgot it; a node's history never returns to an older revision.
+//
+// exhaustive walks every schedule of every scenario in a small scope, each
+// state once; drawn has rapid draw larger scenarios and schedules. Neither
+// can see what one goroutine runs whole: data races, or anything between
+// two of the hub's critical sections (the stress test and the hub
+// schedules); nor what a render holds (the scenarios and delivery
+// properties).
+func TestHubCoreInterleavings(t *testing.T) {
+	snaps := mintSnapshots(t, 16)
+
+	// Each scope is small enough to walk whole; together they hold commits
+	// coalescing over changes and their reversals, renders of a commit in
+	// between and past a routing, failures, deletions with renders and
+	// writes still in flight, and two sessions of one node.
+	for _, sc := range []struct {
+		name  string
+		scope coreScope
+	}{
+		{"one node, four commits, a failure", coreScope{nodes: 1, commits: 4, failures: 1, quiet: true}},
+		{"two nodes, a failure, a leave", coreScope{nodes: 2, commits: 2, failures: 1, leaves: 1, global: true}},
+		{"two nodes, a failure, a deletion", coreScope{nodes: 2, commits: 2, failures: 1, deletions: 1, global: true}},
+		{"a second session, a failure", coreScope{nodes: 1, commits: 2, joins: 1, failures: 1, quiet: true, global: true}},
+	} {
+		t.Run("exhaustive/"+sc.name, func(t *testing.T) {
+			states, leaves := exploreCore(t, snaps, sc.scope)
+			t.Logf("%d states, %d of them with nothing left to do", states, leaves)
+		})
+	}
+
+	t.Run("drawn", func(t *testing.T) {
+		rapid.Check(t, func(t *rapid.T) {
+			scope := coreScope{
+				nodes:     rapid.IntRange(1, 4).Draw(t, "nodes"),
+				commits:   rapid.IntRange(1, len(snaps)-2).Draw(t, "commits"),
+				joins:     rapid.IntRange(0, 3).Draw(t, "joins"),
+				failures:  rapid.IntRange(0, 3).Draw(t, "failures"),
+				deletions: rapid.IntRange(0, 1).Draw(t, "deletions"),
+				leaves:    rapid.IntRange(0, 2).Draw(t, "leaves"),
+				drawn:     true,
+			}
+
+			m := newCoreMachine(t, snaps, scope)
+			for {
+				evs := m.enabled()
+				if len(evs) == 0 {
+					break
+				}
+
+				m.apply(rapid.SampledFrom(evs).Draw(t, "event"))
+			}
+
+			m.settle()
+		})
+	})
+}
+
+// mintSnapshots returns n snapshots of one State, one commit apart.
+func mintSnapshots(t *testing.T, n int) []*state.Snapshot {
+	t.Helper()
+
+	_, s, ids := streamTestState(t, ownUserOnly)
+
+	out := []*state.Snapshot{s.Snapshot()}
+	for i := 1; i < n; i++ {
+		scalingEndpoint(t, s, ids[0], i)
+		out = append(out, s.Snapshot())
+		require.Equal(t, out[i-1].Rev()+1, out[i].Rev(), "test sanity: one commit per write")
+	}
+
+	return out
+}
+
+// coreScope bounds what a core machine may do: its nodes, and how many
+// commits, extra sessions, failed renders, node deletions and leaves.
+type coreScope struct {
+	nodes, commits, joins, failures, deletions, leaves int
+	// A commit flips one node's value, or every node's; quiet offers one
+	// that changes nothing a node is sent, global one every map reads.
+	quiet, global bool
+	// drawn draws each commit's flips instead, any bits of any values.
+	drawn bool
+}
+
+type coreKind int
+
+const (
+	coreCommit coreKind = iota
+	coreLoad
+	coreRoute
+	coreTake
+	coreEnd
+	coreFail
+	coreDeliver
+	coreJoin
+	coreLeave
+)
+
+// coreEvent is one step of a core machine. For a commit, edit is what it
+// does; sess is the session acted on, or the node joined.
+type coreEvent struct {
+	kind coreKind
+	sess int
+	edit coreEdit
+}
+
+func (e coreEvent) String() string {
+	switch e.kind {
+	case coreCommit:
+		return "commit " + e.edit.String()
+	case coreLoad:
+		return "load"
+	case coreRoute:
+		return "route"
+	case coreJoin:
+		return fmt.Sprintf("join n%d", e.sess+1)
+	case coreTake, coreEnd, coreFail, coreDeliver, coreLeave:
+	}
+
+	return fmt.Sprintf("%s s%d", [...]string{coreTake: "take", coreEnd: "end", coreFail: "fail", coreDeliver: "deliver", coreLeave: "leave"}[e.kind], e.sess)
+}
+
+// coreEdit is a commit's change: each node's value flipped by flip[n], a
+// commit every map reads, or a node deleted.
+type coreEdit struct {
+	flip   [4]uint8
+	global bool
+	del    int // the node deleted, plus one; zero for none
+}
+
+func (e coreEdit) String() string {
+	switch {
+	case e.del > 0:
+		return fmt.Sprintf("delete n%d", e.del)
+	case e.global:
+		return fmt.Sprintf("global %v", e.flip)
+	}
+
+	return fmt.Sprintf("%v", e.flip)
+}
+
+const (
+	coreIdle = iota
+	coreTook
+	coreWritten
+)
+
+// coreSess is one session of a core machine.
+type coreSess struct {
+	n     int
+	sess  *Session
+	st    *Stream
+	first bool
+	phase int
+	// took is the commit the render in flight took (for a first map, the
+	// one it was handed); held the commit whose value it holds; tried the
+	// commit its last render was of, and ok whether that succeeded.
+	took, held, tried int
+	ok                bool
+	pending           sentView
+	// ended is set when the hub ended it; gone once it left the hub.
+	ended, gone bool
+}
+
+// coreMachine is the hub, its watcher's routing and its sessions' streams,
+// run by the test goroutine against the model's views.
+type coreMachine struct {
+	t     pbtT
+	scope coreScope
+	snaps []*state.Snapshot
+	h     *Hub
+
+	// views[i][n] is node n's value at commit i: the peers it sees, as bits,
+	// and one bit no peer stands for.
+	views     [][4]uint8
+	global    []bool
+	deletedAt [4]int // the commit deleting node n; zero while it lives
+
+	committed, routed, target int
+	loaded                    bool
+
+	sess                          []*coreSess
+	joins, failures, dels, leaves int
+	histRev                       [4]uint64
+	path                          []coreEvent
+}
+
+func newCoreMachine(t pbtT, snaps []*state.Snapshot, scope coreScope) *coreMachine {
+	m := &coreMachine{t: t, scope: scope, snaps: snaps, h: NewHub(), views: make([][4]uint8, 1), global: make([]bool, 1)}
+	m.h.renders.route = m.route
+
+	// Every node sees every other.
+	for n := range scope.nodes {
+		m.views[0][n] = uint8(1<<scope.nodes-1) &^ (1 << n)
+	}
+
+	m.h.route(snaps[0], snaps[0])
+	m.h.advance(snaps[0])
+
+	for n := range scope.nodes {
+		s := m.join(n)
+		m.take(s)
+		m.end(s, true)
+		m.deliver(s)
+	}
+
+	return m
+}
+
+func (m *coreMachine) id(n int) types.NodeID { return types.NodeID(n + 1) } //nolint:gosec // small
+
+func (m *coreMachine) index(snap *state.Snapshot) int { return int(snap.Rev() - m.snaps[0].Rev()) } //nolint:gosec // small
+
+// route is the model's Route over two snapshots.
+func (m *coreMachine) route(old, cur *state.Snapshot) (bool, map[types.NodeID]struct{}) {
+	x, c := m.index(old), m.index(cur)
+	if slices.Contains(m.global[x+1:c+1], true) {
+		return true, nil
+	}
+
+	wake := map[types.NodeID]struct{}{}
+
+	for n := range m.scope.nodes {
+		if m.views[x][n] != m.views[c][n] {
+			wake[m.id(n)] = struct{}{}
+		}
+	}
+
+	return false, wake
+}
+
+// alive reports whether node n lives at commit i.
+func (m *coreMachine) alive(n, i int) bool { return m.deletedAt[n] == 0 || i < m.deletedAt[n] }
+
+func (m *coreMachine) live(s *coreSess) bool { return !s.gone && !s.ended }
+
+func (m *coreMachine) edits() []coreEdit {
+	if m.scope.drawn {
+		// A drawn machine draws its edit as it commits.
+		return []coreEdit{{}}
+	}
+
+	var out []coreEdit
+
+	for n := range m.scope.nodes {
+		var e coreEdit
+
+		e.flip[n] = m.flipOf(n)
+		out = append(out, e)
+	}
+
+	var all coreEdit
+	for n := range m.scope.nodes {
+		all.flip[n] = m.flipOf(n)
+	}
+
+	if m.scope.nodes > 1 {
+		out = append(out, all)
+	}
+
+	if m.scope.global {
+		all.global = true
+		out = append(out, all)
+	}
+
+	if m.scope.quiet {
+		out = append(out, coreEdit{})
+	}
+
+	if m.dels < m.scope.deletions && m.scope.nodes > 1 && m.alive(m.scope.nodes-1, m.committed+1) {
+		out = append(out, coreEdit{del: m.scope.nodes})
+	}
+
+	return out
+}
+
+// flipOf is how an edit of node n flips its value: the peers it sees, or,
+// for a node alone, a bit no peer stands for.
+func (m *coreMachine) flipOf(n int) uint8 {
+	if m.scope.nodes == 1 {
+		return 1 << 7
+	}
+
+	return uint8(1<<m.scope.nodes-1) &^ (1 << n)
+}
+
+// enabled lists what may happen next.
+func (m *coreMachine) enabled() []coreEvent {
+	var out []coreEvent
+
+	if m.committed < m.scope.commits {
+		for _, e := range m.edits() {
+			out = append(out, coreEvent{kind: coreCommit, edit: e})
+		}
+	}
+
+	if !m.loaded && m.routed < m.committed {
+		out = append(out, coreEvent{kind: coreLoad})
+	}
+
+	if m.loaded {
+		out = append(out, coreEvent{kind: coreRoute})
+	}
+
+	for i, s := range m.sess {
+		switch {
+		case s.gone:
+		case s.phase == coreTook:
+			out = append(out, coreEvent{kind: coreEnd, sess: i})
+			if !s.first && m.failures < m.scope.failures {
+				out = append(out, coreEvent{kind: coreFail, sess: i})
+			}
+		case s.phase == coreWritten:
+			out = append(out, coreEvent{kind: coreDeliver, sess: i})
+		case s.ended:
+		default:
+			if s.first || len(s.sess.wakes) > 0 {
+				out = append(out, coreEvent{kind: coreTake, sess: i})
+			}
+
+			if m.leaves < m.scope.leaves {
+				out = append(out, coreEvent{kind: coreLeave, sess: i})
+			}
+		}
+	}
+
+	if m.joins < m.scope.joins {
+		for n := range m.scope.nodes {
+			if m.alive(n, m.committed) {
+				out = append(out, coreEvent{kind: coreJoin, sess: n})
+			}
+		}
+	}
+
+	return out
+}
+
+// apply makes e happen and judges the result.
+func (m *coreMachine) apply(e coreEvent) {
+	m.path = append(m.path, e)
+
+	switch e.kind {
+	case coreCommit:
+		if m.scope.drawn {
+			e.edit = m.drawEdit()
+			m.path[len(m.path)-1].edit = e.edit
+		}
+
+		m.commit(e.edit)
+	case coreLoad:
+		m.loaded, m.target = true, m.committed
+	case coreRoute:
+		m.routing()
+	case coreTake:
+		m.take(m.sess[e.sess])
+	case coreEnd, coreFail:
+		m.end(m.sess[e.sess], e.kind == coreEnd)
+	case coreDeliver:
+		m.deliver(m.sess[e.sess])
+	case coreJoin:
+		m.joins++
+		m.join(e.sess)
+	case coreLeave:
+		m.leaves++
+		m.leave(m.sess[e.sess])
+	}
+
+	m.reap()
+	m.judge()
+}
+
+// drawEdit draws a drawn machine's commit: any flips, now and then one
+// every map reads, or a deletion.
+func (m *coreMachine) drawEdit() coreEdit {
+	t, _ := m.t.(*rapid.T)
+
+	var e coreEdit
+
+	if m.dels < m.scope.deletions && m.scope.nodes > 1 && rapid.IntRange(0, 3).Draw(t, "delete") == 0 {
+		if n := rapid.IntRange(0, m.scope.nodes-1).Draw(t, "deleted"); m.alive(n, m.committed+1) {
+			return coreEdit{del: n + 1}
+		}
+	}
+
+	for n := range m.scope.nodes {
+		e.flip[n] = rapid.Uint8Range(0, 1<<m.scope.nodes-1).Draw(t, "flip") &^ (1 << n)
+	}
+
+	e.global = rapid.IntRange(0, 5).Draw(t, "global") == 0
+
+	return e
+}
+
+func (m *coreMachine) commit(e coreEdit) {
+	v := m.views[m.committed]
+	for n := range m.scope.nodes {
+		v[n] ^= e.flip[n]
+	}
+
+	if e.del > 0 {
+		m.dels++
+		m.deletedAt[e.del-1] = m.committed + 1
+
+		for n := range m.scope.nodes {
+			v[n] &^= 1 << (e.del - 1)
+		}
+	}
+
+	m.committed++
+	m.views = append(m.views, v)
+	m.global = append(m.global, e.global)
+}
+
+// routing is the watcher's loop body over the commits since it last routed:
+// route, advance, forget the deleted, wake.
+func (m *coreMachine) routing() {
+	_, all, wake, _ := m.h.route(m.snaps[m.routed], m.snaps[m.target])
+	m.h.advance(m.snaps[m.target])
+
+	for n := range m.scope.nodes {
+		if d := m.deletedAt[n]; d > m.routed && d <= m.target {
+			m.h.forget(m.id(n))
+			m.histRev[n] = 0
+		}
+	}
+
+	m.h.wake(all, wake)
+	m.routed, m.loaded = m.target, false
+}
+
+func (m *coreMachine) join(n int) *coreSess {
+	s := &coreSess{n: n, first: true}
+	s.sess = m.h.Join(m.id(n), func() { s.ended = true })
+	s.st = &Stream{hub: m.h, nodeID: m.id(n)}
+	s.st.Attach(s.sess)
+	m.sess = append(m.sess, s)
+
+	return s
+}
+
+// take has s take its wake, unless it is a first map, and the newest commit,
+// as poll does; an update observes it as it starts.
+func (m *coreMachine) take(s *coreSess) {
+	if !s.first {
+		<-s.sess.wakes
+		m.h.observe(m.snaps[m.committed])
+	}
+
+	s.took, s.phase = m.committed, coreTook
+}
+
+// end ends s's render as Initial and Update do, or fails it as Update's
+// error path does. A render of a node no longer there fails, and its
+// session ends.
+func (m *coreMachine) end(s *coreSess, ok bool) {
+	snap := m.snaps[s.took]
+	s.phase = coreIdle
+
+	if s.first {
+		snap, _ = m.h.initialState(m.id(s.n), snap)
+	}
+
+	at := m.index(snap)
+
+	if !m.alive(s.n, at) {
+		s.st.rendered(snap, ErrNodeGone)
+		m.leave(s)
+
+		return
+	}
+
+	if !ok {
+		m.failures++
+
+		s.st.rendered(snap, errInjected)
+		s.tried, s.ok = at, false
+
+		return
+	}
+
+	changed := s.first || m.views[at][s.n] != m.views[s.held][s.n]
+	s.st.rendered(snap, nil)
+	s.first, s.held, s.tried, s.ok = false, at, at, true
+
+	if changed {
+		s.pending = sentView{ids: m.peers(at, s.n), rev: snap.Rev()}
+		m.h.mayHavePeers(s.sess, m.id(s.n), s.pending)
+		s.phase = coreWritten
+	}
+}
+
+// peers is node n's peer view at commit i.
+func (m *coreMachine) peers(i, n int) []types.NodeID {
+	var out []types.NodeID
+
+	for p := range m.scope.nodes {
+		if m.views[i][n]&(1<<p) != 0 {
+			out = append(out, m.id(p))
+		}
+	}
+
+	return out
+}
+
+func (m *coreMachine) deliver(s *coreSess) {
+	s.st.pending = &s.pending
+	s.st.Delivered()
+	s.phase = coreIdle
+}
+
+func (m *coreMachine) leave(s *coreSess) {
+	m.h.Leave(s.sess)
+	s.gone = true
+}
+
+// reap has the sessions the hub ended leave once nothing is in flight, as
+// poll's loop returns on stop.
+func (m *coreMachine) reap() {
+	for _, s := range m.sess {
+		if s.ended && !s.gone && s.phase == coreIdle {
+			m.leave(s)
+		}
+	}
+}
+
+func (m *coreMachine) fatalf(format string, args ...any) {
+	m.t.Helper()
+	m.t.Fatalf("%s\nafter: %v", fmt.Sprintf(format, args...), m.path)
+}
+
+// judge holds the sessions to the commit routed to, and the peer history to
+// what the hub forgot and what it delivered.
+func (m *coreMachine) judge() {
+	m.t.Helper()
+
+	// A routing runs whole here, so its end is always a boundary.
+	for i, s := range m.sess {
+		if !m.live(s) || s.first || s.phase != coreIdle || len(s.sess.wakes) > 0 || s.tried >= m.routed || !m.alive(s.n, m.routed) {
+			continue
+		}
+
+		if !s.ok {
+			m.fatalf("s%d (n%d) failed to render r%d, the hub routed to r%d, and no wake is pending", i, s.n+1, s.tried, m.routed)
+		}
+
+		if m.views[s.held][s.n] != m.views[m.routed][s.n] {
+			m.fatalf("s%d (n%d) holds r%d's map, stale at r%d, and no wake is pending", i, s.n+1, s.held, m.routed)
+		}
+	}
+
+	for n := range m.scope.nodes {
+		m.h.mu.Lock()
+		v, ok := m.h.core.sentPeers[m.id(n)]
+		m.h.mu.Unlock()
+
+		switch {
+		case !ok:
+		case m.deletedAt[n] != 0 && m.deletedAt[n] <= m.routed:
+			m.fatalf("n%d was deleted at r%d and forgotten, yet has peer history", n+1, m.deletedAt[n])
+		case v.rev < m.histRev[n]:
+			m.fatalf("n%d's peer history went back from revision %d to %d", n+1, m.histRev[n], v.rev)
+		default:
+			m.histRev[n] = v.rev
+		}
+	}
+}
+
+// settle routes, takes, renders and delivers, without failing, until nothing
+// is left, one more commit retrying a failure; then every session holds the
+// latest commit's value.
+func (m *coreMachine) settle() {
+	m.t.Helper()
+
+	retried := false
+
+	for range 1000 {
+		evs := m.enabled()
+		next := slices.IndexFunc(evs, func(e coreEvent) bool {
+			return e.kind != coreCommit && e.kind != coreFail && e.kind != coreJoin && e.kind != coreLeave
+		})
+
+		if next >= 0 {
+			m.apply(evs[next])
+
+			continue
+		}
+
+		if !retried && slices.ContainsFunc(m.sess, func(s *coreSess) bool { return m.live(s) && !s.ok }) {
+			// A failure no routing went past waits for the next commit,
+			// which wakes it whatever it names.
+			retried = true
+
+			m.path = append(m.path, coreEvent{kind: coreCommit})
+			m.commit(coreEdit{})
+			m.judge()
+
+			continue
+		}
+
+		for i, s := range m.sess {
+			if !m.live(s) || !m.alive(s.n, m.committed) {
+				continue
+			}
+
+			if !s.ok || s.first || m.views[s.held][s.n] != m.views[m.committed][s.n] {
+				m.fatalf("settled: s%d (n%d) holds r%d (ok %t), latest r%d", i, s.n+1, s.held, s.ok, m.committed)
+			}
+		}
+
+		return
+	}
+
+	m.fatalf("the core machine did not settle")
+}
+
+// key names the machine's state, the hub's own included, so a walk visits
+// each once.
+func (m *coreMachine) key() string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "c%d r%d t%d l%t j%d f%d d%d v%d|", m.committed, m.routed, m.target, m.loaded, m.joins, m.failures, m.dels, m.leaves)
+
+	for i := range m.committed + 1 {
+		fmt.Fprintf(&b, "%v%t,", m.views[i][:m.scope.nodes], m.global[i])
+	}
+
+	fmt.Fprintf(&b, "%v|", m.deletedAt)
+
+	for _, s := range m.sess {
+		fmt.Fprintf(&b, "%d %t %d %d %d %d %t %t %t %d %v;", s.n, s.first, s.phase, s.took, s.held, s.tried, s.ok, s.ended, s.gone, len(s.sess.wakes), s.pending)
+	}
+
+	m.h.mu.Lock()
+	defer m.h.mu.Unlock()
+
+	fmt.Fprintf(&b, "|L%d|", m.h.latest.Rev())
+
+	for n := range m.scope.nodes {
+		v, ok := m.h.core.sentPeers[m.id(n)]
+		_, off := m.h.core.offlineAt[m.id(n)]
+		fmt.Fprintf(&b, "%t %v %d %v %t %t;", ok, v.ids, v.rev, v.attempts, v.folded, off)
+	}
+
+	for i := range m.h.renders.shards {
+		sh := &m.h.renders.shards[i]
+		if sh.routed == nil && len(sh.done) == 0 && len(sh.failed) == 0 {
+			continue
+		}
+
+		done := make([]string, 0, len(sh.done))
+		for _, d := range sh.done {
+			done = append(done, fmt.Sprintf("%d@%d", d.id, d.snap.Rev()))
+		}
+
+		slices.Sort(done)
+
+		failed := slices.Sorted(slices.Values(sh.failed))
+
+		var routed uint64
+		if sh.routed != nil {
+			routed = sh.routed.Rev()
+		}
+
+		fmt.Fprintf(&b, "%d:%d %v %v;", i, routed, done, failed)
+	}
+
+	return b.String()
+}
+
+// exploreCore walks every schedule of every scenario scope allows, each
+// state once, and returns how many states it met and how many had nothing
+// left to do. A state is reached again by replaying its path on a new hub.
+func exploreCore(t *testing.T, snaps []*state.Snapshot, scope coreScope) (int, int) {
+	t.Helper()
+
+	replay := func(path []coreEvent) *coreMachine {
+		m := newCoreMachine(t, snaps, scope)
+		for _, e := range path {
+			m.apply(e)
+		}
+
+		return m
+	}
+
+	seen := map[string]bool{replay(nil).key(): true}
+	stack := [][]coreEvent{nil}
+	leaves := 0
+
+	for len(stack) > 0 {
+		path := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		evs := replay(path).enabled()
+		if len(evs) == 0 {
+			leaves++
+
+			replay(path).settle()
+
+			continue
+		}
+
+		for _, e := range evs {
+			next := append(slices.Clip(path), e)
+
+			k := replay(next).key()
+			if !seen[k] {
+				seen[k] = true
+
+				stack = append(stack, next)
+			}
+		}
+	}
+
+	return len(seen), leaves
 }
