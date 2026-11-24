@@ -159,7 +159,9 @@ func (m *Map[K, V]) Cursor() *Map[K, V] {
 
 // Changes returns the keys whose entry differs between old and m, each
 // once. It reads the edit log when it can and compares every key when it
-// cannot, so it is always correct; old may be nil.
+// cannot, so it is always correct; old may be nil. old must hold
+// entries: a [Cursor] is a token for [Map.ChangedSince] only, and what
+// [Changes] answers from one is nothing the package promises.
 func Changes[K comparable, V any](old, m *Map[K, V]) []K {
 	if m == old {
 		return nil
@@ -167,12 +169,6 @@ func Changes[K comparable, V any](old, m *Map[K, V]) []K {
 
 	// Done already records unique, exact differences for its base Map.
 	// Cursors hold no entries and are only ChangedSince tokens.
-	// TODO(kradalby): graph/changes-cursor: when the log reaches the
-	// cursor's Map, this returns the logged keys the new Map holds, which
-	// is neither the difference from the Map the cursor stands for nor,
-	// as Cursor's doc reads, from an empty Map. No production caller
-	// passes a cursor here. Pinned by
-	// TestChangesFromACursorNamesLoggedKeys.
 	if m != nil && m.log != nil && old != nil && old.items != nil && m.log.from == old.id {
 		return slices.Clone(m.log.keys)
 	}

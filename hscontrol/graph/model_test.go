@@ -201,7 +201,6 @@ func (m graphModel) step(c commitPlan) commitOutcome {
 
 // The Map's counted exceptions.
 const (
-	excChangesCursor = "graph/changes-cursor"
 	excChangesNever  = "graph/changes-never"
 	excNilEditDone   = "graph/nil-edit-done"
 )

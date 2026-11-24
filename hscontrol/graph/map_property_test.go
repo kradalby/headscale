@@ -105,52 +105,47 @@ func keysOf(set [mapKeys]bool) []int {
 
 // compare holds Changes and ChangedSince between old and new to the model:
 // Changes is the exact difference, each key once, and its result the
-// caller's; ChangedSince answers exactly when new's log reaches old, with
-// every key that differs and only keys the edits between wrote, and counts
-// a miss otherwise.
+// caller's; from a cursor nothing is promised, it being a ChangedSince
+// token alone. ChangedSince answers exactly when new's log reaches old,
+// with every key that differs and only keys the edits between wrote, and
+// counts a miss otherwise.
 func (r *mapRun) compare(tl tally, old, next mapRef) string {
 	eq := r.eqFor(old, next)
 	reaches, through, written := r.lineage(old, next)
 
-	got := Changes(old.m, next.m)
-	want := diffKeys(old.contents, next.contents, eq)
+	// A cursor is a token for ChangedSince only, so what Changes would
+	// answer from one is nothing the package promises.
+	if !old.cursor {
+		got := Changes(old.m, next.m)
+		want := diffKeys(old.contents, next.contents, eq)
 
-	if sorted := slices.Sorted(slices.Values(got)); !slices.Equal(sorted, want) {
-		// TODO(kradalby): graph/changes-cursor: Changes from a Cursor whose
-		// Map the log reaches names the logged keys the new Map holds,
-		// which is neither the difference from the Map the cursor stands
-		// for nor, as Cursor's doc reads, from an empty Map. Counted here;
-		// delete with TestChangesFromACursorNamesLoggedKeys once the doc
-		// says which, or Changes takes one. No caller passes a cursor.
-		held := func(m map[int]int) func(int) bool {
-			return func(k int) bool { _, ok := m[k]; return ok }
+		if sorted := slices.Sorted(slices.Values(got)); !slices.Equal(sorted, want) {
+			held := func(m map[int]int) func(int) bool {
+				return func(k int) bool { _, ok := m[k]; return ok }
+			}
+
+			// TODO(kradalby): graph/changes-never: over a Map whose equality
+			// calls nothing equal (Never, and the zero and nil-born Maps, which
+			// have none), Changes names every key either side holds when it
+			// compares them all, but only the keys the edits between wrote when
+			// it reads the log, so its answer depends on how far the log
+			// reaches; its doc calls it exact. Counted here; delete with
+			// TestChangesUnderNeverDependsOnTheLog once the doc says which.
+			neverForm := slices.DeleteFunc(slices.Clone(through), func(k int) bool {
+				return !held(next.contents)(k) && !held(old.contents)(k)
+			})
+
+			if eq == eqNever && reaches && slices.Equal(sorted, neverForm) {
+				tl[excChangesNever]++
+			} else {
+				return fmt.Sprintf("Changes = %v, want %v", sorted, want)
+			}
 		}
-		cursorForm := slices.DeleteFunc(slices.Clone(through), func(k int) bool { return !held(next.contents)(k) })
 
-		// TODO(kradalby): graph/changes-never: over a Map whose equality
-		// calls nothing equal (Never, and the zero and nil-born Maps, which
-		// have none), Changes names every key either side holds when it
-		// compares them all, but only the keys the edits between wrote when
-		// it reads the log, so its answer depends on how far the log
-		// reaches; its doc calls it exact. Counted here; delete with
-		// TestChangesUnderNeverDependsOnTheLog once the doc says which.
-		neverForm := slices.DeleteFunc(slices.Clone(through), func(k int) bool {
-			return !held(next.contents)(k) && !held(old.contents)(k)
-		})
-
-		switch {
-		case old.cursor && reaches && slices.Equal(sorted, cursorForm):
-			tl[excChangesCursor]++
-		case eq == eqNever && reaches && slices.Equal(sorted, neverForm):
-			tl[excChangesNever]++
-		default:
-			return fmt.Sprintf("Changes = %v, want %v", sorted, want)
+		// The result is the caller's: scribbling on it must not reach a log.
+		for i := range got {
+			got[i] = -1
 		}
-	}
-
-	// The result is the caller's: scribbling on it must not reach a log.
-	for i := range got {
-		got[i] = -1
 	}
 
 	before := MapLogMisses()
@@ -531,10 +526,11 @@ func callsBeyond(r *mapRun, prev groupResult, in mapRef, called []int, same func
 	return ""
 }
 
-// TestChangesFromACursorNamesLoggedKeys pins graph/changes-cursor: from a
-// cursor its log reaches, Changes names the logged keys the new Map holds,
-// [3]. From the Map the cursor stands for the difference is [1 3]; from an
-// empty Map, which Cursor's doc says other reads see, it is [2 3].
+// TestChangesFromACursorNamesLoggedKeys records what [Changes] answers
+// from a [Cursor], a token [Map.ChangedSince] alone promises: with the
+// log reaching it, the logged keys the new Map holds — [3] here, where
+// the difference from the Map the cursor stands for is [1 3] and from an
+// empty Map, which Cursor's doc says other reads see, [2 3].
 func TestChangesFromACursorNamesLoggedKeys(t *testing.T) {
 	base := NewMap(Same[int], map[int]int{1: 1, 2: 2})
 	e := base.Edit()
@@ -543,7 +539,7 @@ func TestChangesFromACursorNamesLoggedKeys(t *testing.T) {
 	next := e.Done()
 
 	if got := slices.Sorted(slices.Values(Changes(base.Cursor(), next))); !slices.Equal(got, []int{3}) {
-		t.Fatalf("Changes from the cursor = %v: see graph/changes-cursor", got)
+		t.Fatalf("Changes from the cursor = %v", got)
 	}
 }
 
