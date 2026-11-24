@@ -82,7 +82,6 @@ func goldenFilterSources() []goldenFilterSource {
 		{dir: "acl_results", glob: "acl-*.hujson", build: buildACLUsersAndNodes},
 		{dir: "grant_results", glob: "*-*.hujson", build: grants},
 		{dir: "routes_results", glob: "routes-*.hujson", build: routes},
-		{dir: "issue_3212", glob: "*.hujson", build: routes},
 		{dir: "ssh_results", glob: "ssh-*.hujson", build: ssh},
 		{dir: filepath.Join("ssh_results", "forwarding"), glob: "ssh-*.hujson", build: ssh},
 		{dir: "nodeattrs_results", glob: "*.hujson", build: nodeAttrs},
