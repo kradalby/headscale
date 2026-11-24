@@ -1138,59 +1138,105 @@ func TestViewersGivenTheSameRoutesShareRoutedPeers(t *testing.T) {
 
 		assert.Equal(t, 1, len(peerMaps), "%d routers: the sessions of one class given the same routes share one peer map", routers) //nolint:testifylint // the count is the message
 
-		// The cost of a session is what it adds to the heap kept: more
-		// sessions of members, which share every router with the rest. The
-		// cleanups earlier tests leave run after a collection and free more,
-		// so the heap is read once a collection frees nothing more, and the
-		// median of three batches is taken.
-		heap := func() int64 {
-			var last int64
+		// More sessions of members, which share every router with the rest.
+		perSession[routers] = heapPerSession(t, extra, func(k int) *Stream {
+			st := NewStream(cfg, hub, all.At(routers+k).ID(), capVer)
+			_, err := st.Initial(snap)
+			require.NoError(t, err)
 
-			for i := range 20 {
-				runtime.GC()
+			return st
+		})
 
-				var ms runtime.MemStats
-				runtime.ReadMemStats(&ms)
-
-				h := int64(ms.HeapAlloc) //nolint:gosec // a heap fits
-				if i > 0 && h-last < 1024 && last-h < 1024 {
-					return h
-				}
-
-				last = h
-
-				runtime.Gosched()
-			}
-
-			return last
-		}
-
-		batches, added := make([]int64, 0, 3), make([]*Stream, 0, 3*extra)
-
-		for range 3 {
-			before := heap()
-
-			for k := range extra {
-				st := NewStream(cfg, hub, all.At(routers+k).ID(), capVer)
-				_, err := st.Initial(snap)
-				require.NoError(t, err)
-
-				added = append(added, st)
-			}
-
-			batches = append(batches, (heap()-before)/extra)
-		}
-
-		slices.Sort(batches)
-		perSession[routers] = batches[1]
-
-		runtime.KeepAlive(added)
 		runtime.KeepAlive(streams)
 	}
 
 	t.Logf("heap kept per session: %d B with 4 routers, %d B with 64", perSession[4], perSession[64])
 	assert.Less(t, perSession[64]-perSession[4], int64(2048),
 		"sixty more routers shared with every other session must not grow a session")
+}
+
+// heapPerSession returns what each of the n sessions add returns adds to the
+// heap kept. The cleanups earlier tests leave run after a collection and free
+// more, so the heap is read once a collection frees nothing more, and the
+// median of three batches is taken.
+func heapPerSession(t *testing.T, n int, add func(k int) *Stream) int64 {
+	t.Helper()
+
+	heap := func() int64 {
+		var last int64
+
+		for i := range 20 {
+			runtime.GC()
+
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+
+			h := int64(ms.HeapAlloc) //nolint:gosec // a heap fits
+			if i > 0 && h-last < 1024 && last-h < 1024 {
+				return h
+			}
+
+			last = h
+
+			runtime.Gosched()
+		}
+
+		return last
+	}
+
+	batches, added := make([]int64, 0, 3), make([]*Stream, 0, 3*n)
+
+	for range 3 {
+		before := heap()
+
+		for k := range n {
+			added = append(added, add(k))
+		}
+
+		batches = append(batches, (heap()-before)/int64(n))
+	}
+
+	runtime.KeepAlive(added)
+	slices.Sort(batches)
+
+	return batches[1]
+}
+
+// TestIdleSessionKeepsNoPeerList holds a session that has sent its first map
+// and waits to what its peers' map costs, which its class shares: the list
+// of peers the first map named is spent once the map is sent, so a session
+// costs the same however many peers it holds.
+func TestIdleSessionKeepsNoPeerList(t *testing.T) {
+	const extra = 40
+
+	perSession := map[int]int64{}
+
+	for _, nodes := range []int{60, 660} {
+		cfg, s := benchState(t, nodes, 4)
+		all := s.ListNodes()
+		snap := s.Snapshot()
+		hub := NewHub()
+
+		// The class's map, which every session shares, is built once.
+		first := NewStream(cfg, hub, all.At(0).ID(), capVer)
+		_, err := first.Initial(snap)
+		require.NoError(t, err)
+
+		perSession[nodes] = heapPerSession(t, extra, func(k int) *Stream {
+			st := NewStream(cfg, hub, all.At(1+k).ID(), capVer)
+			resps, err := st.Initial(snap)
+			require.NoError(t, err)
+			require.Len(t, resps[0].Peers, nodes-1, "test sanity: a session sees every other node")
+
+			return st
+		})
+
+		runtime.KeepAlive(first)
+	}
+
+	t.Logf("heap kept per idle session: %d B with 59 peers, %d B with 659", perSession[60], perSession[660])
+	assert.Less(t, perSession[660]-perSession[60], int64(600),
+		"six hundred more peers, shared with every other session, must not grow an idle session")
 }
 
 // BenchmarkRoutedRender measures one endpoint update with unrelated routers,

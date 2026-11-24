@@ -113,7 +113,8 @@ func (st *Stream) Initial(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) 
 	}
 
 	st.sent = nm
-	nm.base = nil
+	// As in Update; a first map's changes name every peer it holds.
+	nm.base, nm.changed, nm.removed = nil, nil, nil
 
 	st.rendered(snap, nil)
 	st.record(snap)
@@ -145,9 +146,10 @@ func (st *Stream) Update(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) {
 	peersMoved := peerSetChanged(nm)
 	st.sent = nm
 
-	// base was only for this diff; keeping it would chain every render
-	// this stream ever made.
-	nm.base = nil
+	// base and the peers moved from it were only for this diff: keeping
+	// base would chain every render this stream ever made, and no render
+	// reads either of the map it follows.
+	nm.base, nm.changed, nm.removed = nil, nil, nil
 
 	st.rendered(snap, nil)
 	st.record(snap)
