@@ -21,7 +21,7 @@ correct.
 1. One capture file per scenario in the existing format (`hscontrol/types/testcapture`,
    HuJSON, schema version 1), named by the scenario id, in the category directory given.
    Existing examples: `hscontrol/policy/v2/testdata/routes_results/`,
-   `…/grant_results/`, `…/issue_3212/`.
+   `…/grant_results/`.
 2. Under each scenario below, an **Answer:** line: the answer to its question (quote the
    netmap field that shows it), anything unexpected, or "could not be set up" with the
    reason where that is the answer.
@@ -211,7 +211,7 @@ Each entry: headscale today / the other reading / what in the capture decides.
 
 ### S14 `routes-exit-node-public-destination` (routes, two captures a/b) — `Node.CanAccessRoutes`
 
-Capture `issue_3212/routes-b18` settled that an exit node is given the subnet routes behind
+Capture `routes_results/routes-b18` settled that an exit node is given the subnet routes behind
 the sources of a rule to `autogroup:internet`. Two neighbouring cases are not decided by
 it; headscale reads both wide.
 
