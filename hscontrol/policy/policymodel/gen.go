@@ -43,8 +43,6 @@ func Worlds() *rapid.Generator[World] { return worlds }
 // edit is a write headscale accepts where it lands.
 func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 	return rapid.Custom(func(t *rapid.T) Scenario {
-		s := Scenario{Start: worlds.Draw(t, "start")}
-
 		// Scripts begin some scenarios with sequences no run of single
 		// draws reaches: an anchor's key moving, where the start holds
 		// one; a node's form flipping, its address moving and its form
@@ -62,6 +60,9 @@ func Scenarios(maxSteps int) *rapid.Generator[Scenario] {
 		way := index(t, numApproverWays, "approver-way")
 		// Drawn after the other scripts' draws, so it moves none of them.
 		twice := chance(t, doubleGrants, "double-grant")
+
+		// After the scripts' chances, as in [worlds].
+		s := Scenario{Start: worlds.Draw(t, "start")}
 
 		var scripted []Step
 
@@ -346,8 +347,6 @@ var (
 		return canonTopology(drawTopology(t))
 	})
 	worlds = rapid.Custom(func(t *rapid.T) World {
-		w := World{Policy: policies.Draw(t, "policy"), Topology: topologies.Draw(t, "topology")}
-
 		// Shapes a policy and a topology make only together, each in one
 		// world in eight to sixteen: an own rule that reaches nothing on
 		// its receiver yet places a merged rule; an app grant to public space
@@ -368,6 +367,11 @@ var (
 		viaNet := chance(t, viaInternetWorlds, "via-internet")
 		viaNetShape := viaInternets.Draw(t, "via-internet-shape")
 		stacked := chance(t, stackedRouters, "stacked-router")
+
+		// The policy and topology come after the chances: shrinking a list
+		// moves every later draw, which could switch on a script that fails
+		// a property alone, and the shrinker cannot take that out again.
+		w := World{Policy: policies.Draw(t, "policy"), Topology: topologies.Draw(t, "topology")}
 
 		if via {
 			viaRouters(&w, who, down, cover)

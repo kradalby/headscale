@@ -168,6 +168,9 @@ not: fix that clause's restatement, never the judge.
   `TestShrinksToSmallCases` holds that.
 - Every draw moves every later one. After a change, rerun `TestCoverage` and
   the properties on a few hundred fresh seeds.
+- Draw a script's chance before the lists a shrink can shorten: a shift
+  there can switch on a script that fails a property alone, which the
+  shrinker then cannot take out.
 - A coverage floor must sit far below what any seed draws, or apply to deep
   runs only. A floor that one seed in a thousand misses is a red CI build.
 - A new shape is finished when a seeded bug that needs it makes a property
