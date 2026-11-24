@@ -199,11 +199,6 @@ func (m graphModel) step(c commitPlan) commitOutcome {
 	return out
 }
 
-// The Map's counted exceptions.
-const (
-	excNilEditDone   = "graph/nil-edit-done"
-)
-
 // mapIdent is one Map as the model knows it: the Maps a net-zero edit
 // returns are the one it started from, and every zero Map is one.
 type mapIdent struct {
@@ -368,7 +363,7 @@ func (r *mapRun) edit(at int, ops []mapOp, filler bool) int {
 	changed := slices.DeleteFunc(diffKeys(b.contents, staged, r.eqOf(base.ident)), func(k int) bool { return !written[k] })
 
 	switch {
-	case len(changed) == 0 && base.ident != nilIdent:
+	case len(changed) == 0:
 		if got != base.m {
 			r.failf("an edit changing nothing returned a new Map")
 		}
@@ -377,13 +372,7 @@ func (r *mapRun) edit(at int, ops []mapOp, filler bool) int {
 
 		return len(r.versions) - 1
 	case got == nil:
-		if base.ident != nilIdent || len(changed) > 0 {
-			r.failf("Done returned nil")
-		}
-
-		r.add(nil, nilIdent, at, filler)
-
-		return len(r.versions) - 1
+		r.failf("Done returned nil")
 	case got == base.m:
 		r.failf("an edit changing %v returned the Map it started from", changed)
 	}
@@ -391,16 +380,6 @@ func (r *mapRun) edit(at int, ops []mapOp, filler bool) int {
 	id := mapIdent{m: got, contents: staged, parent: base.ident, changed: changed, written: sortedKeys(written), hasEq: b.hasEq}
 
 	if base.ident == nilIdent {
-		// TODO(kradalby): graph/nil-edit-done: an edit of a nil Map that
-		// changes nothing returns a new empty Map, where Done's doc says it
-		// returns the Map it started from. The model takes the new Map, as
-		// an edit changing something from nil returns: a lineage with no
-		// log and no equality. Delete with TestEditOfANilMapReturnsAMap
-		// once the doc says so, or Done returns nil.
-		if len(changed) == 0 {
-			r.excepts[excNilEditDone]++
-		}
-
 		id.parent, id.hasEq = -1, false
 	} else {
 		id.logLen = b.logLen + 1

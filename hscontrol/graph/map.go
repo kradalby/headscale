@@ -287,8 +287,8 @@ func (e *MapEdit[K, V]) touch(k K) {
 	}
 }
 
-// Done returns the edited Map, or the Map the edit started from when no
-// entry ends up different from it.
+// Done returns the edited Map, or the Map the edit started from — nil
+// included — when no entry ends up different from it.
 func (e *MapEdit[K, V]) Done() *Map[K, V] {
 	eq := e.base.eqOr(nil)
 
@@ -303,11 +303,7 @@ func (e *MapEdit[K, V]) Done() *Map[K, V] {
 		}
 	}
 
-	// TODO(kradalby): graph/nil-edit-done: the unchanged check spares
-	// only a non-nil base, so an edit of a nil Map that changes nothing
-	// returns a new empty Map, not the nil it started from, as Done's
-	// doc says. Pinned by TestEditOfANilMapReturnsAMap.
-	if len(changed) == 0 && e.base != nil {
+	if len(changed) == 0 {
 		return e.base
 	}
 

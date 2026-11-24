@@ -538,19 +538,15 @@ func TestChangesFromACursorNamesLoggedKeys(t *testing.T) {
 	}
 }
 
-// TestEditOfANilMapReturnsAMap pins graph/nil-edit-done: an edit of a nil
-// Map that changes nothing returns a new empty Map, not the nil it started
-// from.
-func TestEditOfANilMapReturnsAMap(t *testing.T) {
+// TestEditOfANilMapReturnsNil pins Done's rule for a nil base: an edit
+// that changes nothing returns the Map it started from, nil included, so
+// a no-op edit keeps pointer identity where it began.
+func TestEditOfANilMapReturnsNil(t *testing.T) {
 	var m *Map[int, int]
 
 	got := m.Edit().Done()
-	if got == nil {
-		t.Fatal("Done returned nil: see graph/nil-edit-done")
-	}
-
-	if got.Len() != 0 {
-		t.Fatalf("Done returned %d entries", got.Len())
+	if got != nil {
+		t.Fatal("Done returned a new Map, want the nil it started from")
 	}
 }
 

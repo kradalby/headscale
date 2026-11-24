@@ -1366,8 +1366,7 @@ func TestMapHistoryCoverage(t *testing.T) {
 		"op set": 0.2, "op delete": 0.1, "op same": 0.1, "op readd": 0.1, "op restore": 0.1,
 		"branch": 0.1, "net-zero edit": 0.1, "long lineage": 0.05, "log trimmed": 0.02,
 		"root new": 0.02, "root copy": 0.02, "root zero": 0.02, "root nil": 0.02,
-		"edit of the zero Map": 0.01, "edit of nil": 0.01, excNilEditDone: 0.002,
-		"ancestor pair": 0.06, "descendant pair": 0.05, "sibling pair": 0.02, "unrelated pair": 0.02,
+		"edit of the zero Map": 0.01, "edit of nil": 0.01, "ancestor pair": 0.06, "descendant pair": 0.05, "sibling pair": 0.02, "unrelated pair": 0.02,
 		"ancestor in turn": 0.2, "sibling in turn": 0.1, "unrelated in turn": 0.05,
 		"cursor pair": 0.05, "nil pair": 0.05,
 	})
