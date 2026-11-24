@@ -91,6 +91,7 @@ const (
 	stepIdentity
 	stepRace
 	stepClock
+	stepRecords
 	numSteps
 )
 
@@ -101,7 +102,7 @@ var fdJudges = []string{"stored", "client", "reference", "restart"}
 
 var stepNames = [numSteps]string{
 	"world", "burst", "flap", "poll restart", "client restart", "endpoints", "rename", "logout", "relogin", "server restart",
-	"ownership", "identity", "race", "clock",
+	"ownership", "identity", "race", "clock", "records",
 }
 
 // fdNode is a model node's client and how it joined, which a login, a
@@ -167,6 +168,13 @@ type frontDoor struct {
 	w         policymodel.World
 	nodes     map[types.NodeID]*fdNode
 	elections *policymodel.Elections
+	// derp is whether the policy the server holds names a DERP region the
+	// model's document does not ([recordsStep] added it); the next policy
+	// write, which PUTs the model's document, drops it again.
+	derp bool
+	// records is what the records step published last; a restart serves
+	// the configured ones alone, which is none here.
+	records []tailcfg.DNSRecord
 	// unheld are the subnet routes a burst left with no router available:
 	// who held them last is history the election history missed, so the
 	// routes go unjudged until a router can take them again.
@@ -315,7 +323,7 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 	for i := range steps {
 		at := fmt.Sprintf("step %d", i+1)
 
-		kind := rapid.IntRange(0, 28).Draw(rt, "kind")
+		kind := rapid.IntRange(0, 29).Draw(rt, "kind")
 
 		switch {
 		case kind < 6:
@@ -346,6 +354,8 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 			fd.race(at)
 		case kind == 28:
 			fd.clockStep(at)
+		case kind == 29:
+			fd.recordsStep(at)
 		}
 
 		fd.settle(at)
@@ -724,6 +734,7 @@ func (fd *frontDoor) updateUser(at string, id uint, set func(*types.User)) {
 func (fd *frontDoor) setPolicy(p policymodel.Policy) {
 	fd.mustAPI("the policy", http.MethodPut, "/api/v1/policy", map[string]any{"policy": string(p.HuJSON())}, nil)
 	fd.w.Policy = p
+	fd.derp = false
 }
 
 // tagNames are the policy tags of indices.
@@ -1406,6 +1417,106 @@ func (fd *frontDoor) clockStep(at string) {
 
 	if !nd.tc.Polling() {
 		fd.t.Fatalf("%s: n%d does not poll again after its reconnect", at, n.ID)
+	}
+}
+
+// fdRecords are the extra DNS records the records manager republishes
+// through [state.State.SetExtraRecords]: names no node can hold, both
+// families.
+var fdRecords = []tailcfg.DNSRecord{
+	{Name: "alpha.service.example", Type: "A", Value: "192.0.2.10"},
+	{Name: "beta.service.example", Type: "A", Value: "192.0.2.11"},
+	{Name: "gamma.service.example", Type: "AAAA", Value: "2001:db8::10"},
+}
+
+// fdDERPRegion is the region a policy's derpMap key adds: 900 is the
+// configured map's own, so the two never collide.
+const fdDERPRegion = 901
+
+// fdDERPDoc is the derpMap key the records step writes beside the
+// model's policy: one region, one node, ids matching, as the rules the
+// loader applies demand.
+const fdDERPDoc = `"derpMap": {"Regions": {"901": {"RegionID": 901, "RegionCode": "frontdoor", "RegionName": "Front Door", "Nodes": [
+	{"Name": "901a", "RegionID": 901, "HostName": "127.0.0.1", "DERPPort": -1}]}}}`
+
+// recordsStep changes what the running server serves behind its streams'
+// maps — never a node itself: the extra DNS records the records manager
+// republishes through [state.State.SetExtraRecords], and the DERP region
+// a policy's derpMap key adds to the served document, which the next
+// policy write — here or in any other step — drops again. The model
+// holds neither; what must hold is that every client converges on what a
+// fresh session is given, and that the region reaches every client's
+// DERP map while the document names it ([judgeClients] checks that).
+func (fd *frontDoor) recordsStep(at string) {
+	fd.run.tally.steps[stepNames[stepRecords]]++
+
+	kind := rapid.IntRange(0, 2).Draw(fd.t, "records")
+
+	if kind < 2 {
+		// Extra records: a drawn subset, empty included — a republish
+		// that drops what was there does.
+		var records []tailcfg.DNSRecord
+
+		if kind == 0 {
+			for _, r := range fdRecords {
+				if rapid.Bool().Draw(fd.t, "record") {
+					records = append(records, r)
+				}
+			}
+		}
+
+		fd.srv.State().SetExtraRecords(records)
+		fd.records = slices.Clone(records)
+
+		if len(records) > 0 {
+			fd.run.tally.steps[stepNames[stepRecords]+": extra records published"]++
+		} else {
+			fd.run.tally.steps[stepNames[stepRecords]+": extra records cleared"]++
+		}
+
+		return
+	}
+
+	if !fd.derp {
+		body := strings.TrimSpace(string(fd.w.Policy.HuJSON()))
+
+		switch body {
+		case "{}":
+			body = "{" + fdDERPDoc + "}"
+		default:
+			body = strings.TrimSuffix(body, "}") + ",\n" + fdDERPDoc + "}"
+		}
+
+		// The document carries the model's tokens, so the write is
+		// refused while they name several users, as the identity step's
+		// rewrite is; the served document is unchanged then.
+		amb := len(policymodel.NewView(fd.w).AmbiguousRefs()) > 0
+
+		switch err := fd.api(http.MethodPut, "/api/v1/policy", map[string]any{"policy": body}, nil); {
+		case err == nil:
+			fd.derp = true
+			fd.run.tally.steps[stepNames[stepRecords]+": the policy's DERP region added"]++
+		case amb:
+			fd.run.tally.steps[stepNames[stepRecords]+": the policy's DERP region (refused: a token names several users)"]++
+		default:
+			fd.t.Fatalf("%s: the policy's DERP region is not written: %v", at, err)
+		}
+
+		return
+	}
+
+	// The region leaves through the write every policy step makes: the
+	// model's document, without the derpMap key.
+	amb := len(policymodel.NewView(fd.w).AmbiguousRefs()) > 0
+
+	switch err := fd.api(http.MethodPut, "/api/v1/policy", map[string]any{"policy": string(fd.w.Policy.HuJSON())}, nil); {
+	case err == nil:
+		fd.derp = false
+		fd.run.tally.steps[stepNames[stepRecords]+": the policy's DERP region dropped"]++
+	case amb:
+		fd.run.tally.steps[stepNames[stepRecords]+": the policy's DERP region kept (refused: a token names several users)"]++
+	default:
+		fd.t.Fatalf("%s: the model's policy is not written back: %v", at, err)
 	}
 }
 
@@ -2398,6 +2509,10 @@ func (fd *frontDoor) identityRewrite(at string) string {
 		return " (refused: a token names several users)"
 	}
 
+	// The write put the model's document: a DERP region the records step
+	// added to the served one is gone with it.
+	fd.derp = false
+
 	return ""
 }
 
@@ -2579,6 +2694,10 @@ func (fd *frontDoor) outcome(at string, id types.NodeID, outcomes map[string]pol
 func (fd *frontDoor) restart(at string) {
 	fd.run.tally.steps[stepNames[stepServerRestart]]++
 	fd.run.tally.restarts++
+
+	// A restart serves the configured extra records alone, which is none
+	// here; the published ones were the running server's own state.
+	fd.records = nil
 
 	held := map[types.NodeID]string{}
 

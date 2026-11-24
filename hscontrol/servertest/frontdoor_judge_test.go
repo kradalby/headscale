@@ -263,6 +263,25 @@ func (fd *frontDoor) judgeClients(at string) {
 			if d := policymodel.WireKeys(nm, fd.registrationKeys); d != "" {
 				fd.t.Fatalf("%s: n%d's client holds an entry whose keys differ from its registration: %s", at, n.ID, d)
 			}
+
+			// The DERP region the records step wrote beside the model's
+			// policy reaches every client's map while the served document
+			// names it, and leaves it when a write drops it.
+			if nm.DERPMap == nil {
+				fd.t.Fatalf("%s: n%d holds no DERP map", at, n.ID)
+			}
+
+			if _, ok := nm.DERPMap.Regions[fdDERPRegion]; ok != fd.derp {
+				fd.t.Fatalf("%s: n%d's map %s the policy's DERP region %d", at, n.ID, map[bool]string{true: "holds", false: "does not hold"}[ok], fdDERPRegion)
+			}
+
+			// The extra records the records step published are part of
+			// every client's DNS config; a fresh session and a held one
+			// could lose them together, so they are checked against what
+			// the server was given, not against a fresh session.
+			if got, want := recordKeys(nm.DNS.ExtraRecords), recordKeys(fd.records); !slices.Equal(got, want) {
+				fd.t.Fatalf("%s: n%d's DNS config holds %v, the server was given %v", at, n.ID, got, want)
+			}
 		}
 
 		if ref == nil {
@@ -320,9 +339,32 @@ func durable(nm *netmap.NetworkMap) string {
 	}
 
 	fmt.Fprintf(&sb, "\n filter %v;\n ssh %s;\n dns %s;\n profiles %s;\n caps %s",
-		policymodel.CountsDiff(policymodel.RuleCounts(nm.PacketFilterRules.AsSlice()), nil), policymodel.JSON(nm.SSHPolicy), policymodel.JSON(nm.DNS), policymodel.JSON(nm.UserProfiles), policymodel.JSON(nm.AllCaps))
+		policymodel.CountsDiff(policymodel.RuleCounts(nm.PacketFilterRules.AsSlice()), nil), policymodel.JSON(nm.SSHPolicy), policymodel.JSON(dnsWithoutRuntime(nm.DNS)), policymodel.JSON(nm.UserProfiles), policymodel.JSON(nm.AllCaps))
 
 	return sb.String()
+}
+
+// dnsWithoutRuntime is the DNS config a restart must keep: extra records
+// are the running server's own state ([state.State.SetExtraRecords]; a
+// restart serves the configured ones alone), so they are not durable.
+func dnsWithoutRuntime(d tailcfg.DNSConfig) tailcfg.DNSConfig {
+	d.ExtraRecords = nil
+
+	return d
+}
+
+// recordKeys is the records as a sorted list of name-type-value strings,
+// so two sets compare whatever order the server normalised them into.
+func recordKeys(rs []tailcfg.DNSRecord) []string {
+	out := make([]string, 0, len(rs))
+
+	for _, r := range rs {
+		out = append(out, r.Name+"|"+r.Type+"|"+r.Value)
+	}
+
+	slices.Sort(out)
+
+	return out
 }
 
 // requireStored holds what the server stored to the model
