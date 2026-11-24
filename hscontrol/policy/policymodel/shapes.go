@@ -108,17 +108,6 @@ func (v *View) anyNode(f func(Node) bool) bool { return slices.ContainsFunc(v.no
 
 func (v *View) exitPresent() bool { return v.anyNode(Node.Exit) }
 
-func (v *View) sharedAddr() bool {
-	return v.anyNode(func(n Node) bool {
-		return slices.ContainsFunc(n.Addrs(), func(a netip.Addr) bool { return v.heldByOther(n, a) })
-	})
-}
-
-// heldByOther reports whether a node other than n holds a.
-func (v *View) heldByOther(n Node, a netip.Addr) bool {
-	return a.IsValid() && v.anyNode(func(m Node) bool { return m.ID != n.ID && slices.Contains(m.Addrs(), a) })
-}
-
 // protos is the protocols of the filter rules r compiles to: an ACL's
 // one, a grant's one per ip entry.
 func protos(r Rule, grant bool) []int {

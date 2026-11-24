@@ -31,7 +31,7 @@ type Level interface {
 }
 
 // Moment is the moment l is at, as the reference reads it; a level adds
-// what only it knows (shared addresses, routes it left unheld).
+// what only it knows (routes it left unheld).
 func Moment(l Level) policymodel.Moment {
 	return policymodel.Moment{World: l.Model(), Elections: l.Elections()}
 }

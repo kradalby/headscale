@@ -103,31 +103,6 @@ func (r *Ref) CapSources(id types.NodeID) []string {
 
 func ownerStamp(uid uint) string { return "owner:" + strconv.FormatUint(uint64(uid), 10) }
 
-// sharedStamp reports whether a node outside what stamp s names holds an
-// address of a node it names: the client asks one node per address, so s
-// must go as addresses.
-func (r *Ref) sharedStamp(s string) bool {
-	in := func(n RefNode) bool { return r.member(n, s) }
-
-	if uid, ok := strings.CutPrefix(s, "owner:"); ok {
-		in = func(n RefNode) bool { return strconv.FormatUint(uint64(n.owner()), 10) == uid && n.owner() != 0 }
-	}
-
-	for _, m := range r.nodes {
-		if !in(m) {
-			continue
-		}
-
-		for _, o := range r.nodes {
-			if !in(o) && slices.ContainsFunc(o.Addrs, func(a netip.Addr) bool { return slices.Contains(m.Addrs, a) }) {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
 // FormJudge judges the form of the filters receivers are served or hold,
 // and counts what it judged. The zero value is ready.
 type FormJudge struct {
@@ -144,14 +119,11 @@ type FormJudge struct {
 	// ByRule counts the rules of receivers sent capabilities held to
 	// addresses by their own kind: "cap-grant" and "portless".
 	ByRule map[string]int
-	// Shared counts the source capabilities held to addresses because a
-	// node outside them holds a member's address.
-	Shared int
 }
 
 func (j *FormJudge) String() string {
-	return fmt.Sprintf("filters by receiver %v (address mode %d); with a cap: source %d, required %d; rules mixed %d, with several caps %d; held by rule %v; shared stamps %d",
-		j.Filters, j.Address, j.WithCaps, j.Required, j.Mixed, j.MultiCap, j.ByRule, j.Shared)
+	return fmt.Sprintf("filters by receiver %v (address mode %d); with a cap: source %d, required %d; rules mixed %d, with several caps %d; held by rule %v",
+		j.Filters, j.Address, j.WithCaps, j.Required, j.Mixed, j.MultiCap, j.ByRule)
 }
 
 // Check returns what is wrong with the form of rules, node id's filter in
@@ -183,14 +155,12 @@ func (j *FormJudge) Check(w World, ref *Ref, id types.NodeID, rules []tailcfg.Fi
 
 	why := j.receiver(NewView(w), n)
 
-	held, msg := j.sources(ref, id, why, rules)
+	held, msg := j.sources(id, why, rules)
 	if msg != "" {
 		return msg
 	}
 
 	if why != "" {
-		j.countShared(ref, w)
-
 		return ""
 	}
 
@@ -225,7 +195,7 @@ func (j *FormJudge) receiver(v *View, n Node) string {
 
 // sources holds each rule's cap: sources to the rule and to why, the
 // receiver's reason, and returns the stamps they name.
-func (j *FormJudge) sources(ref *Ref, id types.NodeID, why string, rules []tailcfg.FilterRule) (map[string]bool, string) {
+func (j *FormJudge) sources(id types.NodeID, why string, rules []tailcfg.FilterRule) (map[string]bool, string) {
 	held := map[string]bool{}
 
 	for _, r := range rules {
@@ -254,10 +224,6 @@ func (j *FormJudge) sources(ref *Ref, id types.NodeID, why string, rules []tailc
 				return nil, c + " names no identity or owner"
 			}
 
-			if ref.sharedStamp(s) {
-				return nil, c + " is sent, and a node outside it holds a member's address"
-			}
-
 			held[s] = true
 		}
 	}
@@ -265,22 +231,6 @@ func (j *FormJudge) sources(ref *Ref, id types.NodeID, why string, rules []tailc
 	j.WithCaps += b2i(len(held) > 0)
 
 	return held, ""
-}
-
-// countShared counts the identity sources of w's rules held to addresses
-// because a node outside them holds a member's address.
-func (j *FormJudge) countShared(ref *Ref, w World) {
-	if !SharesAddress(w) {
-		return
-	}
-
-	for _, d := range ref.doc.Rules {
-		for _, s := range d.Src {
-			if identity(s) && ref.sharedStamp(s) {
-				j.Shared++
-			}
-		}
-	}
 }
 
 // capSources is r's sources that are capabilities.

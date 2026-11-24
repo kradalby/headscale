@@ -24,9 +24,6 @@ func NamesNode(q netip.Prefix) bool { return q.IsSingleIP() && nodeRanges.Contai
 // Node is the node with id as the reference reads it.
 func (r *Ref) Node(id types.NodeID) (RefNode, bool) { return r.node(id) }
 
-// SharesAddress reports whether two of w's nodes hold one address.
-func SharesAddress(w World) bool { return NewView(w).sharedAddr() }
-
 // routersOf are the nodes serving subnet route q, in ID order.
 func (r *Ref) routersOf(q netip.Prefix) []RefNode {
 	var out []RefNode

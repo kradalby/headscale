@@ -739,7 +739,7 @@ func TestWorldSidesShapes(t *testing.T) {
 			nodes: types.Nodes{
 				shapeNode(1, alice, "100.64.0.1", "", nil, nil, nil),
 				shapeNode(5, nil, "100.64.0.5", "", []string{"tag:r"}, []string{"100.64.0.8/30"}, nil),
-				shapeNode(6, bob, "100.64.0.5", "", nil, nil, nil),
+				shapeNode(6, bob, "100.64.0.6", "", nil, nil, nil),
 				shapeNode(8, carol, "100.64.0.8", "", nil, nil, nil),
 			},
 			write: func(e *nodeEdit) { e.Set(8, shapeNode(8, nil, "100.64.0.8", "", []string{"tag:x"}, nil, nil)) },

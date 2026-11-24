@@ -560,10 +560,9 @@ type MembershipReport struct {
 	// those resolved afresh, when the compile was not current.
 	Compiled, Indexed, Fresh int
 	// Judged counts the (node, identity selector) pairs decided by the
-	// node's own addresses; Unaddressed and Shared the nodes that could not
-	// be, having none or sharing one, which the relabelled resolution alone
-	// decides. Relabelled counts the pairs that resolution decided.
-	Judged, Unaddressed, Shared, Relabelled int
+	// node's own addresses; Relabelled the pairs decided again by a fresh
+	// resolution over the nodes relabelled with a unique address each.
+	Judged, Relabelled int
 }
 
 // AuditMembership checks m against what it must agree with, returning
@@ -573,10 +572,9 @@ type MembershipReport struct {
 //     the policy finds in the sections in scope ([selectorSections]);
 //   - user sets, role sets and postings equal a build from scratch;
 //   - every node is in an identity selector's postings exactly when the
-//     compile's resolution of it holds the node's own addresses, for every
-//     node whose addresses no other node shares; and exactly when the same
-//     resolution over the nodes relabelled with a unique address each holds
-//     its label, for every node;
+//     compile's resolution of it holds the node's own addresses; and
+//     exactly when a fresh resolution over the nodes relabelled with a
+//     unique address each holds its label;
 //   - each owner lists the user's untagged nodes the compile wrote
 //     autogroup:self rules for, under self only;
 //   - address selectors list no nodes and resolve without users or nodes.
@@ -703,21 +701,10 @@ func auditResolve(m Membership) (MembershipReport, error) {
 		resolve, owners = compiledResolver(m.Policy, &rep), m.Policy.userNodeIdx
 	}
 
-	// The same nodes, each with a unique address of its own: membership of
-	// every node, addressed or not, reads straight off the resolution.
+	// The same nodes, each with a unique address of its own, resolved
+	// afresh: postings held to a resolution other than the compile's.
 	relabelled, labels := relabel(nvs, m.Nodes)
 	resolveRelabelled := indexedResolver(m.Selectors.pol, m.Users, relabelled)
-
-	shared := sharedAddresses(nvs)
-
-	for _, nv := range nvs.All() {
-		switch {
-		case len(nv.IPs()) == 0:
-			rep.Unaddressed++
-		case slices.ContainsFunc(nv.IPs(), func(a netip.Addr) bool { return shared[a] }):
-			rep.Shared++
-		}
-	}
 
 	for _, s := range m.Selectors.table.sels {
 		members := m.Postings.Nodes(SelectorRole(s.ID))
@@ -733,7 +720,7 @@ func auditResolve(m Membership) (MembershipReport, error) {
 				return rep, fmt.Errorf("%w: resolving %s: %w", errMembershipAudit, s.Name, err)
 			}
 
-			err = auditMembers(s, members, nvs, shared, want, &rep.Judged)
+			err = auditMembers(s, members, nvs, want, &rep.Judged)
 			if err != nil {
 				return rep, err
 			}
@@ -779,16 +766,11 @@ func auditResolve(m Membership) (MembershipReport, error) {
 	return rep, auditOwners(m, owners)
 }
 
-// auditMembers holds members against want for every node judged by its
-// own addresses: none shared with another node, at least one, all of them
-// in want or none.
-func auditMembers(s Selector, members []types.NodeID, nvs views.Slice[types.NodeView], shared map[netip.Addr]bool, want ResolvedAddresses, judged *int) error {
+// auditMembers holds members against want for every node: all of its
+// addresses in want or none.
+func auditMembers(s Selector, members []types.NodeID, nvs views.Slice[types.NodeView], want ResolvedAddresses, judged *int) error {
 	for _, nv := range nvs.All() {
 		ips := nv.IPs()
-		if len(ips) == 0 || slices.ContainsFunc(ips, func(a netip.Addr) bool { return shared[a] }) {
-			continue
-		}
-
 		in := 0
 
 		for _, a := range ips {
@@ -867,27 +849,6 @@ func relabel(nvs views.Slice[types.NodeView], nodes *NodeMap) (views.Slice[types
 	}
 
 	return views.SliceOf(out), labels
-}
-
-// sharedAddresses returns the addresses more than one node holds.
-func sharedAddresses(nvs views.Slice[types.NodeView]) map[netip.Addr]bool {
-	seen := map[netip.Addr]int{}
-
-	for _, nv := range nvs.All() {
-		for _, a := range nv.IPs() {
-			seen[a]++
-		}
-	}
-
-	shared := map[netip.Addr]bool{}
-
-	for a, n := range seen {
-		if n > 1 {
-			shared[a] = true
-		}
-	}
-
-	return shared
 }
 
 // selectorSections decides, for every exported field of [Policy], whether

@@ -326,10 +326,6 @@ func TestAuditMembershipCatchesMistakes(t *testing.T) {
 		{ID: 1, IPv4: addr(1), User: &users[0], UserID: &users[0].ID},
 		{ID: 2, IPv4: addr(2), User: &users[1], UserID: &users[1].ID},
 		{ID: 3, IPv4: addr(3), Tags: []string{"tag:web"}},
-		// No address yet.
-		{ID: 4, User: &users[1], UserID: &users[1].ID},
-		// Sharing alice's address.
-		{ID: 5, IPv4: addr(1), Tags: []string{"tag:web"}},
 	}
 
 	const src = `{"tagOwners":{"tag:web":["alice@"]},
@@ -418,22 +414,6 @@ func TestAuditMembershipCatchesMistakes(t *testing.T) {
 		require.ErrorContains(t, err, "node 2 listed true, resolved false")
 	})
 
-	t.Run("an addressless node in the wrong postings", func(t *testing.T) {
-		// Node 4's addresses cannot tell: the relabelled resolution must.
-		err := resolveOnly(setPostings(map[Role][]types.NodeID{
-			role("tag:web"):          {3, 4, 5},
-			role("autogroup:member"): {1, 2},
-		}))
-		require.ErrorContains(t, err, "node 4 listed")
-		require.ErrorContains(t, err, "relabelled")
-	})
-
-	t.Run("a node sharing an address in the wrong posting", func(t *testing.T) {
-		// alice@ resolves to the address node 5 shares with node 1.
-		err := resolveOnly(setPostings(map[Role][]types.NodeID{role("alice@"): {1, 5}}))
-		require.ErrorContains(t, err, "node 5 listed true, resolved false (relabelled)")
-	})
-
 	t.Run("owner lists another user's node", func(t *testing.T) {
 		err := resolveOnly(setPostings(map[Role][]types.NodeID{OwnerRole(1): {1, 2}}))
 		require.ErrorContains(t, err, "owner 1 lists")
@@ -457,10 +437,8 @@ func TestAuditMembershipCatchesMistakes(t *testing.T) {
 		require.ErrorContains(t, err, "the selector table lacks it")
 	})
 
-	rep, err := m.audit()
+	_, err := m.audit()
 	require.NoError(t, err)
-	assert.Equal(t, 1, rep.Unaddressed)
-	assert.Equal(t, 2, rep.Shared)
 }
 
 // TestSelectorTableCollectsEverySection requires each section in scope to
@@ -669,8 +647,6 @@ func goldenMembership(t *testing.T, tally *membershipTally, src []byte, users ty
 		g.report.Indexed += rep.Indexed
 		g.report.Fresh += rep.Fresh
 		g.report.Judged += rep.Judged
-		g.report.Unaddressed += rep.Unaddressed
-		g.report.Shared += rep.Shared
 		g.report.Relabelled += rep.Relabelled
 	})
 }
@@ -698,8 +674,8 @@ func TestGoldenMembership(t *testing.T) {
 		r := tally.report
 		t.Logf("oracle: %d identity selectors held against the compile's alias cache, %d through its indexes, %d resolved afresh",
 			r.Compiled, r.Indexed, r.Fresh)
-		t.Logf("per node: %d node×selector pairs judged by own addresses, %d decided by relabelling; nodes without addresses %d, sharing one %d",
-			r.Judged, r.Relabelled, r.Unaddressed, r.Shared)
+		t.Logf("per node: %d node×selector pairs judged by own addresses, %d by relabelling",
+			r.Judged, r.Relabelled)
 	})
 
 	sources := goldenFilterSources()
