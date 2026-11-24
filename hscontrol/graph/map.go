@@ -400,9 +400,11 @@ func exact[K any](keys []K) []K {
 
 // GroupBy groups the keys of in by groupsOf, which names every group an
 // entry belongs to. Given its previous result, it moves only the keys that
-// changed since prev.In. sameGroups, when not nil, reports that an entry's
-// old and new value name the same groups, sparing groupsOf for a change
-// the grouping does not read.
+// changed since prev.In, by the Map's equality alone: groupsOf must not
+// put two values that equality calls equal into different groups, or a
+// key left in its old group lands in the wrong one. sameGroups, when not
+// nil, reports that an entry's old and new value name the same groups,
+// sparing groupsOf for a change the grouping does not read.
 func GroupBy[K cmp.Ordered, V any, G comparable](
 	prev Grouped[K, V, G],
 	in *Map[K, V],

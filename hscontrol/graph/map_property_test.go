@@ -550,9 +550,10 @@ func TestEditOfANilMapReturnsNil(t *testing.T) {
 	}
 }
 
-// TestGroupByTrustsTheInputsEquality pins what GroupBy's doc leaves out:
-// it moves only the keys Changes names, so a groupsOf that tells apart
-// values the input's equality calls equal leaves a key in its old group.
+// TestGroupByTrustsTheInputsEquality pins GroupBy's precondition: it
+// moves only the keys the input's equality reports as changed, so a
+// groupsOf that tells apart values the equality calls equal must not be
+// given to it — a key it would regroup stays in its old group.
 func TestGroupByTrustsTheInputsEquality(t *testing.T) {
 	tens := func(a, b int) bool { return a/10 == b/10 }
 	byValue := func(_, v int) []int { return []int{v} }

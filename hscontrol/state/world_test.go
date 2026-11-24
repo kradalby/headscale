@@ -3504,6 +3504,11 @@ func TestWorldIndexMatchesFullBuild(t *testing.T) {
 		require.Equal(t, groups(want.byNodeKey), groups(got.byNodeKey), "step %d", step)
 		require.Equal(t, groups(want.byMachineKey), groups(got.byMachineKey), "step %d", step)
 		require.Equal(t, groups(want.byUser), groups(got.byUser), "step %d", step)
+		require.Equal(t, groups(want.routed), groups(got.routed), "step %d", step)
+		require.Equal(t, groups(want.approvers), groups(got.approvers), "step %d", step)
+		require.Equal(t, groups(want.advertisers), groups(got.advertisers), "step %d", step)
+		require.Equal(t, groups(want.byName), groups(got.byName), "step %d", step)
+		require.Equal(t, groups(want.byUserCopy), groups(got.byUserCopy), "step %d", step)
 
 		// Electing only the touched prefixes equals electing all of them.
 		require.Equal(t, electPrimaryRoutes(snap.nodes(), prevRoutes), snap.PrimaryRoutes(), "step %d", step)
