@@ -4336,7 +4336,7 @@ func TestRouteWalksEachViewOnce(t *testing.T) {
 	cur := s.Snapshot()
 
 	walked := 0
-	for _, v := range reachedViews(old, cur, changed) {
+	for _, v := range reachedViews(old, changed) {
 		walked += len(v)
 	}
 

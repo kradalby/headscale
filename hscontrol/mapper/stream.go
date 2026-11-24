@@ -1023,10 +1023,11 @@ func (h *Hub) advance(snap *state.Snapshot) {
 // Peer visibility is not symmetric: an exit node sees every source of a
 // capability grant whose destination reaches the internet, which does not
 // see it. So the nodes a change reaches are the node's readers
-// ([state.Snapshot.PeerReaders]), not its own view. An online flip needs no
-// check of the node's role (router, relay, via): a peer's map reads the
-// node's online state only through the node's own entry and the primaries,
-// and both wake the peer.
+// ([state.Snapshot.PeerReaders]), not its own view. Its readers in old
+// suffice: one that starts or stops reading it has its peers changed, so
+// PeerSets names it. An online flip needs no check of the node's role
+// (router, relay, via): a peer's map reads the node's online state only
+// through the node's own entry and the primaries, and both wake the peer.
 func Route(old, cur *state.Snapshot, c state.Change) (bool, map[types.NodeID]struct{}) {
 	if old == nil || c.Global {
 		return true, nil
@@ -1096,7 +1097,7 @@ func Route(old, cur *state.Snapshot, c state.Change) (bool, map[types.NodeID]str
 		viewed = append(viewed, old.RoutedNodes(), cur.RoutedNodes())
 	}
 
-	for _, v := range reachedViews(old, cur, viewed...) {
+	for _, v := range reachedViews(old, viewed...) {
 		add(v)
 	}
 
@@ -1104,9 +1105,9 @@ func Route(old, cur *state.Snapshot, c state.Change) (bool, map[types.NodeID]str
 }
 
 // reachedViews returns, as distinct lists, the nodes that see a node of ids
-// before and after. The lists are shared holder lists, so a change of many
-// nodes walks each once rather than once per node.
-func reachedViews(old, cur *state.Snapshot, ids ...[]types.NodeID) [][]types.NodeID {
+// in snap. The lists are shared holder lists, so a change of many nodes
+// walks each once rather than once per node.
+func reachedViews(snap *state.Snapshot, ids ...[]types.NodeID) [][]types.NodeID {
 	type viewKey struct {
 		first *types.NodeID
 		n     int
@@ -1118,7 +1119,7 @@ func reachedViews(old, cur *state.Snapshot, ids ...[]types.NodeID) [][]types.Nod
 
 	for _, group := range ids {
 		for _, id := range group {
-			for _, v := range slices.Concat(old.PeerReaders(id), cur.PeerReaders(id)) {
+			for _, v := range snap.PeerReaders(id) {
 				if len(v) == 0 {
 					continue
 				}
