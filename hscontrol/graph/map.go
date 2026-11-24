@@ -159,9 +159,12 @@ func (m *Map[K, V]) Cursor() *Map[K, V] {
 
 // Changes returns the keys whose entry differs between old and m, each
 // once. It reads the edit log when it can and compares every key when it
-// cannot, so it is always correct; old may be nil. old must hold
-// entries: a [Cursor] is a token for [Map.ChangedSince] only, and what
-// [Changes] answers from one is nothing the package promises.
+// cannot; with an equality that decides changes the two agree, and with
+// none (Never, or a Map that never had one) the log names the keys the
+// edits between wrote when it reaches old, and comparison names every key
+// either side holds. old may be nil. old must hold entries: a [Cursor]
+// is a token for [Map.ChangedSince] only, and what [Changes] answers
+// from one is nothing the package promises.
 func Changes[K comparable, V any](old, m *Map[K, V]) []K {
 	if m == old {
 		return nil
@@ -176,13 +179,6 @@ func Changes[K comparable, V any](old, m *Map[K, V]) []K {
 	eq := m.eqOr(old)
 
 	if logged, ok := m.ChangedSince(old); ok {
-		// TODO(kradalby): graph/changes-never: over a Map whose equality
-		// calls nothing equal (Never, and the zero and nil-born Maps,
-		// which have none), this path names only the keys the edits
-		// between wrote, where comparing every key below names every key
-		// either side holds, so the answer depends on how far the log
-		// reaches; the doc calls it exact. Pinned by
-		// TestChangesUnderNeverDependsOnTheLog.
 		// The log also names keys that changed back.
 		seen := make(map[K]struct{}, len(logged))
 		keys := logged[:0:0]

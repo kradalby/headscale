@@ -119,27 +119,22 @@ func (r *mapRun) compare(tl tally, old, next mapRef) string {
 		got := Changes(old.m, next.m)
 		want := diffKeys(old.contents, next.contents, eq)
 
-		if sorted := slices.Sorted(slices.Values(got)); !slices.Equal(sorted, want) {
-			held := func(m map[int]int) func(int) bool {
-				return func(k int) bool { _, ok := m[k]; return ok }
-			}
+		// With no equality that decides changes, the log names the keys
+		// the edits between wrote when it reaches old, and comparison
+		// names every key either side holds.
+		if eq == eqNever && reaches {
+			want = slices.DeleteFunc(slices.Clone(through), func(k int) bool {
+				_, held := next.contents[k]
+				if !held {
+					_, held = old.contents[k]
+				}
 
-			// TODO(kradalby): graph/changes-never: over a Map whose equality
-			// calls nothing equal (Never, and the zero and nil-born Maps, which
-			// have none), Changes names every key either side holds when it
-			// compares them all, but only the keys the edits between wrote when
-			// it reads the log, so its answer depends on how far the log
-			// reaches; its doc calls it exact. Counted here; delete with
-			// TestChangesUnderNeverDependsOnTheLog once the doc says which.
-			neverForm := slices.DeleteFunc(slices.Clone(through), func(k int) bool {
-				return !held(next.contents)(k) && !held(old.contents)(k)
+				return !held
 			})
+		}
 
-			if eq == eqNever && reaches && slices.Equal(sorted, neverForm) {
-				tl[excChangesNever]++
-			} else {
-				return fmt.Sprintf("Changes = %v, want %v", sorted, want)
-			}
+		if sorted := slices.Sorted(slices.Values(got)); !slices.Equal(sorted, want) {
+			return fmt.Sprintf("Changes = %v, want %v", sorted, want)
 		}
 
 		// The result is the caller's: scribbling on it must not reach a log.
@@ -584,10 +579,10 @@ func TestGroupByTrustsTheInputsEquality(t *testing.T) {
 	}
 }
 
-// TestChangesUnderNeverDependsOnTheLog pins graph/changes-never: over a Map
-// with an equality that calls nothing equal, Changes from the Map an edit
-// started from names what it wrote; from an equal Map of another lineage,
-// every key.
+// TestChangesUnderNeverDependsOnTheLog pins Changes' rule for a Map with
+// no usable equality: from the Map an edit started from, whose log the
+// answer reads, it names what the edits wrote; from an equal Map of
+// another lineage, compared key by key, every key.
 func TestChangesUnderNeverDependsOnTheLog(t *testing.T) {
 	base := NewMap(Never[int], map[int]int{1: 1, 2: 2})
 	e := base.Edit()
@@ -595,11 +590,11 @@ func TestChangesUnderNeverDependsOnTheLog(t *testing.T) {
 	next := e.Done()
 
 	if got := Changes(base, next); !slices.Equal(got, []int{3}) {
-		t.Fatalf("Changes through the log = %v: see graph/changes-never", got)
+		t.Fatalf("Changes through the log = %v, want the keys the edit wrote", got)
 	}
 
 	twin := NewMap(Never[int], map[int]int{1: 1, 2: 2})
 	if got := slices.Sorted(slices.Values(Changes(twin, next))); !slices.Equal(got, []int{1, 2, 3}) {
-		t.Fatalf("Changes by comparison = %v: see graph/changes-never", got)
+		t.Fatalf("Changes by comparison = %v, want every key either side holds", got)
 	}
 }
