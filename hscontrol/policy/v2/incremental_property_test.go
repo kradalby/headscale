@@ -373,32 +373,6 @@ func literalStrings(t *Templates) []string {
 	return out
 }
 
-// sharingDiffer compares the sharing two filters serve from: carried for
-// an incremental one, found from the list for one built from scratch.
-func sharingDiffer(table *SelectorTable, inc, scr *Filters) string {
-	a, b := inc.sharing(), scr.sharing()
-
-	var as, bs []string
-
-	for id := range a.shared {
-		if a.shared[id] {
-			as = append(as, table.Selector(SelectorID(id)).Name) //nolint:gosec // a selector ID
-		}
-	}
-
-	for id := range b.shared {
-		if b.shared[id] {
-			bs = append(bs, table.Selector(SelectorID(id)).Name) //nolint:gosec // a selector ID
-		}
-	}
-
-	if !slices.Equal(as, bs) || !maps.Equal(a.ownerShared, b.ownerShared) {
-		return fmt.Sprintf("selectors sharing an address: incremental %v owners %v, from scratch %v owners %v", as, a.ownerShared, bs, b.ownerShared)
-	}
-
-	return ""
-}
-
 // identityDiffers returns how cur, updated from prev, breaks an identity
 // later layers rely on: what did not change keeps its value by identity,
 // and what is kept by identity did not change.
@@ -600,8 +574,7 @@ func tableDiffersFromModel(table *SelectorTable, p policymodel.Policy) string {
 // role sets, postings, templates and literals, approvals, sides (side
 // sets, facts, holders, cover, address and route indexes, public lists),
 // peers and readers, receiver facts and the address-form index, the via
-// plan, route access, stamps, the sharing capability form carries, and
-// every node's filter in address mode and in both capability-mode forms,
+// plan, route access, stamps, and every node's filter in address mode and in both capability-mode forms,
 // cut from the incremental inputs. It also holds the identities later
 // layers key on (identityDiffers), and the table to the model's reading
 // of the document (tableDiffersFromModel).
@@ -652,10 +625,6 @@ func TestPipelineIncrementalMatchesScratch(t *testing.T) {
 			}
 
 			if msg := templatesDiffer(inc.t, scr.t); msg != "" {
-				t.Fatalf("after step %d (%s): %s", i+1, st, msg)
-			}
-
-			if msg := sharingDiffer(inc.sel.table, inc.cap, scr.cap); msg != "" {
 				t.Fatalf("after step %d (%s): %s", i+1, st, msg)
 			}
 

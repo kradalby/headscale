@@ -987,7 +987,7 @@ func TestScalingWriteWorkChurnCapability(t *testing.T) {
 
 	// Sessions woken, sent an update, peers rendered, others sent a
 	// packet filter, filters cut, selector resolutions built, members those
-	// listed, address sorts, over the writes.
+	// listed, over the writes.
 	//
 	// Woken = updated: a join or retag renders the subject for its viewers,
 	// a leave drops it, and a group edit restamps editedUser's nodes for
@@ -997,35 +997,35 @@ func TestScalingWriteWorkChurnCapability(t *testing.T) {
 	// retagged subject itself, and editedUser's nodes entering or leaving a
 	// rule's destinations under selectors. Only cutting an address form
 	// resolves selectors: the routers' two (members, group:eng; via: members
-	// and the via tag). Nothing sorts every node's addresses.
-	ceilings := map[string][8]int{
-		"group/group-all": {400, 400, 3960, 0, 0, 0, 0, 0},
-		"group/routers":   {400, 400, 3168, 80, 80, 8, 496, 0},
-		"group/selectors": {400, 400, 3168, 0, 32, 0, 0, 0},
-		"join/allow-all":  {400, 400, 400, 0, 0, 0, 0, 0},
-		"join/group-all":  {400, 400, 400, 0, 0, 0, 0, 0},
-		"join/mesh":       {400, 400, 400, 0, 0, 0, 0, 0},
-		"join/routers":    {400, 400, 400, 80, 80, 8, 488, 0},
-		"join/selectors":  {308, 308, 308, 0, 0, 0, 0, 0},
-		"join/self":       {40, 40, 40, 0, 0, 0, 0, 0},
-		"join/tags":       {40, 40, 40, 0, 0, 0, 0, 0},
-		"join/users":      {40, 40, 40, 0, 0, 0, 0, 0},
-		"join/via":        {400, 400, 400, 40, 40, 8, 404, 0},
-		"leave/allow-all": {396, 396, 0, 0, 0, 0, 0, 0},
-		"leave/group-all": {396, 396, 0, 0, 0, 0, 0, 0},
-		"leave/mesh":      {396, 396, 0, 0, 0, 0, 0, 0},
-		"leave/routers":   {396, 396, 0, 80, 80, 8, 472, 0},
-		"leave/selectors": {304, 304, 0, 0, 0, 0, 0, 0},
-		"leave/self":      {36, 36, 0, 0, 0, 0, 0, 0},
-		"leave/tags":      {40, 40, 0, 0, 0, 0, 0, 0},
-		"leave/users":     {36, 36, 0, 0, 0, 0, 0, 0},
-		"leave/via":       {396, 396, 0, 40, 40, 8, 396, 0},
-		"tag/group-all":   {400, 400, 196, 0, 4, 0, 0, 0},
-		"tag/mesh":        {400, 400, 0, 0, 4, 0, 0, 0},
-		"tag/routers":     {400, 400, 0, 80, 84, 8, 472, 0},
-		"tag/selectors":   {308, 308, 120, 0, 4, 0, 0, 0},
-		"tag/tags":        {80, 80, 72, 0, 4, 0, 0, 0},
-		"tag/via":         {400, 400, 396, 40, 44, 8, 400, 0},
+	// and the via tag).
+	ceilings := map[string][7]int{
+		"group/group-all": {400, 400, 3960, 0, 0, 0, 0},
+		"group/routers":   {400, 400, 3168, 80, 80, 8, 496},
+		"group/selectors": {400, 400, 3168, 0, 32, 0, 0},
+		"join/allow-all":  {400, 400, 400, 0, 0, 0, 0},
+		"join/group-all":  {400, 400, 400, 0, 0, 0, 0},
+		"join/mesh":       {400, 400, 400, 0, 0, 0, 0},
+		"join/routers":    {400, 400, 400, 80, 80, 8, 488},
+		"join/selectors":  {308, 308, 308, 0, 0, 0, 0},
+		"join/self":       {40, 40, 40, 0, 0, 0, 0},
+		"join/tags":       {40, 40, 40, 0, 0, 0, 0},
+		"join/users":      {40, 40, 40, 0, 0, 0, 0},
+		"join/via":        {400, 400, 400, 40, 40, 8, 404},
+		"leave/allow-all": {396, 396, 0, 0, 0, 0, 0},
+		"leave/group-all": {396, 396, 0, 0, 0, 0, 0},
+		"leave/mesh":      {396, 396, 0, 0, 0, 0, 0},
+		"leave/routers":   {396, 396, 0, 80, 80, 8, 472},
+		"leave/selectors": {304, 304, 0, 0, 0, 0, 0},
+		"leave/self":      {36, 36, 0, 0, 0, 0, 0},
+		"leave/tags":      {40, 40, 0, 0, 0, 0, 0},
+		"leave/users":     {36, 36, 0, 0, 0, 0, 0},
+		"leave/via":       {396, 396, 0, 40, 40, 8, 396},
+		"tag/group-all":   {400, 400, 196, 0, 4, 0, 0},
+		"tag/mesh":        {400, 400, 0, 0, 4, 0, 0},
+		"tag/routers":     {400, 400, 0, 80, 84, 8, 472},
+		"tag/selectors":   {308, 308, 120, 0, 4, 0, 0},
+		"tag/tags":        {80, 80, 72, 0, 4, 0, 0},
+		"tag/via":         {400, 400, 396, 40, 44, 8, 400},
 	}
 
 	for _, kind := range slices.Sorted(maps.Keys(churnWrites)) {
@@ -1039,7 +1039,7 @@ func TestScalingWriteWorkChurnCapability(t *testing.T) {
 				s, streams := scalingTailnet(t, n, shape)
 				cr := newChurnRun(t, s, streams, shape)
 
-				var work [4]uint64
+				var work [3]uint64
 
 				for i := range writes {
 					w.write(cr, t, i)
@@ -1059,10 +1059,10 @@ func TestScalingWriteWorkChurnCapability(t *testing.T) {
 
 				cr.requireSettled(t, kind)
 
-				got := [8]int{cr.woken, cr.updates, cr.rendered, cr.filterSends, int(work[0]), int(work[1]), int(work[2]), int(work[3])} //nolint:gosec // small
+				got := [7]int{cr.woken, cr.updates, cr.rendered, cr.filterSends, int(work[0]), int(work[1]), int(work[2])} //nolint:gosec // small
 				limit, ok := ceilings[kind+"/"+shape]
 				require.True(t, ok, "no ceiling for %s/%s", kind, shape)
-				assert.Equal(t, limit, got, "sessions woken, updated, peers rendered, others sent a filter, filters cut, resolutions built, members listed, address sorts")
+				assert.Equal(t, limit, got, "sessions woken, updated, peers rendered, others sent a filter, filters cut, resolutions built, members listed")
 			})
 		}
 	}

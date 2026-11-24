@@ -1792,9 +1792,7 @@ func TestRouteLeavesNoSessionStale(t *testing.T) {
 
 	if fallbacks["mode"] > 0 {
 		for _, label := range policyv2.FallbackReasons() {
-			// shared-address needs two nodes holding one address, which
-			// NewState refuses.
-			if label != "address-mode" && label != "shared-address" {
+			if label != "address-mode" {
 				require.NotZerof(t, fallbacks[label], "capability mode reached the %s fallback", label)
 			}
 		}
@@ -1846,12 +1844,11 @@ func capabilityForm(f policyv2.ReceiverFacts) bool {
 }
 
 // capWork reads the served filters' work counters: filters cut, selector
-// resolutions built, the members they listed, and sorts of every node's
-// addresses.
-func capWork() [4]uint64 {
-	res, members, sorts := policyv2.ServedWorkForTest()
+// resolutions built and the members they listed.
+func capWork() [3]uint64 {
+	res, members := policyv2.ServedWorkForTest()
 
-	return [4]uint64{state.FilterCuts(), res, members, sorts}
+	return [3]uint64{state.FilterCuts(), res, members}
 }
 
 // hasOneWayView reports whether a node of snap sees one that does not see
@@ -3820,81 +3817,81 @@ func TestScalingWriteWorkCapability(t *testing.T) {
 	// rows' setup write replaces the shape's policy with one naming no
 	// identity, so every stamped node loses its stamps and every viewer is
 	// sent it again. Filters cut: a port edit moves every node's filter;
-	// nothing else cuts one. No write resolves a selector or sorts every
-	// node's addresses: capability form reads neither.
-	ceilings := map[string][7]int{
-		"derp/allow-all":           {400, 400, 0, 0, 0, 0, 0},
-		"derp/group-all":           {400, 400, 0, 0, 0, 0, 0},
-		"derp/mesh":                {400, 400, 0, 0, 0, 0, 0},
-		"derp/routers":             {400, 400, 0, 0, 0, 0, 0},
-		"derp/selectors":           {400, 400, 0, 0, 0, 0, 0},
-		"derp/self":                {400, 400, 0, 0, 0, 0, 0},
-		"derp/tags":                {400, 400, 0, 0, 0, 0, 0},
-		"derp/users":               {400, 400, 0, 0, 0, 0, 0},
-		"derp/via":                 {400, 400, 0, 0, 0, 0, 0},
-		"endpoint/allow-all":       {400, 400, 396, 0, 0, 0, 0},
-		"endpoint/group-all":       {400, 400, 396, 0, 0, 0, 0},
-		"endpoint/mesh":            {400, 400, 396, 0, 0, 0, 0},
-		"endpoint/routers":         {341, 341, 337, 0, 0, 0, 0},
-		"endpoint/selectors":       {323, 323, 319, 0, 0, 0, 0},
-		"endpoint/self":            {40, 40, 36, 0, 0, 0, 0},
-		"endpoint/tags":            {44, 44, 40, 0, 0, 0, 0},
-		"endpoint/users":           {40, 40, 36, 0, 0, 0, 0},
-		"endpoint/via":             {400, 400, 396, 0, 0, 0, 0},
-		"endpoints-x16/allow-all":  {400, 400, 6336, 0, 0, 0, 0},
-		"endpoints-x16/group-all":  {400, 400, 5776, 0, 0, 0, 0},
-		"endpoints-x16/mesh":       {400, 400, 6336, 0, 0, 0, 0},
-		"endpoints-x16/routers":    {400, 400, 5349, 0, 0, 0, 0},
-		"endpoints-x16/selectors":  {400, 400, 5632, 0, 0, 0, 0},
-		"endpoints-x16/self":       {100, 100, 576, 0, 0, 0, 0},
-		"endpoints-x16/tags":       {360, 360, 640, 0, 0, 0, 0},
-		"endpoints-x16/users":      {100, 100, 576, 0, 0, 0, 0},
-		"endpoints-x16/via":        {400, 400, 6336, 0, 0, 0, 0},
-		"ignored-health/allow-all": {0, 0, 0, 0, 0, 0, 0},
-		"ignored-health/group-all": {0, 0, 0, 0, 0, 0, 0},
-		"ignored-health/mesh":      {0, 0, 0, 0, 0, 0, 0},
-		"ignored-health/routers":   {0, 0, 0, 0, 0, 0, 0},
-		"ignored-health/selectors": {0, 0, 0, 0, 0, 0, 0},
-		"ignored-health/self":      {0, 0, 0, 0, 0, 0, 0},
-		"ignored-health/tags":      {0, 0, 0, 0, 0, 0, 0},
-		"ignored-health/users":     {0, 0, 0, 0, 0, 0, 0},
-		"ignored-health/via":       {0, 0, 0, 0, 0, 0, 0},
-		"online/allow-all":         {400, 396, 396, 0, 0, 0, 0},
-		"online/group-all":         {400, 396, 396, 0, 0, 0, 0},
-		"online/mesh":              {400, 396, 396, 0, 0, 0, 0},
-		"online/routers":           {341, 337, 337, 0, 0, 0, 0},
-		"online/selectors":         {323, 319, 319, 0, 0, 0, 0},
-		"online/self":              {40, 36, 36, 0, 0, 0, 0},
-		"online/tags":              {44, 40, 40, 0, 0, 0, 0},
-		"online/users":             {40, 36, 36, 0, 0, 0, 0},
-		"online/via":               {400, 397, 495, 0, 0, 0, 0},
-		"policy/allow-all":         {500, 500, 0, 400, 0, 0, 0},
-		"policy/group-all":         {500, 500, 6950, 400, 0, 0, 0},
-		"policy/mesh":              {500, 500, 9900, 400, 0, 0, 0},
-		"policy/routers":           {500, 500, 9100, 400, 0, 0, 0},
-		"policy/selectors":         {500, 500, 9348, 400, 0, 0, 0},
-		"policy/self":              {500, 500, 9900, 400, 0, 0, 0},
-		"policy/tags":              {500, 500, 9900, 400, 0, 0, 0},
-		"policy/users":             {500, 500, 9900, 400, 0, 0, 0},
-		"policy/via":               {500, 500, 0, 400, 0, 0, 0},
-		"rejoin/allow-all":         {400, 0, 396, 0, 0, 0, 0},
-		"rejoin/group-all":         {400, 0, 396, 0, 0, 0, 0},
-		"rejoin/mesh":              {400, 0, 396, 0, 0, 0, 0},
-		"rejoin/routers":           {341, 0, 337, 0, 0, 0, 0},
-		"rejoin/selectors":         {323, 0, 319, 0, 0, 0, 0},
-		"rejoin/self":              {40, 0, 36, 0, 0, 0, 0},
-		"rejoin/tags":              {44, 0, 40, 0, 0, 0, 0},
-		"rejoin/users":             {40, 0, 36, 0, 0, 0, 0},
-		"rejoin/via":               {400, 0, 396, 0, 0, 0, 0},
-		"rename/allow-all":         {400, 400, 396, 0, 0, 0, 0},
-		"rename/group-all":         {400, 400, 396, 0, 0, 0, 0},
-		"rename/mesh":              {400, 400, 396, 0, 0, 0, 0},
-		"rename/routers":           {341, 341, 337, 0, 0, 0, 0},
-		"rename/selectors":         {323, 323, 319, 0, 0, 0, 0},
-		"rename/self":              {40, 40, 36, 0, 0, 0, 0},
-		"rename/tags":              {44, 44, 40, 0, 0, 0, 0},
-		"rename/users":             {40, 40, 36, 0, 0, 0, 0},
-		"rename/via":               {400, 400, 396, 0, 0, 0, 0},
+	// nothing else cuts one. No write resolves a selector: capability form
+	// reads none.
+	ceilings := map[string][6]int{
+		"derp/allow-all":           {400, 400, 0, 0, 0, 0},
+		"derp/group-all":           {400, 400, 0, 0, 0, 0},
+		"derp/mesh":                {400, 400, 0, 0, 0, 0},
+		"derp/routers":             {400, 400, 0, 0, 0, 0},
+		"derp/selectors":           {400, 400, 0, 0, 0, 0},
+		"derp/self":                {400, 400, 0, 0, 0, 0},
+		"derp/tags":                {400, 400, 0, 0, 0, 0},
+		"derp/users":               {400, 400, 0, 0, 0, 0},
+		"derp/via":                 {400, 400, 0, 0, 0, 0},
+		"endpoint/allow-all":       {400, 400, 396, 0, 0, 0},
+		"endpoint/group-all":       {400, 400, 396, 0, 0, 0},
+		"endpoint/mesh":            {400, 400, 396, 0, 0, 0},
+		"endpoint/routers":         {341, 341, 337, 0, 0, 0},
+		"endpoint/selectors":       {323, 323, 319, 0, 0, 0},
+		"endpoint/self":            {40, 40, 36, 0, 0, 0},
+		"endpoint/tags":            {44, 44, 40, 0, 0, 0},
+		"endpoint/users":           {40, 40, 36, 0, 0, 0},
+		"endpoint/via":             {400, 400, 396, 0, 0, 0},
+		"endpoints-x16/allow-all":  {400, 400, 6336, 0, 0, 0},
+		"endpoints-x16/group-all":  {400, 400, 5776, 0, 0, 0},
+		"endpoints-x16/mesh":       {400, 400, 6336, 0, 0, 0},
+		"endpoints-x16/routers":    {400, 400, 5349, 0, 0, 0},
+		"endpoints-x16/selectors":  {400, 400, 5632, 0, 0, 0},
+		"endpoints-x16/self":       {100, 100, 576, 0, 0, 0},
+		"endpoints-x16/tags":       {360, 360, 640, 0, 0, 0},
+		"endpoints-x16/users":      {100, 100, 576, 0, 0, 0},
+		"endpoints-x16/via":        {400, 400, 6336, 0, 0, 0},
+		"ignored-health/allow-all": {0, 0, 0, 0, 0, 0},
+		"ignored-health/group-all": {0, 0, 0, 0, 0, 0},
+		"ignored-health/mesh":      {0, 0, 0, 0, 0, 0},
+		"ignored-health/routers":   {0, 0, 0, 0, 0, 0},
+		"ignored-health/selectors": {0, 0, 0, 0, 0, 0},
+		"ignored-health/self":      {0, 0, 0, 0, 0, 0},
+		"ignored-health/tags":      {0, 0, 0, 0, 0, 0},
+		"ignored-health/users":     {0, 0, 0, 0, 0, 0},
+		"ignored-health/via":       {0, 0, 0, 0, 0, 0},
+		"online/allow-all":         {400, 396, 396, 0, 0, 0},
+		"online/group-all":         {400, 396, 396, 0, 0, 0},
+		"online/mesh":              {400, 396, 396, 0, 0, 0},
+		"online/routers":           {341, 337, 337, 0, 0, 0},
+		"online/selectors":         {323, 319, 319, 0, 0, 0},
+		"online/self":              {40, 36, 36, 0, 0, 0},
+		"online/tags":              {44, 40, 40, 0, 0, 0},
+		"online/users":             {40, 36, 36, 0, 0, 0},
+		"online/via":               {400, 397, 495, 0, 0, 0},
+		"policy/allow-all":         {500, 500, 0, 400, 0, 0},
+		"policy/group-all":         {500, 500, 6950, 400, 0, 0},
+		"policy/mesh":              {500, 500, 9900, 400, 0, 0},
+		"policy/routers":           {500, 500, 9100, 400, 0, 0},
+		"policy/selectors":         {500, 500, 9348, 400, 0, 0},
+		"policy/self":              {500, 500, 9900, 400, 0, 0},
+		"policy/tags":              {500, 500, 9900, 400, 0, 0},
+		"policy/users":             {500, 500, 9900, 400, 0, 0},
+		"policy/via":               {500, 500, 0, 400, 0, 0},
+		"rejoin/allow-all":         {400, 0, 396, 0, 0, 0},
+		"rejoin/group-all":         {400, 0, 396, 0, 0, 0},
+		"rejoin/mesh":              {400, 0, 396, 0, 0, 0},
+		"rejoin/routers":           {341, 0, 337, 0, 0, 0},
+		"rejoin/selectors":         {323, 0, 319, 0, 0, 0},
+		"rejoin/self":              {40, 0, 36, 0, 0, 0},
+		"rejoin/tags":              {44, 0, 40, 0, 0, 0},
+		"rejoin/users":             {40, 0, 36, 0, 0, 0},
+		"rejoin/via":               {400, 0, 396, 0, 0, 0},
+		"rename/allow-all":         {400, 400, 396, 0, 0, 0},
+		"rename/group-all":         {400, 400, 396, 0, 0, 0},
+		"rename/mesh":              {400, 400, 396, 0, 0, 0},
+		"rename/routers":           {341, 341, 337, 0, 0, 0},
+		"rename/selectors":         {323, 323, 319, 0, 0, 0},
+		"rename/self":              {40, 40, 36, 0, 0, 0},
+		"rename/tags":              {44, 44, 40, 0, 0, 0},
+		"rename/users":             {40, 40, 36, 0, 0, 0},
+		"rename/via":               {400, 400, 396, 0, 0, 0},
 	}
 
 	for _, kind := range slices.Sorted(maps.Keys(scalingWrites)) {
@@ -3904,7 +3901,7 @@ func TestScalingWriteWorkCapability(t *testing.T) {
 				sc := newScalingRun(s, streams)
 				sc.warm(t, kind)
 
-				var work [4]uint64
+				var work [3]uint64
 
 				for i := range writes {
 					before := capWork()
@@ -3918,10 +3915,10 @@ func TestScalingWriteWorkCapability(t *testing.T) {
 
 				sc.requireSettled(t, kind)
 
-				got := [7]int{sc.woken, sc.updates, sc.rendered, int(work[0]), int(work[1]), int(work[2]), int(work[3])} //nolint:gosec // small
+				got := [6]int{sc.woken, sc.updates, sc.rendered, int(work[0]), int(work[1]), int(work[2])} //nolint:gosec // small
 				limit, ok := ceilings[kind+"/"+shape]
 				require.True(t, ok, "no ceiling for %s/%s", kind, shape)
-				assert.Equal(t, limit, got, "sessions woken, updated, peers rendered, filters cut, resolutions built, members listed, address sorts")
+				assert.Equal(t, limit, got, "sessions woken, updated, peers rendered, filters cut, resolutions built, members listed")
 			})
 		}
 	}

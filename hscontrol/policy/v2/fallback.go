@@ -1,7 +1,6 @@
 package v2
 
 import (
-	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +20,6 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
-	"tailscale.com/types/views"
 )
 
 // A filter rule may name a source "cap:<capability>": the receiving client
@@ -144,25 +142,6 @@ const (
 	// host, a prefix, autogroup:internet, autogroup:danger-all. Permanent.
 	reasonLiteral
 
-	// TODO(capsrc/shared-address): lift when the client checks every node holding a source address; canary TestCanaryCapLookupOneNodePerAddress
-	// TODO(kradalby): capsrc/shared-address: the client asks the one node its
-	// netmap indexed last for an address (LocalBackend.srcIPHasCapForFilter,
-	// https://github.com/tailscale/tailscale/blob/f7c1b8e52600c1926623b29c91972a5ea1364d2f/ipn/ipnlocal/local.go,
-	// through nodeBackend.NodeByAddr and updateNodeByAddrLocked in
-	// node_backend.go), and a delta removal drops the address without
-	// pointing it at its other holder (nodeBackend.UpdateNetmapDelta, same
-	// file); upstream, on srcIPHasCapForFilter: `TODO(bradfitz): optimize
-	// this later if/when it matters.` and `TODO(nickkhyl): move this into
-	// [nodeBackend] along with [LocalBackend.updateFilterLocked].` Tracking
-	// https://github.com/tailscale/tailscale/issues/12542; the lookup refuses unsigned peers
-	// since https://github.com/tailscale/tailscale/pull/20513.
-	//
-	// reasonSharedAddress: a node outside the selector holds an address
-	// of one of its members, or, for an autogroup:self rule, a node not
-	// the owner's holds an address of one of the owner's nodes. The client
-	// asks one node per address, whichever its netmap indexed last.
-	reasonSharedAddress
-
 	numReasons
 )
 
@@ -216,10 +195,6 @@ var reasonDocs = [numReasons]reasonDoc{
 	reasonLiteral: {
 		label: "literal", kind: kindPermanent, scope: "*, hosts, prefixes, autogroup:internet, autogroup:danger-all",
 		lift: "never: an address is not a membership",
-	},
-	reasonSharedAddress: {
-		label: "shared-address", kind: kindClient, scope: "a selector a non-member shares a member's address with; an owner whose node shares an address with another user's",
-		lift: "the client checks every node holding a source address", canary: "TestCanaryCapLookupOneNodePerAddress",
 	},
 }
 
@@ -661,21 +636,11 @@ func ruleForm(capGrant bool, proto []int) ipReason {
 	return reasonNone
 }
 
-// sourceTraits is what decides a source's form beyond its rule and
-// receiver.
-type sourceTraits struct {
-	kind SelectorKind
-	// shared: a node outside the source holds an address of a member, or,
-	// for a self rule, a node not the owner's holds an address of one of
-	// the owner's nodes, or the source names only some of them.
-	shared bool
-}
-
-// sourceForm returns why the source src of a rule, granting app
+// sourceForm returns why a source of the given kind in a rule, granting app
 // capabilities when capGrant and over protocols proto, goes as addresses
 // to a receiver with facts f under mode; reasonNone sends it as a
 // capability. It is the only place that chooses.
-func sourceForm(mode SourceMode, f ReceiverFacts, capGrant bool, proto []int, src sourceTraits) ipReason {
+func sourceForm(mode SourceMode, f ReceiverFacts, capGrant bool, proto []int, kind SelectorKind) ipReason {
 	if r := receiverForm(mode, f); r != reasonNone {
 		return r
 	}
@@ -684,11 +649,8 @@ func sourceForm(mode SourceMode, f ReceiverFacts, capGrant bool, proto []int, sr
 		return r
 	}
 
-	switch {
-	case applies(reasonLiteral, !src.kind.HoldsNodes()):
+	if applies(reasonLiteral, !kind.HoldsNodes()) {
 		return reasonLiteral
-	case applies(reasonSharedAddress, src.shared):
-		return reasonSharedAddress
 	}
 
 	return reasonNone
@@ -758,16 +720,9 @@ type stampMemo struct {
 
 // StampsOf returns the source capabilities a node with role set rs holds
 // under t: the identity selectors it is a member of that a rule can name,
-// and its owner's capability when a self rule can. Membership, not
-// holding a member's address: the client asks the node holding a source
-// address, and a node is stamped only for what all of its addresses are
-// sources of; [sourceForm] sends a selector as addresses wherever another
-// node holds a member's address.
-//
-// No test tells membership from holding a member's address: they differ on
-// a shared address only, whose selector [sourceForm] sends as addresses
-// either way, so no client decision moves. Membership is kept as the
-// notion that stays exact once that fallback lifts.
+// and its owner's capability when a self rule can. The client asks the
+// node holding a source address, and no two nodes hold one, so membership
+// is what address form names.
 func (t *Templates) StampsOf(rs RoleSet) Stamps {
 	if v, ok := t.stampCache.m.Load(rs); ok {
 		return v.(Stamps) //nolint:forcetypeassert // only stamps are stored
@@ -902,67 +857,10 @@ func addressSources(why ipReason, srcs []string) []string {
 	return srcs
 }
 
-// capInfo is what capability form needs beyond address form: which
-// selectors and owners a node shares an address across, and each grant's
-// sources as a receiver sent capabilities is sent them.
+// capInfo is what capability form needs beyond address form: each
+// grant's sources as a receiver sent capabilities is sent them.
 type capInfo struct {
-	// shared marks, by selector, the identity selectors a node outside
-	// holds a member's address of; ownerShared the owners one of whose
-	// nodes shares an address with a node not theirs.
-	shared      []bool
-	ownerShared map[uint]bool
-	grants      []grantCaps
-}
-
-// sharing is which identity selectors and owners nodes share an address
-// across, see [capInfo].
-type sharing struct {
-	shared      []bool
-	ownerShared map[uint]bool
-}
-
-// sharingScans counts the times sharing was found by sorting every node's
-// addresses rather than carried over.
-var sharingScans atomic.Uint64
-
-// findSharing finds which selectors and owners the nodes of list, with
-// posts their roles, share an address across.
-func findSharing(list views.Slice[types.NodeView], posts Postings, selectors int) *sharing {
-	sharingScans.Add(1)
-
-	sh := &sharing{shared: make([]bool, selectors), ownerShared: map[uint]bool{}}
-
-	for _, holders := range addressHolders(list) {
-		count := map[SelectorID]int{}
-		owners := map[uint]int{}
-
-		for _, id := range holders {
-			rs, _ := posts.byRole.In.Get(id)
-			for r := range rs.All() {
-				if sel, ok := r.Selector(); ok {
-					count[sel]++
-				}
-
-				if uid, ok := r.Owner(); ok {
-					owners[uid]++
-				}
-			}
-		}
-
-		for sel, n := range count {
-			if n < len(holders) {
-				sh.shared[sel] = true
-			}
-		}
-
-		for uid, n := range owners {
-			if n < len(holders) {
-				sh.ownerShared[uid] = true
-			}
-		}
-	}
-
-	return sh
+	grants []grantCaps
 }
 
 // grantCaps is a grant's sources in capability form.
@@ -992,29 +890,18 @@ type formSources struct {
 // describe is cut in address form throughout.
 var eligible = ReceiverFacts{Client: true}
 
-// sharing returns which selectors and owners nodes share an address
-// across: what the filters served give, else found from the list.
-func (x *Expansion) sharing() *sharing {
-	if x.share != nil {
-		return x.share()
-	}
-
-	return findSharing(x.list, x.posts, x.table.Len())
-}
-
 // capForms returns what capability form needs, built once. Each grant's
 // port rule sources read addresses only where a fallback writes them so.
 func (x *Expansion) capForms() *capInfo {
 	x.capsOnce.Do(func() {
-		sh := x.sharing()
-		ci := &capInfo{shared: sh.shared, ownerShared: sh.ownerShared, grants: make([]grantCaps, len(x.t.grants))}
+		ci := &capInfo{grants: make([]grantCaps, len(x.t.grants))}
 
 		for g, gt := range x.t.grants {
 			if gt.none || gt.kind == grantVia {
 				continue
 			}
 
-			ports := x.selectorForms(gt.srcs, false, gt.wildcard, ci)
+			ports := x.selectorForms(gt.srcs, false, gt.wildcard)
 			ci.grants[g].srcs, ci.grants[g].reasons = ports.srcs, ports.reasons
 		}
 
@@ -1028,14 +915,14 @@ func (x *Expansion) capForms() *capInfo {
 // companions for a receiver sent capabilities, written once.
 func (ci *capInfo) appForms(x *Expansion, g int) (formSources, formSources) {
 	gc := &ci.grants[g]
-	gc.appOnce.Do(func() { gc.app, gc.comp = x.appCaps(x.t.grants[g], x.grant(g), ci) })
+	gc.appOnce.Do(func() { gc.app, gc.comp = x.appCaps(x.t.grants[g], x.grant(g)) })
 
 	return gc.app, gc.comp
 }
 
 // appCaps decides each source of gt's app capability rule and companions
 // for a receiver sent capabilities.
-func (x *Expansion) appCaps(gt *GrantTemplate, ge *grantExpansion, ci *capInfo) (formSources, formSources) {
+func (x *Expansion) appCaps(gt *GrantTemplate, ge *grantExpansion) (formSources, formSources) {
 	if !ge.capGrant {
 		return formSources{}, formSources{}
 	}
@@ -1051,7 +938,7 @@ func (x *Expansion) appCaps(gt *GrantTemplate, ge *grantExpansion, ci *capInfo) 
 		return formSources{srcs: srcs, reasons: []ipReason{why}}, formSources{srcs: ge.dstIPs, reasons: []ipReason{why}}
 	}
 
-	return x.selectorForms(gt.srcs, true, gt.wildcard, ci), x.selectorForms(gt.dsts, true, gt.dstWildcard, ci)
+	return x.selectorForms(gt.srcs, true, gt.wildcard), x.selectorForms(gt.dsts, true, gt.dstWildcard)
 }
 
 // selectorForms writes ids, the sources of a rule granting app
@@ -1059,7 +946,7 @@ func (x *Expansion) appCaps(gt *GrantTemplate, ge *grantExpansion, ci *capInfo) 
 // [sourceForm] decides, the addresses sorted as address form writes them,
 // then the capabilities. wildcard adds the approved subnet routes a *
 // names.
-func (x *Expansion) selectorForms(ids []SelectorID, capGrant, wildcard bool, ci *capInfo) formSources {
+func (x *Expansion) selectorForms(ids []SelectorID, capGrant, wildcard bool) formSources {
 	var (
 		fs    formSources
 		addrs []string
@@ -1077,7 +964,7 @@ func (x *Expansion) selectorForms(ids []SelectorID, capGrant, wildcard bool, ci 
 	for _, id := range ids {
 		s := x.table.Selector(id)
 
-		why := sourceForm(CapabilitySources, eligible, capGrant, nil, sourceTraits{kind: s.Kind, shared: ci.shared[id]})
+		why := sourceForm(CapabilitySources, eligible, capGrant, nil, s.Kind)
 		switch {
 		case why == reasonNone && s.Kind.HoldsNodes():
 			caps = append(caps, capSourcePrefix+string(selectorCap(s)))
@@ -1098,7 +985,7 @@ func (x *Expansion) selectorForms(ids []SelectorID, capGrant, wildcard bool, ci 
 
 	// * adds the approved subnet routes, which only an address names.
 	if wildcard && len(x.routes) > 0 {
-		if why := sourceForm(CapabilitySources, eligible, capGrant, nil, sourceTraits{kind: SelectorWildcard}); why != reasonNone {
+		if why := sourceForm(CapabilitySources, eligible, capGrant, nil, SelectorWildcard); why != reasonNone {
 			address(why, x.routes...)
 		}
 	}
@@ -1117,11 +1004,11 @@ func (x *Expansion) selectorForms(ids []SelectorID, capGrant, wildcard bool, ci 
 }
 
 // selfCapabilityOnly reports whether every autogroup:self rule of grant g
-// cut for owner uid goes as the owner's capability, with named saying how
+// cut for an owner goes as the owner's capability, with named saying how
 // many of the owner's nodes each source names: [Expansion.capFormSelf]'s
 // decision, asked of every rule. Such rules read none of the owner's
 // nodes but the receiver.
-func (x *Expansion) selfCapabilityOnly(g int, uid uint, named []selfNaming) bool {
+func (x *Expansion) selfCapabilityOnly(g int, named []selfNaming) bool {
 	gt := x.t.grants[g]
 
 	// TODO(kradalby): overwake/self-owners-every-form: an app self grant is
@@ -1143,7 +1030,7 @@ func (x *Expansion) selfCapabilityOnly(g int, uid uint, named []selfNaming) bool
 		}
 
 		for k, src := range x.srcIDs(g) {
-			if named[k] != namedNone && x.selfForm(ipr.proto, src, uid, named[k] == namedAll) != reasonNone {
+			if named[k] != namedNone && x.selfForm(ipr.proto, src) != reasonNone {
 				return false
 			}
 		}
@@ -1152,30 +1039,22 @@ func (x *Expansion) selfCapabilityOnly(g int, uid uint, named []selfNaming) bool
 	return true
 }
 
-// selfForm decides an autogroup:self rule's source src, which names some
-// of owner uid's nodes, every one when all: an identity source naming every
-// node of the owner, none of which shares an address with another node,
-// goes as the owner's capability. Only an address another node holds names
-// some of an owner's nodes and not all: membership is by user.
-func (x *Expansion) selfForm(proto []int, src SelectorID, uid uint, all bool) ipReason {
-	return sourceForm(CapabilitySources, eligible, false, proto, sourceTraits{
-		kind:   x.table.Selector(src).Kind,
-		shared: !all || x.capForms().ownerShared[uid],
-	})
+// selfForm decides an autogroup:self rule's source src, which names an
+// owner's nodes: an identity source goes as the owner's capability, since
+// membership is by user and no two nodes hold one address.
+func (x *Expansion) selfForm(proto []int, src SelectorID) ipReason {
+	return sourceForm(CapabilitySources, eligible, false, proto, x.table.Selector(src).Kind)
 }
 
 // selfNamed returns how many of owner uid's nodes each source of self
 // grant g names, as [Expansion.selfRules] counts them by address: by
-// membership where no node outside a source holds a member's address and
-// none of the owner's shares one, which then decides it alike, so
-// capability form need not resolve the sources.
+// membership where every source is an identity, which decides it alike as
+// no two nodes hold one address, so capability form need not resolve the
+// sources.
 func (x *Expansion) selfNamed(g int, uid uint) []selfNaming {
-	ci := x.capForms()
 	srcs := x.srcIDs(g)
 
-	if ci.ownerShared[uid] || slices.ContainsFunc(srcs, func(id SelectorID) bool {
-		return !x.table.Selector(id).Kind.HoldsNodes() || ci.shared[id]
-	}) {
+	if slices.ContainsFunc(srcs, func(id SelectorID) bool { return !x.table.Selector(id).Kind.HoldsNodes() }) {
 		return x.selfRules(g, uid).named
 	}
 
@@ -1206,53 +1085,6 @@ func (x *Expansion) selfNamed(g int, uid uint) []selfNaming {
 	}
 
 	return named
-}
-
-// addressHolders returns, for every address more than one node of nodes
-// holds, its holders.
-func addressHolders(nodes views.Slice[types.NodeView]) [][]types.NodeID {
-	type held struct {
-		ip netip.Addr
-		id types.NodeID
-	}
-
-	all := make([]held, 0, 2*nodes.Len())
-
-	for _, n := range nodes.All() {
-		for _, ip := range n.IPs() {
-			all = append(all, held{ip: ip, id: n.ID()})
-		}
-	}
-
-	slices.SortFunc(all, func(a, b held) int {
-		if c := a.ip.Compare(b.ip); c != 0 {
-			return c
-		}
-
-		return cmp.Compare(a.id, b.id)
-	})
-
-	var out [][]types.NodeID
-
-	for i := 0; i < len(all); {
-		j := i + 1
-		for j < len(all) && all[j].ip == all[i].ip {
-			j++
-		}
-
-		if j-i > 1 {
-			ids := make([]types.NodeID, 0, j-i)
-			for _, h := range all[i:j] {
-				ids = append(ids, h.id)
-			}
-
-			out = append(out, slices.Compact(ids))
-		}
-
-		i = j
-	}
-
-	return out
 }
 
 // addressPair reports whether a receiver sent capabilities is sent a rule
@@ -1306,13 +1138,12 @@ func (f *Filters) Census(receivers Receivers) (FallbackCensus, error) {
 // censusCount is a census of the rules: the grants' but the self rules,
 // the self rules by owner and in all, and what those were counted under:
 // each self grant's template, held weakly so an older document does not
-// stay alive through the census, and the addresses shared.
+// stay alive through the census.
 type censusCount struct {
 	grants     reasonCounts
 	selfCounts *graph.Map[uint, reasonCounts]
 	selfTotal  reasonCounts
 	selfGrants []weak.Pointer[GrantTemplate]
-	shared     *sharing
 }
 
 // selfGrantsOf is t's self grant templates by position, weakly.
@@ -1356,16 +1187,15 @@ func sameReasonCounts(a, b reasonCounts) bool { return a == b }
 // followCensus gives f a base to count its census from: prev's census, or
 // the one prev would count from, with the owners of moved, the nodes whose
 // facts or roles moved since prev, marked. A self rule's form reads its
-// owner's nodes, their roles, what they share and its template alone, so
-// the base holds while the addresses shared are carried unchanged and no
-// self grant's template moved; else f counts every owner.
+// owner's nodes, their roles and its template alone, so the base holds
+// while no self grant's template moved; else f counts every owner.
 func (f *Filters) followCensus(prev *Filters, moved []types.NodeID) {
 	base := prev.censusFrom
 	if n := prev.counted.Load(); n != nil {
 		base = &censusBase{of: n, dirty: graph.NewMap[uint](graph.Same[struct{}], nil)}
 	}
 
-	if base == nil || f.shared.Load() == nil || f.shared.Load() != base.of.shared || !slices.Equal(base.of.selfGrants, selfGrantsOf(f.t)) {
+	if base == nil || !slices.Equal(base.of.selfGrants, selfGrantsOf(f.t)) {
 		return
 	}
 
@@ -1399,7 +1229,7 @@ func (f *Filters) countRules() (*censusCount, error) {
 		return nil, err
 	}
 
-	n := &censusCount{grants: f.countGrants(x), selfGrants: selfGrantsOf(f.t), shared: x.sharing()}
+	n := &censusCount{grants: f.countGrants(x), selfGrants: selfGrantsOf(f.t)}
 
 	if b := f.censusFrom; b != nil {
 		n.selfTotal = b.of.selfTotal
@@ -1506,7 +1336,7 @@ func (x *Expansion) selfCount(uid uint) reasonCounts {
 				case ruleForm(false, ipr.proto) != reasonNone:
 					n[ruleForm(false, ipr.proto)]++
 				default:
-					n[x.selfForm(ipr.proto, src, uid, named[k] == namedAll)]++
+					n[x.selfForm(ipr.proto, src)]++
 				}
 			}
 		}

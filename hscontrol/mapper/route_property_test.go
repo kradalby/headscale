@@ -1054,27 +1054,12 @@ func (r *scenarioRun) countWakes(j int) {
 // protocol without ports, whose sources capability form writes as
 // addresses; a via grant, whose tags' holders are named when anything of
 // it moved; a self destination, whose owners are named in every form
-// unless every source goes as their capability; an address two nodes
-// hold, which turns a selector's capability into addresses. "plain" is
-// none of them. A class goes, and the law covers it, when its key does.
+// unless every source goes as their capability. "plain" is none of them.
+// A class goes, and the law covers it, when its key does.
 func ruleClass(w policymodel.World) string {
 	// TODO(kradalby): overwake/ssh-changed-nodes.
 	if len(w.Policy.SSH) > 0 {
 		return "ssh"
-	}
-
-	held := map[netip.Addr]bool{}
-
-	for _, n := range w.Topology.Nodes {
-		for _, a := range n.Addrs() {
-			// TODO(kradalby): overwake/owner-sharing-flip,
-			// overwake/delta-address-holders.
-			if held[a] {
-				return "shared-address"
-			}
-
-			held[a] = true
-		}
 	}
 
 	portless := func(p int) bool { return slices.Contains([]string{"icmp", "ipv6-icmp", "gre"}, policymodel.Protos[p]) }

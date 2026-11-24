@@ -36,7 +36,6 @@ import (
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
-	"tailscale.com/wgengine/filter"
 )
 
 // officialHostinfo is what a current Tailscale client reports of itself,
@@ -1008,7 +1007,6 @@ func reasonConst(r ipReason) string {
 	return map[ipReason]string{
 		reasonAddressMode: "reasonAddressMode", reasonClient: "reasonClient", reasonLocalNets: "reasonLocalNets",
 		reasonCapGrant: "reasonCapGrant", reasonPortless: "reasonPortless", reasonLiteral: "reasonLiteral",
-		reasonSharedAddress: "reasonSharedAddress",
 	}[r]
 }
 
@@ -1048,14 +1046,6 @@ var sensitivityFixtures = map[ipReason]sensitivityFixture{
 	reasonLiteral: {
 		policy:   `{"tagOwners": {"tag:web": ["alice@example.com"]}, "grants": [{"src": ["100.64.0.0/24"], "dst": ["tag:web"], "ip": ["tcp:443"]}]}`,
 		receiver: "web1",
-	},
-	reasonSharedAddress: {
-		// db1, outside group:eng, holds alice's IPv4 address; the client
-		// asks the node it indexed last, db1.
-		policy: `{"groups": {"group:eng": ["alice@example.com"]}, "tagOwners": {"tag:web": ["alice@example.com"], "tag:db": ["alice@example.com"]},
-			"grants": [{"src": ["group:eng"], "dst": ["tag:web", "tag:db"], "ip": ["tcp:443"]}]}`,
-		receiver: "web1",
-		tweak:    func(n types.Nodes) { n[3].IPv4 = new(netip.MustParseAddr("100.64.0.1")) },
 	},
 }
 
@@ -1221,70 +1211,6 @@ func TestSourceCapNamespaceReserved(t *testing.T) {
 
 	plain := tailcfg.NodeCapMap{nodecap.SSH: nil}
 	require.Equal(t, fmt.Sprintf("%p", plain), fmt.Sprintf("%p", WithStamps(plain, nil)), "nothing to add or drop keeps the map")
-}
-
-// TestStampNotionsUnderSharedAddresses works out what "holds a selector"
-// must mean for the client's lookup to agree with address form, with the
-// probe harness. db1, outside group:eng, holds alice's IPv4 address and
-// an IPv6 address of its own; web1 receives group:eng's rule.
-//
-//   - Stamped by membership, sent capabilities: the client asks db1, which
-//     it indexed last, about the shared address and refuses alice there:
-//     narrower than address form.
-//   - Stamped as the sides count holding, a member's address included: db1
-//     is admitted from its own IPv6 address too: wider than address form.
-//   - Stamped by membership, the selector sent as addresses wherever a
-//     node outside holds a member's address (reasonSharedAddress): alike.
-//
-// With no address shared, membership is exact: every address of a member
-// is a source, and no address of a non-member is.
-func TestStampNotionsUnderSharedAddresses(t *testing.T) { //nolint:paralleltest // switches a fallback off
-	f := sensitivityFixtures[reasonSharedAddress]
-	db1v6 := netip.MustParseAddr("fd7a:115c:a1e0::14")
-
-	t.Run("membership, address form where shared", func(t *testing.T) {
-		require.True(t, f.probe(t).equivalent())
-	})
-
-	fallbacksOff[reasonSharedAddress] = true
-
-	defer func() { fallbacksOff[reasonSharedAddress] = false }()
-
-	t.Run("membership", func(t *testing.T) {
-		p := f.probe(t)
-		require.False(t, p.equivalent())
-
-		for _, d := range p.report.Verdicts {
-			require.Equalf(t, canaryAlice, d.Probe.Src, "only the shared address differs: %v", d.Probe)
-			require.Equal(t, filter.Accept, d.Ref)
-			require.Equal(t, filter.Drop, d.Cand, "narrower, never wider")
-		}
-	})
-
-	t.Run("holding a member's address", func(t *testing.T) {
-		cm := f.model(t)
-		id := cm.byName(t, f.receiver)
-
-		ip, err := cm.ip.ForNode(id, ReceiverFacts{})
-		require.NoError(t, err)
-
-		capForm, err := cm.cap.ForNode(id, cm.receivers.Of(id))
-		require.NoError(t, err)
-
-		nm := cm.netmapOf(id)
-		for i, p := range nm.Peers {
-			if p.Name() == "db1" {
-				n := p.AsStruct()
-				n.CapMap = tailcfg.NodeCapMap{capGroupEng: nil}
-				nm.Peers[i] = n.View()
-			}
-		}
-
-		p := probeCapForm(ip, capForm, nm)
-		require.True(t, slices.ContainsFunc(p.report.Verdicts, func(d policymodel.VerdictDiff) bool {
-			return d.Probe.Src == db1v6 && d.Ref == filter.Drop && d.Cand == filter.Accept
-		}), "db1 admitted from its own address: %s", p.report)
-	})
 }
 
 // TestCensusCountsEachReceiverOnce counts receivers whose node and

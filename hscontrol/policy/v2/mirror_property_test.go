@@ -96,7 +96,7 @@ func TestMayBeAddressFormCoversReceiverForm(t *testing.T) {
 //     some rule of the grant as addresses whatever its source (an app
 //     capability rule or a companion, an ip rule over a protocol without
 //     ports);
-//   - selfCapabilityOnly(grant, owner): true only if capFormSelf, cut for
+//   - selfCapabilityOnly(grant, naming): true only if capFormSelf, cut for
 //     each of the owner's nodes, writes every self rule as the owner's
 //     capability; and true wherever it does, but for grants with an app
 //     capability, which it declines outright;
@@ -116,7 +116,7 @@ func TestMayBeAddressFormCoversReceiverForm(t *testing.T) {
 //     It holds only while the local-nets reason stands (counted apart).
 //
 // Oracle: sourceForm and the slow paths, in the same package; they share
-// the cut's inputs (expansion, postings, sharing).
+// the cut's inputs (expansion, postings).
 func TestFormShortcutsAgreeWithSourceForm(t *testing.T) {
 	var (
 		shapes shapeTally
@@ -186,9 +186,9 @@ func shortcutsDiffer(w policymodel.World, off []ipReason, tally *changeTally) st
 	return ""
 }
 
-// identityTraits is an unshared identity source: what sourceForm decides
-// for a rule's own reasons alone.
-var identityTraits = sourceTraits{kind: SelectorGroup}
+// identityKind is an identity source: what sourceForm decides for a rule's
+// own reasons alone.
+var identityKind = SelectorGroup
 
 // shortcutMode is the mode every shortcut held here serves.
 var shortcutMode = CapabilitySources
@@ -202,13 +202,13 @@ func addressPairDiffers(st *stage, _ *Expansion, tally *changeTally) string {
 		var why []string
 
 		if gt.app != nil {
-			if r := sourceForm(shortcutMode, eligible, true, nil, identityTraits); r != reasonNone {
+			if r := sourceForm(shortcutMode, eligible, true, nil, identityKind); r != reasonNone {
 				why = append(why, "the app rule goes as addresses ("+r.String()+")")
 			}
 		}
 
 		for _, ipr := range gt.ip {
-			if r := sourceForm(shortcutMode, eligible, false, ipr.proto, identityTraits); r != reasonNone {
+			if r := sourceForm(shortcutMode, eligible, false, ipr.proto, identityKind); r != reasonNone {
 				why = append(why, fmt.Sprintf("the ip rule over %v goes as addresses (%s)", ipr.proto, r))
 			}
 		}
@@ -241,7 +241,7 @@ func selfShortcutsDiffer(st *stage, x *Expansion, tally *changeTally) string {
 				return fmt.Sprintf("grant %d, owner %d: selfNamed's shortcut names %v, the rules by address %v: %s", g, uid, named, want, grantJSON(gt))
 			}
 
-			only := x.selfCapabilityOnly(g, uid, named)
+			only := x.selfCapabilityOnly(g, named)
 			cut, capable := false, true
 
 			for _, id := range st.posts.Nodes(OwnerRole(uid)) {
@@ -324,9 +324,9 @@ func stampTableDiffers(st *stage, x *Expansion, tally *changeTally) string {
 		}
 
 		capable := slices.ContainsFunc(gt.ip, func(ipr ipRule) bool {
-			return sourceForm(shortcutMode, eligible, false, ipr.proto, identityTraits) == reasonNone
+			return sourceForm(shortcutMode, eligible, false, ipr.proto, identityKind) == reasonNone
 		})
-		app := gt.app != nil && sourceForm(shortcutMode, eligible, true, nil, identityTraits) == reasonNone
+		app := gt.app != nil && sourceForm(shortcutMode, eligible, true, nil, identityKind) == reasonNone
 
 		for _, id := range gt.srcs {
 			if table.Selector(id).Kind.HoldsNodes() && (capable || app) {

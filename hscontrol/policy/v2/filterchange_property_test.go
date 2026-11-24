@@ -394,11 +394,6 @@ func unmovedNamed(a, b *stage, id types.NodeID) string {
 		// an address a destination gained or lost only where the
 		// receiver's own reach of the rule moved.
 		return "holds an address a destination gained or lost"
-	case ownerSharingFlipped(a, b, is):
-		// TODO(kradalby): overwake/owner-sharing-flip: delete this case
-		// when filterRoute.self in expand.go names an owner whose sharing
-		// flipped only in the form whose rules the flip moves.
-		return "owner sharing flipped"
 	case selfOwnerMoved(a, b, is):
 		// TODO(kradalby): overwake/self-owners-every-form: delete this case
 		// when filterRoute.self and selfAddressOnly in expand.go, and
@@ -417,18 +412,6 @@ func unmovedNamed(a, b *stage, id types.NodeID) string {
 // facts did.
 func deltaHolder(a, b *stage, id types.NodeID) bool {
 	return movedSubjects(a, b)[id]
-}
-
-// ownerSharingFlipped reports whether n is an owner node one of whose
-// user's nodes began or stopped sharing an address with a node not theirs.
-func ownerSharingFlipped(a, b *stage, n types.NodeView) bool {
-	if !n.User().Valid() || n.IsTagged() {
-		return false
-	}
-
-	uid := n.User().ID()
-
-	return a.cap.sharing().ownerShared[uid] != b.cap.sharing().ownerShared[uid]
 }
 
 // TestFiltersChangedSoundPreciseAndCarried drives each scenario's filters
@@ -655,7 +638,7 @@ func selfOwnerMoved(a, b *stage, n types.NodeView) bool {
 		}
 
 		na, nb := xa.selfRules(g, uid).named, xb.selfRules(g, uid).named
-		if !xa.selfCapabilityOnly(g, uid, na) || !xb.selfCapabilityOnly(g, uid, nb) ||
+		if !xa.selfCapabilityOnly(g, na) || !xb.selfCapabilityOnly(g, nb) ||
 			!slices.Equal(na, nb) || !slices.Equal(xa.srcIDs(g), xb.srcIDs(g)) {
 			return true
 		}

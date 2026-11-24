@@ -177,7 +177,7 @@ chunks](policy.md#filter-chunks) send, from one snapshot:
 
 The reasons, described in [Where addresses stay](policy.md#where-addresses-stay), are `address-mode` (the option is
 off), `literal` (addresses by nature), `local-nets` (routes, app connector or service IP), `client`, `cap-grant` (app
-capabilities), `portless` (other protocols) and `shared-address`. The same counts are exported as
+capabilities) and `portless` (other protocols). The same counts are exported as
 `headscale_policy_address_form_receivers{reason}`, `headscale_policy_address_form_rules{reason}`,
 `headscale_policy_address_form_filters_cut_total{reason}`, `headscale_policy_address_form_rules_cut_total{reason}` and
 `headscale_policy_filter_deliveries_total{delivery}`; `headscale_policy_capability_sources_enabled` is 1 with the option

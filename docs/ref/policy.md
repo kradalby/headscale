@@ -351,7 +351,6 @@ Headscale sends a source as addresses wherever the client cannot match it as a c
 - A rule granting app capabilities (`app` in a grant, such as `tailscale.com/cap/drive`): the client grants them by
   address only.
 - A rule naming a protocol other than TCP, UDP, SCTP and ICMP: the client matches those by address only.
-- A selector a node outside it shares an address with a member. Headscale's allocator never hands out shared addresses.
 
 Apart from the first, these follow the client's current behaviour and are tracked to be lifted
 ([tailscale/tailscale#12542](https://github.com/tailscale/tailscale/issues/12542)). `/debug/capability-sources` counts

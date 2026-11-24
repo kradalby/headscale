@@ -423,47 +423,6 @@ func hostLANs() *netipx.IPSet {
 	return s
 }
 
-// TestCanaryCapLookupOneNodePerAddress pins that, when two nodes hold the
-// same address, the client decides a capability source by one of them:
-// the one its netmap lists last, whatever the other holds. Address form
-// admits the address whoever holds it. Fallback: reasonSharedAddress.
-func TestCanaryCapLookupOneNodePerAddress(t *testing.T) {
-	t.Parallel()
-
-	rules := []tailcfg.FilterRule{{
-		SrcIPs:   []string{capSourcePrefix + string(canaryCap)},
-		DstPorts: web1Dsts(443, 443),
-		IPProto:  []int{6},
-	}}
-	web1 := netip.MustParseAddr("100.64.0.10")
-
-	verdict := func(peerOrder ...int) filter.Response {
-		nodes := exampleNodes()
-		nodes[0].CapMap = tailcfg.NodeCapMap{canaryCap: nil}
-		nodes[3].CapMap = nil
-		// db1 holds alice's IPv4 address besides its own IPv6 one.
-		nodes[3].Addresses = []netip.Prefix{netip.PrefixFrom(canaryAlice, 32), netip.MustParsePrefix("fd7a:115c:a1e0::14/128")}
-
-		peers := make([]*tailcfg.Node, 0, len(peerOrder))
-		for _, i := range peerOrder {
-			peers = append(peers, nodes[i])
-		}
-
-		f := canaryBackend(t, canaryNetmap(t, nodes[2], peers, rules), &ipn.Prefs{WantRunning: true})
-
-		return runIn(f, ipproto.TCP, canaryAlice, web1, 443)
-	}
-
-	if got := verdict(3, 0); got != filter.Accept {
-		t.Fatalf("setup: with the cap holder listed last, %s connects: %v, want Accept", canaryAlice, got)
-	}
-
-	if got := verdict(0, 3); got != filter.Drop {
-		t.Errorf("with a node lacking the cap listed last, %s connects: %v; the client now checks every node holding "+
-			"a source address, so fallback reasonSharedAddress can be reconsidered", canaryAlice, got)
-	}
-}
-
 // TestCanaryCapLookupForgetsAddressOnRemoval pins the delta path of the
 // lookup: a peer removed as a delta takes its addresses out of the index,
 // and another peer holding one of them is not indexed again, so a

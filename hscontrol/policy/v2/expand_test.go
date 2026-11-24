@@ -1686,10 +1686,10 @@ func TestSSHPolicyAfreshFillsNoCache(t *testing.T) {
 // joinWork is what the served pipeline did for one join or leave:
 // allocations and bytes, and its own counters.
 type joinWork struct {
-	allocs, bytes                             uint64
-	cuts, resolutions, members, sorts, routed uint64
-	copied                                    uint64
-	named, viewers                            int
+	allocs, bytes                      uint64
+	cuts, resolutions, members, routed uint64
+	copied                             uint64
+	named, viewers                     int
 }
 
 // measureChurn registers joins, or deletes nodes it joined, under
@@ -1762,8 +1762,8 @@ func measureChurn(t *testing.T, n int, leave bool, routers int) joinWork {
 		require.NoError(t, err)
 	}
 
-	read := func() [5]uint64 {
-		return [5]uint64{FilterCuts(), resolutionsBuilt.Load(), membersExpanded.Load(), sharingScans.Load(), routedNodes.Load()}
+	read := func() [4]uint64 {
+		return [4]uint64{FilterCuts(), resolutionsBuilt.Load(), membersExpanded.Load(), routedNodes.Load()}
 	}
 
 	// copied counts the entries the pipeline's group lists copied, each a
@@ -1862,13 +1862,12 @@ func measureChurn(t *testing.T, n int, leave bool, routers int) joinWork {
 		w.cuts += is[0] - was[0]
 		w.resolutions += is[1] - was[1]
 		w.members += is[2] - was[2]
-		w.sorts += is[3] - was[3]
-		w.routed += is[4] - was[4]
+		w.routed += is[3] - was[3]
 		w.copied += copied - wasCopied
 		w.named, w.viewers = named, viewers
 	}
 
-	for _, v := range []*uint64{&w.allocs, &w.bytes, &w.cuts, &w.resolutions, &w.members, &w.sorts, &w.routed, &w.copied} {
+	for _, v := range []*uint64{&w.allocs, &w.bytes, &w.cuts, &w.resolutions, &w.members, &w.routed, &w.copied} {
 		*v /= rounds
 	}
 
@@ -1893,7 +1892,6 @@ func TestJoinWorkWithRouters(t *testing.T) {
 
 	for _, w := range []joinWork{small, large} {
 		assert.Equal(t, uint64(2), w.cuts, "the subject's filter and the router's are cut")
-		assert.Zero(t, w.sorts, "no node's addresses are sorted")
 	}
 
 	assert.Equal(t, small.resolutions, large.resolutions, "the router's cut resolves every selector, at any size")
@@ -1903,15 +1901,14 @@ func TestJoinWorkWithRouters(t *testing.T) {
 // TestCensusAfterJoinCostsWhatMoved pins that a metrics scrape landing
 // after a join, before any routing or read of the new filters, counts the
 // census from the one scraped before: no owner's self rules but the
-// joiner's are counted again, no node's addresses are sorted and no
-// selector resolved, and the scrape allocates alike at 100 and at 10,000
+// joiner's are counted again, no selector resolved, and the scrape allocates alike at 100 and at 10,000
 // nodes.
 func TestCensusAfterJoinCostsWhatMoved(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds a 10,000 node tailnet")
 	}
 
-	type censusWork struct{ allocs, owners, sorts, resolutions uint64 }
+	type censusWork struct{ allocs, owners, resolutions uint64 }
 
 	measure := func(n int) censusWork {
 		const pol = `{"groups": {"group:small": ["small@"]},
@@ -1973,7 +1970,7 @@ func TestCensusAfterJoinCostsWhatMoved(t *testing.T) {
 			recv = recv.Update(m.nodes, caps)
 			f = FollowFiltersFor(CapabilitySources, f, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
 
-			counts := [3]uint64{ownerCounts.Load(), sharingScans.Load(), resolutionsBuilt.Load()}
+			counts := [2]uint64{ownerCounts.Load(), resolutionsBuilt.Load()}
 
 			runtime.GC()
 
@@ -1988,8 +1985,7 @@ func TestCensusAfterJoinCostsWhatMoved(t *testing.T) {
 
 			w.allocs += after.Mallocs - before.Mallocs
 			w.owners += ownerCounts.Load() - counts[0]
-			w.sorts += sharingScans.Load() - counts[1]
-			w.resolutions += resolutionsBuilt.Load() - counts[2]
+			w.resolutions += resolutionsBuilt.Load() - counts[1]
 
 			want, err := f.Uncached().Census(recv)
 			require.NoError(t, err)
@@ -2006,7 +2002,6 @@ func TestCensusAfterJoinCostsWhatMoved(t *testing.T) {
 
 	for _, w := range []censusWork{small, large} {
 		assert.Zero(t, w.owners, "no census counts every owner")
-		assert.Zero(t, w.sorts, "no node's addresses are sorted")
 		assert.Zero(t, w.resolutions, "no selector is resolved")
 	}
 
@@ -2031,8 +2026,8 @@ func groupCopies[G comparable](a, b *graph.Map[G, []types.NodeID]) uint64 {
 // H): in capability mode one join, or one leave, under a policy whose
 // subject has the same viewers at any size costs the served pipeline the
 // same at 100 and at 10,000 nodes. It names the subject alone, cuts its
-// filter alone (a leaver's is not cut), builds no selector's resolution and
-// sorts no node's addresses; its allocations do not grow with the tailnet.
+// filter alone (a leaver's is not cut) and builds no selector's
+// resolution; its allocations do not grow with the tailnet.
 // Its bytes do, by what the posting and holder lists the subject enters or
 // leaves copy: each is a sorted slice, copied on edit.
 func TestJoinWorkFollowsChange(t *testing.T) {
@@ -2058,7 +2053,6 @@ func TestJoinWorkFollowsChange(t *testing.T) {
 				assert.Equal(t, uint64(1), w.routed, "routing visits the subject alone")
 				assert.Zero(t, w.resolutions, "no selector's members are expanded")
 				assert.Zero(t, w.members)
-				assert.Zero(t, w.sorts, "no node's addresses are sorted")
 			}
 
 			assert.Equal(t, small.viewers, large.viewers, "test sanity: the subject has the same viewers at both sizes")

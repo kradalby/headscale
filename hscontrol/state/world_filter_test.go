@@ -1436,13 +1436,6 @@ func TestWorldNarrowRoutingFollowsEachFallback(t *testing.T) {
 
 	const self = `{"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]}]}`
 
-	moveAddress := func(id types.NodeID, ip string) func(*world) {
-		return func(w *world) {
-			_, ok := w.UpdateNode(id, func(n *types.Node) { n.IPv4 = new(netip.MustParseAddr(ip)) })
-			require.True(t, ok)
-		}
-	}
-
 	setPolicy := func(src string) func(*world) {
 		return func(w *world) {
 			_, err := w.SetPolicy([]byte(src), noCheck)
@@ -1465,13 +1458,6 @@ func TestWorldNarrowRoutingFollowsEachFallback(t *testing.T) {
 			name: "self/local-nets", policy: self, owner: true,
 			into: hostinfoOf(2, func(hi *tailcfg.Hostinfo) { hi.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.9.0.0/24")} }),
 			out:  hostinfoOf(2, func(hi *tailcfg.Hostinfo) { hi.RoutableIPs = nil }),
-		},
-		{
-			// bob's node takes the address of alice's: her self rules go
-			// as addresses while another user's node holds one of hers.
-			name: "self/shared-address", policy: self, owner: true,
-			into: moveAddress(5, "100.64.0.1"),
-			out:  moveAddress(5, "100.64.0.5"),
 		},
 		{
 			name: "client",
@@ -1516,13 +1502,6 @@ func TestWorldNarrowRoutingFollowsEachFallback(t *testing.T) {
 				_, ok := w.UpdateNode(2, func(n *types.Node) { n.ApprovedRoutes = nil })
 				require.True(t, ok)
 			},
-		},
-		{
-			// bob's node takes alice's address: group:eng is sent as
-			// addresses while a non-member holds a member's.
-			name: "shared-address",
-			into: moveAddress(5, "100.64.0.1"),
-			out:  moveAddress(5, "100.64.0.5"),
 		},
 	}
 

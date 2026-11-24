@@ -317,18 +317,11 @@ type Expansion struct {
 	ownersOnce sync.Once
 	owners     []uint
 
-	// share gives the addresses nodes share, which capability form reads:
-	// the filters the expansion serves work it out from the ones they
-	// follow. Without, it is found from list.
-	share func() *sharing
-
 	mu   sync.Mutex
 	self map[selfKey]*ownRules
 
-	// list is the node list the postings were built from, which capability
-	// form reads for the addresses nodes share; caps is what it needs
-	// beyond address form, built on first use.
-	list     views.Slice[types.NodeView]
+	// caps is what capability form needs beyond address form, built on
+	// first use.
 	capsOnce sync.Once
 	caps     *capInfo
 }
@@ -499,10 +492,10 @@ var (
 )
 
 // ServedWorkForTest returns, for tests outside the package, the selector
-// resolutions served filters built, the members those listed, and the
-// times every node's addresses were sorted, in that order.
-func ServedWorkForTest() (uint64, uint64, uint64) {
-	return resolutionsBuilt.Load(), membersExpanded.Load(), sharingScans.Load()
+// resolutions served filters built and the members those listed, in that
+// order.
+func ServedWorkForTest() (uint64, uint64) {
+	return resolutionsBuilt.Load(), membersExpanded.Load()
 }
 
 // rulePos numbers a rule in the list a filter is cut from: by grant, then
@@ -883,12 +876,6 @@ type Filters struct {
 	// fresh is [Filters.Fresh], once asked for.
 	fresh atomic.Pointer[Filters]
 
-	// shared is which selectors and owners nodes share an address across,
-	// in capability mode: carried from the filters these follow when no
-	// node that moved holds an address another node holds, else found from
-	// the list when first read.
-	shared atomic.Pointer[sharing]
-
 	// census is [Filters.Census] less the receivers, counted once: from
 	// censusFrom when set, else from every owner. counted is its count,
 	// for the filters that follow, once done. censusFrom is set when f is
@@ -950,7 +937,6 @@ func FollowFiltersFor(mode SourceMode, prev *Filters, t *Templates, posts Postin
 		// What moved since prev: the nodes whose facts or roles did.
 		moved := slices.Concat(graph.Changes(prev.sides.from, sides.from), graph.Changes(prev.posts.byRole.In, posts.byRole.In))
 
-		f.followSharing(prev, moved)
 		f.followCensus(prev, moved)
 	}
 
@@ -998,52 +984,9 @@ func (f *Filters) expansion() (*Expansion, error) {
 		expansionBuilds.Add(1)
 
 		f.x, f.err = NewExpansion(f.t, f.posts, f.routes, f.node)
-		if f.x != nil {
-			f.x.list, f.x.share = f.nodes, f.sharing
-		}
 	})
 
 	return f.x, f.err
-}
-
-// followSharing gives f prev's addresses shared, unless a node whose
-// facts or roles moved holds an address another node holds at either end,
-// which is the only way what nodes share, or whose roles they cross, can
-// move. Such a node leaves f to find them from the list when first read.
-func (f *Filters) followSharing(prev *Filters, moved []types.NodeID) {
-	sh := prev.shared.Load()
-	if sh == nil {
-		return
-	}
-
-	for _, id := range moved {
-		for _, end := range [2]*Filters{prev, f} {
-			n, ok := end.node(id)
-			if !ok {
-				continue
-			}
-
-			for _, ip := range n.IPs() {
-				if ids, _ := end.sides.byAddr.Groups.Get(ip); len(ids) > 1 {
-					return
-				}
-			}
-		}
-	}
-
-	f.shared.Store(sh)
-}
-
-// sharing returns which selectors and owners nodes share an address
-// across, found from the list unless carried over.
-func (f *Filters) sharing() *sharing {
-	if sh := f.shared.Load(); sh != nil {
-		return sh
-	}
-
-	f.shared.CompareAndSwap(nil, findSharing(f.nodes, f.posts, f.t.table().Len()))
-
-	return f.shared.Load()
 }
 
 // node looks id up in the sorted node list.
@@ -2256,32 +2199,6 @@ func (r *filterRoute) self(g int, gt *GrantTemplate, all bool) {
 				}
 			}
 		}
-
-		// An owner whose node began or stopped sharing an address with a
-		// node not theirs is sent its rules in the other form.
-		//
-		// TODO(kradalby): overwake/owner-sharing-flip: such an owner's nodes
-		// are named in every form, though the flip moves only the rules a
-		// shared address sends as addresses (an owner node sharing an
-		// address with another user's node that joins or leaves). Safe: a
-		// recut. Fixing it takes naming them in the form whose self rules the
-		// flip moves. The flip exists because the client asks one node per
-		// address (LocalBackend.srcIPHasCapForFilter,
-		// https://github.com/tailscale/tailscale/blob/f7c1b8e52600c1926623b29c91972a5ea1364d2f/ipn/ipnlocal/local.go); tracking
-		// https://github.com/tailscale/tailscale/issues/12542. Tolerated by unmovedNamed ("owner
-		// sharing flipped") in TestFiltersChangedSoundPreciseAndCarried and by
-		// the shared-address class of ruleClass in
-		// TestSessionsFollowGeneratedScenarios.
-		if r.caps {
-			was, is := r.xo.capForms().ownerShared, r.xn.capForms().ownerShared
-			for _, m := range [2]map[uint]bool{was, is} {
-				for uid := range m {
-					if was[uid] != is[uid] {
-						owners[uid] = struct{}{}
-					}
-				}
-			}
-		}
 	}
 
 	if len(owners) == 0 {
@@ -2333,7 +2250,7 @@ func (r *filterRoute) selfAddressOnly(g int, uid uint) bool {
 		}
 
 		named[end] = x.selfNamed(g, uid)
-		if !x.selfCapabilityOnly(g, uid, named[end]) {
+		if !x.selfCapabilityOnly(g, named[end]) {
 			return false
 		}
 	}
@@ -2750,9 +2667,8 @@ func (x *Expansion) capGrantRules(gt *GrantTemplate, ge *grantExpansion, rc rece
 // dstPorts returns the destinations of a rule of gt over ports that reach
 // rc, in the compile's order: by destination, address, then port. byRole
 // tells a receiver without routes inside an identity destination by its
-// membership where no node outside the destination holds a member's
-// address, which then decides it alike, so capability form need not
-// resolve the destination.
+// membership, which decides it alike as no two nodes hold one address, so
+// capability form need not resolve the destination.
 func (x *Expansion) dstPorts(gt *GrantTemplate, ports []tailcfg.PortRange, rc receiver, byRole bool) []tailcfg.NetPortRange {
 	var out []tailcfg.NetPortRange
 
@@ -2771,7 +2687,7 @@ func (x *Expansion) dstPorts(gt *GrantTemplate, ports []tailcfg.PortRange, rc re
 				add("*")
 			}
 		case s.Kind.HoldsNodes():
-			if !rc.routed && byRole && !x.capForms().shared[id] {
+			if !rc.routed && byRole {
 				if rs, _ := x.posts.byRole.In.Get(rc.n.ID()); rs.Has(SelectorRole(id)) {
 					for _, ip := range rc.ips {
 						add(ip.String())
@@ -3284,7 +3200,7 @@ func (x *Expansion) capFormSelf(rules []formRule, g int, gt *GrantTemplate, rc r
 				continue
 			}
 
-			why := x.selfForm(ipr.proto, src, uid, named[k] == namedAll)
+			why := x.selfForm(ipr.proto, src)
 			if why != reasonNone {
 				byAddress(func(o ownRule) bool { return o.ip == ip && o.src == src }, why)
 
@@ -3318,7 +3234,7 @@ func (x *Expansion) capFormSelf(rules []formRule, g int, gt *GrantTemplate, rc r
 	app := ruleForm(true, nil)
 	for k, src := range srcs {
 		if app == reasonNone && named[k] != namedNone {
-			app = x.selfForm(nil, src, uid, named[k] == namedAll)
+			app = x.selfForm(nil, src)
 		}
 	}
 
