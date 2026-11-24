@@ -510,16 +510,23 @@ const renderShards = 16
 type renderPoint int
 
 const (
-	// renderDecided is where end has read how far its shard was routed and
-	// chosen what to do, before it records anything.
+	// renderDecided is where end has decided and recorded what to do with
+	// a render, its shard's lock still held.
 	renderDecided renderPoint = iota
 	// routingDrained is where a routing has taken a shard's renders and
-	// not yet moved the shard on.
+	// moved the shard on, its lock still held.
 	routingDrained
 )
 
 type renderShard struct {
+	logShard
+
 	mu sync.Mutex
+}
+
+// logShard is a shard's log as plain data: each of its methods decides and
+// records in one call, which the shard's lock holds whole.
+type logShard struct {
 	// routed is the snapshot the last routing went to.
 	routed *state.Snapshot
 	// done are the renders finished since then, of snapshots past it, for
@@ -565,27 +572,32 @@ func (l *renderLog) at(p renderPoint, sh *renderShard) {
 func (l *renderLog) end(s *Session, snap *state.Snapshot, ok bool) (uint64, bool) {
 	sh := l.shard(s)
 	sh.mu.Lock()
-
-	routed := sh.routed
-	past := routed != nil && routed.Rev() > snap.Rev()
-
+	routed := sh.end(s.NodeID, snap, ok)
 	l.at(renderDecided, sh)
-
-	switch {
-	case past:
-	case !ok:
-		sh.failed = append(sh.failed, s.NodeID)
-	case routed == nil || routed.Rev() != snap.Rev():
-		sh.done = append(sh.done, renderDone{id: s.NodeID, snap: snap})
-	}
-
 	sh.mu.Unlock()
 
-	if !past {
+	if routed == nil {
 		return 0, false
 	}
 
 	return routed.Rev(), !ok || l.set(snap.Rev(), routed.Rev()).has(snap, routed, s.NodeID)
+}
+
+// end records that id rendered snap, or failed to, unless a routing went
+// past snap: then it records nothing and returns where that routing went.
+func (sh *logShard) end(id types.NodeID, snap *state.Snapshot, ok bool) *state.Snapshot {
+	routed := sh.routed
+
+	switch {
+	case routed != nil && routed.Rev() > snap.Rev():
+		return routed
+	case !ok:
+		sh.failed = append(sh.failed, id)
+	case routed == nil || routed.Rev() != snap.Rev():
+		sh.done = append(sh.done, renderDone{id: id, snap: snap})
+	}
+
+	return nil
 }
 
 // set returns the reach set of revisions from and to, made if need be.
@@ -687,6 +699,16 @@ func (sh *renderShard) between(l *renderLog, out []types.NodeID, weigh []renderD
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
+	out, weigh = sh.visit(out, weigh, from, to)
+	l.at(routingDrained, sh)
+
+	return out, weigh
+}
+
+// visit hands the routing from `from` to `to` the shard's failed renders,
+// to wake, and its renders of a snapshot strictly between, to weigh; it
+// keeps the renders past `to`, and moves the shard there.
+func (sh *logShard) visit(out []types.NodeID, weigh []renderDone, from, to *state.Snapshot) ([]types.NodeID, []renderDone) {
 	out = append(out, sh.failed...)
 	sh.failed = nil
 
@@ -713,9 +735,6 @@ func (sh *renderShard) between(l *renderLog, out []types.NodeID, weigh []renderD
 
 	clear(sh.done[len(kept):])
 	sh.done = kept
-
-	l.at(routingDrained, sh)
-
 	sh.routed = to
 
 	return out, weigh

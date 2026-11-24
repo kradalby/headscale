@@ -10308,8 +10308,8 @@ func TestHubRenderLogCases(t *testing.T) {
 		mid := hh.transient("transient")
 		to := s.Snapshot()
 
-		// The routing runs where end has read how far its shard was routed,
-		// if the shard's lock lets it: it must not, or it must be seen.
+		// The routing runs where end has decided, if the shard's lock lets
+		// it: it must not, or it must be seen.
 		sh := hh.h.renders.shard(hh.sessions[ids[0]])
 		routed := false
 		hh.h.renders.hook = func(p renderPoint, _ *renderShard) {
@@ -10339,9 +10339,9 @@ func TestHubRenderLogCases(t *testing.T) {
 		mid := hh.transient("transient")
 		to := s.Snapshot()
 
-		// The render ends where the routing has taken the session's shard's
-		// renders and not moved the shard on, if the shard's lock lets it:
-		// it must not, or the render must be weighed.
+		// The render ends where the routing has visited the session's shard,
+		// if the shard's lock lets it: it must not, or the render must be
+		// weighed.
 		sh := hh.h.renders.shard(hh.sessions[ids[0]])
 		rendered := false
 		hh.h.renders.hook = func(p renderPoint, at *renderShard) {

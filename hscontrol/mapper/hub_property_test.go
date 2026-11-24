@@ -36,8 +36,8 @@ const (
 	watchIdle watchAt = iota
 	// watchLoad: about to load the latest snapshot and route to it.
 	watchLoad
-	// watchShard: the routing has moved every shard before shard on and
-	// holds shard's lock, its renders taken, the shard not yet moved.
+	// watchShard: the routing has moved every shard up to shard on and
+	// holds shard's lock.
 	watchShard
 	// watchRouted: the routing moved every shard, advanced the caches,
 	// ended the sessions of deleted nodes and woke what it reached.
