@@ -162,8 +162,6 @@ type steerGrant struct {
 	tags []SelectorID
 	src  []Role
 	dsts []SelectorID
-	// wildcardSrc is set when "*" is among the sources.
-	wildcardSrc bool
 	// internet is set when the destinations name autogroup:internet;
 	// internetAlias when they name it or *; appOnly for a capability
 	// without ip, which never reaches the internet.
@@ -464,10 +462,6 @@ func steerGrants(p *sidePlan) ([]steerGrant, bool) {
 		st := steerGrant{via: g.HasVia(), appOnly: len(g.InternetProtocols) == 0 && len(g.App) > 0}
 
 		for _, a := range g.Sources {
-			if _, ok := a.(Asterix); ok {
-				st.wildcardSrc = true
-			}
-
 			if id, ok := lookup(a); ok {
 				st.src = p.atoms(id, ctxResolveOK, st.src)
 			}
@@ -3080,13 +3074,10 @@ type SidesReport struct {
 
 	Covering, Covered                          int
 	SingleFamily, ExitOneFamily, Exit          int
-	PublicRoute, InsideApproved                int
+	PublicRoute                                int
 	TaggedWithUser, ViaTargets, ViaRouterOnSrc int
 	Steered, RoutesKept                        int
 	AsymmetricPeers                            int
-	// WildcardSteerOutside counts steering pairs under a via plan with a
-	// "*" source whose viewer has an address outside the tailnet ranges.
-	WildcardSteerOutside int
 }
 
 // Add adds o's counts to r.
@@ -3102,14 +3093,12 @@ func (r *SidesReport) Add(o SidesReport) {
 	r.ExitOneFamily += o.ExitOneFamily
 	r.Exit += o.Exit
 	r.PublicRoute += o.PublicRoute
-	r.InsideApproved += o.InsideApproved
 	r.TaggedWithUser += o.TaggedWithUser
 	r.ViaTargets += o.ViaTargets
 	r.ViaRouterOnSrc += o.ViaRouterOnSrc
 	r.Steered += o.Steered
 	r.RoutesKept += o.RoutesKept
 	r.AsymmetricPeers += o.AsymmetricPeers
-	r.WildcardSteerOutside += o.WildcardSteerOutside
 }
 
 // AuditSides checks a's sides, classes and via plan against builds from
@@ -3292,13 +3281,7 @@ func auditRouteAccess(a SidesAudit, oracle *PolicyManager, rep *SidesReport) err
 }
 
 func auditSteering(a SidesAudit, oracle *PolicyManager, rep *SidesReport) error {
-	wildcard := slices.ContainsFunc(a.Templates.sidePlan().steer, func(st steerGrant) bool { return st.wildcardSrc })
-
 	for _, viewer := range a.List.All() {
-		outside := slices.ContainsFunc(viewer.IPs(), func(ip netip.Addr) bool {
-			return !tsaddr.CGNATRange().Contains(ip) && !tsaddr.TailscaleULARange().Contains(ip)
-		})
-
 		for _, peer := range a.List.All() {
 			want := oracle.ViaRoutesForPeer(viewer, peer)
 			got := a.Via.Steer(a.Sides, viewer, peer, a.Via.StaticPrimary)
@@ -3311,10 +3294,6 @@ func auditSteering(a SidesAudit, oracle *PolicyManager, rep *SidesReport) error 
 
 			if len(got.Include)+len(got.Exclude) > 0 {
 				rep.Steered++
-			}
-
-			if wildcard && outside && viewer.ID() != peer.ID() && len(peer.SubnetRoutes())+len(peer.ExitRoutes()) > 0 {
-				rep.WildcardSteerOutside++
 			}
 		}
 	}
@@ -3371,10 +3350,6 @@ func countShapes(a SidesAudit, rep *SidesReport) {
 
 		if slices.ContainsFunc(f.routes, func(p netip.Prefix) bool { return util.HasInternetDestination(prefixSet(p)) }) {
 			rep.PublicRoute++
-		}
-
-		if f.approvedAddr && !slices.ContainsFunc(f.ips, asterixResolved().Contains) {
-			rep.InsideApproved++
 		}
 
 		if n.IsTagged() && (n.User != nil || n.UserID != nil) {
