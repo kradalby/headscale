@@ -37,9 +37,12 @@ const (
 	watchIdle watchAt = iota
 	// watchLoad: about to load the latest snapshot and route to it.
 	watchLoad
-	// watchShard: the routing has moved every shard up to shard on and
-	// holds shard's lock.
-	watchShard
+	// watchLoaded: the routing loaded its snapshot and worked out Route's
+	// answer; the render log is as it was.
+	watchLoaded
+	// watchDrained: the routing took the render log's renders and moved
+	// every shard on; nothing advanced, nobody woken.
+	watchDrained
 	// watchRouted: the routing moved every shard, advanced the caches,
 	// ended the sessions of deleted nodes and woke what it reached.
 	watchRouted
@@ -47,7 +50,6 @@ const (
 
 type watchPoint struct {
 	at       watchAt
-	shard    int
 	from, to uint64
 	between  int
 }
@@ -56,8 +58,10 @@ func (p watchPoint) String() string {
 	switch p.at {
 	case watchLoad:
 		return "load"
-	case watchShard:
-		return fmt.Sprintf("shard %d", p.shard)
+	case watchLoaded:
+		return "loaded"
+	case watchDrained:
+		return "drained"
 	case watchRouted:
 		return fmt.Sprintf("routed r%d→r%d", p.from, p.to)
 	case watchIdle:
@@ -71,12 +75,14 @@ func (p watchPoint) String() string {
 // point and wait for it to be handed back, so the watcher and the test
 // goroutine never run at once and which runs between two points is the
 // test's choice. The points are before the watcher loads a snapshot
-// (beforeRoute), after it visited a shard the test marks (the render log's
-// routingDrained, under that shard's lock) and once it woke what the
-// routing reached (routed). Shard 0 and the last shard are always marked
-// and hold no session (see [hubMachine.admit]): stopped there, the routing
-// has loaded and computed its answer but visited no session's shard, or
-// visited every one but advanced nothing and woken nobody.
+// (beforeRoute), once it loaded one and worked out Route's answer
+// (loaded), once it took the render log's renders and moved every shard
+// (drained), and once it woke what the routing reached (routed). No point
+// holds a lock, so a render ends, as a session's own goroutine would end
+// it, wherever the watcher stands; a render's end and a shard's visit are
+// each one critical section, and for a session only whether its end comes
+// before or after its own shard's visit decides anything, which loaded
+// and drained both reach.
 //
 // Commits wake the watcher through a subscription holding one wake-up.
 // Between routings the watcher waits at routed rather than on its
@@ -92,9 +98,6 @@ type steppedWatcher struct {
 	resume chan struct{}
 	quit   chan struct{}
 
-	mu     sync.Mutex
-	waitAt map[int]bool
-
 	// token is set by a commit the watcher has not taken the wake-up of.
 	token bool
 	// held is set while it is idle at routed, its goroutine parked.
@@ -102,40 +105,19 @@ type steppedWatcher struct {
 	// loaded is what the routing in progress loaded; routed what the last
 	// one routed to.
 	loaded, routed *state.Snapshot
-
-	// decided, when set, runs where a render's end has decided, if the
-	// render's shard is not locked there.
-	decided func(sh *renderShard)
 }
 
 func newSteppedWatcher(t pbtT, h *Hub, s *state.State) *steppedWatcher {
 	w := &steppedWatcher{
 		t: t, h: h, s: s,
 		parked: make(chan watchPoint), resume: make(chan struct{}), quit: make(chan struct{}),
-		waitAt: map[int]bool{0: true, renderShards - 1: true},
 	}
 
 	h.beforeRoute = func() { w.park(watchPoint{at: watchLoad}) }
+	h.loaded = func() { w.park(watchPoint{at: watchLoaded}) }
+	h.drained = func() { w.park(watchPoint{at: watchDrained}) }
 	h.routed = func(from, to uint64, between int) {
 		w.park(watchPoint{at: watchRouted, from: from, to: to, between: between})
-	}
-	h.renders.hook = func(p renderPoint, sh *renderShard) {
-		switch p {
-		case routingDrained:
-			i := shardIndex(h, sh)
-
-			w.mu.Lock()
-			wait := w.waitAt[i]
-			w.mu.Unlock()
-
-			if wait {
-				w.park(watchPoint{at: watchShard, shard: i})
-			}
-		case renderDecided:
-			if w.decided != nil && shardFree(sh) {
-				w.decided(sh)
-			}
-		}
 	}
 
 	h.Watch(s)
@@ -160,27 +142,6 @@ func newSteppedWatcher(t pbtT, h *Hub, s *state.State) *steppedWatcher {
 	}
 
 	return w
-}
-
-func shardIndex(h *Hub, sh *renderShard) int {
-	for i := range h.renders.shards {
-		if &h.renders.shards[i] == sh {
-			return i
-		}
-	}
-
-	return -1
-}
-
-// shardFree reports whether sh's lock is free: a render can end there now.
-func shardFree(sh *renderShard) bool {
-	if sh.mu.TryLock() {
-		sh.mu.Unlock()
-
-		return true
-	}
-
-	return false
 }
 
 // park runs on the watcher: it reports p and waits for the test.
@@ -218,7 +179,7 @@ func (w *steppedWatcher) await() {
 		}
 
 		w.routed = w.loaded
-	case watchIdle, watchShard:
+	case watchIdle, watchLoaded, watchDrained:
 	}
 }
 
@@ -275,13 +236,15 @@ func (w *steppedWatcher) step() bool {
 	return true
 }
 
-// routing reports whether a routing is part way through its shards.
-func (w *steppedWatcher) routing() bool { return w.at.at == watchShard }
+// routing reports whether a routing is part way.
+func (w *steppedWatcher) routing() bool {
+	return w.at.at == watchLoaded || w.at.at == watchDrained
+}
 
 // finish ends the routing in progress, if any, and leaves the watcher
 // idle or about to load.
 func (w *steppedWatcher) finish() {
-	for w.at.at == watchLoad || w.at.at == watchShard {
+	for w.at.at == watchLoad || w.routing() {
 		w.step()
 	}
 
@@ -293,17 +256,6 @@ func (w *steppedWatcher) finish() {
 // settle routes until the watcher is idle.
 func (w *steppedWatcher) settle() {
 	for w.step() {
-	}
-}
-
-// wait sets the shards the watcher stops at besides the first and last.
-func (w *steppedWatcher) wait(shards map[int]bool) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	w.waitAt = map[int]bool{0: true, renderShards - 1: true}
-	for i := range shards {
-		w.waitAt[i] = true
 	}
 }
 
@@ -339,8 +291,6 @@ type hubSess struct {
 
 func (s *hubSess) String() string { return fmt.Sprintf("s%d(n%d)", s.n, s.id) }
 
-func (s *hubSess) shard(h *Hub) *renderShard { return h.renders.shard(s.sess) }
-
 // hubMachine drives the real hub, its watcher stepped, against a State
 // written from a generated world, with sessions run by the test.
 type hubMachine struct {
@@ -374,8 +324,8 @@ type hubMachine struct {
 
 // hubPropertyReach counts the windows the schedules reached.
 type hubPropertyReach struct {
-	coalesced, logWoke, endWoke, endedPast, endedMidRouting, retried, firstNewer, decidedRouting int
-	events                                                                                       map[string]int
+	coalesced, logWoke, endWoke, endedPast, endedMidRouting, retried, firstNewer int
+	events                                                                       map[string]int
 	// wakes counts what woke each render that sent something.
 	wakes *wakeTally
 }
@@ -394,14 +344,12 @@ func (r hubPropertyReach) String() string {
 // endpoint write, which names only it and its readers; a write a client,
 // the HA prober or an operator makes through its production entry point;
 // a script's next move, its setup played when it is drawn); the watcher
-// moving to its next point (load, after a session's shard, routed); a
+// moving to its next point (load, loaded, drained, routed); a
 // session taking its wake and the latest snapshot; a session ending its
 // render, which may fail (a failure no snapshot explains, as Update's
 // error path ends it); a node's session admitted, its first map rendered
 // later; a session leaving or reconnecting; a node with a session opening
-// another, as a reconnect that overlaps its old stream does. Sessions end renders only where their shard's lock is
-// free; at the point a render's end decides, if its shard's lock were free
-// there (it is not), the watcher could finish a routing.
+// another, as a reconnect that overlaps its old stream does.
 //
 // It judges by rendering afresh, never by reading the hub's bookkeeping:
 // whenever no routing is part way, every live session that is not
@@ -420,7 +368,8 @@ func (r hubPropertyReach) String() string {
 //
 // What it cannot see: data races (the handoffs order everything; the
 // stress test runs under -race); preemption inside a render or between a
-// render's end and its wake; orderings inside one shard's visit.
+// render's end and its wake; orderings inside a render's end or a shard's
+// visit, each one critical section.
 func TestHubSessionsConvergeUnderDrawnSchedules(t *testing.T) {
 	t.Setenv(state.TestFilterChunksEnv, "false")
 
@@ -483,17 +432,6 @@ func runHubMachine(t *rapid.T, reach *hubPropertyReach, audits *auditLines) {
 	m.p.committed = func(before uint64) {
 		m.w.committed(before)
 	}
-	m.w.decided = func(*renderShard) {
-		// Only a render deciding outside its shard's lock gets here, and
-		// only a routing to come can run there.
-		if m.w.at.at != watchIdle && pbtChance(t, 2, "route-at-decision") {
-			t.Logf("a routing at the point a render's end decided")
-			m.w.finish()
-
-			m.reach.decidedRouting++
-		}
-	}
-
 	for _, n := range m.p.s.Snapshot().ListNodes().All() {
 		s := m.admit(n.ID())
 		m.take(s)
@@ -566,17 +504,6 @@ func runHubMachine(t *rapid.T, reach *hubPropertyReach, audits *auditLines) {
 
 // admit opens a session of id, its first map to be rendered.
 func (m *hubMachine) admit(id types.NodeID) *hubSess {
-	m.h.mu.Lock()
-	next := m.h.core.admitted + 1
-	m.h.mu.Unlock()
-
-	// Keep the first and last shard free of sessions, see [steppedWatcher].
-	for next%renderShards == 0 || next%renderShards == renderShards-1 {
-		m.h.Leave(m.h.Join(1<<40, func() {}))
-
-		next++
-	}
-
 	m.n++
 	s := &hubSess{n: m.n, id: id, first: true, capVer: capVer}
 
@@ -589,31 +516,14 @@ func (m *hubMachine) admit(id types.NodeID) *hubSess {
 	s.st.Attach(s.sess)
 
 	m.sess = append(m.sess, s)
-	m.shards()
 	m.t.Logf("%s admitted", s)
 
 	return s
 }
 
-// shards marks for the watcher to stop at the shards of the sessions
-// rendering: only they can end a render on either side of their shard's
-// visit.
-func (m *hubMachine) shards() {
-	at := map[int]bool{}
-
-	for _, s := range m.sess {
-		if s.took != nil {
-			at[shardIndex(m.h, s.shard(m.h))] = true
-		}
-	}
-
-	m.w.wait(at)
-}
-
 func (m *hubMachine) drop(s *hubSess) {
 	m.h.Leave(s.sess)
 	m.sess = slices.DeleteFunc(m.sess, func(o *hubSess) bool { return o == s })
-	m.shards()
 }
 
 // reap drops the sessions the hub ended that are not rendering, as poll's
@@ -761,7 +671,7 @@ func (m *hubMachine) flash(t *rapid.T) {
 	}
 
 	for _, s := range slices.Concat(took, inFlight) {
-		if s.took != nil && shardFree(s.shard(m.h)) && rapid.Bool().Draw(t, "ends") {
+		if s.took != nil && rapid.Bool().Draw(t, "ends") {
 			m.finish(s, true)
 		}
 	}
@@ -858,12 +768,11 @@ func (m *hubMachine) take(s *hubSess) {
 	}
 
 	s.took = m.p.s.Snapshot()
-	m.shards()
 	m.t.Logf("%s takes r%d", s, s.took.Rev())
 }
 
 func (m *hubMachine) finishAny(t *rapid.T) {
-	s := m.pickSess(t, func(s *hubSess) bool { return s.took != nil && shardFree(s.shard(m.h)) })
+	s := m.pickSess(t, func(s *hubSess) bool { return s.took != nil })
 	m.finish(s, s.first || !pbtChance(t, 4, "fail"))
 }
 
@@ -874,14 +783,8 @@ func (m *hubMachine) finish(s *hubSess, ok bool) {
 	took := s.took
 	s.took = nil
 
-	m.shards()
-
 	if m.w.routing() {
 		m.reach.endedMidRouting++
-
-		if m.w.at.shard == shardIndex(m.h, s.shard(m.h)) {
-			m.reach.events["ended-in-own-shard"]++
-		}
 	}
 
 	if took.Rev() < m.w.routed.Rev() {

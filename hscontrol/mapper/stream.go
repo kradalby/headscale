@@ -271,13 +271,16 @@ type Hub struct {
 
 	now func() time.Time
 
-	// beforeRoute and routed are test hooks, set before [Hub.Watch].
-	// beforeRoute runs before the watcher takes a commit's snapshot, so a
-	// slow one lets commits coalesce; routed runs once the watcher woke what
-	// a routing from revision from to revision to reached, with how many of
-	// those only the render log named.
-	beforeRoute func()
-	routed      func(from, to uint64, between int)
+	// beforeRoute, loaded, drained and routed are test hooks, set before
+	// [Hub.Watch]. beforeRoute runs before the watcher takes a commit's
+	// snapshot, so a slow one lets commits coalesce; loaded once it took
+	// one and worked out Route's answer, before the render log is visited;
+	// drained once every shard was visited; routed once the watcher woke
+	// what a routing from revision from to revision to reached, with how
+	// many of those only the render log named.
+	beforeRoute     func()
+	loaded, drained func()
+	routed          func(from, to uint64, between int)
 }
 
 // hubCore is what the hub decides sessions and peer history with. Its
@@ -960,7 +963,16 @@ func (h *Hub) route(last, snap *state.Snapshot) (state.Change, bool, map[types.N
 	all, wake := h.renders.answer(last, snap, change)
 
 	h.renders.routing(last, snap, all, wake)
+
+	if h.loaded != nil {
+		h.loaded()
+	}
+
 	between := h.renders.between(last, snap, all)
+
+	if h.drained != nil {
+		h.drained()
+	}
 
 	if all || len(between) == 0 {
 		return change, all, wake, 0
