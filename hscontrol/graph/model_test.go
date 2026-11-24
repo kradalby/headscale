@@ -17,12 +17,6 @@ var (
 	errCellPanic = errors.New("a cell panics")
 )
 
-// Counted exceptions: what the package does that its doc comments do not
-// say. Where one applies, the model or the property follows the package
-// and counts the case; each is pinned by a hand test that fails once the
-// package changes.
-const excPeekFirstZero = "graph/peek-first-zero"
-
 // Shapes the model names for the coverage floors though the behaviour they
 // mark is documented, so the floors stay meaningful.
 const shapeInputEqualKept = "input set to an equal value"

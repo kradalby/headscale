@@ -140,30 +140,16 @@ func (h *graphSUT) apply(c commitPlan, m graphModel) applied {
 // the latest snapshot's value, which before the first is an input's initial
 // value and a derived cell's zero value.
 func (h *graphSUT) peeks(tx *Tx, m graphModel, staged map[int]int, when string) {
-	for i, c := range h.plan.Cells {
+	for i := range h.plan.Cells {
 		want, ok := staged[i]
 		if !ok {
 			want = m.values[i]
 		}
 
 		got := Peek(tx, h.nodes[i])
-		if got == want {
-			continue
+		if got != want {
+			h.problems = append(h.problems, fmt.Sprintf("Peek of cell %d %s: %d, want %d", i, when, got, want))
 		}
-
-		// TODO(kradalby): graph/peek-first-zero: Peek in the first
-		// transaction returns the zero value of an input it did not set,
-		// not its initial value, which the first snapshot will hold;
-		// Peek's doc names only the latest snapshot. Counted here; delete
-		// with TestPeekInTheFirstUpdateSeesZero once the doc says, or Peek
-		// returns the initial value.
-		if m.rev == 0 && c.Input && !ok && got == 0 {
-			h.excepts[excPeekFirstZero]++
-
-			continue
-		}
-
-		h.problems = append(h.problems, fmt.Sprintf("Peek of cell %d %s: %d, want %d", i, when, got, want))
 	}
 }
 
@@ -1051,10 +1037,10 @@ func TestInputKeepsAValueItsEqualityCallsEqual(t *testing.T) {
 	}
 }
 
-// TestPeekInTheFirstUpdateSeesZero pins graph/peek-first-zero: before the
-// first snapshot Peek returns an input's zero value, not the initial value
-// the first snapshot holds.
-func TestPeekInTheFirstUpdateSeesZero(t *testing.T) {
+// TestPeekInTheFirstUpdateSeesTheInitialValue pins Peek's rule inside the
+// first Update: an input not yet set reads its initial value, so a
+// read-modify-write there starts from what the first snapshot will hold.
+func TestPeekInTheFirstUpdateSeesTheInitialValue(t *testing.T) {
 	g := New()
 	a := g.NewInput("a", 7, Same[int])
 
@@ -1069,8 +1055,8 @@ func TestPeekInTheFirstUpdateSeesZero(t *testing.T) {
 		t.Fatalf("first snapshot holds %d, want 7", s.Get(a))
 	}
 
-	if peeked != 0 {
-		t.Fatalf("Peek in the first update = %d: it now sees the initial value; see graph/peek-first-zero", peeked)
+	if peeked != 7 {
+		t.Fatalf("Peek in the first update = %d, want the initial value 7", peeked)
 	}
 }
 

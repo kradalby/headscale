@@ -193,23 +193,13 @@ func Set[T any](tx *Tx, in Input[T], v T) {
 
 // Peek returns the value of n as the transaction sees it: the staged
 // value of an input set earlier in tx, otherwise its value in the latest
-// snapshot.
+// snapshot, or, before the first, an input's initial value; a derived
+// cell has no value then and reads as the zero value.
 func Peek[T any](tx *Tx, n Node[T]) T {
 	if v, ok := tx.sets[int(n.ref())]; ok {
 		t, _ := v.(T)
 
 		return t
-	}
-
-	if tx.base == nil {
-		// TODO(kradalby): graph/peek-first-zero: before the first
-		// snapshot Peek returns the zero value of an input it did not
-		// set, not the initial value the first snapshot will hold; the
-		// doc names only the latest snapshot, of which there is none.
-		// Pinned by TestPeekInTheFirstUpdateSeesZero.
-		var zero T
-
-		return zero
 	}
 
 	return tx.base.Get(n)
@@ -251,6 +241,14 @@ func (g *Graph) update(fn func(tx *Tx) error, check func(*Snapshot) error) (*Sna
 	prev := g.snap.Load()
 	tx := &Tx{base: prev, sets: make(map[int]any)}
 
+	if prev == nil {
+		// Before the first snapshot Peek reads the initial values, so a
+		// read-modify-write there starts from what that snapshot will
+		// hold. Built per attempt: registration stays open until the
+		// first publication, so a later attempt may carry more cells.
+		tx.base = g.initialSnapshot()
+	}
+
 	err := fn(tx)
 	if err != nil {
 		return prev, false, err
@@ -279,6 +277,18 @@ func (g *Graph) update(fn func(tx *Tx) error, check func(*Snapshot) error) (*Sna
 	}
 
 	return next, true, nil
+}
+
+// initialSnapshot holds only the registered cells' initial values, the
+// values Peek reads before the first publication: a derived cell has no
+// value then and reads as the zero value.
+func (g *Graph) initialSnapshot() *Snapshot {
+	values := make([]any, len(g.cells))
+	for i, c := range g.cells {
+		values[i] = c.initial
+	}
+
+	return &Snapshot{values: values}
 }
 
 // commit builds the snapshot following prev with sets applied.
