@@ -384,6 +384,83 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 	return tc, nil
 }
 
+// SecondSessionClient is a second map session of share's node: the same
+// machine, node and disco keys, as a tailscaled whose previous stream is
+// still draining has when it reconnects. It registers through the same
+// Noise and registration path as any client — the node is not
+// duplicated — waits for its first map, and is cleaned up with tb.
+func SecondSessionClient(tb testing.TB, server *TestServer, name string, share *TestClient, hi *tailcfg.Hostinfo) *TestClient {
+	tb.Helper()
+
+	bus := eventbus.New()
+	tracker := health.NewTracker(bus)
+	dialer := tsdial.NewDialer(netmon.NewStatic())
+	dialer.SetBus(bus)
+	dialer.SetSystemDialerForTest(server.MemNet().Dial)
+
+	tc := &TestClient{
+		Name:       name,
+		server:     server,
+		machineKey: share.machineKey,
+		discoKey:   share.discoKey,
+		updates:    make(chan *netmap.NetworkMap, 64),
+		firstMap:   make(chan struct{}),
+		bus:        bus,
+		dialer:     dialer,
+		tracker:    tracker,
+
+		// The caller's hostinfo is sent as given, the caller's model of
+		// it being what the server must store.
+		unknownClient: true,
+	}
+
+	tc.logf = func(format string, args ...any) {
+		line := fmt.Sprintf(format, args...)
+		tb.Logf("%s", line)
+
+		tc.mu.Lock()
+		tc.registers, _ = testcapture.AppendRegisterLine(tc.registers, line)
+
+		// The poll logs a response's ControlTime before it applies it.
+		if strings.Contains(line, `{"controltime":`) {
+			tc.frames++
+			tc.stamped = true
+			tc.filterHeld = false
+		}
+		tc.mu.Unlock()
+	}
+
+	direct, err := tc.newDirect(share.Persist(), "", hi)
+	if err != nil {
+		tb.Fatalf("servertest: SecondSessionClient(%s): NewDirect: %v", name, err)
+	}
+
+	tc.direct = direct
+
+	tc.cleanupOnce = sync.OnceFunc(tc.cleanup)
+	tb.Cleanup(tc.cleanupOnce)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err = tc.tryLogin(ctx, controlclient.LoginDefault, nil)
+	if err != nil {
+		tb.Fatalf("servertest: SecondSessionClient(%s): %v", name, err)
+	}
+
+	tc.startPoll(tb)
+
+	select {
+	case <-tc.firstMap:
+	case <-tc.pollDone:
+		tb.Fatalf("servertest: SecondSessionClient(%s): its stream ended before a map", name)
+	case <-time.After(10 * time.Second):
+		tb.Fatalf("servertest: SecondSessionClient(%s): no map after 10s", name)
+	}
+
+	return tc
+}
+
 // NewAutoClient starts the control client tailscaled runs, a
 // [controlclient.Auto], logged in with a pre-auth key for user on the
 // server's in-memory network. Unlike a [TestClient], it decides itself when

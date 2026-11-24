@@ -92,6 +92,7 @@ const (
 	stepRace
 	stepClock
 	stepRecords
+	stepSecond
 	numSteps
 )
 
@@ -102,7 +103,7 @@ var fdJudges = []string{"stored", "client", "reference", "restart"}
 
 var stepNames = [numSteps]string{
 	"world", "burst", "flap", "poll restart", "client restart", "endpoints", "rename", "logout", "relogin", "server restart",
-	"ownership", "identity", "race", "clock", "records",
+	"ownership", "identity", "race", "clock", "records", "second session",
 }
 
 // fdNode is a model node's client and how it joined, which a login, a
@@ -117,6 +118,10 @@ type fdNode struct {
 	keyID    string
 	// loggedOut is set once its client logged out: it holds no node key.
 	loggedOut bool
+	// extras are further map sessions of the node this step opened: the
+	// same device's keys, polling beside tc until the step or the case
+	// ends them.
+	extras []*TestClient
 }
 
 // fdKeys is a node's tunnel keys as its client last registered with.
@@ -323,7 +328,7 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 	for i := range steps {
 		at := fmt.Sprintf("step %d", i+1)
 
-		kind := rapid.IntRange(0, 29).Draw(rt, "kind")
+		kind := rapid.IntRange(0, 30).Draw(rt, "kind")
 
 		switch {
 		case kind < 6:
@@ -356,6 +361,8 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 			fd.clockStep(at)
 		case kind == 29:
 			fd.recordsStep(at)
+		case kind == 30:
+			fd.sessionsStep(at)
 		}
 
 		fd.settle(at)
@@ -1517,6 +1524,143 @@ func (fd *frontDoor) recordsStep(at string) {
 		fd.run.tally.steps[stepNames[stepRecords]+": the policy's DERP region kept (refused: a token names several users)"]++
 	default:
 		fd.t.Fatalf("%s: the model's policy is not written back: %v", at, err)
+	}
+}
+
+// sessionsStep drives one node holding more than one live map session:
+// a second stream opened on the same device's identity while the first
+// still drains, a session ended while another of its node's lives, and
+// past the hub's limit, where the oldest stream is closed for the
+// newcomer. The model changes nothing — a node is online while any of
+// its sessions polls, and every client holds what a fresh session is
+// given, whatever the hub does with the streams it admits.
+func (fd *frontDoor) sessionsStep(at string) {
+	fd.run.tally.steps[stepNames[stepSecond]]++
+
+	n, ok := fd.pick("two-sessions", func(n policymodel.Node, nd *fdNode) bool {
+		return !n.Offline && !n.Expired && !nd.loggedOut && nd.tc.Polling()
+	})
+	if !ok {
+		fd.run.tally.steps[stepNames[stepSecond]+" (no node)"]++
+
+		return
+	}
+
+	nd := fd.nodes[n.ID]
+
+	switch rapid.IntRange(0, 2).Draw(fd.t, "sessions") {
+	case 0:
+		// A second stream beside the first, and a commit both must see.
+		fd.run.tally.steps[stepNames[stepSecond]+": a commit both streams must see"]++
+
+		extra := fd.secondClient(n)
+		nd.extras = append(nd.extras, extra)
+
+		fd.endpointCommit(at, nd)
+		fd.settle(at)
+
+		// Ending the extra must not take the node offline: its first
+		// session still polls.
+		extra.Disconnect(fd.tb)
+
+		nd.extras = nil
+
+		fd.quiet(at)
+
+	case 1:
+		// The first session ends while the second lives: the node must
+		// stay online, and the first must be able to come back.
+		fd.run.tally.steps[stepNames[stepSecond]+": one ended while another lives"]++
+
+		extra := fd.secondClient(n)
+		nd.extras = append(nd.extras, extra)
+
+		fd.settle(at)
+
+		nd.tc.Disconnect(fd.tb)
+		fd.settle(at)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		err := nd.tc.RestartPoll(ctx)
+		if err != nil {
+			fd.t.Fatalf("%s: n%d's first session does not come back: %v", at, n.ID, err)
+		}
+
+		extra.Disconnect(fd.tb)
+
+		nd.extras = nil
+
+		fd.quiet(at)
+
+	default:
+		// Past the limit: the fifth stream closes the oldest, the node
+		// stays online through the rest, and the evicted client does not
+		// thrash reconnecting.
+		fd.run.tally.steps[stepNames[stepSecond]+": past the limit, the oldest evicted"]++
+
+		for range 4 {
+			nd.extras = append(nd.extras, fd.secondClient(n))
+		}
+
+		fd.quiet(at)
+
+		if nd.tc.Polling() {
+			fd.t.Fatalf("%s: n%d holds %d live sessions, and its oldest stream is not closed for the newcomer", at, n.ID, len(nd.extras)+1)
+		}
+
+		fd.quiet(at)
+
+		if nd.tc.Polling() {
+			fd.t.Fatalf("%s: n%d's evicted stream came back on its own", at, n.ID)
+		}
+
+		for _, extra := range nd.extras {
+			extra.Disconnect(fd.tb)
+		}
+
+		nd.extras = nil
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		err := nd.tc.RestartPoll(ctx)
+		if err != nil {
+			fd.t.Fatalf("%s: n%d's evicted session does not come back: %v", at, n.ID, err)
+		}
+
+		fd.quiet(at)
+	}
+}
+
+// secondClient opens a further map session of node n on the same device
+// identity as its client, which stays open beside it.
+func (fd *frontDoor) secondClient(n policymodel.Node) *TestClient {
+	fd.t.Helper()
+
+	name := fmt.Sprintf("n%d-again-%d", n.ID, len(fd.nodes[n.ID].extras)+1)
+	tc := SecondSessionClient(fd.tb, fd.srv, name, fd.nodes[n.ID].tc, fd.hostinfo(n, true))
+
+	fd.run.tally.steps[stepNames[stepSecond]+": a second stream"]++
+
+	return tc
+}
+
+// endpointCommit has the node's client report new endpoints, as the
+// endpoints step does: a write through the map request path, so a commit
+// every one of the node's live sessions must see.
+func (fd *frontDoor) endpointCommit(at string, nd *fdNode) {
+	eps := fdEndpoints[rapid.IntRange(0, len(fdEndpoints)-1).Draw(fd.t, "endpoints")]
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	nd.tc.Direct().SetEndpoints(eps)
+
+	err := nd.tc.Direct().SendUpdate(ctx)
+	if err != nil {
+		fd.t.Fatalf("%s: %s reports endpoints: %v", at, nd.tc.Name, err)
 	}
 }
 

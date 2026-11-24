@@ -226,7 +226,12 @@ func (fd *frontDoor) judgeClients(at string) {
 
 	for _, n := range w.Topology.Nodes {
 		nd := fd.nodes[n.ID]
-		if polling := nd.tc.Polling(); client && polling == n.Offline {
+
+		// A node with several live sessions is online while any of them
+		// polls; the model says nothing of the sessions themselves.
+		polling := nd.tc.Polling() || slices.ContainsFunc(nd.extras, (*TestClient).Polling)
+
+		if client && polling == n.Offline {
 			fd.t.Fatalf("%s: n%d's client polls: %t; the model has it offline: %t", at, n.ID, polling, n.Offline)
 		}
 	}
@@ -290,6 +295,29 @@ func (fd *frontDoor) judgeClients(at string) {
 
 		if d := ref.Client(n.ID, nm, fd.capSources); d != "" {
 			fd.t.Fatalf("%s: n%d: reference: %s", at, n.ID, d)
+		}
+
+		// A second stream of the node is held to the same fresh session
+		// its first is: a commit the hub routed to the node must reach
+		// every live session of it.
+		for _, extra := range nd.extras {
+			if !extra.Polling() {
+				continue
+			}
+
+			if client {
+				fresh := freshNetmap(fd, snap, n.ID, extra.Persist())
+
+				fd.run.tally.clients++
+
+				if d := policymodel.NetmapDiff(extra.Netmap(), fresh, func() { fd.run.tally.unseen++ }); d != "" {
+					fd.t.Fatalf("%s: n%d's second stream, the server quiet, holds other than a fresh session of r%d is given: %s", at, n.ID, snap.Rev(), d)
+				}
+			}
+
+			if d := ref.Client(n.ID, extra.Netmap(), fd.capSources); d != "" {
+				fd.t.Fatalf("%s: n%d: reference: %s", at, n.ID, d)
+			}
 		}
 	}
 }
