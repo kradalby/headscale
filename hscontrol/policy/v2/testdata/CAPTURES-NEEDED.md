@@ -209,6 +209,19 @@ Each entry: headscale today / the other reading / what in the capture decides.
   twice (count `CapGrant` entries and values)?
 - **Headscale:** twice. Cosmetic.
 
+### S14 `routes-exit-node-public-destination` (routes, two captures a/b) — `Node.CanAccessRoutes`
+
+Capture `issue_3212/routes-b18` settled that an exit node is given the subnet routes behind
+the sources of a rule to `autogroup:internet`. Two neighbouring cases are not decided by
+it; headscale reads both wide.
+
+- **a:** `{"action": "accept", "src": ["10.0.0.0/8"], "dst": ["8.8.8.8:*"]}`, a rule to
+  one public address rather than to `autogroup:internet`. Is exit node charmander given
+  caterpie's 10.0.0.0/8? Headscale: yes (any destination overlapping the internet counts).
+- **b:** the b18 policy (`* -> autogroup:internet:*`) with an exit node approved for `::/0`
+  **only**. Is it given the IPv4 subnet routes behind the sources? Headscale: yes (an exit
+  node in either family counts).
+
 ## Behaviour questions (not single-shot policy captures)
 
 These need steps (`Capture.Steps`) or the admin API. If `tscap` cannot drive one, say so
