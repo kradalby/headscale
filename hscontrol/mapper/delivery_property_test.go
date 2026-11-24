@@ -149,6 +149,26 @@ func newRealClient(t pbtT) *realClient {
 func (c *realClient) apply(t pbtT, resp *tailcfg.MapResponse) *netmap.NetworkMap {
 	t.Helper()
 
+	c.send(t, resp)
+
+	select {
+	case c.nm = <-c.nms:
+	case err := <-c.done:
+		c.done <- err
+
+		t.Fatalf("the client refused a response: %v", err)
+	case <-time.After(time.Minute):
+		// A guard against a hang, never a decision.
+		t.Fatalf("the client applied no response")
+	}
+
+	return c.nm
+}
+
+// send writes resp to the client, which has read it when send returns.
+func (c *realClient) send(t pbtT, resp *tailcfg.MapResponse) {
+	t.Helper()
+
 	b, err := Marshal(resp)
 	if err != nil {
 		t.Fatalf("encoding a response: %v", err)
@@ -165,23 +185,7 @@ func (c *realClient) apply(t pbtT, resp *tailcfg.MapResponse) *netmap.NetworkMap
 
 		t.Fatalf("the client stopped reading: %v", err)
 	}
-
-	select {
-	case c.nm = <-c.nms:
-	case err := <-c.done:
-		c.done <- err
-
-		t.Fatalf("the client refused a response: %v", err)
-	case <-time.After(time.Minute):
-		// A guard against a hang, never a decision.
-		t.Fatalf("the client applied no response")
-	}
-
-	return c.nm
 }
-
-// ended waits for the client's long poll to return, and returns why.
-func (c *realClient) ended() error { return <-c.done }
 
 func (c *realClient) close() {
 	if c.closed {
@@ -191,7 +195,15 @@ func (c *realClient) close() {
 	c.closed = true
 
 	_ = c.body.CloseWithError(errClientStopped)
-	_ = c.ended()
+
+	// A case that failed before taking a response leaves the client handing
+	// over its netmap, which it does before it reads the closed body.
+	for ended := false; !ended; {
+		select {
+		case <-c.nms:
+		case _, ended = <-c.done:
+		}
+	}
 
 	_ = c.direct.Close()
 }
@@ -238,6 +250,32 @@ func (f freshSession) client(t pbtT) (*netmap.NetworkMap, policyv2.FilterChunks)
 	}
 
 	return nm, policyv2.FilterChunks{}.ApplyResponse(&resp)
+}
+
+// TestRealClientCloseEndsAClientHoldingANetmap closes a client whose last
+// response the test never took, as a failed case leaves one: the client
+// hands over the netmap it built from it before it reads again, and close
+// must end its session rather than wait for it.
+func TestRealClientCloseEndsAClientHoldingANetmap(t *testing.T) {
+	t.Parallel()
+
+	self := &tailcfg.Node{ID: 1, Name: "n1.headscale.test.", Key: key.NewNode().Public(), Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")}}
+	c := newRealClient(t)
+	c.send(t, &tailcfg.MapResponse{Node: self})
+
+	closed := make(chan struct{})
+
+	go func() {
+		c.close()
+		close(closed)
+	}()
+
+	select {
+	case <-closed:
+	case <-time.After(time.Minute):
+		// A guard against a hang, never a decision.
+		t.Fatal("close waits on a client that is handing over a netmap")
+	}
 }
 
 // TestCanaryClientMapSessionAcrossResponses pins, through [realClient],
