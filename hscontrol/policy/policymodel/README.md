@@ -101,7 +101,14 @@ go test ./hscontrol/mapper -run 'TestDeliveryConvergesThroughTheClient$' -rapid.
 
 # Soak: every property, fresh seeds, deep budgets, for hours
 tools/pbt-soak.sh . 8 6    # worktree, hours, workers; results in ./pbt-soak/, STOP there ends it
+# Smoke: every deep invocation once, its checks capped, proving the runner still works
+PBT_SOAK_SMOKE=1 tools/pbt-soak.sh .
 ```
+
+CI runs both (`.github/workflows/pbt-soak.yml`): a nightly soak for
+about an hour on the default branch, and the smoke on every pull request
+that touches the property layer or the code it tests. The runner exits
+non-zero when any run failed.
 
 A slice runs one judge at one level over one family of shapes, from the
 property's own code: judges left out are not run, and a case without the

@@ -415,6 +415,9 @@ a broken one.
   [`hscontrol/policy/policymodel/README.md`](hscontrol/policy/policymodel/README.md)
   before changing them or when one fails: how to replay a seed, run deep
   or soak, and why a failing seed is never fixed by widening a tolerance.
+  The soak's deep budgets run in CI nightly and as a per-pull-request
+  smoke (`.github/workflows/pbt-soak.yml`); the runner exits non-zero
+  when any run failed.
 - **Policy options in tests**: `policy.capability_sources` and
   `policy.filter_chunks` are on by default, and test binaries follow:
   each is on unless its switch, `HEADSCALE_TEST_CAPABILITY_SOURCES` or

@@ -92,7 +92,7 @@ add 3 "TestHubSessionsConvergeUnderConcurrency|mapper|-|60m|"
 add 1 "TestHubSessionsConvergeUnderConcurrency|mapper|-|60m|race"
 
 printf '%s\n' "${PLAN[@]}" | sort -u >"$OUT/plan.txt"
-echo "plan: $(wc -l <"$OUT/plan.txt") slots, ${SMOKE:+smoke,}$WORKERS workers, $( [ "$SMOKE" = 1 ] || echo "until $(date -d "@$END" '+%F %H:%M'), ")results in $OUT"
+echo "plan: $(wc -l <"$OUT/plan.txt") slots, ${PBT_SOAK_SMOKE:+smoke,}$WORKERS workers, $( [ "$SMOKE" = 1 ] || echo "until $(date -d "@$END" '+%F %H:%M'), ")results in $OUT"
 
 # run_slot runs one slot of the plan, appending its result. A smoke pass
 # caps the checks, so a deep invocation is proven without its deep cost.
