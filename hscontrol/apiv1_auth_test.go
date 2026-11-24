@@ -123,7 +123,7 @@ func TestAPIV1AuthApprove(t *testing.T) {
 		h := newAPIV1Harness(t)
 
 		authID := types.MustAuthID()
-		authReq := types.NewAuthRequest()
+		authReq := types.NewSSHCheckAuthRequest(1, 2)
 		require.NoError(t, h.app.state.SetAuthCacheEntry(authID, authReq))
 
 		body := fmt.Appendf(nil, `{"authId":%q}`, authID.String())
@@ -134,6 +134,26 @@ func TestAPIV1AuthApprove(t *testing.T) {
 
 		verdict := authReq.Verdict()
 		assert.True(t, verdict.Accept(), "approve must finish the session with a passing verdict")
+	})
+
+	// A registration is approved by auth register, which makes its node;
+	// finished here it would tell the client to start over.
+	t.Run("registration refused", func(t *testing.T) {
+		h := newAPIV1Harness(t)
+
+		authID := types.MustAuthID()
+		reg := types.NewRegisterAuthRequest(&types.RegistrationData{
+			MachineKey: key.NewMachine().Public(),
+			NodeKey:    key.NewNode().Public(),
+			Hostname:   "pending-login",
+		})
+		require.NoError(t, h.app.state.SetAuthCacheEntry(authID, reg))
+
+		body := fmt.Appendf(nil, `{"authId":%q}`, authID.String())
+		res := h.callHuma(http.MethodPost, "/api/v1/auth/approve", body)
+
+		assertStatus(t, res, http.StatusBadRequest)
+		assert.False(t, reg.IsFinished(), "the registration must stay pending")
 	})
 
 	// Malformed auth_id: AuthApprove returns codes.InvalidArgument → 400.
