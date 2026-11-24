@@ -567,6 +567,8 @@ func TestFiltersChangedCoversEveryMovedFilter(t *testing.T) {
 						continue
 					}
 
+					requireStartable(t, m.list)
+
 					us = after
 
 					next := FollowFiltersFor(mode, prev, m.t, m.posts, m.appr, m.list.ViewSlice(), m.sides)
@@ -1084,8 +1086,17 @@ func (g sideGen) tweak(nodes types.Nodes) types.Nodes {
 			n.Hostinfo.RoutableIPs = append(slices.Clone(n.Hostinfo.RoutableIPs), p)
 		}
 	case 0:
+		// Never one another node holds: NewState refuses a shared address.
 		v4, _ := g.addrs()
-		n.IPv4 = new(netip.MustParseAddr(g.pick(v4...)))
+		v4 = slices.DeleteFunc(v4, func(a string) bool {
+			return slices.ContainsFunc(nodes, func(o *types.Node) bool {
+				return o.ID != n.ID && slices.Contains(o.IPs(), netip.MustParseAddr(a))
+			})
+		})
+
+		if len(v4) > 0 {
+			n.IPv4 = new(netip.MustParseAddr(g.pick(v4...)))
+		}
 	case 1:
 		switch {
 		case len(n.Tags) == 0:

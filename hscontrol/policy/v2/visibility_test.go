@@ -1277,6 +1277,43 @@ func (g sideGen) node(id types.NodeID, others types.Nodes) *types.Node {
 // clientFacts draws, when g draws facts, what n's client reports of
 // itself: mostly the official client; else tailscale-rs, a client that
 // says nothing, or an app connector.
+// requireStartable fails when nodes hold what NewState refuses: a node
+// without an address, or two nodes holding one.
+func requireStartable(t *testing.T, nodes types.Nodes) {
+	t.Helper()
+
+	holder := map[netip.Addr]types.NodeID{}
+
+	for _, n := range nodes {
+		require.NotEmpty(t, n.IPs(), "node %d holds no address", n.ID)
+
+		for _, a := range n.IPs() {
+			if o, ok := holder[a]; ok {
+				t.Fatalf("nodes %d and %d both hold %s", o, n.ID, a)
+			}
+
+			holder[a] = n.ID
+		}
+	}
+}
+
+// TestSideGenDrawsWhatNewStateAccepts holds the side generators' edits to
+// what a started server can hold, over a pool most of whose addresses are
+// taken.
+func TestSideGenDrawsWhatNewStateAccepts(t *testing.T) {
+	g := sideGen{r: rand.New(rand.NewPCG(1, 2)), facts: rand.New(rand.NewPCG(3, 4))} //nolint:gosec // reproducible
+	nodes := types.Nodes{
+		sideNode(1, &sideUsers[0], "100.64.0.1", "", nil),
+		sideNode(2, &sideUsers[1], "100.64.0.2", "", nil),
+		sideNode(3, nil, "100.64.0.3", "", []string{"tag:a"}),
+	}
+
+	for range 500 {
+		nodes = g.tweak(nodes)
+		requireStartable(t, nodes)
+	}
+}
+
 func (g sideGen) clientFacts(n *types.Node) {
 	if g.facts == nil {
 		return
@@ -1511,6 +1548,8 @@ func TestSidesRandomDifferential(t *testing.T) {
 					if step > 0 {
 						was, wasList, wasVia := m.sides, m.list, m.via.Plan
 						m.step(t, us, g.step(m.list))
+						requireStartable(t, m.list)
+
 						keptPairs += requireRouteRulesSame(t, was, m.sides, wasList, m.list, wasVia, m.via.Plan,
 							"seed", seed, "round", round, "step", step)
 					}
