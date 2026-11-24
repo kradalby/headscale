@@ -2174,6 +2174,64 @@ func TestPollNetMapHandler_RejectsOversizedClientReport(t *testing.T) {
 	}
 }
 
+// TestPollNetMapHandler_RefusedReportKeepsLocalNets pins what a refused
+// report still leaves stored: its routes, capped, and its app connector
+// flag, which widen the client's local nets kept or not. A stream is
+// read-only, so a refused one keeps nothing.
+func TestPollNetMapHandler_RefusedReportKeepsLocalNets(t *testing.T) {
+	t.Parallel()
+
+	routes := make([]netip.Prefix, types.MaxRoutableIPs+1)
+	for i := range routes {
+		routes[i] = netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 0}), 24)
+	}
+
+	oversized := strings.Repeat("v", types.MaxHostinfoSize)
+
+	for _, tt := range []struct {
+		name      string
+		stream    bool
+		hi        tailcfg.Hostinfo
+		routes    []netip.Prefix
+		connector bool
+	}{
+		{name: "routes", hi: tailcfg.Hostinfo{OSVersion: oversized, RoutableIPs: routes}, routes: routes[:types.MaxRoutableIPs]},
+		{name: "app connector", hi: tailcfg.Hostinfo{OSVersion: oversized, AppConnector: "true"}, connector: true},
+		{name: "stream", stream: true, hi: tailcfg.Hostinfo{OSVersion: oversized, RoutableIPs: routes[:1], AppConnector: "true"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			app := createTestApp(t)
+			user := app.state.CreateUserForTest("refused-report")
+			node := putTestNodeInStore(t, app, user, "refused-report")
+			before, ok := app.state.GetNodeByID(node.ID)
+			require.True(t, ok)
+
+			ns := &noiseServer{headscale: app, machineKey: node.MachineKey}
+			rec := httptest.NewRecorder()
+			ns.PollNetMapHandler(rec, newMapRequest(t, tailcfg.MapRequest{
+				Version: tailcfg.CurrentCapabilityVersion, NodeKey: node.NodeKey,
+				Stream: tt.stream, OmitPeers: !tt.stream, Hostinfo: &tt.hi,
+			}))
+			require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code, "body=%q", rec.Body.String())
+
+			after, ok := app.state.GetNodeByID(node.ID)
+			require.True(t, ok)
+
+			if tt.routes == nil && !tt.connector {
+				assert.Equal(t, before, after, "a refused stream must not mutate the node")
+				return
+			}
+
+			assert.Equal(t, tt.routes, after.AnnouncedRoutes())
+			assert.Equal(t, tt.connector, after.Hostinfo().AppConnector().EqualBool(true))
+			assert.Equal(t, before.Hostinfo().OSVersion(), after.Hostinfo().OSVersion(), "the rest stays refused")
+			require.NoError(t, types.ValidateHostinfo(after.Hostinfo().AsStruct()), "what is kept fits the limits")
+		})
+	}
+}
+
 func TestPollNetMapHandler_UnknownNodeBeforeReportValidation(t *testing.T) {
 	t.Parallel()
 	app := createTestApp(t)

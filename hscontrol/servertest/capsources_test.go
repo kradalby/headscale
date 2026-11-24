@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -242,6 +243,145 @@ func TestCapabilitySourcesThroughClient(t *testing.T) {
 	})
 
 	requireHoldsFresh(t, srv, "capability form again", web)
+}
+
+func isCapSource(src string) bool { return strings.HasPrefix(src, "cap:") }
+
+// TestCapabilitySourcesRefusedReport: the client widens its local nets from
+// its own preferences whether or not the server keeps its report, so a
+// report refused for its size that starts announcing a route, or running as
+// an app connector, still sends the node addresses, over its live stream
+// and after a restart. The rest of the report stays refused.
+func TestCapabilitySourcesRefusedReport(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		widen func(*tailcfg.Hostinfo)
+	}{
+		{"announces a route", func(hi *tailcfg.Hostinfo) { hi.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.9.0.0/24")} }},
+		{"app connector", func(hi *tailcfg.Hostinfo) { hi.AppConnector.Set(true) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := servertest.NewServer(t, servertest.WithCapabilitySources())
+			setCapPolicy(t, srv, capSourcesPolicy)
+
+			ops := srv.CreateUser(t, "ops")
+			alice := srv.CreateUser(t, "alice")
+
+			web := servertest.NewClient(t, srv, "web", servertest.WithUser(ops), servertest.WithTags("tag:web"))
+			aIP := ipv4Of(t, servertest.NewClient(t, srv, "alice-laptop", servertest.WithUser(alice)))
+			id := findNodeID(t, srv, "web")
+
+			web.WaitForCondition(t, "capability form", 10*time.Second, func(nm *netmap.NetworkMap) bool {
+				return slices.Contains(capRuleSources(nm), "cap:"+capEng)
+			})
+
+			streams, _ := web.Stream()
+
+			hi := &tailcfg.Hostinfo{
+				BackendLogID: "servertest-web", Hostname: "web", GoVersion: "go1.27.3", IPNVersion: "1.94.1",
+				OSVersion: strings.Repeat("v", types.MaxHostinfoSize),
+			}
+			tc.widen(hi)
+			web.Direct().SetHostinfo(hi)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			require.ErrorContains(t, web.Direct().SendUpdate(ctx), "initial fetch failed 413")
+
+			web.WaitForCondition(t, "address form after the refusal", 10*time.Second, func(nm *netmap.NetworkMap) bool {
+				srcs := capRuleSources(nm)
+
+				return slices.Contains(srcs, aIP.String()) && !slices.ContainsFunc(srcs, isCapSource)
+			})
+
+			now, _ := web.Stream()
+			require.Equal(t, streams, now, "the refusal leaves the stream up")
+			require.True(t, web.Polling())
+
+			nv, ok := srv.State().GetNodeByID(id)
+			require.True(t, ok)
+			require.Empty(t, nv.Hostinfo().OSVersion(), "the rest of the report stays refused")
+
+			srv.Restart(t)
+
+			served, err := srv.State().Snapshot().FilterForNode(id)
+			require.NoError(t, err)
+			require.NotEmpty(t, served)
+
+			for _, r := range served {
+				require.False(t, slices.ContainsFunc(r.SrcIPs, isCapSource), "after a restart: %v", r.SrcIPs)
+			}
+		})
+	}
+}
+
+// netmapObserver is a [controlclient.Observer] handing seen each network
+// map the client receives.
+type netmapObserver func(*netmap.NetworkMap)
+
+func (seen netmapObserver) SetControlClientStatus(_ controlclient.Client, st controlclient.Status) {
+	if st.NetMap != nil {
+		seen(st.NetMap)
+	}
+}
+
+// TestAutoClientRefusedReportKeepsStream runs tailscaled's own control
+// client: a Hostinfo change goes out in a lite update of its own, which the
+// client retries when it is refused while its stream stays up, so the
+// address form reaches it over that stream.
+func TestAutoClientRefusedReportKeepsStream(t *testing.T) {
+	t.Parallel()
+
+	srv := servertest.NewServer(t, servertest.WithCapabilitySources())
+	setCapPolicy(t, srv, `{
+		"groups": {"group:eng": ["alice@"]},
+		"grants": [{"src": ["group:eng"], "dst": ["router@"], "ip": ["tcp:443"]}]
+	}`)
+
+	router := srv.CreateUser(t, "router")
+	alice := srv.CreateUser(t, "alice")
+	aIP := ipv4Of(t, servertest.NewClient(t, srv, "alice-laptop", servertest.WithUser(alice)))
+
+	var held atomic.Pointer[netmap.NetworkMap]
+
+	hi := &tailcfg.Hostinfo{BackendLogID: "servertest-auto-router", Hostname: "auto-router", GoVersion: "go1.27.3", IPNVersion: "1.94.1"}
+	auto := servertest.NewAutoClient(t, srv, router, hi.Clone(), netmapObserver(held.Store))
+
+	sources := func() []string {
+		if nm := held.Load(); nm != nil {
+			return capRuleSources(nm)
+		}
+
+		return nil
+	}
+
+	require.Eventually(t, func() bool { return slices.Contains(sources(), "cap:"+capEng) },
+		10*time.Second, 10*time.Millisecond, "capability form")
+
+	id := findNodeID(t, srv, "auto-router")
+	before, ok := srv.State().GetNodeByID(id)
+	require.True(t, ok)
+
+	refused := hi.Clone()
+	refused.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.9.0.0/24")}
+	refused.OSVersion = strings.Repeat("v", types.MaxHostinfoSize)
+	auto.SetHostinfo(refused)
+
+	require.Eventually(t, func() bool {
+		srcs := sources()
+
+		return slices.Contains(srcs, aIP.String()) && !slices.ContainsFunc(srcs, isCapSource)
+	}, 10*time.Second, 10*time.Millisecond, "address form over the stream")
+
+	after, ok := srv.State().GetNodeByID(id)
+	require.True(t, ok)
+	require.Equal(t, before.SessionEpoch(), after.SessionEpoch(), "no new stream: a stream carrying the report is refused too")
+	require.Empty(t, after.Hostinfo().OSVersion(), "the report was refused")
 }
 
 // TestCapabilitySourcesUnknownClient pins the client fallback: a node

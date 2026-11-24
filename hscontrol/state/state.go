@@ -4170,6 +4170,96 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 	return nil
 }
 
+// KeepRefusedLocalNets keeps, from a map request refused for its Hostinfo,
+// what widens node id's local nets past its own addresses: the routes it
+// announces, capped as an accepted report's are, when none are stored, and
+// that it runs as an app connector. Its client widens them from its own
+// preferences whether or not the report is kept, and such a node must be
+// sent addresses, not capability sources. The routes are announced as an
+// accepted report's are, to auto-approval too; the rest stays refused.
+func (s *State) KeepRefusedLocalNets(id types.NodeID, nodeKey key.NodePublic, refused *tailcfg.Hostinfo) error {
+	if refused == nil || len(refused.RoutableIPs) == 0 && !refused.AppConnector.EqualBool(true) {
+		return nil
+	}
+
+	var (
+		updateErr  error
+		kept, full bool
+	)
+
+	snap := s.world.update(func(nodes *nodeEdit) {
+		// A retried batch runs this again: set every result on each run.
+		updateErr, kept, full = nil, false, false
+
+		stored, ok := nodes.Get(id)
+		if !ok {
+			updateErr = fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, id)
+			return
+		}
+
+		if stored.NodeKey != nodeKey {
+			updateErr = ErrNodeKeyChanged
+			return
+		}
+
+		hi := cmp.Or(stored.Hostinfo.Clone(), &tailcfg.Hostinfo{})
+
+		routes := len(hi.RoutableIPs) == 0 && len(refused.RoutableIPs) > 0
+		if routes {
+			hi.RoutableIPs = slices.Clone(refused.RoutableIPs[:min(len(refused.RoutableIPs), types.MaxRoutableIPs)])
+		}
+
+		connector := !hi.AppConnector.EqualBool(true) && refused.AppConnector.EqualBool(true)
+		if connector {
+			prior := hi.AppConnector
+			hi.AppConnector.Set(true)
+
+			// The flag's bytes count against the stored report's size
+			// limit; routes count only by number.
+			if types.ValidateHostinfo(hi) != nil {
+				hi.AppConnector, connector, full = prior, false, true
+			}
+		}
+
+		if !routes && !connector {
+			return
+		}
+
+		node := *stored
+		node.Hostinfo = hi
+		node.ReportGen = s.reportSeq.Add(1)
+
+		if routes {
+			dropWithdrawnAutoApprovals(&node)
+			s.approveAnnouncedRoutes(&node)
+		}
+
+		nodes.Set(id, &node)
+
+		kept = true
+	})
+
+	if updateErr != nil {
+		return updateErr
+	}
+
+	if kept {
+		log.Info().Uint64(zf.NodeID, id.Uint64()).Msg("kept what widens the node's local nets from a refused Hostinfo")
+	}
+
+	if full {
+		log.Warn().Uint64(zf.NodeID, id.Uint64()).Msg("no room in the stored Hostinfo for a refused one's app connector flag")
+	}
+
+	node, ok := snap.GetNode(id)
+	if !ok {
+		return fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, id)
+	}
+
+	// A retry after a failed write persists what the first one kept.
+	return s.persistReport(node)
+}
+
 // persistReport writes the row of a node a map request updated, unless a
 // row write already covered every report the node holds. A no-op
 // MapRequest (identical re-send / reconnect with matching state) then

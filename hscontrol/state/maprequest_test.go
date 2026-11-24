@@ -1,6 +1,7 @@
 package state
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -1168,6 +1169,85 @@ func TestMapRequestAutoApprovalIsOneWrite(t *testing.T) {
 	assert.Contains(t, nv.SubnetRoutes(), route)
 
 	checkPeersMatchFullBuild(t, after)
+}
+
+// TestKeepRefusedLocalNetsAnnounces pins the trade of keeping a refused
+// report's routes: they are announced, so auto-approval approves them as
+// it would an accepted report's, and the approval is persisted.
+func TestKeepRefusedLocalNetsAnnounces(t *testing.T) {
+	s, ids := newAutoApproveTestState(t, nil)
+	route := netip.MustParsePrefix("10.55.1.0/24")
+
+	nv, ok := s.GetNodeByID(ids[0])
+	require.True(t, ok)
+
+	require.NoError(t, s.KeepRefusedLocalNets(ids[0], nv.NodeKey(), &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}))
+
+	nv, ok = s.GetNodeByID(ids[0])
+	require.True(t, ok)
+	assert.Contains(t, nv.SubnetRoutes(), route)
+
+	row, err := s.DB().GetNodeByID(ids[0])
+	require.NoError(t, err)
+	assert.Contains(t, row.ApprovedRoutes, route, "the approval must be persisted")
+}
+
+// TestKeepRefusedLocalNetsWithinLimits pins that what a refused report
+// leaves stored passes the limits an accepted one does, so the startup
+// check keeps it: routes beyond the count limit are cut, and a flag that
+// would take the stored report past its size limit is not kept, while
+// routes, counted only by number, still are.
+func TestKeepRefusedLocalNetsWithinLimits(t *testing.T) {
+	t.Run("routes", func(t *testing.T) {
+		dbPath, s, id := persistTestSetup(t)
+
+		nv, ok := s.GetNodeByID(id)
+		require.True(t, ok)
+
+		routes := make([]netip.Prefix, types.MaxRoutableIPs+1)
+		for i := range routes {
+			routes[i] = netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 0}), 24)
+		}
+
+		refused := &tailcfg.Hostinfo{RoutableIPs: routes}
+		require.Error(t, types.ValidateHostinfo(refused), "test sanity: refused for its routes")
+		require.NoError(t, s.KeepRefusedLocalNets(id, nv.NodeKey(), refused))
+		require.NoError(t, s.Close())
+
+		reloaded, ok := persistTestReopen(t, dbPath).GetNodeByID(id)
+		require.True(t, ok)
+		assert.Equal(t, routes[:types.MaxRoutableIPs], reloaded.AnnouncedRoutes())
+	})
+
+	t.Run("app connector", func(t *testing.T) {
+		_, s, id := persistTestSetup(t)
+		t.Cleanup(func() { _ = s.Close() })
+
+		nv, ok := s.GetNodeByID(id)
+		require.True(t, ok)
+
+		// A stored report exactly at the size limit.
+		hi := &tailcfg.Hostinfo{Hostname: nv.Hostname(), OSVersion: "v"}
+		encoded, err := json.Marshal(hi)
+		require.NoError(t, err)
+
+		hi.OSVersion = strings.Repeat("v", 1+types.MaxHostinfoSize-len(encoded))
+		require.NoError(t, s.UpdateNodeFromMapRequest(id, tailcfg.MapRequest{NodeKey: nv.NodeKey(), DiscoKey: nv.DiscoKey(), Hostinfo: hi}))
+
+		before, ok := s.GetNodeByID(id)
+		require.True(t, ok)
+		require.NoError(t, types.ValidateHostinfo(before.Hostinfo().AsStruct()))
+
+		route := netip.MustParsePrefix("10.9.0.0/24")
+		refused := &tailcfg.Hostinfo{AppConnector: "true", RoutableIPs: []netip.Prefix{route}}
+		require.NoError(t, s.KeepRefusedLocalNets(id, nv.NodeKey(), refused))
+
+		after, ok := s.GetNodeByID(id)
+		require.True(t, ok)
+		assert.False(t, after.Hostinfo().AppConnector().EqualBool(true), "no room for the flag")
+		assert.Equal(t, []netip.Prefix{route}, after.AnnouncedRoutes())
+		assert.NoError(t, types.ValidateHostinfo(after.Hostinfo().AsStruct()))
+	})
 }
 
 // TestMapRequestWithdrawingRoutesClearsUnhealthy pins that a node whose

@@ -853,7 +853,19 @@ func (ns *noiseServer) PollNetMapHandler(
 	// Reject before the session, the node or its peers keep the report.
 	err = types.ValidateHostinfo(mapRequest.Hostinfo)
 	if err != nil {
+		// Its client acts on its routes and app connector flag whether or
+		// not they are kept, and they decide its filter's form. A stream is
+		// read-only: its report may predate a later update.
+		if !mapRequest.Stream {
+			keepErr := ns.headscale.state.KeepRefusedLocalNets(nv.ID(), mapRequest.NodeKey, mapRequest.Hostinfo)
+			if keepErr != nil {
+				log.Warn().Uint64(zf.NodeID, nv.ID().Uint64()).Err(keepErr).
+					Msg("keeping the local nets of a refused Hostinfo")
+			}
+		}
+
 		httpError(writer, NewHTTPError(http.StatusRequestEntityTooLarge, err.Error(), err))
+
 		return
 	}
 
