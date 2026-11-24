@@ -219,8 +219,11 @@ headscale/
   session is sent its filter (`FilterDelivery`). Its `TODO(capsrc/<reason>)`
   lines are matched byte-exact by `TestFallbackReasonsComplete`: do not
   reword them.
-- **DNS ownership**: `Config.DNSView` freezes startup DNS settings, including
-  MagicDNS reverse routes. Runtime readers of the client-facing DNS config use
+- **DNS ownership**: `Config.DNSView` freezes startup DNS settings: the
+  wire config, the base domain and the challenge provider's `Isolates`
+  predicate. It carries no reverse routes — clients answer reverse
+  lookups for the Tailscale ranges themselves. Runtime readers of the
+  client-facing DNS config use
   `Snapshot.DNS`; only extra records change after construction. Wire and debug
   serializers get owned copies. The DNS-01 challenge config (`DNSChallenge`)
   stays on `Config`, except the provider's `Isolates` predicate, which the view
