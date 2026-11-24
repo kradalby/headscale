@@ -3296,6 +3296,12 @@ func (s *State) HandleNodeFromAuthPath(
 	// resolve to a single node rather than racing the find-then-create section.
 	defer s.lockRegistration(machineKey)()
 
+	// An approval that held the lock first may have decided the login since
+	// it was looked up.
+	if regEntry.IsFinished() {
+		return types.NodeView{}, hsdb.ErrNodeNotFoundRegistrationCache
+	}
+
 	all := s.Snapshot().GetNodesByMachineKeyAllUsers(machineKey)
 
 	// Named conditions - describe WHAT we found, not HOW we check it.
