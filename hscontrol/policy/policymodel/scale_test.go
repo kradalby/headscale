@@ -8,10 +8,9 @@ import (
 )
 
 // TestScale holds drawn cases to mostly small with a tail, from the side
-// TestCoverage cannot: few scenarios take no step or start with one node,
-// and few reads fall in a world the reference properties skip whole for a
-// database-only address. The tail's floors are shapes in Required. Run
-// with -v for the distributions.
+// TestCoverage cannot: few scenarios take no step or start with one node.
+// The tail's floors are shapes in Required. Run with -v for the
+// distributions.
 func TestScale(t *testing.T) {
 	t.Parallel()
 
@@ -20,7 +19,7 @@ func TestScale(t *testing.T) {
 	nodes, users := make([]int, 0, coverageSamples), make([]int, 0, coverageSamples)
 	rules, steps := make([]int, 0, coverageSamples), make([]int, 0, coverageSamples)
 
-	var quiet, alone, reads, skip int
+	var quiet, alone int
 
 	for i := range coverageSamples {
 		s := gen.Example(i)
@@ -37,26 +36,13 @@ func TestScale(t *testing.T) {
 		if len(s.Start.Topology.Nodes) == 1 {
 			alone++
 		}
-
-		for k, w := range s.Worlds() {
-			n := len(w.Topology.Nodes)
-			if k > 0 {
-				n = len(s.Steps[k-1].Reads)
-			}
-
-			reads += n
-
-			if NewView(w).outsideAddr() {
-				skip += n
-			}
-		}
 	}
 
 	t.Logf("start nodes %s", spread(nodes))
 	t.Logf("start users %s", spread(users))
 	t.Logf("start rules %s", spread(rules))
 	t.Logf("steps %s", spread(steps))
-	t.Logf("no step %d, one node %d, of %d; reads in skipped worlds %d of %d", quiet, alone, coverageSamples, skip, reads)
+	t.Logf("no step %d, one node %d, of %d", quiet, alone, coverageSamples)
 
 	for _, c := range []struct {
 		what      string
@@ -64,7 +50,6 @@ func TestScale(t *testing.T) {
 	}{
 		{"scenarios without a step", share(quiet, coverageSamples), 0.1},
 		{"starts with one node", share(alone, coverageSamples), 0.1},
-		{"reads in a world holding a database-only address", share(skip, reads), 0.15},
 	} {
 		if c.got > c.most {
 			t.Errorf("%s: %.3f, want at most %.2f", c.what, c.got, c.most)

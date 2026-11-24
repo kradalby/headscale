@@ -53,13 +53,6 @@ const (
 	// anyOf bounds a draw picking among what the world decides, so that
 	// every node of a large world can be picked.
 	anyOf = 63
-
-	// Addresses outside the tailnet are drawn rarely, and in small worlds:
-	// the reference properties skip a world holding one whole. One small
-	// world in outsideWorlds may hold them, and one address edit in
-	// strayAddrs may move onto one.
-	outsideWorlds = 32
-	strayAddrs    = 24
 )
 
 // crowd is the identity of users after the fourth, drawn in large
@@ -108,12 +101,11 @@ func runsOf[E any](t *rapid.T, elem *rapid.Generator[E], r runs, label string) [
 	return out
 }
 
-// topologySize is how many users a topology may hold, how its nodes come,
-// and whether it is large.
+// topologySize is how many users a topology may hold and how its nodes
+// come.
 type topologySize struct {
 	users int
 	nodes runs
-	large bool
 }
 
 // drawTopologySize draws a topology's size: one run of nodes, rarely,
@@ -123,7 +115,7 @@ func drawTopologySize(t *rapid.T) topologySize {
 	company := usually(t, companyBits, "company")
 	large := chance(t, largeTopologies, "large-topology")
 
-	sz := topologySize{users: len(defaultUsers), nodes: runs{each: fleetNodes, least: 1, most: 1}, large: large}
+	sz := topologySize{users: len(defaultUsers), nodes: runs{each: fleetNodes, least: 1, most: 1}}
 
 	if company {
 		sz.nodes.least, sz.nodes.most = 2, 2

@@ -160,23 +160,11 @@ const (
 
 // Node addresses. Node n owns 100.64.0.n and fd7a:115c:a1e0::n, so nodes
 // are distinct unless a draw says otherwise; moved addresses are tailnet
-// addresses no node owns; outside addresses are not the tailnet's.
+// addresses no node owns.
 var (
 	tailnetV4 = netip.MustParsePrefix("100.64.0.0/10")
 	tailnetV6 = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
 )
-
-// outsideAddrs are node id's addresses outside the tailnet in family: in
-// public space and, for IPv4, inside the 10.0.0.0/24 subnet. They are its
-// own, so two nodes outside the tailnet share an address only when a draw
-// says so.
-func outsideAddrs(family int, id uint64) []netip.Addr {
-	if family == 4 {
-		return []netip.Addr{netip.AddrFrom4([4]byte{8, 8, 8, byte(id)}), netip.AddrFrom4([4]byte{10, 0, 0, byte(4 + id)})} //nolint:gosec // the low byte of the ID
-	}
-
-	return []netip.Addr{netip.AddrFrom16([16]byte{0x26, 0x06, 0x47, 0x00, 14: byte(id >> 8), 15: byte(id)})} //nolint:gosec // as above
-}
 
 func ownAddr(family int, id uint64) netip.Addr {
 	if family == 4 {

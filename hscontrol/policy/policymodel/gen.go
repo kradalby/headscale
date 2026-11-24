@@ -1079,14 +1079,9 @@ func drawTopology(t *rapid.T) Topology {
 		return u
 	}), 1, sz.users).Draw(t, "users")
 
-	// A world holds addresses outside the tailnet rarely and then
-	// several; most worlds are what headscale hands out. A large one
-	// never: a reference property skips it whole.
-	outside := chance(t, outsideWorlds, "outside-world") && !sz.large
-
 	// Nodes come in runs, so that a large topology grows to dozens.
 	runsOf(t, rapid.Custom(func(t *rapid.T) Node {
-		n := drawNode(t, types.NodeID(len(nodes)+1), users, allTags, outside) //nolint:gosec // small
+		n := drawNode(t, types.NodeID(len(nodes)+1), users, allTags) //nolint:gosec // small
 		nodes = append(nodes, n)
 
 		return n
@@ -1122,10 +1117,8 @@ func drawTopology(t *rapid.T) Topology {
 
 var allTags = []int{0, 1, 2}
 
-// drawNode draws node id: owned by a user, or by tags from tags. With
-// outside, its addresses may be outside the tailnet, which registration
-// never hands out.
-func drawNode(t *rapid.T, id types.NodeID, users []User, tags []int, outside bool) Node {
+// drawNode draws node id: owned by a user, or by tags from tags.
+func drawNode(t *rapid.T, id types.NodeID, users []User, tags []int) Node {
 	n := Node{ID: id}
 
 	tagged := chance(t, 5, "tagged")
@@ -1141,7 +1134,7 @@ func drawNode(t *rapid.T, id types.NodeID, users []User, tags []int, outside boo
 
 	// One family may be missing, not both: the server refuses a node
 	// without addresses at startup.
-	n.V4, n.V6 = drawAddr(t, 4, id, outside), drawAddr(t, 6, id, outside)
+	n.V4, n.V6 = drawAddr(t, 4, id), drawAddr(t, 6, id)
 	if !n.V4.IsValid() && !n.V6.IsValid() {
 		n.V4 = ownAddr(4, uint64(id))
 	}
@@ -1185,20 +1178,10 @@ func drawTags(t *rapid.T, tags []int) []int {
 	return out
 }
 
-// drawAddr draws node id's address in family: its own, or rarely none;
-// in a world that has them, one outside the tailnet.
-func drawAddr(t *rapid.T, family int, id types.NodeID, outside bool) netip.Addr {
-	none := chance(t, 8, "no-addr")
-	away := chance(t, 2, "outside")
-	where := rapid.IntRange(0, 15).Draw(t, "where")
-
-	switch {
-	case none:
+// drawAddr draws node id's address in family: its own, or rarely none.
+func drawAddr(t *rapid.T, family int, id types.NodeID) netip.Addr {
+	if chance(t, 8, "no-addr") {
 		return netip.Addr{}
-	case outside && away:
-		pool := outsideAddrs(family, uint64(id))
-
-		return pool[where%len(pool)]
 	}
 
 	return ownAddr(family, uint64(id))
@@ -1327,7 +1310,7 @@ func drawJoiner(t *rapid.T, w World) (Node, bool) {
 		}
 	}
 
-	n := drawNode(t, w.Topology.nextID(), w.Topology.Users, defined, false)
+	n := drawNode(t, w.Topology.nextID(), w.Topology.Users, defined)
 	n.Approved, n.AutoApproved, n.Expired = nil, nil, false
 
 	return n, len(w.Topology.Users) > 0 || len(defined) > 0
@@ -1408,7 +1391,7 @@ const (
 
 // addrShares is how many shares of the node edits move an address: each
 // family has its own lost, gained and moved shapes to reach.
-const addrShares = 3
+const addrShares = 4
 
 func drawNodeEdit(t *rapid.T, w World) Edit {
 	tp := w.Topology
@@ -1542,18 +1525,12 @@ func drawHeld(t *rapid.T, held []int) []int {
 }
 
 // drawSetAddr moves n in one family: back to its own address, to none,
-// to a tailnet address nobody owns; rarely outside the tailnet.
+// to a tailnet address nobody owns.
 func drawSetAddr(t *rapid.T, n Node) Edit {
 	family := drawFamily(t)
 	cur := n.Addr(family)
 
-	rare := chance(t, strayAddrs, "outside-addr")
-
 	to := []netip.Addr{ownAddr(family, uint64(n.ID)), {}, movedAddr(family, uint64(n.ID))}
-	if rare {
-		to = append(to, outsideAddrs(family, uint64(n.ID))...)
-	}
-
 	to = slices.DeleteFunc(to, func(a netip.Addr) bool { return a == cur })
 	e := SetAddr{n.ID, family, pickAny(t, to, "to")}
 

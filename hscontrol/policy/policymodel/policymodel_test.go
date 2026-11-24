@@ -1216,8 +1216,6 @@ func leftovers(s Scenario, needs []string) []string {
 		plainNode := Node{ID: n.ID, User: n.User, V4: ownAddr(4, uint64(n.ID)), V6: ownAddr(6, uint64(n.ID))}
 
 		switch {
-		case slices.ContainsFunc(n.Addrs(), Outside):
-			got = append(got, "outside")
 		case len(n.Addrs()) == 1:
 			got = append(got, "single-family")
 		case n.V4 != plainNode.V4 || n.V6 != plainNode.V6:

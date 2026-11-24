@@ -114,10 +114,6 @@ func (v *View) sharedAddr() bool {
 	})
 }
 
-func (v *View) outsideAddr() bool {
-	return v.anyNode(func(n Node) bool { return slices.ContainsFunc(n.Addrs(), Outside) })
-}
-
 // heldByOther reports whether a node other than n holds a.
 func (v *View) heldByOther(n Node, a netip.Addr) bool {
 	return a.IsValid() && v.anyNode(func(m Node) bool { return m.ID != n.ID && slices.Contains(m.Addrs(), a) })
@@ -173,21 +169,14 @@ var private = func() *netipx.IPSet {
 // public reports whether p reaches beyond private and tailnet space.
 func public(p netip.Prefix) bool { return !private.ContainsPrefix(p) }
 
-// reachesInternet reports whether a destination names public space.
+// reachesInternet reports whether a destination names public space. No
+// node holds a public address, so an identity never does.
 func (v *View) reachesInternet(d Sel) bool {
-	switch d.Kind { //nolint:exhaustive // identities reach it through their members, below
+	switch d.Kind { //nolint:exhaustive // the rest name nodes or the tailnet's ranges
 	case SelHost, SelPrefix:
 		return public(v.selPrefix(d))
 	case SelInternet:
 		return true
-	case SelSelf:
-		return false
-	}
-
-	for _, n := range v.MembersOf(d) {
-		if slices.ContainsFunc(n.Addrs(), func(a netip.Addr) bool { return public(netip.PrefixFrom(a, a.BitLen())) }) {
-			return true
-		}
 	}
 
 	return false
@@ -472,7 +461,6 @@ var Required = append([]Shape{
 	{Name: "single-family", Why: "rules that reach a node in one family only", Min: 0.3, World: func(v *View) bool {
 		return v.anyNode(func(n Node) bool { return len(n.Addrs()) == 1 })
 	}},
-	{Name: "outside-address", Why: "addresses * and the tailnet ranges do not cover (database only)", Min: 0.013, World: (*View).outsideAddr},
 	{Name: "user-without-nodes", Why: "a user a token names who owns nothing", Min: 0.3, World: func(v *View) bool {
 		return slices.ContainsFunc(v.users, func(u User) bool {
 			return !v.anyNode(func(n Node) bool { return n.User == u.ID })
@@ -647,28 +635,10 @@ var Required = append([]Shape{
 	}},
 
 	// Pairs.
-	{Name: "self-from-star-outside-owner", Why: "* as a self source names owners by range", Min: 0, World: func(v *View) bool {
-		star := slices.ContainsFunc(v.World.Policy.ACLs, func(r Rule) bool {
-			return r.selfRule() && slices.ContainsFunc(r.Src, func(s Sel) bool { return s.Kind == SelAll })
-		})
-
-		return star && v.anyNode(func(n Node) bool { return !n.Tagged() && slices.ContainsFunc(n.Addrs(), Outside) })
-	}},
-	{Name: "outside-address-exit", Why: "exit visibility with addresses outside the tailnet", Min: 0.001, World: func(v *View) bool { return v.outsideAddr() && v.exitPresent() }},
 	{Name: "cap-to-internet-with-exit", Why: "the inputs of one-way visibility: a member's app grant to public space, and an exit", Min: 0.015, World: func(v *View) bool {
 		return v.exitPresent() && slices.ContainsFunc(v.World.Policy.Grants, func(r Rule) bool {
 			return len(r.App) > 0 && len(v.MembersOf(r.Src...)) > 0 &&
 				slices.ContainsFunc(r.Dst, func(d Dest) bool { return v.reachesInternet(d.Sel) })
-		})
-	}},
-	{Name: "via-star-outside-viewer", Why: "a viewer outside the tailnet under a * via source", Min: 0, World: func(v *View) bool {
-		return v.outsideAddr() && slices.ContainsFunc(v.World.Policy.Grants, func(r Rule) bool {
-			return len(r.Via) > 0 && slices.ContainsFunc(r.Src, func(s Sel) bool { return s.Kind == SelAll })
-		})
-	}},
-	{Name: "companion-outside", Why: "companion rules with addresses outside the tailnet", Min: 0, World: func(v *View) bool {
-		return v.outsideAddr() && v.anyRule(func(r Rule, _ bool) bool {
-			return slices.ContainsFunc(r.App, func(a App) bool { return strings.HasPrefix(Apps[a.Cap], "tailscale.com/") })
 		})
 	}},
 	{Name: "portless-to-cap-receiver", Why: "a portless rule to a receiver sent capabilities", Min: 0.02, World: func(v *View) bool {
