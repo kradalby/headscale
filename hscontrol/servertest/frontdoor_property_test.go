@@ -1861,6 +1861,109 @@ func (fd *frontDoor) makeTagOwner(at string) {
 	fd.made("policy", "a login's user made an owner of a tagged node's tags")
 }
 
+// makeRenewable leaves the world holding a node an interactive login can
+// renew while it stays tagged: a user's node tagged by the admin with a
+// tag its user owns — made an owner first when no owned tag exists — so
+// the user's login requesting the tag is granted and keeps the node the
+// tag's. It reports whether it did.
+func (fd *frontDoor) makeRenewable(at string) bool {
+	n, ok := fd.pick("to-renew", func(n policymodel.Node, nd *fdNode) bool {
+		u, _ := fd.w.Topology.User(n.User)
+
+		// claims after the tag write is what matters: a key-registered
+		// node stays its key user's claim alone.
+		return !n.Tagged() && !nd.loggedOut && fd.claims(n, u) &&
+			(nd.Method != util.RegisterMethodAuthKey || nd.KeyUser == u.ID)
+	})
+	if !ok {
+		return false
+	}
+
+	u, _ := fd.w.Topology.User(n.User)
+
+	t, ok := fd.renewableTag(at, u)
+	if !ok {
+		return false
+	}
+
+	fd.mustAPI(at, http.MethodPost, fmt.Sprintf("/api/v1/node/%d/tags", n.ID), map[string]any{"tags": tagNames([]int{t})}, nil)
+	fd.apply(policymodel.Retag{ID: n.ID, Tags: []int{t}})
+	fd.made("Retag", "API, its owner to renew it")
+
+	return true
+}
+
+// renewRenewable manufactures a tagged node whose own tags its user owns
+// when the world holds none, reporting whether it did; the caller then
+// recomputes the granted asks.
+func (fd *frontDoor) renewRenewable(at string, granted []tagAsk) bool {
+	if slices.ContainsFunc(granted, func(a tagAsk) bool { return a.n.Tagged() && slices.Equal(a.n.Tags, a.tags) }) {
+		return false
+	}
+
+	return fd.makeRenewable(at)
+}
+
+// tallyRenewal records that a case renewed a tagged node at a login:
+// the floor require holds a deep run to.
+func (fd *frontDoor) tallyRenewal(n policymodel.Node, tags []int) {
+	if slices.Equal(n.Tags, tags) {
+		fd.run.tally.steps[stepNames[stepOwnership]+": a login renews an expired tagged node"]++
+	}
+}
+
+// renewableTag is a tag u owns, or a drawn one u is made an owner of
+// through a reference naming it alone; it reports whether the policy can
+// name u at all.
+func (fd *frontDoor) renewableTag(at string, u policymodel.User) (int, bool) {
+	v := policymodel.NewView(fd.w)
+
+	var owned []int
+
+	for t := range policymodel.Tags {
+		if fd.w.Policy.DefinesTag(t) && userOwnsTag(noWildcardOwners(fd.w), u.ID, t) {
+			owned = append(owned, t)
+		}
+	}
+
+	slices.Sort(owned)
+
+	if len(owned) > 0 {
+		return owned[rapid.IntRange(0, len(owned)-1).Draw(fd.t, "owned-tag")], true
+	}
+
+	if len(v.AmbiguousRefs()) > 0 {
+		return 0, false
+	}
+
+	ref := -1
+
+	for r := range policymodel.UserRefs {
+		if us := v.RefUsers(r); len(us) == 1 && us[0] == u.ID && !v.Ambiguous(r) {
+			ref = r
+
+			break
+		}
+	}
+
+	if ref < 0 {
+		return 0, false
+	}
+
+	t := rapid.IntRange(0, len(policymodel.Tags)-1).Draw(fd.t, "owner-tag")
+	by := policymodel.Sel{Kind: policymodel.SelUser, I: ref}
+
+	if !slices.Contains(fd.w.Policy.TagOwners[t], by) {
+		fd.edit(at, policymodel.SetTagOwners{
+			Tag:     t,
+			Owners:  append(slices.Clone(fd.w.Policy.TagOwners[t]), by),
+			Defined: true,
+		}, nil)
+	}
+
+	return t, true
+}
+
 // reauthTags has a user log a node in interactively requesting tags, as
 // `tailscale up --force-reauth --advertise-tags` does: a tag the node or
 // the user owns is granted, and the node becomes, or stays, the tags',
@@ -1872,6 +1975,17 @@ func (fd *frontDoor) reauthTags(at string) bool {
 	}
 
 	granted, refused := fd.tagLogins()
+
+	// The renewal shape — a tagged node asking its own tags back at a
+	// login, expired first (the survivor, C31) — needs a tagged node
+	// whose tags its claimant owns. With none in the world, make one: a
+	// user's node, tagged by the admin with a tag its user owns or is
+	// made an owner of, so the user's login keeps the node tagged and
+	// renews it.
+	renewal := fd.renewRenewable(at, granted)
+	if renewal {
+		granted, refused = fd.tagLogins()
+	}
 
 	refuse := len(refused) > 0 && (len(granted) == 0 || rapid.IntRange(0, 3).Draw(fd.t, "refused-tags") == 3)
 
@@ -1886,14 +2000,14 @@ func (fd *frontDoor) reauthTags(at string) bool {
 
 	// A tagged node asking for the tags it has comes first: the shape that
 	// renews a tagged node's key while it stays tagged.
-	if same := slices.DeleteFunc(slices.Clone(pool), func(a tagAsk) bool { return !a.n.Tagged() || !slices.Equal(a.n.Tags, a.tags) }); len(same) > 0 && rapid.Bool().Draw(fd.t, "keep-tags") {
+	if same := slices.DeleteFunc(slices.Clone(pool), func(a tagAsk) bool { return !a.n.Tagged() || !slices.Equal(a.n.Tags, a.tags) }); len(same) > 0 && (renewal || rapid.Bool().Draw(fd.t, "keep-tags")) {
 		pool = same
 	}
 
 	a := pool[rapid.IntRange(0, len(pool)-1).Draw(fd.t, "tags-login")]
 	n, nd := a.n, fd.nodes[a.n.ID]
 
-	if !refuse && n.Tagged() && !n.Expired && rapid.Bool().Draw(fd.t, "expire-first") {
+	if !refuse && n.Tagged() && !n.Expired && (renewal || rapid.Bool().Draw(fd.t, "expire-first")) {
 		fd.mustAPI(at, http.MethodPost, fmt.Sprintf("/api/v1/node/%d/expire", n.ID), map[string]any{}, nil)
 		fd.apply(policymodel.SetExpired{ID: n.ID, Expired: true})
 		n, _ = fd.w.Topology.Node(n.ID)
@@ -1954,6 +2068,8 @@ func (fd *frontDoor) reauthTags(at string) bool {
 
 		if n.Expired {
 			what += ", its key renewed"
+
+			fd.tallyRenewal(n, a.tags)
 		}
 	}
 
@@ -2722,6 +2838,12 @@ func (t *fdTally) require(tb testing.TB, held *policymodel.HeldJudge) {
 		if t.joins[j] == 0 {
 			tb.Errorf("no node joined with a %s", j)
 		}
+	}
+
+	// The renewal shape the ownership step manufactures: a survivor
+	// (C31) lives exactly here, so a deep run must have taken it.
+	if t.steps[stepNames[stepOwnership]+": a login renews an expired tagged node"] == 0 {
+		tb.Errorf("no case renewed an expired tagged node at a login")
 	}
 
 	for name, n := range map[string]int{
