@@ -2479,9 +2479,21 @@ func (fd *frontDoor) claimByLogin(at string) bool {
 }
 
 func (fd *frontDoor) loginWithKey(at string) bool {
-	n, ok := fd.pick("key-login", func(n policymodel.Node, nd *fdNode) bool { return nd.Key != "" && nd.reusable && nd.keySpeaksFor(n) })
+	n, ok := fd.pick("key-login", func(n policymodel.Node, nd *fdNode) bool {
+		return nd.Key != "" && nd.reusable && nd.keySpeaksFor(n)
+	})
 	if !ok {
 		return false
+	}
+
+	// The claim — a user's key taking a tagged node back under a new
+	// node key — is the rarest of these logins, and its rarest form is
+	// the ephemeral one, whose claim clears the ephemeral bit. When the
+	// pick is not that, make one: an admin tags a node its user's own
+	// reusable ephemeral key registered, and the key login that follows
+	// claims it.
+	if m, made := fd.makeKeyClaim(at); made && (!fd.nodes[n.ID].Ephemeral || !n.Tagged() || fd.nodes[n.ID].Tagged) {
+		n = m
 	}
 
 	edits := fd.keyLoginEdits(n)
@@ -2495,6 +2507,57 @@ func (fd *frontDoor) loginWithKey(at string) bool {
 	fd.w = fd.w.Apply(edits...)
 
 	return true
+}
+
+// makeKeyClaim makes the shape a login with a key claims: a user's node an
+// ephemeral key of its user registered — tagged by the admin first, for
+// only a tagged node can be claimed — and a fresh reusable key of its
+// user, whose login takes the node back as that user's device, clearing
+// the ephemeral bit. It reports the node it made claimable, when the
+// world holds one to make.
+func (fd *frontDoor) makeKeyClaim(at string) (policymodel.Node, bool) {
+	var defined []int
+
+	for t := range policymodel.Tags {
+		if fd.w.Policy.DefinesTag(t) {
+			defined = append(defined, t)
+		}
+	}
+
+	m, ok := fd.pick("to-claim", func(n policymodel.Node, nd *fdNode) bool {
+		return len(defined) > 0 && !n.Tagged() && nd.Ephemeral && nd.KeyUser == n.User &&
+			nd.Method == util.RegisterMethodAuthKey && !nd.loggedOut
+	})
+	if !ok {
+		return policymodel.Node{}, false
+	}
+
+	// The key that claims it may be fresh, of the user its registration
+	// key speaks for ([types.NodeView.ClaimableBy]): the node's ephemeral
+	// bit is its registration's, which only the claim clears.
+	var out struct {
+		PreAuthKey struct {
+			ID  string `json:"id"`
+			Key string `json:"key"`
+		} `json:"preAuthKey"`
+	}
+
+	fd.mustAPI(at, http.MethodPost, "/api/v1/preauthkey", map[string]any{
+		"reusable": true, "user": strconv.FormatUint(uint64(m.User), 10),
+	}, &out)
+
+	t := defined[rapid.IntRange(0, len(defined)-1).Draw(fd.t, "claim-tag")]
+
+	fd.mustAPI(at, http.MethodPost, fmt.Sprintf("/api/v1/node/%d/tags", m.ID), map[string]any{"tags": tagNames([]int{t})}, nil)
+	fd.apply(policymodel.Retag{ID: m.ID, Tags: []int{t}})
+	fd.made("Retag", "API, its key to claim it")
+
+	nd := fd.nodes[m.ID]
+	nd.Key, nd.keyID, nd.reusable, nd.KeyUser, nd.Tagged = out.PreAuthKey.Key, out.PreAuthKey.ID, true, m.User, false
+
+	n, _ := fd.w.Topology.Node(m.ID)
+
+	return n, true
 }
 
 // ownsTag reports whether node n may take tag t at a login, on its own
@@ -3216,6 +3279,13 @@ func (fd *frontDoor) race(at string) {
 	switch kind {
 	case raceExpireLogin:
 		n, ok = fd.pick("racer", func(n policymodel.Node, nd *fdNode) bool { return nd.Key != "" && nd.reusable && nd.keySpeaksFor(n) })
+
+		// The claim is the rarest shape a key login takes here; when the
+		// drawn racer is not one, make it, as the ownership step does
+		// ([frontDoor.makeKeyClaim]).
+		if m, made := fd.makeKeyClaim(at); made && (!ok || !n.Tagged() || fd.nodes[n.ID].Tagged || !fd.nodes[n.ID].Ephemeral) {
+			n, ok = m, true
+		}
 	default:
 		n, ok = fd.pick("racer", func(n policymodel.Node, nd *fdNode) bool {
 			// A case running the small clock leaves an ephemeral node to
@@ -3822,6 +3892,12 @@ func (t *fdTally) require(tb testing.TB, held *policymodel.HeldJudge) {
 	// (C31) lives exactly here, so a deep run must have taken it.
 	if t.steps[stepNames[stepOwnership]+": a login renews an expired tagged node"] == 0 {
 		tb.Errorf("no case renewed an expired tagged node at a login")
+	}
+
+	// The key-claim shape the ownership step manufactures: two survivors
+	// (C35) live exactly here, so a deep run must have taken it.
+	if t.edits["a user's key takes a tagged node back"] == 0 {
+		tb.Errorf("no case claimed a tagged node back with its key")
 	}
 
 	// Every kind of write the v2 translation routes must have gone

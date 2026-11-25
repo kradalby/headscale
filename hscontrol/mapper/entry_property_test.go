@@ -535,7 +535,7 @@ func (p *pbtWorld) change(cur policymodel.World, was, n policymodel.Node, tn *ty
 			return err
 		})
 	case owner && n.Tagged():
-		p.storeTags(id, tn.Tags)
+		p.storeTags(id, tn.Tags, tn)
 	case owner:
 		p.untag(was, n, tn, cur.Topology.Users)
 	}
@@ -592,16 +592,16 @@ func definesAll(pol policymodel.Policy, tags []int) bool {
 }
 
 // storeTags gives node id tags the document in force does not define, as
-// it came to hold them before a policy write dropped them: the tags
-// through the store, then the auto-approval a tag write runs, through
-// production.
-func (p *pbtWorld) storeTags(id types.NodeID, tags []string) {
+// it came to hold them before a policy write dropped them, with the
+// approvals the model's tag write auto-approved, which the store stands
+// in for as it does for the tags.
+func (p *pbtWorld) storeTags(id types.NodeID, tags []string, tn *types.Node) {
 	p.t.Helper()
 
-	p.store("tags the document does not define", id, func(c *types.Node) { c.Tags, c.UserID, c.User = tags, nil, nil })
-
-	nv, _ := p.s.Snapshot().GetNode(id)
-	p.produce(id, "auto-approve", func() error { return p.s.AutoApproveRoutes(nv) })
+	p.store("tags the document does not define", id, func(c *types.Node) {
+		c.Tags, c.UserID, c.User = tags, nil, nil
+		c.ApprovedRoutes, c.AutoApprovedRoutes = tn.ApprovedRoutes, tn.AutoApprovedRoutes
+	})
 }
 
 // sameRoutes reports whether a and b agree on all but expiry and
@@ -656,14 +656,13 @@ func (p *pbtWorld) untag(was, n policymodel.Node, tn *types.Node, users []policy
 		return
 	}
 
+	// A store stand-in for a login production refuses: the whole of what
+	// the model's login made of the node, the auto-approval it ran
+	// included.
 	p.store("login it cannot claim", id, func(c *types.Node) {
 		c.Tags, c.UserID, c.User, c.Expiry = nil, tn.UserID, tn.User, nil
+		c.ApprovedRoutes, c.AutoApprovedRoutes = tn.ApprovedRoutes, tn.AutoApprovedRoutes
 	})
-
-	// Then the auto-approval the model's login runs for the new owner,
-	// through production.
-	nv, _ := p.s.Snapshot().GetNode(id)
-	p.produce(id, "auto-approve", func() error { return p.s.AutoApproveRoutes(nv) })
 
 	ri.Key = ""
 	p.reg[id] = ri

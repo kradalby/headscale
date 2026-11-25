@@ -358,8 +358,9 @@ func (p *pbtWorld) leaveUsers(cur, w policymodel.World, built func(int) *types.N
 			next := cur.Apply(policymodel.Retag{ID: n.ID, Tags: n.Tags})
 			mid, _ := next.Topology.Node(n.ID)
 
+			tn := built(i)
 			done := p.begin(p.kindOr("batch"))
-			p.storeTags(n.ID, built(i).Tags)
+			p.storeTags(n.ID, tn.Tags, tn)
 			done()
 
 			cur, mids[n.ID] = next, mid
