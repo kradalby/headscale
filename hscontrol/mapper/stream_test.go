@@ -8083,6 +8083,55 @@ func TestTwoRendersOfARevisionCarryTheSameView(t *testing.T) {
 	assert.Empty(t, attempts, "a delivery at the same revision clears its attempt")
 }
 
+// TestAFirstMapSharesTheHistoryAnotherSessionHeld pins a first map reading
+// the peer history an earlier session of its node left: a second session
+// on the same snapshot shares it, a delivery of its own revision leaves
+// the bookkeeping the route audit reads clean, and a later first map
+// announces its removals from that history.
+func TestAFirstMapSharesTheHistoryAnotherSessionHeld(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	hub := NewHub()
+	snap := s.Snapshot()
+
+	a := NewStream(cfg, hub, ids[0], capVer)
+	_, err := a.Initial(snap)
+	require.NoError(t, err)
+	a.Delivered()
+
+	held := hub.lastPeers(ids[0])
+	require.Len(t, held, 3, "test sanity: the node held itself and both peers")
+
+	// A second session of the node is a first map on the same snapshot:
+	// it shares the history a left rather than starting from none.
+	b := NewStream(cfg, hub, ids[0], capVer)
+	_, err = b.Initial(snap)
+	require.NoError(t, err)
+	assert.Equal(t, held, b.pending.ids, "the first map shares the history another session held")
+
+	b.Delivered()
+
+	hub.mu.Lock()
+	got, attempts := hub.core.sentPeers[ids[0]].ids, hub.core.sentPeers[ids[0]].attempts
+	hub.mu.Unlock()
+	assert.Empty(t, attempts, "a delivery at the same revision clears its attempt")
+	assert.Equal(t, held, got, "the shared history stays recorded")
+
+	// A peer the node's client held goes away while it has no stream: the
+	// next first map announces its removal from the shared history.
+	require.NoError(t, s.DeleteNode(mustNode(t, s, ids[1])))
+
+	c := NewStream(cfg, hub, ids[0], capVer)
+	resps, err := c.Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	var removed []tailcfg.NodeID
+	for _, resp := range resps {
+		removed = append(removed, resp.PeersRemoved...)
+	}
+
+	assert.Equal(t, []tailcfg.NodeID{ids[1].NodeID()}, removed, "a reconnect announces the removal its shared history held")
+}
+
 // TestHubFoldsUnconfirmedViews writes more unconfirmed views than the hub
 // keeps apart: they fold into one, and a reconnect still announces every
 // peer any of them carried.
