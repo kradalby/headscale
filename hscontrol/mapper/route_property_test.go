@@ -875,6 +875,11 @@ func (r *scenarioRun) read(id types.NodeID) {
 	t.Logf("n%d reads r%d: %s", id, snap.Rev(), describeResponses(resps))
 
 	requireRenderFresh(t, r.p.cfg, snap, id, ss.capVer, ss.st.sent, ss.client)
+
+	self, peers := ss.client.served()
+	if d := statemodel.Served(r.p, r.p.cfg, self, peers); d != "" {
+		t.Fatalf("n%d holds r%d: %s", id, snap.Rev(), d)
+	}
 }
 
 // freshAt renders id at snap with caches of its own and filters cut

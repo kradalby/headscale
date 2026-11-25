@@ -7,6 +7,7 @@ package statemodel
 import (
 	"fmt"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 )
 
 // Joined is how a node registered, as a level registered it: what a
@@ -116,6 +118,143 @@ func usersOf(users []types.User) string {
 // of w, and from how it joined, or "".
 func NodeDiff(got *types.Node, w policymodel.World, n policymodel.Node, j Joined) string {
 	return storedDiff(got, w.Topology.BuildNode(n), n, j)
+}
+
+// Served holds the wire entries a client holds — its own first, then its
+// peers' — to what the State stores and the config fixed: the fields no
+// model judge reads (a stable ID, a name, endpoints, a home DERP, a last
+// seen, a creation time, the baseline capabilities an own entry carries,
+// what a peer's hostinfo says of it), which a render drops or invents
+// for held and fresh sessions alike, so only the store can say. It says
+// how they differ, or "".
+func Served(l Level, cfg *types.Config, self tailcfg.NodeView, peers []tailcfg.NodeView) string {
+	snap := l.State().Snapshot()
+
+	for i, e := range append([]tailcfg.NodeView{self}, peers...) {
+		if !e.Valid() {
+			continue
+		}
+
+		id := types.NodeID(e.ID()) //nolint:gosec // small
+
+		nv, ok := snap.GetNode(id)
+		if !ok {
+			// A peer the client has not learned is gone yet.
+			continue
+		}
+
+		if d := servedDiff(cfg, snap.DNS(), e, nv, i == 0); d != "" {
+			return fmt.Sprintf("served: n%d: %s", id, d)
+		}
+	}
+
+	return ""
+}
+
+// servedDiff is how e, the entry a client holds of node nv, differs from
+// what the State stores and cfg fixed, on the fields no model judge
+// reads. self says whether it is the client's own entry, which carries
+// the baseline capabilities; a peer's entry carries no endpoints and no
+// home DERP once expired.
+func servedDiff(cfg *types.Config, dns types.DNSView, e tailcfg.NodeView, nv types.NodeView, self bool) string {
+	if e.StableID() != nv.ID().StableID() {
+		return fmt.Sprintf("stable ID %q, its ID's %q", e.StableID(), nv.ID().StableID())
+	}
+
+	fqdn, err := nv.GetFQDN(dns.BaseDomain())
+	if err != nil {
+		return fmt.Sprintf("no name: %v", err)
+	}
+
+	if e.Name() != fqdn {
+		return fmt.Sprintf("name %q, the FQDN of its given name %q", e.Name(), fqdn)
+	}
+
+	if !e.Created().Equal(nv.CreatedAt().UTC()) {
+		return fmt.Sprintf("created %s, the store %s", e.Created(), nv.CreatedAt().UTC())
+	}
+
+	// A peer entry carries a LastSeen only when the render that reached
+	// the client sent it whole — the patch that marks it offline carries
+	// none — and the store's own moves with every further report of it,
+	// so what it holds is only held to be a real time, never the zero
+	// time. An own entry never carries one.
+	if seen := e.LastSeen(); !self && seen.Valid() && seen.Get().IsZero() {
+		return "last seen the zero time"
+	}
+
+	endpoints, derp := nv.Endpoints().AsSlice(), tailcfg.DERPRegionID(0)
+
+	if nv.Hostinfo().Valid() && nv.Hostinfo().NetInfo().Valid() {
+		derp = nv.Hostinfo().NetInfo().PreferredDERP()
+	}
+
+	if !self && nv.IsExpired() {
+		endpoints, derp = nil, 0
+	}
+
+	if !slices.Equal(e.Endpoints().AsSlice(), endpoints) {
+		return fmt.Sprintf("endpoints %v, the store %v", e.Endpoints().AsSlice(), endpoints)
+	}
+
+	if e.HomeDERP() != derp {
+		return fmt.Sprintf("home DERP %d, the store %d", e.HomeDERP(), derp)
+	}
+
+	if !self {
+		return peerHostinfoDiff(e.Hostinfo(), nv.Hostinfo())
+	}
+
+	// The baseline capabilities an own entry carries whatever the policy
+	// grants, headscale having no user roles.
+	caps := e.CapMap()
+
+	for _, c := range []nodecap.Cap{nodecap.SSH, nodecap.SSHEnvironmentVariables} {
+		if !caps.Contains(c) {
+			return fmt.Sprintf("no %s capability", c)
+		}
+	}
+
+	if got := caps.Contains(nodecap.FileSharing); got != cfg.Taildrop.Enabled {
+		return fmt.Sprintf("file sharing %t, the config %t", got, cfg.Taildrop.Enabled)
+	}
+
+	_, certDomain := nv.CertDomain(dns)
+
+	if got := caps.Contains(nodecap.HTTPS); got != certDomain {
+		return fmt.Sprintf("HTTPS %t, its certificate domain %t", got, certDomain)
+	}
+
+	wantUpdate := tailcfg.RawMessage(strconv.FormatBool(cfg.AutoUpdate.Enabled))
+	if got, ok := caps.GetOk(nodecap.DefaultAutoUpdate); !ok || got.Len() != 1 || got.At(0) != wantUpdate {
+		return fmt.Sprintf("default auto-update %v, the config %t", got, cfg.AutoUpdate.Enabled)
+	}
+
+	return ""
+}
+
+// peerHostinfoDiff is how the hostinfo e carries of its node differs
+// from what the node reported and a peer may see of it: the PeerAPI DNS
+// service is its client's own, so a peer's entry leaves it out.
+func peerHostinfoDiff(e, hi tailcfg.HostinfoView) string {
+	if !hi.Valid() || !e.Valid() {
+		return ""
+	}
+
+	if e.Hostname() != hi.Hostname() || e.OS() != hi.OS() {
+		return fmt.Sprintf("hostname %q OS %q, the node reported %q and %q", e.Hostname(), e.OS(), hi.Hostname(), hi.OS())
+	}
+
+	services := slices.DeleteFunc(hi.Services().AsSlice(), func(s tailcfg.Service) bool { return s.Proto == tailcfg.PeerAPIDNS })
+	if !slices.EqualFunc(e.Services().AsSlice(), services, func(a, b tailcfg.Service) bool { return reflect.DeepEqual(a, b) }) {
+		return fmt.Sprintf("services %s, the node reported %s", policymodel.JSON(e.Services().AsSlice()), policymodel.JSON(services))
+	}
+
+	if !slices.Equal(e.SSH_HostKeys().AsSlice(), hi.SSH_HostKeys().AsSlice()) {
+		return fmt.Sprintf("SSH host keys %v, the node reported %v", e.SSH_HostKeys().AsSlice(), hi.SSH_HostKeys().AsSlice())
+	}
+
+	return ""
 }
 
 // storedDiff is how got, as production holds it, differs from tn, model

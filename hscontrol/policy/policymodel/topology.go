@@ -173,6 +173,13 @@ func (t Topology) nextUserID() uint {
 // built with Go, a release headscale serves.
 func officialHostinfo(hi *tailcfg.Hostinfo) {
 	hi.GoVersion, hi.IPNVersion = "go1.27.3", "1.94.1-t0123456789ab-g0123456789ab"
+
+	// What its peers are served of its host: an OS, its SSH host keys,
+	// and its services, one announcing the DNS proxy that a peer's entry
+	// leaves out ([types.PeerHostinfo]).
+	hi.OS = "linux"
+	hi.SSH_HostKeys = []string{"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILdBfhO0SK09YQ"}
+	hi.Services = append(hi.Services, tailcfg.Service{Proto: "peerapi", Port: 1}, tailcfg.Service{Proto: tailcfg.PeerAPIDNS, Port: 1})
 }
 
 // expiredAt is when expired nodes expired: a fixed time in the past, so

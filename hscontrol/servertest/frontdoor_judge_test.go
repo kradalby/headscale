@@ -269,6 +269,10 @@ func (fd *frontDoor) judgeClients(at string) {
 				fd.t.Fatalf("%s: n%d's client holds an entry whose keys differ from its registration: %s", at, n.ID, d)
 			}
 
+			if d := statemodel.Served(fd, fd.srv.cfg, nm.SelfNode, nm.Peers); d != "" {
+				fd.t.Fatalf("%s: n%d's client holds an entry that differs from what the server stores: %s", at, n.ID, d)
+			}
+
 			// The DERP region the records step wrote beside the model's
 			// policy reaches every client's map while the served document
 			// names it, and leaves it when a write drops it.

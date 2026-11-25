@@ -596,6 +596,24 @@ type modelClient struct {
 	deltaPeers map[tailcfg.NodeID]bool
 }
 
+// served is the client's own entry and its peers', by ID, as views for
+// the stored judge ([statemodel.Served]).
+func (c *modelClient) served() (tailcfg.NodeView, []tailcfg.NodeView) {
+	var self tailcfg.NodeView
+	if c.self != nil {
+		self = c.self.View()
+	}
+
+	peers := make([]tailcfg.NodeView, 0, len(c.peers))
+	for _, id := range slices.Sorted(maps.Keys(c.peers)) {
+		if p := c.peers[id]; p != nil {
+			peers = append(peers, p.View())
+		}
+	}
+
+	return self, peers
+}
+
 // capHolders returns the addresses of the nodes the client holds, itself
 // and its peers, whose CapMap has capability.
 func (c *modelClient) capHolders(capability nodecap.Cap) []netip.Addr {

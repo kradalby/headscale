@@ -1111,6 +1111,10 @@ func (dw *deliveryWorld) fresh(at string) map[types.NodeID]*netmap.NetworkMap {
 			dw.failf(judgeClient, "%s: n%d's client holds an entry whose tunnel keys differ from its registration: %s", at, id, d)
 		}
 
+		if d := statemodel.Served(dw.p, dw.p.cfg, have.SelfNode, have.Peers); d != "" {
+			dw.failf(judgeClient, "%s: n%d's client holds an entry that differs from what the State stores: %s", at, id, d)
+		}
+
 		if !s.held.Equal(chunks) {
 			dw.failf(judgeClient, "%s: n%d's client holds chunks %v, a fresh session's %v", at, id, s.held.Names(), chunks.Names())
 		}
@@ -1526,13 +1530,15 @@ func TestDeliveryConvergesThroughTheClient(t *testing.T) {
 	floors := map[string]int{
 		"lagged renders": reach.lagged, "failed writes": reach.failed, "reconnects": reach.reconnected,
 		"chunks deleted": reach.deleted, "overlapping reconnects": reach.overlapped, "address indexes held": reach.indexed,
-		"netinfo-less reports": reach.writes["map request without NetInfo"],
 	}
 
 	// A run of the default length can judge no membership churn and see no
 	// delivery flip, which only some cases draw; a deep one always does.
 	if deep {
 		floors["membership churn"], floors["delivery flips"] = reach.churnJudged, reach.flips
+
+		// Deep runs draw enough client reports to leave NetInfo out.
+		floors["netinfo-less reports"] = reach.writes["map request without NetInfo"]
 
 		// Its leaves are mostly nodes joined for a moment, in session, and
 		// it draws few logins: the collector, which takes an idle ephemeral
