@@ -1976,6 +1976,43 @@ func TestReauthPublicationExpiresPastSweepWatermark(t *testing.T) {
 	}
 }
 
+// TestExpireExpiredNodesTakesAConnectedNodeOffline pins the sweep itself:
+// a key that expires by the clock alone leaves the online bit until the
+// sweep recomputes it, and the sweep's write stops there — the node's
+// sessions stay as they are.
+func TestExpireExpiredNodesTakesAConnectedNodeOffline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		_, s, id := persistTestSetup(t)
+		t.Cleanup(func() { _ = s.Close() })
+
+		_, err := s.SetNodeExpiry(id, new(time.Now().Add(time.Hour)))
+		require.NoError(t, err)
+		s.Connect(id)
+
+		node, ok := s.GetNodeByID(id)
+		require.True(t, ok)
+		require.True(t, node.Online(), "test sanity: the node is online")
+
+		// The key expires with no write at all, as the clock passes it.
+		watermark := time.Now()
+
+		<-time.After(90 * time.Minute)
+
+		stale, ok := s.GetNodeByID(id)
+		require.True(t, ok)
+		require.True(t, stale.IsExpired())
+		require.True(t, stale.Online(), "expiry by the clock alone has not written anything")
+
+		_, found := s.ExpireExpiredNodes(watermark)
+		assert.True(t, found, "the sweep sees the node expired since the last check")
+
+		after, ok := s.GetNodeByID(id)
+		require.True(t, ok)
+		assert.False(t, after.Online(), "the sweep takes a connected node offline")
+		assert.Equal(t, 1, after.ActiveSessions(), "the sweep does not touch the node's sessions")
+	})
+}
+
 func BenchmarkPublishRegistrationUnchangedOwner(b *testing.B) {
 	for _, count := range []int{1, 100, 1000} {
 		b.Run(strconv.Itoa(count), func(b *testing.B) {
