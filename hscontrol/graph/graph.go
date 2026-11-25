@@ -145,7 +145,10 @@ func (s *Snapshot) Rev() uint64 { return s.rev }
 // Time is when the snapshot was committed.
 func (s *Snapshot) Time() time.Time { return s.at }
 
-// Get returns the value of n in s.
+// Get returns the value of n in s. A handle carries no graph identity, so
+// a handle from another graph whose cell at that index holds the same
+// type reads this graph's cell without complaint; only a cell of another
+// type panics.
 func (s *Snapshot) Get[T any](n Node[T]) T {
 	i := int(n.ref())
 	if s.reads != nil {
@@ -209,7 +212,8 @@ func Peek[T any](tx *Tx, n Node[T]) T {
 // cells affected, publishes the new snapshot and wakes subscribers. An
 // error from fn aborts the transaction. A transaction that changes nothing
 // publishes nothing and returns the latest snapshot. The first Update
-// computes every derived cell. fn must not call Update.
+// computes every derived cell. fn must not call Update: doing so waits
+// forever, silently, on the lock this call already holds.
 func (g *Graph) Update(fn func(tx *Tx) error) (*Snapshot, error) {
 	return g.UpdateChecked(fn, nil)
 }

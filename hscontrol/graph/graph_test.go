@@ -211,9 +211,11 @@ func TestPanickingUpdateReleasesTheGraph(t *testing.T) {
 	}
 }
 
-// TestGetPanicsOnAnotherGraphsHandle reads a cell through a handle of
-// another graph: it must fail loudly, not return an empty value.
-func TestGetPanicsOnAnotherGraphsHandle(t *testing.T) {
+// TestGetPanicsOnAnotherGraphsHandleOfAnotherType reads a cell of another
+// type through a handle of another graph: only a type mismatch fails
+// loudly. A same-typed foreign handle reads this graph's cell silently
+// (TestGetReadsAnotherGraphsHandleOfTheSameType).
+func TestGetPanicsOnAnotherGraphsHandleOfAnotherType(t *testing.T) {
 	g, other := New(), New()
 	_ = g.NewInput("a", "x", Same[string])
 	n := other.NewInput("n", 1, Same[int])
@@ -233,7 +235,7 @@ func TestGetPanicsOnAnotherGraphsHandle(t *testing.T) {
 // handle of another graph whose cell holds the same type: Get cannot see
 // the handle is foreign and reads this graph's cell at its index,
 // silently. Only a handle of another type fails the assertion and panics
-// (TestGetPanicsOnAnotherGraphsHandle). The day the package learns to
+// (TestGetPanicsOnAnotherGraphsHandleOfAnotherType). The day the package learns to
 // tell graphs apart, this pin is the test that changes.
 func TestGetReadsAnotherGraphsHandleOfTheSameType(t *testing.T) {
 	g, other := New(), New()
