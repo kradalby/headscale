@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
@@ -152,6 +153,57 @@ func TestOlderInitialMapLeavesNewerStreamsPeers(t *testing.T) {
 			require.Empty(t, quiet, "old stream completion must not subtract newer stream peers")
 		})
 	}
+}
+
+// TestRedeliveredRevisionClearsHistoryAttempts pins the promise
+// hubCore.setLastPeers makes: only an older render is refused, so a
+// delivery of the revision the hub already holds confirms it. A reconnect's
+// first map shares that recorded view, and the unconfirmed views a failed
+// write leaves behind are gone once one delivery lands — otherwise every
+// first map would merge them again, for nothing, and a node that keeps
+// reconnecting folds them into its history until the hub's bound evicts
+// other nodes'.
+func TestRedeliveredRevisionClearsHistoryAttempts(t *testing.T) {
+	cfg, s, ids := streamTestState(t, ownUserOnly)
+
+	h := NewHub()
+	defer h.Close()
+
+	history := func() sentView {
+		t.Helper()
+
+		h.mu.Lock()
+		defer h.mu.Unlock()
+
+		return h.core.sentPeers[ids[0]]
+	}
+
+	first := NewStream(cfg, h, ids[0], capVer)
+	first.Attach(h.Join(ids[0], func() {}))
+
+	snap := s.Snapshot()
+	_, err := first.Initial(snap)
+	require.NoError(t, err)
+	first.Delivered()
+
+	view := history()
+	require.Equal(t, snap.Rev(), view.rev, "test sanity: the render is the node's history")
+	require.Equal(t, []types.NodeID{ids[0], ids[1]}, view.ids, "test sanity: the delivered view is recorded")
+	require.Empty(t, view.attempts, "a delivery of the revision the hub holds confirms it")
+
+	// A second session of the node first-maps the same revision: it shares
+	// the recorded view rather than merging anything into it.
+	second := NewStream(cfg, h, ids[0], capVer)
+	second.Attach(h.Join(ids[0], func() {}))
+
+	_, previous := h.firstMap(ids[0], second.sess, snap)
+	require.Equal(t, view.ids, previous, "a reconnect shares the recorded view")
+
+	_, err = second.Initial(snap)
+	require.NoError(t, err)
+	second.Delivered()
+
+	require.Empty(t, history().attempts, "a redelivered revision clears the attempts the next reconnect would merge")
 }
 
 func TestNodeDeletedWhileChangesPending(t *testing.T) {

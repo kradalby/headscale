@@ -1755,7 +1755,9 @@ func (a *auditLines) judge() string {
 // one routed to must have succeeded and hold that commit's value; once
 // nothing is left to do, every session holds the latest commit's value, one
 // more commit retrying a failure; a deleted node's history is gone once the
-// hub forgot it; a node's history never returns to an older revision.
+// hub forgot it; a node's history never returns to an older revision; a
+// node's history holds only the unconfirmed views a delivery has not
+// cleared.
 //
 // exhaustive walks every schedule of every scenario in a small scope, each
 // state once; drawn has rapid draw larger scenarios and schedules. Neither
@@ -1942,7 +1944,10 @@ type coreMachine struct {
 	sess                          []*coreSess
 	joins, failures, dels, leaves int
 	histRev                       [4]uint64
-	path                          []coreEvent
+	// attempts is the model of the unconfirmed views a node's history
+	// holds: what mayHavePeers appends and a delivery clears.
+	attempts [4]int
+	path     []coreEvent
 }
 
 func newCoreMachine(t pbtT, snaps []*state.Snapshot, scope coreScope) *coreMachine {
@@ -2186,6 +2191,7 @@ func (m *coreMachine) routing() {
 		if d := m.deletedAt[n]; d > m.routed && d <= m.target {
 			m.h.forget(m.id(n))
 			m.histRev[n] = 0
+			m.attempts[n] = 0
 		}
 	}
 
@@ -2264,6 +2270,11 @@ func (m *coreMachine) end(s *coreSess, ok bool) {
 	if changed {
 		s.pending = sentView{ids: m.peers(at, s.n), rev: snap.Rev()}
 		m.h.mayHavePeers(s.sess, m.id(s.n), s.pending)
+
+		if !s.sess.left {
+			m.attempts[s.n]++
+		}
+
 		s.phase = coreWritten
 	}
 }
@@ -2285,6 +2296,11 @@ func (m *coreMachine) deliver(s *coreSess) {
 	s.st.pending = &s.pending
 	s.st.Delivered()
 	s.phase = coreIdle
+
+	// Only an older render is refused, and a left session records nothing.
+	if !s.sess.left && s.pending.rev >= m.histRev[s.n] {
+		m.attempts[s.n] = 0
+	}
 }
 
 func (m *coreMachine) leave(s *coreSess) {
@@ -2340,6 +2356,10 @@ func (m *coreMachine) judge() {
 			m.fatalf("n%d's peer history went back from revision %d to %d", n+1, m.histRev[n], v.rev)
 		default:
 			m.histRev[n] = v.rev
+
+			if len(v.attempts) != m.attempts[n] {
+				m.fatalf("n%d's peer history holds %d unconfirmed views, the model %d", n+1, len(v.attempts), m.attempts[n])
+			}
 		}
 	}
 }
