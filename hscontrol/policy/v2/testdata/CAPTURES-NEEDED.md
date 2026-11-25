@@ -275,8 +275,28 @@ in its answer; the default named below then stands.
   capped number of routes). A change that still keeps the advertised routes (capped) and
   the app-connector flag from a refused report, making them approvable, is written and
   waits on this answer.
+- **Also, the streaming case:** the same oversized Hostinfo on the request that opens
+  the map stream. Is the stream opened (and the report ignored or kept), or refused?
+  Headscale refuses it too, so such a client gets no stream and keeps its last netmap
+  until its report shrinks.
 - **Default if not answerable:** the maintainer decides between keeping the routes as
-  advertised and keeping nothing.
+  advertised and keeping nothing; the streaming request stays refused.
+
+### B5 `map-offline-with-capability-loss` — `render/lastseen-patchify`
+
+- **Question:** when a peer goes offline at the same moment as it loses its last peer
+  capability, what does a client that was already connected hold for that peer's
+  `LastSeen`, compared with a client that connects afterwards?
+- **How:** a policy that gives node X a capability other nodes see in its `CapMap` (a
+  grant with an app capability naming X as source is enough). Client A stays connected
+  and watches X. In one step remove the grant and take X offline (stop its client),
+  as close together as the service allows; then connect a fresh client B. Compare X's
+  `Online` and `LastSeen` in A's and B's netmaps, and record which map responses A was
+  sent (a whole peer in `PeersChanged`, or a patch).
+- **Headscale:** resends the peer whole, because a patch cannot empty a capability map.
+  The client folds that back into a patch and drops the `LastSeen` it did not hold, so A
+  shows X offline with no last-seen time and B shows one. Cosmetic.
+- **Default if not answerable:** keep as a known cosmetic difference.
 
 ## Already settled (no capture needed)
 
