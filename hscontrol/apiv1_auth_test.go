@@ -205,3 +205,36 @@ func TestAPIV1AuthReject(t *testing.T) {
 		assertStatus(t, res, http.StatusNotFound)
 	})
 }
+
+// The two endpoints are deliberately asymmetric on a pending node
+// registration: approve refuses it (a registration is approved by auth
+// register, which makes its node) and leaves the login pending, while
+// reject accepts the ID because refusing a login through the API is the
+// feature — the waiting client is told its request was rejected and the
+// session is released, never to be decided again.
+func TestAPIV1AuthApproveRefusesARegistrationThatRejectRefuses(t *testing.T) {
+	h := newAPIV1Harness(t)
+
+	authID := types.MustAuthID()
+	reg := types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: key.NewMachine().Public(),
+		NodeKey:    key.NewNode().Public(),
+		Hostname:   "pending-login",
+	})
+	require.NoError(t, h.app.state.SetAuthCacheEntry(authID, reg))
+
+	body := fmt.Appendf(nil, `{"authId":%q}`, authID.String())
+
+	res := h.callHuma(http.MethodPost, "/api/v1/auth/approve", body)
+	assertStatus(t, res, http.StatusBadRequest)
+	assert.False(t, reg.IsFinished(), "approve must leave the registration pending")
+
+	res = h.callHuma(http.MethodPost, "/api/v1/auth/reject", body)
+	require.Equal(t, http.StatusOK, res.status)
+
+	verdict := reg.Verdict()
+	assert.False(t, verdict.Accept(), "reject must tell the waiting client its login was refused")
+
+	_, pending := h.app.state.GetAuthCacheEntry(authID)
+	assert.False(t, pending, "the rejected session must be released")
+}
