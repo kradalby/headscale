@@ -241,18 +241,6 @@ func (w *steppedWatcher) routing() bool {
 	return w.at.at == watchLoaded || w.at.at == watchDrained
 }
 
-// finish ends the routing in progress, if any, and leaves the watcher
-// idle or about to load.
-func (w *steppedWatcher) finish() {
-	for w.at.at == watchLoad || w.routing() {
-		w.step()
-	}
-
-	if w.at.at == watchRouted {
-		w.step()
-	}
-}
-
 // settle routes until the watcher is idle.
 func (w *steppedWatcher) settle() {
 	for w.step() {
@@ -432,6 +420,7 @@ func runHubMachine(t *rapid.T, reach *hubPropertyReach, audits *auditLines) {
 	m.p.committed = func(before uint64) {
 		m.w.committed(before)
 	}
+
 	for _, n := range m.p.s.Snapshot().ListNodes().All() {
 		s := m.admit(n.ID())
 		m.take(s)
