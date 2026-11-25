@@ -878,7 +878,7 @@ func (r *scenarioRun) read(id types.NodeID) {
 	requireRenderFresh(t, r.p.cfg, snap, id, ss.capVer, ss.st.sent, ss.client)
 
 	self, peers := ss.client.served()
-	if d := statemodel.Served(r.p, r.p.cfg, self, peers); d != "" {
+	if d := statemodel.Served(r.p, r.p.cfg, ss.capVer, self, peers); d != "" {
 		t.Fatalf("n%d holds r%d: %s", id, snap.Rev(), d)
 	}
 }

@@ -269,7 +269,7 @@ func (fd *frontDoor) judgeClients(at string) {
 				fd.t.Fatalf("%s: n%d's client holds an entry whose keys differ from its registration: %s", at, n.ID, d)
 			}
 
-			if d := statemodel.Served(fd, fd.srv.cfg, nm.SelfNode, nm.Peers); d != "" {
+			if d := statemodel.Served(fd, fd.srv.cfg, tailcfg.CurrentCapabilityVersion, nm.SelfNode, nm.Peers); d != "" {
 				fd.t.Fatalf("%s: n%d's client holds an entry that differs from what the server stores: %s", at, n.ID, d)
 			}
 

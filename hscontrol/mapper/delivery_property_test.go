@@ -1111,7 +1111,7 @@ func (dw *deliveryWorld) fresh(at string) map[types.NodeID]*netmap.NetworkMap {
 			dw.failf(judgeClient, "%s: n%d's client holds an entry whose tunnel keys differ from its registration: %s", at, id, d)
 		}
 
-		if d := statemodel.Served(dw.p, dw.p.cfg, have.SelfNode, have.Peers); d != "" {
+		if d := statemodel.Served(dw.p, dw.p.cfg, s.capVer, have.SelfNode, have.Peers); d != "" {
 			dw.failf(judgeClient, "%s: n%d's client holds an entry that differs from what the State stores: %s", at, id, d)
 		}
 

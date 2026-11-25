@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -124,10 +125,12 @@ func NodeDiff(got *types.Node, w policymodel.World, n policymodel.Node, j Joined
 // peers' — to what the State stores and the config fixed: the fields no
 // model judge reads (a stable ID, a name, endpoints, a home DERP, a last
 // seen, a creation time, the baseline capabilities an own entry carries,
-// what a peer's hostinfo says of it), which a render drops or invents
-// for held and fresh sessions alike, so only the store can say. It says
-// how they differ, or "".
-func Served(l Level, cfg *types.Config, self tailcfg.NodeView, peers []tailcfg.NodeView) string {
+// what a peer's hostinfo says of it, the version a peer's entry is
+// rendered for and the capabilities it carries), which a render drops or
+// invents for held and fresh sessions alike, so only the store can say.
+// cv is the capability version the client speaks. It says how they
+// differ, or "".
+func Served(l Level, cfg *types.Config, cv tailcfg.CapabilityVersion, self tailcfg.NodeView, peers []tailcfg.NodeView) string {
 	snap := l.State().Snapshot()
 
 	for i, e := range append([]tailcfg.NodeView{self}, peers...) {
@@ -143,7 +146,7 @@ func Served(l Level, cfg *types.Config, self tailcfg.NodeView, peers []tailcfg.N
 			continue
 		}
 
-		if d := servedDiff(cfg, snap.DNS(), e, nv, i == 0); d != "" {
+		if d := servedDiff(cfg, snap.DNS(), cv, e, nv, i == 0); d != "" {
 			return fmt.Sprintf("served: n%d: %s", id, d)
 		}
 	}
@@ -156,7 +159,7 @@ func Served(l Level, cfg *types.Config, self tailcfg.NodeView, peers []tailcfg.N
 // reads. self says whether it is the client's own entry, which carries
 // the baseline capabilities; a peer's entry carries no endpoints and no
 // home DERP once expired.
-func servedDiff(cfg *types.Config, dns types.DNSView, e tailcfg.NodeView, nv types.NodeView, self bool) string {
+func servedDiff(cfg *types.Config, dns types.DNSView, cv tailcfg.CapabilityVersion, e tailcfg.NodeView, nv types.NodeView, self bool) string {
 	if e.StableID() != nv.ID().StableID() {
 		return fmt.Sprintf("stable ID %q, its ID's %q", e.StableID(), nv.ID().StableID())
 	}
@@ -202,6 +205,24 @@ func servedDiff(cfg *types.Config, dns types.DNSView, e tailcfg.NodeView, nv typ
 	}
 
 	if !self {
+		// A peer's entry is rendered for the version its viewer speaks,
+		// and carries only what clients read of it: its source stamps and,
+		// for an approved exit node, the exit-node suggestion — none with
+		// values, which ride the filter the viewer holds.
+		if want := min(max(cv, capver.MinSupportedCapabilityVersion), tailcfg.CurrentCapabilityVersion); e.Cap() != want {
+			return fmt.Sprintf("rendered for capability version %d, its viewer speaks %d", e.Cap(), want)
+		}
+
+		for c, vs := range e.CapMap().All() {
+			if vs.Len() > 0 {
+				return fmt.Sprintf("capability %s with %d values, a peer's entry carries none", c, vs.Len())
+			}
+
+			if c != nodecap.SuggestExitNode && !strings.Contains(string(c), strings.TrimPrefix(policymodel.StampPrefix, "https://")) {
+				return fmt.Sprintf("capability %s, which a peer's entry does not carry", c)
+			}
+		}
+
 		return peerHostinfoDiff(e.Hostinfo(), nv.Hostinfo())
 	}
 
