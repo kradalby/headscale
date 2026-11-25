@@ -320,11 +320,13 @@ func randomNext(pfx netip.Prefix) (netip.Addr, error) {
 	return ip, nil
 }
 
+// isTailscaleReservedIP names the single addresses no node may hold. The
+// via range is not among them: the walk jumps it whole ([pastVia]), as one
+// address at a time would never get across, so it is excluded once there.
 func isTailscaleReservedIP(ip netip.Addr) bool {
 	return tsaddr.ChromeOSVMRange().Contains(ip) ||
 		tsaddr.TailscaleServiceIP() == ip ||
-		tsaddr.TailscaleServiceIPv6() == ip ||
-		tsaddr.TailscaleViaRange().Contains(ip)
+		tsaddr.TailscaleServiceIPv6() == ip
 }
 
 // BackfillNodeIPs will take a database transaction, and
