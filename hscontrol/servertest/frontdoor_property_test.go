@@ -95,6 +95,7 @@ const (
 	stepRecords
 	stepSecond
 	stepSSHCheck
+	stepOIDC
 	numSteps
 )
 
@@ -105,7 +106,7 @@ var fdJudges = []string{"stored", "client", "reference", "restart"}
 
 var stepNames = [numSteps]string{
 	"world", "burst", "flap", "poll restart", "client restart", "endpoints", "rename", "logout", "relogin", "server restart",
-	"ownership", "identity", "race", "clock", "records", "second session", "ssh check",
+	"ownership", "identity", "race", "clock", "records", "second session", "ssh check", "oidc login",
 }
 
 // fdNode is a model node's client and how it joined, which a login, a
@@ -189,6 +190,15 @@ type frontDoor struct {
 	// v2token is the case's v2 bearer, minted at the first translated
 	// write.
 	v2token string
+	// idp is the case's identity provider, when it drew one: interactive
+	// registrations go through its real callback.
+	idp *MockIDP
+	// oidcUsers are the users the callback created, by the subject claim
+	// that made them.
+	oidcUsers map[string]uint
+	// oidcClaims are the claims the next login's callback carries; set by
+	// the oidc step, consumed by the first interactive login after it.
+	oidcClaims map[string]any
 	// unheld are the subnet routes a burst left with no router available:
 	// who held them last is history the election history missed, so the
 	// routes go unjudged until a router can take them again.
@@ -302,6 +312,16 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 	}
 
 	opts := []ServerOption{WithEphemeralTimeout(time.Hour), WithBatchDelay(20 * time.Millisecond)}
+
+	fd.idp, fd.oidcUsers = nil, map[string]uint{}
+
+	if rapid.Bool().Draw(rt, "oidc") {
+		fd.idp = NewMockIDP()
+		tb.Cleanup(fd.idp.Close)
+
+		opts = append(opts, WithOIDC(fd.idp))
+	}
+
 	if fd.clock {
 		opts[0] = WithEphemeralTimeout(fdClock)
 	}
@@ -338,7 +358,7 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 	for i := range steps {
 		at := fmt.Sprintf("step %d", i+1)
 
-		kind := rapid.IntRange(0, 31).Draw(rt, "kind")
+		kind := rapid.IntRange(0, 32).Draw(rt, "kind")
 
 		switch {
 		case kind < 6:
@@ -375,6 +395,8 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 			fd.sessionsStep(at)
 		case kind == 31:
 			fd.sshCheckStep(at)
+		case kind == 32:
+			fd.oidcStep(at)
 		}
 
 		fd.settle(at)
@@ -839,6 +861,159 @@ func (fd *frontDoor) approveNow(u policymodel.User) func(authID string) error {
 	}
 }
 
+// oidcStep registers a node through the identity provider's real
+// callback, as a person logging in does: the claims name a user the
+// callback creates, or one an earlier draw of the step created, whose
+// changed claims update it rather than make another.
+func (fd *frontDoor) oidcStep(at string) {
+	fd.run.tally.steps[stepNames[stepOIDC]]++
+
+	if fd.idp == nil {
+		fd.run.tally.steps[stepNames[stepOIDC]+" (no provider)"]++
+
+		return
+	}
+
+	// The claims: a fresh subject, or an earlier draw's with a changed
+	// name or e-mail.
+	var u policymodel.User
+
+	subjects := slices.Sorted(maps.Keys(fd.oidcUsers))
+
+	if len(subjects) == 0 || rapid.Bool().Draw(fd.t, "oidc-first") {
+		id := fd.nextUserID()
+		sub := "u" + strconv.FormatUint(uint64(id), 10)
+
+		u = policymodel.User{
+			ID:       id,
+			Name:     fd.drawName("oidc-name"),
+			Email:    fd.drawEmail("oidc-email"),
+			Provider: fd.idp.URL + "/" + sub,
+		}
+
+		fd.oidcClaims = map[string]any{
+			"sub":                sub,
+			"preferred_username": u.Name,
+			"email":              u.Email,
+		}
+
+		fd.run.tally.steps[stepNames[stepOIDC]+": a first login"]++
+
+		// A node to claim before the model's edits: the user exists in
+		// the model once the claim is to happen, and the callback's
+		// claims, carrying the same identity, are what makes the
+		// server's. No node: no claim, and no claims left set for a
+		// later login to pick up.
+		n, ok := fd.pickOIDCNode()
+		if !ok {
+			fd.oidcClaims = nil
+
+			return
+		}
+
+		fd.apply(policymodel.AddUser{User: u})
+		fd.oidcUsers[sub] = id
+		fd.untag(at, policymodel.Retag{ID: n, User: u.ID})
+
+		// The same subject's changed claims, on a re-login of the node
+		// just claimed: the callback must update the user it made,
+		// never make another.
+		email := fd.drawEmail("oidc-second-email")
+		fd.oidcClaims = map[string]any{
+			"sub": sub, "preferred_username": u.Name, "email": email,
+		}
+
+		fd.apply(policymodel.SetEmail{ID: u.ID, Email: email})
+		fd.run.tally.steps[stepNames[stepOIDC]+": a changed e-mail"]++
+
+		node, _ := fd.w.Topology.Node(n)
+		fd.login(at, n, u, node)
+
+		return
+	}
+
+	sub := subjects[rapid.IntRange(0, len(subjects)-1).Draw(fd.t, "oidc-subject")]
+
+	u, _ = fd.w.Topology.User(fd.oidcUsers[sub])
+
+	// A node to claim before anything else: no node, no model edits, and
+	// no claims left set for a later login to pick up.
+	node, ok := fd.pickOIDCNode()
+	if !ok {
+		fd.oidcClaims = nil
+
+		return
+	}
+
+	switch rapid.IntRange(0, 2).Draw(fd.t, "oidc-claims") {
+	case 0:
+		// A changed e-mail, which must update the user the subject
+		// already names, never make another.
+		email := fd.drawEmail("oidc-new-email")
+		fd.oidcClaims = map[string]any{
+			"sub": sub, "preferred_username": u.Name, "email": email,
+		}
+		fd.run.tally.steps[stepNames[stepOIDC]+": a changed e-mail"]++
+
+		fd.apply(policymodel.SetEmail{ID: u.ID, Email: email})
+	case 1:
+		// A changed name.
+		name := fd.drawName("oidc-new-name")
+		fd.oidcClaims = map[string]any{
+			"sub": sub, "preferred_username": name, "email": u.Email,
+		}
+		fd.run.tally.steps[stepNames[stepOIDC]+": a changed name"]++
+
+		fd.apply(policymodel.RenameUser{ID: u.ID, Name: name})
+	default:
+		// The same claims again: another device of the same user's.
+		fd.oidcClaims = map[string]any{
+			"sub": sub, "preferred_username": u.Name, "email": u.Email,
+		}
+		fd.run.tally.steps[stepNames[stepOIDC]+": another device"]++
+	}
+
+	fd.untag(at, policymodel.Retag{ID: node, User: u.ID})
+}
+
+// pickOIDCNode is a node the next claims login can claim: tagged, live,
+// and claimable by any user, which a claims user is. It reports the
+// node's ID.
+func (fd *frontDoor) pickOIDCNode() (types.NodeID, bool) {
+	n, ok := fd.pick("oidc-claimed", func(n policymodel.Node, nd *fdNode) bool {
+		return n.Tagged() && !n.Offline && !n.Expired && !nd.loggedOut && nd.tc.Polling() &&
+			nd.Method != util.RegisterMethodAuthKey
+	})
+	if !ok {
+		fd.run.tally.steps[stepNames[stepOIDC]+" (no node)"]++
+
+		return 0, false
+	}
+
+	return n.ID, true
+}
+
+// loginApprover is how an interactive login's approval is driven: the
+// oidc step's, through the identity provider's real callback with the
+// claims it set; every other login approves as a person does, through
+// the State, as the identity step's logins always have.
+func (fd *frontDoor) loginApprover(as policymodel.User) func(authID string) error {
+	if fd.idp == nil || fd.oidcClaims == nil {
+		return fd.approverAt(as)
+	}
+
+	claims := fd.oidcClaims
+	fd.oidcClaims = nil
+
+	fd.idp.SetClaims(claims)
+
+	return func(authID string) error {
+		fd.run.tally.steps[stepNames[stepOIDC]+": a login through the callback"]++
+
+		return DriveOIDCLogin(fd.tb, fd.srv, fd.idp, authID)
+	}
+}
+
 // awaitFollowup waits until the client's follow-up request for authID is
 // waiting for its verdict, as it is by the time a person approves the URL
 // the client shows.
@@ -953,7 +1128,7 @@ func (fd *frontDoor) join(at string, n policymodel.Node) policymodel.Node {
 			nd.Method = util.RegisterMethodOIDC
 		}
 
-		opts = append(opts, WithInteractiveLogin(fd.approverAt(as)))
+		opts = append(opts, WithInteractiveLogin(fd.loginApprover(as)))
 	default:
 		nd.Method = util.RegisterMethodAuthKey
 
@@ -1296,7 +1471,7 @@ func (fd *frontDoor) login(at string, id types.NodeID, u policymodel.User, n pol
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	err := nd.tc.Login(ctx, nd.tc.Persist(), "", controlclient.LoginInteractive, fd.hostinfo(n, true), fd.approverAt(u))
+	err := nd.tc.Login(ctx, nd.tc.Persist(), "", controlclient.LoginInteractive, fd.hostinfo(n, true), fd.loginApprover(u))
 	if err != nil {
 		fd.t.Fatalf("%s: n%d logs in as u%d: %v", at, id, u.ID, err)
 	}
@@ -3647,6 +3822,20 @@ func (t *fdTally) require(tb testing.TB, held *policymodel.HeldJudge) {
 	} {
 		if t.steps[kind] == 0 {
 			tb.Errorf("no case took the ssh shape: %s", kind)
+		}
+	}
+
+	// The identity provider's callback: a login driven through it, the
+	// user its claims made, and that user's changed claims (the changed
+	// e-mail, which the first login's second round always drives; the
+	// changed name and the another-device shapes ride on drawn second
+	// logins and are reported, not floored).
+	for _, kind := range []string{
+		stepNames[stepOIDC] + ": a login through the callback",
+		stepNames[stepOIDC] + ": a changed e-mail",
+	} {
+		if t.steps[kind] == 0 {
+			tb.Errorf("no case logged in through the identity provider: %s", kind)
 		}
 	}
 

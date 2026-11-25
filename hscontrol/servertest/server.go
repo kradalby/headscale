@@ -70,6 +70,7 @@ type serverConfig struct {
 	prefixV4              netip.Prefix
 	capSources            bool
 	filterChunks          bool
+	idp                   *MockIDP
 }
 
 func defaultServerConfig() *serverConfig {
@@ -164,6 +165,14 @@ func WithLogTailEnabled() ServerOption {
 	return func(c *serverConfig) { c.logTailEnabled = true }
 }
 
+// WithOIDC turns the server's interactive registrations into the real
+// OIDC flow against idp: the register page redirects to the provider,
+// and the callback exchanges the code for the claims. The provider must
+// stay open for the server's lifetime.
+func WithOIDC(idp *MockIDP) ServerOption {
+	return func(c *serverConfig) { c.idp = idp }
+}
+
 // NewServer creates and starts a Headscale test server.
 // The server is fully functional and accepts real Tailscale control
 // protocol connections over Noise.
@@ -220,6 +229,17 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 	if len(sc.dnsResolvers) > 0 {
 		cfg.DNSConfig.OverrideLocalDNS = true
 		cfg.DNSConfig.Nameservers.Global = sc.dnsResolvers
+	}
+
+	if sc.idp != nil {
+		cfg.OIDC = types.OIDCConfig{
+			Issuer:                     types.HTTPURL(sc.idp.URL),
+			ClientID:                   "headscale",
+			ClientSecret:               types.Secret("mock-idp-secret"),
+			Scope:                      []string{"openid", "profile", "email"},
+			PKCE:                       types.PKCEConfig{Method: types.PKCEMethodS256},
+			OnlyStartIfOIDCIsAvailable: true,
+		}
 	}
 
 	return start(tb, cfg, sc.ephemeralTimeout, sc.realListener)
