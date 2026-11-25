@@ -229,11 +229,20 @@ func (g *Graph) Update(fn func(tx *Tx) error) (*Snapshot, error) {
 func (g *Graph) UpdateChecked(fn func(tx *Tx) error, check func(*Snapshot) error) (*Snapshot, error) {
 	snap, changed, err := g.update(fn, check)
 	if changed {
+		if afterStore != nil {
+			afterStore()
+		}
+
 		g.notify()
 	}
 
 	return snap, err
 }
+
+// afterStore, when set, runs on the commit path between the new snapshot
+// becoming readable and subscribers being woken. Test seam only; nil in
+// production.
+var afterStore func()
 
 // update runs fn and commits under g.mu. A panic in fn or in a cell leaves
 // the published snapshot as it was and the graph unlocked: commit builds the

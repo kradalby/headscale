@@ -260,6 +260,74 @@ func TestGetReadsAnotherGraphsHandleOfTheSameType(t *testing.T) {
 	}
 }
 
+// TestSubscriberWokenAfterStore pins the promise the mapper's hub sits
+// on: a subscriber is woken only after the new snapshot is stored, so a
+// woken reader never renders the state its commit replaced. The seam
+// parks the writer between the store and the wake; a notify-before-store
+// bug makes the parked wake-up arrive, or the parked snapshot stay old,
+// on every run.
+func TestSubscriberWokenAfterStore(t *testing.T) {
+	g := New()
+	a := g.NewInput("a", 1, Same[int])
+
+	sub := g.Subscribe()
+
+	_, _ = g.Update(func(*Tx) error { return nil }) // rev 1
+
+	<-sub.C // drain the first wake-up
+
+	parked, release := make(chan struct{}), make(chan struct{})
+
+	afterStore = func() {
+		parked <- struct{}{}
+
+		<-release
+	}
+	defer func() { afterStore = nil }()
+
+	done := make(chan *Snapshot, 1)
+
+	go func() {
+		s, _ := g.Update(func(tx *Tx) error { Set(tx, a, 2); return nil })
+		done <- s
+	}()
+
+	select {
+	case <-parked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("writer never reached the seam")
+	}
+
+	// The parked commit is already readable: the store precedes the wake.
+	s := g.Snapshot()
+	if s.Rev() != 2 || s.Get(a) != 2 {
+		t.Fatalf("while parked, snapshot holds rev %d a=%d, want rev 2 a=2", s.Rev(), s.Get(a))
+	}
+
+	// No wake-up may arrive while the writer sits between store and notify.
+	select {
+	case <-sub.C:
+		t.Fatal("subscriber woken before the snapshot was stored")
+	default:
+	}
+
+	close(release)
+
+	select {
+	case <-sub.C:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber never woken after the commit")
+	}
+
+	if s := g.Snapshot(); s.Rev() != 2 || s.Get(a) != 2 {
+		t.Fatalf("after the wake, snapshot holds rev %d a=%d, want rev 2 a=2", s.Rev(), s.Get(a))
+	}
+
+	if s := <-done; s.Rev() != 2 {
+		t.Fatalf("writer returned rev %d, want 2", s.Rev())
+	}
+}
+
 // TestConcurrentUpdatesAndReaders commits from several writers while
 // readers and subscribers come and go: no snapshot may mix revisions of
 // its cells, and every subscriber must reach the last commit.
