@@ -401,6 +401,13 @@ func playFrontDoor(t *testing.T, rt *rapid.T, run *fdRun) {
 
 		fd.settle(at)
 	}
+
+	// The v2 key-renewal write, once per case of the v2 form, so its
+	// reach never rests on a case drawing a renewal besides.
+	if fd.v2 {
+		fd.v2Renew("the v2 renewal")
+		fd.settle("the v2 renewal")
+	}
 }
 
 // begin brings the start world in as an admin and clients would: users,
@@ -2283,6 +2290,21 @@ func (fd *frontDoor) relogin(at string) {
 
 	fd.keyLoggedIn(at, n)
 	fd.w = fd.w.Apply(edits...)
+}
+
+// v2Renew writes the v2 key-renewal form, which the drawn edits reach
+// only when a case both draws an expiry renewal and takes the v2 API:
+// an admin renews one unexpired node's key, which changes nothing, so
+// every v2 case carries the write and a deep run always reaches it.
+func (fd *frontDoor) v2Renew(at string) {
+	n, ok := fd.pick("to-renew", func(n policymodel.Node, nd *fdNode) bool {
+		return !n.Expired && !nd.loggedOut
+	})
+	if !ok {
+		return
+	}
+
+	fd.edit(at, policymodel.SetExpired{ID: n.ID, Expired: false}, nil)
 }
 
 // keyLogin logs n's client in again with key under a new node key, as
