@@ -59,6 +59,11 @@ type nodeWrite struct {
 // storeColumns are the columns a store write may move.
 var storeColumns = []string{"IPv4", "IPv6", "Endpoints", "UserID", "Tags", "Expiry", "ApprovedRoutes", "AutoApprovedRoutes"}
 
+// homeDERPRegion is the one region of the driver's DERP map, which every
+// client reports as its home and it holds of every node, whatever a
+// later report leaves out.
+const homeDERPRegion = tailcfg.DERPRegionID(999)
+
 // begin starts counting one node's write of kind; the returned func
 // tallies it.
 func (p *pbtWorld) begin(kind string) func() {
@@ -248,6 +253,13 @@ func (p *pbtWorld) enrol(nc newcomer, w policymodel.World) {
 	p.steerID(id)
 
 	full := tn.Hostinfo.Clone()
+	// Every client reports its home DERP with its hostinfo; later reports
+	// may leave it out (see [pbtWorld.report]), and the stored hostinfo
+	// must keep it.
+	if full.NetInfo == nil {
+		full.NetInfo = &tailcfg.NetInfo{PreferredDERP: homeDERPRegion}
+	}
+
 	bare := full.Clone()
 	bare.RoutableIPs = nil
 
@@ -331,8 +343,10 @@ func (p *pbtWorld) enrol(nc newcomer, w policymodel.World) {
 	}
 
 	p.reg[id] = ri
-	// The keys its entry must carry on the wire ([policymodel.WireKeys]).
+	// The keys its entry must carry on the wire ([policymodel.WireKeys]),
+	// and the home DERP its client reported with its hostinfo.
 	p.regkeys[id] = regKeys{node: tn.NodeKey, disco: tn.DiscoKey}
+	p.derp[id] = homeDERPRegion
 
 	// The allocator's sequence, judged.
 	if got.IPv4().Get() != v4 || got.IPv6().Get() != v6 {
@@ -413,6 +427,12 @@ func (p *pbtWorld) login(id types.NodeID, machine key.MachinePublic, node key.No
 // loginWith is login with the client reporting hi.
 func (p *pbtWorld) loginWith(id types.NodeID, machine key.MachinePublic, node key.NodePublic, hi *tailcfg.Hostinfo, uid uint, method string) types.NodeView {
 	p.t.Helper()
+
+	// The hostinfo a client registers with carries its home DERP.
+	if hi.NetInfo == nil {
+		hi = hi.Clone()
+		hi.NetInfo = &tailcfg.NetInfo{PreferredDERP: homeDERPRegion}
+	}
 
 	authID := types.MustAuthID()
 
@@ -697,13 +717,28 @@ func (p *pbtWorld) report(n policymodel.Node, tn *types.Node) {
 
 			return err
 		})
+	} else {
+		// Every third report leaves NetInfo out, as a client does whose
+		// home DERP did not change: the stored hostinfo keeps it.
+		if hi.NetInfo != nil && p.reports%3 == 0 {
+			hi.NetInfo = nil
+			p.made["map request without NetInfo"]++
+		}
 
-		return
+		p.produce(id, "map request", func() error {
+			return p.s.UpdateNodeFromMapRequest(id, tailcfg.MapRequest{NodeKey: cur.NodeKey, DiscoKey: cur.DiscoKey, Endpoints: cur.Endpoints, Hostinfo: hi})
+		})
 	}
 
-	p.produce(id, "map request", func() error {
-		return p.s.UpdateNodeFromMapRequest(id, tailcfg.MapRequest{NodeKey: cur.NodeKey, DiscoKey: cur.DiscoKey, Endpoints: cur.Endpoints, Hostinfo: hi})
-	})
+	// The request outlives the call as the client's own struct, which it
+	// may reuse: what the State stored must share no memory with it.
+	if len(hi.RoutableIPs) > 0 {
+		hi.RoutableIPs[0] = netip.MustParsePrefix("203.0.113.0/25")
+	}
+
+	if hi.NetInfo != nil {
+		hi.NetInfo.PreferredDERP++
+	}
 }
 
 // online opens or closes n's connections as the model says: a node
@@ -761,6 +796,7 @@ func (p *pbtWorld) leave(n policymodel.Node) {
 
 	delete(p.conns, id)
 	delete(p.reg, id)
+	delete(p.derp, id)
 }
 
 var errNotDeleted = errors.New("was not deleted")
@@ -789,13 +825,22 @@ func (p *pbtWorld) endpoint(id types.NodeID, eps []netip.AddrPort) {
 }
 
 // requireStored holds what production stored to the model after a write
-// ([statemodel.Stored]).
+// ([statemodel.Stored]), and that every node's stored hostinfo keeps the
+// home DERP its client reported: a report without NetInfo carries it, and
+// nothing the client keeps shares memory with what was stored.
 func (p *pbtWorld) requireStored(after string) {
 	p.t.Helper()
 
 	if !p.unstored {
 		if d := statemodel.Stored(p); d != "" {
 			p.t.Fatalf("after %s: %s", after, d)
+		}
+
+		for _, nv := range p.s.Snapshot().ListNodes().All() {
+			hi := nv.Hostinfo()
+			if !hi.Valid() || !hi.NetInfo().Valid() || hi.NetInfo().PreferredDERP() != p.derp[nv.ID()] {
+				p.t.Fatalf("after %s: n%d's stored hostinfo does not hold its home DERP %d", after, nv.ID(), p.derp[nv.ID()])
+			}
 		}
 	}
 }

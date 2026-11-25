@@ -1526,6 +1526,7 @@ func TestDeliveryConvergesThroughTheClient(t *testing.T) {
 	floors := map[string]int{
 		"lagged renders": reach.lagged, "failed writes": reach.failed, "reconnects": reach.reconnected,
 		"chunks deleted": reach.deleted, "overlapping reconnects": reach.overlapped, "address indexes held": reach.indexed,
+		"netinfo-less reports": reach.writes["map request without NetInfo"],
 	}
 
 	// A run of the default length can judge no membership churn and see no

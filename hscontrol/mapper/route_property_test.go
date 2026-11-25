@@ -74,10 +74,13 @@ type pbtWorld struct {
 	// node write by edit kind and the path it took.
 	made map[string]int
 
-	// reg is how each node registered; alloc the allocator's last
-	// addresses, as predicted; reports counts the client reports made.
+	// reg is how each node registered; regkeys the tunnel keys its
+	// client presented; derp the home DERP region its stored hostinfo
+	// must hold; alloc the allocator's last addresses, as predicted;
+	// reports counts the client reports made.
 	reg     map[types.NodeID]statemodel.Joined
 	regkeys map[types.NodeID]regKeys
+	derp    map[types.NodeID]tailcfg.DERPRegionID
 	alloc   [2]netip.Addr
 	reports int
 	// kind is the edit being written; cur counts the node write in
@@ -125,12 +128,12 @@ func newPBTWorld(t pbtT, w policymodel.World, configure ...func(*types.Config)) 
 	t.Cleanup(func() { _ = s.Close() })
 
 	s.SetDERPMap(&tailcfg.DERPMap{
-		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
+		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{homeDERPRegion: {RegionID: homeDERPRegion}},
 	})
 
 	p := &pbtWorld{
 		t: t, cfg: cfg, s: s, conns: map[types.NodeID][]uint64{}, elections: policymodel.NewElections(), made: map[string]int{},
-		reg: map[types.NodeID]statemodel.Joined{}, regkeys: map[types.NodeID]regKeys{},
+		reg: map[types.NodeID]statemodel.Joined{}, regkeys: map[types.NodeID]regKeys{}, derp: map[types.NodeID]tailcfg.DERPRegionID{},
 		alloc: [2]netip.Addr{cfg.Prefixes.V4.Masked().Addr(), cfg.Prefixes.V6.Masked().Addr()},
 	}
 
@@ -548,6 +551,10 @@ func TestSessionsFollowGeneratedScenarios(t *testing.T) {
 				n, err := strconv.Atoi(f.Value.String())
 				if err == nil && n >= 1000 {
 					requireCarried(t, reach.writes)
+
+					if reach.writes["map request without NetInfo"] == 0 {
+						t.Errorf("no client report came without its NetInfo")
+					}
 				}
 			}
 

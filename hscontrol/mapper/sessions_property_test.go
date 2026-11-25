@@ -379,6 +379,7 @@ func (p *pbtWorld) sessionAt(n *types.Node, sw sessionWrite) string {
 		p.mapRequest(n, func(hi *tailcfg.Hostinfo, _ *tailcfg.MapRequest) {
 			hi.NetInfo = &tailcfg.NetInfo{PreferredDERP: derp}
 		})
+		p.derp[id] = derp
 
 		return fmt.Sprintf("home DERP %d", derp)
 	case writeHostname:
