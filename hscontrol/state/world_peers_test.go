@@ -548,6 +548,10 @@ func sidesChurn(t *testing.T, r *rand.Rand, policies []string, focused bool, rep
 		runs := SidesAuditRuns()
 		before := w.snapshot()
 
+		// A generator step that built what the server refuses to start
+		// on fails here, not in a count only a refused world can move.
+		c.requireStartable()
+
 		var kind string
 
 		op := r.IntN(27)

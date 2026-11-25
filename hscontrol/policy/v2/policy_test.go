@@ -5768,7 +5768,7 @@ func TestViaDestinationOverlapReference(t *testing.T) {
 		{ID: 2, IPv4: ap("100.64.0.2"), Tags: []string{"tag:a"}, UserID: new(users[0].ID), Hostinfo: &tailcfg.Hostinfo{RoutableIPs: routes}, ApprovedRoutes: routes},
 		{ID: 3, IPv4: ap("100.64.0.3"), Tags: []string{"tag:a", "tag:b"}, Hostinfo: &tailcfg.Hostinfo{RoutableIPs: routes}, ApprovedRoutes: routes},
 		{ID: 4, IPv4: ap("100.64.0.4"), Tags: []string{"tag:other"}, Hostinfo: &tailcfg.Hostinfo{RoutableIPs: routes}, ApprovedRoutes: routes},
-		{ID: 5, IPv4: ap("10.1.0.7"), Tags: []string{"tag:destination"}},
+		{ID: 5, IPv4: ap("100.64.0.5"), Tags: []string{"tag:destination"}},
 		{ID: 6, IPv4: ap("100.64.0.6"), UserID: new(users[1].ID), User: new(users[1])},
 	}
 
@@ -5792,7 +5792,7 @@ func TestViaDestinationOverlapReference(t *testing.T) {
 
 			changed := slices.Clone(nodes)
 			changed[4] = nodes[4].Clone()
-			changed[4].IPv4 = ap("10.3.0.7")
+			changed[4].IPv4 = ap("100.64.0.7")
 			recompiled, err := NewPolicyManagerFrom(original, pol, users, changed.ViewSlice())
 			require.NoError(t, err)
 

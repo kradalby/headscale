@@ -541,6 +541,21 @@ func (c *churnRun) randomUserFields(u *types.User) {
 	}
 }
 
+// requireStartable holds the churn's world to the address rules a
+// server enforces at start (checkNodeAddresses): a generator that can
+// build what the server refuses to start on fails here, not in a count
+// only a refused world can move.
+func (c *churnRun) requireStartable() {
+	c.t.Helper()
+
+	var nodes types.Nodes
+	for _, nv := range c.w.snapshot().ListNodes().All() {
+		nodes = append(nodes, nv.AsStruct())
+	}
+
+	require.NoError(c.t, checkNodeAddresses(nodes))
+}
+
 // randomNode returns a new node: owned by a listed user, a user the list
 // lacks, or nobody, tagged or not, and with a user and UserID that may
 // disagree.
@@ -685,6 +700,10 @@ func membershipChurn(t *testing.T, r *rand.Rand) {
 
 	for step := range 500 {
 		before := w.snapshot()
+
+		// A generator step that built what the server refuses to start
+		// on fails here, not in a count only a refused world can move.
+		c.requireStartable()
 
 		var kind string
 

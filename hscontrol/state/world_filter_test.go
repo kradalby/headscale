@@ -378,18 +378,21 @@ func (c *churnRun) familyOp(e *nodeEdit) {
 	slices.Sort(ids)
 
 	n := mustGet(c.t, e, ids[c.r.IntN(len(ids))]).Clone()
-	b := byte(n.ID) //nolint:gosec // a few hundred nodes
+
+	// The whole id, so no two nodes the churn can build share an
+	// address: a shared one is a world the server refuses to start on.
+	hi, lo := byte(n.ID>>8), byte(n.ID) //nolint:gosec // a few hundred nodes
 
 	switch c.r.IntN(3) {
 	case 0:
 		n.IPv4 = nil
-		n.IPv6 = new(netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 14: 0x40, 15: b}))
+		n.IPv6 = new(netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 14: 0x40 | hi, 15: lo}))
 	case 1:
-		n.IPv4 = new(netip.AddrFrom4([4]byte{100, 66, 0, b}))
+		n.IPv4 = new(netip.AddrFrom4([4]byte{100, 66, hi, lo}))
 		n.IPv6 = nil
 	default:
-		n.IPv4 = new(netip.AddrFrom4([4]byte{100, 66, 0, b}))
-		n.IPv6 = new(netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 14: 0x40, 15: b}))
+		n.IPv4 = new(netip.AddrFrom4([4]byte{100, 66, hi, lo}))
+		n.IPv6 = new(netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 14: 0x40 | hi, 15: lo}))
 	}
 
 	e.Set(n.ID, n)
@@ -494,6 +497,10 @@ func filterChurn(t *testing.T, r *rand.Rand, policies []string, users bool) poli
 
 	for step := range 400 {
 		runs := FilterAuditRuns()
+
+		// A generator step that built what the server refuses to start
+		// on fails here, not in a count only a refused world can move.
+		c.requireStartable()
 
 		var kind string
 
