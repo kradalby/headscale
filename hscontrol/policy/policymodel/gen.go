@@ -1271,8 +1271,9 @@ func drawEdits(t *rapid.T, w World) []Edit {
 	}), 1, most).Draw(t, "edits")
 }
 
-// drawReuse deletes a node and registers another, which the address
-// allocator hands the freed address.
+// drawReuse deletes a node and registers another taking the freed
+// address over: a moved address only a store write can give it, since
+// the sequential allocator never hands a freed address out again.
 func drawReuse(t *rapid.T, w World) []Edit {
 	x := pick(t, w.Topology.Nodes, "leaves")
 

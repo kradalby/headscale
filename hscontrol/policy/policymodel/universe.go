@@ -172,6 +172,12 @@ func ownAddr(family int, id uint64) netip.Addr {
 		return netip.AddrFrom4([4]byte{100, 64, byte(id >> 8), byte(id)}) //nolint:gosec // the low 16 bits of the ID
 	}
 
+	// In v6, id 83 would be ::53, the Tailscale service address no node
+	// holds, so ids from there on take the next address.
+	if id >= 83 {
+		id++
+	}
+
 	return netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 14: byte(id >> 8), 15: byte(id)}) //nolint:gosec // as above
 }
 
