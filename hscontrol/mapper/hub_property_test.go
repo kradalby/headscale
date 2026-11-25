@@ -1666,9 +1666,10 @@ func (a *auditLines) judge() string {
 // or every node across a commit every map reads. The hub's own code makes
 // every decision: a routing (Hub.route, the render log and its memo), a
 // render's end and the wake it may owe (Stream.rendered), a first map's
-// snapshot (Hub.initialState), peer history, sessions. Spelled out here are
-// only the watcher's loop body and a stream's calls into the hub; no map is
-// rendered, and the snapshots are minted once from one State.
+// snapshot and end (Hub.firstMap, Hub.firstEnded), peer history, sessions.
+// Spelled out here are only the watcher's loop body and a stream's calls
+// into the hub; no map is rendered, and the snapshots are minted once from
+// one State.
 //
 // It judges, after every event (a routing runs whole here): every session
 // that is idle, has no wake pending and last rendered a commit before the
@@ -1698,6 +1699,7 @@ func TestHubCoreInterleavings(t *testing.T) {
 		{"two nodes, a failure, a leave", coreScope{nodes: 2, commits: 2, failures: 1, leaves: 1, global: true}},
 		{"two nodes, a failure, a deletion", coreScope{nodes: 2, commits: 2, failures: 1, deletions: 1, global: true}},
 		{"a second session, a failure", coreScope{nodes: 1, commits: 2, joins: 1, failures: 1, quiet: true, global: true}},
+		{"a second session, three commits", coreScope{nodes: 1, commits: 3, joins: 1}},
 	} {
 		t.Run("exhaustive/"+sc.name, func(t *testing.T) {
 			states, leaves := exploreCore(t, snaps, sc.scope)
@@ -1766,6 +1768,7 @@ const (
 	coreLoad
 	coreRoute
 	coreTake
+	coreBegin
 	coreEnd
 	coreFail
 	coreDeliver
@@ -1791,10 +1794,10 @@ func (e coreEvent) String() string {
 		return "route"
 	case coreJoin:
 		return fmt.Sprintf("join n%d", e.sess+1)
-	case coreTake, coreEnd, coreFail, coreDeliver, coreLeave:
+	case coreTake, coreBegin, coreEnd, coreFail, coreDeliver, coreLeave:
 	}
 
-	return fmt.Sprintf("%s s%d", [...]string{coreTake: "take", coreEnd: "end", coreFail: "fail", coreDeliver: "deliver", coreLeave: "leave"}[e.kind], e.sess)
+	return fmt.Sprintf("%s s%d", [...]string{coreTake: "take", coreBegin: "begin", coreEnd: "end", coreFail: "fail", coreDeliver: "deliver", coreLeave: "leave"}[e.kind], e.sess)
 }
 
 // coreEdit is a commit's change: each node's value flipped by flip[n], a
@@ -1819,6 +1822,7 @@ func (e coreEdit) String() string {
 const (
 	coreIdle = iota
 	coreTook
+	coreBegun
 	coreWritten
 )
 
@@ -1877,6 +1881,7 @@ func newCoreMachine(t pbtT, snaps []*state.Snapshot, scope coreScope) *coreMachi
 	for n := range scope.nodes {
 		s := m.join(n)
 		m.take(s)
+		m.begin(s)
 		m.end(s, true)
 		m.deliver(s)
 	}
@@ -1982,7 +1987,9 @@ func (m *coreMachine) enabled() []coreEvent {
 	for i, s := range m.sess {
 		switch {
 		case s.gone:
-		case s.phase == coreTook:
+		case s.phase == coreTook && s.first:
+			out = append(out, coreEvent{kind: coreBegin, sess: i})
+		case s.phase == coreTook, s.phase == coreBegun:
 			out = append(out, coreEvent{kind: coreEnd, sess: i})
 			if !s.first && m.failures < m.scope.failures {
 				out = append(out, coreEvent{kind: coreFail, sess: i})
@@ -2030,6 +2037,8 @@ func (m *coreMachine) apply(e coreEvent) {
 		m.routing()
 	case coreTake:
 		m.take(m.sess[e.sess])
+	case coreBegin:
+		m.begin(m.sess[e.sess])
 	case coreEnd, coreFail:
 		m.end(m.sess[e.sess], e.kind == coreEnd)
 	case coreDeliver:
@@ -2126,21 +2135,32 @@ func (m *coreMachine) take(s *coreSess) {
 	s.took, s.phase = m.committed, coreTook
 }
 
+// begin starts s's first map as Initial does: the hub picks the snapshot it
+// renders, which may be newer than the one it was handed.
+func (m *coreMachine) begin(s *coreSess) {
+	snap, _ := m.h.firstMap(m.id(s.n), s.sess, m.snaps[s.took])
+	s.took, s.phase = m.index(snap), coreBegun
+}
+
 // end ends s's render as Initial and Update do, or fails it as Update's
 // error path does. A render of a node no longer there fails, and its
 // session ends.
 func (m *coreMachine) end(s *coreSess, ok bool) {
-	snap := m.snaps[s.took]
+	snap, at := m.snaps[s.took], s.took
 	s.phase = coreIdle
 
-	if s.first {
-		snap, _ = m.h.initialState(m.id(s.n), snap)
+	// A first map tells the hub only how it ended: the hub knows what it
+	// rendered.
+	ended := func(err error) {
+		if s.first {
+			m.h.firstEnded(s.sess, err == nil)
+		} else {
+			s.st.rendered(snap, err)
+		}
 	}
 
-	at := m.index(snap)
-
 	if !m.alive(s.n, at) {
-		s.st.rendered(snap, ErrNodeGone)
+		ended(ErrNodeGone)
 		m.leave(s)
 
 		return
@@ -2149,14 +2169,17 @@ func (m *coreMachine) end(s *coreSess, ok bool) {
 	if !ok {
 		m.failures++
 
-		s.st.rendered(snap, errInjected)
+		ended(errInjected)
+
 		s.tried, s.ok = at, false
 
 		return
 	}
 
 	changed := s.first || m.views[at][s.n] != m.views[s.held][s.n]
-	s.st.rendered(snap, nil)
+
+	ended(nil)
+
 	s.first, s.held, s.tried, s.ok = false, at, at, true
 
 	if changed {

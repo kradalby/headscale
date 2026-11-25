@@ -73,14 +73,11 @@ func NewStream(cfg *types.Config, hub *Hub, nodeID types.NodeID, capVer tailcfg.
 // err is set: a failed render leaves the session holding what it held. It
 // runs before [Stream.record] publishes the render to the route audit, so
 // a session the render log wakes again is due to render before the audit
-// can hold it to what it just rendered.
+// can hold it to what it just rendered. A first map ends through
+// [Hub.firstEnded] instead.
 func (st *Stream) rendered(snap *state.Snapshot, err error) {
-	if st.sess == nil {
-		return
-	}
-
-	if rev, again := st.hub.renders.end(st.sess, snap, err == nil); again {
-		st.hub.rewake(st.sess, rev)
+	if st.sess != nil {
+		st.hub.ended(st.sess, snap, err == nil)
 	}
 }
 
@@ -89,11 +86,11 @@ func (st *Stream) rendered(snap *state.Snapshot, err error) {
 // learn removals from deltas would otherwise miss. A node whose history the
 // hub dropped (see [Hub.Join]) gets the full map alone.
 func (st *Stream) Initial(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) {
-	snap, previous := st.hub.initialState(st.nodeID, snap)
+	snap, previous := st.hub.firstMap(st.nodeID, st.sess, snap)
 
 	nm, err := st.r.render(snap)
 	if err != nil {
-		st.rendered(snap, err)
+		st.hub.firstEnded(st.sess, false)
 
 		return nil, err
 	}
@@ -116,7 +113,7 @@ func (st *Stream) Initial(snap *state.Snapshot) ([]*tailcfg.MapResponse, error) 
 	// As in Update; a first map's changes name every peer it holds.
 	nm.base, nm.changed, nm.removed = nil, nil, nil
 
-	st.rendered(snap, nil)
+	st.hub.firstEnded(st.sess, true)
 	st.record(snap)
 
 	st.pending = &sentView{ids: st.r.lastPeerIDs, rev: snap.Rev()}
@@ -283,11 +280,11 @@ type Hub struct {
 	routed          func(from, to uint64, between int)
 }
 
-// hubCore is what the hub decides sessions and peer history with. Its
-// fields are read and written only under [Hub.mu], by its own methods and
-// the hub's queries. Its methods take no lock and read no clock, and reach
-// a session's channels only through what the hub passes them: the hub
-// carries out what they return.
+// hubCore is what the hub decides sessions, their first maps and peer
+// history with. Its fields are read and written only under [Hub.mu], by its
+// own methods and the hub's queries. Its methods take no lock and read no
+// clock, and reach a session's channels only through what the hub passes
+// them: the hub carries out what they return.
 type hubCore struct {
 	sessions map[types.NodeID]map[*Session]struct{}
 	admitted uint64
@@ -472,9 +469,10 @@ func (c *hubCore) holdView(v []types.NodeID, delta int) {
 // a session holding a's render; one whose render was of a snapshot x
 // strictly between can hold what neither end has, and needs waking exactly
 // when the change from x to c reaches it, which [Route] over x and c says.
-// A render reports the snapshot it rendered as it ends: before the routing
-// past it, it is left for that routing to weigh; after, the render itself
-// asks [Route] up to where the hub has routed. A session woken but not yet
+// A render reports the snapshot it rendered as it ends, a first map the one
+// the hub chose for it: before the routing past it, it is left for that
+// routing to weigh; after, the render itself asks [Route] up to where the
+// hub has routed. A session woken but not yet
 // rendering takes a snapshot at least as new as every routing so far, so
 // nothing is kept for it but what its earlier renders left. The log is kept
 // in shards, by session, so renders ending together seldom wait on one
@@ -767,6 +765,9 @@ type Session struct {
 	// its node was deleted; a write still in flight then records nothing.
 	left     bool
 	admitted uint64
+	// first is, under the hub's lock, the snapshot its first map renders,
+	// from [Hub.firstMap] until [Hub.firstEnded].
+	first *state.Snapshot
 
 	// woken is, under the policy audit and the hub's lock, the latest
 	// commit that woke the session; sent what its stream last rendered.
@@ -1628,10 +1629,13 @@ func (h *Hub) lastPeers(nodeID types.NodeID) []types.NodeID {
 
 const hubWorldMismatch = "mapper: a Hub belongs to one State; use a new Hub for a reconstructed State"
 
-// initialState captures history with the newest snapshot the hub observed.
-// An obsolete initial snapshot must neither remove future peers nor lose an
-// older removal when a newer attempted write failed before its removal frame.
-func (h *Hub) initialState(nodeID types.NodeID, snap *state.Snapshot) (*state.Snapshot, []types.NodeID) {
+// firstMap returns the snapshot s's first map renders, the newest the hub
+// observed, and the history nodeID's removals are announced from. An
+// obsolete initial snapshot must neither remove future peers nor lose an
+// older removal when a newer attempted write failed before its removal
+// frame. The hub keeps the snapshot for [Hub.firstEnded], so the render log
+// weighs the first map as what it rendered, whatever its stream was handed.
+func (h *Hub) firstMap(nodeID types.NodeID, s *Session, snap *state.Snapshot) (*state.Snapshot, []types.NodeID) {
 	h.mu.Lock()
 	if h.latest != nil && !h.latest.SameWorld(snap) {
 		h.mu.Unlock()
@@ -1644,6 +1648,7 @@ func (h *Hub) initialState(nodeID types.NodeID, snap *state.Snapshot) (*state.Sn
 		snap = h.latest
 	}
 
+	h.core.firstMap(s, snap)
 	cur := h.core.sentPeers[nodeID]
 	h.mu.Unlock()
 
@@ -1652,6 +1657,45 @@ func (h *Hub) initialState(nodeID types.NodeID, snap *state.Snapshot) (*state.Sn
 	}
 
 	return snap, mergeViews(cur)
+}
+
+// firstEnded tells the hub s's first map ended, failed unless ok, as
+// [Stream.rendered] does for the snapshot [Hub.firstMap] returned.
+func (h *Hub) firstEnded(s *Session, ok bool) {
+	if s == nil {
+		return
+	}
+
+	h.mu.Lock()
+	snap := h.core.firstEnded(s)
+	h.mu.Unlock()
+
+	if snap != nil {
+		h.ended(s, snap, ok)
+	}
+}
+
+// ended puts s's render of snap in the render log, and wakes s again when
+// the log says a routing that went past snap reaches it.
+func (h *Hub) ended(s *Session, snap *state.Snapshot, ok bool) {
+	if rev, again := h.renders.end(s, snap, ok); again {
+		h.rewake(s, rev)
+	}
+}
+
+// firstMap records that s's first map renders snap.
+func (c *hubCore) firstMap(s *Session, snap *state.Snapshot) {
+	if s != nil {
+		s.first = snap
+	}
+}
+
+// firstEnded returns the snapshot s's first map rendered, and forgets it.
+func (c *hubCore) firstEnded(s *Session) *state.Snapshot {
+	snap := s.first
+	s.first = nil
+
+	return snap
 }
 
 func (h *Hub) observe(snap *state.Snapshot) {
