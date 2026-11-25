@@ -224,6 +224,50 @@ func TestSetPolicyEnforcesPolicyTests(t *testing.T) {
 	}
 }
 
+// TestReloadPolicyRefusedKeepsCheckApprovals pins a refused reload's side
+// effects: nothing is published, and the SSH check approvals the policy in
+// force granted stand — the document that would have revoked them never
+// became live. Only a reload that changes the policy revokes them.
+func TestReloadPolicyRefusedKeepsCheckApprovals(t *testing.T) {
+	const (
+		rules    = `"acls":[{"action":"accept","src":["persist-user@"],"dst":["persist-user@:22"]}]`
+		testsOK  = `"tests":[{"src":"persist-user@","accept":["persist-user@:22"]}]`
+		testsBad = `"tests":[{"src":"persist-user@","accept":["persist-user@:80"]}]`
+		widened  = `"acls":[{"action":"accept","src":["persist-user@"],"dst":["persist-user@:22"]},
+			{"action":"accept","src":["persist-user@"],"dst":["persist-user@:80"]}]`
+	)
+
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	_, err := s.SetPolicy([]byte(`{` + rules + `,` + testsOK + `}`))
+	require.NoError(t, err)
+
+	s.SetLastSSHAuth(nodeID, nodeID)
+	_, ok := s.GetLastSSHAuth(nodeID, nodeID)
+	require.True(t, ok, "test sanity: the check approval is recorded")
+
+	_, err = s.SetPolicyInDB(`{` + rules + `,` + testsBad + `}`)
+	require.NoError(t, err)
+
+	before := s.Snapshot()
+	require.Error(t, s.ReloadPolicy(), "a document failing its tests must be refused")
+
+	after := s.Snapshot()
+	assert.Equal(t, before.Rev(), after.Rev(), "a refused reload publishes nothing")
+	assert.Equal(t, string(before.PolicySource()), string(after.PolicySource()))
+
+	_, ok = s.GetLastSSHAuth(nodeID, nodeID)
+	require.True(t, ok, "a refused reload keeps the approvals the policy in force granted")
+
+	_, err = s.SetPolicyInDB(`{` + widened + `,` + testsOK + `}`)
+	require.NoError(t, err)
+	require.NoError(t, s.ReloadPolicy())
+
+	_, ok = s.GetLastSSHAuth(nodeID, nodeID)
+	require.False(t, ok, "a reload that changes the policy revokes the check approvals")
+}
+
 // TestSetPolicyUnchangedDocumentIsANoOp re-sets the live document after a
 // node change made its tests fail: the document is already live, so the
 // write changes nothing and returns no error, which lets a reload of it go
