@@ -312,15 +312,15 @@ type hubMachine struct {
 
 // hubPropertyReach counts the windows the schedules reached.
 type hubPropertyReach struct {
-	coalesced, logWoke, endWoke, endedPast, endedMidRouting, retried, firstNewer int
-	events                                                                       map[string]int
+	coalesced, logWoke, endWoke, endedPast, endedMidRouting, retried, firstNewer, sameRenderKept int
+	events                                                                                       map[string]int
 	// wakes counts what woke each render that sent something.
 	wakes *wakeTally
 }
 
 func (r hubPropertyReach) String() string {
-	return fmt.Sprintf("coalesced routings %d, render-log wakes by a routing %d, by a render's end %d, renders ended past a routing %d, ended mid-routing %d, failures retried %d, first maps of a newer snapshot %d; events %v; renders that sent something: %s",
-		r.coalesced, r.logWoke, r.endWoke, r.endedPast, r.endedMidRouting, r.retried, r.firstNewer, r.events, r.wakes)
+	return fmt.Sprintf("coalesced routings %d, render-log wakes by a routing %d, by a render's end %d, renders ended past a routing %d, ended mid-routing %d, failures retried %d, first maps of a newer snapshot %d, sessions only the same-render cutoff kept convergent %d; events %v; renders that sent something: %s",
+		r.coalesced, r.logWoke, r.endWoke, r.endedPast, r.endedMidRouting, r.retried, r.firstNewer, r.sameRenderKept, r.events, r.wakes)
 }
 
 // TestHubSessionsConvergeUnderDrawnSchedules drives the real hub — its
@@ -384,6 +384,7 @@ func TestHubSessionsConvergeUnderDrawnSchedules(t *testing.T) {
 				floors := map[string]int{
 					"coalesced": reach.coalesced, "endedPast": reach.endedPast,
 					"endedMidRouting": reach.endedMidRouting, "second sessions": reach.events["second session"],
+					"same-render kept": reach.sameRenderKept,
 				}
 
 				// Render-log wakes and retried failures come from few
@@ -714,6 +715,10 @@ func (m *hubMachine) advance(t *rapid.T) {
 	m.w.step()
 	t.Logf("watcher: %s", m.w.at)
 
+	if m.w.at.at == watchLoaded {
+		m.probeSameRender()
+	}
+
 	if m.w.at.at == watchRouted {
 		if m.w.at.to > m.w.at.from+1 {
 			m.reach.coalesced++
@@ -724,6 +729,80 @@ func (m *hubMachine) advance(t *rapid.T) {
 		}
 
 		m.reap()
+	}
+}
+
+// probeSameRender counts, at a routing's loaded point, the sessions that
+// only the nodes whose render at the routing's ends is equal keep
+// convergent: Route keeps such nodes because the routing is coalesced,
+// and a routing that dropped them there too would leave these sessions
+// stale, for the render log covers only sessions that rendered strictly
+// between the routing's ends. Held stale only when some node they see
+// renders differently from what they hold.
+func (m *hubMachine) probeSameRender() {
+	old, cur := m.w.routed, m.w.loaded
+	if old == nil || cur == nil || cur.Rev() <= old.Rev()+1 {
+		return
+	}
+
+	c := cur.Since(old)
+	if c.Global {
+		return
+	}
+
+	all, wake := Route(old, cur, c)
+	if all {
+		return
+	}
+
+	// equal are the changed nodes the +1 cutoff protects only because
+	// the routing is coalesced; rest is what a routing that dropped them
+	// would answer for.
+	var equal []types.NodeID
+
+	rest := make([]types.NodeID, 0, len(c.Nodes))
+
+	for _, n := range c.Nodes {
+		was, wasOK := old.GetNode(n)
+		is, isOK := cur.GetNode(n)
+
+		if wasOK && isOK && was.SameRender(is) {
+			equal = append(equal, n)
+		} else {
+			rest = append(rest, n)
+		}
+	}
+
+	if len(equal) == 0 {
+		return
+	}
+
+	dropped := c
+	dropped.Nodes = rest
+
+	_, only := Route(old, cur, dropped)
+
+	for id := range wake {
+		if _, ok := only[id]; ok {
+			continue
+		}
+
+		for _, s := range m.sess {
+			if s.id != id || s.first || !s.ok || s.last == nil || s.last.Rev() >= old.Rev() {
+				continue
+			}
+
+			for _, n := range equal {
+				held, heldOK := s.last.GetNode(n)
+				is, isOK := cur.GetNode(n)
+
+				if heldOK != isOK || heldOK && !held.SameRender(is) {
+					m.reach.sameRenderKept++
+
+					break
+				}
+			}
+		}
 	}
 }
 
