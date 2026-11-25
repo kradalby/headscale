@@ -1334,14 +1334,34 @@ func TestAgreesWithAddressFormMergesBySourceSet(t *testing.T) {
 		{SrcIPs: []string{"100.64.0.28", "100.64.0.3"}, DstPorts: []tailcfg.NetPortRange{d80}},
 	}
 
-	require.NoError(t, AgreesWithAddressForm(apart, apart, pass), "one source set's rules merged and apart")
-
 	require.ErrorIs(t, AgreesWithAddressForm(apart, apart[1:], pass), errCapForm, "a rule missing")
 
 	d22Elsewhere := tailcfg.NetPortRange{IP: "100.64.0.28", Ports: tailcfg.PortRange{First: 22, Last: 22}}
 	widened := slices.Clone(apart)
 	widened[0].DstPorts = []tailcfg.NetPortRange{d22, d22Elsewhere}
 	require.ErrorIs(t, AgreesWithAddressForm(apart, widened, pass), errCapForm, "a destination widened")
+
+	// Rules over one source set merge however their order reads: the
+	// single rule the compile would build agrees with the two kept apart.
+	merged := []tailcfg.FilterRule{
+		{SrcIPs: []string{"100.64.0.28", "100.64.0.3"}, DstPorts: []tailcfg.NetPortRange{d22, d80}},
+	}
+	require.NoError(t, AgreesWithAddressForm(apart, merged, pass), "one source set's rules merged and apart")
+
+	// The merge key is the source set with the protocol set: rules over
+	// different source sets are two groups, never one, however their
+	// protocols read. A key that merged by the protocol alone would union
+	// the two groups' destinations, and a destination moved between the
+	// source sets — a grant only one of the forms gives — would read as
+	// agreeing.
+	shareProto := []tailcfg.FilterRule{
+		{SrcIPs: []string{"100.64.0.28"}, DstPorts: []tailcfg.NetPortRange{d22}},
+		{SrcIPs: []string{"100.64.0.3"}, DstPorts: []tailcfg.NetPortRange{d80}},
+	}
+
+	moved := slices.Clone(shareProto)
+	moved[0].DstPorts = []tailcfg.NetPortRange{d22, d80}
+	require.ErrorIs(t, AgreesWithAddressForm(shareProto, moved, pass), errCapForm, "a destination moved between two source sets that share a protocol")
 }
 
 // TestFilterDeliveryByClient holds the per-client decision: named chunks go
