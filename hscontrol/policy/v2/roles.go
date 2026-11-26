@@ -41,8 +41,8 @@ const (
 	roleHeldNamed  // an owner itself named by its user's self grants
 	roleHeldOwner  // an owner holding an address of its user's owners
 	roleViaSeen    // a router of that via grant template
-	roleSelfSource // itself an owner its user's self grants name
-	roleSibling    // of a user with a node routing over that user's owners
+	roleSibling    // an owner of that user
+	roleCovered    // a named owner a subnet route of that user's router holds
 	roleLoneSource // a lone exit route over a source of that via grant
 )
 
@@ -87,8 +87,8 @@ var roleKindNames = [...]string{
 	roleNamedPort: "named-port", roleNamedApp: "named-app",
 	roleLiteral: "literal", roleAll: "all", roleApproved: "approved", roleExit: "exit",
 	roleClique: "clique", roleHeldNamed: "held-named", roleHeldOwner: "held-owner",
-	roleViaSeen:    "via-seen",
-	roleSelfSource: "self-source", roleSibling: "sibling",
+	roleViaSeen: "via-seen",
+	roleSibling: "sibling", roleCovered: "covered",
 	roleLoneSource: "lone-source",
 }
 

@@ -105,7 +105,7 @@ func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) 
 // appendListedOnly lists a on b or b on a where one lists the other without
 // being listed back: a sibling's self source, a lone exit route over a
 // source of a via grant the viewer routes for.
-func appendListedOnly(ret map[types.NodeID][]types.NodeID, pm *PolicyManager, siblings map[uint][]matcher.Match, a, b types.NodeView) {
+func appendListedOnly(ret map[types.NodeID][]types.NodeID, pm *PolicyManager, siblings map[uint]map[types.NodeID]bool, a, b types.NodeView) {
 	lists := func(viewer, peer types.NodeView) bool {
 		return selfSourceOfSibling(siblings, viewer, peer) ||
 			loneExitSource(pm.nodeMatchers(viewer, viaPeerRule), viewer, loneExitRanges(peer))

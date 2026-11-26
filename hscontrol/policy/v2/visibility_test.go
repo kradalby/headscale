@@ -390,6 +390,38 @@ func TestSidesQuirks(t *testing.T) {
 			peers: map[types.NodeID][]types.NodeID{1: {2}, 2: {1, 3}, 3: {2}, 4: nil},
 		},
 		{
+			// Under autogroup:self, a router over another user's device
+			// (n1) gets that user's rule and is its peer; the other devices
+			// of the router's user list the covered device, one way
+			// (acl-self-routed-by-other-user), and no device of that user
+			// the route does not cover (n2).
+			name:   "self-sibling-covered",
+			policy: `{"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]}]}`,
+			nodes: types.Nodes{
+				sideNode(1, alice, "100.64.0.1", "fd7a:115c:a1e0::1", nil),
+				sideNode(2, alice, "100.64.0.2", "fd7a:115c:a1e0::2", nil),
+				sideNode(3, bob, "100.64.0.3", "fd7a:115c:a1e0::3", nil, "100.64.0.1/32"),
+				sideNode(4, bob, "100.64.0.4", "fd7a:115c:a1e0::4", nil),
+				sideNode(5, carol, "100.64.0.5", "fd7a:115c:a1e0::5", nil),
+			},
+			peers: map[types.NodeID][]types.NodeID{1: {2, 3}, 2: {1, 3}, 3: {1, 2, 4}, 4: {1, 3}, 5: nil},
+		},
+		{
+			// A route over devices of two users (acl-self-routed-wide-route):
+			// the router's other device lists the covered ones, not n5.
+			name:   "self-sibling-wide-route",
+			policy: `{"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]}]}`,
+			nodes: types.Nodes{
+				sideNode(1, alice, "100.64.0.1", "fd7a:115c:a1e0::1", nil),
+				sideNode(2, alice, "100.64.0.2", "fd7a:115c:a1e0::2", nil),
+				sideNode(3, carol, "100.64.0.3", "fd7a:115c:a1e0::3", nil),
+				sideNode(4, bob, "100.64.0.4", "fd7a:115c:a1e0::4", nil, "100.64.0.0/30"),
+				sideNode(5, alice, "100.64.0.5", "fd7a:115c:a1e0::5", nil),
+				sideNode(6, bob, "100.64.0.6", "fd7a:115c:a1e0::6", nil),
+			},
+			peers: map[types.NodeID][]types.NodeID{1: {2, 4, 5}, 2: {1, 4, 5}, 3: {4}, 4: {1, 2, 3, 5, 6}, 5: {1, 2, 4}, 6: {1, 2, 3, 4}},
+		},
+		{
 			// SSH rules make nobody a peer.
 			name:   "ssh-makes-no-peers",
 			policy: `{"tagOwners": {"tag:s": []}, "acls": [], "ssh": [{"action": "accept", "src": ["alice@"], "dst": ["tag:s"], "users": ["root"]}]}`,

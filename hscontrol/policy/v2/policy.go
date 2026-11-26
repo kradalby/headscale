@@ -2526,40 +2526,42 @@ func sameUser(a, b types.NodeView) bool {
 	return okA && okB && userA == userB
 }
 
-// siblingSelfSources returns, per user, the matchers of other users'
-// autogroup:self rules that a device of the user serves through a subnet
-// route. SaaS keeps that visibility per user: every device of the user lists
-// the rules' sources, which list the router alone.
-func (pm *PolicyManager) siblingSelfSources(nodes views.Slice[types.NodeView]) map[uint][]matcher.Match {
-	out := map[uint][]matcher.Match{}
+// siblingSelfSources returns, per user, the devices of other users that a
+// subnet route of a device of the user covers and that are sources of their
+// own user's autogroup:self rules. SaaS lists such a device on every device
+// of the router's user; it lists the router alone.
+func (pm *PolicyManager) siblingSelfSources(nodes views.Slice[types.NodeView]) map[uint]map[types.NodeID]bool {
+	out := map[uint]map[types.NodeID]bool{}
 	a := pm.addresses()
+
+	if !slices.ContainsFunc(a.compiledGrants, func(cg compiledGrant) bool { return cg.self != nil }) {
+		return out
+	}
 
 	for _, router := range nodes.All() {
 		if !nodeHasUserIdentity(router) {
 			continue
 		}
 
-		subnet := types.RouteRanges(router.SubnetRoutes())
-		if len(subnet) == 0 {
+		routes := router.SubnetRoutes()
+		if len(routes) == 0 {
 			continue
 		}
 
 		owner := router.User().ID()
 
-		for i := range a.compiledGrants {
-			if a.compiledGrants[i].self == nil {
+		for uid, devices := range pm.userNodeIdx {
+			if uid == owner {
 				continue
 			}
 
-			for uid := range pm.userNodeIdx {
-				if uid == owner {
-					continue
-				}
-
-				for _, m := range pm.selfFor(i, uid).matchers {
-					if m.DestsOverlapsRanges(subnet) {
-						out[owner] = append(out[owner], m)
+			for _, d := range devices {
+				if routesCoverAny(routes, []types.NodeView{d}) && pm.selfSource(uid, d) {
+					if out[owner] == nil {
+						out[owner] = map[types.NodeID]bool{}
 					}
+
+					out[owner][d.ID()] = true
 				}
 			}
 		}
@@ -2568,17 +2570,32 @@ func (pm *PolicyManager) siblingSelfSources(nodes views.Slice[types.NodeView]) m
 	return out
 }
 
-// selfSourceOfSibling reports whether peer is a source of another user's
-// autogroup:self rule that a device of viewer's user serves, see
-// [PolicyManager.siblingSelfSources]. The viewer lists such a peer, one way.
-func selfSourceOfSibling(srcs map[uint][]matcher.Match, viewer, peer types.NodeView) bool {
-	if !nodeHasUserIdentity(viewer) {
-		return false
+// selfSource reports whether d is a source of an autogroup:self rule of its
+// user uid.
+func (pm *PolicyManager) selfSource(uid uint, d types.NodeView) bool {
+	a := pm.addresses()
+
+	for i := range a.compiledGrants {
+		if a.compiledGrants[i].self == nil {
+			continue
+		}
+
+		if slices.ContainsFunc(pm.selfFor(i, uid).matchers, func(m matcher.Match) bool {
+			return m.SrcsContainsIPs(d.IPs()...)
+		}) {
+			return true
+		}
 	}
 
-	return slices.ContainsFunc(srcs[viewer.User().ID()], func(m matcher.Match) bool {
-		return m.SrcsContainsIPs(peer.IPs()...)
-	})
+	return false
+}
+
+// selfSourceOfSibling reports whether peer is another user's device that a
+// subnet route of a device of viewer's user covers and that is a source of
+// its user's autogroup:self rules, see [PolicyManager.siblingSelfSources].
+// The viewer lists such a peer, one way.
+func selfSourceOfSibling(srcs map[uint]map[types.NodeID]bool, viewer, peer types.NodeView) bool {
+	return nodeHasUserIdentity(viewer) && srcs[viewer.User().ID()][peer.ID()]
 }
 
 // Three things make a node list another that does not list it back, as on

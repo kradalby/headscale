@@ -712,11 +712,6 @@ type sidesState struct {
 	// inside.
 	cover *graph.Map[netip.Prefix, coverAtoms]
 
-	// siblings holds, per user with a node routing over another user's
-	// owners, those users, sorted: every node of the user holds a sibling
-	// atom for each. It is replaced, never written in place.
-	siblings map[uint64][]uint64
-
 	// lones lists, sorted, the nodes approved for one family's exit route
 	// alone; loneCover counts, per family and while there are any, the
 	// atoms of every node with an address of it, as cover does for a route.
@@ -972,6 +967,7 @@ func UpdateSides(prev Sides, t *Templates, roles Roles, posts Postings, approval
 	moved := u.moveCounts(ids)
 	u.retarget(ids, moved)
 	l3 := u.touchers(l1, ids, moved)
+	u.readdCovered(ids, l3)
 
 	for _, id := range u.relone(ids, approvalsMoved) {
 		l3[id] = struct{}{}
@@ -1280,8 +1276,6 @@ func (u *sidesUpdate) refreshSets(l3 map[types.NodeID]struct{}) {
 		u.next.computed++
 	}
 
-	u.resibling(l3, sets)
-
 	u.next.sets = sets.Done()
 	u.next.held = graph.GroupBy(u.prev.held, u.next.sets, rolesOfSet, graph.Same[RoleSet])
 	u.next.total += u.next.computed
@@ -1424,100 +1418,54 @@ func (u *sidesUpdate) relone(l1 []types.NodeID, approvalsMoved bool) []types.Nod
 	return lones
 }
 
-// routedOver returns, sorted, the users other than own whose owners the
-// node with side set rs routes over: those it holds a held-owner atom of.
-func routedOver(rs RoleSet, own uint64) []uint64 {
-	var out []uint64
-
-	for r := range rs.All() {
-		if r.kind == roleHeldOwner && r.value != own {
-			out = append(out, r.value)
-		}
-	}
-
-	return out
-}
-
-// siblingsOf returns the users the nodes of user uid route over, sorted,
-// reading each node's side set through get.
-func (s Sides) siblingsOf(uid uint64, get func(types.NodeID) (RoleSet, bool)) []uint64 {
-	var out []uint64
-
-	for _, id := range s.posts.Nodes(OwnerRole(uint(uid))) {
-		if rs, ok := get(id); ok {
-			out = append(out, routedOver(rs, uid)...)
-		}
-	}
-
-	slices.Sort(out)
-
-	return slices.Compact(out)
-}
-
-// resibling brings the sibling atoms up to date with the side sets of l3,
-// just set in sets: a user whose nodes came to route over another user's
-// owners, or stopped, moves the side set of every node it has.
-func (u *sidesUpdate) resibling(l3 map[types.NodeID]struct{}, sets *graph.MapEdit[types.NodeID, RoleSet]) {
-	n := &u.next
-
-	users := map[uint64]struct{}{}
-
-	for id := range l3 {
-		for _, f := range []*sideFacts{mustFacts(u.prev.facts, id), mustFacts(n.facts, id)} {
-			if f != nil && f.owned {
-				users[uint64(f.owner)] = struct{}{}
+// coveredAtoms appends a covered atom for each user other than f's owner
+// with a router whose subnet route holds an address of f's node, a source
+// of its own user's self rules. SaaS lists such a device on every device of
+// the router's user, which it does not list back
+// (acl-self-routed-by-other-user, -by-third-user, -wide-route).
+func (s Sides) coveredAtoms(roles []Role, f *sideFacts) []Role {
+	for _, ip := range f.ips {
+		containing(s.routers.Groups, s.routerLens, ip, func(_ netip.Prefix, ids []types.NodeID) {
+			for _, id := range ids {
+				if rf, ok := s.facts.Get(id); ok && rf.owned && rf.owner != f.owner {
+					roles = append(roles, Role{kind: roleCovered, value: uint64(rf.owner)})
+				}
 			}
-		}
+		})
 	}
 
-	var moved map[uint64][]uint64
+	return roles
+}
 
-	for uid := range users {
-		is := n.siblingsOf(uid, sets.Get)
-		if slices.Equal(is, n.siblings[uid]) {
-			continue
-		}
-
-		if moved == nil {
-			moved = map[uint64][]uint64{}
-		}
-
-		moved[uid] = is
-	}
-
-	if moved == nil {
+// readdCovered adds to l3 the nodes inside a subnet route of a node of l1 whose
+// routes or owner moved: their covered atoms read who routes over them.
+func (u *sidesUpdate) readdCovered(l1 []types.NodeID, l3 map[types.NodeID]struct{}) {
+	if len(u.next.plan.selfPort)+len(u.next.plan.selfApp) == 0 {
 		return
 	}
 
-	siblings := maps.Clone(n.siblings)
-	if siblings == nil {
-		siblings = map[uint64][]uint64{}
-	}
+	add := func(id types.NodeID) { l3[id] = struct{}{} }
 
-	for uid, is := range moved {
-		if len(is) == 0 {
-			delete(siblings, uid)
-		} else {
-			siblings[uid] = is
+	for _, id := range l1 {
+		old, _ := u.prev.facts.Get(id)
+		cur, _ := u.next.facts.Get(id)
+
+		if old != nil && cur != nil && old.owned == cur.owned && old.owner == cur.owner && slices.Equal(old.routes, cur.routes) {
+			continue
 		}
-	}
 
-	n.siblings = siblings
+		if old != nil && old.owned {
+			for _, p := range old.routes {
+				u.prev.nodesIn(p, add)
+			}
+		}
 
-	for uid := range moved {
-		for _, id := range n.posts.Nodes(OwnerRole(uint(uid))) {
-			if f, ok := n.facts.Get(id); ok {
-				sets.Set(id, n.setOf(f))
-				n.computed++
+		if cur != nil && cur.owned {
+			for _, p := range cur.routes {
+				u.next.nodesIn(p, add)
 			}
 		}
 	}
-}
-
-func mustFacts(m *graph.Map[types.NodeID, *sideFacts], id types.NodeID) *sideFacts {
-	f, _ := m.Get(id)
-
-	return f
 }
 
 // buildSides computes every node's sides from scratch.
@@ -1572,31 +1520,6 @@ func buildSides(plan *sidePlan, roles Roles, posts Postings, approvals SubnetApp
 	sets := make(map[types.NodeID]RoleSet, len(facts))
 	for id, f := range facts {
 		sets[id] = s.setOf(f)
-	}
-
-	// The sibling atoms read every node's held-owner atoms, set just now.
-	siblings := map[uint64][]uint64{}
-
-	for id, f := range facts {
-		if f.owned && len(routedOver(sets[id], uint64(f.owner))) > 0 {
-			siblings[uint64(f.owner)] = nil
-		}
-	}
-
-	for uid := range siblings {
-		siblings[uid] = s.siblingsOf(uid, func(id types.NodeID) (RoleSet, bool) { rs, ok := sets[id]; return rs, ok })
-	}
-
-	if len(siblings) > 0 {
-		s.siblings = siblings
-
-		for uid := range siblings {
-			for _, id := range posts.Nodes(OwnerRole(uint(uid))) {
-				if f, ok := facts[id]; ok {
-					sets[id] = s.setOf(f)
-				}
-			}
-		}
 	}
 
 	s.sets = graph.NewMap(graph.Same[RoleSet], sets)
@@ -1910,13 +1833,11 @@ func (s Sides) setOf(f *sideFacts) RoleSet {
 		roles = append(roles, Role{kind: roleClique, value: f.clique})
 	}
 
-	if f.owned && (f.namedPort || f.namedApp) {
-		roles = append(roles, Role{kind: roleSelfSource, value: uint64(f.owner)})
-	}
-
 	if f.owned {
-		for _, v := range s.siblings[uint64(f.owner)] {
-			roles = append(roles, Role{kind: roleSibling, value: v})
+		roles = append(roles, Role{kind: roleSibling, value: uint64(f.owner)})
+
+		if f.namedPort || f.namedApp {
+			roles = s.coveredAtoms(roles, f)
 		}
 	}
 
@@ -2044,11 +1965,11 @@ func pairs(r Role) []Role {
 	return nil
 }
 
-// linksOf returns the atoms whose holders r's holders see. A sibling sees,
-// one way, the sources of the self rules its user's router serves.
+// linksOf returns the atoms whose holders r's holders see. A user's device
+// sees, one way, the devices a router of the user covers.
 func (a *sideAdjacency) linksOf(r Role) []Role {
 	if r.kind == roleSibling {
-		return []Role{{kind: roleSelfSource, value: r.value}}
+		return []Role{{kind: roleCovered, value: r.value}}
 	}
 
 	return slices.Concat(a.links[r], pairs(r))
@@ -2056,7 +1977,7 @@ func (a *sideAdjacency) linksOf(r Role) []Role {
 
 // readersOf returns the atoms whose holders see r's holders.
 func (a *sideAdjacency) readersOf(r Role) []Role {
-	if r.kind == roleSelfSource {
+	if r.kind == roleCovered {
 		return []Role{{kind: roleSibling, value: r.value}}
 	}
 

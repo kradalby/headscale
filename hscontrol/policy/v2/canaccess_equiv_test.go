@@ -187,7 +187,7 @@ func peerMapPrefixReference(
 
 	peers := make(map[types.NodeID][]types.NodeID)
 
-	var siblings map[uint][]matcher.Match
+	var siblings map[uint]map[types.NodeID]bool
 	if pm.addresses().needsPerNodeFilter {
 		siblings = pm.siblingSelfSources(nodes.ViewSlice())
 	}

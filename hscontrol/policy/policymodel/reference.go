@@ -1016,20 +1016,21 @@ func (r *Ref) loneExitSource(rl refRule, n, m RefNode) bool {
 }
 
 // siblingSource reports whether n sees m, one way, as a source of rl,
-// another user's autogroup:self rule that a device of n's user serves
-// through a subnet route.
-// Quirk: the service lists such sources on every device of the router's
-// user, though they list the router alone (acl-self-routed-by-other-user,
-// -by-third-user, -wide-route). A source of several devices is listed
-// device by device, by its own address: headscale's reading, which no
-// capture holds.
+// another user's autogroup:self rule, that a subnet route of a device of
+// n's user covers.
+// Quirk: the service lists such a device on every device of the router's
+// user, though it lists the router alone (acl-self-routed-by-other-user,
+// -by-third-user, -wide-route); a device of that user the route does not
+// cover is not listed.
 func (r *Ref) siblingSource(rl refRule, n, m RefNode) bool {
 	if rl.owner == 0 || n.owner() == 0 || n.owner() == rl.owner || !slices.ContainsFunc(m.Addrs, rl.src.Contains) {
 		return false
 	}
 
 	return slices.ContainsFunc(r.nodes, func(router RefNode) bool {
-		return router.owner() == n.owner() && slices.ContainsFunc(router.subnets(), rl.dst.OverlapsPrefix)
+		return router.owner() == n.owner() && slices.ContainsFunc(router.subnets(), func(q netip.Prefix) bool {
+			return slices.ContainsFunc(m.Addrs, q.Contains)
+		})
 	})
 }
 
