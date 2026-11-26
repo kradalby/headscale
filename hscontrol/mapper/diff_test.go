@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/policy/policymodel"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -774,6 +775,52 @@ func TestDiffClearsPeerEndpointsOnWire(t *testing.T) {
 	require.Empty(t, received.Peers[0].Endpoints)
 	require.Empty(t, received.PeersChanged)
 	require.Empty(t, received.PeersChangedPatch)
+}
+
+// TestPeerFieldClearsReachTheClient clears each field a patch can carry to
+// its zero value under a real client holding the old value, which must
+// then hold what a fresh session gives: the wire omits a zero, so a patch
+// carrying one changes nothing.
+func TestPeerFieldClearsReachTheClient(t *testing.T) {
+	cfg := &types.Config{ServerURL: "https://headscale.test"}
+	seen := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	for _, tt := range []struct {
+		name       string
+		set, clear func(*tailcfg.Node)
+	}{
+		{"home DERP", func(*tailcfg.Node) {}, func(n *tailcfg.Node) { n.HomeDERP = 0 }},
+		{"endpoints", func(*tailcfg.Node) {}, func(n *tailcfg.Node) { n.Endpoints = nil }},
+		{"capability version", func(n *tailcfg.Node) { n.Cap = 100 }, func(n *tailcfg.Node) { n.Cap = 0 }},
+		{"capabilities", func(n *tailcfg.Node) { n.CapMap = tailcfg.NodeCapMap{"example.com/cap": nil} }, func(n *tailcfg.Node) { n.CapMap = nil }},
+		{"node key", func(*tailcfg.Node) {}, func(n *tailcfg.Node) { n.Key = key.NodePublic{} }},
+		{"key signature", func(n *tailcfg.Node) { n.KeySignature = []byte{1, 2, 3} }, func(n *tailcfg.Node) { n.KeySignature = nil }},
+		{"disco key", func(n *tailcfg.Node) { n.DiscoKey = key.NewDisco().Public() }, func(n *tailcfg.Node) { n.DiscoKey = key.DiscoPublic{} }},
+		{"online", func(*tailcfg.Node) {}, func(n *tailcfg.Node) { n.Online = nil }},
+		{"last seen", func(n *tailcfg.Node) { n.Online, n.LastSeen = new(false), new(seen) }, func(n *tailcfg.Node) { n.LastSeen = new(time.Time{}) }},
+		{"key expiry", func(n *tailcfg.Node) { n.KeyExpiry = seen }, func(n *tailcfg.Node) { n.KeyExpiry = time.Time{} }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			before := testPeer(2)
+			before.Name = "n2.headscale.test."
+			tt.set(before)
+
+			after := cloneNode(before)
+			tt.clear(after)
+
+			sent := testNetMap(before)
+			next := withPeers(sent, after)
+			client := newRealClient(t)
+			client.apply(t, fullResponse(cfg, sent))
+
+			for _, resp := range diff(sent, next, nil) {
+				client.apply(t, resp)
+			}
+
+			fresh := newRealClient(t).apply(t, fullResponse(cfg, next))
+			require.Empty(t, policymodel.NetmapDiff(client.nm, fresh, func() { t.Error("peer held without LastSeen") }))
+		})
+	}
 }
 
 // TestPatchSendsExpiryInUTC pins that a patch carries the expiry in UTC.

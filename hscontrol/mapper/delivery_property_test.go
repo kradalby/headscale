@@ -2106,6 +2106,26 @@ func TestDeliveryConcurrentReportsToSameNode(t *testing.T) {
 	}
 }
 
+// TestDeliveryClearedDiscoKeyReachesTheClient pins that a node reporting no
+// disco key reaches a client already holding its old one, which then holds
+// what a fresh session gives.
+func TestDeliveryClearedDiscoKeyReachesTheClient(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	viewer, reporter := ids[0], ids[2]
+	s.Connect(reporter)
+	node := mustNode(t, s, reporter)
+	require.False(t, node.DiscoKey().IsZero(), "test sanity: the node starts with a disco key")
+
+	client, observe := observeDelivery(t, cfg, s, viewer)
+	before := s.Snapshot().Rev()
+	require.NoError(t, s.UpdateNodeFromMapRequest(reporter, tailcfg.MapRequest{NodeKey: node.NodeKey()}))
+	require.True(t, mustNode(t, s, reporter).DiscoKey().IsZero(), "test sanity: the State stores the cleared key")
+	observe(before, true)
+
+	fresh, _ := newFreshSession(t, cfg, s.Snapshot(), viewer, capVer).client(t)
+	require.Empty(t, policymodel.NetmapDiff(client.nm, fresh, func() { t.Error("an online peer held without LastSeen") }))
+}
+
 // expectedReport models only the inputs used in this history: one endpoint,
 // a fixed hostname, and no route or policy edits.
 func expectedReport(before *types.Node, req tailcfg.MapRequest) *types.Node {

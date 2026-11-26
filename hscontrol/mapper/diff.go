@@ -207,7 +207,9 @@ func profilesToCompare(sent, next *netMap) []tailcfg.UserID {
 // peerPatch returns the patch taking a client from before to after, nil
 // when they are wire-equal, and false when a changed field cannot be
 // patched. It masks the patchable fields and compares the rest, so a new
-// [tailcfg.Node] field is never silently dropped.
+// [tailcfg.Node] field is never silently dropped. A field changed to its
+// zero value cannot be patched: the wire omits the zero, so the patch
+// would tell the client nothing.
 func peerPatch(before, after *tailcfg.Node) (*tailcfg.PeerChange, bool) {
 	var patch *tailcfg.PeerChange
 
@@ -236,10 +238,18 @@ func peerPatch(before, after *tailcfg.Node) (*tailcfg.PeerChange, bool) {
 	}
 
 	if before.Key != after.Key {
+		if after.Key.IsZero() {
+			return nil, false
+		}
+
 		p().Key = new(after.Key)
 	}
 
 	if before.DiscoKey != after.DiscoKey {
+		if after.DiscoKey.IsZero() {
+			return nil, false
+		}
+
 		p().DiscoKey = new(after.DiscoKey)
 	}
 
@@ -264,10 +274,18 @@ func peerPatch(before, after *tailcfg.Node) (*tailcfg.PeerChange, bool) {
 	// clears it, which a patch cannot say; the Online patch is what the
 	// client acts on, so the stale LastSeen it keeps is harmless.
 	if !equalTimePtr(before.LastSeen, after.LastSeen) && after.LastSeen != nil {
+		if after.LastSeen.IsZero() {
+			return nil, false
+		}
+
 		p().LastSeen = new(*after.LastSeen)
 	}
 
 	if !bytes.Equal(before.KeySignature, after.KeySignature) {
+		if len(after.KeySignature) == 0 {
+			return nil, false
+		}
+
 		p().KeySignature = slices.Clone(after.KeySignature)
 	}
 
@@ -391,13 +409,14 @@ func evictsHeldAddress(sent, next *netMap, changed, removed []tailcfg.NodeID) bo
 }
 
 // needsPeerListRefresh reports a change only a whole peer list can apply:
-// clients drop an Endpoints, HomeDERP, Cap or Online clear from both a patch and a
-// PeersChanged entry they turn into one.
+// clients drop an Endpoints, HomeDERP, Cap, Online or KeySignature clear
+// from both a patch and a PeersChanged entry they turn into one.
 func needsPeerListRefresh(before, after *tailcfg.Node) bool {
 	return before.HomeDERP != 0 && after.HomeDERP == 0 ||
 		len(before.Endpoints) > 0 && len(after.Endpoints) == 0 ||
 		before.Cap != 0 && after.Cap == 0 ||
-		before.Online != nil && after.Online == nil
+		before.Online != nil && after.Online == nil ||
+		len(before.KeySignature) > 0 && len(after.KeySignature) == 0
 }
 
 // sameRules reports whether a and b are the same slice, as the policy's
