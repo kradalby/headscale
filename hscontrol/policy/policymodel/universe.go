@@ -53,6 +53,9 @@ const refUsers = 4
 // providerRef is the UserRefs entry naming a user by provider identifier.
 const providerRef = 5
 
+// domainRef is the UserRefs entry naming an e-mail domain's users.
+const domainRef = 4
+
 // providerPrefix is the identity provider's issuer: an OIDC user's
 // identifier is it followed by the user's ID, so identifiers are unique.
 const providerPrefix = "https://idp.example.com/"
@@ -117,6 +120,11 @@ const (
 	touching        = 7
 	publicPrefix6   = 8
 )
+
+// viaPrefixOf is, for each rule prefix, the one a via grant names in its
+// place: itself, or for one inside the Tailscale ranges, which a via
+// destination may not overlap, a prefix outside them.
+var viaPrefixOf = [numRulePrefixes]int{0, 1, 0, 1, 4, 6, 6, 7, 8}
 
 // hostDefault is the prefix each host names before a draw moves it:
 // a subnet, public space, and one node's address.

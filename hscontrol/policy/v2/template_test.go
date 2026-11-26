@@ -341,14 +341,13 @@ func TestExpanderQuirks(t *testing.T) {
 		},
 		{
 			// Via matches announced and approved routes only: an
-			// unannounced approval over the router's own address gives it
-			// nothing, though the destination would reach its address.
+			// unannounced approval gives the router nothing.
 			name: "via-ignores-unannounced-approval",
 			policy: `{` + owners + `, "grants": [
-				{"src": ["alice@"], "dst": ["100.64.0.0/24"], "ip": ["*"], "via": ["tag:b"]}]}`,
+				{"src": ["alice@"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via": ["tag:b"]}]}`,
 			nodes: quirkNodes(
 				quirkNode{name: "a1", user: alice, v4: "100.64.0.1"},
-				quirkNode{name: "tb", v4: "100.64.0.11", tags: []string{"tag:b"}, only: []string{"100.64.0.0/24"}},
+				quirkNode{name: "tb", v4: "100.64.0.11", tags: []string{"tag:b"}, only: []string{"10.0.0.0/24"}},
 			),
 			receiver: "tb",
 			want:     []tailcfg.FilterRule{},

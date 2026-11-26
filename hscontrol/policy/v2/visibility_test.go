@@ -2,7 +2,6 @@ package v2
 
 import (
 	"bytes"
-	"cmp"
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
@@ -153,7 +152,7 @@ var sidePolicies = []string{
 		{"src": ["alice@", "tag:a"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via": ["tag:b"]},
 		{"src": ["alice@", "tag:a"], "dst": ["10.0.0.0/24", "autogroup:internet"], "ip": ["tcp:22"], "via": ["tag:b"]},
 		{"src": ["alice@"], "dst": ["10.0.0.0/24"], "ip": ["*"]},
-		{"src": ["autogroup:member"], "dst": ["tag:b"], "ip": ["*"], "via": ["tag:b"], "app": {"example.com/cap/x": [{}]}}]}`,
+		{"src": ["autogroup:member"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via": ["tag:b"], "app": {"example.com/cap/x": [{}]}}]}`,
 	`{"groups": {"group:a": ["alice@", "carol@example.com"]},
 	  "tagOwners": {"tag:a": [], "tag:b": []},
 	  "grants": [
@@ -652,16 +651,14 @@ func BenchmarkRolePeersBuild(b *testing.B) {
 }
 
 // TestSidesIncremental moves, one write at a time, the shapes whose side
-// sets an update reaches only through another node: a via router that
-// becomes one because a node it routes over is tagged, seen by a node
-// holding its address; an approval that puts an address inside "*"; a
-// UserID that leaves the clique; a route that comes to cover a member; a
-// via router whose router atom reaches, then leaves, the router over its
-// address; a via destination moving into a route. Peers
-// before and after are written out by hand; every step is also audited,
-// incremental against a build from scratch.
+// sets an update reaches only through another node: an approval that puts
+// an address inside "*"; a UserID that leaves the clique; a route that
+// comes to cover a member; a via router whose router atom reaches, then
+// leaves, the router over its address. Peers before and after are written
+// out by hand; every step is also audited, incremental against a build
+// from scratch.
 func TestSidesIncremental(t *testing.T) {
-	alice, bob, carol := &sideUsers[0], &sideUsers[1], &sideUsers[2]
+	alice, bob := &sideUsers[0], &sideUsers[1]
 
 	tests := []struct {
 		name          string
@@ -670,25 +667,6 @@ func TestSidesIncremental(t *testing.T) {
 		write         func(types.Nodes) types.Nodes
 		before, after map[types.NodeID][]types.NodeID
 	}{
-		{
-			// Tagging the node the router routes over makes it a via router
-			// of the grant; it is among the grant's sources by its route, so
-			// it sees the node holding its address.
-			name: "via-router-through-a-covered-node",
-			policy: `{"tagOwners": {"tag:r": [], "tag:x": []}, "grants": [
-				{"src": ["alice@", "100.64.0.8/30"], "dst": ["tag:x"], "ip": ["*"], "via": ["tag:r"]}]}`,
-			nodes: types.Nodes{
-				sideNode(1, alice, "100.64.0.1", "", nil),
-				sideNode(5, nil, "100.64.0.5", "", []string{"tag:r"}, "100.64.0.8/30"),
-				sideNode(6, bob, "100.64.0.5", "", nil),
-				sideNode(8, carol, "100.64.0.8", "", nil),
-			},
-			write: func(n types.Nodes) types.Nodes {
-				return types.Nodes{n[0], n[1], n[2], sideNode(8, nil, "100.64.0.8", "", []string{"tag:x"})}
-			},
-			before: map[types.NodeID][]types.NodeID{1: nil, 5: nil, 6: nil, 8: nil},
-			after:  map[types.NodeID][]types.NodeID{1: {5}, 5: {1, 6, 8}, 6: {5}, 8: {5}},
-		},
 		{
 			// The clique follows the UserID, which a write can move alone.
 			name:   "user-id-leaves-the-clique",
@@ -757,23 +735,6 @@ func TestSidesIncremental(t *testing.T) {
 			},
 			before: map[types.NodeID][]types.NodeID{4: nil, 5: {7}, 7: {5}},
 			after:  map[types.NodeID][]types.NodeID{4: nil, 5: nil, 7: nil},
-		},
-		{
-			// A via grant's identity destination moving its address into a
-			// router's route makes the router serve the grant.
-			name: "via-destination-moves-into-a-route",
-			policy: `{"tagOwners": {"tag:r": [], "tag:a": []}, "grants": [
-				{"src": ["alice@"], "dst": ["tag:a"], "ip": ["*"], "via": ["tag:r"]}]}`,
-			nodes: types.Nodes{
-				sideNode(1, alice, "100.64.0.1", "", nil),
-				sideNode(5, nil, "100.64.0.5", "", []string{"tag:r"}, "100.64.0.8/30"),
-				sideNode(8, nil, "100.64.0.20", "", []string{"tag:a"}),
-			},
-			write: func(n types.Nodes) types.Nodes {
-				return types.Nodes{n[0], n[1], sideNode(8, nil, "100.64.0.9", "", []string{"tag:a"})}
-			},
-			before: map[types.NodeID][]types.NodeID{1: nil, 5: nil, 8: nil},
-			after:  map[types.NodeID][]types.NodeID{1: {5}, 5: {1}, 8: nil},
 		},
 	}
 
@@ -1077,7 +1038,7 @@ func (g sideGen) policy() []byte {
 		case 0:
 			src, dst = g.selfSrcs(), []string{"autogroup:self"}
 		case 1:
-			dst = g.some(2, "10.0.0.0/24", "10.0.0.0/16", "100.64.0.0/30", "hnet", "tag:a", "autogroup:internet")
+			dst = g.some(2, "10.0.0.0/24", "10.0.0.0/16", "8.8.8.0/24", "hnet", "hpub", "autogroup:internet")
 
 			parts = append(parts, `"via": ["tag:r"]`)
 		}
@@ -1375,64 +1336,6 @@ func requireRouteRulesSame(t *testing.T, was, is Sides, wasList, isList types.No
 	}
 
 	return held
-}
-
-// TestRouteRulesCarryViaDestinations pins that route rules follow a via
-// grant's destinations through the via plan alone: a tag:a member joining
-// inside via router 1's route gives 1 router 2's routes, while no side set,
-// viewer fact, route cover or side rule moves.
-func TestRouteRulesCarryViaDestinations(t *testing.T) {
-	pol := []byte(`{"tagOwners": {"tag:a": [], "tag:r": []},
-	"grants": [{"src": ["tag:r"], "dst": ["tag:a"], "via": ["tag:r"], "ip": ["tcp:22"]}]}`)
-	tagA := []string{"tag:a"}
-
-	for _, tt := range []struct {
-		name   string
-		nodes  types.Nodes
-		join   *types.Node
-		routes []netip.Prefix
-	}{
-		{
-			// Tailnet addresses only: the joiner's address becomes a
-			// destination inside router 2's route, whose cover already
-			// holds tag:a through node 5.
-			name: "tailnet-destination-inside-served-route",
-			nodes: types.Nodes{
-				sideNode(1, nil, "100.64.0.9", "", []string{"tag:r"}, "100.64.0.0/31", "100.64.0.4/31"),
-				sideNode(2, &sideUsers[0], "100.64.0.10", "", nil, "100.64.0.4/30"),
-				sideNode(3, nil, "100.64.0.1", "", tagA),
-				sideNode(5, nil, "100.64.0.6", "", tagA),
-			},
-			join:   sideNode(4, nil, "100.64.0.4", "", tagA),
-			routes: []netip.Prefix{netip.MustParsePrefix("100.64.0.4/30")},
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			pm, err := NewPolicyManager(pol, sideUsers, tt.nodes.ViewSlice())
-			require.NoError(t, err)
-
-			m := newSideModel(t, pm, sideUsers, tt.nodes)
-			_, err = m.audit()
-			require.NoError(t, err)
-
-			next := append(slices.Clone(tt.nodes), tt.join)
-			slices.SortFunc(next, func(a, b *types.Node) int { return cmp.Compare(a.ID, b.ID) })
-
-			was, wasList, wasVia := m.sides, m.list, m.via.Plan
-			m.step(t, NewUserSets(nil, m.t.sel, sideUsers), next)
-			_, err = m.audit()
-			require.NoError(t, err)
-
-			require.Empty(t, was.RouteAccess(1, tt.routes))
-			require.Equal(t, tt.routes, m.sides.RouteAccess(1, tt.routes), "the compile's meaning, as the audit holds")
-			require.NotContains(t, m.sides.ViewersMovedSince(was), types.NodeID(1))
-			require.NotContains(t, m.sides.RoutersMovedSince(was.RouteCover()), types.NodeID(2))
-			require.True(t, m.sides.RouteRules(nil).Same(was.RouteRules(nil)), "test sanity: only the via plan moved")
-			require.False(t, m.sides.RouteRules(m.via.Plan).Same(was.RouteRules(wasVia)))
-
-			requireRouteRulesSame(t, was, m.sides, wasList, m.list, wasVia, m.via.Plan)
-		})
-	}
 }
 
 // TestSidesRandomDifferential draws compilable policies and topologies at

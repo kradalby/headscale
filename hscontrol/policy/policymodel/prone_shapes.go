@@ -239,7 +239,6 @@ func inPlay(p Policy) []Contested {
 		AppWildcard:             has(func(r Rule) bool { return len(r.App) > 0 && dst(r, SelAll) }),
 		ViaOwnAddress:           via,
 		ViaReach:                via,
-		ViaSelf:                 has(func(r Rule) bool { return len(r.Via) > 0 && dst(r, SelSelf) }),
 		ViaExitInternet:         has(func(r Rule) bool { return len(r.Via) > 0 && dst(r, SelInternet) }),
 	}
 

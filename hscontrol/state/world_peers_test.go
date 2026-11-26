@@ -317,11 +317,11 @@ var sidesChurnPolicies = slices.Concat(filterChurnPolicies, []string{
 		{"src": ["alice@", "bob@"], "dst": ["autogroup:self"], "ip": ["tcp:22"]},
 		{"src": ["tag:a"], "dst": ["autogroup:internet"], "ip": ["*"]},
 		{"src": ["tag:b"], "dst": ["8.8.4.0/24"], "app": {"tailscale.com/cap/relay": [{}]}}]}`,
-	// Via to an identity destination a router covers, and to the internet;
-	// a regular grant over the same routes.
+	// Via to a subnet and to the internet; a regular grant over the same
+	// routes.
 	`{"tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
 	  "grants": [
-		{"src": ["alice@", "tag:a"], "dst": ["tag:a"], "ip": ["*"], "via": ["tag:b"]},
+		{"src": ["alice@", "tag:a"], "dst": ["10.0.1.0/24"], "ip": ["*"], "via": ["tag:b"]},
 		{"src": ["bob@"], "dst": ["autogroup:internet", "10.0.0.0/16"], "ip": ["tcp:443"], "via": ["tag:b"]},
 		{"src": ["*"], "dst": ["10.0.0.0/24"], "ip": ["*"]},
 		{"src": ["autogroup:member"], "dst": ["tag:b:*", "100.64.1.0/24"], "ip": ["*"]}]}`,
@@ -329,7 +329,7 @@ var sidesChurnPolicies = slices.Concat(filterChurnPolicies, []string{
 	// what only another node's change reaches.
 	`{"tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]},
 	  "grants": [
-		{"src": ["100.64.1.96/28", "alice@"], "dst": ["tag:a", "10.0.0.0/16"], "ip": ["*"], "via": ["tag:b"]},
+		{"src": ["100.64.1.96/28", "alice@"], "dst": ["10.0.1.0/24", "10.0.0.0/16"], "ip": ["*"], "via": ["tag:b"]},
 		{"src": ["bob@"], "dst": ["autogroup:self"], "ip": ["tcp:22"]}]}`,
 	// Everything reaching everything through routes: the subnet-to-subnet
 	// reverse rule.
@@ -680,16 +680,16 @@ func TestWorldSidesShapes(t *testing.T) {
 		write  func(e *nodeEdit)
 	}{
 		{
-			name: "via-router-through-a-covered-node",
-			policy: `{"tagOwners": {"tag:r": [], "tag:x": []}, "grants": [
-				{"src": ["alice@", "100.64.0.8/30"], "dst": ["tag:x"], "ip": ["*"], "via": ["tag:r"]}]}`,
+			name: "route-comes-to-cover-a-via-source",
+			policy: `{"tagOwners": {"tag:r": []}, "grants": [
+				{"src": ["alice@", "carol@"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via": ["tag:r"]}]}`,
 			nodes: types.Nodes{
 				shapeNode(1, alice, "100.64.0.1", "", nil, nil, nil),
-				shapeNode(5, nil, "100.64.0.5", "", []string{"tag:r"}, []string{"100.64.0.8/30"}, nil),
+				shapeNode(5, nil, "100.64.0.5", "", []string{"tag:r"}, []string{"10.0.0.0/24"}, nil),
 				shapeNode(6, bob, "100.64.0.6", "", nil, nil, nil),
 				shapeNode(8, carol, "100.64.0.8", "", nil, nil, nil),
 			},
-			write: func(e *nodeEdit) { e.Set(8, shapeNode(8, nil, "100.64.0.8", "", []string{"tag:x"}, nil, nil)) },
+			write: func(e *nodeEdit) { e.Set(6, shapeNode(6, bob, "100.64.0.6", "", nil, []string{"100.64.0.8/30"}, nil)) },
 		},
 	}
 

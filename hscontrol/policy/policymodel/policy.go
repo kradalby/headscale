@@ -102,6 +102,49 @@ func (p Policy) HostPrefix(h int) int {
 	return (hostDefault[h] + p.Hosts[h]) % numRulePrefixes
 }
 
+// viaSel is s as a destination of a via grant in p: a via grant takes
+// autogroup:internet, and prefixes and hosts outside the Tailscale ranges.
+func (p Policy) viaSel(s Sel) Sel {
+	switch s.Kind { //nolint:exhaustive // every other kind becomes a prefix
+	case SelInternet:
+		return s
+	case SelHost:
+		if h := p.HostPrefix(s.I); viaPrefixOf[h] != h {
+			return Sel{Kind: SelPrefix, I: viaPrefixOf[h]}
+		}
+
+		return s
+	}
+
+	return Sel{Kind: SelPrefix, I: viaPrefixOf[s.I%numRulePrefixes]}
+}
+
+// viaDsts reports whether a via grant may name every one of dsts in p.
+func (p Policy) viaDsts(dsts []Dest) bool {
+	return !slices.ContainsFunc(dsts, func(d Dest) bool { return p.viaSel(d.Sel) != d.Sel })
+}
+
+// viaHost reports whether a via grant of p names host h.
+func (p Policy) viaHost(h int) bool {
+	return slices.ContainsFunc(p.Grants, func(r Rule) bool {
+		return len(r.Via) > 0 && slices.Contains(r.Dst, Dest{Sel: Sel{Kind: SelHost, I: h}})
+	})
+}
+
+// tagOwners is owners as tagOwners takes them: it refuses a domain's
+// users, so that token becomes the provider identifier, which never names
+// two users either.
+func tagOwners(owners []Sel) []Sel {
+	out := slices.Clone(owners)
+	for i, o := range out {
+		if o.Kind == SelUser && o.I == domainRef {
+			out[i].I = providerRef
+		}
+	}
+
+	return out
+}
+
 // RuleRef names a rule by its place in the document.
 type RuleRef struct {
 	Grant bool
@@ -266,6 +309,7 @@ func (p Policy) mapRefs(to func(int) int) Policy {
 
 	for i := range c.TagOwners {
 		sels(c.TagOwners[i])
+		c.TagOwners[i] = tagOwners(c.TagOwners[i])
 	}
 
 	for i := range c.AutoApprovers.Routes {

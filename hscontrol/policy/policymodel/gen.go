@@ -755,7 +755,7 @@ func drawPolicy(t *rapid.T) Policy {
 		os := owners.Draw(t, "owners")
 
 		if owned {
-			p.TagOwners[i] = os
+			p.TagOwners[i] = tagOwners(os)
 		}
 
 		p.Defined[i] = chance(t, 3, "defined")
@@ -942,6 +942,10 @@ func drawRule(t *rapid.T, grant bool, p Policy) Rule {
 
 	if !self && len(r.IP) > 0 && via {
 		r.Via = []int{viaTag}
+
+		for i := range r.Dst {
+			r.Dst[i].Sel = p.viaSel(r.Dst[i].Sel)
+		}
 	}
 
 	return r
@@ -1714,7 +1718,7 @@ func drawPolicyEditKind(t *rapid.T, w World) Edit {
 		e.Defined = chance(t, 2, "defined")
 
 		if !none {
-			e.Owners = os
+			e.Owners = tagOwners(os)
 		}
 
 		return e
@@ -1785,6 +1789,12 @@ func remapRefs(e Edit, to func(int) int) Edit {
 	remapValue(v, to)
 
 	out, _ := v.Interface().(Edit)
+
+	if o, ok := out.(SetTagOwners); ok {
+		o.Owners = tagOwners(o.Owners)
+
+		return o
+	}
 
 	return out
 }
@@ -1861,7 +1871,15 @@ func drawSetHost(t *rapid.T, p Policy) Edit {
 		h = hs[n%len(hs)]
 	}
 
-	return SetHost{h, other(t, numRulePrefixes, p.Hosts[h], "shift")}
+	shift := other(t, numRulePrefixes, p.Hosts[h], "shift")
+
+	// A host a via grant names stays outside the Tailscale ranges.
+	for at := (hostDefault[h] + shift) % numRulePrefixes; p.viaHost(h) && (viaPrefixOf[at] != at || shift == p.Hosts[h]); {
+		at = (at + 1) % numRulePrefixes
+		shift = (at - hostDefault[h] + numRulePrefixes) % numRulePrefixes
+	}
+
+	return SetHost{h, shift}
 }
 
 func drawSetPorts(t *rapid.T, p Policy, refs []RuleRef) (Edit, bool) {
@@ -1978,6 +1996,10 @@ func drawGrantPart(t *rapid.T, p Policy, ref RuleRef, kind int) (Edit, bool) {
 		return SetVia{ref, nil}, true
 	}
 
+	if !p.viaDsts(r.Dst) {
+		return nil, false
+	}
+
 	return SetVia{ref, tags}, true
 }
 
@@ -2032,7 +2054,12 @@ func drawSetSel(t *rapid.T, p Policy, ref RuleRef) Edit {
 		at = pick(t, dstAt, "at")
 	}
 
-	return SetSel{ref, dst, at, drawNewSel(t, p, selKinds(r, ref.Grant, dst))}
+	sel := drawNewSel(t, p, selKinds(r, ref.Grant, dst))
+	if dst && len(r.Via) > 0 {
+		sel = p.viaSel(sel)
+	}
+
+	return SetSel{ref, dst, at, sel}
 }
 
 // drawAddSel adds a source or a non-self destination to rule ref.
@@ -2048,6 +2075,10 @@ func drawAddSel(t *rapid.T, p Policy, ref RuleRef) Edit {
 	at := rapid.IntRange(0, n).Draw(t, "at")
 	sel := drawNewSel(t, p, selKinds(r, ref.Grant, dst))
 	ports := drawPorts(t)
+
+	if dst && len(r.Via) > 0 {
+		sel = p.viaSel(sel)
+	}
 
 	if !dst || ref.Grant || r.Proto >= portedProtos {
 		ports = 0

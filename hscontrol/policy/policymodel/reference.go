@@ -440,37 +440,17 @@ const (
 	// in dstsAt, once that rule is cut to the router's routes, or once the
 	// whole prefix is decided intended and the reference says so.
 	ViaOwnAddress
-	// ViaReach: a via grant reaches every route its via routers serve, *
-	// being everything, exit routes included. Headscale reaches subnet
-	// routes only, exits only for autogroup:internet, and reads * as the
-	// tailnet's ranges. Fails closed.
+	// ViaReach: a via grant reaches every route its via routers serve,
+	// exit routes included. Headscale reaches subnet routes only, exits
+	// only for autogroup:internet. Fails closed.
 	//
 	// TODO(kradalby): policy/via-reach: fails closed. With
 	// `alice@ -> 8.8.8.0/24 via tag:a`, a tag:a exit node refuses alice's
-	// packets to 8.8.8.0/24; with * as a via destination, nothing outside
-	// the tailnet's ranges is reached. The via goldens decide subnet
-	// destinations only, which agree; none holds * or a public prefix at a
-	// via-tagged exit. The properties in policy/v2/reference_test.go count
-	// it under "via reach". Production: cutVia (subnet routes only) and
-	// the via case of expandGrant (* resolved as the tailnet) in
-	// policy/v2/expand.go. Delete the clause once one reading is chosen:
-	// fix production, or make headscale's reading the reference's own.
+	// packets to 8.8.8.0/24. The properties in policy/v2/reference_test.go
+	// count it under "via reach". Production: cutVia (subnet routes only)
+	// in policy/v2/expand.go. Delete the clause once production follows
+	// the captures grant-via-reach-a and grant-via-router-covered.
 	ViaReach
-	// ViaSelf: a via grant to autogroup:self reaches each user's devices
-	// through the via routers routing their addresses. Headscale gives it
-	// no rule. Fails closed.
-	//
-	// TODO(kradalby): policy/via-self: fails closed. With
-	// `alice@ -> autogroup:self via tag:a`, a tag:a router serving the
-	// prefix that holds alice's device gets no rule, so alice reaches
-	// nothing through it. No capture or document decides it; the generated
-	// scenarios rarely draw it, so the properties in
-	// policy/v2/reference_test.go seldom count it under "via to self".
-	// Production: the via case of expandGrant in policy/v2/expand.go
-	// resolves autogroup:self to nothing. Delete the clause once one
-	// reading is chosen: fix production, or make headscale's reading the
-	// reference's own.
-	ViaSelf
 	// AppWildcard: * in an app grant is everything as a destination, as
 	// it is for the grant's ports: a viewer among its sources gets subnet
 	// routes by it as by an app grant to the subnet (captured, via golden
@@ -598,7 +578,7 @@ const (
 // tries them.
 var ContestedClauses = []Contested{
 	OthersSelf, StarApprovedRoutes, InternetAtSubnetRouters,
-	ViaOwnAddress, ViaReach, ViaSelf, AppWildcard, ViaRouterCover, ViaExitInternet,
+	ViaOwnAddress, ViaReach, AppWildcard, ViaRouterCover, ViaExitInternet,
 	ViaRouterExitRoutes, ViaExitSourceRoutes,
 }
 
@@ -611,7 +591,7 @@ func (c Contested) FailsOpen() bool {
 func (c Contested) String() string {
 	names := []string{
 		"others' self rules", "* adds approved routes", "internet at subnet routers",
-		"via own address", "via reach", "via to self", "* as app destination",
+		"via own address", "via reach", "* as app destination",
 		"via router covered", "via exit internet", "via router exit routes", "via exit source routes",
 	}
 
@@ -644,15 +624,11 @@ type refRule struct {
 	ip       []IPSpec
 	app      tailcfg.PeerCapMap
 	// via restricts the rule to routers holding one of these tags;
-	// viaTerms are its destinations one term at a time as headscale
-	// resolves them, * as the tailnet's ranges: what its readings of a
-	// via rule ([ViaOwnAddress], [ViaRouterExitRoutes]) cut by.
+	// viaTerms are its destinations one term at a time: what headscale's
+	// readings of a via rule ([ViaOwnAddress], [ViaRouterExitRoutes]) cut
+	// by.
 	via      []string
 	viaTerms []*netipx.IPSet
-	// hsDst is a via rule's destinations as headscale resolves them, *
-	// as the tailnet's ranges: they decide its routers for
-	// [ViaRouterCover].
-	hsDst *netipx.IPSet
 	// owner is the user an autogroup:self part is for.
 	owner uint
 }
@@ -736,21 +712,13 @@ func newRef(doc Doc, users []User, nodes []RefNode, without Contested) *Ref {
 			// v80-v91: every router of the destination, via tag or not, sees
 			// the sources of an app grant through via).
 			via := base
-			via.app, via.via, via.hsDst = nil, d.Via, r.starAsTailnet(dsts)
-
-			if without&ViaReach != 0 {
-				via.dst = r.starAsTailnet(dsts)
-			}
+			via.app, via.via = nil, d.Via
 
 			for _, t := range dsts {
-				via.viaTerms = append(via.viaTerms, r.starAsTailnet([]string{t}))
+				via.viaTerms = append(via.viaTerms, r.addrs([]string{t}, false))
 			}
 
 			r.add(via, nil, nil)
-
-			if self && without&ViaSelf == 0 {
-				r.addSelf(via)
-			}
 
 			base.ip = nil
 		}
@@ -807,10 +775,6 @@ func (r *Ref) addSelf(rl refRule) {
 
 		self := rl
 		self.src, self.dst, self.internet, self.owner = named, addrsOf(devices), false, u
-
-		if len(rl.via) > 0 {
-			self.viaTerms = []*netipx.IPSet{self.dst}
-		}
 
 		r.add(self, self.dst, self.src)
 	}
@@ -1266,7 +1230,7 @@ func (r *Ref) coversSourceRouter(rl refRule, router, n RefNode) bool {
 		return false
 	}
 
-	if !slices.ContainsFunc(router.subnets(), rl.hsDst.OverlapsPrefix) && (!rl.internet || !router.exit()) {
+	if !slices.ContainsFunc(router.subnets(), rl.dst.OverlapsPrefix) && (!rl.internet || !router.exit()) {
 		return false
 	}
 
@@ -1370,7 +1334,7 @@ func (r *Ref) viaPartReachesInternet(rl refRule, n RefNode) bool {
 			var b netipx.IPSetBuilder
 
 			b.AddPrefix(p)
-			b.Intersect(rl.hsDst)
+			b.Intersect(rl.dst)
 			b.Intersect(internet)
 
 			if s, _ := b.IPSet(); len(s.Prefixes()) > 0 {

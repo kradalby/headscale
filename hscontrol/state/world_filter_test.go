@@ -276,7 +276,7 @@ var filterChurnPolicies = slices.Concat(filterChurnOwnRules, []string{
 		{"src": ["alice@", "tag:a"], "dst": ["10.0.0.0/24", "autogroup:internet"], "ip": ["tcp:22"], "via": ["tag:b"]},
 		{"src": ["alice@", "tag:a"], "dst": ["autogroup:internet"], "ip": ["*"], "via": ["tag:a", "tag:b"]},
 		{"src": ["alice@", "tag:a"], "dst": ["10.0.0.0/24"], "ip": ["*"]},
-		{"src": ["autogroup:member"], "dst": ["tag:b"], "ip": ["*"], "via": ["tag:b"], "app": {"example.com/cap/x": [{}]}}]}`,
+		{"src": ["autogroup:member"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via": ["tag:b"], "app": {"example.com/cap/x": [{}]}}]}`,
 	// App capabilities: companions both ways, a source naming nobody,
 	// with and without ip.
 	`{"groups": {"group:a": ["alice@", "carol@example.com"]},
@@ -870,10 +870,10 @@ func TestWorldFilterShapes(t *testing.T) {
 			// Via takes announced approvals only.
 			name: "via-unannounced",
 			policy: `{` + owners + `, "grants": [
-				{"src": ["alice@"], "dst": ["100.64.0.0/24"], "ip": ["*"], "via": ["tag:b"]}]}`,
+				{"src": ["alice@"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via": ["tag:b"]}]}`,
 			nodes: types.Nodes{
 				shapeNode(1, alice, "100.64.0.1", "", nil, nil, nil),
-				shapeNode(2, nil, "100.64.0.11", "", []string{"tag:b"}, nil, []string{"100.64.0.0/24"}),
+				shapeNode(2, nil, "100.64.0.11", "", []string{"tag:b"}, nil, []string{"10.0.0.0/24"}),
 			},
 			write: func(w *world) { w.PutNode(*shapeNode(3, alice, "100.64.0.3", "", nil, nil, nil)) },
 		},

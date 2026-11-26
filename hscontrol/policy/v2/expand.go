@@ -596,12 +596,6 @@ func (x *Expansion) expandGrant(gt *GrantTemplate) grantExpansion {
 
 	switch gt.kind {
 	case grantVia:
-		// TODO(kradalby): policy/via-self: autogroup:self resolves to
-		// nothing here, so a via grant to it gives its routers no rule.
-		// TODO(kradalby): policy/via-reach: * resolves to the tailnet's
-		// ranges here, so a via grant to * reaches no route outside them.
-		// Both fail closed; policymodel.ViaSelf and policymodel.ViaReach
-		// keep the plain readings and say what settles them.
 		for _, id := range gt.dsts {
 			res, err := x.resolve(id)
 			if err == nil && res != nil {
