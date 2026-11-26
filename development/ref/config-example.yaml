@@ -2,8 +2,10 @@
 # Every key: https://headscale.net/stable/ref/configuration-options/
 
 # The URL clients connect to, with its `http://` or `https://` scheme, e.g.
-# `https://headscale.example.com:443`. A trailing slash is trimmed on load. Its
-# host must not be `dns.base_domain` or a name below it.
+# `https://headscale.example.com:443`. A trailing slash is trimmed on load. The
+# hostname cannot be the same as `dns.base_domain` or any sub-domain that would
+# cause the Headscale instance to have a `server_url` inside the MagicDNS
+# namespace.
 # Required. Example: https://headscale.example.com
 server_url: ""
 
@@ -26,8 +28,8 @@ unix_socket_permission: "0770"
 
 # The CIDRs of reverse proxies whose `True-Client-IP`, `X-Real-IP` and
 # `X-Forwarded-For` headers are honoured. Empty ignores those headers. Set
-# without a proxy in front, clients can spoof their source IP in logs and the v2
-# API.
+# without a proxy in front, clients can spoof their source IP in logs and the
+# `ip:publicAddress` posture attribute.
 trusted_proxies: []
 
 # Skips the check for a newer headscale release that commands make at start.
@@ -45,10 +47,13 @@ noise:
 # `fd7a:115c:a1e0::/48`, or ranges inside them: the client assumes them, and
 # other ranges are unsupported.
 prefixes:
-  # The IPv4 range, e.g. `100.64.0.0/10`. Empty gives nodes no IPv4 address.
+  # The IPv4 range, e.g. `100.64.0.0/10`. Empty gives nodes no IPv4 address. Use
+  # a prefix inside `100.64.0.0/10`. A range outside it is not supported and
+  # logs a warning.
   v4: 100.64.0.0/10
   # The IPv6 range, e.g. `fd7a:115c:a1e0::/48`. Empty gives nodes no IPv6
-  # address.
+  # address. Use a prefix inside `fd7a:115c:a1e0::/48`. A range outside it is
+  # not supported and logs a warning.
   v6: fd7a:115c:a1e0::/48
   # How a new node's addresses are picked.
   # One of: `sequential`, `random`.
@@ -78,11 +83,11 @@ log:
 
 # Covers node key expiry, ephemeral nodes and subnet routes.
 node:
-  # The key expiry given to a non-tagged node that registers without one,
-  # whatever the method (auth key, CLI, web, OIDC). An expiry the client asks
-  # for, `oidc.use_expiry_from_token` and an admin's `headscale nodes expire`
-  # still apply. Tagged nodes never get this default. Zero or negative disables
-  # the default.
+  # The key expiry given to a node that registers without one, whatever the
+  # method (auth key, CLI, web, OIDC). An expiry the client asks for,
+  # `oidc.use_expiry_from_token` and an admin's `headscale nodes expire` still
+  # apply. A tagged node registers with key expiry turned off and keeps this
+  # time for when it is turned on. Zero or negative disables the default.
   expiry: 0s
   # Covers ephemeral nodes, which register with an ephemeral auth key and are
   # deleted once they have been offline for `node.ephemeral.inactivity_timeout`.
@@ -109,10 +114,10 @@ node:
 # Covers the cleanup of revoked pre-auth keys. See [Pre authenticated
 # key](https://headscale.net/stable/ref/registration/#pre-authenticated-key).
 preauth_keys:
-  # How long a soft-revoked pre-auth key (revoked via the v2 API's DELETE) is
-  # kept retrievable before the background collector hard-deletes it. Keys still
-  # backing a node are kept until the node is deleted. A zero or negative
-  # duration disables the collector.
+  # How long a revoked pre-auth key or OAuth client is kept retrievable before
+  # the background collector hard-deletes it. Keys still backing a node are kept
+  # until the node is deleted. A zero or negative duration disables the
+  # collector.
   revoked_retention: 168h
 
 # The DERP map: the relay servers clients use when they cannot connect directly,
@@ -417,6 +422,20 @@ auto_update:
   # Clients store the default they first see, so a later change reaches only new
   # clients.
   enabled: false
+
+# [tailsql](https://github.com/tailscale/tailsql), a read-only SQL web UI over
+# the headscale database, served as the node `tailsql` with `tag:tailsql` on
+# headscale's own tailnet. Headscale mints its credential, joins it in memory
+# and re-joins it if the node is deleted. Nobody can query it until the policy
+# lists `"tag:tailsql": []` in `tagOwners` and a grant to `tag:tailsql` gives
+# `ip` `tcp:80` (and `tcp:443` with `dns.certificates`) and `app`
+# `{"tailscale.com/cap/tailsql": [{"src": ["headscale"]}]}`.
+tailsql:
+  # Runs tailsql. It needs `database.type` sqlite.
+  enabled: false
+  # Holds the node's identity. Losing it registers a new node, `tailsql-1`, and
+  # leaves the old one for an admin to delete.
+  state_dir: /var/lib/headscale/tailsql
 
 # How the headscale CLI reaches the server: the local `unix_socket` without
 # authentication, or a remote `cli.address` with `cli.api_key`. The CLI reads
