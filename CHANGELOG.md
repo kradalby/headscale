@@ -208,7 +208,7 @@ See [the routes reference](docs/ref/routes.md) for the failover rules.
 - A router of a grant with `via` that is also among the grant's sources is no longer given other nodes' exit routes and public subnet routes through that grant, as on Tailscale.
 - A router is sent the `autogroup:self` rules of every user with a device its approved routes cover, as on Tailscale, and is a peer of those devices; before, only exit nodes got other users' rules. The other devices of the router's user list those devices too, one way.
 - A `via` grant to `autogroup:internet` steers subnet routes to public prefixes too: sources get them only from routers with the `via` tag, as on Tailscale.
-- A node approved for only one of `0.0.0.0/0` and `::/0` is not offered to peers as an exit node, as on Tailscale: peers get neither route nor the exit-node suggestion, and the nodes that accept traffic from a source the route covers list the node without being listed by it. Approve both.
+- A node approved for only one of `0.0.0.0/0` and `::/0` is not offered to peers as an exit node, as on Tailscale: peers get neither route nor the exit-node suggestion, and the routers of a `via` grant whose sources the route covers list the node without being listed by it. Approve both.
 
 #### Nodes and routes
 

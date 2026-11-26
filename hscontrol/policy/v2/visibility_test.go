@@ -300,6 +300,67 @@ func TestSidesQuirks(t *testing.T) {
 			},
 		},
 		{
+			// A node approved for one exit route alone is listed, one way,
+			// by the via routers of a grant whose sources the route covers
+			// (grant-via-internet-one-family-exit, -bare, -untagged), a
+			// lone exit node without the via tag (n4) too.
+			name: "lone-exit-via",
+			policy: `{"tagOwners": {"tag:e": [], "tag:o": [], "tag:s": []}, "grants": [
+				{"src": ["alice@"], "dst": ["autogroup:internet"], "ip": ["*"], "via": ["tag:e"]}]}`,
+			nodes: types.Nodes{
+				sideNode(1, alice, "100.64.0.1", "fd7a:115c:a1e0::1", nil),
+				sideNode(2, nil, "100.64.0.2", "fd7a:115c:a1e0::2", []string{"tag:e"}, exit...),
+				sideNode(3, nil, "100.64.0.3", "fd7a:115c:a1e0::3", []string{"tag:e"}, "0.0.0.0/0"),
+				sideNode(4, nil, "100.64.0.4", "fd7a:115c:a1e0::4", []string{"tag:o"}, "0.0.0.0/0"),
+				sideNode(5, nil, "100.64.0.5", "fd7a:115c:a1e0::5", []string{"tag:s"}),
+			},
+			peers: map[types.NodeID][]types.NodeID{1: {2, 3}, 2: {1, 3, 4}, 3: {1, 4}, 4: nil, 5: nil},
+		},
+		{
+			// A rule without via lists no lone exit node: not the ACL's
+			// destination, not autogroup:self's devices, not an app
+			// grant's destinations or its companion's.
+			name: "lone-exit-acl",
+			policy: `{"tagOwners": {"tag:e": [], "tag:s": []}, "acls": [
+				{"action": "accept", "src": ["alice@"], "dst": ["tag:s:22"]}]}`,
+			nodes: types.Nodes{
+				sideNode(1, alice, "100.64.0.1", "fd7a:115c:a1e0::1", nil),
+				sideNode(2, nil, "100.64.0.2", "fd7a:115c:a1e0::2", []string{"tag:s"}),
+				sideNode(3, nil, "100.64.0.3", "fd7a:115c:a1e0::3", []string{"tag:e"}, "0.0.0.0/0"),
+				sideNode(4, nil, "100.64.0.4", "fd7a:115c:a1e0::4", []string{"tag:e"}, "::/0"),
+				sideNode(5, bob, "100.64.0.5", "fd7a:115c:a1e0::5", nil),
+			},
+			peers: map[types.NodeID][]types.NodeID{1: {2}, 2: {1}, 3: nil, 4: nil, 5: nil},
+		},
+		{
+			name: "lone-exit-self",
+			policy: `{"tagOwners": {"tag:e": [], "tag:s": []}, "acls": [
+				{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]},
+				{"action": "accept", "src": ["bob@"], "dst": ["tag:s:22"]}]}`,
+			nodes: types.Nodes{
+				sideNode(1, alice, "100.64.0.1", "fd7a:115c:a1e0::1", nil),
+				sideNode(2, alice, "100.64.0.2", "fd7a:115c:a1e0::2", nil),
+				sideNode(3, bob, "100.64.0.3", "fd7a:115c:a1e0::3", nil),
+				sideNode(4, nil, "100.64.0.4", "fd7a:115c:a1e0::4", []string{"tag:e"}, "0.0.0.0/0"),
+				sideNode(5, alice, "100.64.0.5", "fd7a:115c:a1e0::5", nil, "0.0.0.0/0"),
+				sideNode(6, nil, "100.64.0.6", "fd7a:115c:a1e0::6", []string{"tag:s"}),
+			},
+			peers: map[types.NodeID][]types.NodeID{1: {2, 5}, 2: {1, 5}, 3: {6}, 4: nil, 5: {1, 2}, 6: {3}},
+		},
+		{
+			name: "lone-exit-app",
+			policy: `{"tagOwners": {"tag:e": [], "tag:s": []}, "grants": [
+				{"src": ["alice@"], "dst": ["tag:s"], "app": {"example.com/cap/x": [{}]}},
+				{"src": ["bob@"], "dst": ["tag:s"], "app": {"tailscale.com/cap/drive": [{"shares": ["*"], "access": "rw"}]}}]}`,
+			nodes: types.Nodes{
+				sideNode(1, alice, "100.64.0.1", "fd7a:115c:a1e0::1", nil),
+				sideNode(2, nil, "100.64.0.2", "fd7a:115c:a1e0::2", []string{"tag:s"}),
+				sideNode(3, bob, "100.64.0.3", "fd7a:115c:a1e0::3", nil),
+				sideNode(4, nil, "100.64.0.4", "fd7a:115c:a1e0::4", []string{"tag:e"}, "0.0.0.0/0"),
+			},
+			peers: map[types.NodeID][]types.NodeID{1: {2}, 2: {1, 3}, 3: {2}, 4: nil},
+		},
+		{
 			// SSH rules make nobody a peer.
 			name:   "ssh-makes-no-peers",
 			policy: `{"tagOwners": {"tag:s": []}, "acls": [], "ssh": [{"action": "accept", "src": ["alice@"], "dst": ["tag:s"], "users": ["root"]}]}`,

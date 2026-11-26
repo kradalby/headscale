@@ -177,8 +177,9 @@ type steerGrant struct {
 	inetLit bool
 }
 
-// lonePart is one rule as a lone exit route reads it: a node whose route
-// covers a source is listed, one way, by the holders of see.
+// lonePart is one via grant as a lone exit route reads it: a node whose
+// route covers a source is listed, one way, by the holders of see, the
+// grant's via routers.
 type lonePart struct {
 	src, see []Role
 }
@@ -202,12 +203,9 @@ type sidePlan struct {
 	// selfPort and selfApp hold, per self grant with port rules and with a
 	// capability, its sources by address.
 	selfPort, selfApp [][]Role
-	// selfComp: a self grant carries a capability with a companion, whose
-	// rule runs from the owners to the named ones.
-	selfComp bool
-	vias     []int
+	vias              []int
 
-	// lone lists every rule part by its two sides, for the lone exit
+	// lone lists every via grant by its two sides, for the lone exit
 	// routes: see [Sides.loneAtoms].
 	lone []lonePart
 
@@ -425,32 +423,12 @@ func newSidePlan(t *Templates) *sidePlan {
 
 			if gt.app != nil {
 				p.selfApp = append(p.selfApp, gs.selfAddr)
-				p.selfComp = p.selfComp || hasCompanion(gt.app)
 			}
 		}
 	}
 
 	for g := range p.grants {
-		gs := &p.grants[g]
-
-		if gs.port {
-			see := gs.portDst
-			if gs.portInet {
-				see = append(slices.Clone(see), atomExit)
-			}
-
-			p.lone = append(p.lone, lonePart{src: gs.src, see: see})
-		}
-
-		if gs.capg {
-			p.lone = append(p.lone, lonePart{src: gs.src, see: gs.capDst})
-		}
-
-		if gs.comp {
-			p.lone = append(p.lone, lonePart{src: gs.compSrc, see: gs.compDst})
-		}
-
-		if len(gs.viaTags) > 0 {
+		if gs := &p.grants[g]; len(gs.viaTags) > 0 {
 			p.lone = append(p.lone, lonePart{src: gs.src, see: []Role{{kind: roleViaSeen, value: uint64(g)}}}) //nolint:gosec // a grant index
 		}
 	}
@@ -1291,10 +1269,11 @@ func (u *sidesUpdate) refreshSets(l3 map[types.NodeID]struct{}) {
 }
 
 // loneAtoms appends the atoms of a node whose only exit route is fam's: one
-// for each rule a source of which has an address of fam, the whole of what
-// the route covers. SaaS reads such a route as a route over the sources,
-// not as an exit route, and lists the node on the rules' destinations
-// without listing them on it.
+// for each via grant a source of which has an address of fam, the whole of
+// what the route covers. SaaS reads such a route as a route over the
+// sources, not as an exit route, and lists the node on the grant's via
+// routers without listing them on it (grant-via-internet-one-family-exit,
+// -bare, -untagged). A rule without via lists no such node.
 func (s Sides) loneAtoms(roles []Role, fam int) []Role {
 	cover := s.loneCover[fam]
 
@@ -1312,15 +1291,6 @@ func (s Sides) loneAtoms(roles []Role, fam int) []Role {
 			}
 		}) {
 			roles = append(roles, Role{kind: roleLoneSource, value: uint64(i)}) //nolint:gosec // an index
-		}
-	}
-
-	for _, c := range cover {
-		switch {
-		case c.r.kind == roleNamedPort && len(s.plan.selfPort) > 0, c.r.kind == roleNamedApp && len(s.plan.selfApp) > 0:
-			roles = append(roles, Role{kind: roleLoneNamed, value: c.r.value})
-		case c.r.kind == roleOwner && s.plan.selfComp:
-			roles = append(roles, Role{kind: roleLoneOwner, value: c.r.value})
 		}
 	}
 
@@ -2056,16 +2026,8 @@ func pairs(r Role) []Role {
 // linksOf returns the atoms whose holders r's holders see. A sibling sees,
 // one way, the sources of the self rules its user's router serves.
 func (a *sideAdjacency) linksOf(r Role) []Role {
-	switch r.kind { //nolint:exhaustive // only these see one way by value
-	case roleSibling:
+	if r.kind == roleSibling {
 		return []Role{{kind: roleSelfSource, value: r.value}}
-	case roleHeldOwner:
-		// The destinations of a user's self rules see a lone exit route
-		// over a source of them, one way; those of their companions,
-		// below, one over an owner.
-		return slices.Concat(a.links[r], pairs(r), []Role{{kind: roleLoneNamed, value: r.value}})
-	case roleHeldNamed:
-		return slices.Concat(a.links[r], pairs(r), []Role{{kind: roleLoneOwner, value: r.value}})
 	}
 
 	return slices.Concat(a.links[r], pairs(r))
@@ -2073,13 +2035,8 @@ func (a *sideAdjacency) linksOf(r Role) []Role {
 
 // readersOf returns the atoms whose holders see r's holders.
 func (a *sideAdjacency) readersOf(r Role) []Role {
-	switch r.kind { //nolint:exhaustive // only these are seen one way by value
-	case roleSelfSource:
+	if r.kind == roleSelfSource {
 		return []Role{{kind: roleSibling, value: r.value}}
-	case roleLoneNamed:
-		return []Role{{kind: roleHeldOwner, value: r.value}}
-	case roleLoneOwner:
-		return []Role{{kind: roleHeldNamed, value: r.value}}
 	}
 
 	return slices.Concat(a.readers[r], pairs(r))

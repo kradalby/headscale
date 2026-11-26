@@ -52,11 +52,7 @@ func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) 
 				if linked || sameUser(nodes.At(i), nodes.At(j)) {
 					ret[nodes.At(i).ID()] = append(ret[nodes.At(i).ID()], nodes.At(j).ID())
 					ret[nodes.At(j).ID()] = append(ret[nodes.At(j).ID()], nodes.At(i).ID())
-
-					continue
 				}
-
-				appendListedOnly(ret, nil, nodes.At(i), nodes.At(j), pm.addresses().matchers, pm.addresses().matchers)
 			}
 		}
 
@@ -99,7 +95,7 @@ func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) 
 				continue
 			}
 
-			appendListedOnly(ret, siblings, nodeI, nodeJ, matchersI, matchersJ)
+			appendListedOnly(ret, pm, siblings, nodeI, nodeJ)
 		}
 	}
 
@@ -108,18 +104,18 @@ func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) 
 
 // appendListedOnly lists a on b or b on a where one lists the other without
 // being listed back: a sibling's self source, a lone exit route over a
-// source.
-func appendListedOnly(ret map[types.NodeID][]types.NodeID, siblings map[uint][]matcher.Match, a, b types.NodeView, ma, mb []matcher.Match) {
-	lists := func(viewer, peer types.NodeView, ms []matcher.Match) bool {
+// source of a via grant the viewer routes for.
+func appendListedOnly(ret map[types.NodeID][]types.NodeID, pm *PolicyManager, siblings map[uint][]matcher.Match, a, b types.NodeView) {
+	lists := func(viewer, peer types.NodeView) bool {
 		return selfSourceOfSibling(siblings, viewer, peer) ||
-			loneExitSource(ms, viewer, types.RouteRanges(viewer.SubnetRoutes()), viewer.IsExitNode(), loneExitRanges(peer))
+			loneExitSource(pm.nodeMatchers(viewer, viaPeerRule), viewer, loneExitRanges(peer))
 	}
 
-	if lists(a, b, ma) {
+	if lists(a, b) {
 		ret[a.ID()] = append(ret[a.ID()], b.ID())
 	}
 
-	if lists(b, a, mb) {
+	if lists(b, a) {
 		ret[b.ID()] = append(ret[b.ID()], a.ID())
 	}
 }
@@ -898,11 +894,7 @@ func buildPeerMapSortedSlice(
 			if linked || sameUser(nodes.At(i), nodes.At(j)) {
 				ret[ids[i]] = append(ret[ids[i]], ids[j])
 				ret[ids[j]] = append(ret[ids[j]], ids[i])
-
-				continue
 			}
-
-			appendListedOnly(ret, nil, nodes.At(i), nodes.At(j), pm.addresses().matchers, pm.addresses().matchers)
 		}
 	}
 
@@ -993,11 +985,7 @@ func buildPeerMapSliceMap(
 			if linked || sameUser(nodes.At(i), nodes.At(j)) {
 				ret[ids[i]] = append(ret[ids[i]], ids[j])
 				ret[ids[j]] = append(ret[ids[j]], ids[i])
-
-				continue
 			}
-
-			appendListedOnly(ret, nil, nodes.At(i), nodes.At(j), pm.addresses().matchers, pm.addresses().matchers)
 		}
 	}
 

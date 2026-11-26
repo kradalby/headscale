@@ -207,7 +207,7 @@ func peerMapPrefixReference(
 				continue
 			}
 
-			appendListedOnly(peers, siblings, a.View(), b.View(), mi, mj)
+			appendListedOnly(peers, pm, siblings, a.View(), b.View())
 		}
 	}
 

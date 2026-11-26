@@ -1132,13 +1132,11 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 					continue
 				}
 
-				ri, rj := routeInfo[ids[i]], routeInfo[ids[j]]
-
-				if capSrc[j] && ri.isExit || loneExitSource(a.matchers, nodes.At(i), ri.subnet, ri.isExit, rj.loneExit) {
+				if capSrc[j] && routeInfo[ids[i]].isExit {
 					ret[ids[i]] = append(ret[ids[i]], ids[j])
 				}
 
-				if capSrc[i] && rj.isExit || loneExitSource(a.matchers, nodes.At(j), rj.subnet, rj.isExit, ri.loneExit) {
+				if capSrc[i] && routeInfo[ids[j]].isExit {
 					ret[ids[j]] = append(ret[ids[j]], ids[i])
 				}
 			}
@@ -1217,12 +1215,12 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 			}
 
 			if capSrc[nodeJ.ID()] && riI.isExit || selfSourceOfSibling(siblingSrcs, nodeI, nodeJ) ||
-				loneExitSource(matchersI, nodeI, riI.subnet, riI.isExit, riJ.loneExit) {
+				loneExitSource(matchersI, nodeI, riJ.loneExit) {
 				ret[nodeI.ID()] = append(ret[nodeI.ID()], nodeJ.ID())
 			}
 
 			if capSrc[nodeI.ID()] && riJ.isExit || selfSourceOfSibling(siblingSrcs, nodeJ, nodeI) ||
-				loneExitSource(matchersJ, nodeJ, riJ.subnet, riJ.isExit, riI.loneExit) {
+				loneExitSource(matchersJ, nodeJ, riI.loneExit) {
 				ret[nodeJ.ID()] = append(ret[nodeJ.ID()], nodeI.ID())
 			}
 		}
@@ -2601,22 +2599,18 @@ func loneExitRanges(node types.NodeView) []netipx.IPRange {
 }
 
 // loneExitSource reports whether lone, a peer's [loneExitRanges], covers a
-// source of a rule that viewer, with matchers rules, is a destination of.
-// The viewer lists such a peer; the peer, no source by its own reckoning,
-// does not list the viewer.
-func loneExitSource(
-	rules []matcher.Match,
-	viewer types.NodeView,
-	subnet []netipx.IPRange,
-	isExit bool,
-	lone []netipx.IPRange,
-) bool {
+// source of a via grant that viewer, with matchers rules, routes for: its
+// via peer rule names the viewer. The viewer lists such a peer; the peer,
+// no source by its own reckoning, does not list the viewer. SaaS does so
+// under via grants (grant-via-internet-one-family-exit, -bare, -untagged);
+// a rule without via lists no such peer.
+func loneExitSource(rules []matcher.Match, viewer types.NodeView, lone []netipx.IPRange) bool {
 	if len(lone) == 0 {
 		return false
 	}
 
 	return slices.ContainsFunc(rules, func(m matcher.Match) bool {
-		return m.SrcsOverlapsRanges(lone) && matcherReachesDestination(&m, viewer.IPs(), subnet, isExit)
+		return m.IsViaRouter() && m.SrcsOverlapsRanges(lone) && m.DestsContainsIP(viewer.IPs()...)
 	})
 }
 

@@ -1003,16 +1003,16 @@ func (r *Ref) sees(n, m RefNode) bool {
 }
 
 // loneExitSource reports whether n sees m, one way, as a node whose lone
-// exit route covers a source of rl, a rule n is a destination of.
+// exit route covers a source of rl, a via grant n is a via router of.
 // Quirk: an exit route approved without the other family's is none to the
 // service: it reads it as a route over the sources it holds, and lists
-// the node on the rule's destinations, which the node does not list back
-// (grant-via-internet-one-family-exit, -bare, -untagged). Captured under
-// a via grant only; under any other rule it is headscale's reading.
+// the node on the grant's via routers, which the node does not list back
+// (grant-via-internet-one-family-exit, -bare, -untagged). A rule without
+// via lists no such node.
 func (r *Ref) loneExitSource(rl refRule, n, m RefNode) bool {
 	exits := m.exitRoutes()
 
-	return len(exits) == 1 && rl.src.OverlapsPrefix(exits[0]) && r.onDst(rl, n)
+	return len(rl.via) > 0 && len(exits) == 1 && rl.src.OverlapsPrefix(exits[0]) && r.viaRouter(rl, n)
 }
 
 // siblingSource reports whether n sees m, one way, as a source of rl,
