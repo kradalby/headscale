@@ -104,6 +104,9 @@ var viaCompatTests = []struct {
 	{"via-grant-v107", "two via grants from one source through one router"},
 	{"via-grant-v108", "a grant and an ACL with the same sources and IPProto"},
 	{"grant-app-wildcard-destination", "capability grant from members to the wildcard"},
+	{"grant-via-internet-one-family-exit", "the internet via an exit node approved for IPv4 only"},
+	{"grant-via-internet-one-family-exit-bare", "the same exit node without its subnet route"},
+	{"grant-via-internet-one-family-exit-untagged", "the same exit node without the via tag"},
 	{"grant-via-internet-exit-is-source", "the internet via tag:exit with the exit nodes among the sources"},
 	{"grant-app-destination-repeated", "capability grant naming the wildcard twice"},
 	{"grant-via-router-covered", "a subnet via tag:router, one holder with only an exit route over it"},
@@ -152,10 +155,11 @@ var routesMapCompatTests = []struct {
 }
 
 // aclMapCompatTests lists ACL captures replayed through the mapper, with only
-// the policy approving routes: a router advertises in each, so each holds
-// auto-approval to SaaS. They are shared with TestACLCompat in policy/v2, which
-// reads their filters; this replay reads the netmaps. In acl-ah01 and acl-h03
-// some nodes have peers only through the route the policy approves.
+// the policy approving routes unless the capture approved them itself: a
+// router advertises in each, so each holds auto-approval to SaaS. They are
+// shared with TestACLCompat in policy/v2, which reads their filters; this
+// replay reads the netmaps. In acl-ah01 and acl-h03 some nodes have peers only
+// through the route the policy approves.
 var aclMapCompatTests = []string{
 	"acl-ah01", "acl-ah02", "acl-au01", "acl-au06", "acl-c09",
 	"acl-d03", "acl-d04", "acl-d08", "acl-e01", "acl-e03",
@@ -164,6 +168,7 @@ var aclMapCompatTests = []string{
 	"acl-mr20", "acl-mu02", "acl-mu07", "acl-o04", "acl-pf03",
 	"acl-r02", "acl-r08", "acl-rs01", "acl-rs02", "acl-rs03",
 	"acl-rs07", "acl-t10", "acl-u11", "acl-w02",
+	"acl-self-routed-by-other-user", "acl-self-routed-by-third-user", "acl-self-routed-wide-route",
 }
 
 // viaCompatSkipReasons lists checks where headscale differs from SaaS, keyed
@@ -205,7 +210,7 @@ func TestACLMapCompat(t *testing.T) {
 			c, err := testcapture.Read(path)
 			require.NoError(t, err, "failed to read %s", path)
 
-			_, clients := startViaMapCompat(t, c, false)
+			_, clients := startViaMapCompat(t, c, routesSetByAPI(c))
 			compareViaMapCompat(t, c, clients)
 		})
 	}

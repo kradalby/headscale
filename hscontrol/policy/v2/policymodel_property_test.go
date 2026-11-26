@@ -242,7 +242,6 @@ type productionShape struct {
 }
 
 var productionShapes = []productionShape{
-	{"own-anchored", "a merged rule placed by an own rule that reaches nothing (FilterShapes.OwnAnchored)", 0.02},
 	{"router-cover-moved-by-policy", "a policy-only step moving a router's cover (Sides.RoutersMovedSince)", 0.025},
 	{"one-way-peers", "a node seeing another that does not see it (RolePeers)", 0.0175},
 }
@@ -307,10 +306,6 @@ func productionShapesOf(t *testing.T, s policymodel.Scenario) []string {
 		var shapes FilterShapes
 		for _, n := range nodes {
 			x.capFilterFor(n.View(), &shapes)
-		}
-
-		if shapes.OwnAnchored > 0 {
-			add("own-anchored")
 		}
 
 		m := newSideModel(t, pm, users, nodes)

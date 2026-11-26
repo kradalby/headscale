@@ -52,16 +52,28 @@ func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) 
 				if linked || sameUser(nodes.At(i), nodes.At(j)) {
 					ret[nodes.At(i).ID()] = append(ret[nodes.At(i).ID()], nodes.At(j).ID())
 					ret[nodes.At(j).ID()] = append(ret[nodes.At(j).ID()], nodes.At(i).ID())
+
+					continue
 				}
+
+				appendListedOnly(ret, nil, nodes.At(i), nodes.At(j), pm.addresses().matchers, pm.addresses().matchers)
 			}
 		}
 
 		return ret
 	}
 
+	siblings := pm.siblingSelfSources(nodes)
+
+	// A node's rules as a via router link it with the grant's sources only:
+	// they are left out where the node is the source.
 	nodeMatchers := make(map[types.NodeID][]matcher.Match, nodes.Len())
+	ownMatchers := make(map[types.NodeID][]matcher.Match, nodes.Len())
+
 	for _, node := range nodes.All() {
-		nodeMatchers[node.ID()] = matcher.MatchesFromFilterRules(pm.peerRulesForNodeLocked(node))
+		ms := pm.nodeMatchers(node, viaPeerRule)
+		nodeMatchers[node.ID()] = ms
+		ownMatchers[node.ID()] = slices.DeleteFunc(slices.Clone(ms), func(m matcher.Match) bool { return m.IsViaRouter() })
 	}
 
 	for i := range nodes.Len() {
@@ -74,8 +86,8 @@ func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) 
 			matchersJ, hasFilterJ := nodeMatchers[nodeJ.ID()]
 			riJ := routeInfo[nodeJ.ID()]
 
-			canIAccessJ := hasFilterI && nodeI.CanAccessWithRoutes(matchersI, nodeJ, riI.subnet, riJ.subnet, riJ.isExit)
-			canJAccessI := hasFilterJ && nodeJ.CanAccessWithRoutes(matchersJ, nodeI, riJ.subnet, riI.subnet, riI.isExit)
+			canIAccessJ := hasFilterI && nodeI.CanAccessWithRoutes(ownMatchers[nodeI.ID()], nodeJ, riI.subnet, riJ.subnet, riJ.isExit)
+			canJAccessI := hasFilterJ && nodeJ.CanAccessWithRoutes(ownMatchers[nodeJ.ID()], nodeI, riJ.subnet, riI.subnet, riI.isExit)
 			canJReachI := hasFilterI && nodeJ.CanAccessWithRoutes(matchersI, nodeI, riJ.subnet, riI.subnet, riI.isExit)
 			canIReachJ := hasFilterJ && nodeI.CanAccessWithRoutes(matchersJ, nodeJ, riI.subnet, riJ.subnet, riJ.isExit)
 
@@ -83,11 +95,33 @@ func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) 
 			if linked || sameUser(nodeI, nodeJ) {
 				ret[nodeI.ID()] = append(ret[nodeI.ID()], nodeJ.ID())
 				ret[nodeJ.ID()] = append(ret[nodeJ.ID()], nodeI.ID())
+
+				continue
 			}
+
+			appendListedOnly(ret, siblings, nodeI, nodeJ, matchersI, matchersJ)
 		}
 	}
 
 	return ret
+}
+
+// appendListedOnly lists a on b or b on a where one lists the other without
+// being listed back: a sibling's self source, a lone exit route over a
+// source.
+func appendListedOnly(ret map[types.NodeID][]types.NodeID, siblings map[uint][]matcher.Match, a, b types.NodeView, ma, mb []matcher.Match) {
+	lists := func(viewer, peer types.NodeView, ms []matcher.Match) bool {
+		return selfSourceOfSibling(siblings, viewer, peer) ||
+			loneExitSource(ms, viewer, types.RouteRanges(viewer.SubnetRoutes()), viewer.IsExitNode(), loneExitRanges(peer))
+	}
+
+	if lists(a, b, ma) {
+		ret[a.ID()] = append(ret[a.ID()], b.ID())
+	}
+
+	if lists(b, a, mb) {
+		ret[b.ID()] = append(ret[b.ID()], a.ID())
+	}
 }
 
 var (
@@ -861,7 +895,11 @@ func buildPeerMapSortedSlice(
 			if linked || sameUser(nodes.At(i), nodes.At(j)) {
 				ret[ids[i]] = append(ret[ids[i]], ids[j])
 				ret[ids[j]] = append(ret[ids[j]], ids[i])
+
+				continue
 			}
+
+			appendListedOnly(ret, nil, nodes.At(i), nodes.At(j), pm.addresses().matchers, pm.addresses().matchers)
 		}
 	}
 
@@ -952,7 +990,11 @@ func buildPeerMapSliceMap(
 			if linked || sameUser(nodes.At(i), nodes.At(j)) {
 				ret[ids[i]] = append(ret[ids[i]], ids[j])
 				ret[ids[j]] = append(ret[ids[j]], ids[i])
+
+				continue
 			}
+
+			appendListedOnly(ret, nil, nodes.At(i), nodes.At(j), pm.addresses().matchers, pm.addresses().matchers)
 		}
 	}
 
@@ -1682,7 +1724,8 @@ func TestPeerClassesMixedSelfVia(t *testing.T) {
 
 						if step == 0 {
 							require.Contains(t, m.peers.Peers(1), types.NodeID(3), "the source router reaches u2")
-							require.NotContains(t, m.peers.Peers(2), types.NodeID(3), "its sibling must not inherit that source route")
+							require.Contains(t, m.peers.Peers(2), types.NodeID(3), "its sibling lists the self source the router serves")
+							require.NotContains(t, m.peers.Peers(3), types.NodeID(2), "which does not list the sibling")
 							require.True(t, sameSlice(m.peers.View(3), m.peers.View(4)), "u2 devices share one peer view")
 						}
 

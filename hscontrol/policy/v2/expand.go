@@ -1427,7 +1427,13 @@ func routeFilters(o, n *Filters, narrow bool) filterChange {
 		// by the routers TestSessionsFollowGeneratedScenarios leaves out of
 		// its join law. Subnet routers: docs/ref/routes.md. No upstream
 		// reference: the decision is headscale's.
-		if !r.narrow {
+		//
+		// With an autogroup:self grant the narrow set names them too: a
+		// router is cut the self rules of the users it routes over, in
+		// address form, where they merge as no capability-form owner's do.
+		if !r.narrow || slices.ContainsFunc(slices.Concat(r.o.t.grants, r.n.t.grants), func(gt *GrantTemplate) bool {
+			return !gt.none && gt.kind == grantSelf
+		}) {
 			r.routers()
 		}
 	}
@@ -2232,6 +2238,11 @@ func (r *filterRoute) self(g int, gt *GrantTemplate, all bool) {
 		if r.selfAddressOnly(g, uid) {
 			r.addrLists = append(r.addrLists, r.o.posts.Nodes(OwnerRole(uid)), r.n.posts.Nodes(OwnerRole(uid)))
 
+			// The routers over the owner's nodes are cut its rules too.
+			for _, s := range r.sides() {
+				r.addrLists = append(r.addrLists, s.Holders(Role{kind: roleHeldOwner, value: uint64(uid)}))
+			}
+
 			continue
 		}
 
@@ -2273,11 +2284,13 @@ func (r *filterRoute) ownersOf(id types.NodeID, owners map[uint]struct{}) {
 	}
 }
 
-// ownerNodes adds the owner nodes of owners at either end.
+// ownerNodes adds the owner nodes of owners at either end, and the routers
+// over one, which are cut the owner's self rules too.
 func (r *filterRoute) ownerNodes(owners map[uint]struct{}) {
 	for uid := range owners {
 		r.add(r.o.posts.Nodes(OwnerRole(uid))...)
 		r.add(r.n.posts.Nodes(OwnerRole(uid))...)
+		r.holders(Role{kind: roleHeldOwner, value: uint64(uid)})
 	}
 }
 
@@ -2728,19 +2741,25 @@ func (x *Expansion) dstPorts(gt *GrantTemplate, ports []tailcfg.PortRange, rc re
 	return out
 }
 
-// cutSelf cuts grant g's autogroup:self rules for the receiver: its own
-// user's, or, on an exit node, every owner's in user order. A rule that
-// reaches nothing is not cut but keeps its place.
-//
-// TODO(kradalby): policy/others-self: a router of another user's device
-// takes none of that user's self rules for what it routes (fails
-// closed); see policymodel.OthersSelf.
+// cutSelf cuts grant g's autogroup:self rules for the receiver, in user
+// order: its own user's, and those of every user with a device a route it
+// serves covers, which on an exit node is every user. A rule that reaches
+// nothing is not cut but keeps its place.
 func (x *Expansion) cutSelf(c *cut, g int) {
 	var uids []uint
 
 	switch n := c.rc.n; {
-	case n.IsExitNode():
-		uids = x.ownerIDs()
+	case c.rc.routed:
+		for _, uid := range x.ownerIDs() {
+			own := nodeHasUserIdentity(n) && n.User().ID() == uid
+			if own || slices.ContainsFunc(x.posts.Nodes(OwnerRole(uid)), func(id types.NodeID) bool {
+				m, ok := x.node(id)
+
+				return ok && slices.ContainsFunc(m.IPs(), c.rc.reach.Contains)
+			}) {
+				uids = append(uids, uid)
+			}
+		}
 	case nodeHasUserIdentity(n):
 		uids = []uint{n.User().ID()}
 	}

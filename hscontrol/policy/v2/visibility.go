@@ -177,6 +177,12 @@ type steerGrant struct {
 	inetLit bool
 }
 
+// lonePart is one rule as a lone exit route reads it: a node whose route
+// covers a source is listed, one way, by the holders of see.
+type lonePart struct {
+	src, see []Role
+}
+
 // sidePlan is what the templates say about sides, built once per
 // [Templates].
 type sidePlan struct {
@@ -188,12 +194,22 @@ type sidePlan struct {
 	// whether it reaches the internet; nil and false for others.
 	lit     []*netipx.IPSet
 	litInet []bool
+	// litFam holds, per address selector, the families its literal has an
+	// address of.
+	litFam [][2]bool
 
 	grants []grantSides
 	// selfPort and selfApp hold, per self grant with port rules and with a
 	// capability, its sources by address.
 	selfPort, selfApp [][]Role
-	vias              []int
+	// selfComp: a self grant carries a capability with a companion, whose
+	// rule runs from the owners to the named ones.
+	selfComp bool
+	vias     []int
+
+	// lone lists every rule part by its two sides, for the lone exit
+	// routes: see [Sides.loneAtoms].
+	lone []lonePart
 
 	steer  []steerGrant
 	hasVia bool
@@ -316,6 +332,7 @@ func newSidePlan(t *Templates) *sidePlan {
 		t: t, table: table,
 		lit:     make([]*netipx.IPSet, table.Len()),
 		litInet: make([]bool, table.Len()),
+		litFam:  make([][2]bool, table.Len()),
 		grants:  make([]grantSides, len(t.grants)),
 	}
 
@@ -333,6 +350,7 @@ func newSidePlan(t *Templates) *sidePlan {
 		for _, pfx := range l.res.Prefixes() {
 			b.AddPrefix(pfx)
 			p.lits.add(pfx, s.ID)
+			p.litFam[s.ID][family(pfx.Addr())] = true
 		}
 
 		p.lit[s.ID], _ = b.IPSet()
@@ -407,7 +425,33 @@ func newSidePlan(t *Templates) *sidePlan {
 
 			if gt.app != nil {
 				p.selfApp = append(p.selfApp, gs.selfAddr)
+				p.selfComp = p.selfComp || hasCompanion(gt.app)
 			}
+		}
+	}
+
+	for g := range p.grants {
+		gs := &p.grants[g]
+
+		if gs.port {
+			see := gs.portDst
+			if gs.portInet {
+				see = append(slices.Clone(see), atomExit)
+			}
+
+			p.lone = append(p.lone, lonePart{src: gs.src, see: see})
+		}
+
+		if gs.capg {
+			p.lone = append(p.lone, lonePart{src: gs.src, see: gs.capDst})
+		}
+
+		if gs.comp {
+			p.lone = append(p.lone, lonePart{src: gs.compSrc, see: gs.compDst})
+		}
+
+		if len(gs.viaTags) > 0 {
+			p.lone = append(p.lone, lonePart{src: gs.src, see: []Role{{kind: roleViaSeen, value: uint64(g)}}}) //nolint:gosec // a grant index
 		}
 	}
 
@@ -681,6 +725,17 @@ type sidesState struct {
 	cover    *graph.Map[netip.Prefix, coverAtoms]
 	targeted []types.NodeID
 
+	// siblings holds, per user with a node routing over another user's
+	// owners, those users, sorted: every node of the user holds a sibling
+	// atom for each. It is replaced, never written in place.
+	siblings map[uint64][]uint64
+
+	// lones lists, sorted, the nodes approved for one family's exit route
+	// alone; loneCover counts, per family and while there are any, the
+	// atoms of every node with an address of it, as cover does for a route.
+	lones     []types.NodeID
+	loneCover [2]coverAtoms
+
 	rules *ruleCache
 
 	// scanned counts the index entries the update that built the state
@@ -930,6 +985,10 @@ func UpdateSides(prev Sides, t *Templates, roles Roles, posts Postings, approval
 	moved := u.moveCounts(ids)
 	retargeted, routerMoved := u.retarget(ids, moved)
 	l3 := u.touchers(l1, slices.Concat(ids, retargeted), moved, routerMoved)
+
+	for _, id := range u.relone(ids, approvalsMoved) {
+		l3[id] = struct{}{}
+	}
 
 	u.refreshSets(l3)
 
@@ -1298,9 +1357,250 @@ func (u *sidesUpdate) refreshSets(l3 map[types.NodeID]struct{}) {
 		u.next.computed++
 	}
 
+	u.resibling(l3, sets)
+
 	u.next.sets = sets.Done()
 	u.next.held = graph.GroupBy(u.prev.held, u.next.sets, rolesOfSet, graph.Same[RoleSet])
 	u.next.total += u.next.computed
+}
+
+// loneAtoms appends the atoms of a node whose only exit route is fam's: one
+// for each rule a source of which has an address of fam, the whole of what
+// the route covers. SaaS reads such a route as a route over the sources,
+// not as an exit route, and lists the node on the rules' destinations
+// without listing them on it.
+func (s Sides) loneAtoms(roles []Role, fam int) []Role {
+	cover := s.loneCover[fam]
+
+	for i, part := range s.plan.lone {
+		if slices.ContainsFunc(part.src, func(a Role) bool {
+			switch a.kind { //nolint:exhaustive // the rest are held by nodes, see default
+			case roleAll:
+				return true
+			case roleLiteral:
+				return s.plan.litFam[a.value][fam]
+			case roleApproved:
+				return len(s.approvedLens[fam]) > 0
+			default:
+				return cover.has(a)
+			}
+		}) {
+			roles = append(roles, Role{kind: roleLoneSource, value: uint64(i)}) //nolint:gosec // an index
+		}
+	}
+
+	for _, c := range cover {
+		switch {
+		case c.r.kind == roleNamedPort && len(s.plan.selfPort) > 0, c.r.kind == roleNamedApp && len(s.plan.selfApp) > 0:
+			roles = append(roles, Role{kind: roleLoneNamed, value: c.r.value})
+		case c.r.kind == roleOwner && s.plan.selfComp:
+			roles = append(roles, Role{kind: roleLoneOwner, value: c.r.value})
+		}
+	}
+
+	return roles
+}
+
+// loneCoverOf counts fam's cover from scratch.
+func (s Sides) loneCoverOf(fam int) coverAtoms {
+	d := map[Role]int32{}
+
+	for _, f := range s.facts.All() {
+		if slices.ContainsFunc(f.ips, func(ip netip.Addr) bool { return family(ip) == fam }) {
+			for r := range f.touch.All() {
+				if counted(r) {
+					d[r]++
+				}
+			}
+		}
+	}
+
+	c, _ := coverAtoms(nil).plus(d)
+
+	return c
+}
+
+// relone brings the lone exit nodes and their cover up to date with the
+// facts of l1, and returns the nodes whose lone atoms the update moved.
+func (u *sidesUpdate) relone(l1 []types.NodeID, approvalsMoved bool) []types.NodeID {
+	n := &u.next
+
+	lones := n.lones
+	changed := false
+
+	for _, id := range l1 {
+		f, _ := n.facts.Get(id)
+		at, was := slices.BinarySearch(lones, id)
+
+		if is := f != nil && len(f.exits) == 1; is != was {
+			if !changed {
+				lones, changed = slices.Clone(lones), true
+			}
+
+			if is {
+				lones = slices.Insert(lones, at, id)
+			} else {
+				lones = slices.Delete(lones, at, at+1)
+			}
+		}
+	}
+
+	n.lones = lones
+
+	if len(lones) == 0 {
+		n.loneCover = [2]coverAtoms{}
+
+		return nil
+	}
+
+	moved := approvalsMoved
+
+	if len(u.prev.lones) == 0 {
+		for fam := range n.loneCover {
+			n.loneCover[fam] = n.loneCoverOf(fam)
+		}
+
+		moved = true
+	} else {
+		var deltas [2]map[Role]int32
+
+		bump := func(f *sideFacts, d int32) {
+			for fam := range deltas {
+				if !slices.ContainsFunc(f.ips, func(ip netip.Addr) bool { return family(ip) == fam }) {
+					continue
+				}
+
+				if deltas[fam] == nil {
+					deltas[fam] = map[Role]int32{}
+				}
+
+				for r := range f.touch.All() {
+					if counted(r) {
+						deltas[fam][r] += d
+					}
+				}
+			}
+		}
+
+		for _, id := range l1 {
+			old, _ := u.prev.facts.Get(id)
+			cur, _ := n.facts.Get(id)
+
+			if old != nil && cur != nil && old.touch == cur.touch && slices.Equal(old.ips, cur.ips) {
+				continue
+			}
+
+			if old != nil {
+				bump(old, -1)
+			}
+
+			if cur != nil {
+				bump(cur, 1)
+			}
+		}
+
+		for fam, d := range deltas {
+			c, atomsMoved := n.loneCover[fam].plus(d)
+			n.loneCover[fam] = c
+			moved = moved || atomsMoved
+		}
+	}
+
+	if !moved {
+		return nil
+	}
+
+	return lones
+}
+
+// routedOver returns, sorted, the users other than own whose owners the
+// node with side set rs routes over: those it holds a held-owner atom of.
+func routedOver(rs RoleSet, own uint64) []uint64 {
+	var out []uint64
+
+	for r := range rs.All() {
+		if r.kind == roleHeldOwner && r.value != own {
+			out = append(out, r.value)
+		}
+	}
+
+	return out
+}
+
+// siblingsOf returns the users the nodes of user uid route over, sorted,
+// reading each node's side set through get.
+func (s Sides) siblingsOf(uid uint64, get func(types.NodeID) (RoleSet, bool)) []uint64 {
+	var out []uint64
+
+	for _, id := range s.posts.Nodes(OwnerRole(uint(uid))) {
+		if rs, ok := get(id); ok {
+			out = append(out, routedOver(rs, uid)...)
+		}
+	}
+
+	slices.Sort(out)
+
+	return slices.Compact(out)
+}
+
+// resibling brings the sibling atoms up to date with the side sets of l3,
+// just set in sets: a user whose nodes came to route over another user's
+// owners, or stopped, moves the side set of every node it has.
+func (u *sidesUpdate) resibling(l3 map[types.NodeID]struct{}, sets *graph.MapEdit[types.NodeID, RoleSet]) {
+	n := &u.next
+
+	users := map[uint64]struct{}{}
+
+	for id := range l3 {
+		for _, f := range []*sideFacts{mustFacts(u.prev.facts, id), mustFacts(n.facts, id)} {
+			if f != nil && f.owned {
+				users[uint64(f.owner)] = struct{}{}
+			}
+		}
+	}
+
+	var moved map[uint64][]uint64
+
+	for uid := range users {
+		is := n.siblingsOf(uid, sets.Get)
+		if slices.Equal(is, n.siblings[uid]) {
+			continue
+		}
+
+		if moved == nil {
+			moved = map[uint64][]uint64{}
+		}
+
+		moved[uid] = is
+	}
+
+	if moved == nil {
+		return
+	}
+
+	siblings := maps.Clone(n.siblings)
+	if siblings == nil {
+		siblings = map[uint64][]uint64{}
+	}
+
+	for uid, is := range moved {
+		if len(is) == 0 {
+			delete(siblings, uid)
+		} else {
+			siblings[uid] = is
+		}
+	}
+
+	n.siblings = siblings
+
+	for uid := range moved {
+		for _, id := range n.posts.Nodes(OwnerRole(uint(uid))) {
+			if f, ok := n.facts.Get(id); ok {
+				sets.Set(id, n.setOf(id, f))
+				n.computed++
+			}
+		}
+	}
 }
 
 func mustFacts(m *graph.Map[types.NodeID, *sideFacts], id types.NodeID) *sideFacts {
@@ -1355,9 +1655,48 @@ func buildSides(plan *sidePlan, roles Roles, posts Postings, approvals SubnetApp
 
 	slices.Sort(s.targeted)
 
+	for id, f := range facts {
+		if len(f.exits) == 1 {
+			s.lones = append(s.lones, id)
+		}
+	}
+
+	if len(s.lones) > 0 {
+		slices.Sort(s.lones)
+
+		for fam := range s.loneCover {
+			s.loneCover[fam] = s.loneCoverOf(fam)
+		}
+	}
+
 	sets := make(map[types.NodeID]RoleSet, len(facts))
 	for id, f := range facts {
 		sets[id] = s.setOf(id, f)
+	}
+
+	// The sibling atoms read every node's held-owner atoms, set just now.
+	siblings := map[uint64][]uint64{}
+
+	for id, f := range facts {
+		if f.owned && len(routedOver(sets[id], uint64(f.owner))) > 0 {
+			siblings[uint64(f.owner)] = nil
+		}
+	}
+
+	for uid := range siblings {
+		siblings[uid] = s.siblingsOf(uid, func(id types.NodeID) (RoleSet, bool) { rs, ok := sets[id]; return rs, ok })
+	}
+
+	if len(siblings) > 0 {
+		s.siblings = siblings
+
+		for uid := range siblings {
+			for _, id := range posts.Nodes(OwnerRole(uint(uid))) {
+				if f, ok := facts[id]; ok {
+					sets[id] = s.setOf(id, f)
+				}
+			}
+		}
 	}
 
 	s.sets = graph.NewMap(graph.Same[RoleSet], sets)
@@ -1672,12 +2011,6 @@ func (s Sides) setOf(id types.NodeID, f *sideFacts) RoleSet {
 	// Room for the own and composite atoms below, so they need no regrowth.
 	roles := append(make([]Role, 0, len(touch)+len(f.addrLit)+len(f.routeLit)+8), touch...)
 
-	has := func(r Role) bool {
-		_, ok := slices.BinarySearchFunc(touch, r, compareRoles)
-
-		return ok
-	}
-
 	for _, lit := range slices.Concat(f.addrLit, f.routeLit) {
 		roles = append(roles, literalRole(lit))
 	}
@@ -1696,18 +2029,28 @@ func (s Sides) setOf(id types.NodeID, f *sideFacts) RoleSet {
 		roles = append(roles, Role{kind: roleClique, value: f.clique})
 	}
 
+	if f.owned && (f.namedPort || f.namedApp) {
+		roles = append(roles, Role{kind: roleSelfSource, value: uint64(f.owner)})
+	}
+
 	if f.owned {
-		u := uint64(f.owner)
-		named := has(Role{kind: roleNamedPort, value: u})
-		namedApp := has(Role{kind: roleNamedApp, value: u})
-		owner := has(OwnerRole(f.owner))
-
-		if named || namedApp {
-			roles = append(roles, Role{kind: roleHeldNamed, value: u})
+		for _, v := range s.siblings[uint64(f.owner)] {
+			roles = append(roles, Role{kind: roleSibling, value: v})
 		}
+	}
 
-		if owner {
-			roles = append(roles, Role{kind: roleHeldOwner, value: u})
+	if len(f.exits) == 1 {
+		roles = s.loneAtoms(roles, family(f.exits[0].Addr()))
+	}
+
+	// A self rule's sides are addresses like any other's: a node holds
+	// them for its own user, and for a user whose device it routes over.
+	for _, r := range touch {
+		switch r.kind { //nolint:exhaustive // only the self atoms are held
+		case roleNamedPort, roleNamedApp:
+			roles = append(roles, Role{kind: roleHeldNamed, value: r.value})
+		case roleOwner:
+			roles = append(roles, Role{kind: roleHeldOwner, value: r.value})
 		}
 	}
 
@@ -1798,6 +2141,10 @@ func newSideAdjacency(plan *sidePlan) *sideAdjacency {
 		both(plan.grants[g].src, []Role{{kind: roleViaSeen, value: uint64(g)}}) //nolint:gosec // a grant index
 	}
 
+	for i, part := range plan.lone {
+		see(part.see, []Role{{kind: roleLoneSource, value: uint64(i)}}) //nolint:gosec // an index
+	}
+
 	for r, ls := range a.links {
 		slices.SortFunc(ls, compareRoles)
 		a.links[r] = slices.Compact(ls)
@@ -1833,11 +2180,37 @@ func pairs(r Role) []Role {
 	return nil
 }
 
-// linksOf returns the atoms whose holders r's holders see.
-func (a *sideAdjacency) linksOf(r Role) []Role { return slices.Concat(a.links[r], pairs(r)) }
+// linksOf returns the atoms whose holders r's holders see. A sibling sees,
+// one way, the sources of the self rules its user's router serves.
+func (a *sideAdjacency) linksOf(r Role) []Role {
+	switch r.kind { //nolint:exhaustive // only these see one way by value
+	case roleSibling:
+		return []Role{{kind: roleSelfSource, value: r.value}}
+	case roleHeldOwner:
+		// The destinations of a user's self rules see a lone exit route
+		// over a source of them, one way; those of their companions,
+		// below, one over an owner.
+		return slices.Concat(a.links[r], pairs(r), []Role{{kind: roleLoneNamed, value: r.value}})
+	case roleHeldNamed:
+		return slices.Concat(a.links[r], pairs(r), []Role{{kind: roleLoneOwner, value: r.value}})
+	}
+
+	return slices.Concat(a.links[r], pairs(r))
+}
 
 // readersOf returns the atoms whose holders see r's holders.
-func (a *sideAdjacency) readersOf(r Role) []Role { return slices.Concat(a.readers[r], pairs(r)) }
+func (a *sideAdjacency) readersOf(r Role) []Role {
+	switch r.kind { //nolint:exhaustive // only these are seen one way by value
+	case roleSelfSource:
+		return []Role{{kind: roleSibling, value: r.value}}
+	case roleLoneNamed:
+		return []Role{{kind: roleHeldOwner, value: r.value}}
+	case roleLoneOwner:
+		return []Role{{kind: roleHeldNamed, value: r.value}}
+	}
+
+	return slices.Concat(a.readers[r], pairs(r))
+}
 
 // keyedClasses are peer classes keyed by side set: a class's view is the
 // union, over its atoms, of what each atom's holders see.
@@ -2250,13 +2623,7 @@ func (s Sides) RouteAccess(viewer types.NodeID, routes []netip.Prefix) []netip.P
 
 	vf, _ := s.facts.Get(viewer)
 
-	key := accessKey{set: vs}
-
-	if vf != nil && vf.owned {
-		key.owner, key.owned = vf.owner, true
-	}
-
-	rules := s.rules.of(s, key)
+	rules := s.rules.of(s, vs)
 	via := s.viaRules(vs, vf)
 
 	if len(rules)+len(via) == 0 {
@@ -2297,25 +2664,17 @@ type accessRule struct {
 	inet         bool
 }
 
-// accessKey is what a viewer's shared and self rules depend on beyond the
-// templates: its side set, and the user it owns a node of.
-type accessKey struct {
-	set   RoleSet
-	owner uint
-	owned bool
-}
-
-// ruleCache holds the rules each accessKey reads routes by. They follow the
+// ruleCache holds the rules each side set reads routes by. They follow the
 // templates otherwise, so a state that keeps them keeps the cache.
 type ruleCache struct {
 	mu     sync.Mutex
-	rules  map[accessKey][]accessRule
+	rules  map[RoleSet][]accessRule
 	builds int
 }
 
-// of returns the shared and self rules of the viewers with key k, built
-// once per key.
-func (c *ruleCache) of(s Sides, k accessKey) []accessRule {
+// of returns the shared and self rules of the viewers with side set k,
+// built once per set.
+func (c *ruleCache) of(s Sides, k RoleSet) []accessRule {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -2326,10 +2685,10 @@ func (c *ruleCache) of(s Sides, k accessKey) []accessRule {
 	// ponytail: keys that come and go stay until the cache is renewed or
 	// outgrows the side sets held; prune by holders if churn makes it matter.
 	if c.rules == nil || len(c.rules) > 2*s.sets.Len()+64 {
-		c.rules = map[accessKey][]accessRule{}
+		c.rules = map[RoleSet][]accessRule{}
 	}
 
-	r := s.sharedRules(k.set)
+	r := s.sharedRules(k)
 	r = s.selfRules(r, k)
 	c.rules[k] = r
 	c.builds++
@@ -2376,24 +2735,33 @@ func (s Sides) sharedRules(vs RoleSet) []accessRule {
 	return out
 }
 
-// selfRules appends to out the self rules of k's user the viewer is on a
-// side of.
-func (s Sides) selfRules(out []accessRule, k accessKey) []accessRule {
-	if !k.owned {
+// selfRules appends to out the self rules the viewer with side set vs is on
+// a side of: those of every user it holds a self atom of.
+func (s Sides) selfRules(out []accessRule, vs RoleSet) []accessRule {
+	if len(s.plan.selfPort) == 0 && len(s.plan.selfApp) == 0 {
 		return out
 	}
 
-	u := uint64(k.owner)
-	owner := []Role{OwnerRole(k.owner)}
+	var users []uint64
 
-	if len(s.plan.selfPort) > 0 {
-		out = addRule(out, k.set, accessRule{src: []Role{{kind: roleNamedPort, value: u}}, dst: owner})
+	for r := range vs.All() {
+		if (r.kind == roleHeldOwner || r.kind == roleHeldNamed) && !slices.Contains(users, r.value) {
+			users = append(users, r.value)
+		}
 	}
 
-	// The companion rule runs the other way between the same sides, which
-	// route access reads both ways: this one decides for both.
-	if len(s.plan.selfApp) > 0 {
-		out = addRule(out, k.set, accessRule{src: []Role{{kind: roleNamedApp, value: u}}, dst: owner})
+	for _, u := range users {
+		owner := []Role{{kind: roleOwner, value: u}}
+
+		if len(s.plan.selfPort) > 0 {
+			out = addRule(out, vs, accessRule{src: []Role{{kind: roleNamedPort, value: u}}, dst: owner})
+		}
+
+		// The companion rule runs the other way between the same sides,
+		// which route access reads both ways: this one decides for both.
+		if len(s.plan.selfApp) > 0 {
+			out = addRule(out, vs, accessRule{src: []Role{{kind: roleNamedApp, value: u}}, dst: owner})
+		}
 	}
 
 	return out
@@ -2660,6 +3028,10 @@ func buildViaPlan(s Sides) *ViaPlan {
 			b.AddPrefix(p)
 		}
 
+		if st.internet {
+			b.AddSet(util.TheInternet())
+		}
+
 		set, _ := b.IPSet()
 
 		var routes []netip.Prefix
@@ -2764,6 +3136,16 @@ func (v *ViaPlan) Steer(s Sides, viewer, peer types.NodeView, primary func(key s
 		for _, d := range v.dsts[i] {
 			for _, r := range peerRoutes {
 				if d.Overlaps(r) && !slices.Contains(routes, r) {
+					routes = append(routes, r)
+				}
+			}
+		}
+
+		// autogroup:internet names every public prefix, so a subnet route
+		// to one is steered as a route to a listed destination is.
+		if st.internet {
+			for _, r := range peerRoutes {
+				if util.TheInternet().OverlapsPrefix(r) && !slices.Contains(routes, r) {
 					routes = append(routes, r)
 				}
 			}

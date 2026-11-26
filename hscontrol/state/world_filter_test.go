@@ -358,7 +358,6 @@ func TestWorldFiltersUnderRandomChurn(t *testing.T) {
 		"exit receivers": shapes.Exit, "routed receivers": shapes.Routed, "self rules": shapes.Self,
 		"via rules": shapes.Via, "capability rules": shapes.CapGrant, "companion rules": shapes.Companion,
 		"rules with cap sources": shapes.Capped, "rules merged at a rule that does not reach the receiver": shapes.Anchored,
-		"rules merged at a receiver's own rule that reaches nothing": shapes.OwnAnchored,
 	} {
 		assert.Positive(t, n, name)
 	}

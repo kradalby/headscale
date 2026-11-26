@@ -12,8 +12,9 @@ import (
 
 // TestReferenceLaws holds the reference to what its own statement implies,
 // over generated worlds, with and without each contested clause: its
-// rules parse in the client; visibility is symmetric but for an exit node
-// seeing the sources of an app grant that reaches the internet; and stamps
+// rules parse in the client; visibility is symmetric but for the one-way
+// listings (an exit node seeing the sources of an app grant that reaches
+// the internet, a router's siblings, a lone exit route); and stamps
 // name only identity sources of the document or an owner.
 func TestReferenceLaws(t *testing.T) {
 	t.Parallel()
@@ -32,8 +33,10 @@ func TestReferenceLaws(t *testing.T) {
 
 				for _, id := range ref.Peers(n.ID) {
 					m, _ := ref.node(id)
-					if !slices.Contains(ref.Peers(id), n.ID) && !slices.ContainsFunc(ref.rules, func(rl refRule) bool { return ref.oneWay(rl, n, m) }) {
-						t.Fatalf("world %d without %v: n%d sees n%d one way, by no app grant reaching the internet\n%#v", i, without, n.ID, id, w)
+					if !slices.Contains(ref.Peers(id), n.ID) && !slices.ContainsFunc(ref.rules, func(rl refRule) bool {
+						return ref.oneWay(rl, n, m) || ref.siblingSource(rl, n, m) || ref.loneExitSource(rl, n, m)
+					}) {
+						t.Fatalf("world %d without %v: n%d sees n%d one way, by none of the one-way listings\n%#v", i, without, n.ID, id, w)
 					}
 				}
 
@@ -147,7 +150,12 @@ func TestServedRoutesFollowTheElections(t *testing.T) {
 			map[types.NodeID][]netip.Prefix{2: {subnet}},
 			nil,
 		},
-		{"via to the internet, a public subnet", internetVia, []RefNode{public}, nil, nil},
+		{
+			"via to the internet, a public subnet of a via router", internetVia,
+			[]RefNode{public},
+			map[types.NodeID][]netip.Prefix{2: public.Approved},
+			nil,
+		},
 	} {
 		r := NewRef(c.doc, users, append([]RefNode{viewer}, c.routers...))
 

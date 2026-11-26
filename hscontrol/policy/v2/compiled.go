@@ -720,27 +720,52 @@ func ownSelfRules(
 	return userSelfRules(cg, node.User().ID(), userIdx)
 }
 
+// selfUsers returns, sorted, the users whose autogroup:self rules node holds:
+// its own, and every user with a device one of routes covers, as SaaS sends
+// them to a router. Reducing the rules to the node keeps the covered
+// destinations.
+func selfUsers(node types.NodeView, routes []netip.Prefix, userIdx userNodeIndex) []uint {
+	var out []uint
+
+	for _, uid := range slices.Sorted(maps.Keys(userIdx)) {
+		own := nodeHasUserIdentity(node) && node.User().ID() == uid
+		if own || routesCoverAny(routes, userIdx[uid]) {
+			out = append(out, uid)
+		}
+	}
+
+	return out
+}
+
+// routesCoverAny reports whether a route contains an address of any node.
+func routesCoverAny(routes []netip.Prefix, nodes []types.NodeView) bool {
+	return slices.ContainsFunc(nodes, func(n types.NodeView) bool {
+		return slices.ContainsFunc(n.IPs(), func(ip netip.Addr) bool {
+			return slices.ContainsFunc(routes, func(r netip.Prefix) bool { return r.Contains(ip) })
+		})
+	})
+}
+
 // filterSelfRules returns the autogroup:self rules a node's packet filter
-// holds: its own user's, or, on an exit node, whose exit routes contain
-// every self destination, every user's in user order, as Tailscale sends
-// them. Only the packet filter needs other users' rules: they never make
-// the exit node a peer, so the peer paths use [ownSelfRules].
+// holds, in user order: those of [selfUsers] over every route it serves,
+// which on an exit node is every user.
 func filterSelfRules(
 	cg *compiledGrant,
 	node types.NodeView,
 	userIdx userNodeIndex,
 ) keyedRules {
-	if !node.IsExitNode() {
-		return ownSelfRules(cg, node, userIdx)
-	}
-
 	if cg.self == nil {
 		return keyedRules{}
 	}
 
+	routes := slices.Concat(node.SubnetRoutes(), node.ExitRoutes())
+	if len(routes) == 0 {
+		return ownSelfRules(cg, node, userIdx)
+	}
+
 	var all keyedRules
 
-	for _, uid := range slices.Sorted(maps.Keys(userIdx)) {
+	for _, uid := range selfUsers(node, routes, userIdx) {
 		r := userSelfRules(cg, uid, userIdx)
 		all.rules = append(all.rules, r.rules...)
 		all.keys = append(all.keys, r.keys...)

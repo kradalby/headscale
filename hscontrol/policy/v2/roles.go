@@ -43,6 +43,11 @@ const (
 	roleHeldOwner   // an owner holding an address of its user's owners
 	roleViaSeen     // a router of that via grant template
 	roleRouterOnSrc // a via router among its own grant's sources
+	roleSelfSource  // itself an owner its user's self grants name
+	roleSibling     // of a user with a node routing over that user's owners
+	roleLoneSource  // a lone exit route over a source of that rule part
+	roleLoneNamed   // a lone exit route over an owner that user's self grants name
+	roleLoneOwner   // a lone exit route over one of that user's owners
 )
 
 // Role is one membership a node holds: a selector of a table, or, under
@@ -87,6 +92,8 @@ var roleKindNames = [...]string{
 	roleLiteral: "literal", roleAll: "all", roleApproved: "approved", roleExit: "exit",
 	roleClique: "clique", roleHeldNamed: "held-named", roleHeldOwner: "held-owner",
 	roleViaSeen: "via-seen", roleRouterOnSrc: "router-on-src",
+	roleSelfSource: "self-source", roleSibling: "sibling",
+	roleLoneSource: "lone-source", roleLoneNamed: "lone-named", roleLoneOwner: "lone-owner",
 }
 
 // RoleSet is the roles one node holds, interned: two sets are equal

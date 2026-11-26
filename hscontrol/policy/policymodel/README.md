@@ -157,7 +157,10 @@ clause in `reference.go` or a counted exception in the test, each tagged
 `TODO(kradalby): <area>/<key>` at the test and at the code, and held to
 production by a hand-built case that fails once production changes.
 `git grep 'TODO(kradalby): policy/'` lists them; `overwake/` lists the wakes
-that are wider than needed.
+that are wider than needed. No policy clause is open now: each was settled
+against a capture of the hosted service, as a "Quirk:" of the reference or a
+fix in production. The mechanism (`Contested`, `Ref.Without`, the judges'
+attribution) stays for the next one.
 
 A judge forgives a difference only where the reference less every clause is
 production exactly, so each clause must restate headscale beside all the

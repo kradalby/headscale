@@ -92,7 +92,7 @@ func TestExpanderQuirks(t *testing.T) {
 		{ID: 2, Name: "bob"},
 		{ID: 3, Name: "carol", Email: "carol@example.com"},
 	}
-	alice, bob, carol := &users[0], &users[1], &users[2]
+	alice, carol := &users[0], &users[2]
 
 	const owners = `"tagOwners": {"tag:a": ["alice@"], "tag:b": ["alice@"]}`
 
@@ -249,30 +249,6 @@ func TestExpanderQuirks(t *testing.T) {
 			receiver: "r",
 			want: []tailcfg.FilterRule{
 				{SrcIPs: []string{"100.64.0.1"}, DstPorts: []tailcfg.NetPortRange{port("100.64.0.10", 22)}},
-			},
-		},
-		{
-			// bob's self rule on the exit node reaches nothing there (bob
-			// has IPv6 only, the exit routes IPv4 only), but the compile
-			// merges before it reduces: the rule still places the merged
-			// rule ahead of *.
-			name: "own-rule-reaching-nothing-places-merge",
-			policy: `{` + owners + `, "grants": [
-				{"src": ["bob@"], "dst": ["autogroup:self"], "ip": ["tcp:22"]},
-				{"src": ["*"], "dst": ["*"], "ip": ["*"]},
-				{"src": ["bob@"], "dst": ["tag:b"], "ip": ["tcp:22"]}]}`,
-			nodes: quirkNodes(
-				quirkNode{name: "b1", user: bob, v6: "fd7a:115c:a1e0::2"},
-				quirkNode{name: "ex", v4: "100.64.0.30", v6: "fd7a:115c:a1e0::1e", tags: []string{"tag:b"}, route: []string{"0.0.0.0/0"}},
-			),
-			receiver: "ex",
-			want: []tailcfg.FilterRule{
-				{
-					SrcIPs:   []string{"fd7a:115c:a1e0::2"},
-					DstPorts: []tailcfg.NetPortRange{port("100.64.0.30", 22), port("fd7a:115c:a1e0::1e", 22)},
-					IPProto:  []int{ProtocolTCP},
-				},
-				everything,
 			},
 		},
 		{

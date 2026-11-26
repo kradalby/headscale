@@ -16,7 +16,8 @@
 //
 // Every clause a plain reading of the documentation would not predict is
 // marked "Quirk:" with its evidence. Where headscale is seen to disagree,
-// the reference keeps its reading and names the clause [Contested].
+// the reference keeps its reading and names the clause [Contested]; none
+// is open now.
 
 package policymodel
 
@@ -365,52 +366,30 @@ type Ref struct {
 // wrong. Leaving a clause out restates headscale's behaviour in that
 // clause's scope alone; a property asks for it only to tell a difference
 // that is exactly that clause from any other.
+//
+// No clause is open: every one raised so far was settled against a capture
+// of the hosted service. The mechanism stays for the next: declare the
+// clause as a bit here, list and name it below, and branch on r.without
+// where the readings part.
 type Contested uint16
 
-const (
-	// OthersSelf: an autogroup:self rule's sides are addresses like any
-	// other rule's: a node routing one of the user's devices' addresses is
-	// on them, takes the rule for what it routes, sees the other side and
-	// gets routes by it. Headscale applies a user's self rules only with
-	// one of the user's devices at one end: it sends them to those devices
-	// and to exit nodes, gives routes by a viewer's own user's, and links
-	// two nodes only when one is the user's. Fails closed.
-	//
-	// TODO(kradalby): policy/others-self: fails closed. With
-	// `* -> autogroup:self:*`, a node of u2 routing a prefix that holds
-	// u1's device takes none of u1's self rule for it, sees only its own
-	// user's devices and gets routes by no other user's self rules. The
-	// docs define self by user (docs/ref/policy.md) and say nothing of
-	// routers; no capture decides it. The properties in
-	// policy/v2/reference_test.go count it under "others' self rules".
-	// Production: cutSelf in policy/v2/expand.go and the self rules of
-	// visibility.go. Delete the clause once one reading is chosen: fix
-	// production, or make headscale's reading the reference's own.
-	OthersSelf Contested = 1 << iota
-)
-
 // ContestedClauses is every contested clause, in the order a property
-// tries them.
-var ContestedClauses = []Contested{
-	OthersSelf,
-}
+// tries them; contestedNames their names, in the same order.
+var (
+	ContestedClauses = []Contested{}
+	contestedNames   = []string{}
+)
 
 // FailsOpen reports whether headscale's side of c admits what the
 // reference refuses.
-func (c Contested) FailsOpen() bool {
-	return false
-}
+func (c Contested) FailsOpen() bool { return false }
 
 func (c Contested) String() string {
-	names := []string{
-		"others' self rules",
-	}
-
 	var parts []string
 
 	for i, k := range ContestedClauses {
 		if c&k != 0 {
-			parts = append(parts, names[i])
+			parts = append(parts, contestedNames[i])
 		}
 	}
 
@@ -928,11 +907,6 @@ func (r *Ref) Rules(id types.NodeID) []tailcfg.FilterRule {
 	var out []tailcfg.FilterRule
 
 	for _, rl := range r.rules {
-		// Headscale cuts every owner's self rules at an exit node.
-		if !r.ownSelf(rl, n) && !n.exit() {
-			continue
-		}
-
 		dst := r.dstsAt(rl, n)
 		if len(dst.Prefixes()) == 0 || len(rl.src.Prefixes()) == 0 {
 			continue
@@ -985,12 +959,6 @@ func (r *Ref) Rules(id types.NodeID) []tailcfg.FilterRule {
 	return out
 }
 
-// ownSelf reports whether rl counts at n with [OthersSelf] left out: it
-// is no autogroup:self rule, or one for n's own user.
-func (r *Ref) ownSelf(rl refRule, n RefNode) bool {
-	return r.without&OthersSelf == 0 || rl.owner == 0 || rl.owner == n.owner()
-}
-
 // Peers are the nodes node id is shown, in ID order. A node sees another
 // when a rule has one on its sources' side and the other on its
 // destinations' side, either way round (the goldens' peer lists); and
@@ -1022,20 +990,47 @@ func (r *Ref) sees(n, m RefNode) bool {
 	}
 
 	for _, rl := range r.rules {
-		if r.without&OthersSelf != 0 && rl.owner != 0 && n.owner() != rl.owner && m.owner() != rl.owner {
-			continue
-		}
-
 		if r.links(rl, n, m) || r.links(rl, m, n) {
 			return true
 		}
 
-		if r.oneWay(rl, n, m) {
+		if r.oneWay(rl, n, m) || r.siblingSource(rl, n, m) || r.loneExitSource(rl, n, m) {
 			return true
 		}
 	}
 
 	return false
+}
+
+// loneExitSource reports whether n sees m, one way, as a node whose lone
+// exit route covers a source of rl, a rule n is a destination of.
+// Quirk: an exit route approved without the other family's is none to the
+// service: it reads it as a route over the sources it holds, and lists
+// the node on the rule's destinations, which the node does not list back
+// (grant-via-internet-one-family-exit, -bare, -untagged). Captured under
+// a via grant only; under any other rule it is headscale's reading.
+func (r *Ref) loneExitSource(rl refRule, n, m RefNode) bool {
+	exits := m.exitRoutes()
+
+	return len(exits) == 1 && rl.src.OverlapsPrefix(exits[0]) && r.onDst(rl, n)
+}
+
+// siblingSource reports whether n sees m, one way, as a source of rl,
+// another user's autogroup:self rule that a device of n's user serves
+// through a subnet route.
+// Quirk: the service lists such sources on every device of the router's
+// user, though they list the router alone (acl-self-routed-by-other-user,
+// -by-third-user, -wide-route). A source of several devices is listed
+// device by device, by its own address: headscale's reading, which no
+// capture holds.
+func (r *Ref) siblingSource(rl refRule, n, m RefNode) bool {
+	if rl.owner == 0 || n.owner() == 0 || n.owner() == rl.owner || !slices.ContainsFunc(m.Addrs, rl.src.Contains) {
+		return false
+	}
+
+	return slices.ContainsFunc(r.nodes, func(router RefNode) bool {
+		return router.owner() == n.owner() && slices.ContainsFunc(router.subnets(), rl.dst.OverlapsPrefix)
+	})
 }
 
 // oneWay reports whether exit node n sees m only as a source of rl, an
@@ -1107,10 +1102,6 @@ func (r *Ref) Routes(viewer, peer types.NodeID) []netip.Prefix {
 		}
 
 		keep := slices.ContainsFunc(r.rules, func(rl refRule) bool {
-			if !r.ownSelf(rl, v) {
-				return false
-			}
-
 			via := len(rl.via) > 0
 
 			if isExitRoute(q) {
