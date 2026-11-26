@@ -140,7 +140,6 @@ shapes of its start world can select its cases.
 | `-rapid.nofailfile`                                                             | Do not write `testdata/rapid/`; rapid replays files it finds there                               |
 | `HEADSCALE_SIDES_SEED`, `HEADSCALE_HUB_SEED`                                    | Replay the clock-seeded tests; a failure prints the value                                        |
 | `HEADSCALE_PBT_JUDGES`, `HEADSCALE_PBT_SHAPES`                                  | Run a slice: the named judges, over cases holding one of the named shapes (`via-*` for a prefix) |
-| `HEADSCALE_PBT_KNOWN_BUGS=1`                                                    | Run the tests pinned to known production bugs; they fail                                         |
 | `HEADSCALE_TEST_CAPABILITY_SOURCES=false`, `HEADSCALE_TEST_FILTER_CHUNKS=false` | Turn a policy option off in tests that follow the default                                        |
 
 Deep runs of the mapper package need a long `-timeout`.
