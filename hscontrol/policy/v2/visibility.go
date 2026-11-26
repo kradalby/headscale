@@ -1279,7 +1279,7 @@ func (u *sidesUpdate) refreshSets(l3 map[types.NodeID]struct{}) {
 			continue
 		}
 
-		sets.Set(id, u.next.setOf(id, f))
+		sets.Set(id, u.next.setOf(f))
 		u.next.computed++
 	}
 
@@ -1518,7 +1518,7 @@ func (u *sidesUpdate) resibling(l3 map[types.NodeID]struct{}, sets *graph.MapEdi
 	for uid := range moved {
 		for _, id := range n.posts.Nodes(OwnerRole(uint(uid))) {
 			if f, ok := n.facts.Get(id); ok {
-				sets.Set(id, n.setOf(id, f))
+				sets.Set(id, n.setOf(f))
 				n.computed++
 			}
 		}
@@ -1582,7 +1582,7 @@ func buildSides(plan *sidePlan, roles Roles, posts Postings, approvals SubnetApp
 
 	sets := make(map[types.NodeID]RoleSet, len(facts))
 	for id, f := range facts {
-		sets[id] = s.setOf(id, f)
+		sets[id] = s.setOf(f)
 	}
 
 	// The sibling atoms read every node's held-owner atoms, set just now.
@@ -1604,7 +1604,7 @@ func buildSides(plan *sidePlan, roles Roles, posts Postings, approvals SubnetApp
 		for uid := range siblings {
 			for _, id := range posts.Nodes(OwnerRole(uint(uid))) {
 				if f, ok := facts[id]; ok {
-					sets[id] = s.setOf(id, f)
+					sets[id] = s.setOf(f)
 				}
 			}
 		}
@@ -1894,9 +1894,9 @@ func (s Sides) touchedBy(f *sideFacts) []Role {
 	return slices.Compact(roles)
 }
 
-// setOf returns node id's side set from its facts, those of the nodes it
-// holds an address of, and the counts of the routes it serves.
-func (s Sides) setOf(id types.NodeID, f *sideFacts) RoleSet {
+// setOf returns the side set of the node with facts f, from them, those of
+// the nodes it holds an address of, and the counts of the routes it serves.
+func (s Sides) setOf(f *sideFacts) RoleSet {
 	touch := s.touchedBy(f)
 	// Room for the own and composite atoms below, so they need no regrowth.
 	roles := append(make([]Role, 0, len(touch)+len(f.addrLit)+len(f.routeLit)+8), touch...)

@@ -307,7 +307,6 @@ func fingerprintSides(f fingerprint, s Sides, table *SelectorTable) {
 	for p, ids := range s.routers.Groups.All() {
 		f.set("routers "+p.String(), ids)
 	}
-
 }
 
 func fingerprintVia(f fingerprint, v *ViaPlan) {

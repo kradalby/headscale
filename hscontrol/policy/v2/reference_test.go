@@ -269,6 +269,7 @@ func refGoldenCapture(t *testing.T, tally *refGoldenTally, id string, captures m
 			g.captures++
 			g.filters++
 			g.probes += rep.Probes
+
 			if filterAgrees {
 				g.filtersAgree++
 			}
