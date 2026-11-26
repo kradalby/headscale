@@ -4922,6 +4922,56 @@ func TestNewStateEmptyPolicyFile(t *testing.T) {
 	require.NoError(t, s.Close())
 }
 
+// refusedPolicyDocuments are documents headscale refuses at validation,
+// as the hosted service does: a tag owner or a group member naming every
+// user of a domain, and a via grant whose destination is not a prefix, a
+// host or autogroup:internet, or lies in the Tailscale address ranges.
+// What a refusal means for a stored document is the same for each, so
+// the tests below table-drive them.
+var refusedPolicyDocuments = map[string]string{
+	"tag-owner-wildcard":    `{"tagOwners": {"tag:web": ["user:*@example.com"]}}`,
+	"group-member-wildcard": `{"groups": {"group:eng": ["user:*@example.com"]}}`,
+	"via-non-ip-dst":        `{"tagOwners": {"tag:web": []}, "grants": [{"src": ["*"], "dst": ["*"], "via": ["tag:web"], "ip": ["*"]}]}`,
+	"via-tailscale-ip-dst":  `{"tagOwners": {"tag:web": []}, "grants": [{"src": ["*"], "dst": ["100.64.0.0/10"], "via": ["tag:web"], "ip": ["*"]}]}`,
+}
+
+// TestNewStateRefusesStoredRefusedPolicy pins that a document headscale
+// refuses at validation stops startup in either policy mode: an upgrade
+// that leaves one stored cannot serve. Recovery is a corrected document:
+// edit the file, or store one with `headscale policy set
+// --bypass-server-and-access-database-directly` while the server is
+// stopped.
+func TestNewStateRefusesStoredRefusedPolicy(t *testing.T) {
+	for name, pol := range refusedPolicyDocuments {
+		t.Run(name+"/database", func(t *testing.T) {
+			cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+
+			// As an upgrade leaves it: stored without validation.
+			d, err := db.NewHeadscaleDatabase(cfg)
+			require.NoError(t, err)
+			_, err = d.SetPolicy(pol)
+			require.NoError(t, err)
+			require.NoError(t, d.Close())
+
+			_, err = NewState(cfg)
+			require.Error(t, err, "a refused document must stop startup")
+		})
+
+		t.Run(name+"/file", func(t *testing.T) {
+			cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+			cfg.Policy = types.PolicyConfig{
+				Mode: types.PolicyModeFile,
+				Path: filepath.Join(t.TempDir(), "policy.hujson"),
+			}
+
+			require.NoError(t, os.WriteFile(cfg.Policy.Path, []byte(pol), 0o600))
+
+			_, err := NewState(cfg)
+			require.Error(t, err, "a refused document must stop startup")
+		})
+	}
+}
+
 func TestNodeNameReplayCompat(t *testing.T) {
 	c, err := testcapture.Read(filepath.Join("..", "servertest", "testdata", "steps", "names.hujson"))
 	require.NoError(t, err)

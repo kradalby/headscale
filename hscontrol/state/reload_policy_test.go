@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -220,6 +222,48 @@ func TestSetPolicyEnforcesPolicyTests(t *testing.T) {
 			isSSH, err := s.SSHPolicy(node)
 			require.NoError(t, err)
 			assert.Equal(t, wasSSH, isSSH)
+		})
+	}
+}
+
+// TestReloadPolicyRefusedKeepsPolicyInForce pins what an operator sees
+// when the configured document is one headscale refuses at validation: a
+// reload (SIGHUP in either mode) returns the error and keeps the policy
+// in force, and so does a set through the API or CLI. The stored
+// document is not corrected by either.
+func TestReloadPolicyRefusedKeepsPolicyInForce(t *testing.T) {
+	const allowAll = `{"grants": [{"src": ["*"], "dst": ["*"], "ip": ["*"]}]}`
+
+	for name, pol := range refusedPolicyDocuments {
+		t.Run(name, func(t *testing.T) {
+			_, s, _ := persistTestSetup(t)
+			t.Cleanup(func() { _ = s.Close() })
+
+			_, err := s.SetPolicy([]byte(allowAll))
+			require.NoError(t, err)
+
+			t.Run("set", func(t *testing.T) {
+				_, err := s.SetPolicy([]byte(pol))
+				require.Error(t, err, "a refused document must not be set")
+				assert.JSONEq(t, allowAll, string(s.Snapshot().PolicySource()), "the policy in force is unchanged")
+			})
+
+			t.Run("reload-from-database", func(t *testing.T) {
+				_, err := s.SetPolicyInDB(pol)
+				require.NoError(t, err)
+
+				require.Error(t, s.ReloadPolicy(), "a refused document must not reload")
+				assert.JSONEq(t, allowAll, string(s.Snapshot().PolicySource()), "the policy in force is unchanged")
+			})
+
+			t.Run("reload-from-file", func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "policy.hujson")
+				require.NoError(t, os.WriteFile(path, []byte(pol), 0o600))
+				s.cfg.Policy = types.PolicyConfig{Mode: types.PolicyModeFile, Path: path}
+
+				require.Error(t, s.ReloadPolicy(), "a refused document must not reload")
+				assert.JSONEq(t, allowAll, string(s.Snapshot().PolicySource()), "the policy in force is unchanged")
+			})
 		})
 	}
 }
