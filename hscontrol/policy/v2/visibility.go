@@ -252,9 +252,7 @@ func (p *sidePlan) atoms(id SelectorID, ctx atomCtx, out []Role) []Role {
 	}
 
 	out = append(out, literalRole(id))
-	// TODO(kradalby): policy/star-approved-routes: * as a source takes every
-	// approved route, announced or not (fails open); see
-	// policymodel.StarApprovedRoutes.
+	// * as a source takes every approved route, announced or not.
 	if s.Kind == SelectorWildcard && ctx == ctxSrc {
 		out = append(out, atomApproved)
 	}

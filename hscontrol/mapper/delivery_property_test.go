@@ -1368,7 +1368,7 @@ func enforced(nm *netmap.NetworkMap) string {
 // under a policy whose capability-form receivers no such change may send a
 // filter (see [ruleClass]), and which nodes it changes. A node serving a
 // subnet route is no such change: * as a source names every approved
-// route (TODO(kradalby): policy/star-approved-routes), so it moves what *
+// route, so it moves what *
 // writes in every form.
 func membershipChurn(before policymodel.World, st policymodel.Step) (map[types.NodeID]bool, bool) {
 	after := before.Apply(st.Edits...)

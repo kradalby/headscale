@@ -940,10 +940,6 @@ func viaDstsForNode(
 		// rather than cut to what the router serves, and a narrower
 		// dst rides on a router covering more than the operator
 		// asked for.
-		// TODO(kradalby): policy/via-own-address: the literal dst also covers
-		// the router's own address, which a broader dst does not restrict
-		// (fails open); cutVia in expand.go does the same. See
-		// policymodel.ViaOwnAddress.
 		if slices.ContainsFunc(nodeSubnetRoutes, dstPrefix.Overlaps) {
 			viaDstPrefixes = append(viaDstPrefixes, dstPrefix)
 		}

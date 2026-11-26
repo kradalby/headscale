@@ -171,8 +171,8 @@ const stackedRouters = 8
 // address, and of the public 2001:4860::/32; approves 10.0.0.0/24 for a
 // third node that does not announce it; and adds rules from * to every
 // user's own devices and to the public prefix, and from the members to the
-// internet. The router then meets three contested clauses at once: others'
-// self rules, * adding approved routes and the internet at subnet routers.
+// internet. The router then meets at once others' self rules, * adding
+// approved routes and the internet at a subnet router.
 // A world of fewer than three nodes is left as it is, and one allowing
 // everything.
 func stackedRouter(w *World, who int) {

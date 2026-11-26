@@ -9,7 +9,6 @@
 package v2
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"maps"
@@ -29,7 +28,6 @@ import (
 	"pgregory.net/rapid"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
-	"tailscale.com/wgengine/filter"
 )
 
 // refInputs is users and nodes as the reference reads them: their fields,
@@ -73,12 +71,8 @@ type refGoldenTally struct {
 
 	files, refused, unreadable, captures int
 	filters, filtersAgree, probes        int
-	// unrouted counts SaaS accepts through a * destination for a route
-	// the node announces unapproved; unroutedAllowAll those of them in a
-	// document with neither acls nor grants.
-	unrouted, unroutedAllowAll int
-	peers, peersAgree          int
-	routes, routesAgree        int
+	peers, peersAgree                    int
+	routes, routesAgree                  int
 	// routesSteered counts captured viewer and peer pairs via steering
 	// decides; routesInDoubt node captures whose routes SaaS's answer is in
 	// doubt for; routesUnseen the routes the reference gives that no
@@ -130,8 +124,7 @@ func TestReferenceAgreesWithCaptures(t *testing.T) {
 		g := tally
 		t.Logf("capture files %d: %d refused by SaaS, %d unreadable by the reference, %d node captures",
 			g.files, g.refused, g.unreadable, g.captures)
-		t.Logf("filters: %d of %d agree (%d probes; %d accepted by SaaS through a * destination for a route the node announces unapproved, %d of them in allow-all documents)",
-			g.filtersAgree, g.filters, g.probes, g.unrouted, g.unroutedAllowAll)
+		t.Logf("filters: %d of %d agree (%d probes)", g.filtersAgree, g.filters, g.probes)
 		t.Logf("peers: %d of %d agree", g.peersAgree, g.peers)
 		t.Logf("routes: %d of %d viewer and peer pairs agree; not compared: %d pairs via steering decides, %d node captures in doubt; %d routes the reference gives no viewer sees as primary",
 			g.routesAgree, g.routes, g.routesSteered, g.routesInDoubt, g.routesUnseen)
@@ -170,7 +163,7 @@ func TestReferenceAgreesWithCaptures(t *testing.T) {
 				ru, rn := refInputs(users, nodes)
 				ref := policymodel.NewRef(doc, ru, rn)
 
-				refGoldenCapture(t, tally, c.TestID, c.Captures, ref, nodes, rn, allowAll(c.Input.FullPolicy))
+				refGoldenCapture(t, tally, c.TestID, c.Captures, ref, nodes, rn)
 			})
 		}
 	}
@@ -179,17 +172,6 @@ func TestReferenceAgreesWithCaptures(t *testing.T) {
 		t.Parallel()
 		refGoldenSequence(t, tally, "policy-generation")
 	})
-}
-
-// allowAll reports whether a document has neither acls nor grants.
-func allowAll(policy string) bool {
-	var m map[string]json.RawMessage
-
-	_ = json.Unmarshal([]byte(policy), &m)
-	_, acls := m["acls"]
-	_, grants := m["grants"]
-
-	return !acls && !grants
 }
 
 // refGoldenDivergences lists, keyed <test_id>[/<step>]/<node>/<check>, the
@@ -231,12 +213,12 @@ func refGoldenSequence(t *testing.T, tally *refGoldenTally, id string) {
 		require.NoError(t, err)
 
 		ru, rn := refInputs(users, nodes)
-		refGoldenCapture(t, tally, id+"/"+step.Name, step.Captures, policymodel.NewRef(doc, ru, rn), nodes, rn, allowAll(string(policy)))
+		refGoldenCapture(t, tally, id+"/"+step.Name, step.Captures, policymodel.NewRef(doc, ru, rn), nodes, rn)
 	}
 }
 
 func refGoldenCapture(t *testing.T, tally *refGoldenTally, id string, captures map[string]testcapture.Node,
-	ref *policymodel.Ref, nodes types.Nodes, rn []policymodel.RefNode, allAllowed bool,
+	ref *policymodel.Ref, nodes types.Nodes, rn []policymodel.RefNode,
 ) {
 	t.Helper()
 
@@ -256,18 +238,6 @@ func refGoldenCapture(t *testing.T, tally *refGoldenTally, id string, captures m
 
 		view := policymodel.ViewFromNetmap(capture.Netmap)
 		rep := policymodel.Compare(capture.PacketFilterRules, ref.Rules(node.ID), view)
-		star := policymodel.StarAccepts(capture.PacketFilterRules, view)
-		unrouted := 0
-
-		rep.Verdicts = slices.DeleteFunc(rep.Verdicts, func(d policymodel.VerdictDiff) bool {
-			if d.Ref == filter.Accept && !ref.Serves(node.ID, d.Probe.Dst) && view.LocalNets.Contains(d.Probe.Dst) && star(d.Probe) {
-				unrouted++
-
-				return true
-			}
-
-			return false
-		})
 
 		var want, got []string
 
@@ -299,12 +269,6 @@ func refGoldenCapture(t *testing.T, tally *refGoldenTally, id string, captures m
 			g.captures++
 			g.filters++
 			g.probes += rep.Probes
-			g.unrouted += unrouted
-
-			if allAllowed {
-				g.unroutedAllowAll += unrouted
-			}
-
 			if filterAgrees {
 				g.filtersAgree++
 			}
@@ -998,89 +962,6 @@ func TestViaRouterCoverIsHeadscalesReading(t *testing.T) {
 		}
 
 		require.Equal(t, c.decides, differs, "%s: whether the clause decides", c.name)
-	}
-}
-
-// TestInternetClausesAreHeadscalesReading pins policymodel's two
-// autogroup:internet clauses to what headscale compiles, from scratch, on
-// hand-built worlds: InternetAtSubnetRouters (a rule without via takes the
-// internet as addresses, so a subnet router serving a public prefix gets
-// it) and ViaExitInternet (a via grant gives it to a via router with any
-// exit route, through all of its routes, and to no other). On each world every
-// node's served filter equals the reference less both clauses, and differs
-// from the reference less the other clause alone exactly where the world
-// says this one decides. It fails once production changes either reading.
-func TestInternetClausesAreHeadscalesReading(t *testing.T) {
-	t.Parallel()
-
-	addr := netip.MustParseAddr
-	// Routes 4 and 8 are 8.8.8.0/24 and 2001:4860::/32; 9 and 10 the exit
-	// routes.
-	world := func(via bool, tagged bool, routes ...int) policymodel.World {
-		var w policymodel.World
-
-		w.Topology.Users = []policymodel.User{{ID: 1, Name: "alice"}, {ID: 2, Name: "bob"}}
-		router := policymodel.Node{ID: 2, User: 2, V4: addr("100.64.0.2"), V6: addr("fd7a:115c:a1e0::2"), Announced: routes, Approved: routes}
-
-		if tagged {
-			router.User, router.Tags = 0, []int{0}
-		}
-
-		w.Topology.Nodes = []policymodel.Node{{ID: 1, User: 1, V4: addr("100.64.0.1"), V6: addr("fd7a:115c:a1e0::1")}, router}
-		w.Topology.NextID, w.Topology.NextUserID = 3, 3
-		w.Policy.Defined[0] = true
-
-		tcp := slices.Index(policymodel.Protos, "tcp")
-		rule := policymodel.Rule{Src: []policymodel.Sel{{Kind: policymodel.SelUser}}, Dst: []policymodel.Dest{{Sel: policymodel.Sel{Kind: policymodel.SelInternet}}}}
-
-		if via {
-			rule.IP, rule.Via = []policymodel.IP{{Proto: tcp}}, []int{0}
-			w.Policy.Grants = []policymodel.Rule{rule}
-		} else {
-			rule.Proto = tcp
-			w.Policy.ACLs = []policymodel.Rule{rule}
-		}
-
-		return w
-	}
-
-	both := policymodel.InternetAtSubnetRouters | policymodel.ViaExitInternet
-
-	for _, c := range []struct {
-		name    string
-		w       policymodel.World
-		decides policymodel.Contested
-	}{
-		{"a subnet router of a public IPv6 prefix", world(false, false, 8), policymodel.InternetAtSubnetRouters},
-		{"a subnet router of a public IPv4 prefix", world(false, false, 4), policymodel.InternetAtSubnetRouters},
-		{"an exit node of one family", world(false, false, 9), 0},
-		{"a via router of a public prefix, no exit", world(true, true, 8), 0},
-		{"a via exit node of IPv4 alone", world(true, true, 9), 0},
-		{"a via exit node of IPv6 alone", world(true, true, 10), 0},
-		{"a via exit node of IPv4 serving a public IPv6 prefix", world(true, true, 9, 8), policymodel.ViaExitInternet},
-		{"a via exit node of IPv6 serving a public IPv4 prefix", world(true, true, 10, 4), policymodel.ViaExitInternet},
-		{"a via exit node of both families serving a public prefix", world(true, true, 9, 10, 8), 0},
-		{"an exit node without the via tag", world(true, false, 9), 0},
-	} {
-		sv, err := serve(nil, c.w, policymodel.Change{})
-		require.NoError(t, err, c.name)
-
-		headscale, plain := sv.ref.Without(both), sv.ref.Without(both&^c.decides)
-		differs := false
-
-		for _, n := range c.w.Topology.Nodes {
-			got, err := sv.ip.ForNode(n.ID, ReceiverFacts{})
-			require.NoError(t, err, c.name)
-
-			view := policymodel.ModelView(n, c.w, nil, nil)
-
-			rep := policymodel.Compare(headscale.Rules(n.ID), got, view)
-			require.Truef(t, rep.Equivalent(), "%s: n%d's filter differs from the reference less both clauses: %s\nreference %v\nheadscale %v", c.name, n.ID, rep, headscale.Rules(n.ID), got)
-
-			differs = differs || !policymodel.Compare(plain.Rules(n.ID), got, view).Equivalent()
-		}
-
-		require.Equal(t, c.decides != 0, differs, "%s: whether %v decides", c.name, c.decides)
 	}
 }
 

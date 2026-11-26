@@ -387,59 +387,6 @@ const (
 	// visibility.go. Delete the clause once one reading is chosen: fix
 	// production, or make headscale's reading the reference's own.
 	OthersSelf Contested = 1 << iota
-	// StarApprovedRoutes: * as a source adds the routes nodes serve.
-	// Headscale adds every approved route, served or not. Fails open.
-	//
-	// TODO(kradalby): policy/star-approved-routes: fails open. With
-	// `* -> *:*` and 10.0.0.0/24 approved for n1 but not announced, every
-	// node accepts sources in 10.0.0.0/24, a range nobody routes into the
-	// tailnet. Production (approvedSubnetRoutes in policy/v2/types.go, the
-	// approved atom of visibility.go) cites Tailscale's "any approved
-	// subnets" and the hosted service keeping a withdrawn route's
-	// approval; no capture holds an approved, unannounced route, so
-	// neither side is confirmed. The properties in
-	// policy/v2/reference_test.go count it under "* adds approved routes".
-	// Delete the clause once a capture decides it, or once production
-	// reads served routes.
-	StarApprovedRoutes
-	// InternetAtSubnetRouters: autogroup:internet is the internet through
-	// exit nodes. Headscale reads it as an address set like any other in a
-	// rule without via, so a subnet router serving a public prefix takes
-	// it, is on its side, and its route is given by it (a via grant reads
-	// it apart: ViaExitInternet). Fails open.
-	//
-	// TODO(kradalby): policy/internet-at-subnet-routers: fails open. With
-	// `* -> autogroup:internet:*`, a subnet router serving 8.8.8.0/24
-	// accepts the sources' packets to it, is shown to them and its route
-	// given to them, though no exit node is involved. docs/ref/policy.md:
-	// autogroup:internet "allows access to the internet through exit
-	// nodes"; no capture has a public subnet route under it. The
-	// properties in policy/v2/reference_test.go count it under "internet
-	// at subnet routers". Production: AutoGroup.resolve in
-	// policy/v2/types.go reads it as util.TheInternet. Delete the clause
-	// once production keeps it to exit nodes, or once a capture shows the
-	// hosted service reading it as addresses.
-	InternetAtSubnetRouters
-	// ViaOwnAddress: a via grant reaches what its via routers route.
-	// Headscale writes each destination prefix whole at a via router with a
-	// subnet route overlapping it, so the router also takes it for its own
-	// address, and for whatever else of it the client handles: a route it
-	// announces unapproved, the internet through its exit route. Fails
-	// open.
-	//
-	// TODO(kradalby): policy/via-own-address: fails open. With
-	// `* -> * via tag:a`, a tag:a router on 100.64.0.1 serving
-	// 100.64.0.2/32 is given the overlapping tailnet prefix whole, so it
-	// accepts every tailnet source to its own address on every port, and
-	// to 100.64.0.3 once it announces 100.64.0.3/32 unapproved. The
-	// plain reading reaches only what the router routes; no capture
-	// decides it. The properties in policy/v2/reference_test.go count it
-	// under "via own address", alone or with "via reach". Production:
-	// cutVia in policy/v2/expand.go (viaDstsForNode in compiled.go) emits
-	// the destination literal by design. Delete the clause, and its branch
-	// in dstsAt, once that rule is cut to the router's routes, or once the
-	// whole prefix is decided intended and the reference says so.
-	ViaOwnAddress
 	// ViaReach: a via grant reaches every route its via routers serve,
 	// exit routes included. Headscale reaches subnet routes only, exits
 	// only for autogroup:internet. Fails closed.
@@ -494,28 +441,6 @@ const (
 	// Delete the clause once a via router is linked with its grant's
 	// sources alone.
 	ViaRouterCover
-	// ViaExitInternet: a via grant's autogroup:internet is, at a via
-	// router, the internet through its exit routes. Headscale writes the
-	// whole internet at a via router with any exit route, and nothing at
-	// one without, and then keeps what any route of the router reaches:
-	// a via exit node also takes the internet through a public subnet
-	// route, in the family it does not exit too. Fails open.
-	//
-	// TODO(kradalby): policy/via-exit-internet: fails open. With
-	// `alice@ -> autogroup:internet via tag:a`, a tag:a node approved for
-	// 0.0.0.0/0 and serving 2001:4860::/32 accepts alice's packets to
-	// 2001:4860::/32, which no exit route of it carries. No capture holds
-	// a via exit node with a public subnet. The properties in
-	// policy/v2/reference_test.go and the delivery property count it under
-	// "via exit internet"; TestInternetClausesAreHeadscalesReading pins
-	// this clause and InternetAtSubnetRouters to what headscale does.
-	// Production: viaDstsForNode in policy/v2/compiled.go and cutVia in
-	// policy/v2/expand.go write util.TheInternet whole at a via router for
-	// which IsExitNode holds; the receiver cut (newReceiver in
-	// policy/v2/expand.go, ReduceFilterRules in policyutil) keeps the
-	// ranges any of its routes overlap. Delete the clause once the via
-	// rule keeps to the router's exit routes.
-	ViaExitInternet
 	// ViaRouterExitRoutes: a via grant offers its sources exit nodes only
 	// for autogroup:internet, and only its via-tagged ones. Headscale's
 	// route access reads a via grant, at a via router, as the router's
@@ -577,22 +502,20 @@ const (
 // ContestedClauses is every contested clause, in the order a property
 // tries them.
 var ContestedClauses = []Contested{
-	OthersSelf, StarApprovedRoutes, InternetAtSubnetRouters,
-	ViaOwnAddress, ViaReach, AppWildcard, ViaRouterCover, ViaExitInternet,
+	OthersSelf, ViaReach, AppWildcard, ViaRouterCover,
 	ViaRouterExitRoutes, ViaExitSourceRoutes,
 }
 
 // FailsOpen reports whether headscale's side of c admits what the
 // reference refuses.
 func (c Contested) FailsOpen() bool {
-	return c&(StarApprovedRoutes|InternetAtSubnetRouters|ViaOwnAddress|ViaRouterCover|ViaExitInternet|ViaRouterExitRoutes|ViaExitSourceRoutes) != 0
+	return c&(ViaRouterCover|ViaRouterExitRoutes|ViaExitSourceRoutes) != 0
 }
 
 func (c Contested) String() string {
 	names := []string{
-		"others' self rules", "* adds approved routes", "internet at subnet routers",
-		"via own address", "via reach", "* as app destination",
-		"via router covered", "via exit internet", "via router exit routes", "via exit source routes",
+		"others' self rules", "via reach", "* as app destination",
+		"via router covered", "via router exit routes", "via exit source routes",
 	}
 
 	var parts []string
@@ -614,21 +537,29 @@ func (r *Ref) Without(c Contested) *Ref {
 	return out
 }
 
+// dstTerm is one destination entry resolved: one node's address for an
+// entry naming nodes, else all the entry names.
+type dstTerm struct {
+	set *netipx.IPSet
+	// internet is set for autogroup:internet; star for *, which is sent
+	// as one entry over both families.
+	internet, star bool
+}
+
 // refRule is one rule resolved to addresses: a grant or ACL entry, its
 // autogroup:self part for one owner, or a companion of either.
 type refRule struct {
 	src, dst *netipx.IPSet
-	// internet: autogroup:internet is among the destinations, which exit
-	// nodes serve.
+	// terms are the destinations one entry at a time, as a node is sent
+	// them; none stands for dst as one entry.
+	terms []dstTerm
+	// internet: a via rule names autogroup:internet, which only its exit
+	// nodes serve; dst leaves it out.
 	internet bool
 	ip       []IPSpec
 	app      tailcfg.PeerCapMap
-	// via restricts the rule to routers holding one of these tags;
-	// viaTerms are its destinations one term at a time: what headscale's
-	// readings of a via rule ([ViaOwnAddress], [ViaRouterExitRoutes]) cut
-	// by.
-	via      []string
-	viaTerms []*netipx.IPSet
+	// via restricts the rule to routers holding one of these tags.
+	via []string
 	// owner is the user an autogroup:self part is for.
 	owner uint
 }
@@ -685,26 +616,20 @@ func newRef(doc Doc, users []User, nodes []RefNode, without Contested) *Ref {
 	for _, d := range doc.Rules {
 		var dsts []string
 
-		self, inet := false, false
+		self := false
 
 		for _, t := range d.Dst {
-			switch t {
-			case "autogroup:self":
+			if t == "autogroup:self" {
 				self = true
-			case internetSel:
-				// autogroup:internet is the internet through exit nodes
-				// (docs/ref/policy.md).
-				inet = true
-			default:
+			} else {
 				dsts = append(dsts, t)
 			}
 		}
 
-		if inet && len(d.Via) == 0 && without&InternetAtSubnetRouters != 0 {
-			dsts, inet = append(slices.Clone(dsts), internetSel), false
-		}
-
-		base := refRule{src: r.srcAddrs(d.Src), dst: r.addrs(dsts, false), internet: inet, ip: d.IP, app: d.App}
+		// Quirk: autogroup:internet is an address set like any other: a
+		// subnet router of a public prefix takes the rule, is on its side
+		// and has the route given by it (routes-internet-public-subnet).
+		base := refRule{src: r.srcAddrs(d.Src), dst: r.addrs(dsts, false), terms: r.terms(dsts), ip: d.IP, app: d.App}
 
 		if len(d.Via) > 0 {
 			// Quirk: via restricts a grant's ip part only; its app part
@@ -713,10 +638,10 @@ func newRef(doc Doc, users []User, nodes []RefNode, without Contested) *Ref {
 			// the sources of an app grant through via).
 			via := base
 			via.app, via.via = nil, d.Via
-
-			for _, t := range dsts {
-				via.viaTerms = append(via.viaTerms, r.addrs([]string{t}, false))
-			}
+			// Quirk: through via, autogroup:internet is served by exit
+			// nodes alone.
+			via.internet = slices.Contains(dsts, internetSel)
+			via.dst = r.addrs(slices.DeleteFunc(slices.Clone(dsts), func(t string) bool { return t == internetSel }), false)
 
 			r.add(via, nil, nil)
 
@@ -725,7 +650,7 @@ func newRef(doc Doc, users []User, nodes []RefNode, without Contested) *Ref {
 
 		if without&AppWildcard != 0 && len(d.App) > 0 {
 			app := base
-			app.ip, app.dst = nil, r.starAsTailnet(dsts)
+			app.ip, app.dst, app.terms = nil, r.starAsTailnet(dsts), nil
 			base.app = nil
 			r.add(app, r.srcAddrs(dsts), r.starAsTailnet(d.Src))
 
@@ -736,7 +661,7 @@ func newRef(doc Doc, users []User, nodes []RefNode, without Contested) *Ref {
 			}
 		}
 
-		if len(dsts) > 0 || inet {
+		if len(dsts) > 0 {
 			r.add(base, r.srcAddrs(dsts), r.addrs(d.Src, false))
 		}
 
@@ -774,10 +699,48 @@ func (r *Ref) addSelf(rl refRule) {
 		}
 
 		self := rl
-		self.src, self.dst, self.internet, self.owner = named, addrsOf(devices), false, u
+		self.src, self.dst, self.terms, self.owner = named, addrsOf(devices), nodeTerms(devices), u
 
 		r.add(self, self.dst, self.src)
 	}
+}
+
+// terms resolves destination entries one at a time.
+func (r *Ref) terms(names []string) []dstTerm {
+	var out []dstTerm
+
+	for _, t := range names {
+		if !identity(t) {
+			out = append(out, dstTerm{set: r.addrs([]string{t}, false), internet: t == internetSel, star: t == "*"})
+
+			continue
+		}
+
+		var members []RefNode
+
+		for _, n := range r.nodes {
+			if r.member(n, t) {
+				members = append(members, n)
+			}
+		}
+
+		out = append(out, nodeTerms(members)...)
+	}
+
+	return out
+}
+
+// nodeTerms is one term for each address of nodes.
+func nodeTerms(nodes []RefNode) []dstTerm {
+	var out []dstTerm
+
+	for _, n := range nodes {
+		for _, a := range n.Addrs {
+			out = append(out, dstTerm{set: setOf(netip.PrefixFrom(a, a.BitLen()))})
+		}
+	}
+
+	return out
 }
 
 // starAsTailnet is what terms name as destinations, reading * as the
@@ -909,8 +872,9 @@ func (r *Ref) usersOf(tok string) []uint {
 }
 
 // srcAddrs is what terms name as sources. Quirk: * as a source adds
-// every route a node serves (acl and grant goldens, e.g. grant-a1's
-// 10.33.0.0/16).
+// every approved subnet route, announced or not (acl and grant goldens,
+// e.g. grant-a1's 10.33.0.0/16; the owner-routes step capture for a route
+// no longer announced).
 func (r *Ref) srcAddrs(terms []string) *netipx.IPSet {
 	if !slices.Contains(terms, "*") {
 		return r.addrs(terms, true)
@@ -921,13 +885,10 @@ func (r *Ref) srcAddrs(terms []string) *netipx.IPSet {
 	b.AddSet(r.addrs(terms, true))
 
 	for _, n := range r.nodes {
-		routes := n.subnets()
-		if r.without&StarApprovedRoutes != 0 {
-			routes = slices.DeleteFunc(slices.Clone(n.Approved), isExitRoute)
-		}
-
-		for _, p := range routes {
-			b.AddPrefix(p)
+		for _, p := range n.Approved {
+			if !isExitRoute(p) {
+				b.AddPrefix(p)
+			}
 		}
 	}
 
@@ -995,59 +956,47 @@ func (n RefNode) served() *netipx.IPSet {
 	return s
 }
 
-// dstsAt is the part of rl's destinations that n takes packets for:
-// autogroup:internet at an exit node; for a via rule, only at a router
-// holding a via tag, and only what it routes.
+// dstsAt is the part of rl's destinations that n is sent: a via rule's
+// only at a router holding a via tag.
+// Quirk: an entry that reaches what n serves is sent whole, not cut to it:
+// a prefix wider than the route, the range of autogroup:internet a public
+// route sits in (routes-destination-wider-than-route,
+// routes-internet-public-subnet, grant-via-internet-one-family-exit). The
+// client then also takes it for a route it announces unapproved.
 func (r *Ref) dstsAt(rl refRule, n RefNode) *netipx.IPSet {
-	var b netipx.IPSetBuilder
-
-	switch {
-	case len(rl.via) == 0:
-		b.AddSet(n.served())
-		b.Intersect(rl.dst)
-	case !n.hasTag(rl.via):
+	via := len(rl.via) > 0
+	if via && !n.hasTag(rl.via) {
 		return &netipx.IPSet{}
-	default:
-		routed := n.routes()
-		if r.without&ViaReach != 0 {
-			routed = n.subnets()
-		}
-
-		for _, p := range routed {
-			b.AddPrefix(p)
-		}
-
-		b.Intersect(rl.dst)
-
-		if r.without&ViaOwnAddress != 0 {
-			for _, term := range rl.viaTerms {
-				for _, p := range term.Prefixes() {
-					if slices.ContainsFunc(n.subnets(), p.Overlaps) {
-						b.AddPrefix(p)
-					}
-				}
-			}
-		}
 	}
 
-	if rl.internet {
-		var exits netipx.IPSetBuilder
+	terms := rl.terms
+	if terms == nil {
+		terms = []dstTerm{{set: rl.dst}}
+	}
 
-		for _, p := range n.exitRoutes() {
-			exits.AddPrefix(p)
+	var b netipx.IPSetBuilder
+
+	for _, term := range terms {
+		reach := n.served()
+
+		switch {
+		case via && term.internet && !n.exit():
+			continue
+		case via && !term.internet && r.without&ViaReach != 0:
+			reach = setOf(n.subnets()...)
 		}
 
-		// Headscale's reading at a via exit node: the internet through
-		// any of its routes.
-		if len(rl.via) > 0 && r.without&ViaExitInternet != 0 && n.exit() {
-			for _, p := range n.routes() {
-				exits.AddPrefix(p)
+		if term.star {
+			b.AddSet(term.set)
+
+			continue
+		}
+
+		for _, rg := range term.set.Ranges() {
+			if reach.OverlapsRange(rg) {
+				b.AddRange(rg)
 			}
 		}
-
-		exits.Intersect(internet)
-		s, _ := exits.IPSet()
-		b.AddSet(s)
 	}
 
 	s, _ := b.IPSet()
@@ -1325,8 +1274,12 @@ func (r *Ref) viaPartReachesInternet(rl refRule, n RefNode) bool {
 		return false
 	}
 
-	for _, term := range rl.viaTerms {
-		for _, p := range term.Prefixes() {
+	for _, term := range rl.terms {
+		if term.internet {
+			continue
+		}
+
+		for _, p := range term.set.Prefixes() {
 			if !slices.ContainsFunc(n.subnets(), p.Overlaps) {
 				continue
 			}

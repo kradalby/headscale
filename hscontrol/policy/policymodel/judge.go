@@ -8,11 +8,8 @@ import (
 	"slices"
 
 	"github.com/juanfont/headscale/hscontrol/types"
-	"go4.org/netipx"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/peercap"
-	"tailscale.com/types/logger"
-	"tailscale.com/wgengine/filter"
 )
 
 // Verdicts are the differences from the reference a property allows when
@@ -21,14 +18,6 @@ import (
 // rules shares them, so that one allowance means one thing wherever the
 // rules come from.
 type Verdicts struct {
-	// Unrouted: the client takes packets for a route its node announces
-	// but is not approved for, through a rule whose destination is "*";
-	// the captures show exactly that.
-	Unrouted int
-	// UnroutedWhole: the same through any other destination entry that
-	// also names something the node serves, written whole. No capture
-	// holds one; reported as a question, not encoded.
-	UnroutedWhole int
 	// CrossFamilyICMP: capability form refuses a packet carrying the
 	// other family's ICMP protocol, which address form accepts: decided as
 	// malformed, failing closed.
@@ -140,8 +129,8 @@ func ContestedCounts(counts map[Contested]int) []string {
 func (c *Verdicts) String() string {
 	parts := ContestedCounts(c.Contested)
 
-	return fmt.Sprintf("allowed %d cross-family ICMP, %d through * on unapproved routes, %d on hidden addresses; suspected: %d through other whole destinations on unapproved routes, %d app values repeated; contested %v",
-		c.CrossFamilyICMP, c.Unrouted, c.Hidden, c.UnroutedWhole, c.RepeatedValues, parts)
+	return fmt.Sprintf("allowed %d cross-family ICMP, %d on hidden addresses; suspected: %d app values repeated; contested %v",
+		c.CrossFamilyICMP, c.Hidden, c.RepeatedValues, parts)
 }
 
 // judge holds rep, a comparison of the reference's rules (as Ref) with
@@ -176,42 +165,6 @@ func (c *Verdicts) judge(rep Report, ref *Ref, id types.NodeID, view ClientView,
 		return false
 	})
 
-	var star, whole func(Probe) bool
-
-	rep.Verdicts = slices.DeleteFunc(rep.Verdicts, func(d VerdictDiff) bool {
-		if d.Ref != filter.Drop || d.Cand != filter.Accept || ref.Serves(id, d.Probe.Dst) || !view.LocalNets.Contains(d.Probe.Dst) {
-			return false
-		}
-
-		if star == nil {
-			star, whole = StarAccepts(got, view), wholeAccepts(got, view, ref.Served(id))
-		}
-
-		switch {
-		case star(d.Probe):
-			c.Unrouted++
-		case whole(d.Probe):
-			// TODO(kradalby): policy/unrouted-whole-destination: fails
-			// open, narrow. A destination entry that reaches the node is
-			// written whole, so the client also accepts the rest of it
-			// inside a route the node announces unapproved: host h-pub
-			// 100.64.0.0/30, `* -> h-pub:*`, n1 on 100.64.0.1 announcing
-			// 100.64.0.0/30 unapproved accepts packets to 100.64.0.0.
-			// Nobody routes those to n1. The captures show this only
-			// through *, which the case above accepts; none decides any
-			// other entry. Production: dstPorts in expand.go keeps a
-			// literal entry whole once receiver.overlaps finds it
-			// reaching the node. Delete this case once entries are cut to
-			// what the node serves, or once a capture shows the hosted
-			// service doing it.
-			c.UnroutedWhole++
-		default:
-			return false
-		}
-
-		return true
-	})
-
 	return rep
 }
 
@@ -244,8 +197,6 @@ func (c *Verdicts) CompareAt(ref *Ref, id types.NodeID, got []tailcfg.FilterRule
 		}
 	}
 
-	c.Unrouted += trial.Unrouted
-	c.UnroutedWhole += trial.UnroutedWhole
 	c.CrossFamilyICMP += trial.CrossFamilyICMP
 	c.Hidden += trial.Hidden
 	c.RepeatedValues += trial.RepeatedValues
@@ -303,72 +254,6 @@ func repeatsOf(c peercap.Cap, ref, cand []tailcfg.RawMessage) bool {
 	}
 
 	return done[0][0]
-}
-
-// acceptsThrough returns whether rules accept a probe through a
-// destination entry keep admits, as the client would with view.
-func acceptsThrough(rules []tailcfg.FilterRule, view ClientView, keep func(tailcfg.NetPortRange) bool) func(Probe) bool {
-	var kept []tailcfg.FilterRule
-
-	for _, r := range rules {
-		var dsts []tailcfg.NetPortRange
-
-		for _, d := range r.DstPorts {
-			if keep(d) {
-				dsts = append(dsts, d)
-			}
-		}
-
-		if len(dsts) > 0 {
-			r.DstPorts, r.CapGrant = dsts, nil
-			kept = append(kept, r)
-		}
-	}
-
-	ms, err := filter.MatchesFromFilterRules(kept)
-	if err != nil || len(ms) == 0 {
-		return func(Probe) bool { return false }
-	}
-
-	f := filter.New(ms, view.HasCap, view.LocalNets, nil, nil, logger.Discard)
-
-	return func(p Probe) bool { return f.RunIn(p.Packet(), 0) == filter.Accept }
-}
-
-// StarAccepts returns whether rules accept a probe through a destination
-// written "*". That is the one way the captures show a node taking packets
-// for a route it announces but is not approved for: every such captured
-// accept comes from such a rule.
-func StarAccepts(rules []tailcfg.FilterRule, view ClientView) func(Probe) bool {
-	return acceptsThrough(rules, view, func(d tailcfg.NetPortRange) bool { return d.IP == "*" })
-}
-
-// wholeAccepts returns whether rules accept a probe through a destination
-// entry that also names something the node serves (served): a rule that
-// reaches the node, written whole. "*" is one; the captures hold no other.
-func wholeAccepts(rules []tailcfg.FilterRule, view ClientView, served *netipx.IPSet) func(Probe) bool {
-	return acceptsThrough(rules, view, func(d tailcfg.NetPortRange) bool {
-		if d.IP == "*" {
-			return true
-		}
-
-		r, err := netipx.ParseIPRange(d.IP)
-		if err != nil {
-			p, perr := netip.ParsePrefix(d.IP)
-			if perr != nil {
-				a, aerr := netip.ParseAddr(d.IP)
-				if aerr != nil {
-					return false
-				}
-
-				p = netip.PrefixFrom(a, a.BitLen())
-			}
-
-			r = netipx.RangeOfPrefix(p)
-		}
-
-		return served.OverlapsRange(r)
-	})
 }
 
 // ContestedPeers reports whether headscale's reading shows node id

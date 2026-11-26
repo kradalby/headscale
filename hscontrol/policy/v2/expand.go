@@ -2710,11 +2710,9 @@ func (x *Expansion) dstPorts(gt *GrantTemplate, ports []tailcfg.PortRange, rc re
 				}
 			}
 		default:
-			// TODO(kradalby): policy/unrouted-whole-destination: an entry
-			// is written whole once it reaches the node, so the client also
-			// accepts the rest of it inside a route the node announces
-			// unapproved (fails open, narrow). Tolerated, with what settles
-			// it, in verdictClasses.judge (policy/v2/reference_test.go).
+			// An entry is written whole once it reaches the node, as on
+			// SaaS, so the client also accepts the rest of it inside a
+			// route the node announces unapproved.
 			for _, e := range x.t.literals[id].entries {
 				if rc.overlaps(e.r) {
 					add(e.str)
@@ -2990,11 +2988,7 @@ func (x *Expansion) cutVia(c *cut, g int, gt *GrantTemplate, ge *grantExpansion)
 	}
 
 	// TODO(kradalby): policy/via-reach: subnet routes only, exits for
-	// autogroup:internet alone (fails closed).
-	// TODO(kradalby): policy/via-own-address: each overlapping destination
-	// is written whole, so a router whose route sits inside a wider
-	// destination also accepts the grant's sources to its own address
-	// (fails open). See policymodel.ViaReach and policymodel.ViaOwnAddress.
+	// autogroup:internet alone (fails closed). See policymodel.ViaReach.
 	subnets := rc.n.SubnetRoutes()
 
 	var dsts []literalEntry
