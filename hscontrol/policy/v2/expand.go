@@ -2403,10 +2403,8 @@ type FilterShapes struct {
 	// capability rules among them; Capped those with sources by cap.
 	Shared, Self, Via, CapGrant, Companion, Capped int
 	// Anchored counts merged rules placed where a rule that does not reach
-	// the receiver sits, ahead of every rule of theirs that does; OwnAnchored
-	// those of them placed by one of the receiver's own rules. OwnUnreached
-	// counts the receiver's own rules that reach nothing on it.
-	Anchored, OwnAnchored, OwnUnreached int
+	// the receiver sits, ahead of every rule of theirs that does.
+	Anchored int
 }
 
 // Add adds o's counts to s.
@@ -2421,8 +2419,6 @@ func (s *FilterShapes) Add(o FilterShapes) {
 	s.Companion += o.Companion
 	s.Capped += o.Capped
 	s.Anchored += o.Anchored
-	s.OwnAnchored += o.OwnAnchored
-	s.OwnUnreached += o.OwnUnreached
 }
 
 // ruleShape is which part of the compile a cut rule comes from.
@@ -2505,7 +2501,6 @@ func (c *cut) finish(st *FilterShapes) {
 	var shapes FilterShapes
 
 	shapes.Receivers = 1
-	shapes.OwnUnreached = c.unreached
 
 	if c.rc.n.IsExitNode() {
 		shapes.Exit = 1
@@ -2517,12 +2512,7 @@ func (c *cut) finish(st *FilterShapes) {
 
 	// A group is anchored ahead of itself when none of its rules sits at
 	// its anchor.
-	type group struct {
-		anchor  int64
-		present bool
-	}
-
-	groups := map[string]*group{}
+	present := map[string]bool{}
 
 	for i, key := range c.f.keys {
 		switch c.shapes[i] {
@@ -2546,23 +2536,12 @@ func (c *cut) finish(st *FilterShapes) {
 			continue
 		}
 
-		g, ok := groups[key]
-		if !ok {
-			g = &group{anchor: c.f.anchors[i]}
-			groups[key] = g
-		}
-
-		g.anchor = min(g.anchor, c.f.anchors[i])
-		g.present = g.present || c.pos[i] == c.f.anchors[i]
+		present[key] = present[key] || c.pos[i] == c.f.anchors[i]
 	}
 
-	for key, g := range groups {
-		if !g.present {
+	for _, at := range present {
+		if !at {
 			shapes.Anchored++
-
-			if at, ok := c.own[key]; ok && at == g.anchor {
-				shapes.OwnAnchored++
-			}
 		}
 	}
 
