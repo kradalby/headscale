@@ -308,7 +308,6 @@ func fingerprintSides(f fingerprint, s Sides, table *SelectorTable) {
 		f.set("routers "+p.String(), ids)
 	}
 
-	f.set("targeted", s.targeted)
 }
 
 func fingerprintVia(f fingerprint, v *ViaPlan) {

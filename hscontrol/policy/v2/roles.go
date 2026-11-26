@@ -31,23 +31,21 @@ const (
 	// Side atoms, held in a [Sides] set. There roleSelector and roleOwner
 	// mean holding an address of a member, or routing over one, which is
 	// how the compile's address sets put a node on a rule's side.
-	roleNamedPort   // an address of an owner a port self grant's source names
-	roleNamedApp    // the same for an app self grant
-	roleRouter      // an address of the via router with that node ID
-	roleLiteral     // in an address selector's literal, by address or route
-	roleAll         // any address or subnet route: inside "*" as written
-	roleApproved    // inside an approved subnet route, which "*" sources add
-	roleExit        // an exit node
-	roleClique      // untagged with that UserID: the same-user clique
-	roleHeldNamed   // an owner itself named by its user's self grants
-	roleHeldOwner   // an owner holding an address of its user's owners
-	roleViaSeen     // a router of that via grant template
-	roleRouterOnSrc // a via router among its own grant's sources
-	roleSelfSource  // itself an owner its user's self grants name
-	roleSibling     // of a user with a node routing over that user's owners
-	roleLoneSource  // a lone exit route over a source of that rule part
-	roleLoneNamed   // a lone exit route over an owner that user's self grants name
-	roleLoneOwner   // a lone exit route over one of that user's owners
+	roleNamedPort  // an address of an owner a port self grant's source names
+	roleNamedApp   // the same for an app self grant
+	roleLiteral    // in an address selector's literal, by address or route
+	roleAll        // any address or subnet route: inside "*" as written
+	roleApproved   // inside an approved subnet route, which "*" sources add
+	roleExit       // an exit node
+	roleClique     // untagged with that UserID: the same-user clique
+	roleHeldNamed  // an owner itself named by its user's self grants
+	roleHeldOwner  // an owner holding an address of its user's owners
+	roleViaSeen    // a router of that via grant template
+	roleSelfSource // itself an owner its user's self grants name
+	roleSibling    // of a user with a node routing over that user's owners
+	roleLoneSource // a lone exit route over a source of that rule part
+	roleLoneNamed  // a lone exit route over an owner that user's self grants name
+	roleLoneOwner  // a lone exit route over one of that user's owners
 )
 
 // Role is one membership a node holds: a selector of a table, or, under
@@ -88,10 +86,10 @@ func (r Role) String() string {
 
 var roleKindNames = [...]string{
 	roleSelector: "selector", roleOwner: "owner",
-	roleNamedPort: "named-port", roleNamedApp: "named-app", roleRouter: "router",
+	roleNamedPort: "named-port", roleNamedApp: "named-app",
 	roleLiteral: "literal", roleAll: "all", roleApproved: "approved", roleExit: "exit",
 	roleClique: "clique", roleHeldNamed: "held-named", roleHeldOwner: "held-owner",
-	roleViaSeen: "via-seen", roleRouterOnSrc: "router-on-src",
+	roleViaSeen:    "via-seen",
 	roleSelfSource: "self-source", roleSibling: "sibling",
 	roleLoneSource: "lone-source", roleLoneNamed: "lone-named", roleLoneOwner: "lone-owner",
 }

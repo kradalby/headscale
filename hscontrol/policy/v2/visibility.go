@@ -25,7 +25,7 @@ import (
 // of filter rules. A node's side set holds every atom that puts it on a
 // side of some rule as the compile's address sets do: membership, holding
 // a member's address or routing over one, a literal's addresses, exit-ness,
-// the same-user clique, and the per-owner and per-router facts of self and
+// the same-user clique, and the per-owner and per-grant facts of self and
 // via rules. Two nodes with the same side set see the same peers, so peer
 // classes are keyed by it; see [Sides] and [RolePeers].
 
@@ -213,10 +213,10 @@ type sidePlan struct {
 
 	steer  []steerGrant
 	hasVia bool
-	// viaReads are the via grants' tags and identity destinations, sorted:
-	// the selectors whose members the via plan reads; viaIdents the
-	// destinations alone, whose members' addresses it reads too.
-	viaReads, viaIdents []SelectorID
+	// viaReads are the via grants' tags, sorted: the selectors whose
+	// members the via plan reads. A via grant's destinations are
+	// prefixes, which name no node.
+	viaReads []SelectorID
 }
 
 func (t *Templates) sidePlan() *sidePlan {
@@ -460,15 +460,11 @@ func newSidePlan(t *Templates) *sidePlan {
 	for _, st := range p.steer {
 		if st.via {
 			p.viaReads = append(p.viaReads, st.tags...)
-			p.viaReads = append(p.viaReads, st.idents...)
-			p.viaIdents = append(p.viaIdents, st.idents...)
 		}
 	}
 
 	slices.Sort(p.viaReads)
 	p.viaReads = slices.Compact(p.viaReads)
-	slices.Sort(p.viaIdents)
-	p.viaIdents = slices.Compact(p.viaIdents)
 
 	return p
 }
@@ -617,7 +613,7 @@ type sideFacts struct {
 func (f *sideFacts) routed() bool { return len(f.routes) > 0 }
 
 // coverAtoms are the atoms of the touch sets of the nodes with an address
-// inside one subnet route, router atoms aside, each with how many of them
+// inside one subnet route, each with how many of them
 // hold it, sorted by atom. A join inside the route moves counts; only an
 // atom that comes or goes moves the side sets of the routers serving it.
 type coverAtoms []atomCount
@@ -632,10 +628,6 @@ func (c coverAtoms) has(r Role) bool {
 
 	return ok
 }
-
-// counted reports whether cover counts hold r: a router atom names one
-// node, so the routers over it are found through the targeted nodes.
-func counted(r Role) bool { return r.kind != roleRouter }
 
 // plus returns c with d added, and whether an atom came or went.
 func (c coverAtoms) plus(d map[Role]int32) (coverAtoms, bool) {
@@ -720,10 +712,8 @@ type sidesState struct {
 	approvedLens prefixLens
 
 	// cover counts, per subnet route a node serves, the atoms of the nodes
-	// inside; targeted lists the via routers, whose router atoms it leaves
-	// out.
-	cover    *graph.Map[netip.Prefix, coverAtoms]
-	targeted []types.NodeID
+	// inside.
+	cover *graph.Map[netip.Prefix, coverAtoms]
 
 	// siblings holds, per user with a node routing over another user's
 	// owners, those users, sorted: every node of the user holds a sibling
@@ -935,7 +925,7 @@ func (p *sidePlan) sameRoutes(o *sidePlan) bool {
 	return reflect.DeepEqual(p.grants, o.grants) && reflect.DeepEqual(p.selfPort, o.selfPort) &&
 		reflect.DeepEqual(p.selfApp, o.selfApp) &&
 		slices.Equal(p.vias, o.vias) && p.hasVia == o.hasVia && reflect.DeepEqual(p.steer, o.steer) &&
-		slices.Equal(p.viaReads, o.viaReads) && slices.Equal(p.viaIdents, o.viaIdents) &&
+		slices.Equal(p.viaReads, o.viaReads) &&
 		reflect.DeepEqual(p.lit, o.lit) && slices.Equal(p.litInet, o.litInet) &&
 		reflect.DeepEqual(p.t.literals, o.t.literals)
 }
@@ -983,8 +973,8 @@ func UpdateSides(prev Sides, t *Templates, roles Roles, posts Postings, approval
 	ids := slices.Sorted(maps.Keys(l1))
 	u.refreshFacts(ids)
 	moved := u.moveCounts(ids)
-	retargeted, routerMoved := u.retarget(ids, moved)
-	l3 := u.touchers(l1, slices.Concat(ids, retargeted), moved, routerMoved)
+	u.retarget(ids, moved)
+	l3 := u.touchers(l1, ids, moved)
 
 	for _, id := range u.relone(ids, approvalsMoved) {
 		l3[id] = struct{}{}
@@ -1050,15 +1040,6 @@ func (u *sidesUpdate) sharing(ip netip.Addr, set map[types.NodeID]struct{}) {
 	for _, id := range ids {
 		set[id] = struct{}{}
 	}
-}
-
-// serving adds to set the nodes routing over ip.
-func (u *sidesUpdate) serving(ip netip.Addr, set map[types.NodeID]struct{}) {
-	containing(u.next.routers.Groups, u.next.routerLens, ip, func(_ netip.Prefix, ids []types.NodeID) {
-		for _, id := range ids {
-			set[id] = struct{}{}
-		}
-	})
 }
 
 // reached returns the nodes whose facts dirty can move: the dirty nodes,
@@ -1164,9 +1145,7 @@ func (u *sidesUpdate) moveCounts(l1 []types.NodeID) map[netip.Prefix]struct{} {
 				}
 
 				for r := range f.touch.All() {
-					if counted(r) {
-						dp[r] += d
-					}
+					dp[r] += d
 				}
 			})
 		}
@@ -1214,94 +1193,53 @@ func (u *sidesUpdate) moveCounts(l1 []types.NodeID) map[netip.Prefix]struct{} {
 }
 
 // retarget recomputes the via targets of the routers in l1 and of those
-// serving a route in moved, which read the counts. It returns those whose
-// facts it moved, and the nodes whose router atom came, went or moved with
-// their addresses.
-func (u *sidesUpdate) retarget(l1 []types.NodeID, moved map[netip.Prefix]struct{}) ([]types.NodeID, []types.NodeID) {
+// serving a route in moved, which read the counts. Both are among the
+// nodes whose side sets the update recomputes.
+func (u *sidesUpdate) retarget(l1 []types.NodeID, moved map[netip.Prefix]struct{}) {
 	n := &u.next
 
-	var retargeted []types.NodeID
-
-	if len(n.plan.vias) > 0 {
-		var ids []types.NodeID
-
-		for _, id := range l1 {
-			if f, ok := n.facts.Get(id); ok && f.routed() {
-				ids = append(ids, id)
-			}
-		}
-
-		for p := range moved {
-			rs, _ := n.routers.Groups.Get(p)
-			ids = append(ids, rs...)
-		}
-
-		slices.Sort(ids)
-
-		e := n.facts.Edit()
-
-		for _, id := range slices.Compact(ids) {
-			f, ok := e.Get(id)
-			if !ok {
-				continue
-			}
-
-			if t := n.targetsOf(f); !slices.Equal(t, f.targets) {
-				g := *f
-				g.targets = t
-				g.touch = n.touchOf(id, &g)
-				e.Set(id, &g)
-
-				retargeted = append(retargeted, id)
-			}
-		}
-
-		n.facts = e.Done()
+	if len(n.plan.vias) == 0 {
+		return
 	}
 
-	var routerMoved []types.NodeID
+	var ids []types.NodeID
 
-	for _, id := range slices.Concat(l1, retargeted) {
-		old, _ := u.prev.facts.Get(id)
-		cur, _ := n.facts.Get(id)
-
-		was := old != nil && len(old.targets) > 0
-		is := cur != nil && len(cur.targets) > 0
-
-		if was != is || was && !slices.Equal(old.ips, cur.ips) {
-			routerMoved = append(routerMoved, id)
+	for _, id := range l1 {
+		if f, ok := n.facts.Get(id); ok && f.routed() {
+			ids = append(ids, id)
 		}
 	}
 
-	if len(routerMoved) > 0 {
-		slices.Sort(routerMoved)
-		routerMoved = slices.Compact(routerMoved)
-
-		targeted := slices.DeleteFunc(slices.Clone(u.prev.targeted), func(id types.NodeID) bool {
-			_, found := slices.BinarySearch(routerMoved, id)
-
-			return found
-		})
-
-		for _, id := range routerMoved {
-			if f, ok := n.facts.Get(id); ok && len(f.targets) > 0 {
-				targeted = append(targeted, id)
-			}
-		}
-
-		slices.Sort(targeted)
-		n.targeted = targeted
+	for p := range moved {
+		rs, _ := n.routers.Groups.Get(p)
+		ids = append(ids, rs...)
 	}
 
-	return retargeted, routerMoved
+	slices.Sort(ids)
+
+	e := n.facts.Edit()
+
+	for _, id := range slices.Compact(ids) {
+		f, ok := e.Get(id)
+		if !ok {
+			continue
+		}
+
+		if t := n.targetsOf(f); !slices.Equal(t, f.targets) {
+			g := *f
+			g.targets = t
+			e.Set(id, &g)
+		}
+	}
+
+	n.facts = e.Done()
 }
 
 // touchers returns l1 with the nodes whose side sets read what moved: those
-// holding an address of a node of refreshed whose touch set moved, the
-// routers serving a route whose atoms moved, and the routers over an
-// address of a node whose router atom moved. A node that left an address is
+// holding an address of a node of refreshed whose touch set moved, and the
+// routers serving a route whose atoms moved. A node that left an address is
 // dirty, and those holding it are in l1 already.
-func (u *sidesUpdate) touchers(l1 map[types.NodeID]struct{}, refreshed []types.NodeID, moved map[netip.Prefix]struct{}, routerMoved []types.NodeID) map[types.NodeID]struct{} {
+func (u *sidesUpdate) touchers(l1 map[types.NodeID]struct{}, refreshed []types.NodeID, moved map[netip.Prefix]struct{}) map[types.NodeID]struct{} {
 	l3 := maps.Clone(l1)
 
 	for _, id := range refreshed {
@@ -1323,18 +1261,6 @@ func (u *sidesUpdate) touchers(l1 map[types.NodeID]struct{}, refreshed []types.N
 		ids, _ := u.next.routers.Groups.Get(p)
 		for _, id := range ids {
 			l3[id] = struct{}{}
-		}
-	}
-
-	for _, id := range routerMoved {
-		for _, f := range []*sideFacts{mustFacts(u.prev.facts, id), mustFacts(u.next.facts, id)} {
-			if f == nil {
-				continue
-			}
-
-			for _, ip := range f.ips {
-				u.serving(ip, l3)
-			}
 		}
 	}
 
@@ -1408,9 +1334,7 @@ func (s Sides) loneCoverOf(fam int) coverAtoms {
 	for _, f := range s.facts.All() {
 		if slices.ContainsFunc(f.ips, func(ip netip.Addr) bool { return family(ip) == fam }) {
 			for r := range f.touch.All() {
-				if counted(r) {
-					d[r]++
-				}
+				d[r]++
 			}
 		}
 	}
@@ -1475,9 +1399,7 @@ func (u *sidesUpdate) relone(l1 []types.NodeID, approvalsMoved bool) []types.Nod
 				}
 
 				for r := range f.touch.All() {
-					if counted(r) {
-						deltas[fam][r] += d
-					}
+					deltas[fam][r] += d
 				}
 			}
 		}
@@ -1636,24 +1558,13 @@ func buildSides(plan *sidePlan, roles Roles, posts Postings, approvals SubnetApp
 
 	// The targets factsOf gave read no counts; the facts are not yet
 	// published, so they are set in place.
-	for id, f := range facts {
+	for _, f := range facts {
 		if !f.routed() || len(plan.vias) == 0 {
 			continue
 		}
 
-		if t := s.targetsOf(f); !slices.Equal(t, f.targets) {
-			f.targets = t
-			f.touch = s.touchOf(id, f)
-		}
+		f.targets = s.targetsOf(f)
 	}
-
-	for id, f := range facts {
-		if len(f.targets) > 0 {
-			s.targeted = append(s.targeted, id)
-		}
-	}
-
-	slices.Sort(s.targeted)
 
 	for id, f := range facts {
 		if len(f.exits) == 1 {
@@ -1790,9 +1701,7 @@ func (s Sides) coverOf(p netip.Prefix) (coverAtoms, int) {
 	visited := s.nodesIn(p, func(id types.NodeID) {
 		if f, ok := s.facts.Get(id); ok {
 			for r := range f.touch.All() {
-				if counted(r) {
-					d[r]++
-				}
+				d[r]++
 			}
 		}
 	})
@@ -1802,8 +1711,8 @@ func (s Sides) coverOf(p netip.Prefix) (coverAtoms, int) {
 	return c, visited
 }
 
-// coveredBy reports whether a node with an address inside route holds r,
-// no router atom, in its touch set: counted for a route a node serves,
+// coveredBy reports whether a node with an address inside route holds r
+// in its touch set: counted for a route a node serves,
 // scanned for another.
 func (s Sides) coveredBy(route netip.Prefix, r Role) bool {
 	if c, ok := s.cover.Get(route); ok {
@@ -1867,14 +1776,14 @@ func (s Sides) factsOf(id types.NodeID, n *types.Node) *sideFacts {
 	}
 
 	f.targets = s.targetsOf(f)
-	f.touch = s.touchOf(id, f)
+	f.touch = s.touchOf(f)
 
 	return f
 }
 
 // touchOf is what the node with facts f puts on the sides of the nodes
 // holding one of its addresses or routing over one.
-func (s Sides) touchOf(id types.NodeID, f *sideFacts) RoleSet {
+func (s Sides) touchOf(f *sideFacts) RoleSet {
 	touch := f.roles.Roles()
 
 	if f.owned {
@@ -1885,10 +1794,6 @@ func (s Sides) touchOf(id types.NodeID, f *sideFacts) RoleSet {
 		if f.namedApp {
 			touch = append(touch, Role{kind: roleNamedApp, value: uint64(f.owner)})
 		}
-	}
-
-	if len(f.targets) > 0 {
-		touch = append(touch, Role{kind: roleRouter, value: uint64(id)})
 	}
 
 	return newRoleSet(s.plan.table.id, touch)
@@ -1949,16 +1854,7 @@ func (s Sides) routesOverlap(f *sideFacts, dsts []SelectorID) bool {
 	}
 
 	for _, id := range dsts {
-		sel := s.plan.table.Selector(id)
-
-		switch {
-		case sel.Kind.HoldsNodes():
-			for _, r := range f.routes {
-				if c, _ := s.cover.Get(r); c.has(SelectorRole(id)) {
-					return true
-				}
-			}
-		case s.plan.resolvesOK(id) && s.plan.lit[id] != nil:
+		if s.plan.resolvesOK(id) && s.plan.lit[id] != nil {
 			if _, ok := slices.BinarySearch(f.routeLit, id); ok {
 				return true
 			}
@@ -1990,12 +1886,6 @@ func (s Sides) touchedBy(f *sideFacts) []Role {
 		c, _ := s.cover.Get(r)
 		for _, a := range c {
 			roles = append(roles, a.r)
-		}
-
-		for _, m := range s.targeted {
-			if mf, ok := s.facts.Get(m); ok && slices.ContainsFunc(mf.ips, r.Contains) {
-				roles = append(roles, Role{kind: roleRouter, value: uint64(m)})
-			}
 		}
 	}
 
@@ -2054,25 +1944,8 @@ func (s Sides) setOf(id types.NodeID, f *sideFacts) RoleSet {
 		}
 	}
 
-	if len(f.targets) > 0 {
-		held := slices.Clone(roles)
-		slices.SortFunc(held, compareRoles)
-
-		onSrc := false
-
-		for _, g := range f.targets {
-			roles = append(roles, Role{kind: roleViaSeen, value: uint64(g)}) //nolint:gosec // a grant index
-
-			onSrc = onSrc || slices.ContainsFunc(s.plan.grants[g].src, func(r Role) bool {
-				_, ok := slices.BinarySearchFunc(held, r, compareRoles)
-
-				return ok
-			})
-		}
-
-		if onSrc {
-			roles = append(roles, Role{kind: roleRouterOnSrc, value: uint64(id)})
-		}
+	for _, g := range f.targets {
+		roles = append(roles, Role{kind: roleViaSeen, value: uint64(g)}) //nolint:gosec // a grant index
 	}
 
 	return newRoleSet(s.plan.table.id, roles)
@@ -2080,8 +1953,8 @@ func (s Sides) setOf(id types.NodeID, f *sideFacts) RoleSet {
 
 // sideAdjacency says, for each atom, which atoms' holders its holders see:
 // a rule links its two sides both ways, and a capability to the internet
-// shows its sources to exit nodes. The per-user and per-router links of
-// self and via rules hold between atoms of the same value.
+// shows its sources to exit nodes. The per-user links of self rules hold
+// between atoms of the same value.
 type sideAdjacency struct {
 	plan  *sidePlan
 	links map[Role][]Role
@@ -2162,7 +2035,7 @@ func newSideAdjacency(plan *sidePlan) *sideAdjacency {
 func pairs(r Role) []Role {
 	v := r.value
 
-	switch r.kind { //nolint:exhaustive // only per-user and per-router atoms pair by value
+	switch r.kind { //nolint:exhaustive // only per-user atoms pair by value
 	case roleClique:
 		return []Role{r}
 	case roleOwner:
@@ -2824,30 +2697,14 @@ func (s Sides) viaDstsFor(f *sideFacts, gs *grantSides) []netip.Prefix {
 	return out
 }
 
-// resolvePrefixes returns what each of ids resolves to, as prefixes, in
-// order, skipping a resolution with an error: an identity selector its
-// members' addresses, an address selector its literal.
+// resolvePrefixes returns what each of ids, a via grant's destinations,
+// resolves to, as prefixes, in order, skipping a resolution with an error.
+// Validation leaves a via grant address selectors only.
 func (s Sides) resolvePrefixes(ids []SelectorID) []netip.Prefix {
 	var out []netip.Prefix
 
 	for _, id := range ids {
-		sel := s.plan.table.Selector(id)
-
-		switch {
-		case sel.Kind.HoldsNodes():
-			var b netipx.IPSetBuilder
-
-			for _, m := range s.posts.Nodes(SelectorRole(id)) {
-				if f, ok := s.facts.Get(m); ok {
-					for _, ip := range f.ips {
-						b.Add(ip)
-					}
-				}
-			}
-
-			set, _ := b.IPSet()
-			out = append(out, set.Prefixes()...)
-		case s.plan.resolvesOK(id):
+		if s.plan.resolvesOK(id) && !s.plan.table.Selector(id).Kind.HoldsNodes() {
 			if l := s.plan.t.literals[id]; l.res != nil {
 				out = append(out, l.res.Prefixes()...)
 			}
@@ -2929,7 +2786,6 @@ type ViaPlan struct {
 type ViaPlans struct {
 	Plan *ViaPlan
 
-	facts   *graph.Map[types.NodeID, *sideFacts]
 	routers *graph.Map[netip.Prefix, []types.NodeID]
 	posts   *graph.Map[Role, []types.NodeID]
 	// Builds counts the plans every update up to this one built, kept or
@@ -2943,7 +2799,7 @@ func (v ViaPlans) Same(o ViaPlans) bool { return v.Plan == o.Plan }
 // UpdateViaPlans returns the via plan of s, prev's while nothing it reads
 // moved or what it builds equals prev's.
 func UpdateViaPlans(prev ViaPlans, s Sides) ViaPlans {
-	next := ViaPlans{Plan: prev.Plan, facts: s.facts, routers: s.routers.Groups, posts: s.posts.byRole.Groups, Builds: prev.Builds}
+	next := ViaPlans{Plan: prev.Plan, routers: s.routers.Groups, posts: s.posts.byRole.Groups, Builds: prev.Builds}
 
 	if prev.Plan != nil && prev.Plan.plan == s.plan && (!s.plan.hasVia || !prev.readsMoved(s)) {
 		return next
@@ -2979,30 +2835,7 @@ func (v ViaPlans) readsMoved(s Sides) bool {
 		return found
 	}
 
-	if v.posts != s.posts.byRole.Groups && slices.ContainsFunc(graph.Changes(v.posts, s.posts.byRole.Groups), relevant) {
-		return true
-	}
-
-	if v.facts == s.facts || len(p.viaIdents) == 0 {
-		return false
-	}
-
-	member := func(f *sideFacts) bool {
-		return f != nil && slices.ContainsFunc(p.viaIdents, func(id SelectorID) bool { return f.roles.Has(SelectorRole(id)) })
-	}
-
-	for _, id := range graph.Changes(v.facts, s.facts) {
-		was, is := mustFacts(v.facts, id), mustFacts(s.facts, id)
-		if was != nil && is != nil && slices.Equal(was.ips, is.ips) {
-			continue
-		}
-
-		if member(was) || member(is) {
-			return true
-		}
-	}
-
-	return false
+	return v.posts != s.posts.byRole.Groups && slices.ContainsFunc(graph.Changes(v.posts, s.posts.byRole.Groups), relevant)
 }
 
 func buildViaPlan(s Sides) *ViaPlan {
@@ -3448,12 +3281,12 @@ type SidesReport struct {
 	// Fresh counts audits whose oracle was compiled afresh.
 	Fresh int
 
-	Covering, Covered                          int
-	SingleFamily, ExitOneFamily, Exit          int
-	PublicRoute                                int
-	TaggedWithUser, ViaTargets, ViaRouterOnSrc int
-	Steered, RoutesKept                        int
-	AsymmetricPeers                            int
+	Covering, Covered                 int
+	SingleFamily, ExitOneFamily, Exit int
+	PublicRoute                       int
+	TaggedWithUser, ViaTargets        int
+	Steered, RoutesKept               int
+	AsymmetricPeers                   int
 }
 
 // Add adds o's counts to r.
@@ -3471,7 +3304,6 @@ func (r *SidesReport) Add(o SidesReport) {
 	r.PublicRoute += o.PublicRoute
 	r.TaggedWithUser += o.TaggedWithUser
 	r.ViaTargets += o.ViaTargets
-	r.ViaRouterOnSrc += o.ViaRouterOnSrc
 	r.Steered += o.Steered
 	r.RoutesKept += o.RoutesKept
 	r.AsymmetricPeers += o.AsymmetricPeers
@@ -3568,10 +3400,6 @@ func sameSides(got, want Sides) error {
 		w, _ := want.cover.Get(d[0])
 
 		return fmt.Errorf("%w: cover counts of routes %v (%v: %v, from scratch %v)", errSidesAudit, d, d[0], c, w)
-	}
-
-	if !slices.Equal(got.targeted, want.targeted) {
-		return fmt.Errorf("%w: via routers %v, from scratch %v", errSidesAudit, got.targeted, want.targeted)
 	}
 
 	if d := mapDiff(want.held.Groups, got.held.Groups, slices.Equal[[]types.NodeID]); len(d) > 0 {
@@ -3733,11 +3561,6 @@ func countShapes(a SidesAudit, rep *SidesReport) {
 		}
 
 		rep.ViaTargets += len(f.targets)
-
-		rs, _ := s.sets.Get(id)
-		if rs.Has(Role{kind: roleRouterOnSrc, value: uint64(id)}) {
-			rep.ViaRouterOnSrc++
-		}
 	}
 }
 

@@ -380,9 +380,9 @@ func TestWorldSidesUnderRandomChurn(t *testing.T) {
 		"routers covering others' addresses": rep.Covering, "single-family nodes": rep.SingleFamily,
 		"exit nodes of one family": rep.ExitOneFamily, "public routes": rep.PublicRoute,
 		"tagged nodes keeping a user": rep.TaggedWithUser,
-		"via routers":                 rep.ViaTargets, "via routers among their sources": rep.ViaRouterOnSrc,
-		"steered pairs": rep.Steered,
-		"one-way peers": rep.AsymmetricPeers, "routes kept": rep.RoutesKept,
+		"via routers":                 rep.ViaTargets,
+		"steered pairs":               rep.Steered,
+		"one-way peers":               rep.AsymmetricPeers, "routes kept": rep.RoutesKept,
 		"audits against a compile afresh, as a refused document makes": rep.Fresh,
 	} {
 		assert.Positive(t, n, name)

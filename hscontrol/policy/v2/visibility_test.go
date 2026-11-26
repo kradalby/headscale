@@ -1477,8 +1477,8 @@ func TestSidesRandomDifferential(t *testing.T) {
 				"covering": rep.Covering, "single family": rep.SingleFamily,
 				"exit": rep.Exit, "one-family exit": rep.ExitOneFamily,
 				"via targets": rep.ViaTargets, "steered": rep.Steered,
-				"tagged with user": rep.TaggedWithUser, "via router on source": rep.ViaRouterOnSrc,
-				"routes kept": rep.RoutesKept,
+				"tagged with user": rep.TaggedWithUser,
+				"routes kept":      rep.RoutesKept,
 			}
 			shapes["pairs kept with the route rules"] = keptPairs
 
