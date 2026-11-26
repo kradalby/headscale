@@ -841,8 +841,14 @@ func TestStreamReusesRoutedPeerOnEndpointChange(t *testing.T) {
 			cfg, s, ids := streamTestState(t, "")
 			route := netip.MustParsePrefix(tt.route)
 			router := mustNode(t, s, ids[1]).AsStruct()
-			router.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
-			router.ApprovedRoutes = []netip.Prefix{route}
+			routes := []netip.Prefix{route}
+			// An exit route is offered only with the other family's.
+			if tsaddr.IsExitRoute(route) {
+				routes = append(routes, tsaddr.AllIPv6())
+			}
+
+			router.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: routes}
+			router.ApprovedRoutes = routes
 			s.PutNodeInStoreForTest(*router)
 
 			if tt.online {

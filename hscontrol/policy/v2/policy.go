@@ -2090,8 +2090,8 @@ func (pm *PolicyManager) viaRoutesForPeer(viewer, peer types.NodeView, primary f
 		// "advertises the destination". The downstream Include/Exclude
 		// split below restricts the viewer to exit nodes carrying the
 		// via tag.
-		if grantHasAutoGroupInternet[i] && peer.IsExitNode() {
-			matchedPrefixes = append(matchedPrefixes, peer.ExitRoutes()...)
+		if grantHasAutoGroupInternet[i] {
+			matchedPrefixes = append(matchedPrefixes, peer.OfferedExitRoutes()...)
 		}
 
 		if len(matchedPrefixes) == 0 {

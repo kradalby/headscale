@@ -59,8 +59,9 @@ func PeerCapMap(peer types.NodeView, peerSelfCaps tailcfg.NodeCapMap, stamped bo
 	// without a nodeAttrs grant: SaaS stamps it by default, and Apple
 	// clients hide the exit-node list without a suggestion. A policy
 	// value, if any, wins. Approval gating prevents the suggestion from
-	// following an advertised-but-not-yet-trusted node.
-	if peer.IsExitNode() {
+	// following an advertised-but-not-yet-trusted node, or one approved for
+	// one family alone, which SaaS offers nobody.
+	if len(peer.OfferedExitRoutes()) > 0 {
 		mak.Set(&out, nodecap.SuggestExitNode, peerSelfCaps[nodecap.SuggestExitNode])
 	}
 

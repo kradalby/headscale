@@ -1188,7 +1188,7 @@ func (s *Snapshot) CompiledRoutesForPeer(viewer, peer types.NodeView) ([]netip.P
 func (w *world) compiledRoutesForPeer(prim primaryRoutes, via *policyv2.ViaRoutes, viewer, peer types.NodeView, matchers []matcher.Match) []netip.Prefix {
 	steer := via.ForPeer(viewer, peer)
 	primaries := slices.Clone(prim.byNode[peer.ID()])
-	candidates := slices.Concat(primaries, peer.ExitRoutes())
+	candidates := slices.Concat(primaries, peer.OfferedExitRoutes())
 
 	var reduced []netip.Prefix
 
@@ -2973,7 +2973,7 @@ func (s *Snapshot) RoutesForPeer(viewer, peer types.NodeView) []netip.Prefix {
 	via := s.s.Get(s.w.primaries).via.ForPeer(viewer, peer)
 	sides := s.s.Get(s.w.sides)
 	primaries := s.PrimaryRoutesForNode(peer.ID())
-	candidates := slices.Concat(primaries, peer.ExitRoutes())
+	candidates := slices.Concat(primaries, peer.OfferedExitRoutes())
 
 	var reduced []netip.Prefix
 

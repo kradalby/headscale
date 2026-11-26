@@ -855,6 +855,12 @@ func TestPeersAndRoutesFollowReference(t *testing.T) {
 						}
 					}
 
+					// The world offers exit routes as a pair only
+					// ([types.Node.OfferedExitRoutes]).
+					if slices.ContainsFunc(routes, tsaddr.IsExitRoute) && (!slices.Contains(routes, tsaddr.AllIPv4()) || !slices.Contains(routes, tsaddr.AllIPv6())) {
+						routes = slices.DeleteFunc(routes, tsaddr.IsExitRoute)
+					}
+
 					if len(routes) == 0 {
 						continue
 					}
@@ -1017,7 +1023,6 @@ func TestViaRouterExitRoutesIsHeadscalesReading(t *testing.T) {
 	}{
 		{"a via router of a public IPv4 prefix among the sources", world(all, true, []int{4}, both, 4), true},
 		{"a via router of a public IPv6 prefix among the sources", world(all, true, []int{8}, both, 8), true},
-		{"the same beside an exit node of IPv4 alone", world(all, true, []int{4}, []int{9}, 4), true},
 		{"a via router not among the sources", world(alice, true, []int{4}, both, 4), false},
 		{"a via router of a private prefix", world(all, true, []int{0}, both, 0), false},
 		{"a via router of the private half of a destination", world(all, true, []int{0}, both, 0, 4), false},

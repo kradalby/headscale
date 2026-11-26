@@ -91,7 +91,8 @@ func (r *Ref) viaRules(v RefNode, q netip.Prefix) []refRule {
 //   - a route viewer is given ([Ref.Routes]) and not steered: an exit
 //     route as given, a subnet route only from its primary ([Ref.Primary]);
 //     unjudged where history elects;
-//   - a single address inside the node ranges: never;
+//   - a single address inside the node ranges, or an exit route without
+//     the other family's: never;
 //   - a subnet route a via grant steers ([Ref.Steered]) that no rule
 //     without via gives: only from the router its election picks
 //     ([Ref.ViaPrimary]), when every such grant carries the same via tags
@@ -125,6 +126,7 @@ func (r *Ref) ServedRoutes(viewer, peer types.NodeID) ([]netip.Prefix, []netip.P
 
 		switch {
 		case NamesNode(q):
+		case isExitRoute(q) && len(p.exitRoutes()) < 2:
 		case !has && slices.Contains(v.subnets(), q):
 			unjudged = append(unjudged, q)
 		case len(via) == 0 && isExitRoute(q):

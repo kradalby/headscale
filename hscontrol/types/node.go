@@ -379,6 +379,17 @@ func (node *Node) SameRouteFacts(other *Node) bool {
 		sameSlice(node.ApprovedRoutes, other.ApprovedRoutes)
 }
 
+// OfferedExitRoutes are the exit routes peers are given of the node: both
+// or none. SaaS offers no node approved for one family alone as an exit
+// node, though the node itself serves the route.
+func (node *Node) OfferedExitRoutes() []netip.Prefix {
+	if routes := node.ExitRoutes(); len(routes) == 2 {
+		return routes
+	}
+
+	return nil
+}
+
 // IsExitNode reports whether the node has any approved exit routes.
 // Approval is required: an advertised-but-unapproved exit route does
 // not make the node an exit node.
@@ -1214,6 +1225,15 @@ func (nv NodeView) ExitRoutes() []netip.Prefix {
 	}
 
 	return nv.ж.ExitRoutes()
+}
+
+// OfferedExitRoutes is [Node.OfferedExitRoutes].
+func (nv NodeView) OfferedExitRoutes() []netip.Prefix {
+	if !nv.Valid() {
+		return nil
+	}
+
+	return nv.ж.OfferedExitRoutes()
 }
 
 func (nv NodeView) IsExitNode() bool {

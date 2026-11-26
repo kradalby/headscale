@@ -273,7 +273,7 @@ func goldenSidesAgainstSaaS(t *testing.T, tally *sidesTally, id string, m *sideM
 				continue
 			}
 
-			routes := slices.Concat(nmPeer.PrimaryRoutes().AsSlice(), peer.ExitRoutes())
+			routes := slices.Concat(nmPeer.PrimaryRoutes().AsSlice(), peer.OfferedExitRoutes())
 
 			var kept []netip.Prefix
 

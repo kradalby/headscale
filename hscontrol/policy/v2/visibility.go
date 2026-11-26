@@ -2772,8 +2772,8 @@ func (v *ViaPlan) Steer(s Sides, viewer, peer types.NodeView, primary func(key s
 			}
 		}
 
-		if st.internet && peer.IsExitNode() {
-			routes = append(routes, peer.ExitRoutes()...)
+		if st.internet {
+			routes = append(routes, peer.OfferedExitRoutes()...)
 		}
 
 		tagged := slices.ContainsFunc(st.tags, func(t SelectorID) bool { return peerRoles.Has(SelectorRole(t)) })

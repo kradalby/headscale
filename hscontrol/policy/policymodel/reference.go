@@ -1219,6 +1219,13 @@ func (r *Ref) Routes(viewer, peer types.NodeID) []netip.Prefix {
 	var out []netip.Prefix
 
 	for _, q := range p.routes() {
+		// Quirk: a node approved for one exit route alone is offered
+		// nobody as an exit node (routes-exit-node-public-destination-b,
+		// grant-via-internet-one-family-exit).
+		if isExitRoute(q) && len(p.exitRoutes()) < 2 {
+			continue
+		}
+
 		keep := slices.ContainsFunc(r.rules, func(rl refRule) bool {
 			if !r.ownSelf(rl, v) {
 				return false

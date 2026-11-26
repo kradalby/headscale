@@ -142,6 +142,7 @@ var routesMapCompatTests = []struct {
 	{"routes-internet-public-subnet", "autogroup:internet with a public subnet router"},
 	{"routes-destination-wider-than-route", "destination wider than the approved route"},
 	{"routes-exit-node-public-destination-a", "a routed prefix to one public address"},
+	{"routes-exit-node-public-destination-b", "the internet with an exit node approved for IPv6 only"},
 }
 
 // aclMapCompatTests lists ACL captures replayed through the mapper, with only
