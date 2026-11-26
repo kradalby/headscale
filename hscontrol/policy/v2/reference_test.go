@@ -25,6 +25,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/require"
+	"go4.org/netipx"
 	"pgregory.net/rapid"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
@@ -73,11 +74,13 @@ type refGoldenTally struct {
 	filters, filtersAgree, probes        int
 	peers, peersAgree                    int
 	routes, routesAgree                  int
-	// routesSteered counts captured viewer and peer pairs via steering
-	// decides; routesInDoubt node captures whose routes SaaS's answer is in
-	// doubt for; routesUnseen the routes the reference gives that no
-	// viewer's netmap shows as the peer's primary, which the captures
-	// cannot confirm or refute.
+	// routesSteered counts the judged pairs via steering decides the
+	// steered routes of, which no capture can confirm or refute; the rest
+	// of each such pair is judged like any other. routesInDoubt counts
+	// node captures whose routes SaaS's answer is in doubt for;
+	// routesUnseen the routes the reference gives that no viewer's netmap
+	// shows as the peer's primary, which the captures cannot confirm or
+	// refute.
 	routesSteered, routesInDoubt, routesUnseen int
 	known                                      []string
 }
@@ -126,8 +129,8 @@ func TestReferenceAgreesWithCaptures(t *testing.T) {
 			g.files, g.refused, g.unreadable, g.captures)
 		t.Logf("filters: %d of %d agree (%d probes)", g.filtersAgree, g.filters, g.probes)
 		t.Logf("peers: %d of %d agree", g.peersAgree, g.peers)
-		t.Logf("routes: %d of %d viewer and peer pairs agree; not compared: %d pairs via steering decides, %d node captures in doubt; %d routes the reference gives no viewer sees as primary",
-			g.routesAgree, g.routes, g.routesSteered, g.routesInDoubt, g.routesUnseen)
+		t.Logf("routes: %d of %d viewer and peer pairs agree; not compared: %d node captures in doubt; %d of the pairs are steered, judged outside the routes a via election decides for them; %d routes the reference gives no viewer sees as primary",
+			g.routesAgree, g.routes, g.routesInDoubt, g.routesSteered, g.routesUnseen)
 		slices.Sort(g.known)
 		t.Logf("listed divergences %v", g.known)
 	})
@@ -163,7 +166,7 @@ func TestReferenceAgreesWithCaptures(t *testing.T) {
 				ru, rn := refInputs(users, nodes)
 				ref := policymodel.NewRef(doc, ru, rn)
 
-				refGoldenCapture(t, tally, c.TestID, c.Captures, ref, nodes, rn)
+				refGoldenCapture(t, tally, c.TestID, c.Captures, ref, nodes, rn, doc)
 			})
 		}
 	}
@@ -213,12 +216,12 @@ func refGoldenSequence(t *testing.T, tally *refGoldenTally, id string) {
 		require.NoError(t, err)
 
 		ru, rn := refInputs(users, nodes)
-		refGoldenCapture(t, tally, id+"/"+step.Name, step.Captures, policymodel.NewRef(doc, ru, rn), nodes, rn)
+		refGoldenCapture(t, tally, id+"/"+step.Name, step.Captures, policymodel.NewRef(doc, ru, rn), nodes, rn, doc)
 	}
 }
 
 func refGoldenCapture(t *testing.T, tally *refGoldenTally, id string, captures map[string]testcapture.Node,
-	ref *policymodel.Ref, nodes types.Nodes, rn []policymodel.RefNode,
+	ref *policymodel.Ref, nodes types.Nodes, rn []policymodel.RefNode, doc policymodel.Doc,
 ) {
 	t.Helper()
 
@@ -289,7 +292,7 @@ func refGoldenCapture(t *testing.T, tally *refGoldenTally, id string, captures m
 			continue
 		}
 
-		refGoldenRoutes(t, tally, key, capture, ref, nodes, rn, node, primaries)
+		refGoldenRoutes(t, tally, key, capture, ref, nodes, rn, node, primaries, doc)
 	}
 }
 
@@ -319,9 +322,14 @@ func unsteeredPrimaries(captures map[string]testcapture.Node, ref *policymodel.R
 
 // refGoldenRoutes holds each captured peer's routes in node's netmap to
 // the reference's route access, both ways, over the routes some unsteered
-// viewer sees as the peer's primary.
+// viewer sees as the peer's primary. A pair the reference calls steered
+// ([policymodel.Ref.Steered]) is judged the same way outside the routes a
+// via election may hand the peer ([steeredRoutes]); which router an
+// election hands one of those routes to is the one thing a capture cannot
+// be held to, because no netmap records the session history it reads, and
+// the reference deliberately does not model elections.
 func refGoldenRoutes(t *testing.T, tally *refGoldenTally, key string, capture testcapture.Node, ref *policymodel.Ref,
-	nodes types.Nodes, rn []policymodel.RefNode, node *types.Node, primaries map[string][]netip.Prefix,
+	nodes types.Nodes, rn []policymodel.RefNode, node *types.Node, primaries map[string][]netip.Prefix, doc policymodel.Doc,
 ) {
 	t.Helper()
 
@@ -341,10 +349,11 @@ func refGoldenRoutes(t *testing.T, tally *refGoldenTally, key string, capture te
 			continue
 		}
 
+		var steered []netip.Prefix
 		if ref.Steered(node.ID, peer.ID) {
-			tally.add(func(g *refGoldenTally) { g.routesSteered++ })
+			steered = steeredRoutes(doc, refNode(peer.ID))
 
-			continue
+			tally.add(func(g *refGoldenTally) { g.routesSteered++ })
 		}
 
 		var wantR, gotR []netip.Prefix
@@ -353,14 +362,14 @@ func refGoldenRoutes(t *testing.T, tally *refGoldenTally, key string, capture te
 
 		for _, p := range nmPeer.AllowedIPs().All() {
 			ownAddr := p.IsSingleIP() && slices.Contains(refNode(peer.ID).Addrs, p.Addr())
-			if !ownAddr && !slices.Contains(ownRoutes, p) {
+			if !ownAddr && !slices.Contains(ownRoutes, p) && !slices.Contains(steered, p) {
 				wantR = append(wantR, p)
 			}
 		}
 
 		for _, p := range ref.Routes(node.ID, peer.ID) {
 			switch {
-			case slices.Contains(ownRoutes, p):
+			case slices.Contains(ownRoutes, p) || slices.Contains(steered, p):
 			case p.Bits() == 0 || slices.Contains(primaries[name], p):
 				gotR = append(gotR, p)
 			default:
@@ -395,6 +404,108 @@ func nameOf(nodes types.Nodes, id types.NodeID) string {
 
 	return fmt.Sprintf("node%d", id)
 }
+
+// steeredRoutes is what a via election may hand the peer of the routes it
+// serves, as far as the document alone can say: the routes of a grant the
+// peer carries a via tag of, whose destination overlaps them, plus its
+// exit routes when a destination reaches the internet — and a peer
+// steering may offer as an exit node is shown whatever routes it serves,
+// not its exit routes alone (grant-via-public-prefix-exit-routes). The
+// reference does not model elections ([policymodel.Ref.Steered]); which
+// router the election hands one of these routes to is what no capture can
+// confirm or refute.
+func steeredRoutes(doc policymodel.Doc, peer policymodel.RefNode) []netip.Prefix {
+	var out []netip.Prefix
+
+	exitOffered := false
+
+	for _, rl := range doc.Rules {
+		if len(rl.Via) == 0 || !slices.ContainsFunc(peer.Tags, func(t string) bool {
+			return slices.Contains(rl.Via, t)
+		}) {
+			continue
+		}
+
+		dsts, internet := viaDestinations(rl, doc)
+
+		reaches := internet
+		for _, d := range dsts {
+			reaches = reaches || refInternet.OverlapsPrefix(d)
+		}
+
+		for _, q := range peer.ServedRoutes() {
+			steerable := q.Bits() > 0 && (slices.ContainsFunc(dsts, q.Overlaps) ||
+				internet && refInternet.ContainsPrefix(q))
+			if steerable && !slices.Contains(out, q) {
+				out = append(out, q)
+			}
+		}
+
+		if reaches && slices.ContainsFunc(peer.ServedRoutes(), func(q netip.Prefix) bool { return q.Bits() == 0 }) {
+			exitOffered = true
+		}
+	}
+
+	if exitOffered {
+		return peer.ServedRoutes()
+	}
+
+	return out
+}
+
+// viaDestinations resolves a via grant's destination entries to prefixes:
+// the destination of a grant with via is refused unless it is one
+// (headscale and the hosted service both), so every other spelling needs
+// no reading here. The second return reports an autogroup:internet entry.
+func viaDestinations(rl policymodel.DocRule, doc policymodel.Doc) ([]netip.Prefix, bool) {
+	var dsts []netip.Prefix
+
+	internet := false
+
+	for _, d := range rl.Dst {
+		switch d {
+		case "autogroup:internet":
+			internet = true
+		default:
+			p, err := netip.ParsePrefix(d)
+			if err == nil {
+				dsts = append(dsts, p)
+
+				continue
+			}
+
+			h, ok := doc.Hosts[d]
+			if ok {
+				dsts = append(dsts, h)
+
+				continue
+			}
+
+			a, err := netip.ParseAddr(d)
+			if err == nil {
+				dsts = append(dsts, netip.PrefixFrom(a, a.BitLen()))
+			}
+		}
+	}
+
+	return dsts, internet
+}
+
+// refInternet is the internet the reference has an exit node serve
+// autogroup:internet for: public IPv4 and global unicast IPv6.
+var refInternet = func() *netipx.IPSet {
+	b := &netipx.IPSetBuilder{}
+	b.AddPrefix(netip.MustParsePrefix("0.0.0.0/0"))
+	b.AddPrefix(netip.MustParsePrefix("2000::/3"))
+	b.RemovePrefix(netip.MustParsePrefix("10.0.0.0/8"))
+	b.RemovePrefix(netip.MustParsePrefix("172.16.0.0/12"))
+	b.RemovePrefix(netip.MustParsePrefix("192.168.0.0/16"))
+	b.RemovePrefix(netip.MustParsePrefix("100.64.0.0/10"))
+	b.RemovePrefix(netip.MustParsePrefix("169.254.0.0/16"))
+	s, _ := b.IPSet()
+
+	return s
+}()
 
 // served is what headscale serves for one world, from the cells the world
 // serves from: filters in both modes, peers, route access, and the CapMaps

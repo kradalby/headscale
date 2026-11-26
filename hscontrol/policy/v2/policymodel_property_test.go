@@ -369,6 +369,10 @@ func TestInvalidPoliciesRefused(t *testing.T) {
 		policymodel.DefectSSHWildcardSource:   ErrSSHSrcNotAllowed,
 		policymodel.DefectTagStartsWithDigit:  ErrTagNameMustStartWithLetter,
 		policymodel.DefectGrantWithoutIPOrApp: ErrGrantMissingIPOrApp,
+		policymodel.DefectTagOwnerWildcard:    ErrTagOwnerUserWildcard,
+		policymodel.DefectGroupMemberWildcard: ErrInvalidGroupMember,
+		policymodel.DefectViaNonIPDst:         ErrGrantViaNonIPDst,
+		policymodel.DefectViaTailscaleIPDst:   ErrGrantViaTailscaleIP,
 	}
 
 	rapid.Check(t, func(t *rapid.T) {

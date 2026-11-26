@@ -42,15 +42,26 @@ const (
 	DefectTagStartsWithDigit
 	// DefectGrantWithoutIPOrApp grants neither ip nor app.
 	DefectGrantWithoutIPOrApp
+	// DefectTagOwnerWildcard names a domain's users as a tag owner.
+	DefectTagOwnerWildcard
+	// DefectGroupMemberWildcard names a domain's users as a group member.
+	DefectGroupMemberWildcard
+	// DefectViaNonIPDst steers a grant with via to a destination that
+	// is not a prefix, a host or autogroup:internet.
+	DefectViaNonIPDst
+	// DefectViaTailscaleIPDst steers a grant with via into the
+	// Tailscale address ranges.
+	DefectViaTailscaleIPDst
 )
 
-const numDefects = int(DefectGrantWithoutIPOrApp) + 1
+const numDefects = int(DefectViaTailscaleIPDst) + 1
 
 func (d Defect) String() string {
 	return [...]string{
 		"reserved-attr", "reserved-app", "self-source", "undefined-tag", "undefined-group", "undefined-host",
 		"default-route-dst", "app-to-internet", "ports-on-icmp", "funnel-attr", "via-in-acl",
 		"ssh-wildcard-source", "tag-starts-with-digit", "grant-without-ip-or-app",
+		"tag-owner-wildcard", "group-member-wildcard", "via-non-ip-dst", "via-tailscale-ip-dst",
 	}[d]
 }
 
@@ -145,6 +156,43 @@ func (iv InvalidPolicy) HuJSON() []byte {
 		doc["tagOwners"] = owners
 	case DefectGrantWithoutIPOrApp:
 		add("grants", map[string]any{"src": all, "dst": all})
+	case DefectTagOwnerWildcard:
+		owners, _ := doc["tagOwners"].(map[string]any)
+		if owners == nil {
+			owners = map[string]any{}
+		}
+
+		list, _ := owners[Tags[0]].([]any)
+		owners[Tags[0]] = append(list, UserRefs[domainRef])
+		doc["tagOwners"] = owners
+	case DefectGroupMemberWildcard:
+		groups, _ := doc["groups"].(map[string]any)
+		if groups == nil {
+			groups = map[string]any{}
+		}
+
+		members, _ := groups[Groups[0]].([]any)
+		groups[Groups[0]] = slices.Insert(members, min(iv.At, len(members)), any(UserRefs[domainRef]))
+		doc["groups"] = groups
+	case DefectViaNonIPDst, DefectViaTailscaleIPDst:
+		// The via tag must be one the document defines, or the refusal
+		// would be about it and not the destination.
+		owners, _ := doc["tagOwners"].(map[string]any)
+		if owners == nil {
+			owners = map[string]any{}
+		}
+
+		if _, ok := owners[Tags[0]]; !ok {
+			owners[Tags[0]] = []any{}
+			doc["tagOwners"] = owners
+		}
+
+		dst := "*"
+		if iv.Defect == DefectViaTailscaleIPDst {
+			dst = "100.64.0.0/10"
+		}
+
+		add("grants", map[string]any{"src": all, "dst": []any{dst}, "via": []any{Tags[0]}, "ip": all})
 	}
 
 	b, err := json.MarshalIndent(doc, "", "  ")

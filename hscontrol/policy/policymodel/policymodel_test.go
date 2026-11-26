@@ -1350,3 +1350,30 @@ func (r *failureLog) Fatal(args ...any)                 { r.Error(args...) }
 func (r *failureLog) FailNow()                          { r.failed = true }
 func (r *failureLog) Fail()                             { r.failed = true }
 func (r *failureLog) Failed() bool                      { return r.failed }
+
+// defectReachFloor is the least drawn defects a coverage sample of 1000
+// may hold: the draw is uniform over every defect, which puts the mean
+// near 56 at eighteen defects, so a floor this far below catches a draw
+// that stops reaching a defect, not noise.
+const defectReachFloor = 20
+
+// TestInvalidPoliciesDrawEveryDefect holds the invalid-policy draw to
+// reaching every defect: a defect it stops reaching would leave the
+// refusal it names unjudged by policy/v2's properties, which draw too
+// few cases to notice one missing.
+func TestInvalidPoliciesDrawEveryDefect(t *testing.T) {
+	t.Parallel()
+
+	const samples = 1000
+
+	drawn := make([]int, numDefects)
+	for i := range samples {
+		drawn[InvalidPolicies().Example(i).Defect]++
+	}
+
+	for d := range numDefects {
+		if drawn[d] < defectReachFloor {
+			t.Errorf("%s drawn in %d of %d samples, floor %d", Defect(d), drawn[d], samples, defectReachFloor)
+		}
+	}
+}
