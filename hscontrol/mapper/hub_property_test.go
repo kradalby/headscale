@@ -2512,3 +2512,725 @@ func exploreCore(t *testing.T, snaps []*state.Snapshot, scope coreScope) (int, i
 
 	return len(seen), leaves
 }
+
+// historySess is a session of [TestHubHistoryHoldsWhatAClientMayHold] and
+// what its client should have been sent.
+type historySess struct {
+	session   *Session
+	stream    *Stream
+	token     uint64
+	stops     int
+	wantStops int
+	pending   *sentView
+	wake      bool
+	pings     []*tailcfg.PingRequest
+}
+
+// TestHubHistoryHoldsWhatAClientMayHold drives the hub's sessions, peer
+// views, writes, deletions, wakes, pings and clock against a model of what
+// each node's client may hold, built without the hub's shared views or
+// folding: a reconnect announces the removal of any peer a client may
+// hold, so the history may drop a peer only when a delivered view at
+// least as new as every attempt leaves it out, or when the TTL or a
+// deletion ends it. Capacity is left to the two properties after it.
+func TestHubHistoryHoldsWhatAClientMayHold(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		h := NewHub()
+		defer h.Close()
+
+		now := time.Unix(1, 0)
+		h.now = func() time.Time { return now }
+
+		var sessions []*historySess
+
+		model := newPeerHistoryModel(maxConcurrentMapSessionsPerNode, peerHistoryTTL)
+		current := sentView{rev: 1}
+		views := [][]types.NodeID{nil}
+
+		var reads [][2][]types.NodeID
+
+		live := func(id types.NodeID) []*historySess {
+			var out []*historySess
+
+			for _, s := range sessions {
+				if model.Live(s.token) && s.session.NodeID == id {
+					out = append(out, s)
+				}
+			}
+
+			return out
+		}
+		pick := func(t *rapid.T) *historySess {
+			if len(sessions) == 0 {
+				t.Skip("no session yet")
+			}
+
+			return sessions[rapid.IntRange(0, len(sessions)-1).Draw(t, "session")]
+		}
+		node := func(t *rapid.T) types.NodeID { return types.NodeID(rapid.Uint64Range(1, 3).Draw(t, "node")) }
+
+		t.Repeat(map[string]func(*rapid.T){
+			"join": func(t *rapid.T) {
+				id := node(t)
+
+				token := uint64(len(sessions) + 1)
+				for _, evicted := range model.Join(token, id, now) {
+					sessions[evicted-1].wantStops++
+				}
+
+				s := &historySess{token: token}
+				s.session = h.Join(id, func() { s.stops++ })
+				require.NotNil(t, s.session)
+				s.stream = &Stream{hub: h, nodeID: id}
+				s.stream.Attach(s.session)
+				sessions = append(sessions, s)
+			},
+			"leave": func(t *rapid.T) {
+				s := pick(t)
+				require.Equal(t, model.Leave(s.token, now), h.Leave(s.session))
+			},
+			"commit": func(t *rapid.T) {
+				current.rev++
+				if rapid.Bool().Draw(t, "earlier view") {
+					current.ids = rapid.SampledFrom(views).Draw(t, "view")
+				} else {
+					current.ids = drawPeerView(t)
+					views = append(views, current.ids)
+				}
+			},
+			"write": func(t *rapid.T) {
+				s := pick(t)
+				if s.pending != nil {
+					t.Skip("a stream finishes a write before it renders again")
+				}
+
+				v := current
+				s.pending = &v
+				s.stream.pending = &v
+				h.mayHavePeers(s.session, s.session.NodeID, v)
+				model.Attempt(s.token, v.rev, v.ids)
+			},
+			"deliver": func(t *rapid.T) {
+				s := pick(t)
+				if s.pending != nil {
+					model.Delivered(s.token, s.pending.rev, s.pending.ids)
+				}
+
+				s.stream.Delivered()
+				s.pending = nil
+				require.Nil(t, s.stream.pending)
+			},
+			"delete": func(t *rapid.T) {
+				id := node(t)
+				for _, token := range model.Forget(id) {
+					sessions[token-1].wantStops++
+				}
+
+				h.forget(id)
+			},
+			"clock": func(t *rapid.T) {
+				now = now.Add(rapid.SampledFrom([]time.Duration{0, time.Nanosecond, peerHistoryTTL - time.Nanosecond, peerHistoryTTL}).Draw(t, "elapsed"))
+				if rapid.Bool().Draw(t, "sweep") {
+					model.Expire(now)
+					h.expireHistory()
+				}
+			},
+			"wake": func(t *rapid.T) {
+				id, all := node(t), rapid.Bool().Draw(t, "all")
+				h.wake(all, map[types.NodeID]struct{}{id: {}})
+
+				for _, s := range sessions {
+					if model.Live(s.token) && (all || s.session.NodeID == id) {
+						s.wake = true
+					}
+				}
+			},
+			"ping": func(t *rapid.T) {
+				id := node(t)
+				for range rapid.IntRange(1, 12).Draw(t, "burst") {
+					pr := &tailcfg.PingRequest{URL: "http://example.test/ping"}
+					accepted := false
+
+					for _, s := range live(id) {
+						if len(s.pings) < cap(s.session.pings) {
+							s.pings = append(s.pings, pr)
+							accepted = true
+						}
+					}
+
+					require.Equal(t, accepted, h.Ping(id, pr))
+				}
+			},
+			"drain": func(t *rapid.T) {
+				s := pick(t)
+				if s.wake {
+					select {
+					case <-s.session.Wakes():
+					default:
+						t.Fatal("missing wake")
+					}
+
+					s.wake = false
+				}
+
+				for _, pr := range s.pings {
+					select {
+					case got := <-s.session.Pings():
+						require.Same(t, pr, got)
+					default:
+						t.Fatal("missing ping")
+					}
+				}
+
+				s.pings = nil
+			},
+			"": func(t *rapid.T) {
+				connected := map[types.NodeID]int{}
+
+				for id := types.NodeID(1); id <= 3; id++ {
+					if n := len(live(id)); n > 0 {
+						connected[id] = n
+					}
+
+					require.Equal(t, connected[id] > 0, h.IsConnected(id))
+					require.Equal(t, model.HasHistory(id), h.HasPeerHistoryForTest(id), "n%d", id)
+					want, got := model.Possible(id), h.lastPeers(id)
+					require.True(t, slices.Equal(want, got), "n%d: may hold %v, history %v", id, want, got)
+					reads = append(reads, [2][]types.NodeID{got, slices.Clone(got)})
+				}
+
+				require.Equal(t, connected, h.Connected())
+
+				for _, s := range sessions {
+					require.Equal(t, !model.Live(s.token), s.session.left)
+					require.Equal(t, s.wantStops, s.stops)
+					require.Equal(t, s.wake, len(s.session.Wakes()) == 1)
+					require.Len(t, s.session.Pings(), len(s.pings))
+				}
+
+				for _, read := range reads {
+					require.Equal(t, read[1], read[0], "a view read earlier changed")
+				}
+
+				requireHistoryCost(t, h)
+			},
+		})
+
+		for _, token := range model.Close() {
+			sessions[token-1].wantStops++
+		}
+
+		h.Close()
+		require.Empty(t, model.Close())
+		h.Close()
+		require.Empty(t, h.Connected())
+		require.Nil(t, h.Join(1, func() { t.Fatal("a refused join called stop") }))
+		require.False(t, h.Ping(1, &tailcfg.PingRequest{}))
+
+		select {
+		case <-h.Done():
+		default:
+			t.Fatal("a closed hub did not signal Done")
+		}
+
+		// Writes finishing after Close record nothing.
+		for _, s := range sessions {
+			require.Equal(t, s.wantStops, s.stops)
+			before := slices.Clone(h.lastPeers(s.session.NodeID))
+			s.stream.Delivered()
+			h.mayHavePeers(s.session, s.session.NodeID, current)
+			require.True(t, slices.Equal(before, h.lastPeers(s.session.NodeID)))
+		}
+	})
+}
+
+// drawPeerView draws a sorted peer view, with spare capacity: a view pins
+// its whole backing array, so the history's cost counts capacity.
+func drawPeerView(t *rapid.T) []types.NodeID {
+	ids := rapid.SliceOfNDistinct(rapid.Uint64Range(10, 30), 0, 8, func(id uint64) uint64 { return id }).Draw(t, "peers")
+
+	view := make([]types.NodeID, len(ids), len(ids)+rapid.IntRange(0, 3).Draw(t, "spare capacity"))
+	for i, id := range ids {
+		view[i] = types.NodeID(id) //nolint:gosec // small
+	}
+
+	slices.Sort(view)
+
+	return view
+}
+
+// requireHistoryCost recounts what the history costs from the histories
+// themselves, not from the counters, list or view counts the hub keeps.
+func requireHistoryCost(t *rapid.T, h *Hub) {
+	t.Helper()
+
+	cost := len(h.core.offlineAt)
+	refs := map[viewKey]int{}
+	arrays := map[*types.NodeID]int{}
+
+	for id, v := range h.core.sentPeers {
+		require.LessOrEqual(t, len(v.attempts), maxPeerAttempts)
+
+		if _, offline := h.core.offlineAt[id]; offline {
+			for _, ids := range append([][]types.NodeID{v.ids}, v.attempts...) {
+				if len(ids) > 0 {
+					arrays[&ids[0]] = cap(ids)
+					refs[viewKey{first: &ids[0], n: len(ids)}]++
+				}
+			}
+		} else if v.folded {
+			cost += cap(v.ids)
+		}
+	}
+
+	for _, capacity := range arrays {
+		cost += capacity
+	}
+
+	require.Equal(t, refs, h.core.views)
+	require.Equal(t, cost, h.core.retained)
+	require.LessOrEqual(t, cost, h.core.maxHistoryIDs)
+	require.Equal(t, len(h.core.offlineAt), h.core.offline.Len())
+}
+
+// TestHubDropsOfflineHistoryOldestFirst takes drawn nodes offline under a
+// drawn cap, some holding the same view, and holds which histories the
+// hub keeps to a FIFO over what each costs, counted from the views drawn:
+// one per history, plus each distinct view's array once.
+func TestHubDropsOfflineHistoryOldestFirst(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		h := NewHub()
+		defer h.Close()
+
+		h.now = func() time.Time { return time.Unix(1, 0) }
+		h.core.maxHistoryIDs = rapid.IntRange(0, 60).Draw(t, "cap")
+		views := [][]types.NodeID{nil, drawPeerView(t), drawPeerView(t), drawPeerView(t)}
+
+		type entry struct {
+			node types.NodeID
+			view int
+		}
+
+		var offline []entry
+
+		cost := func() int {
+			total := len(offline)
+
+			seen := map[int]bool{}
+			for _, e := range offline {
+				if !seen[e.view] && len(views[e.view]) > 0 {
+					total += cap(views[e.view])
+					seen[e.view] = true
+				}
+			}
+
+			return total
+		}
+
+		for i := range rapid.IntRange(1, 30).Draw(t, "nodes") {
+			id := types.NodeID(i + 1) //nolint:gosec // small
+			view := rapid.IntRange(0, len(views)-1).Draw(t, "view")
+			session := h.Join(id, func() {})
+			v := sentView{ids: views[view], rev: 1}
+			h.mayHavePeers(session, id, v)
+
+			if rapid.Bool().Draw(t, "delivered") {
+				(&Stream{hub: h, nodeID: id, sess: session, pending: &v}).Delivered()
+			}
+
+			if rapid.Bool().Draw(t, "overlap") {
+				other := h.Join(id, func() {})
+				require.True(t, h.Leave(session))
+				require.Equal(t, cost(), h.core.retained, "a connected node's history costs nothing yet")
+
+				session = other
+			}
+
+			require.False(t, h.Leave(session))
+			require.False(t, h.Leave(session))
+
+			offline = append(offline, entry{node: id, view: view})
+			for cost() > h.core.maxHistoryIDs {
+				offline = offline[1:]
+			}
+
+			for old := types.NodeID(1); old <= id; old++ {
+				i := slices.IndexFunc(offline, func(e entry) bool { return e.node == old })
+				require.Equal(t, i >= 0, h.HasPeerHistoryForTest(old), "n%d", old)
+
+				if i >= 0 {
+					require.True(t, slices.Equal(views[offline[i].view], h.lastPeers(old)))
+				}
+			}
+
+			require.Equal(t, cost(), h.core.retained)
+			requireHistoryCost(t, h)
+		}
+
+		// A view shared by several histories costs until the last goes.
+		for _, e := range slices.Clone(offline) {
+			h.forget(e.node)
+
+			offline = offline[1:]
+
+			require.Equal(t, cost(), h.core.retained)
+			requireHistoryCost(t, h)
+		}
+
+		require.Empty(t, h.core.sentPeers)
+	})
+}
+
+// TestHubFoldsTheFailedWritesOfAConnectedNode fails drawn writes of a node
+// that never goes offline, each with a peer the next view drops: past
+// [maxPeerAttempts] the attempts fold into one view, which counts against
+// the cap like an offline history and goes when it outgrows it.
+func TestHubFoldsTheFailedWritesOfAConnectedNode(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		h := NewHub()
+		defer h.Close()
+
+		h.core.maxHistoryIDs = rapid.IntRange(0, 24).Draw(t, "cap")
+		keeper := h.Join(1, func() {})
+
+		writes := rapid.IntRange(10, 60).Draw(t, "failed writes")
+		possible := make([]types.NodeID, 0, writes)
+		unfolded := 0
+
+		for i := range writes {
+			// The keeper holds the node online while each failed writer leaves.
+			s := h.Join(1, func() {})
+			peer := types.NodeID(i + 100)                                                 //nolint:gosec // small
+			h.mayHavePeers(s, 1, sentView{ids: []types.NodeID{peer}, rev: uint64(i + 1)}) //nolint:gosec // small
+
+			possible = append(possible, peer)
+
+			unfolded++
+			if unfolded > maxPeerAttempts {
+				unfolded = 0
+
+				if len(possible) > h.core.maxHistoryIDs {
+					possible = nil
+				}
+			}
+
+			require.True(t, slices.Equal(possible, h.lastPeers(1)))
+			require.True(t, h.Leave(s))
+			requireHistoryCost(t, h)
+		}
+
+		require.False(t, h.Leave(keeper))
+		requireHistoryCost(t, h)
+	})
+}
+
+// TestHubHistoryExpiresAfterItsLastSession holds the TTL at its edges: a
+// history outlives the last session by the TTL less a nanosecond and not
+// by the TTL, a repeated Leave does not restart it, a connected node's
+// history never expires, and a node back after the TTL, swept or not, is
+// not told about removals from before it.
+func TestHubHistoryExpiresAfterItsLastSession(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		h := NewHub()
+		defer h.Close()
+
+		now := time.Unix(1, 0)
+		h.now = func() time.Time { return now }
+		model := newPeerHistoryModel(maxConcurrentMapSessionsPerNode, peerHistoryTTL)
+		view := drawPeerView(t)
+
+		model.Join(1, 1, now)
+		s := h.Join(1, func() {})
+
+		model.Attempt(1, 1, view)
+		h.mayHavePeers(s, 1, sentView{ids: view, rev: 1})
+		require.Equal(t, model.Leave(1, now), h.Leave(s))
+		now = now.Add(peerHistoryTTL - time.Nanosecond)
+		require.Equal(t, model.Leave(1, now), h.Leave(s))
+		h.expireHistory()
+		model.Expire(now)
+		require.True(t, h.HasPeerHistoryForTest(1), "a repeated Leave restarted the TTL")
+
+		if rapid.Bool().Draw(t, "reconnect") {
+			model.Join(2, 1, now)
+			s = h.Join(1, func() {})
+			require.True(t, slices.Equal(model.Possible(1), h.lastPeers(1)))
+
+			now = now.Add(2 * peerHistoryTTL)
+
+			h.expireHistory()
+			model.Expire(now)
+			require.True(t, h.HasPeerHistoryForTest(1), "a connected node's history expired")
+			require.Equal(t, model.Leave(2, now), h.Leave(s))
+			now = now.Add(peerHistoryTTL - time.Nanosecond)
+		}
+
+		now = now.Add(time.Nanosecond)
+		if rapid.Bool().Draw(t, "unswept") {
+			model.Join(3, 1, now)
+			h.Join(1, func() {})
+		} else {
+			model.Expire(now)
+			h.expireHistory()
+		}
+
+		require.False(t, model.HasHistory(1))
+		require.False(t, h.HasPeerHistoryForTest(1))
+		requireHistoryCost(t, h)
+	})
+}
+
+// TestHubLateWritesOfRetiredSessionsLeaveNoHistory finishes a session's
+// write after it left, its node was deleted, the hub closed, or a newer
+// session took its place, and holds that the write recorded nothing: a
+// late write must neither bring back a deleted node's history nor roll a
+// newer session's back.
+func TestHubLateWritesOfRetiredSessionsLeaveNoHistory(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		h := NewHub()
+		defer h.Close()
+
+		model := newPeerHistoryModel(maxConcurrentMapSessionsPerNode, peerHistoryTTL)
+		now := time.Unix(1, 0)
+		model.Join(1, 1, now)
+		s := h.Join(1, func() {})
+		v := sentView{ids: drawPeerView(t), rev: 1}
+		h.mayHavePeers(s, 1, v)
+		model.Attempt(1, 1, v.ids)
+		stream := &Stream{hub: h, nodeID: 1, sess: s, pending: &v}
+
+		retire := rapid.SampledFrom([]string{"leave", "delete", "close", "evict"}).Draw(t, "retire")
+		switch retire {
+		case "leave":
+			model.Leave(1, now)
+			h.Leave(s)
+		case "delete":
+			model.Forget(1)
+			h.forget(1)
+		case "close":
+			model.Close()
+			h.Close()
+		case "evict":
+			for token := uint64(2); token <= uint64(maxConcurrentMapSessionsPerNode+1); token++ {
+				model.Join(token, 1, now)
+				h.Join(1, func() {})
+			}
+		}
+
+		if retire != "close" {
+			model.Join(10, 1, now)
+			fresh := h.Join(1, func() {})
+
+			model.Attempt(10, 2, nil)
+			model.Delivered(10, 2, nil)
+			h.mayHavePeers(fresh, 1, sentView{rev: 2})
+			(&Stream{hub: h, nodeID: 1, sess: fresh, pending: &sentView{rev: 2}}).Delivered()
+		}
+
+		release, done := make(chan struct{}), make(chan struct{})
+		go func() {
+			<-release
+			stream.Delivered()
+			h.mayHavePeers(s, 1, v)
+			close(done)
+		}()
+
+		model.Delivered(1, 1, v.ids)
+		model.Attempt(1, 1, v.ids)
+		close(release)
+		<-done
+		require.False(t, model.Live(1))
+		require.Equal(t, model.HasHistory(1), h.HasPeerHistoryForTest(1))
+		require.True(t, slices.Equal(model.Possible(1), h.lastPeers(1)))
+	})
+}
+
+// peerHistoryModel is what each node's client may hold, kept apart from
+// the hub: a set of peers per node, widened by every attempted write and
+// narrowed only by a delivery at least as new as every attempt. Callers
+// give each session a token of its own and finish a write before the
+// next; a retired token stays valid for late writes, which change nothing.
+type peerHistoryModel struct {
+	limit    int
+	ttl      time.Duration
+	sessions map[uint64]types.NodeID
+	owners   map[uint64]types.NodeID
+	order    []uint64
+	history  map[types.NodeID]*peerHistoryEntry
+	closed   bool
+}
+
+type peerHistoryEntry struct {
+	peers   map[types.NodeID]bool
+	rev     uint64
+	offline time.Time
+}
+
+func newPeerHistoryModel(sessionLimit int, ttl time.Duration) *peerHistoryModel {
+	return &peerHistoryModel{
+		limit: sessionLimit, ttl: ttl,
+		sessions: map[uint64]types.NodeID{},
+		owners:   map[uint64]types.NodeID{},
+		history:  map[types.NodeID]*peerHistoryEntry{},
+	}
+}
+
+// Join returns the tokens of the oldest sessions the admission evicted.
+func (m *peerHistoryModel) Join(token uint64, node types.NodeID, now time.Time) []uint64 {
+	if m.closed {
+		return nil
+	}
+
+	m.Expire(now)
+
+	if h := m.history[node]; h != nil {
+		h.offline = time.Time{}
+	}
+
+	var active []uint64
+
+	for _, old := range m.order {
+		if id, ok := m.sessions[old]; ok && id == node {
+			active = append(active, old)
+		}
+	}
+
+	var evicted []uint64
+	if len(active) >= m.limit {
+		evicted = active[:len(active)-m.limit+1]
+		for _, old := range evicted {
+			delete(m.sessions, old)
+		}
+	}
+
+	m.sessions[token] = node
+	m.owners[token] = node
+	m.order = append(m.order, token)
+
+	return evicted
+}
+
+// Leave reports whether another session still serves the token's node; a
+// token left twice still names its node.
+func (m *peerHistoryModel) Leave(token uint64, now time.Time) bool {
+	node, known := m.owners[token]
+	if !known {
+		return false
+	}
+
+	delete(m.sessions, token)
+
+	for _, id := range m.sessions {
+		if id == node {
+			return true
+		}
+	}
+
+	m.Expire(now)
+
+	if h := m.history[node]; h != nil && h.offline.IsZero() {
+		h.offline = now
+	}
+
+	return false
+}
+
+func (m *peerHistoryModel) Attempt(token, rev uint64, ids []types.NodeID) {
+	node, live := m.sessions[token]
+	if !live {
+		return
+	}
+
+	h := m.history[node]
+	if h == nil {
+		h = &peerHistoryEntry{peers: map[types.NodeID]bool{}}
+		m.history[node] = h
+	}
+
+	for _, id := range ids {
+		h.peers[id] = true
+	}
+
+	h.rev = max(h.rev, rev)
+}
+
+func (m *peerHistoryModel) Delivered(token, rev uint64, ids []types.NodeID) {
+	node, live := m.sessions[token]
+	if !live {
+		return
+	}
+
+	if h := m.history[node]; h != nil && h.rev > rev {
+		return
+	}
+
+	peers := map[types.NodeID]bool{}
+	for _, id := range ids {
+		peers[id] = true
+	}
+
+	m.history[node] = &peerHistoryEntry{peers: peers, rev: rev}
+}
+
+// Forget returns the tokens deletion stopped, in admission order.
+func (m *peerHistoryModel) Forget(node types.NodeID) []uint64 {
+	var stopped []uint64
+
+	for _, token := range m.order {
+		if id, live := m.sessions[token]; live && id == node {
+			stopped = append(stopped, token)
+			delete(m.sessions, token)
+		}
+	}
+
+	delete(m.history, node)
+
+	return stopped
+}
+
+func (m *peerHistoryModel) Expire(now time.Time) {
+	for id, h := range m.history {
+		if !h.offline.IsZero() && now.Sub(h.offline) >= m.ttl {
+			delete(m.history, id)
+		}
+	}
+}
+
+// Possible returns the peers node's client may hold, sorted, in storage
+// of its own.
+func (m *peerHistoryModel) Possible(node types.NodeID) []types.NodeID {
+	if h := m.history[node]; h != nil {
+		return slices.Sorted(maps.Keys(h.peers))
+	}
+
+	return nil
+}
+
+func (m *peerHistoryModel) Live(token uint64) bool {
+	_, ok := m.sessions[token]
+
+	return ok
+}
+
+func (m *peerHistoryModel) HasHistory(node types.NodeID) bool {
+	_, ok := m.history[node]
+
+	return ok
+}
+
+// Close retires every live token; the history stays, as the hub's does.
+func (m *peerHistoryModel) Close() []uint64 {
+	m.closed = true
+
+	var stopped []uint64
+
+	for _, token := range m.order {
+		if m.Live(token) {
+			stopped = append(stopped, token)
+		}
+	}
+
+	clear(m.sessions)
+
+	return stopped
+}
