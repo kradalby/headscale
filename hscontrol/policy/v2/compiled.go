@@ -9,6 +9,7 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
 	"go4.org/netipx"
 	"tailscale.com/net/tsaddr"
@@ -935,12 +936,11 @@ func viaDstsForNode(
 		return nil, false
 	}
 
-	// [types.NodeView.SubnetRoutes] excludes exit routes, so the overlap
-	// gate below sees only subnet advertisements. autogroup:internet on
-	// a via-tagged exit advertiser is handled separately because its
-	// eligibility is per-node ([types.NodeView.IsExitNode]) rather than
-	// per-prefix overlap.
-	nodeSubnetRoutes := node.SubnetRoutes()
+	// An exit route serves a destination as a subnet route does: SaaS
+	// sends a via-tagged exit node the rule for any destination of its
+	// family. autogroup:internet is handled separately: only an exit node
+	// serves it, whatever else it routes.
+	nodeRoutes := slices.Concat(node.SubnetRoutes(), node.ExitRoutes())
 
 	var viaDstPrefixes []netip.Prefix
 
@@ -952,7 +952,7 @@ func viaDstsForNode(
 		// rather than cut to what the router serves, and a narrower
 		// dst rides on a router covering more than the operator
 		// asked for.
-		if slices.ContainsFunc(nodeSubnetRoutes, dstPrefix.Overlaps) {
+		if slices.ContainsFunc(nodeRoutes, dstPrefix.Overlaps) {
 			viaDstPrefixes = append(viaDstPrefixes, dstPrefix)
 		}
 	}
@@ -1017,6 +1017,11 @@ func compileViaForNode(
 	return rules
 }
 
+// reachInternet reports whether one of prefixes holds a public address.
+func reachInternet(prefixes []netip.Prefix) bool {
+	return slices.ContainsFunc(prefixes, util.TheInternet().OverlapsPrefix)
+}
+
 // viaPeerRule returns a rule that links node, as a via router, to the grant's
 // sources. It names the router's own addresses: the filter rule names the route,
 // which would also link a router that is a source to everything else serving
@@ -1030,7 +1035,15 @@ func viaPeerRule(
 	cg *compiledGrant,
 	node types.NodeView,
 ) []tailcfg.FilterRule {
-	if prefixes, internet := viaDstsForNode(cg, node); len(prefixes) == 0 && !internet {
+	prefixes, internet := viaDstsForNode(cg, node)
+
+	// A router is shown to the sources through a subnet route, or as an
+	// exit node when a destination is on the internet: SaaS shows nobody an
+	// exit node that is sent the rule for a private destination.
+	subnets := node.SubnetRoutes()
+	if !internet && !slices.ContainsFunc(prefixes, func(p netip.Prefix) bool { return slices.ContainsFunc(subnets, p.Overlaps) }) &&
+		(!node.IsExitNode() || !reachInternet(cg.via.resolvedDsts) ||
+			!slices.ContainsFunc(cg.via.viaTags, func(t Tag) bool { return node.HasTag(string(t)) })) {
 		return nil
 	}
 

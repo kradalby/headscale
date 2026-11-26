@@ -946,9 +946,6 @@ func TestViaRouterCoverIsHeadscalesReading(t *testing.T) {
 		{"the router among the sources by a route over one", world(alice, route(0, 2), route(3), true), 0, true},
 		{"the router the only source, by its routed subnet", world(net, route(0), route(2), true), 0, true},
 		{"the router not among the sources", world(alice, route(0), route(3), true), 0, false},
-		// An exit route reaches the destination in the plain reading, not
-		// in headscale's (policymodel.ViaReach): no router to cover.
-		{"an exit among the sources, no subnet of the destination", world(alice, route(2, 8, 9), route(3), true), policymodel.ViaReach, false},
 		{"the covering node routing over a source too", world(alice, route(0, 2), route(2), true), 0, false},
 		{"no via", world(alice, route(0, 2), route(3), false), 0, false},
 	} {

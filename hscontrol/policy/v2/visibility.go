@@ -149,7 +149,10 @@ type grantSides struct {
 	viaTags     []SelectorID
 	viaDst      []SelectorID
 	viaInternet bool
-	viaPorts    bool
+	// viaPublic: a destination holds a public address, which shows the
+	// sources an exit node carrying a via tag.
+	viaPublic bool
+	viaPorts  bool
 }
 
 // steerGrant is one grant as via steering reads it, in the order the
@@ -350,6 +353,7 @@ func newSidePlan(t *Templates) *sidePlan {
 			gs.src = p.atomsOf(gt.srcs, ctxSrc)
 			gs.viaDst = gt.dsts
 			gs.viaInternet = gt.viaInternet
+			gs.viaPublic = p.inet(gt.dsts, ctxResolveOK)
 			gs.viaPorts = ports
 
 			for _, tag := range gt.via {
@@ -553,10 +557,12 @@ type sideFacts struct {
 	addrLit, routeLit []SelectorID
 	approvedAddr      bool
 	exit              bool
-	clique            uint64
-	cliqued           bool
-	owner             uint
-	owned             bool
+	// exits are the exit routes, which serve a via grant's destinations.
+	exits   []netip.Prefix
+	clique  uint64
+	cliqued bool
+	owner   uint
+	owned   bool
 	// namedPort and namedApp report that a self grant with port rules, and
 	// one with a capability, names the node by one of its addresses.
 	namedPort, namedApp bool
@@ -1387,7 +1393,7 @@ func sameSideFacts(a, b *types.Node) bool {
 		return true
 	}
 
-	return slices.Equal(sortedRoutes(a), sortedRoutes(b)) && a.IsExitNode() == b.IsExitNode()
+	return slices.Equal(sortedRoutes(a), sortedRoutes(b)) && slices.Equal(a.ExitRoutes(), b.ExitRoutes())
 }
 
 // sortedRoutes returns n's subnet routes, sorted and without repeats.
@@ -1482,7 +1488,7 @@ func (s Sides) factsOf(id types.NodeID, n *types.Node) *sideFacts {
 	p := s.plan
 	rs, _ := s.roles.Of(id)
 
-	f := &sideFacts{roles: rs, ips: n.IPs(), routes: sortedRoutes(n), exit: n.IsExitNode()}
+	f := &sideFacts{roles: rs, ips: n.IPs(), routes: sortedRoutes(n), exit: n.IsExitNode(), exits: n.ExitRoutes()}
 
 	if !n.IsTagged() && n.UserID != nil {
 		f.clique, f.cliqued = uint64(*n.UserID), true
@@ -1577,7 +1583,7 @@ func (s Sides) namedBy(f *sideFacts, grants [][]Role) bool {
 
 // targetsOf returns the via grants f's node routes for: it carries one of
 // the via tags and a subnet route overlaps a destination, or it is an
-// exit node and the grant names the internet.
+// exit node and the grant names the internet or a public address.
 func (s Sides) targetsOf(f *sideFacts) []int {
 	var out []int
 
@@ -1588,7 +1594,7 @@ func (s Sides) targetsOf(f *sideFacts) []int {
 			continue
 		}
 
-		if gs.viaInternet && f.exit || s.routesOverlap(f, gs.viaDst) {
+		if (gs.viaInternet || gs.viaPublic) && f.exit || s.routesOverlap(f, gs.viaDst) {
 			out = append(out, g)
 		}
 	}
@@ -2441,13 +2447,13 @@ func (s Sides) viaRules(vs RoleSet, vf *sideFacts) []accessRule {
 	return out
 }
 
-// viaDstsFor returns the destinations of via grant gs that f's subnet
-// routes overlap, as the via router's rules write them.
+// viaDstsFor returns the destinations of via grant gs that f's routes
+// overlap, as the via router's rules write them.
 func (s Sides) viaDstsFor(f *sideFacts, gs *grantSides) []netip.Prefix {
 	var out []netip.Prefix
 
 	for _, d := range s.resolvePrefixes(gs.viaDst) {
-		if slices.ContainsFunc(f.routes, d.Overlaps) {
+		if slices.ContainsFunc(f.routes, d.Overlaps) || slices.ContainsFunc(f.exits, d.Overlaps) {
 			out = append(out, d)
 		}
 	}
@@ -2768,7 +2774,7 @@ func (v *ViaPlan) Steer(s Sides, viewer, peer types.NodeView, primary func(key s
 			}
 		}
 
-		if st.internet {
+		if st.inetLit {
 			routes = append(routes, peer.OfferedExitRoutes()...)
 		}
 

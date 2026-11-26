@@ -1662,6 +1662,9 @@ func (pm *PolicyManager) viaPrep() *viaPrep {
 
 			prep.srcs[i], _ = b.IPSet()
 			prep.dsts[i], prep.internet[i] = resolveViaDestinations(pm.pol, pm.users, pm.nodes, grant.Destinations)
+			// A public prefix steers the exit routes as autogroup:internet
+			// does.
+			prep.internet[i] = prep.internet[i] || grant.HasVia() && reachInternet(prep.dsts[i])
 
 			if !grant.HasVia() {
 				var dst netipx.IPSetBuilder

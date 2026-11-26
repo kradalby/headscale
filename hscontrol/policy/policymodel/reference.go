@@ -387,17 +387,6 @@ const (
 	// visibility.go. Delete the clause once one reading is chosen: fix
 	// production, or make headscale's reading the reference's own.
 	OthersSelf Contested = 1 << iota
-	// ViaReach: a via grant reaches every route its via routers serve,
-	// exit routes included. Headscale reaches subnet routes only, exits
-	// only for autogroup:internet. Fails closed.
-	//
-	// TODO(kradalby): policy/via-reach: fails closed. With
-	// `alice@ -> 8.8.8.0/24 via tag:a`, a tag:a exit node refuses alice's
-	// packets to 8.8.8.0/24. The properties in policy/v2/reference_test.go
-	// count it under "via reach". Production: cutVia (subnet routes only)
-	// in policy/v2/expand.go. Delete the clause once production follows
-	// the captures grant-via-reach-a and grant-via-router-covered.
-	ViaReach
 	// ViaRouterCover: a via grant links its sources with its routers,
 	// nothing else. Headscale links a via router that is itself among the
 	// grant's sources also with every node whose subnet route holds one
@@ -428,7 +417,7 @@ const (
 // ContestedClauses is every contested clause, in the order a property
 // tries them.
 var ContestedClauses = []Contested{
-	OthersSelf, ViaReach, ViaRouterCover,
+	OthersSelf, ViaRouterCover,
 }
 
 // FailsOpen reports whether headscale's side of c admits what the
@@ -439,7 +428,7 @@ func (c Contested) FailsOpen() bool {
 
 func (c Contested) String() string {
 	names := []string{
-		"others' self rules", "via reach", "via router covered",
+		"others' self rules", "via router covered",
 	}
 
 	var parts []string
@@ -883,7 +872,8 @@ func (n RefNode) served() *netipx.IPSet {
 }
 
 // dstsAt is the part of rl's destinations that n is sent: a via rule's
-// only at a router holding a via tag.
+// only at a node holding a via tag, for any route it serves, an exit
+// route among them (grant-via-router-covered, grant-via-reach-a).
 // Quirk: an entry that reaches what n serves is sent whole, not cut to it:
 // a prefix wider than the route, the range of autogroup:internet a public
 // route sits in (routes-destination-wider-than-route,
@@ -902,14 +892,11 @@ func (r *Ref) dstsAt(rl refRule, n RefNode) *netipx.IPSet {
 
 	var b netipx.IPSetBuilder
 
-	for _, term := range terms {
-		reach := n.served()
+	reach := n.served()
 
-		switch {
-		case via && term.internet && !n.exit():
+	for _, term := range terms {
+		if via && term.internet && !n.exit() {
 			continue
-		case via && !term.internet && r.without&ViaReach != 0:
-			reach = setOf(n.subnets()...)
 		}
 
 		if term.star {
@@ -1125,19 +1112,13 @@ func (r *Ref) coversSourceRouter(rl refRule, router, n RefNode) bool {
 	return slices.ContainsFunc(n.subnets(), func(q netip.Prefix) bool { return slices.ContainsFunc(router.Addrs, q.Contains) })
 }
 
-// viaRouter reports whether n is one of via rule rl's routers: it carries
-// a via tag and routes one of rl's destinations.
+// viaRouter reports whether n is one of via rule rl's routers to its
+// peers: it carries a via tag and a subnet route of it overlaps a
+// destination, or it is an exit node and a destination is on the internet.
+// Quirk: an exit node sent the rule for a private destination is shown
+// nobody by it (grant-via-router-covered).
 func (r *Ref) viaRouter(rl refRule, n RefNode) bool {
-	if !n.hasTag(rl.via) {
-		return false
-	}
-
-	routed := n.routes()
-	if r.without&ViaReach != 0 {
-		routed = n.subnets()
-	}
-
-	return slices.ContainsFunc(routed, rl.dst.OverlapsPrefix) || rl.internet && n.exit()
+	return n.hasTag(rl.via) && (slices.ContainsFunc(n.subnets(), rl.dst.OverlapsPrefix) || n.exit() && rl.reachesInternet())
 }
 
 func (r *Ref) links(rl refRule, src, dst RefNode) bool { return on(src, rl.src) && r.onDst(rl, dst) }
@@ -1193,14 +1174,14 @@ func (r *Ref) Routes(viewer, peer types.NodeID) []netip.Prefix {
 
 // Steered reports whether the routes viewer is given of peer are via
 // steering's to decide: viewer is a source of a via grant one of peer's
-// routes reaches, an exit route only through autogroup:internet.
+// routes reaches, an exit route through a destination on the internet.
 func (r *Ref) Steered(viewer, peer types.NodeID) bool {
 	v, _ := r.node(viewer)
 	p, _ := r.node(peer)
 
 	return slices.ContainsFunc(r.rules, func(rl refRule) bool {
 		return len(rl.via) > 0 && on(v, rl.src) && slices.ContainsFunc(p.routes(), func(q netip.Prefix) bool {
-			return !isExitRoute(q) && rl.dst.OverlapsPrefix(q) || rl.internet && (isExitRoute(q) || internet.OverlapsPrefix(q))
+			return !isExitRoute(q) && rl.dst.OverlapsPrefix(q) || rl.reachesInternet() && isExitRoute(q) || rl.internet && internet.OverlapsPrefix(q)
 		})
 	})
 }

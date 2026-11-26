@@ -204,6 +204,7 @@ See [the routes reference](docs/ref/routes.md) for the failover rules.
 - A group holding `user:*@domain` owns its tags for that domain's users at login and for pre-auth keys, not only for their existing devices.
 - An `app` grant to `*` gives its sources the subnet routes of the tailnet's routers, as a grant with `ip` does and as Tailscale does.
 - An `app` grant that repeats a destination grants the capability once, as Tailscale does.
+- A grant with `via` reaches a destination through the exit routes of the nodes carrying the tag, as on Tailscale: such an exit node accepts the grant's traffic, and for a public destination it is offered to the sources as an exit node.
 - A router of a grant with `via` that is also among the grant's sources is no longer given other nodes' exit routes and public subnet routes through that grant, as on Tailscale.
 - A node approved for only one of `0.0.0.0/0` and `::/0` is not offered to peers as an exit node, as on Tailscale: peers get neither route nor the exit-node suggestion. Approve both.
 

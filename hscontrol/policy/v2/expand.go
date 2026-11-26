@@ -2981,8 +2981,8 @@ func naming(nodes []types.NodeView, set ResolvedAddresses) selfNaming {
 }
 
 // cutVia cuts grant g's rules for the receiver when it is one of the
-// grant's via routers: the destinations its approved subnet routes
-// overlap, and the internet on an exit node. A rule that reaches nothing
+// grant's via routers: the destinations its approved routes overlap, an
+// exit route among them, and the internet on an exit node. A rule that reaches nothing
 // is not cut but keeps its place.
 func (x *Expansion) cutVia(c *cut, g int, gt *GrantTemplate, ge *grantExpansion) {
 	rc := c.rc
@@ -2991,14 +2991,12 @@ func (x *Expansion) cutVia(c *cut, g int, gt *GrantTemplate, ge *grantExpansion)
 		return
 	}
 
-	// TODO(kradalby): policy/via-reach: subnet routes only, exits for
-	// autogroup:internet alone (fails closed). See policymodel.ViaReach.
-	subnets := rc.n.SubnetRoutes()
+	subnets, exits := rc.n.SubnetRoutes(), rc.n.ExitRoutes()
 
 	var dsts []literalEntry
 
 	for _, p := range ge.viaDsts {
-		if slices.ContainsFunc(subnets, p.Overlaps) {
+		if slices.ContainsFunc(subnets, p.Overlaps) || slices.ContainsFunc(exits, p.Overlaps) {
 			dsts = append(dsts, literalEntry{str: filterIP(p), r: netipx.RangeOfPrefix(p)})
 		}
 	}
