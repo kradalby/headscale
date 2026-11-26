@@ -1025,6 +1025,10 @@ func (idx *sideIndex) inRange(r netipx.IPRange) []types.NodeID {
 // the list as we see relationships while building the map, making it
 // O(n^2/2) in the end, but with less work per node.
 //
+// No session reads this map: the peers a client is sent come from the
+// graph's peer classes, and the sides audit holds those to this map. Every
+// listing here, the one-way ones included, is that oracle's reading.
+//
 //nolint:gocyclo // global and autogroup:self paths, each with a per-node matcher index
 func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[types.NodeID][]types.NodeID {
 	if pm == nil {

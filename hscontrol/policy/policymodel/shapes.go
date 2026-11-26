@@ -535,6 +535,21 @@ var Required = append([]Shape{
 		return v.anyRule(func(r Rule, _ bool) bool { return r.selfRule() && len(r.Dst) > 1 })
 	}},
 	{Name: "via-grant", Why: "via steering", Min: 0.09, World: func(v *View) bool { return v.anyRule(func(r Rule, _ bool) bool { return len(r.Via) > 0 }) }},
+	{Name: "via-exit-route", Why: "a via grant to a public prefix served by an exit route alone", Min: 0.01, World: func(v *View) bool {
+		return v.anyRule(func(r Rule, _ bool) bool {
+			return len(r.Via) > 0 && slices.ContainsFunc(r.Dst, func(d Dest) bool {
+				if d.Sel.Kind != SelPrefix && d.Sel.Kind != SelHost || !public(v.selPrefix(d.Sel)) {
+					return false
+				}
+
+				return v.anyNode(func(n Node) bool {
+					return n.Exit() && carries(n, r.Via) && !slices.ContainsFunc(served(n), func(rt int) bool {
+						return rt < exit4 && Prefixes[rt].Overlaps(v.selPrefix(d.Sel))
+					})
+				})
+			})
+		})
+	}},
 	{Name: "via-routers-of-one-route", Why: "the via election choosing between two routers", Min: 0.035, World: func(v *View) bool {
 		return v.anyRule(func(r Rule, _ bool) bool {
 			for route := range numRulePrefixes {
