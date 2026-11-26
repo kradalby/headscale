@@ -35,7 +35,8 @@ declare -A PKG=(
 # Cases per run: by package, unless the test is named. Cheap properties get more.
 declare -A DEPTH=([mapper]=2000 [v2]=5000 [state]=5000 [servertest]=1000)
 declare -A CHECKS=(
-	[TestDeliveryConvergesThroughTheClient]=1000
+	[TestDeliveryConvergesThroughTheClient]=1000 [TestDeliveryConcurrentReportsToSameNode]=500
+	[TestDeliveryPolicyFileReplacementHistory]=1000
 	[TestChunkDeltaConverges]=50000 [TestChunkEncodingRoundTrips]=50000
 	[TestMatcherRouteRangesMatchPrefixes]=50000 [TestBuildPeerMapMatchesPrefixReference]=50000
 )
