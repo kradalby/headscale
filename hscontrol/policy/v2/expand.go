@@ -19,6 +19,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/puzpuzpuz/xsync/v4"
 	"go4.org/netipx"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/views"
@@ -623,7 +624,7 @@ func (x *Expansion) expandGrant(gt *GrantTemplate) grantExpansion {
 		return ge
 	}
 
-	for _, id := range gt.dsts {
+	for _, id := range gt.appDsts {
 		res, err := x.resolve(id)
 		if err != nil || res == nil {
 			continue
@@ -768,11 +769,18 @@ func (x *Expansion) Filter() []tailcfg.FilterRule {
 
 		var grants []tailcfg.CapGrant
 
-		for _, id := range gt.dsts {
+		for _, id := range gt.appDsts {
 			res, err := x.resolve(id)
-			if err == nil && res != nil {
-				grants = append(grants, tailcfg.CapGrant{Dsts: res.Prefixes(), CapMap: gt.app})
+			if err != nil || res == nil {
+				continue
 			}
+
+			dsts := res.Prefixes()
+			if x.table.Selector(id).Kind == SelectorWildcard {
+				dsts = []netip.Prefix{tsaddr.AllIPv4(), tsaddr.AllIPv6()}
+			}
+
+			grants = append(grants, tailcfg.CapGrant{Dsts: dsts, CapMap: gt.app})
 		}
 
 		rules = append(rules, tailcfg.FilterRule{SrcIPs: srcs, CapGrant: grants})
@@ -2616,11 +2624,7 @@ func (x *Expansion) capGrantRules(gt *GrantTemplate, ge *grantExpansion, rc rece
 		grants []tailcfg.CapGrant
 	)
 
-	// TODO(kradalby): policy/app-values-repeated: one CapGrant per
-	// destination entry, so a grant naming the receiver twice ("dst":
-	// ["*", "*"]) gives its values twice (cosmetic). Tolerated, with what
-	// settles it, in verdictClasses.judge (policy/v2/reference_test.go).
-	for _, id := range gt.dsts {
+	for _, id := range gt.appDsts {
 		res, err := x.resolve(id)
 		if err != nil || res == nil {
 			continue

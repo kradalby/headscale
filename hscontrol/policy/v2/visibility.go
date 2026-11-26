@@ -219,6 +219,9 @@ const (
 	ctxResolve
 	// ctxResolveOK skips a resolution with an error.
 	ctxResolveOK
+	// ctxCapDst is a capability's destinations: ctxResolveOK, but * is
+	// every address, as in ctxPortDst.
+	ctxCapDst
 )
 
 var (
@@ -236,18 +239,14 @@ func (p *sidePlan) atoms(id SelectorID, ctx atomCtx, out []Role) []Role {
 	switch {
 	case s.Kind.HoldsNodes():
 		return append(out, SelectorRole(id))
-	// TODO(kradalby): policy/app-wildcard: * is everything only as a port
-	// destination; as an app destination it is the tailnet's ranges, so it
-	// gives no subnet route and shows no exit node (fails closed). See
-	// policymodel.AppWildcard.
-	case s.Kind == SelectorDangerAll, s.Kind == SelectorWildcard && ctx == ctxPortDst:
+	case s.Kind == SelectorDangerAll, s.Kind == SelectorWildcard && (ctx == ctxPortDst || ctx == ctxCapDst):
 		return append(out, atomAll)
 	case s.Kind == SelectorSelf, s.Kind == SelectorUnresolvable:
 		return out
 	}
 
 	l := p.t.literals[id]
-	if l.res == nil || ctx == ctxResolveOK && l.err != nil {
+	if l.res == nil || (ctx == ctxResolveOK || ctx == ctxCapDst) && l.err != nil {
 		return out
 	}
 
@@ -268,11 +267,11 @@ func (p *sidePlan) inet(ids []SelectorID, ctx atomCtx) bool {
 
 		switch {
 		case s.Kind.HoldsNodes(), s.Kind == SelectorSelf, s.Kind == SelectorUnresolvable:
-		case s.Kind == SelectorDangerAll, s.Kind == SelectorWildcard && ctx == ctxPortDst:
+		case s.Kind == SelectorDangerAll, s.Kind == SelectorWildcard && (ctx == ctxPortDst || ctx == ctxCapDst):
 			return true
 		default:
 			l := p.t.literals[id]
-			if l.res != nil && (ctx != ctxResolveOK || l.err == nil) && p.litInet[id] {
+			if l.res != nil && (ctx != ctxResolveOK && ctx != ctxCapDst || l.err == nil) && p.litInet[id] {
 				return true
 			}
 		}
@@ -373,12 +372,12 @@ func newSidePlan(t *Templates) *sidePlan {
 
 			if gt.app != nil && slices.ContainsFunc(gt.dsts, p.resolvesOK) {
 				gs.capg = true
-				gs.capDst = p.atomsOf(gt.dsts, ctxResolveOK)
-				gs.capInet = p.inet(gt.dsts, ctxResolveOK)
+				gs.capDst = p.atomsOf(gt.dsts, ctxCapDst)
+				gs.capInet = p.inet(gt.dsts, ctxCapDst)
 
 				gs.comp = hasCompanion(gt.app)
 				if gs.comp {
-					gs.compSrc = slices.Clone(gs.capDst)
+					gs.compSrc = p.atomsOf(gt.dsts, ctxResolveOK)
 					if gt.dstWildcard {
 						gs.compSrc = append(gs.compSrc, atomApproved)
 						slices.SortFunc(gs.compSrc, compareRoles)

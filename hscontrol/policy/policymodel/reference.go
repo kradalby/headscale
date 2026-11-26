@@ -398,24 +398,6 @@ const (
 	// in policy/v2/expand.go. Delete the clause once production follows
 	// the captures grant-via-reach-a and grant-via-router-covered.
 	ViaReach
-	// AppWildcard: * in an app grant is everything as a destination, as
-	// it is for the grant's ports: a viewer among its sources gets subnet
-	// routes by it as by an app grant to the subnet (captured, via golden
-	// v84), and a companion to * reaches the internet, so exit nodes see
-	// its sources. Headscale reads * as the tailnet's ranges for app
-	// capabilities, both ways. Fails closed.
-	//
-	// TODO(kradalby): policy/app-wildcard: fails closed. With an app grant
-	// `autogroup:member -> *`, a member is not given a router's
-	// 10.0.0.0/24, which an app grant to 10.0.0.0/24 would give (via
-	// golden v84); with a companion to *, an exit node is not shown the
-	// sources. No capture holds * as an app destination. The properties in
-	// policy/v2/reference_test.go count it under "* as app destination".
-	// Production: sidePlan.atoms and sidePlan.inet in
-	// policy/v2/visibility.go take * as everything only as a port
-	// destination. Delete the clause once one reading is chosen: fix
-	// production, or make headscale's reading the reference's own.
-	AppWildcard
 	// ViaRouterCover: a via grant links its sources with its routers,
 	// nothing else. Headscale links a via router that is itself among the
 	// grant's sources also with every node whose subnet route holds one
@@ -502,7 +484,7 @@ const (
 // ContestedClauses is every contested clause, in the order a property
 // tries them.
 var ContestedClauses = []Contested{
-	OthersSelf, ViaReach, AppWildcard, ViaRouterCover,
+	OthersSelf, ViaReach, ViaRouterCover,
 	ViaRouterExitRoutes, ViaExitSourceRoutes,
 }
 
@@ -514,7 +496,7 @@ func (c Contested) FailsOpen() bool {
 
 func (c Contested) String() string {
 	names := []string{
-		"others' self rules", "via reach", "* as app destination",
+		"others' self rules", "via reach",
 		"via router covered", "via router exit routes", "via exit source routes",
 	}
 
@@ -553,6 +535,10 @@ type refRule struct {
 	// terms are the destinations one entry at a time, as a node is sent
 	// them; none stands for dst as one entry.
 	terms []dstTerm
+	// appDsts are the destination entries of an app grant, each once: a
+	// node is granted the capability once for each that names it. None
+	// stands for dst as one entry.
+	appDsts []*netipx.IPSet
 	// internet: a via rule names autogroup:internet, which only its exit
 	// nodes serve; dst leaves it out.
 	internet bool
@@ -631,6 +617,14 @@ func newRef(doc Doc, users []User, nodes []RefNode, without Contested) *Ref {
 		// and has the route given by it (routes-internet-public-subnet).
 		base := refRule{src: r.srcAddrs(d.Src), dst: r.addrs(dsts, false), terms: r.terms(dsts), ip: d.IP, app: d.App}
 
+		// Quirk: an entry the document repeats counts once
+		// (grant-app-destination-repeated).
+		for i, t := range dsts {
+			if len(d.App) > 0 && !slices.Contains(dsts[:i], t) {
+				base.appDsts = append(base.appDsts, r.addrs([]string{t}, false))
+			}
+		}
+
 		if len(d.Via) > 0 {
 			// Quirk: via restricts a grant's ip part only; its app part
 			// reaches and shows what a grant without via would (via goldens
@@ -648,21 +642,11 @@ func newRef(doc Doc, users []User, nodes []RefNode, without Contested) *Ref {
 			base.ip = nil
 		}
 
-		if without&AppWildcard != 0 && len(d.App) > 0 {
-			app := base
-			app.ip, app.dst, app.terms = nil, r.starAsTailnet(dsts), nil
-			base.app = nil
-			r.add(app, r.srcAddrs(dsts), r.starAsTailnet(d.Src))
-
-			// The clause reads * alone: the grant's autogroup:self part
-			// keeps its capabilities.
-			if self {
-				r.addSelf(app)
-			}
-		}
-
 		if len(dsts) > 0 {
-			r.add(base, r.srcAddrs(dsts), r.addrs(d.Src, false))
+			// A companion's destinations are the grant's sources as they
+			// resolve: * the tailnet's ranges. Headscale's reading; no
+			// capture holds a companion from an exit node's view.
+			r.add(base, r.srcAddrs(dsts), r.starAsTailnet(d.Src))
 		}
 
 		if self {
@@ -699,7 +683,7 @@ func (r *Ref) addSelf(rl refRule) {
 		}
 
 		self := rl
-		self.src, self.dst, self.terms, self.owner = named, addrsOf(devices), nodeTerms(devices), u
+		self.src, self.dst, self.terms, self.appDsts, self.owner = named, addrsOf(devices), nodeTerms(devices), nil, u
 
 		r.add(self, self.dst, self.src)
 	}
@@ -744,7 +728,7 @@ func nodeTerms(nodes []RefNode) []dstTerm {
 }
 
 // starAsTailnet is what terms name as destinations, reading * as the
-// tailnet's ranges: headscale's reading where a clause is contested.
+// tailnet's ranges.
 func (r *Ref) starAsTailnet(terms []string) *netipx.IPSet {
 	rest := slices.DeleteFunc(slices.Clone(terms), func(t string) bool { return t == "*" })
 	if len(rest) == len(terms) {
@@ -1068,16 +1052,29 @@ func (r *Ref) Rules(id types.NodeID) []tailcfg.FilterRule {
 		// never at addresses it routes, subnet or exit (grant goldens a1,
 		// a3, c1-c6, k11-k25 with * at subnet routers; via goldens v84-v104
 		// with a subnet or a public prefix).
-		var own netipx.IPSetBuilder
-
-		for _, a := range n.Addrs {
-			own.Add(a)
+		entries := rl.appDsts
+		if entries == nil {
+			entries = []*netipx.IPSet{dst}
 		}
 
-		own.Intersect(dst)
+		var grants []tailcfg.CapGrant
 
-		if caps, _ := own.IPSet(); len(rl.app) > 0 && len(caps.Prefixes()) > 0 {
-			out = append(out, tailcfg.FilterRule{SrcIPs: srcs, CapGrant: []tailcfg.CapGrant{{Dsts: caps.Prefixes(), CapMap: rl.app}}})
+		for _, entry := range entries {
+			var own []netip.Prefix
+
+			for _, a := range n.Addrs {
+				if entry.Contains(a) {
+					own = append(own, netip.PrefixFrom(a, a.BitLen()))
+				}
+			}
+
+			if len(own) > 0 {
+				grants = append(grants, tailcfg.CapGrant{Dsts: own, CapMap: rl.app})
+			}
+		}
+
+		if len(rl.app) > 0 && len(grants) > 0 {
+			out = append(out, tailcfg.FilterRule{SrcIPs: srcs, CapGrant: grants})
 		}
 	}
 

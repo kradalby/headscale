@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sync"
 
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -92,6 +93,9 @@ type GrantTemplate struct {
 	// dsts are the destinations other than autogroup:self, in policy
 	// order; for a via grant, every destination but autogroup:internet.
 	dsts []SelectorID
+	// appDsts is dsts as the capability names them: SaaS writes a
+	// destination the document repeats once there, and each time in ports.
+	appDsts []SelectorID
 	// dstWildcard is set when * is among dsts: a capability's companion
 	// rules then add the approved routes to their sources.
 	dstWildcard bool
@@ -255,6 +259,10 @@ func newGrantTemplate(table *SelectorTable, g Grant) (*GrantTemplate, error) {
 		case gt.kind != grantVia && s.Kind == SelectorSelf:
 			gt.kind = grantSelf
 		default:
+			if !slices.Contains(gt.dsts, s.ID) {
+				gt.appDsts = append(gt.appDsts, s.ID)
+			}
+
 			gt.dsts = append(gt.dsts, s.ID)
 			gt.dstWildcard = gt.dstWildcard || s.Kind == SelectorWildcard
 		}

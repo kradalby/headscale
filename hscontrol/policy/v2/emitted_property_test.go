@@ -42,12 +42,8 @@ func ruleDefect(rules []tailcfg.FilterRule, mode SourceMode) string {
 			return fmt.Sprintf("rule %d names no source", i)
 		case len(r.CapGrant) == 0 && len(slices.Compact(slices.Sorted(slices.Values(r.SrcIPs)))) != len(r.SrcIPs):
 			// A companion rule repeats its sources where the document
-			// repeats a destination; that one ruleQuirks counts.
-			//
-			// TODO(kradalby): policy/app-values-repeated: the same root as
-			// the repeated app values reference_test.go allows: a grant is
-			// written once per destination entry. Fold it into that
-			// decision.
+			// names a destination under two entries; that one ruleQuirks
+			// counts.
 			return fmt.Sprintf("rule %d repeats a source: %v", i, r.SrcIPs)
 		}
 

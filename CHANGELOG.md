@@ -202,6 +202,8 @@ See [the routes reference](docs/ref/routes.md) for the failover rules.
 - A grant with `via` accepts only prefixes, hosts and `autogroup:internet` as `dst`, as Tailscale does. A `dst` inside the Tailscale address ranges is rejected too, except the 4via6 range. A policy file that still uses one stops headscale at startup.
 - `tagOwners` rejects `user:*@domain`, as Tailscale does. List the users, or use a group.
 - A group holding `user:*@domain` owns its tags for that domain's users at login and for pre-auth keys, not only for their existing devices.
+- An `app` grant to `*` gives its sources the subnet routes of the tailnet's routers, as a grant with `ip` does and as Tailscale does.
+- An `app` grant that repeats a destination grants the capability once, as Tailscale does.
 
 #### Nodes and routes
 

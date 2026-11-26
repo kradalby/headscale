@@ -560,14 +560,26 @@ func (pol *Policy) compileOtherDests(
 			dstIPStrings []string
 		)
 
-		for _, dst := range otherDests {
+		for i, dst := range otherDests {
+			// SaaS writes a destination the document repeats once.
+			if slices.ContainsFunc(otherDests[:i], func(o Alias) bool { return o.String() == dst.String() }) {
+				continue
+			}
+
 			ips, err := pol.resolveAlias(dst, users, nodes)
 			if err != nil {
 				continue
 			}
 
+			capDsts := ips.Prefixes()
+			// * is every address as a destination, as for ports: SaaS gives
+			// the sources the subnet routes. A receiver is sent its own.
+			if _, wildcard := dst.(Asterix); wildcard {
+				capDsts = []netip.Prefix{tsaddr.AllIPv4(), tsaddr.AllIPv6()}
+			}
+
 			capGrants = append(capGrants, tailcfg.CapGrant{
-				Dsts:   ips.Prefixes(),
+				Dsts:   capDsts,
 				CapMap: grant.App,
 			})
 
