@@ -1418,6 +1418,51 @@ func (u *sidesUpdate) relone(l1 []types.NodeID, approvalsMoved bool) []types.Nod
 	return lones
 }
 
+// selfUsers returns, sorted, the users with a device inside what routed
+// node id reaches, its own among them: those its side set holds an owner
+// of, through an address it shares or a subnet route's cover, and on an
+// exit route every owner with a node of its family, all of them for both.
+// It reports false for a node the sides do not hold.
+func (s Sides) selfUsers(id types.NodeID, owners func() []uint) ([]uint, bool) {
+	f, ok := s.facts.Get(id)
+	if !ok {
+		return nil, false
+	}
+
+	rs, ok := s.sets.Get(id)
+	if !ok {
+		return nil, false
+	}
+
+	users := map[uint]struct{}{}
+
+	if f.owned {
+		users[f.owner] = struct{}{}
+	}
+
+	for r := range rs.All() {
+		if r.kind == roleHeldOwner {
+			users[uint(r.value)] = struct{}{}
+		}
+	}
+
+	switch len(f.exits) {
+	case 0:
+	case 1:
+		for _, c := range s.loneCover[family(f.exits[0].Addr())] {
+			if uid, ok := c.r.Owner(); ok {
+				users[uid] = struct{}{}
+			}
+		}
+	default:
+		for _, uid := range owners() {
+			users[uid] = struct{}{}
+		}
+	}
+
+	return slices.Sorted(maps.Keys(users)), true
+}
+
 // coveredAtoms appends a covered atom for each user other than f's owner
 // with a router whose subnet route holds an address of f's node, a source
 // of its own user's self rules. SaaS lists such a device on every device of

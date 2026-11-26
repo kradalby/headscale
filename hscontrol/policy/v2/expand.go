@@ -318,6 +318,10 @@ type Expansion struct {
 	ownersOnce sync.Once
 	owners     []uint
 
+	// sides, when the filters follow a commit's, tells a router which
+	// users' devices its routes hold without reading the nodes.
+	sides *Sides
+
 	mu   sync.Mutex
 	self map[selfKey]*ownRules
 
@@ -986,6 +990,9 @@ func (f *Filters) expansion() (*Expansion, error) {
 		expansionBuilds.Add(1)
 
 		f.x, f.err = NewExpansion(f.t, f.posts, f.routes, f.node)
+		if f.err == nil && f.hasSides {
+			f.x.sides = &f.sides
+		}
 	})
 
 	return f.x, f.err
@@ -2750,16 +2757,7 @@ func (x *Expansion) cutSelf(c *cut, g int) {
 
 	switch n := c.rc.n; {
 	case c.rc.routed:
-		for _, uid := range x.ownerIDs() {
-			own := nodeHasUserIdentity(n) && n.User().ID() == uid
-			if own || slices.ContainsFunc(x.posts.Nodes(OwnerRole(uid)), func(id types.NodeID) bool {
-				m, ok := x.node(id)
-
-				return ok && slices.ContainsFunc(m.IPs(), c.rc.reach.Contains)
-			}) {
-				uids = append(uids, uid)
-			}
-		}
+		uids = x.routedSelfUsers(c.rc)
 	case nodeHasUserIdentity(n):
 		uids = []uint{n.User().ID()}
 	}
@@ -2790,6 +2788,33 @@ func (x *Expansion) cutSelf(c *cut, g int) {
 			c.emit(rule, "", o.key, nil, anchor, pos, shapeSelf)
 		}
 	}
+}
+
+// routedSelfUsers returns, sorted, the users whose self rules routed
+// receiver rc is cut: its own and those with a device inside what it
+// reaches. Filters following a commit read them off its sides, at the cost
+// of what rc routes over; others walk every owner's nodes.
+func (x *Expansion) routedSelfUsers(rc receiver) []uint {
+	if x.sides != nil {
+		if uids, ok := x.sides.selfUsers(rc.n.ID(), x.ownerIDs); ok {
+			return uids
+		}
+	}
+
+	var uids []uint
+
+	for _, uid := range x.ownerIDs() {
+		own := nodeHasUserIdentity(rc.n) && rc.n.User().ID() == uid
+		if own || slices.ContainsFunc(x.posts.Nodes(OwnerRole(uid)), func(id types.NodeID) bool {
+			m, ok := x.node(id)
+
+			return ok && slices.ContainsFunc(m.IPs(), rc.reach.Contains)
+		}) {
+			uids = append(uids, uid)
+		}
+	}
+
+	return uids
 }
 
 // cutOwn cuts an owner's rule for rc: the destinations that reach it, or,

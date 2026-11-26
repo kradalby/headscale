@@ -385,6 +385,45 @@ func TestExpansionCostFollowsReceiver(t *testing.T) {
 	assert.LessOrEqual(t, allocs[1000], allocs[100]+2, "a receiver's filter grows with the tailnet")
 }
 
+// TestRouterSelfRulesCostFollowsCover holds a router's autogroup:self cut
+// to what its routes cover: with a route over no device, cutting its filter
+// from filters following the commit's sides reads no node, in a tailnet of
+// any size.
+func TestRouterSelfRulesCostFollowsCover(t *testing.T) {
+	const self = `{"tagOwners": {"tag:lan": []}, "acls": [
+		{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]},
+		{"action": "accept", "src": ["autogroup:member"], "dst": ["10.250.0.0/24:*"]}]}`
+
+	lookups := map[int]int{}
+
+	for _, n := range []int{100, 1000} {
+		users, nodes := benchNodes(n)
+		nodes = append(nodes, sideNode(types.NodeID(n+1), nil, "100.127.0.1", "", []string{"tag:lan"}, "10.250.0.0/24")) //nolint:gosec // small
+
+		pm, err := NewPolicyManager([]byte(self), users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		m := newSideModel(t, pm, users, nodes)
+		x, err := FollowFilters(nil, m.t, m.posts, m.appr, nodes.ViewSlice(), m.sides).expansion()
+		require.NoError(t, err)
+
+		router := nodes[len(nodes)-1].View()
+		require.NotEmpty(t, x.FilterForNode(router))
+
+		node := x.node
+		x.node = func(id types.NodeID) (types.NodeView, bool) {
+			lookups[n]++
+
+			return node(id)
+		}
+
+		x.FilterForNode(router)
+	}
+
+	t.Logf("nodes read cutting a router's filter: %v", lookups)
+	assert.LessOrEqual(t, lookups[1000], lookups[100], "a router's self rules read the whole tailnet")
+}
+
 // TestAuditFiltersRequiresSortedNodes holds the audit to the order the
 // expansion assumes: the compile lists an owner's nodes in list order, the
 // postings in ID order, so the two agree only on a list sorted by ID.
