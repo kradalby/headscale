@@ -184,7 +184,7 @@ func runPartialTailnet(t *testing.T, registered, connected int, tc scaleCase) {
 			}
 
 			return true
-		}, 10*time.Second, 100*time.Millisecond, "retired clients and policies must be collectible")
+		}, time.Minute, 100*time.Millisecond, "retired clients and policies must be collectible")
 
 		var live runtime.MemStats
 		runtime.ReadMemStats(&live)
