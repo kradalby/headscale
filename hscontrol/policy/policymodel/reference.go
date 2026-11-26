@@ -1063,12 +1063,31 @@ func (r *Ref) onDst(rl refRule, n RefNode) bool {
 
 // viaRouter reports whether n is one of via rule rl's routers to its
 // peers: it carries a via tag and a subnet route of it overlaps a
-// destination, or it is an exit node and a destination is on the internet.
+// destination, or it is an exit node and the rule names autogroup:internet
+// or a public destination its exit route's family holds.
 // Quirk: an exit node sent the rule for a private destination is shown
 // nobody by it, and a node routing over a router's address is not linked
-// with the router (grant-via-router-covered).
+// with the router (grant-via-router-covered). An exit node of the other
+// family than a public destination is sent no rule and linked with nobody.
 func (r *Ref) viaRouter(rl refRule, n RefNode) bool {
-	return n.hasTag(rl.via) && (slices.ContainsFunc(n.subnets(), rl.dst.OverlapsPrefix) || n.exit() && rl.reachesInternet())
+	if !n.hasTag(rl.via) {
+		return false
+	}
+
+	return slices.ContainsFunc(n.subnets(), rl.dst.OverlapsPrefix) || rl.internet && n.exit() ||
+		slices.ContainsFunc(n.exitRoutes(), func(q netip.Prefix) bool { return publicIn(rl.dst, q) })
+}
+
+// publicIn reports whether set holds a public address inside q.
+func publicIn(set *netipx.IPSet, q netip.Prefix) bool {
+	var b netipx.IPSetBuilder
+
+	b.AddSet(set)
+	b.Intersect(internet)
+
+	public, _ := b.IPSet()
+
+	return public.OverlapsPrefix(q)
 }
 
 func (r *Ref) links(rl refRule, src, dst RefNode) bool { return on(src, rl.src) && r.onDst(rl, dst) }

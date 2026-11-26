@@ -317,6 +317,35 @@ func TestSidesQuirks(t *testing.T) {
 			peers: map[types.NodeID][]types.NodeID{1: {2, 3}, 2: {1, 3, 4}, 3: {1, 4}, 4: nil, 5: nil},
 		},
 		{
+			// A via grant to a public prefix is served through an exit route
+			// of the prefix's family: an exit node of the other family with
+			// the via tag (n4) gets no rule and is linked with nobody; the
+			// routers serving the grant list it, one way, as a lone exit
+			// route over a source.
+			name: "via-public-other-family",
+			policy: `{"tagOwners": {"tag:e": []}, "grants": [
+				{"src": ["alice@"], "dst": ["8.8.8.0/24"], "ip": ["*"], "via": ["tag:e"]}]}`,
+			nodes: types.Nodes{
+				sideNode(1, alice, "100.64.0.1", "fd7a:115c:a1e0::1", nil),
+				sideNode(2, nil, "100.64.0.2", "fd7a:115c:a1e0::2", []string{"tag:e"}, exit...),
+				sideNode(3, nil, "100.64.0.3", "fd7a:115c:a1e0::3", []string{"tag:e"}, "0.0.0.0/0"),
+				sideNode(4, nil, "100.64.0.4", "fd7a:115c:a1e0::4", []string{"tag:e"}, "::/0"),
+			},
+			peers: map[types.NodeID][]types.NodeID{1: {2, 3}, 2: {1, 3, 4}, 3: {1, 4}, 4: nil},
+		},
+		{
+			name: "via-public-other-family-v6",
+			policy: `{"tagOwners": {"tag:e": []}, "grants": [
+				{"src": ["alice@"], "dst": ["2001:4860::/32"], "ip": ["*"], "via": ["tag:e"]}]}`,
+			nodes: types.Nodes{
+				sideNode(1, alice, "100.64.0.1", "fd7a:115c:a1e0::1", nil),
+				sideNode(2, nil, "100.64.0.2", "fd7a:115c:a1e0::2", []string{"tag:e"}, exit...),
+				sideNode(3, nil, "100.64.0.3", "fd7a:115c:a1e0::3", []string{"tag:e"}, "0.0.0.0/0"),
+				sideNode(4, nil, "100.64.0.4", "fd7a:115c:a1e0::4", []string{"tag:e"}, "::/0"),
+			},
+			peers: map[types.NodeID][]types.NodeID{1: {2, 4}, 2: {1, 3, 4}, 3: nil, 4: {1, 3}},
+		},
+		{
 			// A rule without via lists no lone exit node: not the ACL's
 			// destination, not autogroup:self's devices, not an app
 			// grant's destinations or its companion's.

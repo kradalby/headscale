@@ -149,9 +149,10 @@ type grantSides struct {
 	viaTags     []SelectorID
 	viaDst      []SelectorID
 	viaInternet bool
-	// viaPublic: a destination holds a public address, which shows the
-	// sources an exit node carrying a via tag.
-	viaPublic bool
+	// viaPublic says, per family, whether a destination holds a public
+	// address of it, which an exit route of that family serves: such an
+	// exit node carrying a via tag is shown to the sources.
+	viaPublic [2]bool
 	viaPorts  bool
 }
 
@@ -297,6 +298,24 @@ func (p *sidePlan) inet(ids []SelectorID, ctx atomCtx) bool {
 	return false
 }
 
+// publicFamilies says, per family, whether the literal of one of ids holds a
+// public address of it.
+func (p *sidePlan) publicFamilies(ids []SelectorID) [2]bool {
+	var out [2]bool
+
+	for _, id := range ids {
+		if l := p.lit[id]; l != nil && p.resolvesOK(id) {
+			for _, pfx := range l.Prefixes() {
+				if util.TheInternet().OverlapsPrefix(pfx) {
+					out[family(pfx.Addr())] = true
+				}
+			}
+		}
+	}
+
+	return out
+}
+
 func (p *sidePlan) atomsOf(ids []SelectorID, ctx atomCtx) []Role {
 	var out []Role
 	for _, id := range ids {
@@ -369,7 +388,7 @@ func newSidePlan(t *Templates) *sidePlan {
 			gs.src = p.atomsOf(gt.srcs, ctxSrc)
 			gs.viaDst = gt.dsts
 			gs.viaInternet = gt.viaInternet
-			gs.viaPublic = p.inet(gt.dsts, ctxResolveOK)
+			gs.viaPublic = p.publicFamilies(gt.dsts)
 			gs.viaPorts = ports
 
 			for _, tag := range gt.via {
@@ -1797,7 +1816,8 @@ func (s Sides) namedBy(f *sideFacts, grants [][]Role) bool {
 
 // targetsOf returns the via grants f's node routes for: it carries one of
 // the via tags and a subnet route overlaps a destination, or it is an
-// exit node and the grant names the internet or a public address.
+// exit node and the grant names the internet, or a public address of the
+// family of one of its exit routes.
 func (s Sides) targetsOf(f *sideFacts) []int {
 	var out []int
 
@@ -1808,7 +1828,8 @@ func (s Sides) targetsOf(f *sideFacts) []int {
 			continue
 		}
 
-		if (gs.viaInternet || gs.viaPublic) && f.exit || s.routesOverlap(f, gs.viaDst) {
+		if gs.viaInternet && f.exit || slices.ContainsFunc(f.exits, func(q netip.Prefix) bool { return gs.viaPublic[family(q.Addr())] }) ||
+			s.routesOverlap(f, gs.viaDst) {
 			out = append(out, g)
 		}
 	}

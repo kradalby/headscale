@@ -1060,12 +1060,15 @@ func viaPeerRule(
 	prefixes, internet := viaDstsForNode(cg, node)
 
 	// A router is shown to the sources through a subnet route, or as an
-	// exit node when a destination is on the internet: SaaS shows nobody an
-	// exit node that is sent the rule for a private destination.
+	// exit node when a destination it is sent the rule for is on the
+	// internet: SaaS shows nobody an exit node sent the rule for a private
+	// destination, or none, for a public one of the other family.
 	subnets := node.SubnetRoutes()
-	if !internet && !slices.ContainsFunc(prefixes, func(p netip.Prefix) bool { return slices.ContainsFunc(subnets, p.Overlaps) }) &&
-		(!node.IsExitNode() || !reachInternet(cg.via.resolvedDsts) ||
-			!slices.ContainsFunc(cg.via.viaTags, func(t Tag) bool { return node.HasTag(string(t)) })) {
+	serves := internet || slices.ContainsFunc(prefixes, func(p netip.Prefix) bool {
+		return slices.ContainsFunc(subnets, p.Overlaps) || util.TheInternet().OverlapsPrefix(p)
+	})
+
+	if !serves {
 		return nil
 	}
 
