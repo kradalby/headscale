@@ -105,10 +105,10 @@ var viaCompatTests = []struct {
 	{"via-grant-v108", "a grant and an ACL with the same sources and IPProto"},
 	{"grant-app-wildcard-destination", "capability grant from members to the wildcard"},
 	{"grant-via-internet-exit-is-source", "the internet via tag:exit with the exit nodes among the sources"},
+	{"grant-app-destination-repeated", "capability grant naming the wildcard twice"},
 	{"grant-via-router-covered", "a subnet via tag:router, one holder with only an exit route over it"},
 	{"grant-via-reach-a", "a public prefix via tag:exit"},
 	{"grant-via-public-prefix-exit-routes", "a public prefix via tag:router, held by a router and an exit node"},
-	{"grant-app-destination-repeated", "capability grant naming the wildcard twice"},
 }
 
 // routesMapCompatTests lists routes captures replayed through the mapper.
