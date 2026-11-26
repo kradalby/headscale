@@ -546,6 +546,9 @@ func scanRandomPolicy(r *rand.Rand) []byte {
 		g := map[string]any{"src": src, "dst": dst, "ip": [][]string{{"*"}, {"tcp:443"}, {"icmp:*"}, {"udp:53", "tcp:22"}}[r.IntN(4)]}
 		if r.IntN(8) == 0 {
 			g["via"] = []string{[]string{"tag:router", "tag:exit"}[r.IntN(2)]}
+			// A via grant takes only prefixes outside the Tailscale ranges,
+			// and autogroup:internet.
+			g["dst"] = pick([]string{"lan", "10.1.0.0/24", "10.2.0.0/16", "192.168.5.0/24", "fd00:1::/64", "autogroup:internet"}, 1+r.IntN(2))
 
 			// Capability only: via changes nothing, unlike a via grant with ports.
 			if r.IntN(2) == 0 {

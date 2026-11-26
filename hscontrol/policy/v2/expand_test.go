@@ -962,6 +962,11 @@ func (g sideGen) docEdit(src []byte) ([]byte, string) {
 			to += d[len(aclBase(d)):]
 		}
 
+		// A via grant takes only prefixes outside the Tailscale ranges.
+		if _, via := rule["via"]; kind == "dst" && via {
+			to = g.pick("10.0.0.0/24", "10.0.0.0/16", "8.8.8.0/24", "hpub")
+		}
+
 		vs[i] = to
 	case "ports":
 		if acl {
