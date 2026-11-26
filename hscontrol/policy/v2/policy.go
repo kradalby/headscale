@@ -2549,7 +2549,7 @@ func (pm *PolicyManager) nodeOnlyMatchers(node types.NodeView, viaRules func(*co
 			}
 		case grantCategoryVia:
 			for _, rule := range viaRules(cg, node) {
-				ms = append(ms, matcher.MatchFromFilterRuleSrcs(rule, cg.via.srcSet))
+				ms = append(ms, matcher.MatchFromFilterRuleSrcs(rule, cg.via.srcSet).ViaRouter())
 			}
 		}
 	}

@@ -22,7 +22,22 @@ type Match struct {
 	// node; a capability to the internet changes who the exit node lists.
 	internet    bool
 	capInternet bool
+
+	// viaRouter marks a via grant's rule at one of its routers.
+	viaRouter bool
 }
+
+// ViaRouter returns m marked as a via grant's rule at one of its routers:
+// route access reads it from the destination side alone, as the router
+// forwards for the grant and is given nothing as one of its sources.
+func (m Match) ViaRouter() Match {
+	m.viaRouter = true
+
+	return m
+}
+
+// IsViaRouter reports whether m is marked by [Match.ViaRouter].
+func (m *Match) IsViaRouter() bool { return m.viaRouter }
 
 // newMatch unions the port and capability destinations into one set.
 func newMatch(srcs, ports, caps *netipx.IPSet) Match {

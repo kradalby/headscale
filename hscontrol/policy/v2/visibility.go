@@ -2415,11 +2415,6 @@ func (s Sides) viaRules(vs RoleSet, vf *sideFacts) []accessRule {
 		}
 
 		dsts := s.viaDstsFor(vf, gs)
-		// TODO(kradalby): policy/via-exit-source-routes: a via exit router
-		// among the grant's sources reads it as its own rule to the
-		// internet, so route access gives it every peer's public subnet
-		// route, which steering leaves (fails open in route access, closed
-		// in effect). See policymodel.ViaExitSourceRoutes.
 		if gs.viaInternet && vf.exit {
 			dsts = append(dsts, util.TheInternet().Prefixes()...)
 		}
@@ -2435,11 +2430,12 @@ func (s Sides) viaRules(vs RoleSet, vf *sideFacts) []accessRule {
 
 		set, _ := b.IPSet()
 
-		out = addRule(out, vs, accessRule{
-			src: gs.src, dstPrefixes: dsts,
-			isDst: slices.ContainsFunc(vf.ips, set.Contains) || slices.ContainsFunc(vf.routes, set.OverlapsPrefix),
-			inet:  util.HasInternetDestination(set),
-		})
+		// The router forwards for the grant: it reads the rule from the
+		// destination side alone, whether or not it is among the sources.
+		if slices.ContainsFunc(vf.ips, set.Contains) || slices.ContainsFunc(vf.routes, set.OverlapsPrefix) ||
+			util.HasInternetDestination(set) && vs.Has(atomExit) {
+			out = append(out, accessRule{src: gs.src, dstPrefixes: dsts, isDst: true})
+		}
 	}
 
 	return out

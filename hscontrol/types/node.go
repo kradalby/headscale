@@ -531,8 +531,8 @@ func (node *Node) CanAccessRoutes(
 		// If the node's approved subnet routes overlap the source set
 		// and the route overlaps the destination set, the router needs
 		// this route to forward traffic from its local subnet.
-		sides[i].isSrc = m.SrcsContainsIPs(ips...) ||
-			m.SrcsOverlapsPrefixes(subnetRoutes...)
+		sides[i].isSrc = !m.IsViaRouter() && (m.SrcsContainsIPs(ips...) ||
+			m.SrcsOverlapsPrefixes(subnetRoutes...))
 
 		// Reverse: traffic from the route's subnet is destined for
 		// this node's subnets; the router needs the route for return
