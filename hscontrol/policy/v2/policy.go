@@ -1165,6 +1165,7 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 		if slices.ContainsFunc(ms, func(m matcher.Match) bool { return m.IsViaRouter() }) {
 			ownMatchers[node.ID()] = slices.DeleteFunc(slices.Clone(ms), func(m matcher.Match) bool { return m.IsViaRouter() })
 		}
+
 		capSrc[node.ID()] = slices.ContainsFunc(ms, func(m matcher.Match) bool {
 			return m.CapDestsIsTheInternet() &&
 				matcherReachesSource(&m, node.IPs(), routeInfo[node.ID()].subnet)
@@ -2678,7 +2679,7 @@ func (pm *PolicyManager) nodeOnlyMatchers(node types.NodeView, viaRules func(*co
 			}
 		case grantCategoryVia:
 			for _, rule := range viaRules(cg, node) {
-				ms = append(ms, matcher.MatchFromFilterRuleSrcs(rule, cg.via.srcSet).ViaRouter())
+				ms = append(ms, matcher.ViaRouter(matcher.MatchFromFilterRuleSrcs(rule, cg.via.srcSet)))
 			}
 		}
 	}

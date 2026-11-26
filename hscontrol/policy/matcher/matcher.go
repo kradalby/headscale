@@ -30,13 +30,13 @@ type Match struct {
 // ViaRouter returns m marked as a via grant's rule at one of its routers:
 // route access reads it from the destination side alone, as the router
 // forwards for the grant and is given nothing as one of its sources.
-func (m Match) ViaRouter() Match {
+func ViaRouter(m Match) Match {
 	m.viaRouter = true
 
 	return m
 }
 
-// IsViaRouter reports whether m is marked by [Match.ViaRouter].
+// IsViaRouter reports whether m is marked by [ViaRouter].
 func (m *Match) IsViaRouter() bool { return m.viaRouter }
 
 // newMatch unions the port and capability destinations into one set.
