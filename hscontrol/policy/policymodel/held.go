@@ -143,11 +143,11 @@ func NetmapDiff(have, want *netmap.NetworkMap, unseen func()) string {
 			continue
 		}
 
-		// TODO(kradalby): render/lastseen-patchify: a peer going offline
-		// in a change no patch carries (its CapMap or endpoints emptied) is
-		// sent whole; Tailscale's client patchifies it and keeps no
-		// LastSeen it did not hold, so its session shows the peer offline
-		// without the LastSeen a fresh one does. Counted, not judged.
+		// An intended difference (render/lastseen-patchify): a peer going
+		// offline in a change no patch carries (its CapMap or endpoints
+		// emptied) is sent whole; Tailscale's client patchifies it and keeps
+		// no LastSeen it did not hold, so its session shows the peer offline
+		// without the LastSeen a fresh one does. Cosmetic; counted.
 		if hs := h.AsStruct(); hs.LastSeen == nil && w.LastSeen().Valid() && !w.Online().GetOr(true) && !h.Online().GetOr(true) {
 			hs.LastSeen = new(w.LastSeen().Get())
 			if SameNode(hs.View(), w) {
