@@ -1811,8 +1811,7 @@ func newSideAdjacency(plan *sidePlan) *sideAdjacency {
 	return a
 }
 
-// pairs returns the atoms linked to r by value: a user's own atoms, a
-// router's.
+// pairs returns the atoms linked to r by value: a user's own atoms.
 func pairs(r Role) []Role {
 	v := r.value
 
@@ -1829,10 +1828,6 @@ func pairs(r Role) []Role {
 		return []Role{{kind: roleHeldOwner, value: v}}
 	case roleNamedApp:
 		return []Role{{kind: roleHeldOwner, value: v}}
-	case roleRouter:
-		return []Role{{kind: roleRouterOnSrc, value: v}}
-	case roleRouterOnSrc:
-		return []Role{{kind: roleRouter, value: v}}
 	}
 
 	return nil

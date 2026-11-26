@@ -1026,11 +1026,8 @@ func reachInternet(prefixes []netip.Prefix) bool {
 // sources. It names the router's own addresses: the filter rule names the route,
 // which would also link a router that is a source to everything else serving
 // that route, and via-grant-v81 shows SaaS does not.
-//
-// shortcut: a node with an approved route over the router's address also matches,
-// as for any rule naming a node. Bind the link to the router if that shape matters.
-// TODO(kradalby): policy/via-peer-shortcut: decide whether that shape matters;
-// no capture or property covers it.
+// The peer map reads it with the router as destination only, so a node
+// routing over the router's address is not linked by it.
 func viaPeerRule(
 	cg *compiledGrant,
 	node types.NodeView,

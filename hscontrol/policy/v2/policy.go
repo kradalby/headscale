@@ -1143,11 +1143,20 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 	// Reduced rules only show destinations where the node is the target,
 	// but peer relationships require the full bidirectional access rules.
 	nodeMatchers := make(map[types.NodeID][]matcher.Match, nodes.Len())
+	// ownMatchers leaves out a node's rules as a via router, which link it
+	// with the grant's sources alone: read with the router as their
+	// source, they would link it with whatever routes over its address.
+	ownMatchers := make(map[types.NodeID][]matcher.Match, nodes.Len())
 	capSrc := make(map[types.NodeID]bool, nodes.Len())
 
 	for _, node := range nodes.All() {
 		ms := pm.nodeMatchers(node, viaPeerRule)
 		nodeMatchers[node.ID()] = ms
+
+		ownMatchers[node.ID()] = ms
+		if slices.ContainsFunc(ms, func(m matcher.Match) bool { return m.IsViaRouter() }) {
+			ownMatchers[node.ID()] = slices.DeleteFunc(slices.Clone(ms), func(m matcher.Match) bool { return m.IsViaRouter() })
+		}
 		capSrc[node.ID()] = slices.ContainsFunc(ms, func(m matcher.Match) bool {
 			return m.CapDestsIsTheInternet() &&
 				matcherReachesSource(&m, node.IPs(), routeInfo[node.ID()].subnet)
@@ -1179,8 +1188,8 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 			//      using nodeI's matchers? (reverse direction: the matchers
 			//      on the via node accept traffic FROM the source)
 			// Same for matchersJ in both directions.
-			canIAccessJ := hasFilterI && nodeI.CanAccessWithRoutes(matchersI, nodeJ, riI.subnet, riJ.subnet, riJ.isExit)
-			canJAccessI := hasFilterJ && nodeJ.CanAccessWithRoutes(matchersJ, nodeI, riJ.subnet, riI.subnet, riI.isExit)
+			canIAccessJ := hasFilterI && nodeI.CanAccessWithRoutes(ownMatchers[nodeI.ID()], nodeJ, riI.subnet, riJ.subnet, riJ.isExit)
+			canJAccessI := hasFilterJ && nodeJ.CanAccessWithRoutes(ownMatchers[nodeJ.ID()], nodeI, riJ.subnet, riI.subnet, riI.isExit)
 			canJReachI := hasFilterI && nodeJ.CanAccessWithRoutes(matchersI, nodeI, riJ.subnet, riI.subnet, riI.isExit)
 			canIReachJ := hasFilterJ && nodeI.CanAccessWithRoutes(matchersJ, nodeJ, riI.subnet, riJ.subnet, riJ.isExit)
 

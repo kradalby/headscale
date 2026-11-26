@@ -387,48 +387,23 @@ const (
 	// visibility.go. Delete the clause once one reading is chosen: fix
 	// production, or make headscale's reading the reference's own.
 	OthersSelf Contested = 1 << iota
-	// ViaRouterCover: a via grant links its sources with its routers,
-	// nothing else. Headscale links a via router that is itself among the
-	// grant's sources also with every node whose subnet route holds one
-	// of its addresses, both ways, and with no other source: its via peer
-	// rule is the router's own (sources to the router's addresses), and a
-	// pair is linked through a rule one of the two receives, so the
-	// covering node, on that rule's destination side, is linked only with
-	// the router, on its source side. Fails open, for visibility only.
-	//
-	// TODO(kradalby): policy/via-router-cover: fails open, peers only.
-	// With `alice@ -> 10.0.0.0/24 via tag:a`, n1 alice on 100.64.0.1, n2 a
-	// tag:a router of 10.0.0.0/24 and of 100.64.0.0/30 (so a source, by
-	// a route over n1) on 100.64.0.2, and n3 bob routing 100.64.0.2/32, n2
-	// and n3 are shown each other, though n3 is neither a source nor a via
-	// router; n1 and n3 are not. No capture or document decides it. The
-	// properties in policy/v2/reference_test.go and the delivery property
-	// count it under "via router covered";
-	// TestViaRouterCoverIsHeadscalesReading pins the clause to what
-	// headscale does. Production: viaPeerRule in policy/v2/compiled.go
-	// names the router's addresses, the compile's peer map in policy.go
-	// links a pair through a rule either node receives, and Sides restates
-	// both as roleRouter and roleRouterOnSrc (policy/v2/visibility.go).
-	// Delete the clause once a via router is linked with its grant's
-	// sources alone.
-	ViaRouterCover
 )
 
 // ContestedClauses is every contested clause, in the order a property
 // tries them.
 var ContestedClauses = []Contested{
-	OthersSelf, ViaRouterCover,
+	OthersSelf,
 }
 
 // FailsOpen reports whether headscale's side of c admits what the
 // reference refuses.
 func (c Contested) FailsOpen() bool {
-	return c&ViaRouterCover != 0
+	return false
 }
 
 func (c Contested) String() string {
 	names := []string{
-		"others' self rules", "via router covered",
+		"others' self rules",
 	}
 
 	var parts []string
@@ -1058,10 +1033,6 @@ func (r *Ref) sees(n, m RefNode) bool {
 		if r.oneWay(rl, n, m) {
 			return true
 		}
-
-		if r.without&ViaRouterCover != 0 && (r.coversSourceRouter(rl, n, m) || r.coversSourceRouter(rl, m, n)) {
-			return true
-		}
 	}
 
 	return false
@@ -1095,28 +1066,12 @@ func (r *Ref) onDst(rl refRule, n RefNode) bool {
 	return r.viaRouter(rl, n)
 }
 
-// coversSourceRouter reports whether n routes over an address of router,
-// a router of via rule rl as headscale picks them (a via tag, and a subnet
-// route overlapping rl's destinations or an exit route under
-// autogroup:internet) that is among rl's sources: the link
-// [ViaRouterCover] restates.
-func (r *Ref) coversSourceRouter(rl refRule, router, n RefNode) bool {
-	if len(rl.via) == 0 || rl.owner != 0 || !router.hasTag(rl.via) || !on(router, rl.src) {
-		return false
-	}
-
-	if !slices.ContainsFunc(router.subnets(), rl.dst.OverlapsPrefix) && (!rl.internet || !router.exit()) {
-		return false
-	}
-
-	return slices.ContainsFunc(n.subnets(), func(q netip.Prefix) bool { return slices.ContainsFunc(router.Addrs, q.Contains) })
-}
-
 // viaRouter reports whether n is one of via rule rl's routers to its
 // peers: it carries a via tag and a subnet route of it overlaps a
 // destination, or it is an exit node and a destination is on the internet.
 // Quirk: an exit node sent the rule for a private destination is shown
-// nobody by it (grant-via-router-covered).
+// nobody by it, and a node routing over a router's address is not linked
+// with the router (grant-via-router-covered).
 func (r *Ref) viaRouter(rl refRule, n RefNode) bool {
 	return n.hasTag(rl.via) && (slices.ContainsFunc(n.subnets(), rl.dst.OverlapsPrefix) || n.exit() && rl.reachesInternet())
 }

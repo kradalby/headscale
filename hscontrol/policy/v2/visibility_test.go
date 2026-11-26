@@ -653,10 +653,9 @@ func BenchmarkRolePeersBuild(b *testing.B) {
 // TestSidesIncremental moves, one write at a time, the shapes whose side
 // sets an update reaches only through another node: an approval that puts
 // an address inside "*"; a UserID that leaves the clique; a route that
-// comes to cover a member; a via router whose router atom reaches, then
-// leaves, the router over its address. Peers before and after are written
-// out by hand; every step is also audited, incremental against a build
-// from scratch.
+// comes to cover a member; a via router and a node routing over its
+// address, never linked. Peers before and after are written out by hand;
+// every step is also audited, incremental against a build from scratch.
 func TestSidesIncremental(t *testing.T) {
 	alice, bob := &sideUsers[0], &sideUsers[1]
 
@@ -702,9 +701,8 @@ func TestSidesIncremental(t *testing.T) {
 		},
 		{
 			// A route into the grant's destinations makes the node a via
-			// router, on its own sources by that route; nothing else of it
-			// moves, so the router over its address reads its router atom
-			// alone, and comes to see it.
+			// router, on its own sources by that route: the node routing
+			// over its address is still not shown it.
 			name: "covered-node-becomes-a-via-router",
 			policy: `{"tagOwners": {"tag:r": [], "tag:y": []}, "grants": [
 				{"src": ["10.0.0.0/24"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via": ["tag:r"]}]}`,
@@ -716,12 +714,11 @@ func TestSidesIncremental(t *testing.T) {
 				return types.Nodes{sideNode(5, nil, "100.64.0.5", "", []string{"tag:r"}, "10.0.0.0/24"), n[1]}
 			},
 			before: map[types.NodeID][]types.NodeID{5: nil, 7: nil},
-			after:  map[types.NodeID][]types.NodeID{5: {7}, 7: {5}},
+			after:  map[types.NodeID][]types.NodeID{5: nil, 7: nil},
 		},
 		{
 			// The via router leaves the route over its address for one a
-			// node like it keeps: the route's atoms stay, and only its
-			// router atom tells the router over it to stop seeing it.
+			// node like it keeps: nobody is shown anybody, before or after.
 			name: "via-router-leaves-a-route",
 			policy: `{"tagOwners": {"tag:r": [], "tag:y": []}, "grants": [
 				{"src": ["10.0.0.0/24"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via": ["tag:r"]}]}`,
@@ -733,7 +730,7 @@ func TestSidesIncremental(t *testing.T) {
 			write: func(n types.Nodes) types.Nodes {
 				return types.Nodes{n[0], sideNode(5, nil, "100.64.0.9", "", []string{"tag:r"}, "10.0.0.0/24"), n[2]}
 			},
-			before: map[types.NodeID][]types.NodeID{4: nil, 5: {7}, 7: {5}},
+			before: map[types.NodeID][]types.NodeID{4: nil, 5: nil, 7: nil},
 			after:  map[types.NodeID][]types.NodeID{4: nil, 5: nil, 7: nil},
 		},
 	}
