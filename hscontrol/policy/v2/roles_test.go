@@ -173,7 +173,7 @@ func TestMembershipQuirks(t *testing.T) {
 	}
 
 	m := buildMembership(t, `{
-		"groups": {"group:eng": ["alice@", "dup@", "nobody@", "user:*@example.org"]},
+		"groups": {"group:eng": ["alice@", "dup@", "nobody@"]},
 		"hosts": {"lan": "192.168.0.0/16"},
 		"tagOwners": {"tag:web": ["alice@"], "tag:db": ["alice@"]},
 		"acls": [
@@ -197,7 +197,7 @@ func TestMembershipQuirks(t *testing.T) {
 		// Case-insensitive domain, after the last @.
 		"user:*@Example.ORG": ids(7, 8),
 		// Ambiguous and unknown members name nobody; the rest still count.
-		"group:eng": ids(1, 7, 8, 11),
+		"group:eng": ids(1, 11),
 		// Tags own a tagged node, whoever created it.
 		"tag:web":          ids(2),
 		"tag:db":           ids(13),

@@ -747,7 +747,7 @@ func drawPolicy(t *rapid.T) Policy {
 	rules := ruleRuns(t)
 
 	for g := range numGroups {
-		p.Groups[g] = drawMembers(t)
+		p.Groups[g] = groupMembers(drawMembers(t))
 	}
 
 	for i := range numTags {
@@ -1661,7 +1661,14 @@ func drawPolicyEdit(t *rapid.T, w World) Edit {
 	if amb := v.AmbiguousRefs(); len(amb) > 0 {
 		e := ReplaceUserRefs{From: amb}
 		for range amb {
-			e.To = append(e.To, unambiguous(v, rapid.IntRange(0, len(UserRefs)-1).Draw(t, "to")))
+			// Never the domain: a group or tagOwners holding the token
+			// would refuse it.
+			to := unambiguous(v, rapid.IntRange(0, len(UserRefs)-1).Draw(t, "to"))
+			if to == domainRef {
+				to = providerRef
+			}
+
+			e.To = append(e.To, to)
 		}
 
 		return e
@@ -1708,7 +1715,7 @@ func drawPolicyEditKind(t *rapid.T, w World) Edit {
 			return drawSetSel(t, p, pick(t, refs, "rule"))
 		}
 	case editGroup:
-		return SetGroup{index(t, numGroups, "group"), drawMembers(t)}
+		return SetGroup{index(t, numGroups, "group"), groupMembers(drawMembers(t))}
 	case editHost:
 		return drawSetHost(t, p)
 	case editTagOwners:
@@ -1779,7 +1786,7 @@ func remapRefs(e Edit, to func(int) int) Edit {
 			members[i] = to(m)
 		}
 
-		g.Members = members
+		g.Members = groupMembers(members)
 
 		return g
 	}

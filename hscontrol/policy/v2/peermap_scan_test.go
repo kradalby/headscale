@@ -1599,7 +1599,7 @@ func TestUserAliasIncrementalIdentities(t *testing.T) {
 			slices.Reverse(grants)
 		}
 
-		return []byte(`{"groups":{"group:a":["alice@","missing@"],"group:b":["bob@"],"group:overlap":["alice@","bob@","user:*@allowed.example"]},"grants":[` + strings.Join(grants, ",") + `],"ssh":[{"action":"accept","src":["group:a"],"dst":["autogroup:self"],"users":["root"]},{"action":"accept","src":["bob@"],"dst":["autogroup:self"],"users":["root"]}]}`)
+		return []byte(`{"groups":{"group:a":["alice@","missing@"],"group:b":["bob@"],"group:overlap":["alice@","bob@"]},"grants":[` + strings.Join(grants, ",") + `],"ssh":[{"action":"accept","src":["group:a"],"dst":["autogroup:self"],"users":["root"]},{"action":"accept","src":["bob@"],"dst":["autogroup:self"],"users":["root"]}]}`)
 	}
 
 	for _, transition := range []string{"join", "leave", "address", "owner", "tag", "untag", "association-only", "association-lost", "rename", "delete-user", "recreate-user", "email-domain", "reorder-grants", "fresh-policy"} {

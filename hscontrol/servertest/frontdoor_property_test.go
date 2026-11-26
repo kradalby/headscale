@@ -3960,41 +3960,6 @@ func TestCreatingANameOIDCUsersHoldAnswers409(t *testing.T) {
 	require.ErrorContains(t, fd.api(http.MethodPost, "/api/v1/user", map[string]any{"name": "alice"}, nil), "409", "two OIDC users hold alice")
 }
 
-// TestAGroupOfADomainOwnsTagsForItsUsers: with tag:a owned by a group
-// holding user:*@example.com, bob (bob@example.com) is granted tag:a at a
-// login on his own node and on a node an admin tagged, which no owner's
-// addresses hold.
-func TestAGroupOfADomainOwnsTagsForItsUsers(t *testing.T) {
-	srv := NewServer(t)
-
-	_, err := srv.State().SetPolicy([]byte(`{"groups": {"group:g": ["user:*@example.com"]}, "tagOwners": {"tag:a": ["group:g"]},
-		"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]}`))
-	require.NoError(t, err)
-
-	bob, err := srv.State().CreateUser(types.User{Name: "bob", Email: "bob@example.com"})
-	require.NoError(t, err)
-
-	approve := func(authID string) error { return srv.ApproveAuth(t.Context(), authID, "bob") }
-	requestA := func(name string) *tailcfg.Hostinfo {
-		return &tailcfg.Hostinfo{BackendLogID: name, Hostname: name, RequestTags: []string{"tag:a"}}
-	}
-
-	own := NewClient(t, srv, "own", WithUser(bob), WithoutPoll())
-	tagged := NewClient(t, srv, "tagged", WithUser(bob), WithoutPoll())
-
-	nv, ok := srv.State().GetNodeByNodeKey(tagged.Persist().PrivateNodeKey.Public())
-	require.True(t, ok)
-
-	_, err = srv.State().SetNodeTags(nv.ID(), []string{"tag:a"})
-	require.NoError(t, err)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	require.NoError(t, own.Login(ctx, own.Persist(), "", controlclient.LoginInteractive, requestA("own"), approve), "bob's own node")
-	require.NoError(t, tagged.Login(ctx, tagged.Persist(), "", controlclient.LoginInteractive, requestA("tagged"), approve), "bob on a tagged node")
-}
-
 // TestAKeyClaimsOnlyWhatItRegistered pins the front door's claim model to
 // production: a user's key takes a tagged node back only while its
 // registration by the key still stands (preAuthKeyClaimsTaggedNode behind

@@ -443,7 +443,7 @@ var membershipChurnPolicies = []string{
 	``,
 	`{}`,
 	`{"acls": []}`,
-	`{"groups": {"group:a": ["alice@", "dup@", "user:*@other.org"], "group:b": ["bob@", "carol@example.com", "pid@"]},
+	`{"groups": {"group:a": ["alice@", "dup@"], "group:b": ["bob@", "carol@example.com", "pid@"]},
 	  "tagOwners": {"tag:a": ["alice@"], "tag:b": ["group:b"]},
 	  "acls": [
 		{"action": "accept", "src": ["group:a", "tag:a"], "dst": ["group:b:*", "tag:b:22"]},

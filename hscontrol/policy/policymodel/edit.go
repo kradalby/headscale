@@ -992,7 +992,8 @@ type SetGroup struct {
 	Members []int
 }
 
-func (e SetGroup) apply(w *World) { w.Policy.Groups[e.Group] = slices.Clone(e.Members) }
+// apply writes the members as a group takes them ([groupMembers]).
+func (e SetGroup) apply(w *World) { w.Policy.Groups[e.Group] = groupMembers(e.Members) }
 
 func (e SetGroup) undo(w World) (Edit, bool) {
 	return SetGroup{e.Group, w.Policy.Groups[e.Group]}, true
@@ -1027,7 +1028,7 @@ type SetTagOwners struct {
 }
 
 func (e SetTagOwners) apply(w *World) {
-	w.Policy.TagOwners[e.Tag] = slices.Clone(e.Owners)
+	w.Policy.TagOwners[e.Tag] = tagOwners(e.Owners)
 	w.Policy.Defined[e.Tag] = e.Defined
 }
 

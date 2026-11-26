@@ -145,6 +145,19 @@ func tagOwners(owners []Sel) []Sel {
 	return out
 }
 
+// groupMembers is members as a group takes them: it refuses a domain's
+// users, as tagOwners does.
+func groupMembers(members []int) []int {
+	out := slices.Clone(members)
+	for i, m := range out {
+		if m == domainRef {
+			out[i] = providerRef
+		}
+	}
+
+	return out
+}
+
 // RuleRef names a rule by its place in the document.
 type RuleRef struct {
 	Grant bool
@@ -305,6 +318,8 @@ func (p Policy) mapRefs(to func(int) int) Policy {
 		for i, m := range c.Groups[g] {
 			c.Groups[g][i] = to(m)
 		}
+
+		c.Groups[g] = groupMembers(c.Groups[g])
 	}
 
 	for i := range c.TagOwners {
