@@ -682,8 +682,7 @@ func transientNode(w policymodel.World, like types.NodeID) policymodel.Node {
 		n.User, n.Tags = l.User, slices.Clone(l.Tags)
 	}
 
-	n.V4 = netip.AddrFrom4([4]byte{100, 64, byte(id >> 8), byte(id)})                                      //nolint:gosec // the low 16 bits
-	n.V6 = netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 14: byte(id >> 8), 15: byte(id)}) //nolint:gosec // the low 16 bits
+	n.V4, n.V6 = policymodel.OwnAddrs(id)
 
 	return n
 }

@@ -33,6 +33,8 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+
+	"github.com/juanfont/headscale/hscontrol/types"
 )
 
 // The vocabulary is small and fixed so that drawn values collide: two
@@ -187,6 +189,12 @@ func ownAddr(family int, id uint64) netip.Addr {
 	}
 
 	return netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 14: byte(id >> 8), 15: byte(id)}) //nolint:gosec // as above
+}
+
+// OwnAddrs is the addresses node id owns, for a test that adds a node of
+// its own to a drawn world.
+func OwnAddrs(id types.NodeID) (netip.Addr, netip.Addr) {
+	return ownAddr(4, uint64(id)), ownAddr(6, uint64(id))
 }
 
 func movedAddr(family int, id uint64) netip.Addr {
