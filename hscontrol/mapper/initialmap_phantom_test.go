@@ -1,6 +1,7 @@
 package mapper
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -33,7 +34,14 @@ func TestUnreadyConnectionDefersBroadcastsUntilInitialMap(t *testing.T) {
 
 	out, err := st.Update(s.Snapshot())
 	require.NoError(t, err)
-	require.True(t, mentions(out, ids[1]), "pending change reaches stream after initial delivery")
+
+	// The hub may see the commit before Initial runs; Initial then renders
+	// the newer snapshot and the update has nothing left to send.
+	inFirst := slices.ContainsFunc(first[0].Peers, func(p *tailcfg.Node) bool {
+		return p.ID == ids[1].NodeID() && p.Online != nil && *p.Online
+	})
+	require.True(t, inFirst || mentions(out, ids[1]), "pending change reaches stream by the first update")
+	require.False(t, inFirst && len(out) > 0, "a change the initial map carries is not sent again")
 }
 
 func TestUnreadyConnectionBesideReadyOneHoldsBroadcasts(t *testing.T) {

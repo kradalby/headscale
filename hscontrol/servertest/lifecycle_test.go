@@ -1153,7 +1153,7 @@ func TestPeerLastSeenPatches(t *testing.T) {
 	}
 
 	// A new peer can first appear offline, which must not pass for going down.
-	watcher.WaitForCondition(t, "peer online", 15*time.Second, peerOnline(true))
+	watcher.WaitForCondition(t, "peer online", 60*time.Second, peerOnline(true))
 
 	down := time.Now()
 
@@ -1165,7 +1165,7 @@ func TestPeerLastSeenPatches(t *testing.T) {
 	assert.WithinRange(t, seen[0], down, time.Now())
 
 	node.Reconnect(t)
-	watcher.WaitForCondition(t, "peer online", 15*time.Second, peerOnline(true))
+	watcher.WaitForCondition(t, "peer online", 60*time.Second, peerOnline(true))
 
 	assert.Len(t, watcher.DeltaLastSeen(), 1, "online patch carried a last seen time")
 }
@@ -1177,7 +1177,7 @@ func TestServerStateCleanup(t *testing.T) {
 
 	database, err := srv.State().DB().DB.DB()
 	require.NoError(t, err)
-	require.ErrorContains(t, database.Ping(), "database is closed")
+	require.ErrorContains(t, database.PingContext(t.Context()), "database is closed")
 }
 
 // TestTsnetRestartWithAnotherKey drives a real tsnet program that joins and

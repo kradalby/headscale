@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"runtime"
 	"slices"
 	"strconv"
 	"sync"
@@ -16,8 +17,10 @@ import (
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/version"
 )
 
 const (
@@ -547,6 +550,9 @@ func (hsdb *HSDatabase) CreateNodeForTest(user *types.User, hostname ...string) 
 		UserID:         &user.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
 		AuthKeyID:      &pakID,
+		// What the official client reports of itself: test nodes are
+		// Tailscale's clients, so capability mode sends them capabilities.
+		Hostinfo: &tailcfg.Hostinfo{GoVersion: runtime.Version(), IPNVersion: version.Long()},
 	}
 
 	err = hsdb.DB.Save(node).Error

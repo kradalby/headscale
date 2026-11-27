@@ -2,10 +2,12 @@ package mapper
 
 import (
 	"cmp"
+	"encoding/binary"
 	"errors"
 	"iter"
 	"net/netip"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -87,9 +89,14 @@ type netMap struct {
 	profiles    *profileMap
 	selfProfile *tailcfg.UserProfile
 	filter      []tailcfg.FilterRule
-	ssh         *tailcfg.SSHPolicy
-	dns         *tailcfg.DNSConfig
-	derpMap     *tailcfg.DERPMap
+	// chunks is filter as the client holds it where chunked is set: the
+	// named chunks it is sent (see [policyv2.FilterChunks]). Otherwise the
+	// filter goes whole under "base" ([policyv2.FilterDelivery] decides).
+	chunks  policyv2.FilterChunks
+	chunked bool
+	ssh     *tailcfg.SSHPolicy
+	dns     *tailcfg.DNSConfig
+	derpMap *tailcfg.DERPMap
 
 	// base is the render this one follows. changed lists the peers added or
 	// rendered again since base and removed the peers gone, so a diff
@@ -102,6 +109,10 @@ type netMap struct {
 	// ownerless is set when self had no owner, so no profiles were sent
 	// though peers were.
 	ownerless bool
+
+	// holders are the nodes holding each address, in capability mode only,
+	// where a client finds a source's capabilities through its address.
+	holders state.AddressHolders
 }
 
 // renderer renders one node's netMap. After the first render it renders a
@@ -126,26 +137,35 @@ type renderer struct {
 	lastClass   *peerMap
 	lastKey     renderKey
 	lastPeerIDs []types.NodeID // the snapshot's shared view, see [state.Snapshot.PeerView]
-	lastSelf    types.NodeView
-	lastNodes   state.NodesVersion
-	lastCaps    state.CapsVersion
-	// overlays counts peers with viewer-specific routes, so losing the
-	// last overlay restores the shared class map.
-	overlays         int
-	lastIPv4Disabled bool
-	// routedPrimaries are the primary routes each routed peer's routes were
-	// rendered with, and routedVia the via elections: a primary move that
-	// keeps the elections renders again only the routers whose primaries
-	// moved.
+	// lastPeersRev is the peers revision lastPeerIDs and lastKey.side are
+	// of; lastSidesRev the sides revision lastKey.facts and lastCover are
+	// of.
+	lastPeersRev uint64
+	lastSidesRev uint64
+	// lastCover is the cover of the routes rendered last, for telling the
+	// routers whose routes' cover moved since.
+	lastCover policyv2.RouteCover
+	lastSelf  types.NodeView
+	lastNodes state.NodesVersion
+	lastCaps  state.CapsVersion
+	// set is the routes the viewer is given of its routed peers, shared with
+	// the viewers of its class given the same; nil when it is given none and
+	// holds its peers' IPv4 identity, and the class map is its peers.
+	set *routeSet
+	// lastPrimaries are the primary routes of the last render, and routedVia
+	// the via elections: a primary move that keeps the elections renders
+	// again only the routers whose primaries moved.
 	// Weak identity lets idle streams release obsolete compiled policies.
-	routedPrimaries map[tailcfg.NodeID][]netip.Prefix
-	routedVia       weak.Pointer[policyv2.ViaRoutes]
-	routedWinners   *policyv2.ViaRoutes
+	lastPrimaries state.PrimariesVersion
+	routedVia     weak.Pointer[policyv2.ViaRoutes]
+	routedWinners *policyv2.ViaRoutes
 
-	// dns is reused while its inputs, the node and the policy's capability
-	// map and the extra records, are unchanged.
-	dns    *tailcfg.DNSConfig
-	dnsKey dnsKey
+	// dns is reused while its inputs, the node, its own capabilities and
+	// the extra records, are unchanged; dnsCaps are the capabilities it
+	// was generated with.
+	dns     *tailcfg.DNSConfig
+	dnsKey  dnsKey
+	dnsCaps tailcfg.NodeCapMap
 
 	// self is reused while the node, its policy caps and the primary routes,
 	// which its own routes come from, are unchanged.
@@ -154,19 +174,53 @@ type renderer struct {
 	// selfCaps is the policy's immutable map, never the rendered CapMap.
 	selfCaps tailcfg.NodeCapMap
 
+	// chunks are the last filter rendered cut into chunks, so a filter
+	// carried over is not cut again and one cut again builds only the
+	// names that are new.
+	chunks policyv2.FilterChunks
+	// delivery is how the session's filter goes, decided again only when
+	// deliveryKey, what it reads, moves.
+	delivery    policyv2.Delivery
+	deliveryKey deliveryKey
+	decided     bool
+
 	// rendered counts peer renders, for tests that bound per-write work.
 	rendered int
 }
 
-// renderKey is what a peer's rendering reads besides the peer and the
-// viewer: how the policy renders peers, and the primary routes.
+// renderKey is what the routes of the peers rendered read besides the
+// peers and their routes' cover: what every route reads, the primary
+// routes, and the viewer's side set and side facts. The via election and
+// the viewer's own addresses and routes are read too, and checked apart
+// (see [renderer.routedCandidates]).
 type renderKey struct {
-	policy, primaries uint64
+	routes, primaries uint64
+	side              policyv2.RoleSet
+	facts             policyv2.ViewerFacts
 }
 
 type dnsKey struct {
-	self        types.NodeView
-	policy, dns uint64
+	self types.NodeView
+	dns  uint64
+}
+
+// deliveryKey is what [policyv2.FilterDelivery] reads: the option and what
+// the node's client reports of itself.
+type deliveryKey struct {
+	chunks                 bool
+	app, goVersion, ipnVer string
+}
+
+// A node may have no Hostinfo: a row stored before it reported one, or one
+// whose stored Hostinfo failed validation at load. It reports no client, as
+// one reporting empty fields does, and [policyv2.FilterDelivery] sends either
+// the whole filter.
+func deliveryKeyOf(chunks bool, hi tailcfg.HostinfoView) deliveryKey {
+	if !hi.Valid() {
+		return deliveryKey{chunks: chunks}
+	}
+
+	return deliveryKey{chunks: chunks, app: hi.App(), goVersion: hi.GoVersion(), ipnVer: hi.IPNVersion()}
 }
 
 // selfKey holds what the node's own entry renders from. dns is there for
@@ -211,7 +265,7 @@ type versionCache struct {
 
 // peerRenders shares, across sessions, the part of a peer's rendering that
 // does not depend on who views it: everything but its routes. Each stored
-// node is rendered once per policy, not once per viewer.
+// node is rendered once per caps it is given, not once per viewer.
 type peerRenders struct {
 	m sync.Map // types.NodeID -> *atomic.Pointer[peerRender]
 	// mu serialises admission with deletion; floor rejects misses from
@@ -256,10 +310,24 @@ func (pr *peerRenders) of(node types.NodeID, rev uint64) *atomic.Pointer[peerRen
 }
 
 type peerRender struct {
-	node   types.NodeView
-	policy uint64
-	caps   tailcfg.NodeCapMap // the policy's caps for node, all it reads of the policy
-	tn     *tailcfg.Node
+	node types.NodeView
+	// capsRev is the caps revision caps were read at: until it moves, every
+	// node keeps its caps.
+	capsRev uint64
+	caps    tailcfg.NodeCapMap // the policy's caps for node, all it reads of the policy
+	tn      *tailcfg.Node
+}
+
+// capsOf returns a node's capabilities as it and its peers are sent them;
+// nil holds none.
+type capsOf func(types.NodeID) tailcfg.NodeCapMap
+
+func (c capsOf) of(id types.NodeID) tailcfg.NodeCapMap {
+	if c == nil {
+		return nil
+	}
+
+	return c(id)
 }
 
 // render returns peer rendered without routes. The result is shared and
@@ -268,23 +336,24 @@ func (pr *peerRenders) render(
 	cfg *types.Config,
 	dns types.DNSView,
 	capVer tailcfg.CapabilityVersion,
-	rev, policy uint64,
+	rev, capsRev uint64,
 	peer types.NodeView,
-	capMaps map[types.NodeID]tailcfg.NodeCapMap,
+	capMaps capsOf,
+	stamped bool,
 ) (*tailcfg.Node, error) {
 	slot := pr.of(peer.ID(), rev)
-	caps := capMaps[peer.ID()]
+	caps := capMaps.of(peer.ID())
 
 	prev := slot.Load()
 	if prev != nil {
-		if prev.node == peer && prev.policy == policy {
+		if prev.node == peer && prev.capsRev == capsRev {
 			return prev.tn, nil
 		}
 
-		// A new policy that gives the peer the same caps renders it the
-		// same: keep the render, so sessions see nothing to send.
+		// Other caps that give the peer the same caps render it the same:
+		// keep the render, so sessions see nothing to send.
 		if prev.node == peer && reflect.DeepEqual(prev.caps, caps) {
-			slot.Store(&peerRender{node: peer, policy: policy, caps: caps, tn: prev.tn})
+			slot.Store(&peerRender{node: peer, capsRev: capsRev, caps: caps, tn: prev.tn})
 
 			return prev.tn, nil
 		}
@@ -300,8 +369,9 @@ func (pr *peerRenders) render(
 	}
 
 	// A peer's CapMap carries only the caps clients read from the peer
-	// view; see [policyv2.PeerCapMap].
-	tn.CapMap = policyv2.PeerCapMap(peer, caps)
+	// view, and in capability mode its source capabilities; see
+	// [policyv2.PeerCapMap].
+	tn.CapMap = policyv2.PeerCapMap(peer, caps, stamped)
 
 	tn.Hostinfo = types.PeerHostinfo(tn.Hostinfo)
 
@@ -320,7 +390,7 @@ func (pr *peerRenders) render(
 		tn.Hostinfo = prev.tn.Hostinfo
 	}
 
-	slot.Store(&peerRender{node: peer, policy: policy, caps: caps, tn: tn})
+	slot.Store(&peerRender{node: peer, capsRev: capsRev, caps: caps, tn: tn})
 
 	return tn, nil
 }
@@ -360,7 +430,109 @@ func withoutIPv4Identity(base *tailcfg.Node) *tailcfg.Node {
 	})
 	tn.Addresses = slices.DeleteFunc(slices.Clone(base.Addresses), func(p netip.Prefix) bool { return p.Addr().Is4() })
 
+	// A peer left without an address renders like one that never held
+	// any: nil, not an empty list, so a session comparing what it sent
+	// with slices.Equal keeps one form.
+	if len(tn.Addresses) == 0 {
+		tn.Addresses = nil
+	}
+
+	if len(tn.AllowedIPs) == 0 {
+		tn.AllowedIPs = nil
+	}
+
 	return &tn
+}
+
+// overlays holds a render's overlays by what they add to it, see
+// [overlayKey].
+type overlays struct {
+	mu sync.Mutex
+	m  map[string]*tailcfg.Node
+}
+
+// maxOverlays bounds the overlays a render keeps; it starts over when
+// full. Viewers are given few distinct routes of one router.
+const maxOverlays = 64
+
+// overlayCache holds the overlays of each render, by a weak pointer to it,
+// while the render lives, as [nodeJSON] does its encoding.
+var overlayCache sync.Map
+
+// overlay returns base, a peer's render, with routes and without its IPv4
+// identity when v4off: one node for every viewer given the same of base.
+func overlay(base *tailcfg.Node, routes []netip.Prefix, v4off bool) *tailcfg.Node {
+	key := weak.Make(base)
+
+	v, ok := overlayCache.Load(key)
+	if !ok {
+		var loaded bool
+		if v, loaded = overlayCache.LoadOrStore(key, &overlays{}); !loaded {
+			runtime.AddCleanup(base, func(k weak.Pointer[tailcfg.Node]) { overlayCache.Delete(k) }, key)
+		}
+	}
+
+	o := v.(*overlays) //nolint:forcetypeassert // only overlays are stored
+
+	k := overlayKey(routes, v4off)
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if tn, ok := o.m[k]; ok {
+		return tn
+	}
+
+	tn := withRoutes(base, routes)
+	if v4off {
+		tn = withoutIPv4Identity(tn)
+	}
+
+	// base itself would keep its own entry alive.
+	if tn == base {
+		return tn
+	}
+
+	if o.m == nil || len(o.m) >= maxOverlays {
+		o.m = make(map[string]*tailcfg.Node)
+	}
+
+	o.m[k] = tn
+
+	return tn
+}
+
+// overlayKey encodes what an overlay adds to its render: whether the IPv4
+// identity is gone and the routes, in the order given.
+func overlayKey(routes []netip.Prefix, v4off bool) string {
+	b := make([]byte, 1, 1+prefixKeySize*len(routes))
+	if v4off {
+		b[0] = 1
+	}
+
+	return string(appendPrefixes(b, routes))
+}
+
+// prefixKeySize is what [appendPrefixes] writes of one prefix. Every field
+// of a key has a fixed size, so two keys are equal exactly when what they
+// encode is.
+const prefixKeySize = 18
+
+// appendPrefixes appends each prefix as its address in 16 bytes, its bits
+// and its family.
+func appendPrefixes(b []byte, prefixes []netip.Prefix) []byte {
+	for _, p := range prefixes {
+		a := p.Addr().As16()
+
+		family := byte(6)
+		if p.Addr().Is4() {
+			family = 4
+		}
+
+		b = append(append(b, a[:]...), byte(p.Bits()), family) //nolint:gosec // bits fit a byte
+	}
+
+	return b
 }
 
 // taggedSelfUserID isolates a tagged node's self identity from tagged peers.
@@ -375,11 +547,10 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 		return nil, ErrNodeGone
 	}
 
-	pm := snap.Policy()
-	capMaps := pm.NodeCapMaps()
+	capMaps := capsOf(snap.NodeCaps)
 
 	dns := snap.DNS()
-	selfCaps := capMaps[self.ID()]
+	selfCaps := capMaps.of(self.ID())
 
 	if k := (selfKey{self: self, primaries: snap.PrimariesRev(), dns: snap.DNSRev()}); r.self == nil || k != r.selfKey || !r.selfCaps.Equal(selfCaps) {
 		tn, err := self.TailNode(r.capVer, func(types.NodeID) []netip.Prefix {
@@ -405,12 +576,12 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 
 	tn := r.self
 
-	filter, err := pm.FilterForNode(self)
+	filter, err := snap.FilterForNode(self.ID())
 	if err != nil {
 		return nil, err
 	}
 
-	ssh, err := pm.SSHPolicy(r.cfg.ServerURL, self)
+	ssh, err := snap.SSHPolicy(r.cfg.ServerURL, self)
 	if err != nil {
 		// Fail closed: a nil SSHPolicy would leave the client's previous
 		// rules in force.
@@ -420,25 +591,46 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 		ssh = &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}}
 	}
 
-	if k := (dnsKey{self: self, policy: snap.PolicyRev(), dns: snap.DNSRev()}); r.dns == nil || k != r.dnsKey {
-		r.dns, r.dnsKey = generateDNSConfig(dns, self, capMaps[self.ID()]), k
+	// The DNS config reads the node's own capabilities, not the tailnet's:
+	// a peer's stamp moving leaves it.
+	if k := (dnsKey{self: self, dns: snap.DNSRev()}); r.dns == nil || k != r.dnsKey || !r.dnsCaps.Equal(selfCaps) {
+		r.dns, r.dnsKey, r.dnsCaps = generateDNSConfig(dns, self, selfCaps), k, selfCaps
+	}
+
+	if k := deliveryKeyOf(snap.FilterChunks(), self.Hostinfo()); !r.decided || k != r.deliveryKey {
+		r.delivery, r.deliveryKey, r.decided = policyv2.FilterDelivery(k.chunks, self.Hostinfo()), k, true
 	}
 
 	nm := &netMap{
 		at:      snap.Time(),
 		self:    tn,
 		filter:  filter,
+		chunked: r.delivery.Chunked(),
 		ssh:     ssh,
 		dns:     r.dns,
 		derpMap: snap.DERPMap(),
 		base:    r.last,
+		holders: snap.AddressHolders(),
 	}
 
-	err = r.renderPeers(snap, self, capMaps, nm)
-	if err != nil {
-		return nil, err
+	// Nothing past the cut fails today (renderPeers drops a peer it cannot
+	// render instead of failing), so a render that cuts the filter is sent.
+	// Were that to change, a failed render would still advance nothing: what
+	// the client holds is [Stream]'s sent, set from a render that succeeded,
+	// and r.chunks is a cache of the cut.
+	// TODO(kradalby): cost/chunk-names-per-session: each session names
+	// its own chunks, so every session's first map hashes its whole filter
+	// and a node's sessions each hash a new filter of its. Accepted: about
+	// what comparing the filter costs, once per new filter per session.
+	// Fixing it takes naming chunks where filters are cut and carried, so
+	// sessions share the names with the slice. No upstream reference:
+	// headscale's own delivery.
+	if nm.chunked {
+		nm.chunks = r.chunks.Recut(filter)
+		r.chunks = nm.chunks
 	}
 
+	r.renderPeers(snap, self, capMaps, nm)
 	r.renderProfiles(self, nm)
 	r.last = nm
 
@@ -446,26 +638,40 @@ func (r *renderer) render(snap *state.Snapshot) (*netMap, error) {
 }
 
 // renderPeers fills nm.peers: the shared peer map of the node's class (see
-// [classMaps]) without the node itself and with its own routes on the
-// routed peers. After the first render it records in nm.changed and
-// nm.removed the peers that can differ from the base, so a diff looks at
-// only them: those added to or gone from the view, those whose node
-// changed, and those whose render reads something that moved without
-// their node changing (their policy caps, or their routes, which come from
-// the policy, the primary routes and the node's own routes).
+// [classMaps]) with the routes the node is given on the routed peers, which
+// it shares with the viewers of its class given the same (see [routeSet]).
+// The node is in it when it sees its own class; [netMap.peer] and
+// [netMap.allPeers] leave it out. After the first render it records in
+// nm.changed and nm.removed the peers that can differ from the base, so a
+// diff looks at only them: those added to or gone from the view, those
+// whose node changed, and those whose render reads something that moved
+// without their node changing (their policy caps, or their routes, which
+// read the rules, the primary routes, their routes' cover and the viewer).
 func (r *renderer) renderPeers(
 	snap *state.Snapshot,
 	self types.NodeView,
-	capMaps map[types.NodeID]tailcfg.NodeCapMap,
+	capMaps capsOf,
 	nm *netMap,
-) error {
-	key := renderKey{
-		policy:    snap.PeerPolicyRev(),
-		primaries: snap.PrimariesRev(),
+) {
+	// An unmoved peers cell holds the same views and side sets, unmoved
+	// sides the same facts.
+	view, side, facts := r.lastPeerIDs, r.lastKey.side, r.lastKey.facts
+	if nm.base == nil || snap.PeersRev() != r.lastPeersRev {
+		view, side = snap.PeerViewAndSideSet(r.nodeID)
 	}
 
-	view := snap.PeerView(r.nodeID)
-	class, profiles, nodes := r.classes.get(r.cfg, r.renders, snap, view, r.peerCapVer, key.policy, capMaps)
+	if nm.base == nil || snap.SidesRev() != r.lastSidesRev {
+		facts = snap.ViewerFacts(r.nodeID)
+	}
+
+	key := renderKey{
+		routes:    snap.RouteRulesRev(),
+		primaries: snap.PrimariesRev(),
+		side:      side,
+		facts:     facts,
+	}
+
+	class, profiles, nodes := r.classes.get(r.cfg, r.renders, snap, view, r.peerCapVer, snap.CapsRev(), capMaps)
 	nm.peers, nm.profiles = class, profiles
 
 	base := nm.base
@@ -476,16 +682,12 @@ func (r *renderer) renderPeers(
 		// The class map remembers changed renders, including view changes;
 		// falling beyond its edit log compares only this class's peers.
 		candidates = r.peerCandidates(snap, class, view)
-		if base.peers != r.lastClass {
-			// Keep this viewer's route overlays while applying class edits.
-			nm.peers = base.peers
-		}
 	}
 
 	candidates = append(candidates, r.routedCandidates(snap, self, key, base == nil)...)
 
-	_, ipv4Disabled := capMaps[self.ID()][types.NodeAttrDisableIPv4]
-	if (base == nil && ipv4Disabled) || (base != nil && ipv4Disabled != r.lastIPv4Disabled) {
+	_, ipv4Disabled := capMaps.of(self.ID())[types.NodeAttrDisableIPv4]
+	if ipv4Disabled != r.set.ipv4Disabled() {
 		for id := range class.All() {
 			candidates = append(candidates, id)
 		}
@@ -493,99 +695,81 @@ func (r *renderer) renderPeers(
 
 	slices.Sort(candidates)
 	candidates = slices.Compact(candidates)
-	peers := nm.peers.Edit()
-	overlays := r.overlays
 
-	var routed []types.NodeID
-
-	for _, id := range candidates {
-		if base != nil {
-			was, _ := base.peers.Get(id)
-
-			plain, _ := r.lastClass.Get(id)
-			if was != plain {
-				overlays--
+	set := r.nextSet(snap, self, class, view, candidates, ipv4Disabled)
+	if set != nil {
+		nm.peers = set.peersAt(snap.Rev(), class, func() *peerMap {
+			// What the viewer held is the set it held at its last class
+			// map, which differs from this set at this one only at the
+			// candidates.
+			from := class
+			if base != nil && base.peers != r.lastClass {
+				from = base.peers
 			}
-		}
 
-		tn, ok := class.Get(id)
-		if !ok {
-			peers.Delete(id)
-			delete(r.routedPrimaries, id)
+			peers := from.Edit()
 
-			continue
-		}
+			for _, id := range candidates {
+				tn, ok := class.Get(id)
+				if !ok {
+					peers.Delete(id)
 
-		peer, _ := snap.GetNode(types.NodeID(id)) //nolint:gosec // NodeID types are the same value
-		if id != r.nodeID.NodeID() && peer.ApprovedRoutes().Len() > 0 {
-			routed = append(routed, peer.ID())
-		} else {
-			// Not a routed peer any more: its routes need no record.
-			delete(r.routedPrimaries, id)
+					continue
+				}
 
-			if ipv4Disabled && id != r.nodeID.NodeID() {
-				tn = withoutIPv4Identity(tn)
-				if plain, _ := class.Get(id); tn != plain {
-					overlays++
+				tn = set.render(id, tn)
+				if old, _ := peers.Get(id); old != tn {
+					peers.Set(id, tn)
 				}
 			}
 
-			if old, _ := peers.Get(id); old != tn {
-				peers.Set(id, tn)
-			}
-		}
+			return peers.Done()
+		})
 	}
 
-	if len(routed) > 0 {
-		// RoutesForPeer needs the unreduced matchers: every rule where
-		// the node is source or destination.
-		matchers, err := snap.Policy().MatchersForNode(self)
-		if err != nil {
-			return err
-		}
-
-		if r.routedPrimaries == nil {
-			r.routedPrimaries = make(map[tailcfg.NodeID][]netip.Prefix, len(routed))
-		}
-
-		for _, id := range routed {
-			base, _ := class.Get(id.NodeID())
-			peer, _ := snap.GetNode(id)
-
-			r.routedPrimaries[id.NodeID()] = snap.PrimaryRoutesForNode(id)
-
-			tn := withRoutes(base, snap.RoutesForPeer(self, peer, matchers))
-			if ipv4Disabled {
-				tn = withoutIPv4Identity(tn)
-			}
-
-			if tn != base {
-				overlays++
-			}
-
-			if old, _ := peers.Get(id.NodeID()); old != tn {
-				peers.Set(id.NodeID(), tn)
-			}
-		}
-	}
-
-	// Only routed peers differ per viewer; a session without them
-	// shares its class's map outright.
-	nm.peers = peers.Done()
-	if overlays == 0 {
-		nm.peers = class
-	}
-
-	r.overlays, r.lastIPv4Disabled = overlays, ipv4Disabled
+	r.set = set
 
 	nm.recordPeerChanges(base, candidates, r.nodeID.NodeID())
 	r.rendered += len(nm.changed)
 
 	// Only a render that completed moves the cursor; a failed one is
 	// retried from the same place.
-	r.markRendered(snap, key, self, class, nodes)
+	r.markRendered(snap, key, self, class, view, nodes)
+}
 
-	return nil
+// nextSet returns the routes the viewer is given after this render: those
+// of the set it held but at the candidates, where they are what the
+// snapshot gives it now. Its own entry is hidden from it; it takes the
+// routes it is given of itself, which are as a rule what its classmates are
+// given of it, so a router shares their set.
+func (r *renderer) nextSet(
+	snap *state.Snapshot,
+	self types.NodeView,
+	class *peerMap,
+	view []types.NodeID,
+	candidates []tailcfg.NodeID,
+	ipv4Disabled bool,
+) *routeSet {
+	held := r.set
+
+	var edits []routedPeer
+
+	for _, id := range candidates {
+		var routes []netip.Prefix
+
+		if _, ok := class.Get(id); ok {
+			peer, _ := snap.GetNode(types.NodeID(id)) //nolint:gosec // NodeID types are the same value
+			if peer.ApprovedRoutes().Len() > 0 {
+				routes = snap.RoutesForPeer(self, peer)
+			}
+		}
+
+		if !slices.Equal(held.routesOf(id), routes) {
+			edits = append(edits, routedPeer{id: id, routes: routes})
+		}
+	}
+
+	return r.classes.set(keyOf(view), held, edits, ipv4Disabled)
 }
 
 // peerCandidates keeps membership churn from comparing unrelated class maps:
@@ -602,22 +786,67 @@ func (r *renderer) peerCandidates(snap *state.Snapshot, class *peerMap, view []t
 		return graph.Changes(r.lastClass, class)
 	}
 
-	var candidates []tailcfg.NodeID
+	ids := append(touched, snap.CapsChangedSince(r.lastCaps)...)
+	moved := r.classes.viewDelta(old, view)
 
-	for _, id := range append(touched, snap.CapsChangedSince(r.lastCaps)...) {
+	// One slice of the session's own, sized once: the caller sorts and
+	// extends it, and the delta is shared.
+	n := len(moved)
+
+	for _, id := range ids {
+		if inView(old, id) || inView(view, id) {
+			n++
+		}
+	}
+
+	candidates := make([]tailcfg.NodeID, 0, n)
+
+	for _, id := range ids {
 		if inView(old, id) || inView(view, id) {
 			candidates = append(candidates, id.NodeID())
 		}
 	}
 
-	// Both views are sorted; walk their symmetric difference without map reads.
-	for i, j := 0, 0; i < len(old) || j < len(view); {
+	return append(candidates, moved...)
+}
+
+// viewDelta returns the nodes in exactly one of views a and b. Views are
+// immutable and shared by every node of a class, so the sessions moving
+// between the same two views walk them once between them, not once each:
+// under a mesh every viewer of a joiner moves between the same two.
+func (cm *classMaps) viewDelta(a, b []types.NodeID) []tailcfg.NodeID {
+	key := viewPair{from: keyOf(a), to: keyOf(b)}
+
+	cm.dmu.Lock()
+
+	e, ok := cm.deltas[key]
+	if !ok {
+		if cm.deltas == nil {
+			cm.deltas = make(map[viewPair]*viewDeltaEntry)
+		}
+
+		e = &viewDeltaEntry{}
+		cm.deltas[key] = e
+	}
+
+	cm.dmu.Unlock()
+
+	e.once.Do(func() { e.d = symmetricDifference(a, b) })
+
+	return e.d
+}
+
+// symmetricDifference walks two sorted views without map reads.
+func symmetricDifference(a, b []types.NodeID) []tailcfg.NodeID {
+	var out []tailcfg.NodeID
+
+	for i, j := 0, 0; i < len(a) || j < len(b); {
 		switch {
-		case j == len(view) || i < len(old) && old[i] < view[j]:
-			candidates = append(candidates, old[i].NodeID())
+		case j == len(b) || i < len(a) && a[i] < b[j]:
+			out = append(out, a[i].NodeID())
 			i++
-		case i == len(old) || view[j] < old[i]:
-			candidates = append(candidates, view[j].NodeID())
+		case i == len(a) || b[j] < a[i]:
+			out = append(out, b[j].NodeID())
 			j++
 		default:
 			i++
@@ -625,7 +854,24 @@ func (r *renderer) peerCandidates(snap *state.Snapshot, class *peerMap, view []t
 		}
 	}
 
-	return candidates
+	return out
+}
+
+// viewPair names a move between two views; viewDeltaEntry is its delta,
+// walked once.
+type viewPair struct{ from, to classKey }
+
+type viewDeltaEntry struct {
+	once sync.Once
+	d    []tailcfg.NodeID
+}
+
+func keyOf(v []types.NodeID) classKey {
+	if len(v) == 0 {
+		return classKey{}
+	}
+
+	return classKey{view: &v[0], n: len(v)}
 }
 
 func (nm *netMap) recordPeerChanges(base *netMap, candidates []tailcfg.NodeID, self tailcfg.NodeID) {
@@ -657,19 +903,26 @@ func (nm *netMap) recordPeerChanges(base *netMap, candidates []tailcfg.NodeID, s
 }
 
 // routedCandidates returns the routed peers whose routes snap can render
-// differently from the last render: every one after a policy or viewer
-// change, those whose primaries moved after a primary move.
+// differently from the last render: every one after a change to what every
+// route reads or to the viewer, those whose primaries moved after a primary
+// move, those whose routes' cover moved, and those a via election moved.
 func (r *renderer) routedCandidates(snap *state.Snapshot, self types.NodeView, key renderKey, first bool) []tailcfg.NodeID {
 	var out []tailcfg.NodeID
 
 	via := weak.Make(snap.ViaElection())
 
 	switch {
-	case first || key.policy != r.lastKey.policy || !sameRouteFacts(r.lastSelf, self):
-		// A policy or viewer change can steer any router's routes for this
-		// viewer.
-		r.routedPrimaries = nil
-
+	case first || key.routes != r.lastKey.routes || key.side != r.lastKey.side || key.facts != r.lastKey.facts ||
+		!sameRouteFacts(r.lastSelf, self):
+		// The rules or the viewer's own side can move any router's routes
+		// for this viewer: route access and via steering read its side set
+		// and facts, which nothing else here follows.
+		//
+		// TODO(kradalby): overwake/route-viewers, overwake/all-routers: so
+		// every routed peer is rendered again for a viewer whose side set or
+		// facts moved, or after any rule edit, though few of their routes
+		// move; the routing side of both is at Sides.ViewersMovedSince and
+		// Snapshot.Since. No upstream reference: headscale's own renderer.
 		for _, id := range snap.RoutedNodes() {
 			out = append(out, id.NodeID())
 		}
@@ -679,10 +932,16 @@ func (r *renderer) routedCandidates(snap *state.Snapshot, self types.NodeView, k
 		// A peer's routes read the policy, the viewer, the via elections
 		// and the peer's own primaries; check the latter independently
 		// of the via election changes below.
-		for _, id := range snap.RoutedNodes() {
-			if was, ok := r.routedPrimaries[id.NodeID()]; !ok || !slices.Equal(was, snap.PrimaryRoutesForNode(id)) {
-				out = append(out, id.NodeID())
-			}
+		for _, id := range snap.PrimariesMovedSince(r.lastPrimaries, snap.RoutedNodes()) {
+			out = append(out, id.NodeID())
+		}
+	}
+
+	if snap.SidesRev() != r.lastSidesRev {
+		// With the same rules and viewer, a router's routes read the nodes
+		// inside them only through the atoms they hold.
+		for _, id := range snap.RoutersMovedSince(r.lastCover) {
+			out = append(out, id.NodeID())
 		}
 	}
 
@@ -706,10 +965,14 @@ func sameRouteFacts(a, b types.NodeView) bool {
 		slices.Equal(a.AllApprovedRoutes(), b.AllApprovedRoutes())
 }
 
-func (r *renderer) markRendered(snap *state.Snapshot, key renderKey, self types.NodeView, class *peerMap, nodes state.NodesVersion) {
+func (r *renderer) markRendered(snap *state.Snapshot, key renderKey, self types.NodeView, class *peerMap, view []types.NodeID, nodes state.NodesVersion) {
 	r.lastClass, r.lastKey = class, key
-	r.lastPeerIDs, r.lastSelf = snap.PeerView(r.nodeID), self
-	r.lastNodes, r.lastCaps = nodes, snap.CapsVersion()
+	r.lastPeerIDs, r.lastPeersRev, r.lastSelf = view, snap.PeersRev(), self
+	r.lastNodes, r.lastCaps, r.lastPrimaries = nodes, snap.CapsVersion(), snap.PrimariesVersion()
+
+	if rev := snap.SidesRev(); rev != r.lastSidesRev || r.lastCover == (policyv2.RouteCover{}) {
+		r.lastSidesRev, r.lastCover = rev, snap.RouteCover()
+	}
 
 	via := weak.Make(snap.ViaElection())
 	if via != r.routedVia {
@@ -728,6 +991,198 @@ type classMaps struct {
 	m  map[classKey]*classEntry
 	// pruned is the peer-classes revision maps were last pruned against.
 	pruned uint64
+
+	// deltas are the view moves sessions walked since the peer classes
+	// last changed; their keys pin the views they name.
+	dmu    sync.Mutex
+	deltas map[viewPair]*viewDeltaEntry
+
+	// sets are the route sets of each class, weakly: a set lives as long
+	// as a renderer holds it.
+	smu  sync.Mutex
+	sets map[setID]weak.Pointer[routeSet]
+}
+
+// routeSet is what the viewers of one class given the same routes share:
+// the routes they are given of each routed peer giving them any, whether
+// they hold their peers without the IPv4 identity, and the class's peers
+// as they are sent them. It is the same set only when every entry is the
+// same, so each viewer holding it reads its own routes off it; the one
+// entry a viewer never reads is its own.
+type routeSet struct {
+	class classKey
+	// key encodes ipv4Disabled and routes: the set's identity in its class.
+	key    string
+	routes []routedPeer // by peer
+	v4off  bool
+
+	// peers is the class map at as the set's viewers are sent it, from a
+	// render of snapshot rev.
+	mu    sync.Mutex
+	rev   uint64
+	at    *peerMap
+	peers *peerMap
+}
+
+// routedPeer is a peer and the routes a set's viewers are given of it.
+type routedPeer struct {
+	id     tailcfg.NodeID
+	routes []netip.Prefix
+}
+
+type setID struct {
+	class classKey
+	key   string
+}
+
+// routesOf returns the routes s gives of peer id; none for a nil set.
+func (s *routeSet) routesOf(id tailcfg.NodeID) []netip.Prefix {
+	if s == nil {
+		return nil
+	}
+
+	if i, ok := slices.BinarySearchFunc(s.routes, id, func(p routedPeer, id tailcfg.NodeID) int { return cmp.Compare(p.id, id) }); ok {
+		return s.routes[i].routes
+	}
+
+	return nil
+}
+
+func (s *routeSet) ipv4Disabled() bool { return s != nil && s.v4off }
+
+// render returns base, the class's render of peer id, as the set's viewers
+// are sent it.
+func (s *routeSet) render(id tailcfg.NodeID, base *tailcfg.Node) *tailcfg.Node {
+	routes := s.routesOf(id)
+	if len(routes) == 0 && !s.v4off {
+		return base
+	}
+
+	return overlay(base, routes, s.v4off)
+}
+
+// peersAt returns class as the set's viewers are sent it. The first of them
+// to render a class map renders it for all, with build; one rendering an
+// older snapshot than the set's latest keeps its map to itself.
+func (s *routeSet) peersAt(rev uint64, class *peerMap, build func() *peerMap) *peerMap {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.peers != nil && s.at == class {
+		return s.peers
+	}
+
+	peers := build()
+	if s.peers == nil || rev > s.rev {
+		s.rev, s.at, s.peers = rev, class, peers
+	}
+
+	return peers
+}
+
+// set returns the set of class giving held's routes but where edits say,
+// without the IPv4 identity when ipv4Disabled: the one its viewers given
+// the same hold, or a new one. A viewer given no routes that keeps the
+// IPv4 identity holds none.
+func (cm *classMaps) set(class classKey, held *routeSet, edits []routedPeer, ipv4Disabled bool) *routeSet {
+	if len(edits) == 0 && held.ipv4Disabled() == ipv4Disabled && (held == nil || held.class == class) {
+		return held
+	}
+
+	var (
+		routes []routedPeer
+		key    string
+	)
+
+	if held != nil {
+		routes, key = held.routes, held.key
+	}
+
+	if len(edits) > 0 || held.ipv4Disabled() != ipv4Disabled {
+		routes = mergeRoutes(routes, edits)
+		if len(routes) == 0 && !ipv4Disabled {
+			return nil
+		}
+
+		key = setKey(routes, ipv4Disabled)
+	}
+
+	id := setID{class: class, key: key}
+
+	cm.smu.Lock()
+	defer cm.smu.Unlock()
+
+	if s := cm.sets[id].Value(); s != nil {
+		return s
+	}
+
+	s := &routeSet{class: class, key: key, routes: routes, v4off: ipv4Disabled}
+	w := weak.Make(s)
+
+	if cm.sets == nil {
+		cm.sets = make(map[setID]weak.Pointer[routeSet])
+	}
+
+	cm.sets[id] = w
+
+	runtime.AddCleanup(s, func(id setID) {
+		cm.smu.Lock()
+		if cm.sets[id] == w {
+			delete(cm.sets, id)
+		}
+		cm.smu.Unlock()
+	}, id)
+
+	return s
+}
+
+// mergeRoutes returns routes, sorted by peer, with edits, sorted by peer,
+// in place of their peers' entries; an edit giving no routes drops it.
+func mergeRoutes(routes, edits []routedPeer) []routedPeer {
+	out := make([]routedPeer, 0, len(routes)+len(edits))
+
+	for i, j := 0, 0; i < len(routes) || j < len(edits); {
+		switch {
+		case j == len(edits) || i < len(routes) && routes[i].id < edits[j].id:
+			out = append(out, routes[i])
+			i++
+		default:
+			if len(edits[j].routes) > 0 {
+				out = append(out, edits[j])
+			}
+
+			if i < len(routes) && routes[i].id == edits[j].id {
+				i++
+			}
+
+			j++
+		}
+	}
+
+	return out
+}
+
+// setKey encodes a set's routes and ipv4Disabled with fields of a fixed
+// size and a count before each list, so two keys are equal exactly when
+// what they encode is.
+func setKey(routes []routedPeer, ipv4Disabled bool) string {
+	n := 1
+	for _, p := range routes {
+		n += 12 + prefixKeySize*len(p.routes)
+	}
+
+	b := make([]byte, 1, n)
+	if ipv4Disabled {
+		b[0] = 1
+	}
+
+	for _, p := range routes {
+		b = binary.BigEndian.AppendUint64(b, uint64(p.id))          //nolint:gosec // node IDs are positive
+		b = binary.BigEndian.AppendUint32(b, uint32(len(p.routes))) //nolint:gosec // a node's routes fit
+		b = appendPrefixes(b, p.routes)
+	}
+
+	return string(b)
 }
 
 // classEntry is one class's latest map; mu serialises its update, so
@@ -836,8 +1291,8 @@ func (cm *classMaps) get(
 	snap *state.Snapshot,
 	view []types.NodeID,
 	capVer tailcfg.CapabilityVersion,
-	policy uint64,
-	capMaps map[types.NodeID]tailcfg.NodeCapMap,
+	capsRev uint64,
+	capMaps capsOf,
 ) (*peerMap, *profileMap, state.NodesVersion) {
 	renders.advance(snap.Rev())
 
@@ -882,6 +1337,13 @@ func (cm *classMaps) get(
 
 	dns := snap.DNS()
 
+	// TODO(kradalby): cost/class-map-rebuild: a render of a snapshot
+	// older than the class's latest map cannot edit it forward and
+	// rebuilds the map from the whole view, as renders straddling commits
+	// do whenever writes land faster than the batch delay. Accepted: the
+	// map is right either way. Fixing it takes keeping a few recent maps
+	// per class and editing forward from the newest older than the render.
+	// No upstream reference: headscale's own renderer.
 	if cur != nil {
 		if touched, ok := snap.NodesTouchedSince(cur.nodes); ok {
 			e, owners = cur.peers.Edit(), cur.owners.edit()
@@ -918,7 +1380,7 @@ func (cm *classMaps) get(
 			continue
 		}
 
-		tn, err := renders.render(cfg, dns, capVer, snap.Rev(), policy, peer, capMaps)
+		tn, err := renders.render(cfg, dns, capVer, snap.Rev(), capsRev, peer, capMaps, snap.CapabilitySources())
 		if err != nil {
 			// One peer with invalid data must not blank out the map for
 			// every node that can see it.
@@ -991,6 +1453,18 @@ func (cm *classMaps) prune(snap *state.Snapshot) {
 		return
 	}
 
+	// Moves into views of older classes are walked again if anyone still
+	// makes one.
+	cm.dmu.Lock()
+	clear(cm.deltas)
+	cm.dmu.Unlock()
+
+	// TODO(kradalby): cost/class-prune: every class's view is listed at
+	// every peers change to find the maps it no longer holds, whatever
+	// moved (a join under a self policy lists one class per user).
+	// Accepted: once per peers change, not per render. Fixing it takes
+	// pruning by the keyed views that moved (graph.Changes over the views
+	// Map). No upstream reference: headscale's own renderer.
 	current := map[*types.NodeID]struct{}{}
 
 	for _, v := range snap.PeerViews() {

@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -712,6 +713,7 @@ func TestAuthenticationFlows(t *testing.T) {
 				// the real path the node carries the polling session's
 				// machine key. CreateNodeForTest picks a random one.
 				node.MachineKey = machineKey1.Public()
+				registered := app.state.PutNodeInStoreForTest(*node)
 
 				done := make(chan struct{})
 
@@ -720,7 +722,7 @@ func TestAuthenticationFlows(t *testing.T) {
 				go func() {
 					defer close(done)
 
-					nodeToRegister.FinishAuth(types.AuthVerdict{Node: node.View()})
+					nodeToRegister.FinishAuth(types.AuthVerdict{Node: registered})
 				}()
 
 				return fmt.Sprintf("http://localhost:8080/register/%s", regID), nil
@@ -4540,7 +4542,7 @@ func TestWaitForFollowupMachineKeyMismatch(t *testing.T) {
 		// CreateNodeForTest only sets UserID, but nodeToRegisterResponse reads
 		// the owner, and the owner's identity is exactly what must not leak.
 		node.User = user
-		regEntry.FinishAuth(types.AuthVerdict{Node: node.View()})
+		regEntry.FinishAuth(types.AuthVerdict{Node: app.state.PutNodeInStoreForTest(*node)})
 
 		return fmt.Sprintf("http://localhost:8080/register/%s", authID)
 	}
@@ -4581,8 +4583,7 @@ func TestWaitForFollowupMachineKeyMismatch(t *testing.T) {
 	})
 
 	// refusedAtOnce sends a follow-up that must be refused before it waits:
-	// a session hands out one verdict, so a waiter that is not the owner
-	// would take it from the owner.
+	// a waiter that is not the owner would displace the owner's.
 	refusedAtOnce := func(t *testing.T, url string, machineKey key.MachinePublic) {
 		t.Helper()
 
@@ -4618,7 +4619,7 @@ func TestWaitForFollowupMachineKeyMismatch(t *testing.T) {
 		node := app.state.CreateNodeForTest(user, "followup-pending")
 		node.MachineKey = victimMachineKey.Public()
 		node.User = user
-		regEntry.FinishAuth(types.AuthVerdict{Node: node.View()})
+		regEntry.FinishAuth(types.AuthVerdict{Node: app.state.PutNodeInStoreForTest(*node)})
 
 		resp, err := followup(url, victimMachineKey.Public())
 		require.NoError(t, err)
@@ -4664,7 +4665,15 @@ func TestFollowupWaitPrefersCompletedAuthOverExpiredContext(t *testing.T) {
 
 	timeouts, authorized := 0, 0
 
-	for i := range iterations {
+	user := app.state.CreateUserForTest("followup-race-user")
+	node := app.state.CreateNodeForTest(user, "followup-race-node")
+	// waitForFollowup fails closed unless the node carries the polling
+	// session's machine key; production sets this via the cached
+	// RegistrationData. CreateNodeForTest picks a random one.
+	node.MachineKey = machineKey
+	registered := app.state.PutNodeInStoreForTest(*node)
+
+	for range iterations {
 		regID, err := types.NewAuthID()
 		require.NoError(t, err)
 
@@ -4675,13 +4684,7 @@ func TestFollowupWaitPrefersCompletedAuthOverExpiredContext(t *testing.T) {
 		require.NoError(t, app.state.SetAuthCacheEntry(regID, authReq))
 
 		// Registration completes BEFORE we wait: verdict is buffered.
-		user := app.state.CreateUserForTest(fmt.Sprintf("followup-race-user-%d", i))
-		node := app.state.CreateNodeForTest(user, "followup-race-node")
-		// waitForFollowup fails closed unless the node carries the polling
-		// session's machine key; production sets this via the cached
-		// RegistrationData. CreateNodeForTest picks a random one.
-		node.MachineKey = machineKey
-		authReq.FinishAuth(types.AuthVerdict{Node: node.View()})
+		authReq.FinishAuth(types.AuthVerdict{Node: registered})
 
 		// Context is expired BEFORE we wait: both select cases are ready.
 		ctx, cancel := context.WithCancel(context.Background())
@@ -5315,22 +5318,137 @@ func TestRegistrationFollowupReleasesRejectedSession(t *testing.T) {
 	rejected := callHandler(newHumaTestHandler(app), http.MethodPost, "/api/v1/auth/reject", body)
 	require.Equal(t, http.StatusOK, rejected.status)
 
-	_, present = app.state.GetAuthCacheEntry(authID)
-	require.True(t, present, "the verdict must remain available until follow-up consumes it")
+	_, present = app.state.GetAuthCacheEntryForFollowup(authID)
+	require.True(t, present, "the verdict must remain available to the follow-up")
 
 	followup, err := app.waitForFollowup(t.Context(), req.Followup, registrationDataFromRequest(req, machineKey))
-	require.NoError(t, err, "consuming the rejection must free capacity for the replacement")
+	require.NoError(t, err, "the rejected session must yield its slot to the replacement")
 	require.NotEmpty(t, followup.AuthURL)
 	require.NotEqual(t, initial.AuthURL, followup.AuthURL)
 
-	_, present = app.state.GetAuthCacheEntry(authID)
-	require.False(t, present, "the consumed session must release its slot")
+	_, present = app.state.GetAuthCacheEntryForFollowup(authID)
+	require.False(t, present, "the rejected session must release its slot")
+}
+
+// TestFollowupAcrossApprovalIsRegistered drives a follow-up whose node lookup
+// in handleRegister ran before the approval stored the node, and whose
+// pending-login lookup runs after the approval finished. Calling
+// waitForFollowup directly is that interleaving: the node lookup has missed.
+func TestFollowupAcrossApprovalIsRegistered(t *testing.T) {
+	app := createTestApp(t)
+	user := app.state.CreateUserForTest("followup-approval-user")
+
+	machineKey := key.NewMachine().Public()
+	req := tailcfg.RegisterRequest{
+		NodeKey:  key.NewNode().Public(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "followup-approval-node"},
+	}
+	initial, err := app.handleRegisterInteractive(req, machineKey)
+	require.NoError(t, err)
+	authID, err := extractRegistrationIDFromAuthURL(initial.AuthURL)
+	require.NoError(t, err)
+
+	_, found := app.state.GetNodeByNodeKey(req.NodeKey)
+	require.False(t, found, "the follow-up's node lookup misses before the approval")
+
+	node, err := app.state.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, "test")
+	require.NoError(t, err)
+
+	regData := registrationDataFromRequest(req, machineKey)
+
+	for _, reader := range []string{"the follow-up across the approval", "a later follow-up"} {
+		resp, err := app.waitForFollowup(t.Context(), initial.AuthURL, regData)
+		require.NoError(t, err, reader)
+		require.Empty(t, resp.AuthURL, "%s must not be sent to log in again", reader)
+		assert.Equal(t, nodeToRegisterResponse(node), resp, reader)
+	}
+
+	_, err = app.waitForFollowup(t.Context(), initial.AuthURL,
+		registrationDataFromRequest(req, key.NewMachine().Public()))
+	httpErr, ok := errors.AsType[HTTPError](err)
+	require.True(t, ok, "another machine must be refused, got %v", err)
+	assert.Equal(t, http.StatusUnauthorized, httpErr.Code)
+
+	other := app.state.CreateUserForTest("followup-approval-other")
+	_, err = app.state.HandleNodeFromAuthPath(authID, types.UserID(other.ID), nil, "test")
+	require.ErrorIs(t, err, db.ErrNodeNotFoundRegistrationCache,
+		"a decided login must not be approved again")
+
+	_, found = app.state.GetNodesByMachineKeyAllUsers(machineKey)[types.UserID(other.ID)]
+	assert.False(t, found)
+}
+
+// TestLateFollowupOfAGoneNodeStartsOver: a follow-up that comes after its
+// node was deleted or expired starts a new login rather than being told it
+// is in, which its first map request would refute.
+func TestLateFollowupOfAGoneNodeStartsOver(t *testing.T) {
+	for _, change := range []string{"deleted", "expired"} {
+		t.Run(change, func(t *testing.T) {
+			app := createTestApp(t)
+			user := app.state.CreateUserForTest("late-followup-user")
+
+			machineKey := key.NewMachine().Public()
+			req := tailcfg.RegisterRequest{
+				NodeKey:  key.NewNode().Public(),
+				Hostinfo: &tailcfg.Hostinfo{Hostname: "late-followup-node"},
+			}
+			initial, err := app.handleRegisterInteractive(req, machineKey)
+			require.NoError(t, err)
+			authID, err := extractRegistrationIDFromAuthURL(initial.AuthURL)
+			require.NoError(t, err)
+
+			node, err := app.state.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, "test")
+			require.NoError(t, err)
+
+			if change == "deleted" {
+				err = app.state.DeleteNode(node)
+			} else {
+				now := time.Now()
+				_, err = app.state.SetNodeExpiry(node.ID(), &now)
+			}
+
+			require.NoError(t, err)
+
+			resp, err := app.waitForFollowup(t.Context(), initial.AuthURL, registrationDataFromRequest(req, machineKey))
+			require.NoError(t, err)
+			assert.NotEmpty(t, resp.AuthURL, "a follow-up of a node since %s must start a new login", change)
+			assert.NotEqual(t, initial.AuthURL, resp.AuthURL)
+		})
+	}
+}
+
+// TestFollowupVerdictReachesEveryReader drives two readers of one verdict: the
+// first has taken it and not yet returned when the second looks the login up.
+func TestFollowupVerdictReachesEveryReader(t *testing.T) {
+	app := createTestApp(t)
+
+	machineKey := key.NewMachine().Public()
+	authID := types.MustAuthID()
+	reg := types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: machineKey,
+		Hostname:   "followup-readers-node",
+	})
+	require.NoError(t, app.state.SetAuthCacheEntry(authID, reg))
+
+	user := app.state.CreateUserForTest("followup-readers-user")
+	node := app.state.CreateNodeForTest(user, "followup-readers-node")
+	node.MachineKey = machineKey
+	node.User = user
+	reg.FinishAuth(types.AuthVerdict{Node: app.state.PutNodeInStoreForTest(*node)})
+
+	<-reg.WaitForAuth()
+
+	resp, err := app.waitForFollowup(t.Context(),
+		fmt.Sprintf("http://localhost:8080/register/%s", authID),
+		&types.RegistrationData{MachineKey: machineKey, NodeKey: key.NewNode().Public()})
+	require.NoError(t, err)
+	require.Empty(t, resp.AuthURL, "the second reader must not be sent to log in again")
+	assert.Equal(t, nodeToRegisterResponse(node.View()), resp)
 }
 
 // TestFollowupParksOneRequestPerRegistration pins that a pending registration
-// keeps one waiting follow-up, the newest. The session hands out one verdict,
-// so older waiters are answered at once instead of staying parked until the
-// session ends and then each opening a new one.
+// keeps one waiting follow-up, the newest. Older waiters are answered at once
+// instead of staying parked until the session ends.
 func TestFollowupParksOneRequestPerRegistration(t *testing.T) {
 	app := createTestApp(t)
 
@@ -5402,7 +5520,7 @@ func TestFollowupParksOneRequestPerRegistration(t *testing.T) {
 	node := app.state.CreateNodeForTest(user, "followup-park-node")
 	node.MachineKey = machineKey
 	node.User = user
-	reg.FinishAuth(types.AuthVerdict{Node: node.View()})
+	reg.FinishAuth(types.AuthVerdict{Node: app.state.PutNodeInStoreForTest(*node)})
 
 	last := next("the parked follow-up did not collect the verdict")
 	require.NoError(t, last.err)

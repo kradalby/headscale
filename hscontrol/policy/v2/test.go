@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"maps"
@@ -314,40 +315,51 @@ func wrapTestResult(sentinel error, allPassed bool, r testReport) error {
 	}
 }
 
-// RunTests evaluates the policy's own `tests` block against the live compiled
-// filter and returns a wrapped error when any test fails. Callers that need
-// the per-test breakdown can call runPolicyTests directly.
+// RunTests evaluates the policy's own `tests` block against its global
+// filter, expanded from the templates and the membership of pm's users and
+// nodes, built here for callers without a snapshot holding it, and returns
+// a wrapped error when any test fails. Callers that need the per-test
+// breakdown can call runPolicyTests directly.
 func (pm *PolicyManager) RunTests() error {
 	if pm == nil || pm.pol == nil || len(pm.pol.Tests) == 0 {
 		return nil
 	}
 
-	results := runPolicyTests(pm.pol, pm.filter, pm.users, pm.nodes)
+	return pm.RunTestsAgainst(pm.expandedFilter)
+}
+
+// RunTestsAgainst is [PolicyManager.RunTests] against the filter global
+// gives, called only when there are tests: pm's global filter expanded over
+// pm's users and nodes ([Filters.Global]), as a snapshot holding them
+// already has it. It is the one evaluator: the tests read the rules as the
+// server serves them, in IP form whatever form the wire takes, not the
+// compile's own.
+func (pm *PolicyManager) RunTestsAgainst(global func() ([]tailcfg.FilterRule, error)) error {
+	if pm == nil || pm.pol == nil || len(pm.pol.Tests) == 0 {
+		return nil
+	}
+
+	filter, err := global()
+	if err != nil {
+		return err
+	}
+
+	results := runPolicyTests(pm.pol, filter, pm.users, pm.nodes)
 
 	return wrapTestResult(errPolicyTestsFailed, results.AllPassed, results)
 }
 
-// evaluateTests runs the `tests` block against a fresh compilation of pol.
-// It is the user-write sandbox: the live [PolicyManager] state is left
-// untouched, so a failing test rejects the write without side effects.
-func evaluateTests(pol *Policy, users []types.User, nodes views.Slice[types.NodeView]) error {
-	if pol == nil || len(pol.Tests) == 0 {
-		return nil
-	}
+// expandedFilter is pm's global filter expanded from its document's
+// templates over the membership of its users and nodes, from scratch.
+func (pm *PolicyManager) expandedFilter() ([]tailcfg.FilterRule, error) {
+	list := pm.nodes.AsSlice()
+	slices.SortFunc(list, func(a, b types.NodeView) int { return cmp.Compare(a.ID(), b.ID()) })
+	nodes := views.SliceOf(list)
 
-	pol = pol.withResolvedGroups(users, nodes)
-	grants := pol.compileGrants(users, nodes)
+	sel := SelectorsFor(nil, pm)
+	roles := rolesOfViews(NewUserSets(nil, sel, pm.users), nodes)
 
-	var filter []tailcfg.FilterRule
-	if pol.ACLs == nil && pol.Grants == nil {
-		filter = noRulesFilter(users, nodes)
-	} else {
-		filter = globalFilterRules(grants)
-	}
-
-	results := runPolicyTests(pol, filter, users, nodes)
-
-	return wrapTestResult(errPolicyTestsFailed, results.AllPassed, results)
+	return NewFilters(BuildTemplates(nil, sel), Postings{}.Update(roles), approvalsOfViews(nodes), nodes).Global()
 }
 
 // runPolicyTests is the pure evaluation function: given a policy, the
@@ -805,6 +817,18 @@ func CheckPolicy(b []byte) error {
 // against users and nodes. It runs the [PolicyManager.SetPolicy] write
 // boundary, `tests` and `sshTests` included, on a throwaway manager.
 func ValidatePolicy(b []byte, users types.Users, nodes views.Slice[types.NodeView]) error {
+	return ValidatePolicyAgainst(b, users, nodes, nil)
+}
+
+// ValidatePolicyAgainst is [ValidatePolicy] with the tests run against the
+// global filter global gives for the candidate compile, as a snapshot of
+// the same users and nodes expands it; nil expands it from scratch.
+func ValidatePolicyAgainst(
+	b []byte,
+	users types.Users,
+	nodes views.Slice[types.NodeView],
+	global func(*PolicyManager) ([]tailcfg.FilterRule, error),
+) error {
 	if len(b) == 0 {
 		return ErrPolicyEmpty
 	}
@@ -819,7 +843,12 @@ func ValidatePolicy(b []byte, users types.Users, nodes views.Slice[types.NodeVie
 		return err
 	}
 
-	err = multierr.New(pm.RunTests(), pm.RunSSHTests())
+	filter := pm.expandedFilter
+	if global != nil {
+		filter = func() ([]tailcfg.FilterRule, error) { return global(pm) }
+	}
+
+	err = multierr.New(pm.RunTestsAgainst(filter), pm.RunSSHTests())
 	if err != nil {
 		return err
 	}

@@ -104,6 +104,46 @@ func TestTaggedReauthKeepsNilExpiry(t *testing.T) {
 		"tagged node must keep nil key expiry (tagged nodes never expire)")
 }
 
+// TestUntaggingLoginStoresNilTags pins that a login which takes a tagged
+// node back stores no tags, like every other untagging path: a session
+// rendered before the change holds nil, and a fresh one must not see a
+// different empty list.
+func TestUntaggingLoginStoresNilTags(t *testing.T) {
+	dbPath := t.TempDir() + "/headscale.db"
+	cfg := persistTestConfig(dbPath)
+
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(t, err)
+
+	user := database.CreateUserForTest("untag-user")
+	node := database.CreateRegisteredNodeForTest(user, "untag-node")
+	require.NoError(t, database.Close())
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	_, err = s.SetPolicy(fmt.Appendf(nil, `{"tagOwners":{"tag:foo":["%s@"]}}`, user.Name))
+	require.NoError(t, err)
+
+	_, err = s.SetNodeTags(node.ID, []string{"tag:foo"})
+	require.NoError(t, err)
+
+	authID := types.MustAuthID()
+	require.NoError(t, s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: node.MachineKey, NodeKey: node.NodeKey, Hostname: node.Hostname,
+		Hostinfo: &tailcfg.Hostinfo{Hostname: node.Hostname},
+	})))
+
+	got, err := s.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, util.RegisterMethodCLI)
+	require.NoError(t, err)
+	require.Equal(t, node.ID, got.ID(), "the login takes the node back")
+	require.False(t, got.IsTagged())
+
+	tags := got.AsStruct().Tags
+	assert.Nil(t, tags, "the login stores no tags, like every other untagging path")
+}
+
 // TestTaggedReauthWithReusedUserPAK reproduces issue #3312: a containerized
 // node registered with a user-owned one-shot pre-auth key, then converted to a
 // tagged node (UserID cleared to NULL), is logged out when the container

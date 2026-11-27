@@ -14,7 +14,9 @@ func scopeGen() *rapid.Generator[Scope] {
 	known := Known()
 
 	return rapid.Custom(func(t *rapid.T) Scope {
-		if rapid.Float64().Draw(t, "junkP") < 0.2 {
+		// One time in five (policymodel's chance): junk stays rare
+		// enough that failures shrink into the real vocabulary.
+		if rapid.IntRange(0, 4).Draw(t, "junkP") == 0 {
 			return Scope(rapid.StringMatching(`[a-z_]{1,12}(:read)?`).Draw(t, "junk"))
 		}
 

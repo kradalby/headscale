@@ -68,7 +68,11 @@ type Derived[T any] struct{ idx int }
 func (d Derived[T]) ref() cellRef[T] { return cellRef[T](d.idx) }
 
 // NewInput registers an input cell with an initial value. equal decides
-// whether a set value is a change.
+// whether a set value is a change: a value it calls equal to the one the
+// cell holds is dropped and the cell keeps that value, which is what makes
+// a write that changes nothing free — no snapshot, no wake. A derived cell
+// instead stores each value it computes, so the state it carries rides on
+// under one revision.
 func (g *Graph) NewInput[T any](name string, initial T, equal func(a, b T) bool) Input[T] {
 	return Input[T]{idx: g.register(cellDef{
 		name:    name,
@@ -141,7 +145,10 @@ func (s *Snapshot) Rev() uint64 { return s.rev }
 // Time is when the snapshot was committed.
 func (s *Snapshot) Time() time.Time { return s.at }
 
-// Get returns the value of n in s.
+// Get returns the value of n in s. A handle carries no graph identity, so
+// a handle from another graph whose cell at that index holds the same
+// type reads this graph's cell without complaint; only a cell of another
+// type panics.
 func (s *Snapshot) Get[T any](n Node[T]) T {
 	i := int(n.ref())
 	if s.reads != nil {
@@ -163,7 +170,9 @@ func (s *Snapshot) Get[T any](n Node[T]) T {
 }
 
 // ChangedAt returns the revision at which n last changed in s. Two
-// snapshots that report the same revision hold the same value of n.
+// snapshots that report the same revision hold values n's equality calls
+// equal, not the identical value: a derived cell stores each value it
+// computes, so the state it carries rides on under one revision.
 func ChangedAt[T any](s *Snapshot, n Node[T]) uint64 {
 	return s.changed[int(n.ref())]
 }
@@ -187,18 +196,13 @@ func Set[T any](tx *Tx, in Input[T], v T) {
 
 // Peek returns the value of n as the transaction sees it: the staged
 // value of an input set earlier in tx, otherwise its value in the latest
-// snapshot.
+// snapshot, or, before the first, an input's initial value; a derived
+// cell has no value then and reads as the zero value.
 func Peek[T any](tx *Tx, n Node[T]) T {
 	if v, ok := tx.sets[int(n.ref())]; ok {
 		t, _ := v.(T)
 
 		return t
-	}
-
-	if tx.base == nil {
-		var zero T
-
-		return zero
 	}
 
 	return tx.base.Get(n)
@@ -208,7 +212,8 @@ func Peek[T any](tx *Tx, n Node[T]) T {
 // cells affected, publishes the new snapshot and wakes subscribers. An
 // error from fn aborts the transaction. A transaction that changes nothing
 // publishes nothing and returns the latest snapshot. The first Update
-// computes every derived cell. fn must not call Update.
+// computes every derived cell. fn must not call Update: doing so waits
+// forever, silently, on the lock this call already holds.
 func (g *Graph) Update(fn func(tx *Tx) error) (*Snapshot, error) {
 	return g.UpdateChecked(fn, nil)
 }
@@ -224,11 +229,20 @@ func (g *Graph) Update(fn func(tx *Tx) error) (*Snapshot, error) {
 func (g *Graph) UpdateChecked(fn func(tx *Tx) error, check func(*Snapshot) error) (*Snapshot, error) {
 	snap, changed, err := g.update(fn, check)
 	if changed {
+		if afterStore != nil {
+			afterStore()
+		}
+
 		g.notify()
 	}
 
 	return snap, err
 }
+
+// afterStore, when set, runs on the commit path between the new snapshot
+// becoming readable and subscribers being woken. Test seam only; nil in
+// production.
+var afterStore func()
 
 // update runs fn and commits under g.mu. A panic in fn or in a cell leaves
 // the published snapshot as it was and the graph unlocked: commit builds the
@@ -239,6 +253,14 @@ func (g *Graph) update(fn func(tx *Tx) error, check func(*Snapshot) error) (*Sna
 
 	prev := g.snap.Load()
 	tx := &Tx{base: prev, sets: make(map[int]any)}
+
+	if prev == nil {
+		// Before the first snapshot Peek reads the initial values, so a
+		// read-modify-write there starts from what that snapshot will
+		// hold. Built per attempt: registration stays open until the
+		// first publication, so a later attempt may carry more cells.
+		tx.base = g.initialSnapshot()
+	}
 
 	err := fn(tx)
 	if err != nil {
@@ -268,6 +290,18 @@ func (g *Graph) update(fn func(tx *Tx) error, check func(*Snapshot) error) (*Sna
 	}
 
 	return next, true, nil
+}
+
+// initialSnapshot holds only the registered cells' initial values, the
+// values Peek reads before the first publication: a derived cell has no
+// value then and reads as the zero value.
+func (g *Graph) initialSnapshot() *Snapshot {
+	values := make([]any, len(g.cells))
+	for i, c := range g.cells {
+		values[i] = c.initial
+	}
+
+	return &Snapshot{values: values}
 }
 
 // commit builds the snapshot following prev with sets applied.

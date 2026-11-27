@@ -312,7 +312,7 @@ Replaces `noise_private_key_path` ([removed](#noise_private_key_path)).
 
 ## `prefixes` { #prefixes data-toc-label="prefixes" }
 
-The IP ranges node addresses are allocated from. Keep at least one of [`prefixes.v4`](#prefixes.v4) and [`prefixes.v6`](#prefixes.v6). Use the Tailscale ranges, `100.64.0.0/10` and `fd7a:115c:a1e0::/48`, or ranges inside them: the client assumes them, and other ranges are unsupported.
+The IP ranges node addresses are allocated from. Keep at least one of [`prefixes.v4`](#prefixes.v4) and [`prefixes.v6`](#prefixes.v6). Use the Tailscale ranges, `100.64.0.0/10` and `fd7a:115c:a1e0::/48`, or ranges inside them: the client assumes them, and headscale refuses other ranges.
 
 ??? example "All `prefixes` keys and defaults"
 
@@ -423,6 +423,8 @@ Where the access control policy is kept: in a file headscale reads, or in the da
     policy:
       path: ""
       mode: file
+      capability_sources: true
+      filter_chunks: true
     ```
 
 ### `policy.path` { #policy.path data-toc-label="path" }
@@ -484,6 +486,60 @@ Where the policy is kept: in the file [`policy.path`](#policy.path), or in the d
 
     ```nix
     services.headscale.settings.policy.mode = "database";
+    ```
+
+### `policy.capability_sources` { #policy.capability_sources data-toc-label="capability_sources" }
+
+- **Type:** [boolean](#type-boolean)
+- **Default:** `true`
+- **Env:** `HEADSCALE_POLICY_CAPABILITY_SOURCES`
+
+Sends a rule's users, groups, tags and autogroups as node capabilities their members are stamped with: a member joining or leaving changes the capabilities its peers are sent with it, not the packet filter nodes in capability form are sent. Every peer then sees the selectors a node is in, group names included. Sources the client cannot match this way, and nodes that cannot be sent them (nodes announcing routes, approved or not, app connectors, service hosts, clients other than Tailscale's), stay as addresses. Off sends every source as addresses and stamps nothing. Read at startup only. In either mode a policy naming a capability under `https://headscale.net/cap/src/` is refused, a stored one at startup.
+
+=== "YAML"
+
+    ```yaml
+    policy:
+      capability_sources: false
+    ```
+
+=== "Environment"
+
+    ```shell
+    export HEADSCALE_POLICY_CAPABILITY_SOURCES=false
+    ```
+
+=== "NixOS"
+
+    ```nix
+    services.headscale.settings.policy.capability_sources = false;
+    ```
+
+### `policy.filter_chunks` { #policy.filter_chunks data-toc-label="filter_chunks" }
+
+- **Type:** [boolean](#type-boolean)
+- **Default:** `true`
+- **Env:** `HEADSCALE_POLICY_FILTER_CHUNKS`
+
+Sends each node's packet filter as named chunks, so a change sends what changed instead of the whole filter: a chunk per rule, but one chunk for every app capability rule, sent whole again when any of them changes, since their order is what an application reads. Only Tailscale's own client is sent chunks; any other, tailscale-rs among them, is sent the whole filter. Off sends every client the whole filter. Independent of [`policy.capability_sources`](#policy.capability_sources). Read at startup only. Every map session starts by clearing what the client held, so this can be turned on and off between restarts. Tailscale's client holds chunks per map session, so even a rollback to a headscale release that sends no such clear leaves none behind; only a client reporting itself as Tailscale's while keeping chunks across sessions could hold stale ones.
+
+=== "YAML"
+
+    ```yaml
+    policy:
+      filter_chunks: false
+    ```
+
+=== "Environment"
+
+    ```shell
+    export HEADSCALE_POLICY_FILTER_CHUNKS=false
+    ```
+
+=== "NixOS"
+
+    ```nix
+    services.headscale.settings.policy.filter_chunks = false;
     ```
 
 ## `log` { #log data-toc-label="log" }

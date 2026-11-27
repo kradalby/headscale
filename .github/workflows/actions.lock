@@ -59,6 +59,11 @@ workflows:
         - 'dorny/paths-filter@v4.0.3'
         - 'mic92/hestia@v3.1.0'
         - 'nixos/nix-installer-action@v1.0.0'
+    '.github/workflows/pbt-soak.yml':
+        - 'actions/checkout@v7.0.1'
+        - 'actions/upload-artifact@v7.0.2'
+        - 'mic92/hestia@v3.1.0'
+        - 'nixos/nix-installer-action@v1.0.0'
     '.github/workflows/release-check.yml':
         - 'actions/checkout@v7.0.1'
         - 'mic92/hestia@v3.1.0'

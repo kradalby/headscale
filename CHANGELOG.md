@@ -122,6 +122,36 @@ override that refusal. `policy get` keeps its read-only bypass behaviour against
 
 [#37](https://github.com/kradalby/headscale/pull/37)
 
+### Packet filters name groups and tags, and send only what changed
+
+Two options under `policy`, on by default and each switchable off, change how a
+node's packet filter reaches its client. Both are read at startup.
+
+`policy.capability_sources` writes a rule's users, groups, tags,
+`autogroup:member`, `autogroup:tagged` and `autogroup:self` owners as
+capabilities, such as `cap:https://headscale.net/cap/src/group:eng`, instead of
+their members' addresses. Each node is sent, to its peers and to itself, with a
+`CapMap` entry for every such source it belongs to, and the client accepts a
+packet when the sending node carries the capability. A node joining, leaving or
+being retagged then changes the peers other nodes are sent, not the packet
+filters of nodes sent capabilities. Sources that are addresses, nodes that
+announce routes, app connectors, service hosts, clients other than Tailscale's
+own, app capability rules and protocols other than TCP, UDP, SCTP and ICMP stay
+as addresses. Peers can then read which source groups, tags and users a node
+belongs to, and a node that starts announcing routes briefly accepts more ICMP
+than its policy allows; see BREAKING.
+
+`policy.filter_chunks` sends the filter as named chunks, one per rule and one
+for all app capability rules, so a change sends only the chunks that changed;
+an unchanged filter sends nothing.
+Only Tailscale's own client is sent chunks; others get the whole filter under
+`"base"`.
+
+`/debug/capability-sources` and the `headscale_policy_address_form_*` and
+`headscale_policy_filter_deliveries_total` metrics show which nodes and rules
+are sent addresses, and why. See
+[the policy reference](docs/ref/policy.md#how-filters-reach-clients).
+
 ### Via-scoped subnet failover elects live routers
 
 Subnet failover for a grant with `via` now elects from the routers that are
@@ -166,6 +196,19 @@ See [the routes reference](docs/ref/routes.md) for the failover rules.
 - A policy without `acls` or `grants` allows only tailnet addresses and approved routes. Hosts outside the tailnet cannot connect to nodes. Use `autogroup:danger-all` to allow all addresses. [#3649](https://github.com/juanfont/headscale/pull/3649)
 - A user's devices are always peers of each other. The packet filter still controls access. [#3649](https://github.com/juanfont/headscale/pull/3649)
 - SSH `dst` rejects `autogroup:member`, as Tailscale does. Use `autogroup:self`, tags, or the source's own user. A policy file that still uses it stops headscale at startup. [#3343](https://github.com/juanfont/headscale/pull/3343)
+- Peers can read which source selectors a node belongs to: for itself and every peer it sees, a node is sent the groups, tags, users, `user:*@domain` domains and autogroups the policy names as sources, and with `autogroup:self` the owner's user ID, e.g. in `tailscale debug netmap`. Set `policy.capability_sources: false` to send addresses and no membership.
+- A node that starts announcing routes, or becomes an app connector, accepts ICMP (except echo replies and errors, which it accepts from anyone anyway) from any holder of a capability its filter names, to any address of its new local networks, until it installs the address-form filter its announcement earns; for an exit node, every address it forwards to. This normally lasts one map request round trip, and has no bound while headscale refuses that map request (e.g. HTTP 413 for an oversized Hostinfo) or is unreachable. TCP, UDP and SCTP are not affected; withdrawing routes opens no window. Tracked as [tailscale/tailscale#12542](https://github.com/tailscale/tailscale/issues/12542). Set `policy.capability_sources: false` if this is not acceptable.
+- Capabilities under `https://headscale.net/cap/src/` are reserved in either mode. A policy naming one in `nodeAttrs` or an `app` grant is refused; a stored one stops headscale at startup.
+- A grant with `via` accepts only prefixes, hosts and `autogroup:internet` as `dst`, as Tailscale does. A `dst` inside the Tailscale address ranges is rejected too, except the 4via6 range. Write a prefix the router serves, or `autogroup:internet`. As with every policy the validation refuses, a stored one stops headscale at startup in `file` and `database` mode alike, with the error in the log; a reload of one logs the error and keeps the policy in force, and the API and CLI refuse to set one. In database mode, while the server will not start, store a corrected policy with `headscale policy set --file <path> --bypass-server-and-access-database-directly`, which validates it against the persisted users and nodes.
+- `tagOwners` and `groups` reject `user:*@domain`, as Tailscale does. List the users. A stored one stops headscale at startup in either mode, a reload logs the error and keeps the policy in force, and in database mode `headscale policy set --file <path> --bypass-server-and-access-database-directly`, with the server stopped, stores a corrected one.
+- An `app` grant to `*` gives its sources the subnet routes of the tailnet's routers, as a grant with `ip` does and as Tailscale does.
+- An `app` grant that repeats a destination grants the capability once, as Tailscale does.
+- A grant with `via` reaches a destination through the exit routes of the nodes carrying the tag, as on Tailscale: such an exit node accepts the grant's traffic, and for a public destination it is offered to the sources as an exit node.
+- A node with a route over the address of a `via` router is no longer shown that router, as on Tailscale: a grant with `via` links its routers with its sources only.
+- A router of a grant with `via` that is also among the grant's sources is no longer given other nodes' exit routes and public subnet routes through that grant, as on Tailscale.
+- A router is sent the `autogroup:self` rules of every user with a device its approved routes cover, as on Tailscale, and is a peer of those devices; before, only exit nodes got other users' rules. The other devices of the router's user list those devices too, one way.
+- A `via` grant to `autogroup:internet` steers subnet routes to public prefixes too: sources get them only from routers with the `via` tag, as on Tailscale.
+- A node approved for only one of `0.0.0.0/0` and `::/0` is not offered to peers as an exit node, as on Tailscale: peers get neither route nor the exit-node suggestion, and the routers of a `via` grant whose sources the route covers list the node without being listed by it. Approve both.
 
 #### Nodes and routes
 
@@ -178,6 +221,7 @@ See [the routes reference](docs/ref/routes.md) for the failover rules.
 - `app` grants never offer exit routes. Exit nodes list the sources of an `app` grant to an internet address, as on Tailscale SaaS. [#3656](https://github.com/juanfont/headscale/pull/3656)
 - HA and `via` groups choose the healthy, online router with the oldest control session. Reconnecting routers become standby. Routers that keep their session can regain routes. [#3619](https://github.com/juanfont/headscale/pull/3619)
 - Startup adds suffixes to duplicate names. The lowest node ID keeps its name. These changes stay in memory. Check MagicDNS names. Registrations and renames avoid extra DNS record names. Collision names fit 63 bytes. [#3619](https://github.com/juanfont/headscale/pull/3619)
+- Startup refuses a node that has no address, or whose address another node also holds, instead of serving peers an ambiguous one; give each node an unused address from the configured prefixes in the nodes table
 - Peers see a disconnected node as offline after 15 seconds, not 10. HA failover starts 5 seconds later. [#3649](https://github.com/juanfont/headscale/pull/3649)
 
 #### OIDC
@@ -195,6 +239,10 @@ See [the routes reference](docs/ref/routes.md) for the failover rules.
 - Without MagicDNS, `dns.base_domain` is not a search domain. [#3649](https://github.com/juanfont/headscale/pull/3649)
 - A deleted node's map requests get a 404, as from Tailscale. Its client no longer polls `/machine/map` in a tight loop. Tailscale 1.106 and later show "Device removed" and need a new login; older clients keep retrying until `tailscale up --force-reauth`. [#3688](https://github.com/juanfont/headscale/issues/3688)
 - A tagged node sees itself as its own user, with the node name. `tailscale status` shows this name, not `tagged-devices`. Tagged nodes are not devices of one owner for Taildrop. [#3649](https://github.com/juanfont/headscale/pull/3649)
+- By default, packet filters name identity sources as `cap:https://headscale.net/cap/src/<selector>` and nodes carry those capabilities in their `CapMap`, as peers and as themselves; filters arrive as named chunks in `PacketFilters`, not under `"base"`. Integrations reading a node's packet filter or its peers' `CapMap` must handle both forms, or set `policy.capability_sources: false` and `policy.filter_chunks: false`.
+- Tailscale's own client gets its filter as named chunks: one per rule (`r/<hash>`), every app capability rule together (`c/<hash>`). Later responses carry only new chunks and `null` for removed ones; an unchanged filter sends no `PacketFilters`. Other clients, tailscale-rs among them, get the whole filter under `"base"`, as every client does with `policy.filter_chunks: false`.
+- The first response of every map stream carries `"PacketFilters": {"*": null, …}`, clearing what the client held, with either option on or off. Both options can be switched between restarts.
+- Rolling back to an earlier release leaves no stale chunks. Tailscale's client keeps chunks for one map session, and the restart starts new sessions, which replace the whole filter; tailscale-rs, which keeps chunks across sessions, is never sent chunks. Only a client reporting itself as Tailscale's while keeping chunks across sessions could hold stale ones. The new sessions also drop the capability entries and `cap:` rules.
 
 #### API
 
@@ -217,6 +265,7 @@ See [the routes reference](docs/ref/routes.md) for the failover rules.
 - A `derp.paths` file that decodes to neither regions nor `homeparams` now fails to load instead of being silently ignored
 - A `derp.paths` file with a key `tailcfg.DERPMap` has no field for (e.g. a misspelt `regionscore`) fails to load instead of the key being ignored, as Tailscale SaaS rejects such a policy `derpMap` [#2932](https://github.com/juanfont/headscale/pull/2932)
 - A DERP map from `derp.paths` or `derp.urls` must meet the region rules Tailscale SaaS applies to a policy `derpMap`: each region's `regionid` matches its key, each node's `regionid` matches its region, and a region has at least one node. A map that breaks one fails to load. Clients count latency by `regionid`, so a mismatch made them pick a home region the map did not have [#2932](https://github.com/juanfont/headscale/pull/2932)
+- `prefixes.v4` must lie inside `100.64.0.0/10` and `prefixes.v6` inside `fd7a:115c:a1e0::/48`; headscale refuses any other prefix, and a `prefixes.v4` inside `100.115.92.0/23`, which Tailscale reserves for ChromeOS VMs. It also refuses to start while a node holds an address outside these ranges or inside `100.115.92.0/23`. Other prefixes were unsupported, and the policy's `*` did not treat their addresses the same everywhere. A deployment with custom prefixes must give its nodes new addresses before upgrading: see [How can I migrate back to the recommended IP prefixes?](https://headscale.net/stable/about/faq/#how-can-i-migrate-back-to-the-recommended-ip-prefixes)
 - `database.sqlite.path` names the file literally. Before, SQLite cut the path at `?` or `#` and decoded `%XX`, so headscale opened another file. A path with `%`, `?` or `#` now opens a different file than before: move the database to the configured path before upgrading, or headscale starts with an empty one
 - `unix_socket_permission` must be a quoted octal string no higher than `"0777"`, e.g. `"0770"`; an unquoted number or an invalid value now stops headscale from starting instead of silently using `0700` [#3540](https://github.com/juanfont/headscale/pull/3540)
 - `tls_cert_path`, `tls_key_path`, `tls_letsencrypt_*`, `acme_url` and `acme_email` are deprecated in favour of `tls.cert_path`, `tls.key_path` and `tls.acme.*` [#3554](https://github.com/juanfont/headscale/pull/3554)
@@ -330,6 +379,12 @@ See [the routes reference](docs/ref/routes.md) for the failover rules.
 - Peers are rendered for at most the server's current capability version, so a client newer than the server sees each peer's `Cap` as the server's current version, not its own [#37](https://github.com/kradalby/headscale/pull/37)
 - MagicDNS reverse zones for IPv4 prefixes whose configured address has host bits set, and for IPv6 prefixes whose mask is not nibble-aligned, are enumerated from the masked prefix, so tailnets with such custom prefixes advertise the correct set of reverse zones [#40](https://github.com/kradalby/headscale/pull/40)
 - Split-DNS zones with an empty resolver list are now sent as an empty route — handled by the client's built-in resolver — instead of `null` [#40](https://github.com/kradalby/headscale/pull/40)
+- The v1 API returns `409 Conflict`, not `500`, when a user create or rename asks for a name another user already has; a rename to a taken name always returned `500`. This includes a name held only by users from an identity provider, where a create used to succeed and a rename to answer `500`
+- Exit nodes are given the subnet routes behind the sources of a rule to `autogroup:internet`, as on Tailscale SaaS: traffic to a source's own subnet goes through the exit node as well
+- `/api/v1/auth/approve` approves only an SSH check and answers `400` for a pending node registration; approving one used to finish the login without creating its node, so its client started over
+- An approval of a login another approval already decided is refused, so two approvals can no longer both register one login
+- A login the client follows up on late, or twice, is answered with the verdict the interaction already reached instead of starting over; a follow-up whose node is gone starts the login over
+- The IP allocators never hand out an address in `fd7a:115c:a1e0:b1a::/64`, the range the Tailscale client reads as IPv4 routes mapped into IPv6 (4via6); the random strategy could draw one, and a node given it was unusable as itself
 
 ## 0.29.7 (2026-10-30)
 
@@ -677,11 +732,10 @@ connected" routers that maintain their control session but cannot route packets.
 
 #### ACL Policy
 
-- Wildcard (`*`) in ACL sources and destinations now resolves to Tailscale's CGNAT range (`100.64.0.0/10`) and ULA range (`fd7a:115c:a1e0::/48`) instead of all IPs (`0.0.0.0/0` and `::/0`) [#3036](https://github.com/juanfont/headscale/pull/3036)
+- Wildcard (`*`) in ACL sources now resolves to Tailscale's CGNAT range (`100.64.0.0/10`) and ULA range (`fd7a:115c:a1e0::/48`) instead of all IPs (`0.0.0.0/0` and `::/0`) [#3036](https://github.com/juanfont/headscale/pull/3036)
   - This better matches Tailscale's security model where `*` means "any node in the tailnet" rather than "any IP address"
-  - Policies that need to match all IP addresses including non-Tailscale IPs should use `autogroup:danger-all` as a source, or explicit CIDR ranges as destinations [#2180](https://github.com/juanfont/headscale/pull/2180)
+  - Policies that need to match all IP addresses including non-Tailscale IPs should use `autogroup:danger-all` as a source [#2180](https://github.com/juanfont/headscale/pull/2180)
   - `autogroup:danger-all` can only be used as a source; it cannot be used as a destination
-  - **Note**: Users with non-standard IP ranges configured in `prefixes.ipv4` or `prefixes.ipv6` (which is unsupported and produces a warning) will need to explicitly specify their CIDR ranges in ACL rules instead of using `*`
 - Validate `autogroup:self` source restrictions matching Tailscale behavior - tags, hosts, and IPs are rejected as sources for `autogroup:self` destinations [#3036](https://github.com/juanfont/headscale/pull/3036)
   - Policies using tags, hosts, or IP addresses as sources for `autogroup:self` destinations will now fail validation
 - The `proto:icmp` protocol name now only includes ICMPv4 (protocol 1), matching Tailscale behavior [#3036](https://github.com/juanfont/headscale/pull/3036)

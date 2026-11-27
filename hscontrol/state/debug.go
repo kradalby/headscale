@@ -9,6 +9,7 @@ import (
 	"time"
 
 	hsdb "github.com/juanfont/headscale/hscontrol/db"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
 )
@@ -288,6 +289,40 @@ func (s *State) DebugFilter() ([]tailcfg.FilterRule, error) {
 	return filter, nil
 }
 
+// DebugCapabilitySourcesInfo is what the fallbacks of capability sources
+// cost: per reason, the nodes whose whole filter goes as addresses and the
+// rules with a source that does, now; and the filters and rules cut so
+// since the process started.
+type DebugCapabilitySourcesInfo struct {
+	Enabled   bool              `json:"enabled"`
+	Receivers map[string]int    `json:"receivers"`
+	Rules     map[string]int    `json:"rules"`
+	CutTotals map[string]uint64 `json:"filters_cut_in_address_form"`
+	RuleTotal map[string]uint64 `json:"rules_cut_with_address_sources"`
+	// FilterChunks is policy.filter_chunks, Deliveries the sessions'
+	// filter deliveries decided since the process started, by delivery.
+	FilterChunks bool              `json:"filter_chunks"`
+	Deliveries   map[string]uint64 `json:"filter_deliveries"`
+}
+
+// DebugCapabilitySources reports, from one [Snapshot], what the fallbacks
+// of capability sources send as addresses.
+func (s *State) DebugCapabilitySources() (DebugCapabilitySourcesInfo, error) {
+	snap := s.Snapshot()
+
+	census, err := snap.FallbackCensus()
+	if err != nil {
+		return DebugCapabilitySourcesInfo{}, err
+	}
+
+	info := DebugCapabilitySourcesInfo{Enabled: snap.CapabilitySources()}
+	info.Receivers, info.Rules = census.Labelled()
+	info.CutTotals, info.RuleTotal = policyv2.AddressFormCounts()
+	info.FilterChunks, info.Deliveries = snap.FilterChunks(), policyv2.FilterDeliveryCounts()
+
+	return info, nil
+}
+
 // DebugRoutes returns the current primary routes information as a
 // structured object built from one [Snapshot].
 func (s *State) DebugRoutes() types.DebugRoutes {
@@ -351,9 +386,23 @@ func (s *State) DebugPolicyManager() string {
 	return s.PolicyDebugString()
 }
 
-// PolicyDebugString returns a debug representation of the current policy.
+// PolicyDebugString returns a debug representation of the current policy:
+// the compile's document, tag owners, auto-approvers and node list, which
+// it still serves, with the served global filter in place of its own.
 func (s *State) PolicyDebugString() string {
-	return s.Snapshot().Policy().DebugString()
+	snap := s.Snapshot()
+
+	pm, ok := snap.Policy().(*policyv2.PolicyManager)
+	if !ok {
+		return "no policy compiled"
+	}
+
+	rules, _, err := snap.Filter()
+	if err != nil {
+		return fmt.Sprintf("expanding the policy's filter: %v", err)
+	}
+
+	return pm.DebugStringFor(rules)
 }
 
 // DebugOverviewJSON returns a structured overview of the current state for debugging.
@@ -464,6 +513,6 @@ func (s *State) DebugNodeStoreJSON() map[types.NodeID]types.Node {
 // DebugPolicyManagerJSON returns structured debug information about the policy manager.
 func (s *State) DebugPolicyManagerJSON() DebugStringInfo {
 	return DebugStringInfo{
-		Content: s.Snapshot().Policy().DebugString(),
+		Content: s.PolicyDebugString(),
 	}
 }

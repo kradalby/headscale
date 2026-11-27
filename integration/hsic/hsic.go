@@ -29,6 +29,7 @@ import (
 	clientv2 "github.com/juanfont/headscale/gen/client/v2"
 	"github.com/juanfont/headscale/hscontrol"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
+	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/integration/dockertestutil"
@@ -148,6 +149,32 @@ func WithCustomTLS(caCert, cert, key []byte) Option {
 func WithConfigEnv(configEnv map[string]string) Option {
 	return func(hsic *HeadscaleInContainer) {
 		maps.Copy(hsic.env, configEnv)
+	}
+}
+
+// WithCapabilitySources names filter sources by node capability
+// (policy.capability_sources), whatever [capabilitySourcesEnv] says.
+func WithCapabilitySources() Option {
+	return withPolicyOption("HEADSCALE_POLICY_CAPABILITY_SOURCES", true)
+}
+
+// capabilitySourcesEnv, a boolean that `hi` passes through, sets
+// policy.capability_sources for every headscale a suite starts; unset,
+// headscale's default holds.
+const capabilitySourcesEnv = "HEADSCALE_INTEGRATION_CAPABILITY_SOURCES"
+
+// WithFilterChunks sends packet filters as named chunks
+// (policy.filter_chunks), whatever [filterChunksEnv] says.
+func WithFilterChunks() Option {
+	return withPolicyOption("HEADSCALE_POLICY_FILTER_CHUNKS", true)
+}
+
+// filterChunksEnv is [capabilitySourcesEnv] for policy.filter_chunks.
+const filterChunksEnv = "HEADSCALE_INTEGRATION_FILTER_CHUNKS"
+
+func withPolicyOption(env string, on bool) Option {
+	return func(hsic *HeadscaleInContainer) {
+		hsic.env[env] = strconv.FormatBool(on)
 	}
 }
 
@@ -349,6 +376,23 @@ func New(
 		env:              DefaultConfigEnv(),
 		filesInContainer: []fileInContainer{},
 		policyMode:       types.PolicyModeFile,
+	}
+
+	for env, key := range map[string]string{
+		capabilitySourcesEnv: "HEADSCALE_POLICY_CAPABILITY_SOURCES",
+		filterChunksEnv:      "HEADSCALE_POLICY_FILTER_CHUNKS",
+	} {
+		v := os.Getenv(env)
+		if v == "" {
+			continue
+		}
+
+		on, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("%s=%q: %w", env, v, err)
+		}
+
+		withPolicyOption(key, on)(hsic)
 	}
 
 	for _, opt := range opts {
@@ -1733,6 +1777,13 @@ func (t *HeadscaleInContainer) DebugNodeStore() (map[types.NodeID]types.Node, er
 // DebugFilter fetches the current filter rules from the debug endpoint.
 func (t *HeadscaleInContainer) DebugFilter() ([]tailcfg.FilterRule, error) {
 	return t.debugJSON[[]tailcfg.FilterRule]("filter")
+}
+
+// DebugCapabilitySources fetches which filter sources the server sends as
+// addresses instead of capabilities, and whether it names any by
+// capability at all.
+func (t *HeadscaleInContainer) DebugCapabilitySources() (*state.DebugCapabilitySourcesInfo, error) {
+	return t.debugJSON[*state.DebugCapabilitySourcesInfo]("capability-sources")
 }
 
 // debugJSON fetches and decodes a JSON-returning debug endpoint by name.

@@ -70,15 +70,6 @@ func registerUsers(api huma.API, b Backend) {
 		Tags:        []string{"Users"},
 		Security:    bearerAuth,
 	}, func(ctx context.Context, in *createUserInput) (*userOutput, error) {
-		// Pre-check yields a 409 for the common case; the DB unique constraint
-		// is the real guard.
-		if in.Body.Name != "" {
-			_, err := b.State.GetUserByName(in.Body.Name)
-			if err == nil {
-				return nil, huma.Error409Conflict("user already exists")
-			}
-		}
-
 		user, err := b.State.CreateUser(types.User{
 			Name:          in.Body.Name,
 			DisplayName:   in.Body.DisplayName,
@@ -113,18 +104,13 @@ func registerUsers(api huma.API, b Backend) {
 			return nil, mapError("renaming user", err)
 		}
 
-		_, err = b.State.RenameUser(types.UserID(oldUser.ID), in.NewName)
+		renamed, err := b.State.RenameUser(types.UserID(oldUser.ID), in.NewName)
 		if err != nil {
 			return nil, mapError("renaming user", err)
 		}
 
-		newUser, err := b.State.GetUserByName(in.NewName)
-		if err != nil {
-			return nil, huma.Error500InternalServerError("renaming user", err)
-		}
-
 		out := &userOutput{}
-		out.Body.User = userFromView(newUser.View())
+		out.Body.User = userFromView(renamed.View())
 
 		return out, nil
 	})

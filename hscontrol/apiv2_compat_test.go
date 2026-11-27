@@ -26,6 +26,7 @@ import (
 	"time"
 
 	apiv2 "github.com/juanfont/headscale/hscontrol/api/v2"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/stretchr/testify/assert"
@@ -1224,7 +1225,10 @@ func (r *apiReplay) enforcedNow(t *testing.T) string {
 		nv, ok := r.app.state.GetNodeByID(types.NodeID(id))
 		require.True(t, ok, label)
 
-		rules, err := r.app.state.Snapshot().Policy().FilterForNode(nv)
+		pm, ok := r.app.state.Snapshot().Policy().(*policyv2.PolicyManager)
+		require.True(t, ok, "test sanity: a v2 policy")
+
+		rules, err := pm.FilterForNode(nv)
 		require.NoError(t, err)
 
 		ssh, err := r.app.state.SSHPolicy(nv)

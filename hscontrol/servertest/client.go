@@ -1,10 +1,16 @@
 package servertest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"path"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -25,6 +31,7 @@ import (
 	"tailscale.com/types/persist"
 	"tailscale.com/types/views"
 	"tailscale.com/util/eventbus"
+	"tailscale.com/version"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -77,6 +84,9 @@ type TestClient struct {
 	// streams and streamMaps: see [TestClient.Stream].
 	streams, streamMaps int
 
+	// unknownClient: see [WithUnknownClient].
+	unknownClient bool
+
 	// deltaUpdates, deltaRemoved and deltaSeen: see [WithDeltaUpdates].
 	deltaUpdates bool
 	deltaRemoved []tailcfg.NodeID
@@ -84,6 +94,11 @@ type TestClient struct {
 
 	// registers: see [TestClient.RegisterAttempts].
 	registers []testcapture.RegisterAttempt
+
+	// filterHeld is set while the last netmap in history is one a
+	// [WithDeltaUpdates] client's in-place filter update made for the
+	// response in hand, which a full rebuild of the same response replaces.
+	filterHeld bool
 
 	// frames: see [TestClient.Frames]. stamped is set while the response
 	// in hand carried a ControlTime, so its rebuild is already counted.
@@ -107,6 +122,7 @@ type ClientOption func(*clientConfig)
 
 type clientConfig struct {
 	deferFirstMap bool
+	noPoll        bool
 	ephemeral     bool
 	hostname      string
 	tags          []string
@@ -115,6 +131,7 @@ type clientConfig struct {
 	deltaUpdates  bool
 	noHistory     bool
 	hostinfo      *tailcfg.Hostinfo
+	unknownClient bool
 	approve       func(authID string) error
 	loginFlags    controlclient.LoginFlags
 	endpoints     []tailcfg.Endpoint
@@ -163,6 +180,14 @@ func WithHostinfo(hi *tailcfg.Hostinfo) ClientOption {
 	return func(c *clientConfig) { c.hostinfo = hi }
 }
 
+// WithUnknownClient makes the client report no Go client and no Tailscale
+// version, as tailscale-rs does: the server cannot tell it applies
+// capability sources. Without it, every Hostinfo the client sends carries
+// the Go and Tailscale versions the official client reports.
+func WithUnknownClient() ClientOption {
+	return func(c *clientConfig) { c.unknownClient = true }
+}
+
 // WithInteractiveLogin registers without an auth key, as `tailscale up`
 // does: the server answers with an auth URL and approve, given its auth ID,
 // completes the login, as `headscale auth register` would.
@@ -198,6 +223,13 @@ func WithUser(user *types.User) ClientOption {
 // The caller must release its gate and wait for a map before checking client state.
 func WithoutInitialMapWait() ClientOption {
 	return func(c *clientConfig) { c.deferFirstMap = true }
+}
+
+// WithoutPoll returns once the client is registered, without opening a map
+// session, as a node that registered and went down before it connected;
+// [TestClient.RestartPoll] connects it.
+func WithoutPoll() ClientOption {
+	return func(c *clientConfig) { c.noPoll = true }
 }
 
 // NewClient creates a [TestClient], registers it with the [TestServer]
@@ -285,8 +317,9 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 		dialer:     dialer,
 		tracker:    tracker,
 
-		deltaUpdates: cc.deltaUpdates,
-		noHistory:    cc.noHistory,
+		deltaUpdates:  cc.deltaUpdates,
+		noHistory:     cc.noHistory,
+		unknownClient: cc.unknownClient,
 	}
 
 	tc.logf = func(format string, args ...any) {
@@ -300,6 +333,7 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 		if strings.Contains(line, `{"controltime":`) {
 			tc.frames++
 			tc.stamped = true
+			tc.filterHeld = false
 		}
 		tc.mu.Unlock()
 	}
@@ -330,6 +364,10 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 		return tc, err
 	}
 
+	if cc.noPoll {
+		return tc, nil
+	}
+
 	// Start long-polling in the background.
 	tc.startPoll(tb)
 
@@ -348,6 +386,83 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 	}
 
 	return tc, nil
+}
+
+// SecondSessionClient is a second map session of share's node: the same
+// machine, node and disco keys, as a tailscaled whose previous stream is
+// still draining has when it reconnects. It registers through the same
+// Noise and registration path as any client — the node is not
+// duplicated — waits for its first map, and is cleaned up with tb.
+func SecondSessionClient(tb testing.TB, server *TestServer, name string, share *TestClient, hi *tailcfg.Hostinfo) *TestClient {
+	tb.Helper()
+
+	bus := eventbus.New()
+	tracker := health.NewTracker(bus)
+	dialer := tsdial.NewDialer(netmon.NewStatic())
+	dialer.SetBus(bus)
+	dialer.SetSystemDialerForTest(server.MemNet().Dial)
+
+	tc := &TestClient{
+		Name:       name,
+		server:     server,
+		machineKey: share.machineKey,
+		discoKey:   share.discoKey,
+		updates:    make(chan *netmap.NetworkMap, 64),
+		firstMap:   make(chan struct{}),
+		bus:        bus,
+		dialer:     dialer,
+		tracker:    tracker,
+
+		// The caller's hostinfo is sent as given, the caller's model of
+		// it being what the server must store.
+		unknownClient: true,
+	}
+
+	tc.logf = func(format string, args ...any) {
+		line := fmt.Sprintf(format, args...)
+		tb.Logf("%s", line)
+
+		tc.mu.Lock()
+		tc.registers, _ = testcapture.AppendRegisterLine(tc.registers, line)
+
+		// The poll logs a response's ControlTime before it applies it.
+		if strings.Contains(line, `{"controltime":`) {
+			tc.frames++
+			tc.stamped = true
+			tc.filterHeld = false
+		}
+		tc.mu.Unlock()
+	}
+
+	direct, err := tc.newDirect(share.Persist(), "", hi)
+	if err != nil {
+		tb.Fatalf("servertest: SecondSessionClient(%s): NewDirect: %v", name, err)
+	}
+
+	tc.direct = direct
+
+	tc.cleanupOnce = sync.OnceFunc(tc.cleanup)
+	tb.Cleanup(tc.cleanupOnce)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err = tc.tryLogin(ctx, controlclient.LoginDefault, nil)
+	if err != nil {
+		tb.Fatalf("servertest: SecondSessionClient(%s): %v", name, err)
+	}
+
+	tc.startPoll(tb)
+
+	select {
+	case <-tc.firstMap:
+	case <-tc.pollDone:
+		tb.Fatalf("servertest: SecondSessionClient(%s): its stream ended before a map", name)
+	case <-time.After(10 * time.Second):
+		tb.Fatalf("servertest: SecondSessionClient(%s): no map after 10s", name)
+	}
+
+	return tc
 }
 
 // NewAutoClient starts the control client tailscaled runs, a
@@ -376,7 +491,7 @@ func NewAutoClient(
 		GetMachinePrivateKey: func() (key.MachinePrivate, error) { return machineKey, nil },
 		ServerURL:            server.URL,
 		AuthKey:              server.CreatePreAuthKey(tb, types.UserID(user.ID)),
-		Hostinfo:             hi,
+		Hostinfo:             officialHostinfo(hi),
 		DiscoPublicKey:       key.NewDisco().Public(),
 		Logf:                 tb.Logf,
 		HealthTracker:        health.NewTracker(bus),
@@ -409,7 +524,7 @@ func (c *TestClient) newDirect(
 		GetMachinePrivateKey: func() (key.MachinePrivate, error) { return c.machineKey, nil },
 		ServerURL:            c.server.URL,
 		AuthKey:              authKey,
-		Hostinfo:             hi,
+		Hostinfo:             c.clientHostinfo(hi),
 		DiscoPublicKey:       c.discoKey,
 		Logf:                 c.logf,
 		HealthTracker:        c.tracker,
@@ -422,6 +537,35 @@ func (c *TestClient) newDirect(
 	}
 
 	return direct, err
+}
+
+// clientHostinfo is hi as the client sends it: with the Go and Tailscale
+// versions [hostinfo.New] fills in, unless the client is unknown.
+func (c *TestClient) clientHostinfo(hi *tailcfg.Hostinfo) *tailcfg.Hostinfo {
+	if c.unknownClient {
+		return hi
+	}
+
+	return officialHostinfo(hi)
+}
+
+// officialHostinfo is hi with the Go and Tailscale versions [hostinfo.New]
+// fills in, where it has none; a copy.
+func officialHostinfo(hi *tailcfg.Hostinfo) *tailcfg.Hostinfo {
+	if hi == nil || hi.GoVersion != "" && hi.IPNVersion != "" {
+		return hi
+	}
+
+	out := hi.Clone()
+	if out.GoVersion == "" {
+		out.GoVersion = runtime.Version()
+	}
+
+	if out.IPNVersion == "" {
+		out.IPNVersion = version.Long()
+	}
+
+	return out
 }
 
 // register performs the initial [controlclient.Direct.TryLogin] to register the client.
@@ -463,6 +607,10 @@ func (c *TestClient) tryLogin(ctx context.Context, flags controlclient.LoginFlag
 	return c.direct.SendUpdate(ctx)
 }
 
+// errLoginStartedOver is a login the server answered with a new auth URL
+// once approve had completed it.
+var errLoginStartedOver = errors.New("the login was answered with a new auth URL")
+
 // waitLogin waits on the auth URL while approve completes the login it names.
 func (c *TestClient) waitLogin(ctx context.Context, url string, approve func(string) error) error {
 	ctx, cancel := context.WithCancel(ctx)
@@ -471,13 +619,27 @@ func (c *TestClient) waitLogin(ctx context.Context, url string, approve func(str
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := c.direct.WaitLoginURL(ctx, url)
+		next, err := c.direct.WaitLoginURL(ctx, url)
+		if err == nil && next != "" {
+			// The server told the client to start over: it is not logged in.
+			err = fmt.Errorf("%w: %q", errLoginStartedOver, next)
+		}
+
 		done <- err
 	}()
 
 	// The URL ends in the auth ID: /register/<id>.
 	err := approve(path.Base(url))
 	if err != nil {
+		// A follow-up the server already told to start over is why the
+		// approval found no login.
+		cancel()
+
+		ferr := <-done
+		if errors.Is(ferr, errLoginStartedOver) {
+			return ferr
+		}
+
 		return err
 	}
 
@@ -548,16 +710,31 @@ func (c *TestClient) resetNetmapState() {
 func (c *TestClient) UpdateFullNetmap(nm *netmap.NetworkMap) {
 	c.mu.Lock()
 	c.netmap = nm
-	c.updatesReceived++
-	c.streamMaps++
+
+	// A rebuild of a response whose filter was installed in place stands
+	// for it: one netmap per response.
+	if c.filterHeld {
+		c.filterHeld = false
+
+		if !c.noHistory && len(c.history) > 0 {
+			c.history[len(c.history)-1] = nm
+		}
+	} else {
+		c.updatesReceived++
+		c.streamMaps++
+
+		if !c.noHistory {
+			c.history = append(c.history, nm)
+		}
+	}
 
 	// A client built without TryNewClient has no firstMap.
 	if c.updatesReceived == 1 && c.firstMap != nil {
-		close(c.firstMap)
-	}
-
-	if !c.noHistory {
-		c.history = append(c.history, nm)
+		select {
+		case <-c.firstMap:
+		default:
+			close(c.firstMap)
+		}
 	}
 
 	// Removals sent ahead of their batch carry no ControlTime, so a rebuild
@@ -585,7 +762,37 @@ func (c *TestClient) UpdateFullNetmap(nm *netmap.NetworkMap) {
 // full netmap is still delivered and the client's peer state stays exact.
 type deltaRecorder struct{ *TestClient }
 
-func (d deltaRecorder) UpdatePacketFilter(views.Slice[tailcfg.FilterRule], []filter.Match) bool {
+// UpdatePacketFilter installs the filter in the netmap the client holds,
+// as tailscaled's backend does: a response carrying only a filter builds
+// no full netmap. The netmap it makes counts as one, in
+// [TestClient.UpdateCount] and [TestClient.History], unless the response
+// goes on to a full rebuild, which takes its place.
+func (d deltaRecorder) UpdatePacketFilter(rules views.Slice[tailcfg.FilterRule], matches []filter.Match) bool {
+	d.mu.Lock()
+
+	nm := d.netmap
+	if nm != nil {
+		held := *nm
+		held.PacketFilterRules, held.PacketFilter = rules, matches
+		nm = &held
+		d.netmap = nm
+		d.updatesReceived++
+		d.streamMaps++
+		d.filterHeld = true
+
+		if !d.noHistory {
+			d.history = append(d.history, nm)
+		}
+	}
+	d.mu.Unlock()
+
+	if nm != nil {
+		select {
+		case d.updates <- nm:
+		default:
+		}
+	}
+
 	return true
 }
 
@@ -668,6 +875,21 @@ func (c *TestClient) Disconnect(tb testing.TB) {
 	if c.pollCancel != nil {
 		c.pollCancel()
 		<-c.pollDone
+	}
+}
+
+// Polling reports whether the client's long-poll session is running: a
+// client that disconnected, or went down, holds the netmap it last got.
+func (c *TestClient) Polling() bool {
+	if c.pollDone == nil {
+		return false
+	}
+
+	select {
+	case <-c.pollDone:
+		return false
+	default:
+		return true
 	}
 }
 
@@ -1059,7 +1281,8 @@ func (c *TestClient) PeerNames() []string {
 	return names
 }
 
-// UpdateCount returns the total number of full netmap updates received.
+// UpdateCount returns the total number of netmaps received: full netmap
+// updates, and the filters a [WithDeltaUpdates] client installs in place.
 func (c *TestClient) UpdateCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -1149,6 +1372,49 @@ func (c *TestClient) MachineKey() key.MachinePublic {
 // advanced operations like [controlclient.Direct.SetHostinfo] or SendUpdate.
 func (c *TestClient) Direct() *controlclient.Direct {
 	return c.direct
+}
+
+// SSHAction is the SSH check action the node's tailscaled is given for a
+// connection src→dst as localUser, polled over the client's real Noise
+// connection, as tailssh does. An empty authID is the initial poll the
+// client makes; a non-empty one is the follow-up it parks on. The poll
+// blocks until the verdict is in, as the client's does.
+func (c *TestClient) SSHAction(ctx context.Context, srcID, dstID types.NodeID, localUser, authID string) (*tailcfg.SSHAction, error) {
+	u := fmt.Sprintf("%s/machine/ssh/action/%d/to/%d?local_user=%s", c.server.URL, srcID, dstID, url.QueryEscape(localUser))
+	if authID != "" {
+		u += "&auth_id=" + authID
+	}
+
+	// Noise requests are addressed with the https scheme; the control
+	// client routes them over the established Noise connection.
+	u = strings.Replace(u, "http://", "https://", 1)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.direct.DoNoiseRequest(req)
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(resp.Body)
+
+		return nil, fmt.Errorf("servertest: SSHAction(%s): %d: %s", c.Name, resp.StatusCode, bytes.TrimSpace(msg)) //nolint:err113
+	}
+
+	var action tailcfg.SSHAction
+
+	err = json.NewDecoder(resp.Body).Decode(&action)
+	if err != nil {
+		return nil, fmt.Errorf("servertest: SSHAction(%s): %w", c.Name, err)
+	}
+
+	return &action, nil
 }
 
 // String implements [fmt.Stringer] for debug output.

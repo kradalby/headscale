@@ -318,8 +318,9 @@ func (node *Node) IsTagged() bool {
 	return len(node.Tags) > 0
 }
 
-// IsUserOwned returns true if node is owned by a user (not tagged).
-// Tagged nodes may have a UserID for "created by" tracking, but the tag is the owner.
+// IsUserOwned returns true if node is owned by a user (not tagged). State
+// clears a tagged node's user, but a node built by hand can carry both, and
+// the tag is the owner.
 func (node *Node) IsUserOwned() bool {
 	return !node.IsTagged()
 }
@@ -376,6 +377,17 @@ func (node *Node) ExitRoutes() []netip.Prefix {
 func (node *Node) SameRouteFacts(other *Node) bool {
 	return sameSlice(node.AnnouncedRoutes(), other.AnnouncedRoutes()) &&
 		sameSlice(node.ApprovedRoutes, other.ApprovedRoutes)
+}
+
+// OfferedExitRoutes are the exit routes peers are given of the node: both
+// or none. SaaS offers no node approved for one family alone as an exit
+// node, though the node itself serves the route.
+func (node *Node) OfferedExitRoutes() []netip.Prefix {
+	if routes := node.ExitRoutes(); len(routes) == 2 {
+		return routes
+	}
+
+	return nil
 }
 
 // IsExitNode reports whether the node has any approved exit routes.
@@ -511,6 +523,7 @@ func (node *Node) CanAccessRoutes(
 
 	ips := node.IPs()
 	subnetRoutes := node.SubnetRoutes()
+	isExit := node.IsExitNode()
 	sides := make([]struct{ isSrc, isDst bool }, len(matchers))
 
 	for i, m := range matchers {
@@ -518,14 +531,16 @@ func (node *Node) CanAccessRoutes(
 		// If the node's approved subnet routes overlap the source set
 		// and the route overlaps the destination set, the router needs
 		// this route to forward traffic from its local subnet.
-		sides[i].isSrc = m.SrcsContainsIPs(ips...) ||
-			m.SrcsOverlapsPrefixes(subnetRoutes...)
+		sides[i].isSrc = !m.IsViaRouter() && (m.SrcsContainsIPs(ips...) ||
+			m.SrcsOverlapsPrefixes(subnetRoutes...))
 
 		// Reverse: traffic from the route's subnet is destined for
 		// this node's subnets; the router needs the route for return
-		// traffic.
+		// traffic. An exit node serves a rule's internet destinations,
+		// so it is on that side too, as [Node.CanAccess] has it.
 		sides[i].isDst = m.DestsContainsIP(ips...) ||
-			m.DestsOverlapsPrefixes(subnetRoutes...)
+			m.DestsOverlapsPrefixes(subnetRoutes...) ||
+			(isExit && m.DestsIsTheInternet())
 	}
 
 	var result []netip.Prefix
@@ -812,6 +827,10 @@ func (node *Node) PeerChangeFromMapRequest(req tailcfg.MapRequest) tailcfg.PeerC
 	}
 
 	// Compare endpoints using order-independent comparison
+	// An empty req.Endpoints clears nothing: slices.Clone of an empty
+	// slice is nil, and ApplyPeerChange skips a nil. Kept: the field is
+	// omitted from the wire when empty, so a request without endpoints is
+	// one that says nothing of them.
 	if EndpointsChanged(node.Endpoints, req.Endpoints) {
 		ret.Endpoints = slices.Clone(req.Endpoints)
 	}
@@ -1207,6 +1226,15 @@ func (nv NodeView) ExitRoutes() []netip.Prefix {
 	return nv.ж.ExitRoutes()
 }
 
+// OfferedExitRoutes is [Node.OfferedExitRoutes].
+func (nv NodeView) OfferedExitRoutes() []netip.Prefix {
+	if !nv.Valid() {
+		return nil
+	}
+
+	return nv.ж.OfferedExitRoutes()
+}
+
 func (nv NodeView) IsExitNode() bool {
 	if !nv.Valid() {
 		return false
@@ -1477,6 +1505,11 @@ func (nv NodeView) TailNode(
 	addresses := nv.Prefixes()
 	if ipv4Disabled {
 		addresses = filterIPv4(addresses)
+		if len(addresses) == 0 {
+			// One form with a node that holds no address: a session
+			// compares what it sent with slices.Equal.
+			addresses = nil
+		}
 	}
 
 	// routeFunc returns ALL routes (subnet + exit) for this node.
@@ -1622,6 +1655,11 @@ func PeerHostinfo(hi tailcfg.HostinfoView) tailcfg.HostinfoView {
 
 // renderedHostinfoEqual compares the union of SelfHostinfo, PeerHostinfo,
 // TailNode's HomeDERP and NextDNS metadata (OS), without copying reports.
+//
+// TODO(kradalby): overwake/announce-readers: the union makes a field only
+// SelfHostinfo carries (the announced routes) a change to every peer's
+// render too, so mapper.Route wakes the node's viewers for nothing. No
+// upstream reference: the self and peer Hostinfo split is headscale's.
 func renderedHostinfoEqual(a, b *tailcfg.Hostinfo) bool {
 	if a == b {
 		return true

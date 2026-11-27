@@ -404,8 +404,7 @@ func TestNewHeadscaleWarnsBeforeRejecting(t *testing.T) {
 	buf := captureLog(t, zerolog.WarnLevel)
 
 	cfg := validConfig(t)
-	v4 := netip.MustParsePrefix("10.0.0.0/8")
-	cfg.Prefixes.V4 = &v4
+	cfg.DNSConfig.Nameservers.Global = []string{"https://dns.example.com:port"}
 	cfg.Tuning.BatchChangeDelay = 0
 
 	warnings := config.Warnings(&cfg)
@@ -585,8 +584,6 @@ func TestNewHeadscaleFreezesDNS(t *testing.T) {
 			}
 
 			app := createTestApp(t, func(cfg *types.Config) {
-				cfg.Prefixes.V4 = new(netip.MustParsePrefix("172.16.0.0/16"))
-				cfg.Prefixes.V6 = new(netip.MustParsePrefix("fd00:115c:a1e0::/48"))
 				cfg.DNSConfig.MagicDNS = mode == "magic"
 				cfg.DNSConfig.BaseDomain = "frozen.example.com"
 				cfg.DNSConfig.Nameservers.Split = split
@@ -605,16 +602,6 @@ func TestNewHeadscaleFreezesDNS(t *testing.T) {
 
 			require.Len(t, split, 1, "startup must not mutate the builder")
 			assert.Equal(t, []*dnstype.Resolver{{Addr: "1.1.1.1"}}, out.Routes["split.test"])
-
-			for _, zone := range []string{"16.172.in-addr.arpa", "0.e.1.a.c.5.1.1.0.0.d.f.ip6.arpa"} {
-				resolvers, ok := out.Routes[zone]
-				assert.Equal(t, mode == "magic", ok, zone)
-
-				if ok {
-					assert.NotNil(t, resolvers)
-					assert.Empty(t, resolvers)
-				}
-			}
 		})
 	}
 }

@@ -3,6 +3,7 @@ package mapper
 import (
 	"fmt"
 	"net/netip"
+	"runtime"
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/db"
@@ -10,6 +11,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
+	"tailscale.com/version"
 )
 
 // The old Batcher ingress/connection benchmarks now measure the Hub operations
@@ -150,7 +152,7 @@ func newSTUNReportRun(tb testing.TB, visible, unrelated int, router bool) *stunR
 	s.Connect(reporter)
 	node := mustNode(tb, s, reporter)
 
-	hi := &tailcfg.Hostinfo{Hostname: node.Hostname(), NetInfo: &tailcfg.NetInfo{PreferredDERP: 1}}
+	hi := &tailcfg.Hostinfo{Hostname: node.Hostname(), GoVersion: runtime.Version(), IPNVersion: version.Long(), NetInfo: &tailcfg.NetInfo{PreferredDERP: 1}}
 	if router {
 		hi.RoutableIPs = []netip.Prefix{netip.MustParsePrefix("10.42.0.0/24")}
 	}

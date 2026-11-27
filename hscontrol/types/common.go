@@ -124,8 +124,7 @@ type PendingRegistrationConfirmation struct {
 // AuthRequest represents a pending authentication request from a user or a
 // node. It carries the minimum data needed to either complete a node
 // registration (regData or regDataJSON populated) or an SSH check-mode auth (sshBinding
-// populated), and signals the verdict via the finished channel. The closed
-// flag guards [AuthRequest.FinishAuth] against double-close.
+// populated), and holds its verdict once [AuthRequest.FinishAuth] decides it.
 //
 // [AuthRequest] is always handled by pointer so the channel and atomic flag
 // have a single canonical instance even when stored in caches that
@@ -155,8 +154,11 @@ type AuthRequest struct {
 	// finalise the request without re-running the OIDC flow.
 	pendingConfirmation *PendingRegistrationConfirmation
 
-	finished chan AuthVerdict
-	closed   *atomic.Bool
+	// verdict is written once, before done is closed, so every reader,
+	// early or late, sees the same one.
+	verdict AuthVerdict
+	done    chan struct{}
+	closed  *atomic.Bool
 
 	// waiter is closed once a newer request parks on this session; see
 	// [AuthRequest.Park].
@@ -167,8 +169,8 @@ type AuthRequest struct {
 // for non-registration flows that only need a verdict channel.
 func NewAuthRequest() *AuthRequest {
 	return &AuthRequest{
-		finished: make(chan AuthVerdict, 1),
-		closed:   &atomic.Bool{},
+		done:   make(chan struct{}),
+		closed: &atomic.Bool{},
 	}
 }
 
@@ -178,9 +180,9 @@ func NewAuthRequest() *AuthRequest {
 // must not mutate it until preparation finishes.
 func NewRegisterAuthRequest(data *RegistrationData) *AuthRequest {
 	return &AuthRequest{
-		regData:  data,
-		finished: make(chan AuthVerdict, 1),
-		closed:   &atomic.Bool{},
+		regData: data,
+		done:    make(chan struct{}),
+		closed:  &atomic.Bool{},
 	}
 }
 
@@ -227,8 +229,8 @@ func NewSSHCheckAuthRequest(src, dst NodeID) *AuthRequest {
 			SrcNodeID: src,
 			DstNodeID: dst,
 		},
-		finished: make(chan AuthVerdict, 1),
-		closed:   &atomic.Bool{},
+		done:   make(chan struct{}),
+		closed: &atomic.Bool{},
 	}
 }
 
@@ -281,7 +283,12 @@ func (rn *AuthRequest) IsSSHCheck() bool {
 
 // IsFinished reports whether a verdict has already resolved this request.
 func (rn *AuthRequest) IsFinished() bool {
-	return rn.closed.Load()
+	select {
+	case <-rn.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // SetPendingConfirmation marks this [AuthRequest] as having an
@@ -299,26 +306,49 @@ func (rn *AuthRequest) PendingConfirmation() *PendingRegistrationConfirmation {
 	return rn.pendingConfirmation
 }
 
+// FinishAuth decides the request. Only the first verdict counts.
 func (rn *AuthRequest) FinishAuth(verdict AuthVerdict) {
-	if rn.closed.Swap(true) {
-		return
+	if rn.Claim() {
+		rn.Deliver(verdict)
 	}
-
-	rn.finished <- verdict
-
-	close(rn.finished)
 }
 
-func (rn *AuthRequest) WaitForAuth() <-chan AuthVerdict {
-	return rn.finished
+// Claim takes the request's verdict for the caller, who must then Deliver or
+// Release it; FinishAuth from anyone else, expiry included, is dropped until
+// then. It reports false when the request is decided or claimed.
+func (rn *AuthRequest) Claim() bool {
+	return !rn.closed.Swap(true)
+}
+
+// Deliver decides a request the caller claimed.
+func (rn *AuthRequest) Deliver(verdict AuthVerdict) {
+	rn.verdict = verdict
+
+	close(rn.done)
+}
+
+// Release returns a request the caller claimed to pending.
+func (rn *AuthRequest) Release() {
+	rn.closed.Store(false)
+}
+
+// WaitForAuth returns a channel that is closed once the request is decided.
+func (rn *AuthRequest) WaitForAuth() <-chan struct{} {
+	return rn.done
+}
+
+// Verdict blocks until the request is decided and returns the verdict.
+func (rn *AuthRequest) Verdict() AuthVerdict {
+	<-rn.done
+
+	return rn.verdict
 }
 
 // Park makes the caller the one request waiting on [AuthRequest.WaitForAuth]
 // and returns a channel that is closed once a newer caller takes its place.
-// [AuthRequest.FinishAuth] hands out one verdict, so a session needs one
-// waiter. The newest wins, so a client that reconnected is not kept out by
-// its own dead request. Parked requests are then bounded by the sessions in
-// the auth cache, not by how many requests clients send.
+// The newest wins, so a client that reconnected is not kept out by its own
+// dead request. Parked requests are then bounded by the sessions in the auth
+// cache, not by how many requests clients send.
 func (rn *AuthRequest) Park() <-chan struct{} {
 	waiter := make(chan struct{})
 

@@ -98,6 +98,8 @@ var (
 	ErrGrantMissingIPOrApp             = errors.New("ip and app can not both be empty")
 	ErrGrantIPPortList                 = errors.New("only one port range allowed")
 	ErrGrantViaNotATag                 = errors.New("via can only be a tag")
+	ErrGrantViaNonIPDst                = errors.New("cannot use via with non-IP dsts")
+	ErrGrantViaTailscaleIP             = errors.New("cannot use via with tailscale IPs")
 	ErrProtocolPortInvalidFormat       = errors.New("expected only one colon in Internet protocol and port type")
 	ErrCapNameInvalidForm              = errors.New("capability name must have the form {domain}/{path}")
 	ErrCapNameTailscaleDomain          = errors.New("capability name must not be in the tailscale.com domain")
@@ -114,6 +116,7 @@ var (
 	ErrNodeAttrUnsupported          = errors.New("nodeAttrs uses a feature headscale does not yet support")
 	ErrNodeAttrIPPoolUnsupported    = errors.New("nodeAttrs ipPool requires the IP allocator (https://github.com/juanfont/headscale/issues/2912)")
 	ErrNodeAttrTargetUnsupported    = errors.New("nodeAttrs target alias type is not supported")
+	ErrCapReserved                  = errors.New("capabilities under " + selectorCapPrefix + " are reserved for headscale's source capabilities")
 )
 
 // NextDNSAttrPrefix is the form Tailscale uses for per-node NextDNS profile
@@ -177,6 +180,7 @@ var (
 	ErrInvalidAlias                = errors.New("invalid alias format")
 	ErrInvalidAutoApprover         = errors.New("invalid auto approver format")
 	ErrInvalidOwner                = errors.New("invalid owner format")
+	ErrTagOwnerUserWildcard        = errors.New("only tag:name, group:name, role autogroups, or user@domain are allowed")
 	ErrGroupNotDefined             = errors.New("group not found")
 	ErrInvalidGroupMember          = errors.New("invalid group member type")
 	ErrGroupValueNotArray          = errors.New("group value must be an array of users")
@@ -931,6 +935,8 @@ func (ag *AutoGroup) resolve(p *Policy, users types.Users, nodes views.Slice[typ
 	var build netipx.IPSetBuilder
 
 	switch *ag {
+	// An address set like any other, as on SaaS: a subnet router serving a
+	// public prefix takes rules to it.
 	case AutoGroupInternet:
 		return util.TheInternet(), nil
 
@@ -1521,6 +1527,12 @@ func (g *Groups) UnmarshalJSON(b []byte) error {
 		for _, u := range rawGroups[key] {
 			if isGroup(u) {
 				return fmt.Errorf("groups[%q]: %q: %w", key, u, ErrGroupMembersCannotBeRecursive)
+			}
+
+			// SaaS takes a domain's users as a source or destination,
+			// never as the members of a group.
+			if strings.HasPrefix(u, "user:*@") {
+				return fmt.Errorf("groups[%q]: %q: %w", key, u, ErrInvalidGroupMember)
 			}
 		}
 	}
@@ -2498,6 +2510,42 @@ var tailscaleCapAllowlist = map[peercap.Cap]bool{
 	peercap.Cap("tailscale.com/cap/secrets"): true,
 }
 
+// validateViaDestinations refuses what SaaS refuses as the destination of a
+// grant with via: only routable prefixes and autogroup:internet can be
+// steered through a router, and a node's own address is not routed. The
+// 4via6 range is the one part of the Tailscale ranges a router serves.
+func validateViaDestinations(hosts Hosts, destinations Aliases) error {
+	for _, dst := range destinations {
+		var pfx netip.Prefix
+
+		switch d := dst.(type) {
+		case *Prefix:
+			pfx = netip.Prefix(*d)
+		case *Host:
+			pfx = netip.Prefix(hosts[*d])
+		case *AutoGroup:
+			if !d.Is(AutoGroupInternet) {
+				return ErrGrantViaNonIPDst
+			}
+
+			continue
+		default:
+			return ErrGrantViaNonIPDst
+		}
+
+		if !pfx.IsValid() || tsaddr.TailscaleViaRange().Contains(pfx.Addr()) &&
+			pfx.Bits() >= tsaddr.TailscaleViaRange().Bits() {
+			continue
+		}
+
+		if pfx.Overlaps(tsaddr.CGNATRange()) || pfx.Overlaps(tsaddr.TailscaleULARange()) {
+			return ErrGrantViaTailscaleIP
+		}
+	}
+
+	return nil
+}
+
 // validateGrantSrcDstCombination validates [Grant]-specific source/destination
 // combinations. [Grant]s are stricter than [ACL]s: wildcard (*) sources are NOT
 // allowed with autogroup:self destinations because * includes tags, and tags
@@ -2803,6 +2851,12 @@ func (p *Policy) validate() error {
 		// Tailscale requires cap names to be {domain}/{path} (no URL scheme)
 		// and rejects caps in the tailscale.com domain.
 		for capName := range grant.App {
+			if IsSourceCap(string(capName)) {
+				errs = append(errs, fmt.Errorf("%w: app %q", ErrCapReserved, capName))
+
+				continue
+			}
+
 			err := validateCapabilityName(string(capName))
 			if err != nil {
 				errs = append(errs, err)
@@ -2927,6 +2981,13 @@ func (p *Policy) validate() error {
 			}
 		}
 
+		if len(grant.Via) > 0 {
+			err := validateViaDestinations(p.Hosts, grant.Destinations)
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}
+
 		// Validate grant-specific source/destination combinations.
 		// Grants are stricter than ACLs: wildcard (*) src with autogroup:self
 		// dst is rejected because * includes tags, and tags cannot use
@@ -2987,6 +3048,10 @@ func (p *Policy) validate() error {
 		}
 
 		for _, attr := range na.Attrs {
+			if IsSourceCap(string(attr)) {
+				errs = append(errs, fmt.Errorf("%w: nodeAttrs %q", ErrCapReserved, attr))
+			}
+
 			issue, ok := nodeAttrUnsupportedCaps[attr]
 			if ok {
 				errs = append(errs, fmt.Errorf("%w: %q tracked in %s", ErrNodeAttrUnsupported, attr, issue))
@@ -3019,6 +3084,11 @@ func (p *Policy) validate() error {
 				if _, ok := p.TagOwners[*tagOwner]; !ok {
 					errs = append(errs, fmt.Errorf("tagOwners[%q]: %q: %w",
 						string(tag), string(*tagOwner), ErrUndefinedTagReference))
+				}
+			case *Username:
+				if strings.HasPrefix(string(*tagOwner), "user:*@") {
+					errs = append(errs, fmt.Errorf("tagOwners[%q]: %q: %w",
+						string(tag), string(*tagOwner), ErrTagOwnerUserWildcard))
 				}
 			}
 		}

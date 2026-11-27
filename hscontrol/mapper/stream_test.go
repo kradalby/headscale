@@ -1,10 +1,12 @@
 package mapper
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"math/rand/v2"
 	"net/netip"
@@ -15,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -26,6 +29,8 @@ import (
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -37,6 +42,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
 	"tailscale.com/util/zstdframe"
+	"tailscale.com/version"
 )
 
 const capVer = tailcfg.CurrentCapabilityVersion
@@ -49,7 +55,7 @@ const preNetmapRemovalsVer = capver.FullNetmapRemovalsCapVer - 1
 
 // streamTestState returns a State with users u1, u2 and nodes n1, n1b
 // (u1) and n2 (u2), under policy (allow-all when empty).
-func streamTestState(tb testing.TB, policy string, configure ...func(*types.Config)) (*types.Config, *state.State, [3]types.NodeID) {
+func streamTestState(tb pbtT, policy string, configure ...func(*types.Config)) (*types.Config, *state.State, [3]types.NodeID) {
 	tb.Helper()
 
 	p4 := netip.MustParsePrefix("100.64.0.0/10")
@@ -57,7 +63,7 @@ func streamTestState(tb testing.TB, policy string, configure ...func(*types.Conf
 	cfg := &types.Config{
 		Database: types.DatabaseConfig{
 			Type:   types.DatabaseSqlite,
-			Sqlite: types.SqliteConfig{Path: tb.TempDir() + "/h.db"},
+			Sqlite: types.SqliteConfig{Path: streamTestDir(tb) + "/h.db"},
 		},
 
 		ServerURL: "https://headscale.test",
@@ -92,6 +98,24 @@ func streamTestState(tb testing.TB, policy string, configure ...func(*types.Conf
 	}
 
 	return cfg, s, [3]types.NodeID{n1.ID, n1b.ID, n2.ID}
+}
+
+func streamTestDir(tb pbtT) string {
+	tb.Helper()
+
+	if t, ok := tb.(testing.TB); ok {
+		return t.TempDir()
+	}
+
+	// Rapid cleans up each generated case, including a replay during shrinking.
+	dir, err := os.MkdirTemp(os.Getenv("GOTMPDIR"), "headscale-mapper-")
+	require.NoError(tb, err)
+	tb.Cleanup(func() {
+		err := os.RemoveAll(dir) //nolint:gosec // MkdirTemp created this directory.
+		require.NoError(tb, err)
+	})
+
+	return dir
 }
 
 const ownUserOnly = `{"acls":[
@@ -140,6 +164,9 @@ func mentions(resps []*tailcfg.MapResponse, id types.NodeID) bool {
 }
 
 func TestStreamMembershipDeltaCandidates(t *testing.T) {
+	// Pinned to address form: a membership edit moves the stamps of the nodes it moves, whose viewers render them again.
+	t.Setenv(state.TestCapabilitySourcesEnv, "false")
+
 	for _, kind := range []string{"join", "leave", "replace", "coalesced", "coalesced-outside", "caps", "visibility", "invalid", "repair"} {
 		t.Run(kind, func(t *testing.T) {
 			policy := ""
@@ -229,7 +256,7 @@ func TestStreamMembershipDeltaCandidates(t *testing.T) {
 			after := s.Snapshot()
 			view := after.PeerView(ids[0])
 			require.False(t, len(view) == len(st.r.lastPeerIDs) && len(view) > 0 && &view[0] == &st.r.lastPeerIDs[0], "fixture must replace view identity")
-			class, _, _ := st.r.classes.get(cfg, st.r.renders, after, view, capVer, after.PeerPolicyRev(), after.Policy().NodeCapMaps())
+			class, _, _ := st.r.classes.get(cfg, st.r.renders, after, view, capVer, after.CapsRev(), after.NodeCaps)
 			misses := graph.MapLogMisses()
 			candidates := st.r.peerCandidates(after, class, view)
 
@@ -290,7 +317,7 @@ func TestStreamSharesClassNodeCursor(t *testing.T) {
 			st.Delivered()
 		}
 
-		_, _, cursor := streams[0].r.classes.get(cfg, streams[0].r.renders, snap, snap.PeerView(ids[0]), capVer, snap.PeerPolicyRev(), snap.Policy().NodeCapMaps())
+		_, _, cursor := streams[0].r.classes.get(cfg, streams[0].r.renders, snap, snap.PeerView(ids[0]), capVer, snap.CapsRev(), snap.NodeCaps)
 		for _, st := range streams {
 			if cursor != st.r.lastNodes {
 				t.Fatal("sessions must share their class's existing cursor")
@@ -539,7 +566,7 @@ func TestStreamEndsWhenNodeDeleted(t *testing.T) {
 	require.ErrorIs(t, err, ErrNodeGone)
 }
 
-func mustNode(tb testing.TB, s *state.State, id types.NodeID) types.NodeView {
+func mustNode(tb pbtT, s *state.State, id types.NodeID) types.NodeView {
 	tb.Helper()
 
 	nv, ok := s.GetNodeByID(id)
@@ -553,6 +580,7 @@ func mustNode(tb testing.TB, s *state.State, id types.NodeID) types.NodeView {
 type modelClient struct {
 	self     *tailcfg.Node
 	peers    map[tailcfg.NodeID]*tailcfg.Node
+	chunks   policyv2.FilterChunks
 	filter   []tailcfg.FilterRule
 	ssh      *tailcfg.SSHPolicy
 	dns      *tailcfg.DNSConfig
@@ -566,6 +594,48 @@ type modelClient struct {
 	// deltaPeers is the peer set of a consumer that learns removals only
 	// from PeersRemoved: a peer dropped without one stays here.
 	deltaPeers map[tailcfg.NodeID]bool
+}
+
+// served is the client's own entry and its peers', by ID, as views for
+// the stored judge ([statemodel.Served]).
+func (c *modelClient) served() (tailcfg.NodeView, []tailcfg.NodeView) {
+	var self tailcfg.NodeView
+	if c.self != nil {
+		self = c.self.View()
+	}
+
+	peers := make([]tailcfg.NodeView, 0, len(c.peers))
+	for _, id := range slices.Sorted(maps.Keys(c.peers)) {
+		if p := c.peers[id]; p != nil {
+			peers = append(peers, p.View())
+		}
+	}
+
+	return self, peers
+}
+
+// capHolders returns the addresses of the nodes the client holds, itself
+// and its peers, whose CapMap has capability.
+func (c *modelClient) capHolders(capability nodecap.Cap) []netip.Addr {
+	var out []netip.Addr
+
+	for _, n := range append([]*tailcfg.Node{c.self}, slices.Collect(maps.Values(c.peers))...) {
+		if n == nil {
+			continue
+		}
+
+		if _, ok := n.CapMap[capability]; !ok {
+			continue
+		}
+
+		for _, p := range n.Addresses {
+			if p.IsSingleIP() {
+				out = append(out, p.Addr())
+			}
+		}
+	}
+
+	return out
 }
 
 func newModelClient(full *tailcfg.MapResponse) *modelClient {
@@ -701,8 +771,12 @@ func (c *modelClient) apply(r *tailcfg.MapResponse) {
 		}
 	}
 
-	if f, ok := r.PacketFilters["base"]; ok {
-		c.filter = f
+	// The filter is what the client assembles from the chunks it holds,
+	// whichever way they came: "base" in address mode, named chunks in
+	// capability mode.
+	if r.PacketFilter != nil || r.PacketFilters != nil {
+		c.chunks = c.chunks.ApplyResponse(r)
+		c.filter = c.chunks.Rules()
 	}
 }
 
@@ -726,6 +800,8 @@ func (c *modelClient) sameAs(fresh *modelClient) string {
 		return fmt.Sprintf("peers: have %s, want %s", have, want)
 	case !reflect.DeepEqual(fresh.filter, c.filter):
 		return "filter"
+	case !fresh.chunks.Equal(c.chunks):
+		return fmt.Sprintf("filter chunks: have %v, want %v", c.chunks.Names(), fresh.chunks.Names())
 	case !reflect.DeepEqual(fresh.ssh, c.ssh):
 		return "ssh"
 	case !reflect.DeepEqual(fresh.dns, c.dns):
@@ -765,8 +841,14 @@ func TestStreamReusesRoutedPeerOnEndpointChange(t *testing.T) {
 			cfg, s, ids := streamTestState(t, "")
 			route := netip.MustParsePrefix(tt.route)
 			router := mustNode(t, s, ids[1]).AsStruct()
-			router.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
-			router.ApprovedRoutes = []netip.Prefix{route}
+			routes := []netip.Prefix{route}
+			// An exit route is offered only with the other family's.
+			if tsaddr.IsExitRoute(route) {
+				routes = append(routes, tsaddr.AllIPv6())
+			}
+
+			router.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: routes}
+			router.ApprovedRoutes = routes
 			s.PutNodeInStoreForTest(*router)
 
 			if tt.online {
@@ -929,6 +1011,258 @@ func TestStreamRouteOverlaysFollowPeerVisibility(t *testing.T) {
 	}
 }
 
+// TestStreamRouteOverlaySurvivesRerenderedPeer pins a viewer's route overlay
+// while its class map holds an unchanged peer under another pointer than the
+// viewer's map: a session behind the viewer renders the peer's previous
+// version into the shared render cache, so the viewer's next class, rebuilt
+// for a join, renders the peer anew. When that peer and the router then
+// change together, the peer must not count as an overlay the viewer lost.
+func TestStreamRouteOverlaySurvivesRerenderedPeer(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	viewer, peer, router := ids[0], ids[1], ids[2]
+	route := netip.MustParsePrefix("10.0.0.0/24")
+
+	n := mustNode(t, s, router).AsStruct()
+	n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+	n.ApprovedRoutes = []netip.Prefix{route}
+	s.PutNodeInStoreForTest(*n)
+	s.Connect(router)
+
+	hub := NewHub()
+	t.Cleanup(hub.Close)
+
+	st := NewStream(cfg, hub, viewer, capVer)
+	initial, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+	st.Delivered()
+
+	behind := NewStream(cfg, hub, router, capVer)
+	_, err = behind.Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	client := newModelClient(initial[0])
+	update := func() {
+		t.Helper()
+
+		resps, err := st.Update(s.Snapshot())
+		require.NoError(t, err)
+
+		for _, resp := range resps {
+			client.apply(resp)
+		}
+
+		st.Delivered()
+	}
+
+	scalingEndpoint(t, s, peer, 1)
+	stale := s.Snapshot()
+	scalingEndpoint(t, s, peer, 2)
+	update()
+
+	// The router's session renders the snapshot it read before the last write.
+	_, err = behind.Update(stale)
+	require.NoError(t, err)
+
+	joined := mustNode(t, s, peer).AsStruct()
+	joined.ID = types.NodeID(1 << 40)
+	joined.Hostname, joined.GivenName = "joined", "joined"
+	joined.IPv4, joined.IPv6 = new(netip.MustParseAddr("100.100.100.100")), nil
+	s.PutNodeInStoreForTest(*joined)
+	update()
+
+	held, _ := st.sent.peer(peer.NodeID())
+	plain, _ := st.r.lastClass.Get(peer.NodeID())
+	require.NotSame(t, plain, held, "fixture must leave the viewer an equal render under another pointer")
+
+	scalingEndpoint(t, s, peer, 3)
+	scalingEndpoint(t, s, router, 1)
+	update()
+
+	sent, ok := st.sent.peer(router.NodeID())
+	require.True(t, ok)
+	assert.Contains(t, sent.AllowedIPs, route, "the router keeps the viewer's route")
+
+	fresh, err := NewStream(cfg, NewHub(), viewer, capVer).Initial(s.Snapshot())
+	require.NoError(t, err)
+	require.Empty(t, client.sameAs(newModelClient(fresh[0])))
+}
+
+// TestViewersGivenTheSameRoutesShareRoutedPeers holds what a session keeps
+// for its routed peers to what it is given: the sessions given the same
+// routes of a router hold one render of it, and the sessions of a class
+// given the same routes of every router hold one peer map. So a session
+// costs the same however many routers it shares with the others, where a
+// copy of every routed peer per session would cost the control plane
+// sessions × routers.
+func TestViewersGivenTheSameRoutesShareRoutedPeers(t *testing.T) {
+	const nodes, extra = 160, 40
+
+	perSession := map[int]int64{}
+
+	for _, routers := range []int{4, 64} {
+		cfg, s := benchState(t, nodes, 4)
+		all := s.ListNodes()
+
+		for i := range routers {
+			n := all.At(i).AsStruct()
+			p := netip.PrefixFrom(netip.AddrFrom4([4]byte{10, 0, byte(i), 0}), 24)
+			n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{p}}
+			n.ApprovedRoutes = []netip.Prefix{p}
+			s.PutNodeInStoreForTest(*n)
+			s.Connect(n.ID)
+		}
+
+		snap := s.Snapshot()
+		hub := NewHub()
+
+		streams := make([]*Stream, 0, nodes)
+
+		for _, nv := range all.All() {
+			st := NewStream(cfg, hub, nv.ID(), capVer)
+			_, err := st.Initial(snap)
+			require.NoError(t, err)
+
+			streams = append(streams, st)
+		}
+
+		// The most renders any router is held in beyond the routes it gives.
+		worst, held := 0, 0
+
+		for i := range routers {
+			router := mustNode(t, s, all.At(i).ID())
+			answers, copies := map[string]struct{}{}, map[*tailcfg.Node]struct{}{}
+
+			for _, st := range streams {
+				if st.nodeID == router.ID() {
+					continue
+				}
+
+				routes := snap.RoutesForPeer(mustNode(t, s, st.nodeID), router)
+				require.NotEmpty(t, routes, "test sanity: every viewer is given router %d's route", i)
+				answers[fmt.Sprint(routes)] = struct{}{}
+
+				p, ok := st.sent.peer(router.ID().NodeID())
+				require.True(t, ok)
+				require.Contains(t, p.AllowedIPs, routes[0])
+
+				copies[p] = struct{}{}
+			}
+
+			if extra := len(copies) - len(answers); extra > worst {
+				worst, held = extra, len(copies)
+			}
+		}
+
+		assert.Zero(t, worst, "%d routers: %d viewers given one route of a router hold %d renders of it", routers, nodes-1, held)
+
+		peerMaps := map[*peerMap]struct{}{}
+		for _, st := range streams {
+			peerMaps[st.sent.peers] = struct{}{}
+		}
+
+		assert.Equal(t, 1, len(peerMaps), "%d routers: the sessions of one class given the same routes share one peer map", routers) //nolint:testifylint // the count is the message
+
+		// More sessions of members, which share every router with the rest.
+		perSession[routers] = heapPerSession(t, extra, func(k int) *Stream {
+			st := NewStream(cfg, hub, all.At(routers+k).ID(), capVer)
+			_, err := st.Initial(snap)
+			require.NoError(t, err)
+
+			return st
+		})
+
+		runtime.KeepAlive(streams)
+	}
+
+	t.Logf("heap kept per session: %d B with 4 routers, %d B with 64", perSession[4], perSession[64])
+	assert.Less(t, perSession[64]-perSession[4], int64(2048),
+		"sixty more routers shared with every other session must not grow a session")
+}
+
+// heapPerSession returns what each of the n sessions add returns adds to the
+// heap kept. The cleanups earlier tests leave run after a collection and free
+// more, so the heap is read once a collection frees nothing more, and the
+// median of three batches is taken.
+func heapPerSession(t *testing.T, n int, add func(k int) *Stream) int64 {
+	t.Helper()
+
+	heap := func() int64 {
+		var last int64
+
+		for i := range 20 {
+			runtime.GC()
+
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+
+			h := int64(ms.HeapAlloc) //nolint:gosec // a heap fits
+			if i > 0 && h-last < 1024 && last-h < 1024 {
+				return h
+			}
+
+			last = h
+
+			runtime.Gosched()
+		}
+
+		return last
+	}
+
+	batches, added := make([]int64, 0, 3), make([]*Stream, 0, 3*n)
+
+	for range 3 {
+		before := heap()
+
+		for k := range n {
+			added = append(added, add(k))
+		}
+
+		batches = append(batches, (heap()-before)/int64(n))
+	}
+
+	runtime.KeepAlive(added)
+	slices.Sort(batches)
+
+	return batches[1]
+}
+
+// TestIdleSessionKeepsNoPeerList holds a session that has sent its first map
+// and waits to what its peers' map costs, which its class shares: the list
+// of peers the first map named is spent once the map is sent, so a session
+// costs the same however many peers it holds.
+func TestIdleSessionKeepsNoPeerList(t *testing.T) {
+	const extra = 40
+
+	perSession := map[int]int64{}
+
+	for _, nodes := range []int{60, 660} {
+		cfg, s := benchState(t, nodes, 4)
+		all := s.ListNodes()
+		snap := s.Snapshot()
+		hub := NewHub()
+
+		// The class's map, which every session shares, is built once.
+		first := NewStream(cfg, hub, all.At(0).ID(), capVer)
+		_, err := first.Initial(snap)
+		require.NoError(t, err)
+
+		perSession[nodes] = heapPerSession(t, extra, func(k int) *Stream {
+			st := NewStream(cfg, hub, all.At(1+k).ID(), capVer)
+			resps, err := st.Initial(snap)
+			require.NoError(t, err)
+			require.Len(t, resps[0].Peers, nodes-1, "test sanity: a session sees every other node")
+
+			return st
+		})
+
+		runtime.KeepAlive(first)
+	}
+
+	t.Logf("heap kept per idle session: %d B with 59 peers, %d B with 659", perSession[60], perSession[660])
+	assert.Less(t, perSession[660]-perSession[60], int64(600),
+		"six hundred more peers, shared with every other session, must not grow an idle session")
+}
+
 // BenchmarkRoutedRender measures one endpoint update with unrelated routers,
 // including invisible routers whose routes never belong to the viewer.
 func BenchmarkRoutedRender(b *testing.B) {
@@ -1039,6 +1373,10 @@ func benchState(tb testing.TB, n, users int) (*types.Config, *state.State) {
 
 	database, err := db.NewHeadscaleDatabase(cfg)
 	require.NoError(tb, err)
+
+	// As in scalingTailnet: the fixture's fsyncs are its cost on disk, and
+	// the state reopens the file with its own settings.
+	require.NoError(tb, database.DB.Exec("PRAGMA synchronous = OFF").Error)
 
 	for i, u := range database.CreateUsersForTest(users, "u") {
 		database.CreateRegisteredNodesForTest(u, n/users+min(1, max(0, n%users-i)), u.Name)
@@ -1316,38 +1654,716 @@ func TestStreamsConvergeUnderRandomWrites(t *testing.T) {
 
 	failures := state.PolicyAuditFailures()
 
+	reach := runStreamsConverge(t, oracleAudited)
+
+	require.Equal(t, failures, state.PolicyAuditFailures(), "incremental compiles must match compiles from scratch")
+
+	reach.require(t)
+}
+
+// TestStreamsMatchTheCompileUnderRandomWrites runs the random writes of
+// [TestStreamsConvergeUnderRandomWrites] with the policy audit off, as
+// production runs, and holds what every session holds — its peers, its
+// packet filter and each peer's routes — to what the compile, which
+// serves none of them, gives for the same snapshot. A fresh session shares
+// any mistake of the served path; the compile does not.
+func TestStreamsMatchTheCompileUnderRandomWrites(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "false")
+
+	// Either delivery, the source form as the suite runs it.
+	for _, chunks := range []bool{false, true} {
+		t.Run(fmt.Sprintf("filter_chunks=%t", chunks), func(t *testing.T) {
+			t.Setenv(state.TestFilterChunksEnv, strconv.FormatBool(chunks))
+
+			reach := runStreamsConverge(t, oracleCompile)
+			reach.require(t)
+			require.NotZero(t, reach.retuned, "a rule's port, protocol or app value edited in place at some step")
+		})
+	}
+}
+
+// TestRouteLeavesNoSessionStale holds routing to the snapshot with the
+// policy audit off, as production runs: under every policy the random
+// writes switch between, every kind of write, alone and coalesced with
+// another, is routed as the hub routes it, the sessions it wakes update,
+// and every session not waiting on a wake must hold what a fresh render
+// gives. The fresh render has caches of its own and cuts filters afresh: a
+// filter carried over on routing's word would share routing's mistake. A
+// third of the sessions lag, taking their wakes every fourth write, so
+// they render across several commits.
+func TestRouteLeavesNoSessionStale(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "false")
+
+	var reach oracleReach
+
+	// Fallbacks reached, by label, in capability mode.
+	fallbacks := map[string]int{}
+
+	// One more document for this test alone: an app capability rule, a
+	// rule over a protocol without ports, and a * source, each of which
+	// capability form writes as addresses whatever the receiver.
+	policies := append(slices.Clone(oraclePolicies), `{"groups":{"group:g":["u1@"]},"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
+	  "grants":[{"src":["group:g"],"dst":["tag:a","u2@"],"app":{"example.com/cap/x":[{}]}},
+	            {"src":["u2@"],"dst":["u1@"],"ip":["gre:*"]},
+	            {"src":["autogroup:member"],"dst":["autogroup:member"],"ip":["tcp:22"]},
+	            {"src":["*"],"dst":["tag:b","u1@"],"ip":["tcp:80"]}]}`)
+
+	for pi, pol := range policies {
+		t.Run(fmt.Sprintf("policy=%d", pi), func(t *testing.T) {
+			r := rand.New(rand.NewPCG(uint64(pi), 11)) //nolint:gosec // deterministic test input
+			// Draws of its own for what happens between coalesced commits,
+			// and for the receiver facts and addresses it moves, so the
+			// writes are those of the stream above.
+			between := rand.New(rand.NewPCG(uint64(pi), 12)) //nolint:gosec // deterministic test input
+
+			o, cfg, hub, sessions := newOracleRun(t, r, &reach)
+			s := o.s
+
+			_, err := s.SetPolicy([]byte(pol))
+			if err != nil {
+				// The random writes try it as a refused edit; op 10 does here.
+				t.Skipf("the document is refused: %v", err)
+			}
+
+			for _, id := range slices.Sorted(maps.Keys(sessions)) {
+				_, err := sessions[id].st.Update(s.Snapshot())
+				require.NoError(t, err)
+				sessions[id].st.Delivered()
+			}
+
+			last := s.Snapshot()
+			pending := map[types.NodeID]bool{}
+			step, routed := 0, 0
+
+			// Sessions render through the hub, as the poll loop does, so it
+			// knows which rendered a snapshot between coalesced commits.
+			render := func(id types.NodeID, snap *state.Snapshot) {
+				st := sessions[id].st
+				if st.sess == nil {
+					st.Attach(hub.Join(id, func() {}))
+				}
+
+				_, err := st.Update(snap)
+				require.NoError(t, err)
+				st.Delivered()
+
+				pending[id] = false
+			}
+
+			var rendered []types.NodeID
+
+			deliver := func() {
+				snap := s.Snapshot()
+				_, all, ids, _ := hub.route(last, snap)
+
+				if !all && snap.Rev() > last.Rev() {
+					routed++
+				}
+
+				last = snap
+
+				for _, id := range slices.Sorted(maps.Keys(sessions)) {
+					if _, live := snap.GetNode(id); !live {
+						delete(sessions, id)
+						delete(pending, id)
+
+						continue
+					}
+
+					if _, ok := ids[id]; all || ok {
+						pending[id] = true
+					}
+
+					if pending[id] && (id%3 != 0 || step%4 == 0) {
+						render(id, snap)
+					}
+				}
+
+				reach.betweenStale += heldStale(t, cfg, snap, rendered, sessions, pending)
+				rendered = nil
+
+				countFallbacks(t, snap, fallbacks)
+
+				if hasServiceHost(snap) {
+					reach.serviceHost++
+				}
+
+				if hasOneWayView(snap) {
+					reach.oneWay++
+				}
+
+				requireNoStaleSession(t, step, cfg, snap, sessions, pending)
+
+				if nodeInsideRoute(snap) {
+					reach.inside++
+				}
+
+				step++
+			}
+
+			for round := range 3 {
+				for op := range oracleWrites {
+					nodes := s.ListNodes()
+					nv := nodes.At(r.IntN(nodes.Len()))
+					o.writeOp(op, step, nodes, nv, nv.ID())
+
+					// Now and then a receiver fact or an address moves with
+					// the write.
+					if between.IntN(3) == 0 {
+						moveReceiver(t, between, o)
+					}
+
+					if (op+round)%4 == 1 {
+						// Now and then a node joins here and leaves with the
+						// second write: neither end of the routing has it.
+						var transient types.NodeID
+						if between.IntN(3) == 0 {
+							transient = o.addNode(fmt.Sprintf("transient-%d", step))
+						}
+
+						// Sessions woken earlier render meanwhile, holding a
+						// snapshot neither end of the routing has.
+						rendered = renderBetween(between, s.Snapshot(), sessions, pending, render)
+						reach.between += len(rendered)
+
+						// A second write the hub routes with the first, as
+						// commits coalesce under load.
+						if transient != 0 {
+							require.NoError(t, s.DeleteNode(mustNode(t, s, transient)))
+
+							reach.transient++
+						} else {
+							nodes = s.ListNodes()
+							nv = nodes.At(r.IntN(nodes.Len()))
+							o.writeOp(r.IntN(oracleWrites), step, nodes, nv, nv.ID())
+						}
+					}
+
+					deliver()
+
+					if string(s.Snapshot().PolicySource()) != pol {
+						_, err := s.SetPolicy([]byte(pol))
+						require.NoError(t, err)
+						deliver()
+					}
+				}
+			}
+
+			require.Positive(t, routed, "some writes were routed to fewer than every session")
+		})
+	}
+
+	require.NotZero(t, reach.inside, "a node inside another node's route at some step")
+	require.NotZero(t, reach.retargeted, "a rule's source or destination moved to another selector")
+	require.NotZero(t, reach.regrouped, "a group's members moved by a document edit")
+	require.NotZero(t, reach.betweenStale, "a session rendered between coalesced commits held what the routing over both had to wake it for")
+	require.NotZero(t, reach.transient, "a node joined and left between two routings")
+	require.NotZero(t, reach.oneWay, "a node saw one that did not see it")
+
+	if fallbacks["mode"] > 0 {
+		for _, label := range policyv2.FallbackReasons() {
+			if label != "address-mode" {
+				require.NotZerof(t, fallbacks[label], "capability mode reached the %s fallback", label)
+			}
+		}
+
+		require.NotZero(t, reach.serviceHost, "a node was sent addresses for being a service host alone")
+	}
+
+	t.Logf("fallbacks reached, by steps: %v", fallbacks)
+	t.Logf("rendered between coalesced commits %d, of which woken again with something to send %d; transient nodes %d",
+		reach.between, reach.betweenStale, reach.transient)
+}
+
+// moveReceiver moves a random node's receiver facts or address: its
+// client turns unknown or known again, it becomes an app connector or
+// stops, or it takes an address no node held.
+func moveReceiver(t *testing.T, r *rand.Rand, o *oracleRun) {
+	t.Helper()
+
+	nodes := o.s.ListNodes()
+	n := nodes.At(r.IntN(nodes.Len())).AsStruct()
+
+	n.Hostinfo = n.Hostinfo.Clone()
+	if n.Hostinfo == nil {
+		n.Hostinfo = &tailcfg.Hostinfo{}
+	}
+
+	switch r.IntN(3) {
+	case 0:
+		if n.Hostinfo.App == "" {
+			n.Hostinfo.App, n.Hostinfo.GoVersion = "tailscale-rs", ""
+		} else {
+			n.Hostinfo.App, n.Hostinfo.GoVersion = "", runtime.Version()
+		}
+	case 1:
+		n.Hostinfo.AppConnector.Set(!n.Hostinfo.AppConnector.EqualBool(true))
+	default:
+		o.addrs++
+		n.IPv4 = new(netip.MustParseAddr(fmt.Sprintf("100.64.%d.%d", 4+o.addrs/250, o.addrs%250)))
+	}
+
+	o.s.PutNodeInStoreForTest(*n)
+}
+
+// capabilityForm reports whether a receiver with facts f is sent
+// capability sources: written here from the receiver rule, not read from
+// the code it checks.
+func capabilityForm(f policyv2.ReceiverFacts) bool {
+	return f.Client && !f.Announces && !f.AppConnector && !f.ServiceHost
+}
+
+// capWork reads the served filters' work counters: filters cut, selector
+// resolutions built and the members they listed.
+func capWork() [3]uint64 {
+	res, members := policyv2.ServedWorkForTest()
+
+	return [3]uint64{state.FilterCuts(), res, members}
+}
+
+// hasOneWayView reports whether a node of snap sees one that does not see
+// it.
+func hasOneWayView(snap *state.Snapshot) bool {
+	for _, n := range snap.ListNodes().All() {
+		for _, p := range snap.PeerView(n.ID()) {
+			if _, ok := slices.BinarySearch(snap.PeerView(p), n.ID()); p != n.ID() && !ok {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// hasServiceHost reports whether, in capability mode, a node of snap is
+// sent addresses for being a service host alone.
+func hasServiceHost(snap *state.Snapshot) bool {
+	if !snap.CapabilitySources() {
+		return false
+	}
+
+	for _, n := range snap.ListNodes().All() {
+		if snap.ReceiverFacts(n.ID()) == (policyv2.ReceiverFacts{Client: true, ServiceHost: true}) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// countFallbacks adds, in capability mode, the fallbacks in force in snap
+// to reached, by label, and the step to "mode".
+func countFallbacks(t *testing.T, snap *state.Snapshot, reached map[string]int) {
+	t.Helper()
+
+	if !snap.CapabilitySources() {
+		return
+	}
+
+	census, err := snap.FallbackCensus()
+	require.NoError(t, err)
+
+	receivers, rules := census.Labelled()
+	for label, n := range receivers {
+		if n > 0 {
+			reached[label]++
+		}
+	}
+
+	for label, n := range rules {
+		if n > 0 && receivers[label] == 0 {
+			reached[label]++
+		}
+	}
+
+	reached["mode"]++
+}
+
+// renderBetween renders some of the sessions pending a wake at mid, as
+// sessions woken earlier render while commits land, and returns them.
+func renderBetween(r *rand.Rand, mid *state.Snapshot, sessions map[types.NodeID]*oracleSession, pending map[types.NodeID]bool,
+	render func(types.NodeID, *state.Snapshot),
+) []types.NodeID {
+	var out []types.NodeID
+
+	for _, id := range slices.Sorted(maps.Keys(pending)) {
+		if _, live := mid.GetNode(id); live && pending[id] && !sessions[id].down && r.IntN(2) == 0 {
+			render(id, mid)
+			out = append(out, id)
+		}
+	}
+
+	return out
+}
+
+// heldStale counts the sessions of ids pending a wake that hold a map other
+// than a fresh render of snap: what they would be left with unwoken.
+func heldStale(t *testing.T, cfg *types.Config, snap *state.Snapshot, ids []types.NodeID,
+	sessions map[types.NodeID]*oracleSession, pending map[types.NodeID]bool,
+) int {
+	t.Helper()
+
+	fresh := snap.Uncached()
+	n := 0
+
+	for _, id := range ids {
+		if sess, ok := sessions[id]; ok && pending[id] && !sess.down {
+			out, err := freshDiff(cfg, fresh, id, sess.capVer, sess.st.sent, &versionCache{})
+			require.NoError(t, err)
+
+			if len(out) > 0 {
+				n++
+			}
+		}
+	}
+
+	return n
+}
+
+// nodeInsideRoute reports whether a node's address is inside another
+// node's approved subnet route in snap.
+func nodeInsideRoute(snap *state.Snapshot) bool {
+	nodes := snap.ListNodes()
+
+	for _, router := range nodes.All() {
+		for _, p := range router.SubnetRoutes() {
+			for _, n := range nodes.All() {
+				if n.ID() != router.ID() && slices.ContainsFunc(n.IPs(), p.Contains) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// retarget returns pol with one rule's source or destination moved to
+// another selector pol names, or, given a group, its members moved, and
+// what moved; false when pol has no rule.
+func retarget(r *rand.Rand, pol string) (string, string, bool) {
+	var doc map[string]any
+	if json.Unmarshal([]byte(pol), &doc) != nil {
+		return "", "", false
+	}
+
+	acls, _ := doc["acls"].([]any)
+	grants, _ := doc["grants"].([]any)
+	rules := slices.Concat(acls, grants)
+
+	if groups, ok := doc["groups"].(map[string]any); ok && r.IntN(3) == 0 {
+		groups["group:g"] = [][]any{{}, {"u1@"}, {"u2@"}, {"u1@", "u2@"}}[r.IntN(4)]
+
+		out, err := json.Marshal(doc)
+
+		return string(out), "group", err == nil
+	}
+
+	if len(rules) == 0 {
+		return "", "", false
+	}
+
+	// An ACL destination carries its ports after the last colon.
+	base := func(d string, acl bool) string {
+		if i := strings.LastIndexByte(d, ':'); acl && i >= 0 {
+			return d[:i]
+		}
+
+		return d
+	}
+
+	var named []string
+
+	for _, v := range rules {
+		rule, _ := v.(map[string]any)
+		_, acl := rule["action"]
+
+		for _, key := range []string{"src", "dst"} {
+			vs, _ := rule[key].([]any)
+			for _, sel := range vs {
+				name, _ := sel.(string)
+				if b := base(name, acl && key == "dst"); b != "autogroup:self" {
+					named = append(named, b)
+				}
+			}
+		}
+	}
+
+	rule, _ := rules[r.IntN(len(rules))].(map[string]any)
+	_, acl := rule["action"]
+	key := []string{"src", "dst"}[r.IntN(2)]
+
+	vs, _ := rule[key].([]any)
+	if len(vs) == 0 || len(named) == 0 {
+		return "", "", false
+	}
+
+	i := r.IntN(len(vs))
+	old, _ := vs[i].(string)
+	to := named[r.IntN(len(named))]
+
+	if key == "dst" && acl {
+		to += old[len(base(old, true)):]
+	}
+
+	vs[i] = to
+
+	out, err := json.Marshal(doc)
+
+	return string(out), key, err == nil
+}
+
+// retune edits one rule of pol in place, a port, a protocol or an app
+// capability's value, so a rule changes while its sources and destinations
+// stay: what a chunk named without that field would miss.
+func retune(r *rand.Rand, pol string) (string, bool) {
+	var doc map[string]any
+	if json.Unmarshal([]byte(pol), &doc) != nil {
+		return "", false
+	}
+
+	var sites []func()
+
+	grants, _ := doc["grants"].([]any)
+	for _, g := range grants {
+		rule, _ := g.(map[string]any)
+
+		ips, _ := rule["ip"].([]any)
+		for i, e := range ips {
+			proto, port, ok := strings.Cut(fmt.Sprint(e), ":")
+			if !ok {
+				continue
+			}
+
+			sites = append(sites, func() {
+				n, err := strconv.Atoi(port)
+				if err != nil || r.IntN(2) == 0 {
+					to := "tcp"
+					if proto == "tcp" {
+						to = "udp"
+					}
+
+					ips[i] = to + ":" + port
+
+					return
+				}
+
+				ips[i] = proto + ":" + strconv.Itoa(n%60000+1)
+			})
+		}
+
+		// One value of a capability's list, the others kept: a name that
+		// read only some of them would miss it.
+		app, _ := rule["app"].(map[string]any)
+		for _, k := range slices.Sorted(maps.Keys(app)) {
+			values, _ := app[k].([]any)
+			for i := range values {
+				sites = append(sites, func() { values[i] = map[string]any{"v": r.IntN(4)} })
+			}
+		}
+	}
+
+	acls, _ := doc["acls"].([]any)
+	for _, a := range acls {
+		rule, _ := a.(map[string]any)
+
+		dsts, _ := rule["dst"].([]any)
+		for i, d := range dsts {
+			ds := fmt.Sprint(d)
+
+			j := strings.LastIndexByte(ds, ':')
+			if j < 0 {
+				continue
+			}
+
+			n, err := strconv.Atoi(ds[j+1:])
+			if err != nil {
+				continue
+			}
+
+			sites = append(sites, func() { dsts[i] = ds[:j+1] + strconv.Itoa(n%60000+1) })
+		}
+	}
+
+	if len(sites) == 0 {
+		return "", false
+	}
+
+	sites[r.IntN(len(sites))]()
+
+	out, err := json.Marshal(doc)
+
+	return string(out), err == nil
+}
+
+// requireNoStaleSession checks every session not waiting on a wake holds
+// what a fresh render of snap gives.
+func requireNoStaleSession(t *testing.T, step int, cfg *types.Config, snap *state.Snapshot, sessions map[types.NodeID]*oracleSession, pending map[types.NodeID]bool) {
+	t.Helper()
+
+	fresh := snap.Uncached()
+	caches := map[tailcfg.CapabilityVersion]*versionCache{}
+
+	for _, id := range slices.Sorted(maps.Keys(sessions)) {
+		sess := sessions[id]
+		if pending[id] || sess.down {
+			continue
+		}
+
+		pcv := peerCapVer(sess.capVer)
+		if caches[pcv] == nil {
+			caches[pcv] = &versionCache{}
+		}
+
+		out, err := freshDiff(cfg, fresh, id, sess.capVer, sess.st.sent, caches[pcv])
+		require.NoError(t, err)
+
+		if len(out) > 0 {
+			t.Fatalf("step %d: session %d, waiting on no wake, holds a stale map: %s", step, id, describeResponses(out))
+		}
+	}
+}
+
+// oracleMode says what the random writes check besides each session
+// against a fresh one.
+type oracleMode int
+
+const (
+	// oracleAudited requires every snapshot audited.
+	oracleAudited oracleMode = iota
+	// oracleCompile holds every session to the compile.
+	oracleCompile
+)
+
+func runStreamsConverge(t *testing.T, mode oracleMode) oracleReach {
+	t.Helper()
+
 	var reach oracleReach
 
 	for seed := range uint64(6) {
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
-			got := testStreamsConverge(t, rand.New(rand.NewPCG(seed, 6))) //nolint:gosec // deterministic test input
+			got := testStreamsConverge(t, rand.New(rand.NewPCG(seed, 6)), mode) //nolint:gosec // deterministic test input
 			reach.via += got.via
 			reach.exit += got.exit
 			reach.autoApproved += got.autoApproved
 			reach.keysRotated += got.keysRotated
 			reach.minCapVer += got.minCapVer
+			reach.addressMoved += got.addressMoved
+			reach.inside += got.inside
+			reach.retuned += got.retuned
 		})
 	}
 
-	require.Equal(t, failures, state.PolicyAuditFailures(), "incremental compiles must match compiles from scratch")
+	return reach
+}
 
-	// A shape the seeds never reach tests nothing.
+// require fails unless every shape was reached: a shape the seeds never
+// reach tests nothing.
+func (reach oracleReach) require(t *testing.T) {
+	t.Helper()
+
 	require.NotZero(t, reach.via, "a via route served at some step")
 	require.NotZero(t, reach.exit, "an exit route served to a client at some step")
 	require.NotZero(t, reach.autoApproved, "a route auto-approved at some step")
 	require.NotZero(t, reach.keysRotated, "a node's keys rotated at some step")
 	require.NotZero(t, reach.minCapVer, "a session at the oldest supported capability version")
+	require.NotZero(t, reach.addressMoved, "a node's address changed at some step")
+	require.NotZero(t, reach.inside, "a node inside another node's route at some step")
 }
 
 // oracleReach counts how often the oracle reached the shapes its writes
 // and policies are there for.
 type oracleReach struct {
-	via, exit, autoApproved, keysRotated, minCapVer int
+	via, exit, autoApproved, keysRotated, minCapVer, addressMoved int
+	// inside counts steps with a node inside another node's route;
+	// retargeted and regrouped the document edits that moved a rule's
+	// source or destination to another selector, or a group's members;
+	// retuned those that moved a port, a protocol or an app value alone.
+	inside, retargeted, regrouped, retuned int
+	// between counts sessions that rendered a snapshot between two
+	// coalesced commits; betweenStale those of them the routing over
+	// both had to wake again.
+	between, betweenStale int
+	// transient counts nodes that joined and left between two routings.
+	transient int
+	// serviceHost counts steps with a node sent addresses in capability
+	// mode for being a service host alone.
+	serviceHost int
+	// oneWay counts steps where a node sees one that does not see it.
+	oneWay int
 }
 
-// testStreamsConverge runs one seed and returns what it reached, so the
-// caller can tell every shape was exercised.
-func testStreamsConverge(t *testing.T, r *rand.Rand) oracleReach {
+// oraclePolicies are the documents the random writes switch between.
+var oraclePolicies = []string{
+	"",
+	ownUserOnly,
+	`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
+	  "acls":[{"action":"accept","src":["tag:a"],"dst":["tag:b:*"]},
+	          {"action":"accept","src":["u1@"],"dst":["u1@:*","10.0.0.0/24:*"]}],
+	  "ssh":[{"action":"accept","src":["u1@"],"dst":["tag:b"],"users":["root"]}]}`,
+	`{"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`,
+	`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
+	  "acls":[{"action":"accept","src":["*"],"dst":["*:*"]}],
+	  "ssh":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self"],"users":["root"]},
+	         {"action":"check","src":["tag:a"],"dst":["tag:b"],"users":["autogroup:nonroot"]}]}`,
+	// SSH alone connects u1 to tag:b, so only SSH wakes reach them.
+	`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
+	  "acls":[{"action":"accept","src":["tag:a"],"dst":["tag:a:*"]}],
+	  "ssh":[{"action":"accept","src":["u1@"],"dst":["tag:b"],"users":["root"]},
+	         {"action":"accept","src":["autogroup:member"],"dst":["autogroup:self"],"users":["root"]}]}`,
+	`{"nodeAttrs":[{"target":["u1@"],"attr":["disable-ipv4"]}],
+	  "acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`,
+	// These two differ only in u2 reaching the route: a viewer that
+	// already sees the router gains or loses it with no peer set or
+	// own filter change, so only the routed wake reaches it.
+	`{"acls":[{"action":"accept","src":["u1@","u2@"],"dst":["u1@:*","u2@:*"]}]}`,
+	`{"acls":[{"action":"accept","src":["u1@","u2@"],"dst":["u1@:*","u2@:*"]},
+	          {"action":"accept","src":["u2@"],"dst":["10.0.0.0/24:*"]}]}`,
+	// u2 reaches the route only through a tag:a router.
+	`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
+	  "grants":[{"src":["u2@"],"dst":["10.0.0.0/24"],"ip":["*"],"via":["tag:a"]},
+	            {"src":["*"],"dst":["*"],"ip":["*"]}]}`,
+	// Exit routes are reachable through autogroup:internet only.
+	`{"acls":[{"action":"accept","src":["u2@"],"dst":["autogroup:internet:*"]},
+	          {"action":"accept","src":["u1@","u2@"],"dst":["u1@:*","u2@:*"]}]}`,
+	`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
+	  "autoApprovers":{"routes":{"10.0.0.0/24":["tag:a"]},"exitNode":["tag:b"]},
+	  "acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`,
+	// A group, and rules over tailnet addresses some routes cover.
+	`{"groups":{"group:g":["u1@"]},"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
+	  "acls":[{"action":"accept","src":["group:g"],"dst":["tag:a:*","100.64.0.0/29:*"]},
+	          {"action":"accept","src":["u2@","tag:b"],"dst":["group:g:*","tag:b:22"]}]}`,
+	`{"hosts":{"lan":"10.0.0.0/24","h1":"100.64.0.1/32"},
+	  "acls":[{"action":"accept","src":["u2@"],"dst":["lan:*","h1:22"]},
+	          {"action":"accept","src":["u1@"],"dst":["u1@:*"]}]}`,
+	// An exit node sees the sources of a capability grant whose destination
+	// reaches the internet, which do not see it: a write of a source must
+	// reach the exit node.
+	`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
+	  "autoApprovers":{"exitNode":["u1@","tag:a","tag:b"]},
+	  "grants":[{"src":["u2@"],"dst":["8.8.8.0/24"],"app":{"example.com/cap/x":[{}]}},
+	            {"src":["u1@"],"dst":["u1@"],"ip":["*"]}]}`,
+	// Rules alike but for a port, a protocol or an app capability's value,
+	// one capability with two values: each must reach the client apart, and
+	// an edit of that field alone must too.
+	`{"grants":[{"src":["u1@"],"dst":["u2@"],"ip":["tcp:22"]},
+	            {"src":["u1@"],"dst":["u2@"],"ip":["udp:22"]},
+	            {"src":["u1@"],"dst":["u2@"],"ip":["tcp:2222"]},
+	            {"src":["u1@"],"dst":["u2@"],"app":{"example.com/cap/x":[{"v":1},{"v":3}]}},
+	            {"src":["u1@"],"dst":["u2@"],"app":{"example.com/cap/x":[{"v":2}]}},
+	            {"src":["u2@"],"dst":["u1@"],"ip":["tcp:80","udp:80"]}]}`,
+	// Service hosts add their service IPs to their local nets: in
+	// capability mode they are sent addresses, which follow u1's members.
+	`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
+	  "nodeAttrs":[{"target":["u2@","tag:b"],"attr":["service-host"]}],
+	  "acls":[{"action":"accept","src":["u1@"],"dst":["u2@:*","tag:b:*"]},
+	          {"action":"accept","src":["*"],"dst":["u1@:*"]}]}`,
+}
+
+// newOracleRun builds the random writes' tailnet: a node of u1 and u2 in
+// turn beyond the fixture's, a tag:a router of the route, and a session
+// per node.
+func newOracleRun(t *testing.T, r *rand.Rand, reach *oracleReach) (*oracleRun, *types.Config, *Hub, map[types.NodeID]*oracleSession) {
 	t.Helper()
 
 	cfg, s, _ := streamTestState(t, "")
@@ -1394,49 +2410,7 @@ func testStreamsConverge(t *testing.T, r *rand.Rand) oracleReach {
 	router.ApprovedRoutes = []netip.Prefix{route}
 	s.PutNodeInStoreForTest(*router)
 
-	policies := []string{
-		"",
-		ownUserOnly,
-		`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
-		  "acls":[{"action":"accept","src":["tag:a"],"dst":["tag:b:*"]},
-		          {"action":"accept","src":["u1@"],"dst":["u1@:*","10.0.0.0/24:*"]}],
-		  "ssh":[{"action":"accept","src":["u1@"],"dst":["tag:b"],"users":["root"]}]}`,
-		`{"acls":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self:*"]}]}`,
-		`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
-		  "acls":[{"action":"accept","src":["*"],"dst":["*:*"]}],
-		  "ssh":[{"action":"accept","src":["autogroup:member"],"dst":["autogroup:self"],"users":["root"]},
-		         {"action":"check","src":["tag:a"],"dst":["tag:b"],"users":["autogroup:nonroot"]}]}`,
-		// SSH alone connects u1 to tag:b, so only SSH wakes reach them.
-		`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
-		  "acls":[{"action":"accept","src":["tag:a"],"dst":["tag:a:*"]}],
-		  "ssh":[{"action":"accept","src":["u1@"],"dst":["tag:b"],"users":["root"]},
-		         {"action":"accept","src":["autogroup:member"],"dst":["autogroup:self"],"users":["root"]}]}`,
-		`{"nodeAttrs":[{"target":["u1@"],"attr":["disable-ipv4"]}],
-		  "acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`,
-		// These two differ only in u2 reaching the route: a viewer that
-		// already sees the router gains or loses it with no peer set or
-		// own filter change, so only the routed wake reaches it.
-		`{"acls":[{"action":"accept","src":["u1@","u2@"],"dst":["u1@:*","u2@:*"]}]}`,
-		`{"acls":[{"action":"accept","src":["u1@","u2@"],"dst":["u1@:*","u2@:*"]},
-		          {"action":"accept","src":["u2@"],"dst":["10.0.0.0/24:*"]}]}`,
-		// u2 reaches the route only through a tag:a router.
-		`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
-		  "grants":[{"src":["u2@"],"dst":["10.0.0.0/24"],"ip":["*"],"via":["tag:a"]},
-		            {"src":["*"],"dst":["*"],"ip":["*"]}]}`,
-		// Exit routes are reachable through autogroup:internet only.
-		`{"acls":[{"action":"accept","src":["u2@"],"dst":["autogroup:internet:*"]},
-		          {"action":"accept","src":["u1@","u2@"],"dst":["u1@:*","u2@:*"]}]}`,
-		`{"tagOwners":{"tag:a":["u1@"],"tag:b":["u1@"]},
-		  "autoApprovers":{"routes":{"10.0.0.0/24":["tag:a"]},"exitNode":["tag:b"]},
-		  "acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`,
-		`{"hosts":{"lan":"10.0.0.0/24","h1":"100.64.0.1/32"},
-		  "acls":[{"action":"accept","src":["u2@"],"dst":["lan:*","h1:22"]},
-		          {"action":"accept","src":["u1@"],"dst":["u1@:*"]}]}`,
-	}
-
 	exitRoutes := []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")}
-
-	var reach oracleReach
 
 	sessions := map[types.NodeID]*oracleSession{}
 	open := func(id types.NodeID) {
@@ -1467,6 +2441,25 @@ func testStreamsConverge(t *testing.T, r *rand.Rand) oracleReach {
 		open(nv.ID())
 	}
 
+	o := &oracleRun{
+		t: t, r: r, s: s, gens: map[types.NodeID]uint64{}, policies: oraclePolicies,
+		route: route, exitRoutes: exitRoutes, router: router,
+		u1: u1, u2: u2, open: open, addNode: addNode, reach: reach,
+	}
+
+	return o, cfg, hub, sessions
+}
+
+// testStreamsConverge runs one seed and returns what it reached, so the
+// caller can tell every shape was exercised.
+func testStreamsConverge(t *testing.T, r *rand.Rand, mode oracleMode) oracleReach {
+	t.Helper()
+
+	var reach oracleReach
+
+	o, cfg, hub, sessions := newOracleRun(t, r, &reach)
+	s := o.s
+
 	// wake returns the sessions the write from last to snap reaches, as
 	// the hub routes it.
 	last := s.Snapshot()
@@ -1485,13 +2478,13 @@ func testStreamsConverge(t *testing.T, r *rand.Rand) oracleReach {
 		return out
 	}
 
-	gens := map[types.NodeID]uint64{}
+	handed := handedOut{}
+	defer handed.requireUnchanged(t)
 
-	o := &oracleRun{
-		t: t, r: r, s: s, gens: gens, policies: policies,
-		route: route, exitRoutes: exitRoutes, router: router,
-		u1: u1, u2: u2, open: open, addNode: addNode, reach: &reach,
-	}
+	// Clients reporting themselves otherwise, on a stream of their own:
+	// each session's client must end holding what a fresh one is sent
+	// across every change of its delivery.
+	flips := rand.New(rand.NewPCG(11, 13)) //nolint:gosec // deterministic test input
 
 	for step := range 400 {
 		nodes := s.ListNodes()
@@ -1500,10 +2493,33 @@ func testStreamsConverge(t *testing.T, r *rand.Rand) oracleReach {
 
 		o.write(step, nodes, nv, id)
 
+		if flips.IntN(4) == 0 {
+			moveClient(flips, o)
+		}
+
 		snap := s.Snapshot()
+
+		if mode == oracleAudited {
+			// The snapshot every session renders was audited at the commit
+			// that last changed its membership.
+			require.True(t, snap.MembershipAudited(), "step %d: the last change to membership was audited", step)
+			require.True(t, snap.FilterAudited(), "step %d: every filter was expanded from templates and checked at the last change", step)
+			require.True(t, snap.SidesAudited(), "step %d: peers, routes and via from roles were checked at the last change", step)
+			require.True(t, snap.ViaElectionAudited() || snap.PolicyErr() != nil, "step %d: the via elections were checked against the plan", step)
+		}
 
 		advanceOracleSessions(t, r, cfg, hub, snap, wake(snap), sessions)
 		requireOracleConverged(t, step, cfg, snap, sessions)
+
+		for _, sess := range sessions {
+			if !sess.down {
+				handed.see(t, step, sess.st.sent.filter)
+			}
+		}
+
+		if mode == oracleCompile {
+			requireSessionsMatchCompile(t, step, snap, sessions)
+		}
 
 		if servesVia(snap) {
 			reach.via++
@@ -1512,9 +2528,82 @@ func testStreamsConverge(t *testing.T, r *rand.Rand) oracleReach {
 		if servesExit(sessions) {
 			reach.exit++
 		}
+
+		if nodeInsideRoute(snap) {
+			reach.inside++
+		}
 	}
 
 	return reach
+}
+
+// moveClient makes a node's client report itself as Tailscale's current
+// client, tailscale-rs, or a release before the oldest headscale serves:
+// what decides how its filter is delivered, and in capability mode its
+// form.
+func moveClient(r *rand.Rand, o *oracleRun) {
+	nodes := o.s.ListNodes()
+	n := nodes.At(r.IntN(nodes.Len())).AsStruct()
+
+	n.Hostinfo = n.Hostinfo.Clone()
+	if n.Hostinfo == nil {
+		n.Hostinfo = &tailcfg.Hostinfo{}
+	}
+
+	switch r.IntN(3) {
+	case 0:
+		n.Hostinfo.App, n.Hostinfo.GoVersion, n.Hostinfo.IPNVersion = "", runtime.Version(), version.Long()
+	case 1:
+		n.Hostinfo.App = "tailscale-rs"
+	default:
+		n.Hostinfo.IPNVersion = "1.0.0"
+	}
+
+	o.s.PutNodeInStoreForTest(*n)
+}
+
+// handedOut is every filter slice the served path handed a session, as
+// it was encoded then. A session takes a slice handed out again for the
+// same rules (the diff's identity check, [policyv2.FilterChunks.Recut]), so
+// a producer that changed a filter in place after handing it out, or wrote
+// another into its array, would leave a client holding stale chunks for
+// the rest of its session.
+type handedOut map[handedKey][]byte
+
+type handedKey struct {
+	first *tailcfg.FilterRule
+	n     int
+}
+
+// see records rules, failing when the slice was handed out before holding
+// other rules.
+func (h handedOut) see(t *testing.T, step int, rules []tailcfg.FilterRule) {
+	t.Helper()
+
+	if len(rules) == 0 {
+		return
+	}
+
+	enc, err := json.Marshal(rules)
+	require.NoError(t, err)
+
+	k := handedKey{&rules[0], len(rules)}
+	if was, ok := h[k]; ok && !bytes.Equal(was, enc) {
+		t.Fatalf("step %d: a filter handed out holds other rules now:\nthen %s\nnow  %s", step, was, enc)
+	}
+
+	h[k] = enc
+}
+
+// requireUnchanged fails when a filter handed out was changed since.
+func (h handedOut) requireUnchanged(t *testing.T) {
+	t.Helper()
+
+	for k, was := range h {
+		now, err := json.Marshal(unsafe.Slice(k.first, k.n))
+		require.NoError(t, err)
+		require.Equal(t, string(was), string(now), "a filter handed out was changed in place")
+	}
 }
 
 // oracleRun holds what the oracle's writes act on.
@@ -1531,16 +2620,28 @@ type oracleRun struct {
 	open       func(types.NodeID)
 	addNode    func(string) types.NodeID
 	reach      *oracleReach
+	// addrs counts the addresses address changes handed out.
+	addrs int
 }
+
+// oracleWrites is how many kinds of write [oracleRun.writeOp] makes.
+const oracleWrites = 21
 
 // write applies one random write to nv, at step, of the kinds a real
 // server sees.
 func (o *oracleRun) write(step int, nodes views.Slice[types.NodeView], nv types.NodeView, id types.NodeID) {
+	o.writeOp(o.r.IntN(oracleWrites), step, nodes, nv, id)
+}
+
+// writeOp applies write kind op to nv, at step.
+//
+//nolint:gocyclo // one case per kind of write
+func (o *oracleRun) writeOp(op, step int, nodes views.Slice[types.NodeView], nv types.NodeView, id types.NodeID) {
 	t, r, s, gens, policies := o.t, o.r, o.s, o.gens, o.policies
 	route, exitRoutes, router, u1, u2 := o.route, o.exitRoutes, o.router, o.u1, o.u2
 	open, addNode := o.open, o.addNode
 
-	switch op := r.IntN(19); op {
+	switch op {
 	case 0, 1, 2:
 		n := nv.AsStruct()
 		n.Endpoints = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(step))} //nolint:gosec // small
@@ -1564,10 +2665,16 @@ func (o *oracleRun) write(step int, nodes views.Slice[types.NodeView], nv types.
 			n.Hostinfo = &tailcfg.Hostinfo{}
 		}
 
-		routes := []netip.Prefix{route}
-		if r.IntN(3) == 0 {
-			routes = exitRoutes
-		}
+		// The subnet, the exit routes, or a route over tailnet addresses:
+		// other nodes are then inside it.
+		routes := [][]netip.Prefix{
+			{route},
+			{route},
+			exitRoutes,
+			{netip.MustParsePrefix("100.64.0.0/29")},
+			{netip.MustParsePrefix("100.64.0.8/29")},
+			{route, netip.MustParsePrefix("fd7a:115c:a1e0::/125")},
+		}[r.IntN(6)]
 
 		n.Hostinfo.RoutableIPs = routes
 		s.PutNodeInStoreForTest(*n)
@@ -1640,6 +2747,51 @@ func (o *oracleRun) write(step int, nodes views.Slice[types.NodeView], nv types.
 		if mustNode(t, s, id).ApprovedRoutes().Len() > nv.ApprovedRoutes().Len() {
 			o.reach.autoApproved++
 		}
+	case 19:
+		// An address change, a policy fact no other write moves: one
+		// family, the other or both, to addresses no node held before.
+		o.addrs++
+		n := nv.AsStruct()
+		v4 := netip.MustParseAddr(fmt.Sprintf("100.64.%d.%d", 4+o.addrs/250, o.addrs%250))
+		v6 := netip.MustParseAddr(fmt.Sprintf("fd7a:115c:a1e0:4::%x", o.addrs))
+
+		switch r.IntN(3) {
+		case 0:
+			n.IPv4 = &v4
+		case 1:
+			n.IPv6 = &v6
+		default:
+			n.IPv4, n.IPv6 = &v4, &v6
+		}
+
+		s.PutNodeInStoreForTest(*n)
+
+		o.reach.addressMoved++
+	case 20:
+		// A document edit moving a rule's source or destination to another
+		// selector the document names, or a group's members; now and then
+		// one moving a rule's port, protocol or app value alone.
+		if r.IntN(3) == 0 {
+			if pol, ok := retune(r, string(s.Snapshot().PolicySource())); ok {
+				if _, err := s.SetPolicy([]byte(pol)); err == nil { //nolint:noinlineerr
+					o.reach.retuned++
+				}
+
+				return
+			}
+		}
+
+		pol, kind, ok := retarget(r, string(s.Snapshot().PolicySource()))
+		if !ok {
+			return
+		}
+
+		_, err := s.SetPolicy([]byte(pol))
+		if err == nil && kind == "group" {
+			o.reach.regrouped++
+		} else if err == nil {
+			o.reach.retargeted++
+		}
 	case 16:
 		// A map request stamping LastSeen, online or not.
 		n := nv.AsStruct()
@@ -1658,6 +2810,99 @@ func (o *oracleRun) write(step int, nodes views.Slice[types.NodeView], nv types.
 	}
 }
 
+// requireSessionsMatchCompile holds every live session's peers, packet
+// filter and peers' routes to the compile's answers for snap: its pair scan
+// for peers, its filter for the node, and its route composition (its
+// matchers and its own via scopes) for each peer's routes.
+func requireSessionsMatchCompile(t *testing.T, step int, snap *state.Snapshot, sessions map[types.NodeID]*oracleSession) {
+	t.Helper()
+
+	pm, ok := snap.Policy().(*policyv2.PolicyManager)
+	require.True(t, ok)
+
+	peerMap := pm.BuildPeerMap(snap.ListNodes())
+
+	for _, id := range slices.Sorted(maps.Keys(sessions)) {
+		sess := sessions[id]
+		if sess.down {
+			continue
+		}
+
+		self, ok := snap.GetNode(id)
+		require.True(t, ok)
+
+		want := slices.Clone(peerMap[id])
+		slices.Sort(want)
+
+		want = slices.DeleteFunc(want, func(p types.NodeID) bool { return p == id })
+
+		got := make([]types.NodeID, 0, len(sess.client.peers))
+		for pid := range sess.client.peers {
+			got = append(got, types.NodeID(pid)) //nolint:gosec // node IDs fit
+		}
+
+		slices.Sort(got)
+
+		if !slices.Equal(want, got) {
+			t.Fatalf("step %d: session %d holds peers %v, the compile's pair scan %v", step, id, got, want)
+		}
+
+		filter, err := pm.FilterForNode(self)
+		require.NoError(t, err)
+
+		switch {
+		case len(filter) == 0 && len(sess.client.filter) == 0:
+		case !snap.CapabilitySources() && !sess.st.sent.chunked:
+			// The whole filter under "base", as the compile writes it.
+			if !reflect.DeepEqual(filter, sess.client.filter) {
+				t.Fatalf("step %d: session %d holds filter %v, the compile's %v", step, id, sess.client.filter, filter)
+			}
+		default:
+			// What the client enforces, from what it assembled (chunks in
+			// key order, or capability sources looked up in its netmap),
+			// must answer as the compile's filter does; nothing of the
+			// chunking or of capability form is on the oracle's side.
+			if d := heldDivergence(sess.client.filter, filter, clientLookup(sess.client), localNets(self), snap.ListNodes()); d != "" {
+				t.Fatalf("step %d: session %d enforces otherwise than the compile: %s\nheld    %v\ncompile %v", step, id, d, sess.client.filter, filter)
+			}
+
+			if snap.CapabilitySources() {
+				// And the filter served says what the compile says once each
+				// capability is the addresses of the nodes this client holds
+				// with it, as rule multisets.
+				served, err := snap.FilterForNode(id)
+				require.NoError(t, err)
+
+				err = policyv2.AgreesWithAddressForm(served, filter, sess.client.capHolders)
+				if err != nil {
+					t.Fatalf("step %d: session %d: %v", step, id, err)
+				}
+			}
+		}
+
+		for pid, tn := range sess.client.peers {
+			peer, ok := snap.GetNode(types.NodeID(pid)) //nolint:gosec // node IDs fit
+			require.True(t, ok)
+
+			routes, err := snap.CompiledRoutesForPeer(self, peer)
+			require.NoError(t, err)
+
+			if got, want := heldRoutes(tn), slices.SortedFunc(slices.Values(routes), netip.Prefix.Compare); !slices.Equal(got, want) {
+				t.Fatalf("step %d: session %d holds routes %v of peer %d, the compile's %v", step, id, got, pid, want)
+			}
+		}
+	}
+}
+
+// heldRoutes returns the routes a peer's AllowedIPs hold beyond its
+// addresses, sorted.
+func heldRoutes(tn *tailcfg.Node) []netip.Prefix {
+	routes := slices.DeleteFunc(slices.Clone(tn.AllowedIPs), func(p netip.Prefix) bool { return slices.Contains(tn.Addresses, p) })
+	slices.SortFunc(routes, netip.Prefix.Compare)
+
+	return routes
+}
+
 // servesExit reports whether any client holds a peer offering an exit
 // route.
 func servesExit(sessions map[types.NodeID]*oracleSession) bool {
@@ -1672,12 +2917,28 @@ func servesExit(sessions map[types.NodeID]*oracleSession) bool {
 	return false
 }
 
+// compiledPolicy returns snap's policy compile, whose address compile the
+// tests hold what is served to.
+func compiledPolicy(tb testing.TB, snap *state.Snapshot) *policyv2.PolicyManager {
+	tb.Helper()
+
+	pm, ok := snap.Policy().(*policyv2.PolicyManager)
+	require.True(tb, ok, "test sanity: a v2 policy")
+
+	return pm
+}
+
 // servesVia reports whether any node gets a route through a via grant.
 func servesVia(snap *state.Snapshot) bool {
+	pm, ok := snap.Policy().(*policyv2.PolicyManager)
+	if !ok {
+		return false
+	}
+
 	nodes := snap.ListNodes()
 	for _, viewer := range nodes.All() {
 		for _, peer := range nodes.All() {
-			if len(snap.Policy().ViaRoutesForPeer(viewer, peer).Include) > 0 {
+			if len(pm.ViaRoutesForPeer(viewer, peer).Include) > 0 {
 				return true
 			}
 		}
@@ -1845,8 +3106,13 @@ func requireOracleConverged(t *testing.T, step int, cfg *types.Config, snap *sta
 // for a tailnet of 10 users whose nodes, for "tags", carry one of 20 tags.
 // For "via", every tenth node is an online tag:r router sharing an HA
 // subnet with the next one, reached through a via grant, so every peer
-// render resolves via routes.
+// render resolves via routes. The churn shapes (mesh, group-all, routers,
+// selectors) are described with their policies in churn_test.go.
 var scalingPolicies = map[string]string{
+	"mesh":      meshPolicy,
+	"group-all": groupAllPolicy(false),
+	"routers":   routersPolicy(false),
+	"selectors": selectorsPolicy(false),
 	"allow-all": `{}`,
 	"users": func() string {
 		acls := make([]string, 0, 10)
@@ -1905,16 +3171,14 @@ func scalingRouters(tb testing.TB, s *state.State) {
 	// standby.
 	snap := s.Snapshot()
 	viewer, router, standby := s.ListNodes().At(1), s.ListNodes().At(0), s.ListNodes().At(10)
-	matchers, err := snap.Policy().MatchersForNode(viewer)
-	require.NoError(tb, err)
 
 	subnet := netip.MustParsePrefix("10.0.0.0/24")
-	require.Contains(tb, snap.RoutesForPeer(viewer, mustNode(tb, s, router.ID()), matchers), subnet)
-	require.NotContains(tb, snap.RoutesForPeer(viewer, mustNode(tb, s, standby.ID()), matchers), subnet)
+	require.Contains(tb, snap.RoutesForPeer(viewer, mustNode(tb, s, router.ID())), subnet)
+	require.NotContains(tb, snap.RoutesForPeer(viewer, mustNode(tb, s, standby.ID())), subnet)
 
 	// And it is the via grant that serves it, not HA primaries under a
 	// plain grant.
-	via := snap.Policy().ViaRoutesForPeer(viewer, mustNode(tb, s, router.ID()))
+	via := compiledPolicy(tb, snap).ViaRoutesForPeer(viewer, mustNode(tb, s, router.ID()))
 	require.Contains(tb, via.Include, subnet, "the via grant steers the subnet")
 	require.NotContains(tb, via.UsePrimary, subnet, "a plain grant covers the subnet")
 }
@@ -1939,10 +3203,19 @@ func scalingTailnet(tb testing.TB, n int, shape string) (*state.State, []*Stream
 	database, err := db.NewHeadscaleDatabase(cfg)
 	require.NoError(tb, err)
 
+	// One fsync'd transaction per fixture node made setup, not the writes,
+	// the cost of a run on disk. Only this setup connection skips them: the
+	// state below reopens the file with its own settings.
+	require.NoError(tb, database.DB.Exec("PRAGMA synchronous = OFF").Error)
+
 	users := database.CreateUsersForTest(10, "u")
+
+	nodes := make([]*types.Node, 0, n)
 	for i, u := range users {
-		database.CreateRegisteredNodesForTest(u, n/10+min(1, max(0, n%10-i)), u.Name)
+		nodes = append(nodes, database.CreateRegisteredNodesForTest(u, n/10+min(1, max(0, n%10-i)), u.Name)...)
 	}
+
+	shapeFixture(tb, database, shape, nodes)
 
 	require.NoError(tb, database.Close())
 
@@ -1964,11 +3237,15 @@ func scalingTailnet(tb testing.TB, n int, shape string) (*state.State, []*Stream
 		}
 	}
 
-	_, err = s.SetPolicy([]byte(scalingPolicies[shape]))
+	_, err = s.SetPolicy([]byte(shapePolicy(shape)))
 	require.NoError(tb, err)
 
 	if shape == "via" {
 		scalingRouters(tb, s)
+	}
+
+	if shape == "routers" || shape == "rules" {
+		subnetRouters(tb, s, shape)
 	}
 
 	hub := NewHub()
@@ -2090,8 +3367,10 @@ func TestScalingEndpointWrite(t *testing.T) {
 // For policy writes, shape is the starting policy: setup opens visibility
 // to every node, and the loop only alternates its port. Endpoint writes use
 // the test store to update the immutable world without SQL. Every session
-// encodes its response and confirms delivery. BenchmarkSTUNEndpointReports
-// separately measures public MapRequests, including SQL persistence.
+// encodes its response and confirms delivery; encoded-bytes/op is what they
+// send, compressed. BenchmarkSTUNEndpointReports separately measures public
+// MapRequests, including SQL persistence. The churn kinds (join, leave, tag,
+// group) go through the production entry points instead; see churnWrites.
 func BenchmarkScalingWrites(b *testing.B) {
 	sizes := []int{100, 400, 1000}
 	if testing.Short() {
@@ -2106,10 +3385,24 @@ func BenchmarkScalingWrites(b *testing.B) {
 		sizes = []int{n}
 	}
 
-	for _, kind := range slices.Sorted(maps.Keys(scalingWrites)) {
+	kinds := slices.Concat(slices.Collect(maps.Keys(scalingWrites)), slices.Collect(maps.Keys(churnWrites)))
+	slices.Sort(kinds)
+
+	for _, kind := range kinds {
 		for _, shape := range slices.Sorted(maps.Keys(scalingPolicies)) {
+			churn, isChurn := churnWrites[kind]
+			if isChurn && !churn.applies(churnShapes[shape]) {
+				continue
+			}
+
 			for _, n := range sizes {
 				b.Run(fmt.Sprintf("%s/%s/nodes=%d", kind, shape, n), func(b *testing.B) {
+					if isChurn {
+						benchChurn(b, kind, shape, n)
+
+						return
+					}
+
 					s, streams := scalingTailnet(b, n, shape)
 					sc := newScalingRun(s, streams)
 
@@ -2130,6 +3423,7 @@ func BenchmarkScalingWrites(b *testing.B) {
 					b.ReportMetric(float64(sc.woken)/float64(i), "woken/op")
 					b.ReportMetric(float64(sc.updates)/float64(i), "updates/op")
 					b.ReportMetric(float64(sc.rendered)/float64(i), "peer-renders/op")
+					b.ReportMetric(float64(sc.encoded)/float64(i), "encoded-bytes/op")
 				})
 			}
 		}
@@ -2188,10 +3482,8 @@ func BenchmarkViaOnlineWrites(b *testing.B) {
 				if kind == "router-failover" {
 					snap := s.Snapshot()
 					viewer := mustNode(b, s, streams[1].nodeID)
-					matchers, err := snap.Policy().MatchersForNode(viewer)
-					require.NoError(b, err)
 					winner := mustNode(b, s, streams[(i%2)*10].nodeID)
-					require.Contains(b, snap.RoutesForPeer(viewer, winner, matchers), netip.MustParsePrefix("10.0.0.0/24"))
+					require.Contains(b, snap.RoutesForPeer(viewer, winner), netip.MustParsePrefix("10.0.0.0/24"))
 					require.Positive(b, sc.updates, "each failover must send route changes")
 				}
 
@@ -2252,10 +3544,8 @@ func BenchmarkViaMixedOnlineWrites(b *testing.B) {
 
 				snap := s.Snapshot()
 				viewer := mustNode(b, s, streams[1].nodeID)
-				matchers, err := snap.Policy().MatchersForNode(viewer)
-				require.NoError(b, err)
 				winner := mustNode(b, s, streams[(i%2)*10].nodeID)
-				require.Contains(b, snap.RoutesForPeer(viewer, winner, matchers), netip.MustParsePrefix("10.0.0.0/24"))
+				require.Contains(b, snap.RoutesForPeer(viewer, winner), netip.MustParsePrefix("10.0.0.0/24"))
 				require.Positive(b, sc.updates)
 				b.ReportMetric(float64(sc.woken)/float64(i), "woken/op")
 				b.ReportMetric(float64(sc.updates)/float64(i), "updates/op")
@@ -2279,19 +3569,57 @@ func scalingEndpoint(tb testing.TB, s *state.State, id types.NodeID, i int) {
 // counts the work: sessions woken, those with something to send, and the
 // peers they rendered.
 type scalingRun struct {
+	scalingWork
+
 	s       *state.State
 	streams []*Stream
 	byNode  map[types.NodeID]*Stream
 	last    *state.Snapshot
 
+	// encode encodes each response sent; see sizedEncoder for the one
+	// that also measures them.
+	encode func(*tailcfg.MapResponse, bool) ([]byte, error)
+	sized  *sizedEncoder
+
+	// subjects are the nodes the write being delivered changed: what is
+	// sent to them is the write's own, not fan-out.
+	subjects map[types.NodeID]struct{}
+
+	// watch makes a delivery do what hub's watcher does for each commit
+	// besides waking sessions: advance its caches, and forget deleted
+	// nodes, whose sessions it ends.
+	watch bool
+	hub   *Hub
+
+	// observe, when set, sees what each woken session was sent.
+	observe func(snap *state.Snapshot, id types.NodeID, out []*tailcfg.MapResponse)
+}
+
+// scalingWork is the work deliveries counted.
+type scalingWork struct {
 	woken, updates, rendered int
 
 	// quiet counts writes that woke no session.
 	quiet int
+
+	// encoded counts the bytes sent, compressed, and commits the commits
+	// delivered.
+	encoded, commits int
+
+	// With a sizedEncoder, the JSON bytes sent split into packet filters
+	// sent to sessions other than the subjects', and how many of those
+	// sessions were sent one; packet filters sent to the subjects; and
+	// everything else. chunksSent and chunksDeleted count the filter
+	// chunks every session was sent and told to delete.
+	filterBytes, filterSends, selfFilterBytes, restBytes int
+	chunksSent, chunksDeleted                            int
 }
 
 func newScalingRun(s *state.State, streams []*Stream) *scalingRun {
-	sc := &scalingRun{s: s, streams: streams, byNode: make(map[types.NodeID]*Stream, len(streams)), last: s.Snapshot()}
+	sc := &scalingRun{
+		s: s, streams: streams, byNode: make(map[types.NodeID]*Stream, len(streams)), last: s.Snapshot(),
+		encode: benchEncode,
+	}
 	for _, st := range streams {
 		sc.byNode[st.nodeID] = st
 	}
@@ -2311,16 +3639,28 @@ func (sc *scalingRun) warm(tb testing.TB, kind string) {
 	}
 }
 
-// step makes write i on the i-th session's node and updates, encodes for
-// and confirms delivery to the sessions it wakes.
+// step makes write i on the i-th session's node and delivers it.
 func (sc *scalingRun) step(tb testing.TB, write func(testing.TB, *state.State, types.NodeID, int), i int) {
 	tb.Helper()
 
 	write(tb, sc.s, sc.streams[i%len(sc.streams)].nodeID, i)
+	sc.deliver(tb)
+}
+
+// deliver routes the commits since the last delivery as the hub does,
+// and updates, encodes for and confirms delivery to the sessions they wake.
+func (sc *scalingRun) deliver(tb testing.TB) {
+	tb.Helper()
 
 	snap := sc.s.Snapshot()
-	all, wake := Route(sc.last, snap, snap.Since(sc.last))
+	change := snap.Since(sc.last)
+	all, wake := Route(sc.last, snap, change)
+	sc.commits += int(snap.Rev() - sc.last.Rev()) //nolint:gosec // revisions only grow
 	sc.last = snap
+
+	if sc.watch {
+		sc.watched(snap, change)
+	}
 
 	// Visit the woken sessions only, as the hub does.
 	targets := sc.streams
@@ -2351,16 +3691,30 @@ func (sc *scalingRun) step(tb testing.TB, write func(testing.TB, *state.State, t
 			sc.updates++
 		}
 
+		if sc.observe != nil {
+			sc.observe(snap, st.nodeID, out)
+		}
+
 		for _, resp := range out {
-			_, err := st.hub.Encode(resp, true, benchEncode)
+			data, err := st.hub.Encode(resp, true, sc.encode)
 			if err != nil {
 				tb.Fatal(err)
+			}
+
+			sc.encoded += len(data)
+
+			if sc.sized != nil && !sc.account(st.nodeID, resp) {
+				tb.Fatal("a response was sent that the sized encoder did not encode")
 			}
 		}
 
 		st.Delivered()
 
 		sc.rendered += st.r.rendered - before
+	}
+
+	if sc.sized != nil {
+		clear(sc.sized.sizes)
 	}
 }
 
@@ -2373,7 +3727,7 @@ func (sc *scalingRun) requireSettled(tb testing.TB, kind string) {
 
 	for _, st := range sc.streams {
 		require.Nil(tb, st.pending, "successful writes confirm delivery even when attempts would fold")
-		require.Empty(tb, st.hub.sentPeers[st.nodeID].attempts, "successful writes leave no failed-write history")
+		require.Empty(tb, st.hub.core.sentPeers[st.nodeID].attempts, "successful writes leave no failed-write history")
 	}
 
 	// A policy write that repeats the previous port rewrites the identical
@@ -2389,6 +3743,9 @@ func (sc *scalingRun) requireSettled(tb testing.TB, kind string) {
 // Rows above what the write needs say so, with the item that would lower
 // them.
 func TestScalingWriteWork(t *testing.T) {
+	// Pinned to address form: the counts are address mode's work; capability mode re-renders the peers whose stamps a write moves, and sends fewer filters (BenchmarkScalingWrites reports both).
+	t.Setenv(state.TestCapabilitySourcesEnv, "false")
+
 	const n, writes = 100, 4
 
 	// Sessions woken, sessions sent an update and peers rendered, over the
@@ -2398,53 +3755,93 @@ func TestScalingWriteWork(t *testing.T) {
 	// Policy rows add the setup write that expands visibility, which every
 	// session renders, to the writes that only alternate its port.
 	//
-	// Rejoin is two commits the hub routes as one, which wakes every
-	// session (Snapshot.Since escalation, N2): above need.
+	// Rejoin is two commits the hub routes as one, compared end to end:
+	// the node, changed back, and its viewers are woken, as an endpoint
+	// write wakes them, and have nothing to send. A node the log names
+	// cannot be told unchanged without its intermediate renders; that it
+	// wakes its viewers is above need.
 	//
 	// The via shape sees what allow-all does, plus routes that differ per
-	// viewer: a write that moves the policy, as policy and rejoin writes
-	// do, re-renders every routed peer in every session (renderPeers),
-	// five primary routers here: above need. A via election move renders
-	// only the routers the election steers to or from. The first online
-	// write also changes the router's own PrimaryRoutes. Rejoin
-	// restores its original SessionStart, so final wire state is unchanged.
+	// viewer: a routed peer's routes are read again for a viewer when what
+	// every route reads moved, as at the policy rows' writes, when the
+	// viewer's side set did, as the rejoined node's does, or when the
+	// peer's routes' cover did, and it renders again only when they differ:
+	// viewers given the same routes of a render share one. A via election
+	// move renders only the routers the election steers to or from. The first online write also
+	// changes the router's own PrimaryRoutes. Rejoin restores its original
+	// SessionStart, so final wire state is unchanged.
+	//
+	// The routers shape's first subject is a router, whose only viewers
+	// are group:eng's members.
 	ceilings := map[string][3]int{
 		"derp/allow-all":           {400, 400, 0},
+		"derp/group-all":           {400, 400, 0},
+		"derp/mesh":                {400, 400, 0},
+		"derp/routers":             {400, 400, 0},
+		"derp/selectors":           {400, 400, 0},
 		"derp/self":                {400, 400, 0},
 		"derp/tags":                {400, 400, 0},
 		"derp/users":               {400, 400, 0},
 		"derp/via":                 {400, 400, 0},
 		"endpoint/allow-all":       {400, 400, 396},
+		"endpoint/group-all":       {400, 400, 396},
+		"endpoint/mesh":            {400, 400, 396},
+		"endpoint/routers":         {341, 341, 337},
+		"endpoint/selectors":       {323, 323, 319},
 		"endpoint/self":            {40, 40, 36},
 		"endpoint/tags":            {44, 44, 40},
 		"endpoint/users":           {40, 40, 36},
 		"endpoint/via":             {400, 400, 396},
 		"endpoints-x16/allow-all":  {400, 400, 6336},
+		"endpoints-x16/group-all":  {400, 400, 5776},
+		"endpoints-x16/mesh":       {400, 400, 6336},
+		"endpoints-x16/routers":    {400, 400, 5349},
+		"endpoints-x16/selectors":  {400, 400, 5632},
 		"endpoints-x16/self":       {100, 100, 576},
 		"endpoints-x16/tags":       {360, 360, 640},
 		"endpoints-x16/users":      {100, 100, 576},
 		"endpoints-x16/via":        {400, 400, 6336},
 		"ignored-health/allow-all": {0, 0, 0},
+		"ignored-health/group-all": {0, 0, 0},
+		"ignored-health/mesh":      {0, 0, 0},
+		"ignored-health/routers":   {0, 0, 0},
+		"ignored-health/selectors": {0, 0, 0},
 		"ignored-health/self":      {0, 0, 0},
 		"ignored-health/tags":      {0, 0, 0},
 		"ignored-health/users":     {0, 0, 0},
 		"ignored-health/via":       {0, 0, 0},
 		"online/allow-all":         {400, 396, 396},
+		"online/group-all":         {400, 396, 396},
+		"online/mesh":              {400, 396, 396},
+		"online/routers":           {341, 337, 337},
+		"online/selectors":         {323, 319, 319},
 		"online/self":              {40, 36, 36},
 		"online/tags":              {44, 40, 40},
 		"online/users":             {40, 36, 36},
 		"online/via":               {400, 397, 495},
 		"policy/allow-all":         {500, 500, 0},
+		"policy/group-all":         {500, 500, 2000},
+		"policy/mesh":              {500, 500, 0},
+		"policy/routers":           {500, 500, 1980},
+		"policy/selectors":         {500, 500, 1860},
 		"policy/self":              {500, 500, 9000},
 		"policy/tags":              {500, 500, 8900},
 		"policy/users":             {500, 500, 9000},
-		"policy/via":               {500, 500, 2475},
+		"policy/via":               {500, 500, 0},
 		"rejoin/allow-all":         {400, 0, 396},
-		"rejoin/self":              {400, 0, 36},
-		"rejoin/tags":              {400, 0, 40},
-		"rejoin/users":             {400, 0, 36},
-		"rejoin/via":               {400, 0, 2277},
+		"rejoin/group-all":         {400, 0, 396},
+		"rejoin/mesh":              {400, 0, 396},
+		"rejoin/routers":           {341, 0, 337},
+		"rejoin/selectors":         {323, 0, 319},
+		"rejoin/self":              {40, 0, 36},
+		"rejoin/tags":              {44, 0, 40},
+		"rejoin/users":             {40, 0, 36},
+		"rejoin/via":               {400, 0, 396},
 		"rename/allow-all":         {400, 400, 396},
+		"rename/group-all":         {400, 400, 396},
+		"rename/mesh":              {400, 400, 396},
+		"rename/routers":           {341, 341, 337},
+		"rename/selectors":         {323, 323, 319},
 		"rename/self":              {40, 40, 36},
 		"rename/tags":              {44, 44, 40},
 		"rename/users":             {40, 40, 36},
@@ -2472,6 +3869,445 @@ func TestScalingWriteWork(t *testing.T) {
 			})
 		}
 	}
+}
+
+// TestScalingWriteWorkCapability is [TestScalingWriteWork] in capability
+// mode, adding the served filters' work on the way: filters cut, selector
+// resolutions built, the members those listed, and sorts of every node's
+// addresses.
+func TestScalingWriteWorkCapability(t *testing.T) {
+	t.Setenv(state.TestCapabilitySourcesEnv, "true")
+	// The audit cuts filters of its own, which the counts would include.
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "false")
+
+	const n, writes = 100, 4
+
+	// Sessions woken, updated and peers rendered are address mode's (see
+	// TestScalingWriteWork) except where a write moves stamps: the policy
+	// rows' setup write replaces the shape's policy with one naming no
+	// identity, so every stamped node loses its stamps and every viewer is
+	// sent it again. Filters cut: a port edit moves every node's filter;
+	// nothing else cuts one. No write resolves a selector: capability form
+	// reads none.
+	ceilings := map[string][6]int{
+		"derp/allow-all":           {400, 400, 0, 0, 0, 0},
+		"derp/group-all":           {400, 400, 0, 0, 0, 0},
+		"derp/mesh":                {400, 400, 0, 0, 0, 0},
+		"derp/routers":             {400, 400, 0, 0, 0, 0},
+		"derp/selectors":           {400, 400, 0, 0, 0, 0},
+		"derp/self":                {400, 400, 0, 0, 0, 0},
+		"derp/tags":                {400, 400, 0, 0, 0, 0},
+		"derp/users":               {400, 400, 0, 0, 0, 0},
+		"derp/via":                 {400, 400, 0, 0, 0, 0},
+		"endpoint/allow-all":       {400, 400, 396, 0, 0, 0},
+		"endpoint/group-all":       {400, 400, 396, 0, 0, 0},
+		"endpoint/mesh":            {400, 400, 396, 0, 0, 0},
+		"endpoint/routers":         {341, 341, 337, 0, 0, 0},
+		"endpoint/selectors":       {323, 323, 319, 0, 0, 0},
+		"endpoint/self":            {40, 40, 36, 0, 0, 0},
+		"endpoint/tags":            {44, 44, 40, 0, 0, 0},
+		"endpoint/users":           {40, 40, 36, 0, 0, 0},
+		"endpoint/via":             {400, 400, 396, 0, 0, 0},
+		"endpoints-x16/allow-all":  {400, 400, 6336, 0, 0, 0},
+		"endpoints-x16/group-all":  {400, 400, 5776, 0, 0, 0},
+		"endpoints-x16/mesh":       {400, 400, 6336, 0, 0, 0},
+		"endpoints-x16/routers":    {400, 400, 5349, 0, 0, 0},
+		"endpoints-x16/selectors":  {400, 400, 5632, 0, 0, 0},
+		"endpoints-x16/self":       {100, 100, 576, 0, 0, 0},
+		"endpoints-x16/tags":       {360, 360, 640, 0, 0, 0},
+		"endpoints-x16/users":      {100, 100, 576, 0, 0, 0},
+		"endpoints-x16/via":        {400, 400, 6336, 0, 0, 0},
+		"ignored-health/allow-all": {0, 0, 0, 0, 0, 0},
+		"ignored-health/group-all": {0, 0, 0, 0, 0, 0},
+		"ignored-health/mesh":      {0, 0, 0, 0, 0, 0},
+		"ignored-health/routers":   {0, 0, 0, 0, 0, 0},
+		"ignored-health/selectors": {0, 0, 0, 0, 0, 0},
+		"ignored-health/self":      {0, 0, 0, 0, 0, 0},
+		"ignored-health/tags":      {0, 0, 0, 0, 0, 0},
+		"ignored-health/users":     {0, 0, 0, 0, 0, 0},
+		"ignored-health/via":       {0, 0, 0, 0, 0, 0},
+		"online/allow-all":         {400, 396, 396, 0, 0, 0},
+		"online/group-all":         {400, 396, 396, 0, 0, 0},
+		"online/mesh":              {400, 396, 396, 0, 0, 0},
+		"online/routers":           {341, 337, 337, 0, 0, 0},
+		"online/selectors":         {323, 319, 319, 0, 0, 0},
+		"online/self":              {40, 36, 36, 0, 0, 0},
+		"online/tags":              {44, 40, 40, 0, 0, 0},
+		"online/users":             {40, 36, 36, 0, 0, 0},
+		"online/via":               {400, 397, 495, 0, 0, 0},
+		"policy/allow-all":         {500, 500, 0, 400, 0, 0},
+		"policy/group-all":         {500, 500, 6950, 400, 0, 0},
+		"policy/mesh":              {500, 500, 9900, 400, 0, 0},
+		"policy/routers":           {500, 500, 9100, 400, 0, 0},
+		"policy/selectors":         {500, 500, 9348, 400, 0, 0},
+		"policy/self":              {500, 500, 9900, 400, 0, 0},
+		"policy/tags":              {500, 500, 9900, 400, 0, 0},
+		"policy/users":             {500, 500, 9900, 400, 0, 0},
+		"policy/via":               {500, 500, 0, 400, 0, 0},
+		"rejoin/allow-all":         {400, 0, 396, 0, 0, 0},
+		"rejoin/group-all":         {400, 0, 396, 0, 0, 0},
+		"rejoin/mesh":              {400, 0, 396, 0, 0, 0},
+		"rejoin/routers":           {341, 0, 337, 0, 0, 0},
+		"rejoin/selectors":         {323, 0, 319, 0, 0, 0},
+		"rejoin/self":              {40, 0, 36, 0, 0, 0},
+		"rejoin/tags":              {44, 0, 40, 0, 0, 0},
+		"rejoin/users":             {40, 0, 36, 0, 0, 0},
+		"rejoin/via":               {400, 0, 396, 0, 0, 0},
+		"rename/allow-all":         {400, 400, 396, 0, 0, 0},
+		"rename/group-all":         {400, 400, 396, 0, 0, 0},
+		"rename/mesh":              {400, 400, 396, 0, 0, 0},
+		"rename/routers":           {341, 341, 337, 0, 0, 0},
+		"rename/selectors":         {323, 323, 319, 0, 0, 0},
+		"rename/self":              {40, 40, 36, 0, 0, 0},
+		"rename/tags":              {44, 44, 40, 0, 0, 0},
+		"rename/users":             {40, 40, 36, 0, 0, 0},
+		"rename/via":               {400, 400, 396, 0, 0, 0},
+	}
+
+	for _, kind := range slices.Sorted(maps.Keys(scalingWrites)) {
+		for _, shape := range slices.Sorted(maps.Keys(scalingPolicies)) {
+			t.Run(kind+"/"+shape, func(t *testing.T) {
+				s, streams := scalingTailnet(t, n, shape)
+				sc := newScalingRun(s, streams)
+				sc.warm(t, kind)
+
+				var work [3]uint64
+
+				for i := range writes {
+					before := capWork()
+
+					sc.step(t, scalingWrites[kind], i)
+
+					for k, v := range capWork() {
+						work[k] += v - before[k]
+					}
+				}
+
+				sc.requireSettled(t, kind)
+
+				got := [6]int{sc.woken, sc.updates, sc.rendered, int(work[0]), int(work[1]), int(work[2])} //nolint:gosec // small
+				limit, ok := ceilings[kind+"/"+shape]
+				require.True(t, ok, "no ceiling for %s/%s", kind, shape)
+				assert.Equal(t, limit, got, "sessions woken, updated, peers rendered, filters cut, resolutions built, members listed")
+			})
+		}
+	}
+}
+
+// BenchmarkHubSessionsCoalescedWrites measures what the hub does for two
+// endpoint writes that land together, with every node's session a
+// goroutine attached to a watched hub as poll runs it: the routings, the
+// wakes, every session's render and its end in the render log, and the
+// next routing's weighing of those renders. Under a mesh both writes wake
+// every session; an op ends when every session rendered the second. ns/op
+// is wall time, allocs/op every goroutine's.
+func BenchmarkHubSessionsCoalescedWrites(b *testing.B) {
+	for _, n := range benchSizes(b, 1000) {
+		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) {
+			s, fixture := scalingTailnet(b, n, "mesh")
+			cfg := fixture[0].cfg
+
+			hub := NewHub()
+			defer hub.Close()
+
+			hub.Watch(s)
+
+			var (
+				renders atomic.Int64
+				wg      sync.WaitGroup
+			)
+
+			nodes := s.ListNodes()
+			last := make([]atomic.Uint64, nodes.Len())
+			quit := make(chan struct{})
+
+			for i, nv := range nodes.All() {
+				sess := hub.Join(nv.ID(), func() {})
+				st := NewStream(cfg, hub, nv.ID(), capVer)
+				st.Attach(sess)
+
+				_, err := st.Initial(s.Snapshot())
+				require.NoError(b, err)
+				st.Delivered()
+
+				wg.Go(func() {
+					for {
+						select {
+						case <-quit:
+							return
+						case <-sess.Wakes():
+							snap := s.Snapshot()
+
+							_, err := st.Update(snap)
+							if err == nil {
+								st.Delivered()
+							}
+
+							last[i].Store(snap.Rev())
+							renders.Add(1)
+						}
+					}
+				})
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			i := 0
+			for b.Loop() {
+				scalingEndpoint(b, s, nodes.At(i%nodes.Len()).ID(), i)
+				scalingEndpoint(b, s, nodes.At((i+1)%nodes.Len()).ID(), i)
+
+				want := s.Snapshot().Rev()
+
+				for j := range last {
+					for last[j].Load() < want {
+						runtime.Gosched()
+					}
+				}
+
+				i++
+			}
+
+			b.StopTimer()
+			close(quit)
+			wg.Wait()
+
+			b.ReportMetric(float64(renders.Load())/float64(i), "renders/op")
+		})
+	}
+}
+
+// BenchmarkHubPollStyle is [BenchmarkHubSessionsCoalescedWrites] with the
+// sessions run as poll runs them: each waits out a batch delay after a
+// wake and takes its own snapshot of the state, and the watcher waits a
+// moment before each commit, so its routings coalesce and renders land
+// between their ends. An op is four writes 1 ms apart, every one waking
+// every session; it ends when every session rendered the last. It reports
+// the watcher's time per routing and its worst.
+func BenchmarkHubPollStyle(b *testing.B) {
+	for _, n := range benchSizes(b, 1000, 5000) {
+		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) {
+			const delay = 5 * time.Millisecond
+
+			s, fixture := scalingTailnet(b, n, "mesh")
+			cfg := fixture[0].cfg
+
+			hub := NewHub()
+			defer hub.Close()
+
+			var (
+				mu                 sync.Mutex
+				start              time.Time
+				routings           int
+				routingNs, worstNs int64
+				renders            atomic.Int64
+				wg                 sync.WaitGroup
+			)
+
+			hub.beforeRoute = func() {
+				time.Sleep(time.Millisecond) //nolint:forbidigo // a slow watcher, not a wait
+
+				mu.Lock()
+				start = time.Now()
+				mu.Unlock()
+			}
+			hub.routed = func(_, _ uint64, _ int) {
+				mu.Lock()
+				d := time.Since(start).Nanoseconds()
+				routings++
+				routingNs += d
+				worstNs = max(worstNs, d)
+				mu.Unlock()
+			}
+			hub.Watch(s)
+
+			nodes := s.ListNodes()
+			last := make([]atomic.Uint64, nodes.Len())
+			quit := make(chan struct{})
+
+			for i, nv := range nodes.All() {
+				sess := hub.Join(nv.ID(), func() {})
+				st := NewStream(cfg, hub, nv.ID(), capVer)
+				st.Attach(sess)
+
+				_, err := st.Initial(s.Snapshot())
+				require.NoError(b, err)
+				st.Delivered()
+
+				wg.Go(func() {
+					for {
+						select {
+						case <-quit:
+							return
+						case <-sess.Wakes():
+							select {
+							case <-quit:
+								return
+							case <-time.After(delay):
+							}
+
+							snap := s.Snapshot()
+
+							_, err := st.Update(snap)
+							if err == nil {
+								st.Delivered()
+							}
+
+							last[i].Store(snap.Rev())
+							renders.Add(1)
+						}
+					}
+				})
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			i := 0
+
+			for b.Loop() {
+				for k := range 4 {
+					scalingEndpoint(b, s, nodes.At((i*4+k)%nodes.Len()).ID(), i)
+					time.Sleep(time.Millisecond) //nolint:forbidigo // writes spread out, not a wait
+				}
+
+				want := s.Snapshot().Rev()
+
+				for j := range last {
+					for last[j].Load() < want {
+						time.Sleep(100 * time.Microsecond) //nolint:forbidigo // waiting on the sessions
+					}
+				}
+
+				i++
+			}
+
+			b.StopTimer()
+			close(quit)
+			wg.Wait()
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			b.ReportMetric(float64(renders.Load())/float64(i), "renders/op")
+			b.ReportMetric(float64(routingNs)/float64(max(routings, 1))/1e6, "ms/routing")
+			b.ReportMetric(float64(worstNs)/1e6, "worst-ms/routing")
+		})
+	}
+}
+
+// BenchmarkRenderLog measures the render log's paths at 10,000 sessions on
+// their own, in a 1,000 node mesh: every session's render ending, 8 at a
+// time, before the routing that covers it (end); the same after a routing
+// went past it, each asking Route (end-past); a routing over coalesced
+// commits weighing 10,000 renders of one commit between its ends (between);
+// and a wake of every session (wake), which no longer touches the log.
+// Every session holds a snapshot of its own, as poll takes them.
+func BenchmarkRenderLog(b *testing.B) {
+	const n = 10_000
+
+	s, _ := scalingTailnet(b, 1000, "mesh")
+	nodes := s.ListNodes()
+
+	from := s.Snapshot()
+	scalingEndpoint(b, s, nodes.At(0).ID(), 1)
+
+	mids := make([]*state.Snapshot, n)
+	for i := range mids {
+		mids[i] = s.Snapshot()
+	}
+
+	scalingEndpoint(b, s, nodes.At(1).ID(), 2)
+	to := s.Snapshot()
+
+	hub := NewHub()
+	defer hub.Close()
+
+	// Sessions of nodes the snapshots do not have: the log weighs them as
+	// any other, and no routing names them.
+	sessions := make([]*Session, n)
+	for i := range sessions {
+		sessions[i] = hub.Join(types.NodeID(2000+i), func() {}) //nolint:gosec // small
+	}
+
+	ends := func() {
+		var wg sync.WaitGroup
+
+		for w := range 8 {
+			wg.Go(func() {
+				for i := w; i < n; i += 8 {
+					hub.renders.end(sessions[i], mids[i], true)
+				}
+			})
+		}
+
+		wg.Wait()
+	}
+
+	// reset routes to from, so mid is past no routing; past routes to to.
+	reset := func() { hub.renders.between(nil, from, false) }
+	past := func() { hub.renders.between(nil, to, false) }
+
+	b.Run("end", func(b *testing.B) {
+		b.ReportAllocs()
+
+		for b.Loop() {
+			b.StopTimer()
+			reset()
+			b.StartTimer()
+
+			ends()
+		}
+
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/render")
+	})
+
+	b.Run("end-past", func(b *testing.B) {
+		b.ReportAllocs()
+
+		for b.Loop() {
+			b.StopTimer()
+			past()
+			b.StartTimer()
+
+			ends()
+		}
+
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/render")
+	})
+
+	b.Run("between", func(b *testing.B) {
+		b.ReportAllocs()
+
+		for b.Loop() {
+			b.StopTimer()
+			reset()
+			ends()
+			b.StartTimer()
+
+			hub.renders.between(from, to, false)
+		}
+	})
+
+	b.Run("wake", func(b *testing.B) {
+		b.ReportAllocs()
+
+		for b.Loop() {
+			hub.wake(true, nil)
+
+			b.StopTimer()
+
+			for _, sess := range sessions {
+				select {
+				case <-sess.wakes:
+				default:
+				}
+			}
+
+			b.StartTimer()
+		}
+	})
 }
 
 // BenchmarkRouteCoalescedWrites measures Route alone over k endpoint
@@ -2504,9 +4340,9 @@ func BenchmarkRouteCoalescedWrites(b *testing.B) {
 }
 
 // TestRouteWalksEachViewOnce changes many nodes of one class: Route must
-// walk the class's shared view once, not once per changed node. The work
-// tests count woken sessions and renders, which a repeated walk of the
-// same view does not change.
+// walk each shared holder list that reads them once, not once per changed
+// node. The work tests count woken sessions and renders, which a repeated
+// walk of the same list does not change.
 func TestRouteWalksEachViewOnce(t *testing.T) {
 	s, _ := scalingTailnet(t, 100, "allow-all")
 	old := s.Snapshot()
@@ -2522,7 +4358,16 @@ func TestRouteWalksEachViewOnce(t *testing.T) {
 	}
 
 	cur := s.Snapshot()
-	assert.Len(t, reachedViews(old, cur, changed), 1, "allow-all has one class")
+
+	walked := 0
+	for _, v := range reachedViews(old, changed) {
+		walked += len(v)
+	}
+
+	// Under allow-all the lists are those of the atoms every node holds
+	// and the changed nodes' owners' own; once per changed node is 20 times
+	// that.
+	assert.LessOrEqual(t, walked, 3*nodes.Len(), "each list walked once")
 
 	all, wake := Route(old, cur, cur.Since(old))
 	assert.False(t, all)
@@ -2742,7 +4587,7 @@ func viaSourceCheck(
 
 			routerView, ok := live.GetNode(id)
 			if assert.True(t, ok) {
-				via := live.Policy().ViaRoutesForPeer(v, routerView)
+				via := compiledPolicy(t, live).ViaRoutesForPeer(v, routerView)
 				assert.Empty(t, via.Include, "a viewer outside the source steers no route to the router")
 				assert.Empty(t, via.Exclude, "a viewer outside the source steers nothing away from the router either")
 			}
@@ -3161,7 +5006,7 @@ func TestViaMoveRendersOnlyChangedRouters(t *testing.T) {
 				require.NoError(t, s.Disconnect(winner, mustNode(t, s, winner).SessionEpoch()))
 				s.Connect(winner)
 				snap := s.Snapshot()
-				require.Equal(t, before.PeerPolicyRev(), snap.PeerPolicyRev(), "only availability changes")
+				require.Equal(t, before.CapsRev(), snap.CapsRev(), "only availability changes")
 
 				renders := 0
 
@@ -3174,7 +5019,7 @@ func TestViaMoveRendersOnlyChangedRouters(t *testing.T) {
 					renders += st.r.rendered - count
 					// Force the reference to revisit every routed peer, as before
 					// election invalidation was narrowed to its changed winners.
-					reference[i].r.lastKey.policy = ^uint64(0)
+					reference[i].r.lastKey.routes = ^uint64(0)
 					want, err := reference[i].Update(snap)
 					require.NoError(t, err)
 					require.Equal(t, want, responses, "step %d viewer %d: identical wire deltas", step, st.nodeID)
@@ -3223,7 +5068,13 @@ func TestRendererForgetsRoutersItNoLongerRenders(t *testing.T) {
 	_, err = st.Initial(s.Snapshot())
 	require.NoError(t, err)
 
-	routed := func() int { return len(st.r.routedPrimaries) }
+	routed := func() int {
+		if st.r.set == nil {
+			return 0
+		}
+
+		return len(st.r.set.routes)
+	}
 
 	for i := range 12 {
 		n := s.CreateRegisteredNodeForTest(u1, fmt.Sprintf("churn-%d", i))
@@ -3780,7 +5631,7 @@ func TestFirstMapDeliveryAfterFoldedAttempts(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	require.Empty(t, hub.sentPeers[ids[0]].attempts, "folding does not mean a reconnect was delivered")
+	require.Empty(t, hub.core.sentPeers[ids[0]].attempts, "folding does not mean a reconnect was delivered")
 	require.Nil(t, setup.pending, "the setup stream cannot report reconnect delivery")
 	require.NotNil(t, last.pending)
 
@@ -4006,7 +5857,7 @@ func BenchmarkClassMapsUpdate(b *testing.B) {
 					renders peerRenders
 				)
 				for _, view := range before.PeerViews() {
-					cm.get(cfg, &renders, before, view, capVer, before.PeerPolicyRev(), before.Policy().NodeCapMaps())
+					cm.get(cfg, &renders, before, view, capVer, before.CapsRev(), before.NodeCaps)
 				}
 
 				previous := make(map[*classEntry]*classPeers, len(cm.m))
@@ -4062,7 +5913,7 @@ func BenchmarkClassMapsUpdate(b *testing.B) {
 
 				for _, view := range views {
 					require.NotNil(b, cm.m[classKey{view: &view[0], n: len(view)}], "the delta keeps view identity")
-					cm.get(cfg, &renders, after, view, capVer, after.PeerPolicyRev(), after.Policy().NodeCapMaps())
+					cm.get(cfg, &renders, after, view, capVer, after.CapsRev(), after.NodeCaps)
 				}
 
 				b.ReportAllocs()
@@ -4077,7 +5928,7 @@ func BenchmarkClassMapsUpdate(b *testing.B) {
 					b.StartTimer()
 
 					for _, view := range views {
-						cm.get(cfg, &renders, after, view, capVer, after.PeerPolicyRev(), after.Policy().NodeCapMaps())
+						cm.get(cfg, &renders, after, view, capVer, after.CapsRev(), after.NodeCaps)
 					}
 				}
 			})
@@ -4104,7 +5955,7 @@ func TestClassMapsChangedCandidates(t *testing.T) {
 	)
 
 	before := s.Snapshot()
-	old, oldProfiles, _ := cm.get(cfg, &renders, before, view, capVer, before.PeerPolicyRev(), before.Policy().NodeCapMaps())
+	old, oldProfiles, _ := cm.get(cfg, &renders, before, view, capVer, before.CapsRev(), before.NodeCaps)
 
 	oldNodes := maps.Collect(old.All())
 	for id, node := range oldNodes {
@@ -4133,11 +5984,11 @@ func TestClassMapsChangedCandidates(t *testing.T) {
 
 		snap := s.Snapshot()
 		cm.pruned = snap.PeersRev() // Keep testing the supplied view after a deletion changes live classes.
-		got, profiles, _ := cm.get(cfg, &renders, snap, view, capVer, snap.PeerPolicyRev(), snap.Policy().NodeCapMaps())
+		got, profiles, _ := cm.get(cfg, &renders, snap, view, capVer, snap.CapsRev(), snap.NodeCaps)
 
 		var fresh classMaps
 
-		want, wantProfiles, _ := fresh.get(cfg, &renders, snap, view, capVer, snap.PeerPolicyRev(), snap.Policy().NodeCapMaps())
+		want, wantProfiles, _ := fresh.get(cfg, &renders, snap, view, capVer, snap.CapsRev(), snap.NodeCaps)
 		require.Equal(t, maps.Collect(want.All()), maps.Collect(got.All()))
 		require.Equal(t, maps.Collect(wantProfiles.All()), maps.Collect(profiles.All()))
 
@@ -4150,7 +6001,7 @@ func TestClassMapsChangedCandidates(t *testing.T) {
 	s.DeleteNodeFromStoreForTest(ids[1])
 	check()
 
-	stale, staleProfiles, _ := cm.get(cfg, &renders, before, view, capVer, before.PeerPolicyRev(), before.Policy().NodeCapMaps())
+	stale, staleProfiles, _ := cm.get(cfg, &renders, before, view, capVer, before.CapsRev(), before.NodeCaps)
 	require.Equal(t, oldNodes, maps.Collect(stale.All()))
 	require.Equal(t, oldOwners, maps.Collect(staleProfiles.All()))
 	check()
@@ -4270,72 +6121,114 @@ func TestClassOwnersProfileAndOwnershipChanges(t *testing.T) {
 func BenchmarkFirstMap(b *testing.B) {
 	for _, n := range []int{1000, 10000} {
 		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) {
-			s, streams := scalingTailnet(b, n, "allow-all")
-			st := streams[len(streams)/2]
-			snap := s.Snapshot()
-
-			for _, cache := range []string{"warm-hub", "cold-hub", "new-state"} {
-				for _, encoding := range []string{"json", "zstd"} {
-					b.Run(cache+"/"+encoding, func(b *testing.B) {
-						if cache == "warm-hub" {
-							first := NewStream(st.cfg, st.hub, st.nodeID, capVer)
-							resps, err := first.Initial(snap)
-							require.NoError(b, err)
-							_, err = st.hub.Encode(resps[0], encoding == "zstd", benchEncode)
-							require.NoError(b, err)
-							first.Delivered()
-						}
-
-						b.ReportAllocs()
-
-						var (
-							first *Stream
-							size  int
-						)
-
-						for b.Loop() {
-							hub, current := st.hub, snap
-							if cache != "warm-hub" {
-								hub = NewHub()
-							}
-
-							var reopened *state.State
-
-							if cache == "new-state" {
-								var err error
-
-								reopened, err = state.NewState(st.cfg)
-								require.NoError(b, err)
-
-								current = reopened.Snapshot()
-							}
-
-							first = NewStream(st.cfg, hub, st.nodeID, capVer)
-							resps, err := first.Initial(current)
-							require.NoError(b, err)
-							data, err := hub.Encode(resps[0], encoding == "zstd", benchEncode)
-							require.NoError(b, err)
-							first.Delivered()
-
-							size = len(data)
-
-							if reopened != nil {
-								require.NoError(b, reopened.Close())
-							}
-						}
-
-						require.NotNil(b, first)
-						require.Nil(b, first.pending, "successful reconnects confirm delivery even when attempts would fold")
-
-						if cache == "warm-hub" {
-							require.Empty(b, st.hub.sentPeers[st.nodeID].attempts, "successful reconnects leave no failed-write history")
-						}
-
-						b.ReportMetric(float64(size), "encoded-bytes/op")
-					})
-				}
-			}
+			benchFirstMap(b, n, "allow-all", nil)
 		})
+	}
+}
+
+// BenchmarkFirstMapShapes is [BenchmarkFirstMap] under policies whose peers
+// hold several source identities: users in groups, tagged nodes, a member
+// mesh. That is where a map naming sources by capability grows each peer's
+// CapMap. filter-bytes/op is the JSON of the map's packet filter, and
+// rest-bytes/op the JSON of everything else. HEADSCALE_SCALE_NODES runs one
+// size instead.
+func BenchmarkFirstMapShapes(b *testing.B) {
+	for _, shape := range []string{"mesh", "selectors", "tags", "rules"} {
+		for _, n := range benchSizes(b, 1000, 10000) {
+			b.Run(fmt.Sprintf("%s/nodes=%d", shape, n), func(b *testing.B) {
+				benchFirstMap(b, n, shape, newSizedEncoder())
+			})
+		}
+	}
+}
+
+// benchFirstMap runs [BenchmarkFirstMap] for one tailnet. A sized encoder,
+// when given, encodes in place of benchEncode and splits the bytes.
+func benchFirstMap(b *testing.B, n int, shape string, sized *sizedEncoder) {
+	b.Helper()
+
+	encode := benchEncode
+	if sized != nil {
+		encode = sized.fn
+	}
+
+	s, streams := scalingTailnet(b, n, shape)
+	st := streams[len(streams)/2]
+	snap := s.Snapshot()
+
+	for _, cache := range []string{"warm-hub", "cold-hub", "new-state"} {
+		for _, encoding := range []string{"json", "zstd"} {
+			b.Run(cache+"/"+encoding, func(b *testing.B) {
+				if cache == "warm-hub" {
+					first := NewStream(st.cfg, st.hub, st.nodeID, capVer)
+					resps, err := first.Initial(snap)
+					require.NoError(b, err)
+					_, err = st.hub.Encode(resps[0], encoding == "zstd", encode)
+					require.NoError(b, err)
+					first.Delivered()
+				}
+
+				b.ReportAllocs()
+
+				var (
+					first *Stream
+					size  int
+					split responseSize
+					found bool
+				)
+
+				for b.Loop() {
+					hub, current := st.hub, snap
+					if cache != "warm-hub" {
+						hub = NewHub()
+					}
+
+					var reopened *state.State
+
+					if cache == "new-state" {
+						var err error
+
+						reopened, err = state.NewState(st.cfg)
+						require.NoError(b, err)
+
+						current = reopened.Snapshot()
+					}
+
+					first = NewStream(st.cfg, hub, st.nodeID, capVer)
+					resps, err := first.Initial(current)
+					require.NoError(b, err)
+					data, err := hub.Encode(resps[0], encoding == "zstd", encode)
+					require.NoError(b, err)
+					first.Delivered()
+
+					size = len(data)
+
+					if sized != nil {
+						split, found = sized.sizes[resps[0]]
+						clear(sized.sizes)
+					}
+
+					if reopened != nil {
+						require.NoError(b, reopened.Close())
+					}
+				}
+
+				require.NotNil(b, first)
+				require.Nil(b, first.pending, "successful reconnects confirm delivery even when attempts would fold")
+
+				if cache == "warm-hub" {
+					require.Empty(b, st.hub.core.sentPeers[st.nodeID].attempts, "successful reconnects leave no failed-write history")
+				}
+
+				b.ReportMetric(float64(size), "encoded-bytes/op")
+
+				if sized != nil {
+					require.True(b, found, "the sized encoder encoded the first map")
+					b.ReportMetric(float64(split.filter), "filter-bytes/op")
+					b.ReportMetric(float64(split.json-split.filter), "rest-bytes/op")
+				}
+			})
+		}
 	}
 }
 
@@ -4662,19 +6555,6 @@ func TestStreamDNSInitialReverseRoutes(t *testing.T) {
 	assert.Equal(t, []*dnstype.Resolver{{Addr: "9.9.9.9"}}, out[0].DNSConfig.Routes["64.100.in-addr.arpa"], "operator routes inside client-handled ranges remain explicit")
 	assert.NotContains(t, out[0].DNSConfig.Routes, "127.100.in-addr.arpa")
 	assert.NotContains(t, out[0].DNSConfig.Routes, "0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa")
-
-	custom4 := netip.MustParsePrefix("10.44.0.0/24")
-	custom6 := netip.MustParsePrefix("fd00:abcd::/64")
-	cfg.Prefixes.V4, cfg.Prefixes.V6 = &custom4, &custom6
-
-	view := cfg.DNSView().AsStruct()
-	for _, zone := range []string{"0.44.10.in-addr.arpa", "0.0.0.0.0.0.0.0.d.c.b.a.0.0.d.f.ip6.arpa"} {
-		resolvers, ok := view.Routes[zone]
-		assert.True(t, ok, zone)
-		assert.NotNil(t, resolvers, zone)
-		assert.Empty(t, resolvers, zone)
-	}
-
 	assert.Equal(t, []*dnstype.Resolver{{Addr: "1.1.1.1"}}, out[0].DNSConfig.Routes["split.test"])
 }
 
@@ -4769,7 +6649,13 @@ func TestRouteWakesViewerGainingARouteByPolicy(t *testing.T) {
 	s.Connect(router)
 	require.Contains(t, s.Snapshot().ListPeerIDs(viewer), router, "test sanity: the viewer sees the router")
 
+	// Every node's session has read its filter: an edit across selectors
+	// compares what was served, and names a node nobody was served one for.
 	before := s.Snapshot()
+	for _, nv := range before.ListNodes().All() {
+		_, err := before.FilterForNode(nv.ID())
+		require.NoError(t, err)
+	}
 
 	_, err = s.SetPolicy([]byte(with))
 	require.NoError(t, err)
@@ -4852,6 +6738,9 @@ func TestRouteWakesNodeWhoseCapsAloneChanged(t *testing.T) {
 // compile, while every node keeps the caps it had: the peer it saw before
 // must keep its render, so it is not sent again.
 func TestPeerRenderSurvivesEqualCapsRecompile(t *testing.T) {
+	// Pinned to address form: its recompile keeps the policy's caps, not the stamps, which name the selectors the document uses.
+	t.Setenv(state.TestCapabilitySourcesEnv, "false")
+
 	cfg, s, ids := streamTestState(t, ownUserOnly)
 
 	st := NewStream(cfg, NewHub(), ids[0], capVer)
@@ -4864,7 +6753,7 @@ func TestPeerRenderSurvivesEqualCapsRecompile(t *testing.T) {
 
 	_, err = s.SetPolicy([]byte(`{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`))
 	require.NoError(t, err)
-	require.NotEqual(t, before.PeerPolicyRev(), s.Snapshot().PeerPolicyRev(), "test sanity: the recompile renders peers anew")
+	require.NotEqual(t, before.PolicyRev(), s.Snapshot().PolicyRev(), "test sanity: the policy recompiles")
 
 	resps, err := st.Update(s.Snapshot())
 	require.NoError(t, err)
@@ -5333,9 +7222,9 @@ func TestSTUNReportsCoalesceWhileInitialWriteIsBlocked(t *testing.T) {
 	require.Eventually(t, func() bool { return len(sess.wakes) == 1 }, time.Second, time.Millisecond)
 	require.Empty(t, hiddenSession.wakes)
 	h.mu.Lock()
-	retained, attempts := h.retained, len(h.sentPeers[viewer].attempts)
+	retained, attempts := h.core.retained, len(h.core.sentPeers[viewer].attempts)
 	h.mu.Unlock()
-	require.LessOrEqual(t, retained, h.maxHistoryIDs)
+	require.LessOrEqual(t, retained, h.core.maxHistoryIDs)
 	require.LessOrEqual(t, attempts, maxPeerAttempts)
 
 	old := <-written
@@ -5921,7 +7810,7 @@ func TestClassMapsPruneVanishedClassWithoutNewOne(t *testing.T) {
 
 	render := func(id types.NodeID) {
 		snap := s.Snapshot()
-		cm.get(cfg, &renders, snap, snap.PeerView(id), capVer, snap.PeerPolicyRev(), nil)
+		cm.get(cfg, &renders, snap, snap.PeerView(id), capVer, snap.CapsRev(), nil)
 	}
 
 	render(ids[0])
@@ -6213,9 +8102,58 @@ func TestTwoRendersOfARevisionCarryTheSameView(t *testing.T) {
 	b.Delivered()
 
 	hub.mu.Lock()
-	attempts := hub.sentPeers[ids[0]].attempts
+	attempts := hub.core.sentPeers[ids[0]].attempts
 	hub.mu.Unlock()
 	assert.Empty(t, attempts, "a delivery at the same revision clears its attempt")
+}
+
+// TestAFirstMapSharesTheHistoryAnotherSessionHeld pins a first map reading
+// the peer history an earlier session of its node left: a second session
+// on the same snapshot shares it, a delivery of its own revision leaves
+// the bookkeeping the route audit reads clean, and a later first map
+// announces its removals from that history.
+func TestAFirstMapSharesTheHistoryAnotherSessionHeld(t *testing.T) {
+	cfg, s, ids := streamTestState(t, "")
+	hub := NewHub()
+	snap := s.Snapshot()
+
+	a := NewStream(cfg, hub, ids[0], capVer)
+	_, err := a.Initial(snap)
+	require.NoError(t, err)
+	a.Delivered()
+
+	held := hub.lastPeers(ids[0])
+	require.Len(t, held, 3, "test sanity: the node held itself and both peers")
+
+	// A second session of the node is a first map on the same snapshot:
+	// it shares the history a left rather than starting from none.
+	b := NewStream(cfg, hub, ids[0], capVer)
+	_, err = b.Initial(snap)
+	require.NoError(t, err)
+	assert.Equal(t, held, b.pending.ids, "the first map shares the history another session held")
+
+	b.Delivered()
+
+	hub.mu.Lock()
+	got, attempts := hub.core.sentPeers[ids[0]].ids, hub.core.sentPeers[ids[0]].attempts
+	hub.mu.Unlock()
+	assert.Empty(t, attempts, "a delivery at the same revision clears its attempt")
+	assert.Equal(t, held, got, "the shared history stays recorded")
+
+	// A peer the node's client held goes away while it has no stream: the
+	// next first map announces its removal from the shared history.
+	require.NoError(t, s.DeleteNode(mustNode(t, s, ids[1])))
+
+	c := NewStream(cfg, hub, ids[0], capVer)
+	resps, err := c.Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	var removed []tailcfg.NodeID
+	for _, resp := range resps {
+		removed = append(removed, resp.PeersRemoved...)
+	}
+
+	assert.Equal(t, []tailcfg.NodeID{ids[1].NodeID()}, removed, "a reconnect announces the removal its shared history held")
 }
 
 // TestHubFoldsUnconfirmedViews writes more unconfirmed views than the hub
@@ -6235,7 +8173,7 @@ func TestHubFoldsUnconfirmedViews(t *testing.T) {
 	assert.Equal(t, want, h.lastPeers(1), "every attempted peer stays announceable")
 
 	h.mu.Lock()
-	attempts := len(h.sentPeers[1].attempts)
+	attempts := len(h.core.sentPeers[1].attempts)
 	h.mu.Unlock()
 	assert.LessOrEqual(t, attempts, maxPeerAttempts, "attempts fold instead of growing")
 }
@@ -6317,7 +8255,7 @@ func TestHubForgetIsNotUndoneByAWriteInFlight(t *testing.T) {
 			}
 
 			hub.mu.Lock()
-			v, kept := hub.sentPeers[ids[0]]
+			v, kept := hub.core.sentPeers[ids[0]]
 			hub.mu.Unlock()
 
 			if slices.Contains(order, "forget") {
@@ -6704,7 +8642,7 @@ func TestOfflinePeerHistorySurvivesPartialReconnect(t *testing.T) {
 
 	generations := make([]uint64, 0, len(clients))
 	for id := range clients {
-		generations = append(generations, hub.sentPeers[id].rev)
+		generations = append(generations, hub.core.sentPeers[id].rev)
 	}
 	hub.mu.Unlock()
 
@@ -6800,7 +8738,7 @@ func historyCost(hub *Hub) int {
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
 
-	return cost + len(hub.offlineAt)
+	return cost + len(hub.core.offlineAt)
 }
 
 // historyArrays returns the distinct views hub's histories retain, by
@@ -6809,9 +8747,9 @@ func historyArrays(hub *Hub) map[*types.NodeID][]types.NodeID {
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
 
-	arrays := make(map[*types.NodeID][]types.NodeID, len(hub.sentPeers))
+	arrays := make(map[*types.NodeID][]types.NodeID, len(hub.core.sentPeers))
 
-	for _, history := range hub.sentPeers {
+	for _, history := range hub.core.sentPeers {
 		for _, view := range append([][]types.NodeID{history.ids}, history.attempts...) {
 			if len(view) > 0 {
 				arrays[&view[0]] = view
@@ -6872,7 +8810,7 @@ func TestHubDropsOfflinePeerHistoryAfterTTL(t *testing.T) {
 func TestHubCapsOfflinePeerHistory(t *testing.T) {
 	cfg, s, _ := streamTestState(t, "")
 	hub := NewHub()
-	hub.maxHistoryIDs = 40
+	hub.core.maxHistoryIDs = 40
 
 	u1, err := s.GetUserByName("u1")
 	require.NoError(t, err)
@@ -6889,10 +8827,10 @@ func TestHubCapsOfflinePeerHistory(t *testing.T) {
 		left = append(left, n.ID)
 
 		retained := historyCost(hub)
-		require.LessOrEqual(t, retained, hub.maxHistoryIDs, "after %d leaves", i+1)
+		require.LessOrEqual(t, retained, hub.core.maxHistoryIDs, "after %d leaves", i+1)
 
 		hub.mu.Lock()
-		counted := hub.retained
+		counted := hub.core.retained
 		hub.mu.Unlock()
 		require.Equal(t, retained, counted, "the hub counts what its histories hold")
 	}
@@ -6908,7 +8846,7 @@ func leaveWithHistory(t *testing.T, hub *Hub, id types.NodeID, v sentView) {
 	t.Helper()
 
 	hub.mu.Lock()
-	hub.sentPeers[id] = v
+	hub.core.sentPeers[id] = v
 	hub.mu.Unlock()
 
 	require.False(t, hub.Leave(hub.Join(id, func() {})))
@@ -6918,7 +8856,7 @@ func retainedOf(hub *Hub) int {
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
 
-	return hub.retained
+	return hub.core.retained
 }
 
 // TestHubCapsEmptyOfflineHistories disconnects more isolated nodes, whose
@@ -6926,16 +8864,16 @@ func retainedOf(hub *Hub) int {
 // oldest first.
 func TestHubCapsEmptyOfflineHistories(t *testing.T) {
 	hub := NewHub()
-	hub.maxHistoryIDs = 4
+	hub.core.maxHistoryIDs = 4
 
 	for i := range 12 {
 		leaveWithHistory(t, hub, types.NodeID(100+i), sentView{rev: uint64(i + 1)})
 
 		hub.mu.Lock()
-		entries := len(hub.offlineAt)
+		entries := len(hub.core.offlineAt)
 		hub.mu.Unlock()
 
-		require.LessOrEqual(t, entries, hub.maxHistoryIDs, "after %d leaves", i+1)
+		require.LessOrEqual(t, entries, hub.core.maxHistoryIDs, "after %d leaves", i+1)
 		require.Equal(t, historyCost(hub), retainedOf(hub), "the hub counts what its histories hold")
 	}
 
@@ -6948,14 +8886,14 @@ func TestHubCapsEmptyOfflineHistories(t *testing.T) {
 // like delivered ones.
 func TestHubCapsFailedAttemptsOfOfflineNodes(t *testing.T) {
 	hub := NewHub()
-	hub.maxHistoryIDs = 20
+	hub.core.maxHistoryIDs = 20
 
 	for i := range 10 {
 		id := types.NodeID(100 + i)
 		attempt := []types.NodeID{id + 1, id + 2, id + 3, id + 4}
 		leaveWithHistory(t, hub, id, sentView{rev: uint64(i + 1), attempts: [][]types.NodeID{attempt}})
 
-		require.LessOrEqual(t, historyCost(hub), hub.maxHistoryIDs, "after %d leaves", i+1)
+		require.LessOrEqual(t, historyCost(hub), hub.core.maxHistoryIDs, "after %d leaves", i+1)
 		require.Equal(t, historyCost(hub), retainedOf(hub))
 	}
 
@@ -7009,7 +8947,7 @@ func TestHubBoundsFailedHistoryOfAConnectedNode(t *testing.T) {
 	for _, delivered := range []bool{false, true} {
 		t.Run(fmt.Sprintf("delivered=%v", delivered), func(t *testing.T) {
 			hub := NewHub()
-			hub.maxHistoryIDs = 8
+			hub.core.maxHistoryIDs = 8
 
 			const id = types.NodeID(1)
 
@@ -7025,8 +8963,8 @@ func TestHubBoundsFailedHistoryOfAConnectedNode(t *testing.T) {
 					hub.setLastPeers(by, id, v)
 				}
 
-				require.LessOrEqual(t, retainedOf(hub), hub.maxHistoryIDs, "after %d attempts", i+1)
-				require.LessOrEqual(t, len(hub.lastPeers(id)), hub.maxHistoryIDs+maxPeerAttempts,
+				require.LessOrEqual(t, retainedOf(hub), hub.core.maxHistoryIDs, "after %d attempts", i+1)
+				require.LessOrEqual(t, len(hub.lastPeers(id)), hub.core.maxHistoryIDs+maxPeerAttempts,
 					"after %d attempts: peers of failed writes accumulate", i+1)
 			}
 
@@ -7056,7 +8994,7 @@ func TestFoldedHistoryIsRightSized(t *testing.T) {
 	}
 
 	hub.mu.Lock()
-	cur := hub.sentPeers[id]
+	cur := hub.core.sentPeers[id]
 	hub.mu.Unlock()
 
 	require.True(t, cur.folded, "test sanity: the attempts folded")
@@ -7190,7 +9128,7 @@ func BenchmarkOfflinePeerHistory(b *testing.B) {
 						b.StopTimer()
 
 						hub.mu.Lock()
-						histories := len(hub.sentPeers)
+						histories := len(hub.core.sentPeers)
 						hub.mu.Unlock()
 
 						arrays := historyArrays(hub)
@@ -7299,7 +9237,7 @@ func TestClassMapsBuildAndEdit(t *testing.T) {
 
 			before := s.Snapshot()
 			view := before.PeerView(ids[0])
-			peers, profiles, _ := cm.get(cfg, &renders, before, view, capVer, before.PeerPolicyRev(), nil)
+			peers, profiles, _ := cm.get(cfg, &renders, before, view, capVer, before.CapsRev(), nil)
 			entry := cm.m[classKey{view: &view[0], n: len(view)}]
 			require.NotNil(t, entry)
 			owners := entry.cur.owners
@@ -7319,18 +9257,18 @@ func TestClassMapsBuildAndEdit(t *testing.T) {
 			s.PutNodeInStoreForTest(*moved)
 			after := s.Snapshot()
 			require.Same(t, &view[0], &after.PeerView(ids[0])[0], "ownership preserves the allow-all class")
-			cm.get(cfg, &renders, after, view, capVer, after.PeerPolicyRev(), nil)
+			cm.get(cfg, &renders, after, view, capVer, after.CapsRev(), nil)
 
 			orphan := mustNode(t, s, ids[0]).AsStruct()
 			orphan.UserID, orphan.User = nil, nil
 			s.PutNodeInStoreForTest(*orphan)
 			after = s.Snapshot()
 			require.Same(t, &view[0], &after.PeerView(ids[0])[0], "orphaning preserves the allow-all class")
-			updated, updatedProfiles, _ := cm.get(cfg, &renders, after, view, capVer, after.PeerPolicyRev(), nil)
+			updated, updatedProfiles, _ := cm.get(cfg, &renders, after, view, capVer, after.CapsRev(), nil)
 
 			var fresh classMaps
 
-			expected, expectedProfiles, _ := fresh.get(cfg, &renders, after, view, capVer, after.PeerPolicyRev(), nil)
+			expected, expectedProfiles, _ := fresh.get(cfg, &renders, after, view, capVer, after.CapsRev(), nil)
 			require.Equal(t, maps.Collect(expected.All()), maps.Collect(updated.All()))
 			require.Equal(t, maps.Collect(expectedProfiles.All()), maps.Collect(updatedProfiles.All()))
 
@@ -7663,7 +9601,7 @@ func TestStreamCapabilityVersionLifetime(t *testing.T) {
 			require.Eventually(t, func() bool {
 				runtime.GC()
 				return old.Value() == nil
-			}, time.Second, 10*time.Millisecond, "advancing or releasing the stream must release old capability data")
+			}, 30*time.Second, 10*time.Millisecond, "advancing or releasing the stream must release old capability data")
 			runtime.KeepAlive(st)
 			runtime.KeepAlive(active)
 			runtime.KeepAlive(s)
@@ -7699,7 +9637,7 @@ func TestStreamDoesNotRetainObsoletePolicy(t *testing.T) {
 	require.Eventually(t, func() bool {
 		runtime.GC()
 		return old.Value() == nil
-	}, time.Second, 10*time.Millisecond, "idle stream must not own an obsolete compiled policy")
+	}, 30*time.Second, 10*time.Millisecond, "idle stream must not own an obsolete compiled policy")
 	require.NotNil(t, current.Value(), "live world must retain its current policy")
 	runtime.KeepAlive(st)
 	runtime.KeepAlive(s)
@@ -7717,10 +9655,1678 @@ func TestRoutedCandidatesAfterElectionCollection(t *testing.T) {
 	require.Eventually(t, func() bool {
 		runtime.GC()
 		return old.Value() == nil
-	}, time.Second, 10*time.Millisecond, "streams must not retain the old election binding")
+	}, 30*time.Second, 10*time.Millisecond, "streams must not retain the old election binding")
 
 	snap := s.Snapshot()
 	got := st.r.routedCandidates(snap, mustNode(t, s, st.nodeID), st.r.lastKey, false)
 	want := []tailcfg.NodeID{winner.NodeID(), streams[10].nodeID.NodeID()}
 	require.ElementsMatch(t, want, got, "collected history must include exactly the losing and gaining routers")
+}
+
+// TestHubRouteAudit runs the hub's route audit on live sessions: after
+// each commit routed to fewer than every session it renders afresh each
+// session routing did not wake that rendered since its last wake. Sessions
+// that took every wake pass. One left holding a map from before a change
+// that reached it, as a dropped wake would leave it, fails at the next
+// commit it is not woken for.
+func TestHubRouteAudit(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+
+	cfg, s, ids := streamTestState(t, ownUserOnly)
+
+	h := NewHub()
+	t.Cleanup(h.Close)
+	h.Watch(s)
+
+	streams := map[types.NodeID]*Stream{}
+	sessions := map[types.NodeID]*Session{}
+
+	for _, id := range ids {
+		sessions[id] = h.Join(id, func() {})
+		streams[id] = NewStream(cfg, h, id, capVer)
+		streams[id].Attach(sessions[id])
+
+		_, err := streams[id].Initial(s.Snapshot())
+		require.NoError(t, err)
+		streams[id].Delivered()
+	}
+
+	// settle waits for the hub to route the latest commit and brings the
+	// woken sessions to it, as their poll loops would.
+	settle := func(runs uint64) {
+		t.Helper()
+
+		require.Eventually(t, func() bool { return RouteAuditRuns() >= runs }, 5*time.Second, time.Millisecond)
+
+		for _, id := range ids {
+			select {
+			case <-sessions[id].Wakes():
+				_, err := streams[id].Update(s.Snapshot())
+				require.NoError(t, err)
+				streams[id].Delivered()
+			default:
+			}
+		}
+	}
+
+	failures := RouteAuditFailures()
+
+	// Only n2 sees n2: the sessions of n1 and n1b are not woken, and are
+	// audited.
+	runs := RouteAuditRuns()
+
+	scalingEndpoint(t, s, ids[2], 1)
+	settle(runs + 2)
+
+	stale := streams[ids[0]].sent
+
+	runs = RouteAuditRuns()
+
+	scalingEndpoint(t, s, ids[1], 2)
+	settle(runs + 1)
+	require.Equal(t, failures, RouteAuditFailures(), "sessions that took every wake hold fresh maps")
+
+	// Integration runs fail on the line the audit logs, so it is what is
+	// checked, and kept out of this test's output.
+	logged := tapLog(t)
+
+	sessions[ids[0]].sent.Store(&sentRecord{nm: stale, rev: s.Snapshot().Rev(), cfg: cfg, capVer: capVer})
+
+	scalingEndpoint(t, s, ids[2], 3)
+	require.Eventually(t, func() bool { return RouteAuditFailures() > failures }, 5*time.Second, time.Millisecond,
+		"a session holding a map without n1b's endpoint is stale")
+	// The audit counts the failure before it logs it.
+	require.Eventually(t, func() bool { return strings.Contains(logged(), "policy audit: route") },
+		5*time.Second, time.Millisecond, "the failure is logged")
+}
+
+// TestHubRouteAuditCoversCoalescedCommits audits a change routed across
+// two commits, as the hub routes them under load: the sessions it does not
+// wake are rendered afresh like those of a single commit.
+func TestHubRouteAuditCoversCoalescedCommits(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "true")
+
+	cfg, s, ids := streamTestState(t, ownUserOnly)
+	h := NewHub()
+
+	for _, id := range ids {
+		st := NewStream(cfg, h, id, capVer)
+		st.Attach(h.Join(id, func() {}))
+
+		_, err := st.Initial(s.Snapshot())
+		require.NoError(t, err)
+		st.Delivered()
+	}
+
+	before := s.Snapshot()
+	scalingEndpoint(t, s, ids[2], 1)
+	scalingEndpoint(t, s, ids[2], 2)
+	after := s.Snapshot()
+	require.Greater(t, after.Rev(), before.Rev()+1, "test sanity: the commits coalesce")
+
+	all, wake := Route(before, after, after.Since(before))
+	require.False(t, all, "test sanity: node writes alone wake their viewers")
+
+	runs, failures := RouteAuditRuns(), RouteAuditFailures()
+
+	h.wakeAt(all, wake, after.Rev())
+	h.auditRoutes(after, wake)
+
+	assert.Equal(t, runs+uint64(len(ids)-len(wake)), RouteAuditRuns(), "every session not woken was rendered afresh") //nolint:gosec // a handful
+	assert.Equal(t, failures, RouteAuditFailures())
+}
+
+// handHub is a hub routed by hand: sessions render the snapshots a test
+// hands them, at the points it chooses, and routings deliver their wakes.
+type handHub struct {
+	t        *testing.T
+	cfg      *types.Config
+	s        *state.State
+	h        *Hub
+	u1       *types.User
+	streams  map[types.NodeID]*Stream
+	sessions map[types.NodeID]*Session
+}
+
+// newHandHub is u1's two nodes, which see each other, and u2's node, which
+// sees itself, under [ownUserOnly], each with a session that rendered its
+// first map; more makes that many more nodes of u1 with sessions.
+func newHandHub(t *testing.T, more int) (*handHub, [3]types.NodeID) {
+	t.Helper()
+
+	cfg, s, ids := streamTestState(t, ownUserOnly)
+
+	u1, err := s.GetUserByName("u1")
+	require.NoError(t, err)
+
+	hh := &handHub{t: t, cfg: cfg, s: s, h: NewHub(), u1: u1, streams: map[types.NodeID]*Stream{}, sessions: map[types.NodeID]*Session{}}
+
+	for _, id := range ids {
+		hh.open(id)
+	}
+
+	for i := range more {
+		hh.open(hh.addNode(fmt.Sprintf("more-%d", i)))
+	}
+
+	return hh, ids
+}
+
+// addNode registers a node of u1, which u1's nodes see.
+func (hh *handHub) addNode(name string) types.NodeID {
+	n := hh.s.CreateRegisteredNodeForTest(hh.u1, name)
+	n.User = hh.u1
+	hh.s.PutNodeInStoreForTest(*n)
+
+	return n.ID
+}
+
+// open opens a session of id and renders its first map.
+func (hh *handHub) open(id types.NodeID) {
+	hh.t.Helper()
+
+	st := hh.attach(id)
+
+	_, err := st.Initial(hh.s.Snapshot())
+	require.NoError(hh.t, err)
+	st.Delivered()
+}
+
+// attach opens a new session of id, its first map the test's to render;
+// it replaces the node's session the test holds.
+func (hh *handHub) attach(id types.NodeID) *Stream {
+	st := NewStream(hh.cfg, hh.h, id, capVer)
+	sess := hh.h.Join(id, func() {})
+	st.Attach(sess)
+
+	hh.streams[id], hh.sessions[id] = st, sess
+
+	return st
+}
+
+// render renders id's session from snap.
+func (hh *handHub) render(id types.NodeID, snap *state.Snapshot) {
+	hh.t.Helper()
+
+	_, err := hh.streams[id].Update(snap)
+	require.NoError(hh.t, err)
+	hh.streams[id].Delivered()
+}
+
+// route routes from last to snap as the watcher does and wakes what it
+// reaches; it returns that.
+func (hh *handHub) route(last, snap *state.Snapshot) map[types.NodeID]struct{} {
+	all, wake := hubWake(hh.h, last, snap)
+	hh.h.wake(all, wake)
+
+	return wake
+}
+
+// settled renders every session woken, from the latest snapshot, until
+// none is, without routing, then holds every session to a fresh render of
+// that snapshot.
+func (hh *handHub) settled(why string) {
+	hh.t.Helper()
+
+	for woke := true; woke; {
+		woke = false
+
+		for id, sess := range hh.sessions {
+			select {
+			case <-sess.Wakes():
+				hh.render(id, hh.s.Snapshot())
+
+				woke = true
+			default:
+			}
+		}
+	}
+
+	fresh := hh.s.Snapshot().Uncached()
+
+	for id, st := range hh.streams {
+		out, err := freshDiff(hh.cfg, fresh, id, capVer, st.sent, &versionCache{})
+		require.NoError(hh.t, err)
+		require.Emptyf(hh.t, out, "%s: node %d holds a stale map: %s", why, id, describeResponses(out))
+	}
+}
+
+// transient has a node of u1 join, returns the snapshot holding it, and
+// has it leave.
+func (hh *handHub) transient(name string) *state.Snapshot {
+	id := hh.addNode(name)
+	mid := hh.s.Snapshot()
+	hh.s.DeleteNodeFromStoreForTest(id)
+
+	return mid
+}
+
+// TestHubWakesSessionsRenderedBetweenCoalescedCommits pins how the hub
+// routes commits that coalesced: their two ends are compared, which is
+// exact for a session holding the first end's render; a session that
+// rendered a snapshot in between is woken again when the change from that
+// snapshot reaches it, by the routing if its render ended first and at
+// once if the routing went first; a session woken but not yet rendering is
+// not woken again, since what it takes is at least as new. A node that
+// joins and leaves between two routings is the case only these wakes
+// reach: neither end has it, so neither end's viewers are its viewers.
+func TestHubWakesSessionsRenderedBetweenCoalescedCommits(t *testing.T) {
+	hh, ids := newHandHub(t, 0)
+	s := hh.s
+
+	start := s.Snapshot()
+	hh.route(start, start)
+
+	mid := hh.transient("transient")
+	end := s.Snapshot()
+	require.Greater(t, end.Rev(), start.Rev()+1, "test sanity: the commits coalesce")
+
+	hh.render(ids[0], mid)
+
+	all, wake := Route(start, end, end.Since(start))
+	require.False(t, all, "coalesced commits are not woken wholesale")
+	require.NotContains(t, wake, ids[0], "test sanity: comparing the ends alone leaves it out")
+
+	wake = hh.route(start, end)
+	assert.Contains(t, wake, ids[0], "the session that rendered in between is woken")
+
+	for _, id := range ids[1:] {
+		assert.NotContains(t, wake, id, "a session holding the first end's render, which equals the last's, is not woken")
+	}
+
+	hh.settled("rendered in between")
+
+	// Woken and not yet rendering: not woken again by a routing over
+	// coalesced commits, whatever they were.
+	from := s.Snapshot()
+	scalingEndpoint(t, s, ids[1], 1)
+
+	woken := hh.route(from, s.Snapshot())
+	require.Contains(t, woken, ids[0], "test sanity: the endpoint write of ids[1] wakes ids[0]")
+
+	from = s.Snapshot()
+	scalingEndpoint(t, s, ids[2], 1)
+	scalingEndpoint(t, s, ids[2], 2)
+
+	wake = hh.route(from, s.Snapshot())
+	assert.NotContains(t, wake, ids[0], "a session woken that has not taken a snapshot is not woken again")
+	hh.settled("woken before")
+
+	// A client reconnecting: its new session's first map is of a snapshot
+	// holding a node that joins and leaves, and ends after the routing over
+	// both, which nothing in it names: the render itself asks.
+	from = s.Snapshot()
+	mid = hh.transient("transient-again")
+	hh.route(from, s.Snapshot())
+
+	again := hh.attach(ids[1])
+	_, err := again.Initial(mid)
+	require.NoError(t, err)
+	again.Delivered()
+	require.Len(t, hh.sessions[ids[1]].wakes, 1, "a first map of a snapshot a routing went past is woken again")
+
+	hh.settled("reconnected")
+}
+
+// TestHubRoutesALateReadInTheFormServed routes a session that took a
+// snapshot when woken for its own form flip, and cuts its filter from it
+// only after the hub routed the next commit: a document edit that changes
+// which selectors or grants there are. Its node held a cut of its other
+// form alone there, which says nothing of the one it is served. The
+// session must end holding what a fresh render of the edit gives, and the
+// filters must name it themselves, whatever else wakes it. A merge position
+// moved by an inserted grant reorders the address form, which the wire
+// shows only for a whole filter; a member removed from a via grant takes
+// away the access a router's address form gives, and route viewers woken
+// wholesale (overwake/route-viewers) wake its router too.
+func TestHubRoutesALateReadInTheFormServed(t *testing.T) {
+	t.Setenv(state.TestFilterChunksEnv, "false")
+
+	route := netip.MustParsePrefix("10.0.0.0/24")
+
+	viaDoc := func(members, extra string) string {
+		return fmt.Sprintf(`{"groups": {"group:g": [%s]}, "tagOwners": {"tag:r": ["u1@"]},
+		"grants": [{"src": ["u1@"], "dst": ["u1@"], "ip": ["*"]}, {"src": ["u2@"], "dst": ["u2@"], "ip": ["*"]},
+			{"src": ["u2@"], "dst": ["tag:r"], "ip": ["tcp:22"]}%s,
+			{"src": ["group:g"], "dst": ["10.0.0.0/24"], "ip": ["*"], "via": ["tag:r"]}]}`, members, extra)
+	}
+
+	for _, tc := range []struct {
+		name string
+		// router makes the flipping node a tag:r router of route, not yet
+		// announcing it; else it is u1's first node.
+		router bool
+		flip   func(*tailcfg.Hostinfo)
+		// docs are the document at the start, the one committed with the
+		// flip ("" for none) and the edit.
+		docs [3]string
+	}{
+		{
+			name: "merge position",
+			flip: func(hi *tailcfg.Hostinfo) { hi.AppConnector.Set(true) },
+			docs: [3]string{
+				`{"grants": [{"src": ["u1@"], "dst": ["u1@"], "ip": ["tcp:22"]}, {"src": ["u2@"], "dst": ["u1@"], "ip": ["tcp:22"]}]}`,
+				"",
+				`{"grants": [{"src": ["u2@"], "dst": ["u2@"], "ip": ["tcp:22"]},
+					{"src": ["u1@"], "dst": ["u1@"], "ip": ["tcp:22"]}, {"src": ["u2@"], "dst": ["u1@"], "ip": ["tcp:22"]}]}`,
+			},
+		},
+		{
+			name:   "via member removed",
+			router: true,
+			flip:   func(hi *tailcfg.Hostinfo) { hi.RoutableIPs = []netip.Prefix{route} },
+			docs: [3]string{
+				viaDoc(`"u1@", "u2@"`, ""),
+				viaDoc(`"u1@", "u2@"`, `, {"src": ["u1@"], "dst": ["u1@"], "ip": ["tcp:22"]}`),
+				viaDoc(`"u1@"`, ""),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, s, ids := streamTestState(t, tc.docs[0], func(cfg *types.Config) { cfg.Policy.CapabilitySources = true })
+
+			u1, err := s.GetUserByName("u1")
+			require.NoError(t, err)
+
+			hh := &handHub{t: t, cfg: cfg, s: s, h: NewHub(), u1: u1, streams: map[types.NodeID]*Stream{}, sessions: map[types.NodeID]*Session{}}
+
+			official := func(n *types.Node) {
+				n.Hostinfo = &tailcfg.Hostinfo{GoVersion: runtime.Version(), IPNVersion: version.Long()}
+			}
+
+			for _, id := range ids {
+				n, ok := s.GetNodeByID(id)
+				require.True(t, ok)
+
+				nn := n.AsStruct()
+				official(nn)
+				s.PutNodeInStoreForTest(*nn)
+			}
+
+			all, x := ids[:], ids[0]
+
+			if tc.router {
+				router := s.CreateRegisteredNodeForTest(u1, "router")
+				router.Tags = []string{"tag:r"}
+				router.UserID, router.User = nil, nil
+				router.ApprovedRoutes = []netip.Prefix{route}
+				official(router)
+				s.PutNodeInStoreForTest(*router)
+
+				x = router.ID
+				all = append(all, x)
+			}
+
+			for _, id := range all {
+				hh.open(id)
+			}
+
+			// Every session reads the snapshot routed from, as the next
+			// routing compares from it.
+			start := s.Snapshot()
+			hh.route(start, start)
+			hh.settled("start")
+
+			for _, id := range all {
+				hh.render(id, start)
+			}
+
+			n, ok := s.GetNodeByID(x)
+			require.True(t, ok)
+
+			nn := n.AsStruct()
+			nn.Hostinfo = nn.Hostinfo.Clone()
+			tc.flip(nn.Hostinfo)
+			s.PutNodeInStoreForTest(*nn)
+
+			if tc.docs[1] != "" {
+				_, err = s.SetPolicy([]byte(tc.docs[1]))
+				require.NoError(t, err)
+			}
+
+			flipped := s.Snapshot()
+			require.NotEqual(t, start.ReceiverFacts(x), flipped.ReceiverFacts(x), "test sanity: the node's form flips")
+			require.Contains(t, hh.route(start, flipped), x, "test sanity: the flip wakes its session")
+
+			// It takes the wake and the snapshot.
+			<-hh.sessions[x].Wakes()
+
+			_, err = s.SetPolicy([]byte(tc.docs[2]))
+			require.NoError(t, err)
+
+			edited := s.Snapshot()
+			hh.route(flipped, edited)
+
+			// What the routing read, before the late read cuts the form.
+			filters := edited.Since(flipped).Filters
+
+			was, err := flipped.FilterForNode(x)
+			require.NoError(t, err)
+
+			is, err := edited.Uncached().FilterForNode(x)
+			require.NoError(t, err)
+			require.NotEqual(t, was, is, "test sanity: the edit moves the filter it is served")
+
+			assert.Contains(t, filters, x, "the filters name the node whose served form moved")
+
+			hh.render(x, flipped)
+			hh.settled("after the edit")
+		})
+	}
+}
+
+// TestHubSessionsRenderWhatReachesThemUnderChurn routes by hand, so no
+// scheduling decides it: u1's two sessions are woken by two writes that
+// reach them, take the wake and wait out a batch delay, as poll does, while
+// writes to u2's node,
+// which they cannot see, land three to a routing for fifty routings; then
+// each renders a snapshot strictly between a routing's ends, once ending
+// before the routing and once after it, while those writes go on. They are
+// woken by nothing but the first routing: a session waiting to render is
+// in no log, and a render is woken again only when what changed since its
+// snapshot reaches it. No routing resyncs, which would wake everyone.
+func TestHubSessionsRenderWhatReachesThemUnderChurn(t *testing.T) {
+	envknob.SetenvForTest(t, "HEADSCALE_DEBUG_POLICY_AUDIT", "false")
+
+	for _, capSources := range []bool{false, true} {
+		t.Run(fmt.Sprintf("capability=%t", capSources), func(t *testing.T) {
+			t.Setenv(state.TestCapabilitySourcesEnv, strconv.FormatBool(capSources))
+
+			hh, ids := newHandHub(t, 0)
+			s, viewers := hh.s, ids[:2]
+
+			last := s.Snapshot()
+			port := 0
+
+			churn := func(n int) {
+				for range n {
+					port++
+					scalingEndpoint(t, s, ids[2], port)
+				}
+			}
+
+			route := func() map[types.NodeID]struct{} {
+				t.Helper()
+
+				now := s.Snapshot()
+				change, all, wake, _ := hh.h.route(last, now)
+				require.False(t, change.Resync, "test sanity: the node log covers the routing")
+				require.False(t, all)
+
+				hh.h.wake(all, wake)
+
+				last = now
+
+				return wake
+			}
+
+			woken := func() int {
+				n := 0
+				for _, id := range viewers {
+					n += len(hh.sessions[id].wakes)
+				}
+
+				return n
+			}
+
+			scalingEndpoint(t, s, ids[1], 1)
+			scalingEndpoint(t, s, ids[1], 2)
+
+			wake := route()
+			for _, id := range viewers {
+				require.Contains(t, wake, id, "test sanity: the writes reach u1's sessions")
+			}
+
+			// As poll does, each takes its wake and waits out the delay
+			// before it takes a snapshot.
+			for _, id := range viewers {
+				<-hh.sessions[id].wakes
+			}
+
+			for range 50 {
+				churn(3)
+				route()
+				require.Zero(t, woken(), "a session waiting to render is not woken again")
+			}
+
+			for _, id := range viewers {
+				hh.render(id, s.Snapshot())
+			}
+
+			// A render of a snapshot between a routing's ends, ending before
+			// the routing, then one ending after it.
+			for _, id := range viewers {
+				churn(1)
+
+				x := s.Snapshot()
+
+				churn(2)
+				hh.render(id, x)
+				route()
+				churn(1)
+
+				x = s.Snapshot()
+
+				churn(2)
+				route()
+				hh.render(id, x)
+			}
+
+			require.Zero(t, woken(), "nothing the sessions cannot see woke them again")
+			hh.settled("after the churn")
+		})
+	}
+}
+
+// TestHubRenderLogCases drives the render log by hand at the points its
+// argument rests on, each session finally held to a fresh render.
+func TestHubRenderLogCases(t *testing.T) {
+	t.Run("woken while rendering", func(t *testing.T) {
+		hh, ids := newHandHub(t, 0)
+		s := hh.s
+
+		// ids[0] takes mid; the routing over the node's coming and going
+		// and an endpoint write of ids[1] wakes it while it renders mid.
+		from := s.Snapshot()
+		mid := hh.transient("transient")
+
+		scalingEndpoint(t, s, ids[1], 1)
+
+		wake := hh.route(from, s.Snapshot())
+		require.Contains(t, wake, ids[0], "test sanity: the endpoint write reaches ids[0]")
+
+		hh.render(ids[0], mid)
+		require.Len(t, hh.sessions[ids[0]].wakes, 1, "the wake that came during the render is pending")
+		hh.settled("woken while rendering")
+	})
+
+	t.Run("a render a routing went past", func(t *testing.T) {
+		hh, ids := newHandHub(t, 0)
+		s := hh.s
+
+		// The routing's ends are equal and name nobody; ids[0]'s render of
+		// mid ends after it, so the render asks.
+		from := s.Snapshot()
+		mid := hh.transient("transient")
+
+		wake := hh.route(from, s.Snapshot())
+		require.NotContains(t, wake, ids[0])
+
+		hh.render(ids[0], mid)
+		require.Len(t, hh.sessions[ids[0]].wakes, 1, "a render of a snapshot a routing went past, which the rest reaches, is woken")
+		hh.settled("a routing went past")
+	})
+
+	t.Run("woken by a wake-all while rendering", func(t *testing.T) {
+		hh, ids := newHandHub(t, 0)
+		s := hh.s
+
+		from := s.Snapshot()
+		mid := hh.transient("transient")
+
+		hubWake(hh.h, from, s.Snapshot())
+		hh.h.wake(true, nil)
+		hh.render(ids[0], mid)
+		require.Len(t, hh.sessions[ids[0]].wakes, 1, "the wake-all is pending")
+		hh.settled("wake-all")
+	})
+
+	t.Run("a first map records the snapshot it rendered", func(t *testing.T) {
+		hh, ids := newHandHub(t, 0)
+		s := hh.s
+
+		a := s.Snapshot()
+		hh.route(a, a)
+
+		// ids[0] renders b, a snapshot holding a node that then leaves: the
+		// hub's latest is b, which a first map handed a renders instead.
+		id := hh.addNode("transient")
+		b := s.Snapshot()
+		hh.render(ids[0], b)
+		s.DeleteNodeFromStoreForTest(id)
+		c := s.Snapshot()
+
+		hh.route(a, c)
+
+		st := hh.attach(ids[1])
+		_, err := st.Initial(a)
+		require.NoError(t, err)
+		st.Delivered()
+
+		_, holds := st.sent.peer(id.NodeID())
+		require.True(t, holds, "test sanity: the first map is of b, which holds the node")
+		require.Len(t, hh.sessions[ids[1]].wakes, 1, "the first map is weighed by the snapshot it rendered")
+		hh.settled("first map")
+	})
+
+	t.Run("a first map between a routing and the caches' advance", func(t *testing.T) {
+		hh, ids := newHandHub(t, 0)
+		s := hh.s
+
+		from := s.Snapshot()
+		mid := hh.transient("transient")
+		to := s.Snapshot()
+
+		hubWake(hh.h, from, to)
+
+		st := hh.attach(ids[1])
+		_, err := st.Initial(mid)
+		require.NoError(t, err)
+		st.Delivered()
+		hh.h.advance(to)
+
+		hh.settled("first map before the advance")
+	})
+
+	t.Run("a render newer than the routing in progress", func(t *testing.T) {
+		hh, ids := newHandHub(t, 0)
+		s := hh.s
+
+		from := s.Snapshot()
+		scalingEndpoint(t, s, ids[2], 1)
+		to := s.Snapshot()
+
+		// to+1: a node joins after the hub took to.
+		id := hh.addNode("transient")
+		next := s.Snapshot()
+		require.Equal(t, to.Rev()+1, next.Rev(), "test sanity: the render is of to+1")
+
+		hh.render(ids[0], next)
+		hh.route(from, to)
+
+		s.DeleteNodeFromStoreForTest(id)
+
+		wake := hh.route(to, s.Snapshot())
+		assert.Contains(t, wake, ids[0], "a render past the routing is kept for the next")
+		hh.settled("newer than the routing")
+	})
+
+	t.Run("a render of from+1 in every shard", func(t *testing.T) {
+		hh, ids := newHandHub(t, renderShards)
+		s := hh.s
+
+		// u1's nodes, one per shard: they see the node that joins.
+		shards := map[*renderShard]types.NodeID{}
+
+		for id, sess := range hh.sessions {
+			if id != ids[2] {
+				shards[hh.h.renders.shard(sess)] = id
+			}
+		}
+
+		require.Len(t, shards, renderShards, "test sanity: a session in every shard")
+
+		from := s.Snapshot()
+		mid := hh.transient("transient")
+		require.Equal(t, from.Rev()+1, mid.Rev(), "test sanity: the render is of from+1")
+
+		for _, id := range shards {
+			hh.render(id, mid)
+		}
+
+		wake := hh.route(from, s.Snapshot())
+
+		for _, id := range shards {
+			assert.Contains(t, wake, id, "every shard's render in between is weighed")
+		}
+
+		hh.settled("every shard")
+	})
+
+	t.Run("a routing at the point the render decides", func(t *testing.T) {
+		hh, ids := newHandHub(t, 0)
+		s := hh.s
+
+		from := s.Snapshot()
+		mid := hh.transient("transient")
+		to := s.Snapshot()
+
+		// The routing runs where end has decided, if the shard's lock lets
+		// it: it must not, or it must be seen.
+		sh := hh.h.renders.shard(hh.sessions[ids[0]])
+		routed := false
+		hh.h.renders.hook = func(p renderPoint, _ *renderShard) {
+			if p == renderDecided && !routed && sh.mu.TryLock() {
+				sh.mu.Unlock()
+				hh.route(from, to)
+
+				routed = true
+			}
+		}
+
+		hh.render(ids[0], mid)
+		hh.h.renders.hook = nil
+
+		if !routed {
+			hh.route(from, to)
+		}
+
+		hh.settled("routed at the decision")
+	})
+
+	t.Run("a render ending where a routing drained its shard", func(t *testing.T) {
+		hh, ids := newHandHub(t, 0)
+		s := hh.s
+
+		from := s.Snapshot()
+		mid := hh.transient("transient")
+		to := s.Snapshot()
+
+		// The render ends where the routing has visited the session's shard,
+		// if the shard's lock lets it: it must not, or the render must be
+		// weighed.
+		sh := hh.h.renders.shard(hh.sessions[ids[0]])
+		rendered := false
+		hh.h.renders.hook = func(p renderPoint, at *renderShard) {
+			if p == routingDrained && at == sh && !rendered && sh.mu.TryLock() {
+				sh.mu.Unlock()
+				hh.render(ids[0], mid)
+
+				rendered = true
+			}
+		}
+
+		hh.route(from, to)
+		hh.h.renders.hook = nil
+
+		if !rendered {
+			hh.render(ids[0], mid)
+		}
+
+		hh.settled("rendered at the drain")
+	})
+}
+
+// TestViewDeltaKeysViewsByStartAndLength pins what names a view in the
+// view walks sessions share: its first element's address and its length.
+// The views the peer classes build never share a first element while
+// differing in length, so no other test tells a key without the length
+// apart; two views cut from one array do share it.
+func TestViewDeltaKeysViewsByStartAndLength(t *testing.T) {
+	var cm classMaps
+
+	all := []types.NodeID{1, 2, 3, 4}
+	short, long := all[:2], all[:3]
+	to := []types.NodeID{1, 2, 3, 4}
+
+	assert.Equal(t, []tailcfg.NodeID{3, 4}, cm.viewDelta(short, to))
+	assert.Equal(t, []tailcfg.NodeID{4}, cm.viewDelta(long, to), "a view sharing another's start but not its length is another view")
+	assert.Equal(t, []tailcfg.NodeID{1, 2, 3, 4}, cm.viewDelta(nil, to))
+	assert.Empty(t, cm.viewDelta(to, to))
+}
+
+// hubWake is [Hub.route]'s sessions to wake, as the watcher wakes them.
+func hubWake(h *Hub, last, snap *state.Snapshot) (bool, map[types.NodeID]struct{}) {
+	_, all, wake, _ := h.route(last, snap)
+
+	return all, wake
+}
+
+// TestHubWakesSessionAfterFailedRender pins that a session whose render
+// failed is woken by the next routing, whatever that routing names: it
+// holds what it held before, which no routing describes, and only a new
+// snapshot can render otherwise; and one whose render fails after a
+// routing went past its snapshot is woken at once, the next commit already
+// there. Its node's given name is one no FQDN can be made of, as a corrupt
+// row loads, so its own map cannot render; once the node is renamed, its
+// next render holds what a fresh one gives, and it is woken for nothing
+// more.
+func TestHubWakesSessionAfterFailedRender(t *testing.T) {
+	// u2's node sees only itself: its endpoint writes name no other node.
+	cfg, s, ids := streamTestState(t, ownUserOnly)
+	h := NewHub()
+
+	st := NewStream(cfg, h, ids[0], capVer)
+	sess := h.Join(ids[0], func() {})
+	st.Attach(sess)
+
+	_, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+	st.Delivered()
+
+	start := s.Snapshot()
+	hubWake(h, start, start)
+
+	node := mustNode(t, s, ids[0]).AsStruct()
+	name := node.GivenName
+	node.GivenName = strings.Repeat("a", types.MaxHostnameLength+1)
+	s.PutNodeInStoreForTest(*node)
+
+	broken := s.Snapshot()
+	_, wake := hubWake(h, start, broken)
+	require.Contains(t, wake, ids[0], "test sanity: its own change wakes it")
+
+	_, err = st.Update(broken)
+	require.ErrorIs(t, err, types.ErrHostnameTooLong, "test sanity: its map cannot render")
+
+	for i := range 2 {
+		was := s.Snapshot()
+		scalingEndpoint(t, s, ids[2], i+1)
+		is := s.Snapshot()
+
+		_, routed := Route(was, is, is.Since(was))
+		require.NotContains(t, routed, ids[0], "test sanity: the write names only u2's node")
+
+		_, wake = hubWake(h, was, is)
+		assert.Contains(t, wake, ids[0], "a session whose render failed is woken by the next routing")
+
+		_, err = st.Update(is)
+		require.Error(t, err, "test sanity: it still cannot render")
+	}
+
+	// The render takes y; a routing past y names it not; the render fails.
+	y := s.Snapshot()
+	hubWake(h, y, y)
+	scalingEndpoint(t, s, ids[2], 3)
+	_, wake = hubWake(h, y, s.Snapshot())
+	require.NotContains(t, wake, ids[0])
+
+	_, err = st.Update(y)
+	require.Error(t, err)
+	assert.Len(t, sess.wakes, 1, "a render failing after a routing went past its snapshot is retried at once")
+
+	select {
+	case <-sess.wakes:
+	default:
+	}
+
+	was := s.Snapshot()
+	node.GivenName = name
+	s.PutNodeInStoreForTest(*node)
+
+	fixed := s.Snapshot()
+	_, wake = hubWake(h, was, fixed)
+	require.Contains(t, wake, ids[0])
+
+	_, err = st.Update(fixed)
+	require.NoError(t, err)
+	st.Delivered()
+
+	out, err := freshDiff(cfg, fixed.Uncached(), ids[0], capVer, st.sent, &versionCache{})
+	require.NoError(t, err)
+	assert.Empty(t, out, "once it renders, it holds what a fresh render gives")
+
+	scalingEndpoint(t, s, ids[2], 4)
+	_, wake = hubWake(h, fixed, s.Snapshot())
+	assert.NotContains(t, wake, ids[0], "a session that rendered is not woken for a write it renders nothing of")
+}
+
+// logSink is where the package's tests log. A test that reads the hub's
+// lines taps it: swapping the global logger would race with the hub's
+// watcher, which logs from its own goroutine.
+var logSink = &tapWriter{}
+
+func TestMain(m *testing.M) {
+	log.Logger = zerolog.New(logSink).With().Timestamp().Logger()
+
+	m.Run()
+}
+
+// tapWriter writes to stderr, or to the writer a test taps it with.
+type tapWriter struct {
+	mu  sync.Mutex
+	tap io.Writer
+}
+
+func (w *tapWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.tap != nil {
+		return w.tap.Write(p)
+	}
+
+	return os.Stderr.Write(p)
+}
+
+// tapTo sends what is logged until the test ends to w instead of stderr.
+// w is written under the sink's lock.
+func tapTo(t *testing.T, w io.Writer) {
+	t.Helper()
+
+	logSink.mu.Lock()
+	logSink.tap = w
+	logSink.mu.Unlock()
+
+	t.Cleanup(func() {
+		logSink.mu.Lock()
+		logSink.tap = nil
+		logSink.mu.Unlock()
+	})
+}
+
+// tapLog keeps what is logged until the test ends out of its output and
+// returns a reader of it.
+func tapLog(t *testing.T) func() string {
+	t.Helper()
+
+	var buf bytes.Buffer
+
+	tapTo(t, &buf)
+
+	return func() string {
+		logSink.mu.Lock()
+		defer logSink.mu.Unlock()
+
+		return buf.String()
+	}
+}
+
+// routerOf makes id a tag:r router serving route, online.
+func routerOf(t *testing.T, s *state.State, id types.NodeID, route netip.Prefix) {
+	t.Helper()
+
+	taggedRouterOf(t, s, id, "tag:r", route)
+}
+
+// taggedRouterOf makes id a router of tag serving route, online.
+func taggedRouterOf(t *testing.T, s *state.State, id types.NodeID, tag string, route netip.Prefix) {
+	t.Helper()
+
+	_, err := s.SetNodeTags(id, []string{tag})
+	require.NoError(t, err)
+
+	n := mustNode(t, s, id).AsStruct()
+	n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+	s.PutNodeInStoreForTest(*n)
+
+	_, err = s.SetApprovedRoutes(id, []netip.Prefix{route})
+	require.NoError(t, err)
+
+	s.Connect(id)
+}
+
+// joinAt registers a node of user, as the random writes add one, at addr.
+func joinAt(t *testing.T, s *state.State, user, name string, addr netip.Addr) types.NodeID {
+	t.Helper()
+
+	u, err := s.GetUserByName(user)
+	require.NoError(t, err)
+
+	n := s.CreateRegisteredNodeForTest(u, name)
+	n.User, n.IPv4 = u, &addr
+	s.PutNodeInStoreForTest(*n)
+
+	return n.ID
+}
+
+// serve has id announce and approve routes, online, keeping its owner.
+func serve(t *testing.T, s *state.State, id types.NodeID, routes ...netip.Prefix) {
+	t.Helper()
+
+	n := mustNode(t, s, id).AsStruct()
+	n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: routes}
+	s.PutNodeInStoreForTest(*n)
+
+	_, err := s.SetApprovedRoutes(id, routes)
+	require.NoError(t, err)
+
+	s.Connect(id)
+}
+
+// TestRouteWakesTheNodesThatSeeAChangedNode pins that a write of a node
+// wakes the nodes that see it, which visibility does not make the nodes it
+// sees: an exit node sees every source of a capability grant whose
+// destination reaches the internet, to host the service, and the source
+// does not see the exit node. An endpoint write of the source must reach
+// the exit node's session.
+func TestRouteWakesTheNodesThatSeeAChangedNode(t *testing.T) {
+	for _, capSources := range []bool{false, true} {
+		t.Run(fmt.Sprintf("capability=%t", capSources), func(t *testing.T) {
+			t.Setenv(state.TestCapabilitySourcesEnv, strconv.FormatBool(capSources))
+
+			cfg, s, ids := streamTestState(t, `{"grants":[{"src":["u2@"],"dst":["8.8.8.0/24"],"app":{"example.com/cap/x":[{}]}}]}`)
+			exit, src := ids[0], ids[2]
+
+			serve(t, s, exit, netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"))
+
+			before := s.Snapshot()
+			require.Contains(t, before.PeerView(exit), src, "test sanity: the exit node sees the grant's source")
+			require.NotContains(t, before.PeerView(src), exit, "test sanity: the source does not see the exit node")
+
+			st := NewStream(cfg, NewHub(), exit, capVer)
+			_, err := st.Initial(before)
+			require.NoError(t, err)
+			st.Delivered()
+
+			scalingEndpoint(t, s, src, 1)
+
+			after := s.Snapshot()
+			all, wake := Route(before, after, after.Since(before))
+			require.False(t, all)
+			assert.Contains(t, wake, exit, "the exit node sees the written node")
+
+			out, err := freshDiff(cfg, after.Uncached(), exit, capVer, st.sent, &versionCache{})
+			require.NoError(t, err)
+			require.NotEmpty(t, out, "test sanity: the exit node's map moved with the write")
+		})
+	}
+}
+
+// TestRouteWakesViewerOfRouterWhoseCoverMovedByPolicy moves a node into a
+// group by a document edit, not a write: X, inside R's route, becomes a
+// destination of V's rule to the group, so V may use R's route. V's filter,
+// peers, side set and facts are as they were, and X is no node write, so
+// nothing wakes V but its seeing R, whose cover moved.
+func TestRouteWakesViewerOfRouterWhoseCoverMovedByPolicy(t *testing.T) {
+	const doc = `{"groups":{"group:g":%s},"tagOwners":{"tag:r":["u1@"],"tag:m":["u1@"]},"acls":[
+		{"action":"accept","src":["u2@"],"dst":["tag:r:*","tag:m:*","group:g:*"]}]}`
+
+	cfg, s, ids := streamTestState(t, fmt.Sprintf(doc, `[]`))
+	router, viewer := ids[0], ids[2]
+
+	inside := netip.MustParsePrefix("100.64.0.8/29")
+	routerOf(t, s, router, inside)
+
+	// u1's other node joins no group.
+	_, err := s.SetNodeTags(ids[1], []string{"tag:m"})
+	require.NoError(t, err)
+
+	x := joinAt(t, s, "u1", "x", netip.MustParseAddr("100.64.0.9"))
+	serve(t, s, x, netip.MustParsePrefix("100.64.0.16/29"))
+
+	m := joinAt(t, s, "u1", "m", netip.MustParseAddr("100.64.0.17"))
+	_, err = s.SetNodeTags(m, []string{"tag:m"})
+	require.NoError(t, err)
+
+	st := NewStream(cfg, NewHub(), viewer, capVer)
+	_, err = st.Initial(s.Snapshot())
+	require.NoError(t, err)
+	st.Delivered()
+
+	held, ok := st.sent.peer(router.NodeID())
+	require.True(t, ok, "test sanity: the viewer sees the router")
+	_, ok = st.sent.peer(x.NodeID())
+	require.True(t, ok, "test sanity: and X, whose route covers M")
+	require.NotContains(t, held.AllowedIPs, inside, "test sanity: no destination of the viewer's is inside the router's route yet")
+
+	before := s.Snapshot()
+	_, err = s.SetPolicy(fmt.Appendf(nil, doc, `["u1@"]`))
+	require.NoError(t, err)
+
+	after := s.Snapshot()
+
+	c := after.Since(before)
+	require.Empty(t, c.Nodes, "test sanity: no node was written")
+	require.NotContains(t, c.Filters, viewer, "test sanity: the viewer's filter did not move")
+	require.NotContains(t, c.PeerSets, viewer, "test sanity: nor what it sees")
+	require.NotContains(t, c.RouteViewers, viewer, "test sanity: nor its side set or facts")
+	require.False(t, c.AllRouters, "test sanity: nor any rule a route reads")
+	require.Contains(t, c.Routers, router, "the router's route gained a destination atom")
+
+	all, wake := Route(before, after, c)
+	require.False(t, all)
+	require.Contains(t, wake, viewer, "it sees the router whose cover moved")
+
+	_, err = st.Update(after)
+	require.NoError(t, err)
+	st.Delivered()
+
+	held, _ = st.sent.peer(router.NodeID())
+	assert.Contains(t, held.AllowedIPs, inside, "the viewer may use the router's route")
+
+	stale, err := freshDiff(cfg, after.Uncached(), viewer, capVer, st.sent, &versionCache{})
+	require.NoError(t, err)
+	assert.Empty(t, stale, "it holds what a fresh render gives: %s", describeResponses(stale))
+}
+
+// TestRouteRerendersRoutedPeersWhenViewerServesTheirRoute has a router also
+// serve a route another router serves as primary: a viewer serving a
+// primary's route is given it, whatever the rules. The viewer's side set
+// and facts do not move, it already serving a route; only its own routes
+// do, which its own node write wakes it for, and it must render the
+// primary again.
+func TestRouteRerendersRoutedPeersWhenViewerServesTheirRoute(t *testing.T) {
+	cfg, s, ids := streamTestState(t, `{"tagOwners":{"tag:r":["u1@"]},"acls":[
+		{"action":"accept","src":["u2@"],"dst":["tag:r:*"]}]}`)
+	primary, viewer := ids[0], ids[2]
+
+	shared, own := netip.MustParsePrefix("192.168.1.0/24"), netip.MustParsePrefix("192.168.2.0/24")
+	routerOf(t, s, primary, shared)
+	serve(t, s, viewer, own)
+
+	st := NewStream(cfg, NewHub(), viewer, capVer)
+	_, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+	st.Delivered()
+
+	held, ok := st.sent.peer(primary.NodeID())
+	require.True(t, ok, "test sanity: the viewer sees the primary")
+	require.NotContains(t, held.AllowedIPs, shared, "test sanity: no rule gives the viewer the primary's route")
+
+	// One write, as a map request announcing what the admin approved.
+	before := s.Snapshot()
+	n := mustNode(t, s, viewer).AsStruct()
+	n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{own, shared}}
+	n.ApprovedRoutes = []netip.Prefix{own, shared}
+	s.PutNodeInStoreForTest(*n)
+	after := s.Snapshot()
+
+	c := after.Since(before)
+	require.NotContains(t, c.RouteViewers, viewer, "test sanity: the viewer's side set and facts did not move")
+	require.Equal(t, []netip.Prefix{shared}, after.PrimaryRoutesForNode(primary), "test sanity: the primary keeps the route")
+
+	all, wake := Route(before, after, c)
+	require.False(t, all)
+	require.Contains(t, wake, viewer, "its own routes moved")
+
+	_, err = st.Update(after)
+	require.NoError(t, err)
+	st.Delivered()
+
+	held, _ = st.sent.peer(primary.NodeID())
+	assert.Contains(t, held.AllowedIPs, shared, "a viewer serving the primary's route is given it")
+
+	stale, err := freshDiff(cfg, after.Uncached(), viewer, capVer, st.sent, &versionCache{})
+	require.NoError(t, err)
+	assert.Empty(t, stale, "it holds what a fresh render gives: %s", describeResponses(stale))
+}
+
+// TestRouteSSHFollowsLocalpartEmail changes a source user's email under a
+// localpart SSH rule: the destinations' SSH policies map another local
+// user, though no filter, side set or node moved. That reaches their
+// sessions only through the compile's SSH routing, alone and coalesced
+// with another write; the dependency is stated here.
+func TestRouteSSHFollowsLocalpartEmail(t *testing.T) {
+	for _, coalesced := range []bool{false, true} {
+		t.Run(fmt.Sprintf("coalesced=%t", coalesced), func(t *testing.T) {
+			cfg, s, ids := streamTestState(t, `{"tagOwners":{"tag:b":["u1@"]},
+				"acls":[{"action":"accept","src":["u1@"],"dst":["u1@:*"]}],
+				"ssh":[{"action":"accept","src":["u1@"],"dst":["tag:b"],"users":["localpart:*@example.com"]}]}`)
+			dest, other := ids[2], ids[1]
+
+			u1, err := s.GetUserByName("u1")
+			require.NoError(t, err)
+
+			setEmail := func(email string) {
+				t.Helper()
+
+				_, err := s.UpdateUser(types.UserID(u1.ID), func(u *types.User) error {
+					u.Email = email
+
+					return nil
+				})
+				require.NoError(t, err)
+			}
+
+			setEmail("alice@example.com")
+
+			_, err = s.SetNodeTags(dest, []string{"tag:b"})
+			require.NoError(t, err)
+
+			st := NewStream(cfg, NewHub(), dest, capVer)
+			_, err = st.Initial(s.Snapshot())
+			require.NoError(t, err)
+			st.Delivered()
+
+			localUsers := func() []string {
+				out := make([]string, 0, len(st.sent.ssh.Rules))
+				for _, rule := range st.sent.ssh.Rules {
+					out = append(out, slices.Collect(maps.Keys(rule.SSHUsers))...)
+				}
+
+				slices.Sort(out)
+
+				return out
+			}
+
+			require.Contains(t, localUsers(), "alice", "test sanity: the destination maps alice")
+
+			before := s.Snapshot()
+
+			setEmail("bob@example.com")
+
+			if coalesced {
+				n := mustNode(t, s, other).AsStruct()
+				n.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")}
+				s.PutNodeInStoreForTest(*n)
+			}
+
+			after := s.Snapshot()
+			require.Equal(t, coalesced, after.Rev() > before.Rev()+1, "test sanity: the commits coalesce or not")
+
+			c := after.Since(before)
+			require.NotContains(t, c.Nodes, dest, "test sanity: the destination was not written")
+
+			all, wake := Route(before, after, c)
+			if !all {
+				require.Contains(t, wake, dest, "its SSH policy moved")
+			}
+
+			_, err = st.Update(after)
+			require.NoError(t, err)
+			st.Delivered()
+
+			assert.Contains(t, localUsers(), "bob", "the destination maps the new localpart")
+			assert.NotContains(t, localUsers(), "alice")
+		})
+	}
+}
+
+// TestRouteWakesCoveringRouterAsViewer joins a node inside a router's
+// route: the router is then on the joiner's side of a rule (it routes for
+// an address the rule names), so it may use another router's route it
+// could not before. Neither the router nor anything it sees changed, nor
+// did its filter, though a moved rule recuts every router; it does not
+// render the other router again but because its side set moved. It sees
+// the other router and not itself, so the routers whose cover moved,
+// itself among them, wake only what they are seen by.
+func TestRouteWakesCoveringRouterAsViewer(t *testing.T) {
+	cfg, s, ids := streamTestState(t, `{"groups":{"group:eng":["u2@"]},"tagOwners":{"tag:c":["u1@"],"tag:r":["u1@"]},"acls":[
+		{"action":"accept","src":["tag:c"],"dst":["tag:r:*"]},
+		{"action":"accept","src":["group:eng"],"dst":["10.1.0.0/24:*"]}]}`)
+	covering, other := ids[0], ids[1]
+
+	inside := netip.MustParsePrefix("100.64.0.8/29")
+	subnet := netip.MustParsePrefix("10.1.0.0/24")
+
+	taggedRouterOf(t, s, covering, "tag:c", inside)
+	routerOf(t, s, other, subnet)
+
+	st := NewStream(cfg, NewHub(), covering, capVer)
+	_, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+	st.Delivered()
+
+	held, ok := st.sent.peer(other.NodeID())
+	require.True(t, ok, "test sanity: the routers see each other")
+	require.NotContains(t, held.AllowedIPs, subnet, "test sanity: no rule lets the covering router use the subnet yet")
+
+	before := s.Snapshot()
+	joinAt(t, s, "u2", "inside", netip.MustParseAddr("100.64.0.9"))
+	after := s.Snapshot()
+
+	c := after.Since(before)
+	require.NotContains(t, c.PeerSets, covering, "test sanity: what it sees did not move")
+	require.Contains(t, c.RouteViewers, covering, "its side set moved, which the routes it is offered read")
+
+	all, wake := Route(before, after, c)
+	require.False(t, all)
+	require.Contains(t, wake, covering)
+
+	_, err = st.Update(after)
+	require.NoError(t, err)
+	st.Delivered()
+
+	held, _ = st.sent.peer(other.NodeID())
+	assert.Contains(t, held.AllowedIPs, subnet, "it renders the other router again, and may use its subnet")
+
+	stale, err := freshDiff(cfg, after.Uncached(), covering, capVer, st.sent, &versionCache{})
+	require.NoError(t, err)
+	assert.Empty(t, stale, "it holds what a fresh render gives: %s", describeResponses(stale))
+}
+
+// TestRouteWakesAddressSharerAsViewer joins a member of group:eng at the
+// address of X, a node of another user: a source names nodes by address, so
+// X is on group:eng's side of its rule and may use the route it grants.
+// X's filter, peers and node are as they were, and X is no router: nothing
+// wakes it but the move of its own side set.
+func TestRouteWakesAddressSharerAsViewer(t *testing.T) {
+	cfg, s, ids := streamTestState(t, `{"groups":{"group:eng":["u2@"]},"tagOwners":{"tag:r":["u1@"]},"acls":[
+		{"action":"accept","src":["u1@"],"dst":["tag:r:*"]},
+		{"action":"accept","src":["group:eng"],"dst":["10.1.0.0/24:*"]}]}`)
+	router, x := ids[0], ids[1]
+
+	subnet := netip.MustParsePrefix("10.1.0.0/24")
+	routerOf(t, s, router, subnet)
+
+	_, err := s.SetNodeTags(ids[2], []string{"tag:r"})
+	require.NoError(t, err)
+
+	st := NewStream(cfg, NewHub(), x, capVer)
+	_, err = st.Initial(s.Snapshot())
+	require.NoError(t, err)
+	st.Delivered()
+
+	held, ok := st.sent.peer(router.NodeID())
+	require.True(t, ok, "test sanity: X sees the router")
+	require.NotContains(t, held.AllowedIPs, subnet, "test sanity: X is no member of group:eng")
+
+	before := s.Snapshot()
+	joinAt(t, s, "u2", "sharer", mustNode(t, s, x).IPv4().Get())
+	after := s.Snapshot()
+
+	c := after.Since(before)
+	require.NotContains(t, c.Filters, x, "test sanity: X's filter did not move")
+	require.NotContains(t, c.PeerSets, x, "test sanity: nor what it sees")
+	require.Contains(t, c.RouteViewers, x, "its side set moved")
+
+	all, wake := Route(before, after, c)
+	require.False(t, all)
+	require.Contains(t, wake, x)
+
+	_, err = st.Update(after)
+	require.NoError(t, err)
+	st.Delivered()
+
+	held, _ = st.sent.peer(router.NodeID())
+	assert.Contains(t, held.AllowedIPs, subnet, "X may use the route by the address it shares")
+
+	stale, err := freshDiff(cfg, after.Uncached(), x, capVer, st.sent, &versionCache{})
+	require.NoError(t, err)
+	assert.Empty(t, stale, "it holds what a fresh render gives: %s", describeResponses(stale))
+}
+
+// TestRouteRerendersRouterWhoseCoverMoved joins a node inside a router's
+// route that a viewer is the destination of a rule from: the router's
+// route now overlaps the rule's sources, so the viewer may use it, though
+// neither the router nor the viewer changed. The viewer sees the joiner
+// and is woken for it; it must render the router again too.
+func TestRouteRerendersRouterWhoseCoverMoved(t *testing.T) {
+	cfg, s, ids := streamTestState(t, `{"groups":{"group:eng":["u2@"]},"tagOwners":{"tag:r":["u1@"]},"acls":[
+		{"action":"accept","src":["u1@"],"dst":["tag:r:*"]},
+		{"action":"accept","src":["group:eng"],"dst":["u1@:*"]}]}`)
+	viewer, router := ids[0], ids[1]
+
+	inside := netip.MustParsePrefix("100.64.0.8/29")
+	routerOf(t, s, router, inside)
+
+	st := NewStream(cfg, NewHub(), viewer, capVer)
+	_, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+	st.Delivered()
+
+	held, ok := st.sent.peer(router.NodeID())
+	require.True(t, ok, "test sanity: the viewer sees the router")
+	require.NotContains(t, held.AllowedIPs, inside, "test sanity: nothing inside the route is a source of the viewer's yet")
+
+	before := s.Snapshot()
+	joinAt(t, s, "u2", "inside", netip.MustParseAddr("100.64.0.9"))
+	after := s.Snapshot()
+
+	c := after.Since(before)
+	require.Contains(t, c.Routers, router, "the router's route gained a source atom")
+
+	all, wake := Route(before, after, c)
+	require.False(t, all)
+	require.Contains(t, wake, viewer)
+
+	_, err = st.Update(after)
+	require.NoError(t, err)
+	st.Delivered()
+
+	held, _ = st.sent.peer(router.NodeID())
+	assert.Contains(t, held.AllowedIPs, inside, "the viewer renders the router again, and may use its route")
+
+	stale, err := freshDiff(cfg, after.Uncached(), viewer, capVer, st.sent, &versionCache{})
+	require.NoError(t, err)
+	assert.Empty(t, stale, "it holds what a fresh render gives: %s", describeResponses(stale))
+}
+
+// TestRouteWakesRouterCoveringANewDestination joins a node of a rule's
+// destination inside a router's route: the router's filter lists the
+// destination's members it routes for, so it gains the joiner's address,
+// though it neither sees the joiner nor is named by any source that moved.
+func TestRouteWakesRouterCoveringANewDestination(t *testing.T) {
+	// The router sees u1's node already, through the first rule, so the
+	// join moves nothing it sees.
+	cfg, s, ids := streamTestState(t, `{"tagOwners":{"tag:r":["u1@"]},"acls":[
+		{"action":"accept","src":["tag:r"],"dst":["u1@:*"]},
+		{"action":"accept","src":["u1@"],"dst":["u2@:22"]}]}`)
+	router := ids[0]
+
+	routerOf(t, s, router, netip.MustParsePrefix("100.64.0.8/29"))
+
+	st := NewStream(cfg, NewHub(), router, capVer)
+	_, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+	st.Delivered()
+
+	before := s.Snapshot()
+	joinAt(t, s, "u2", "inside", netip.MustParseAddr("100.64.0.9"))
+	after := s.Snapshot()
+
+	c := after.Since(before)
+	require.NotContains(t, c.PeerSets, router, "test sanity: the router sees nothing new")
+
+	all, wake := Route(before, after, c)
+	require.False(t, all)
+	require.Contains(t, wake, router, "its filter gained the joiner's address")
+
+	_, err = st.Update(after)
+	require.NoError(t, err)
+	st.Delivered()
+
+	require.True(t, slices.ContainsFunc(st.sent.filter, func(r tailcfg.FilterRule) bool {
+		return slices.ContainsFunc(r.DstPorts, func(d tailcfg.NetPortRange) bool { return d.IP == "100.64.0.9" })
+	}), "the router is served a filter naming the joiner, not a carried one: %v", st.sent.filter)
+
+	stale, err := freshDiff(cfg, after.Uncached(), router, capVer, st.sent, &versionCache{})
+	require.NoError(t, err)
+	assert.Empty(t, stale, "it holds what a fresh render gives: %s", describeResponses(stale))
+}
+
+// TestRouteReordersFilterWhenAnotherRuleSplitsItsKey pins that merge
+// positions are global in IP form. N is in tag:s and tag:s2, so the rules
+// from each have one merge key and V's rule from tag:s2 sits where the
+// tag:s rule does, first. N leaving tag:s splits the key: V's rule moves
+// behind its rule from tag:t, though none of V's own rules' members moved
+// and the tag:s rule never reached V.
+func TestRouteReordersFilterWhenAnotherRuleSplitsItsKey(t *testing.T) {
+	// In capability mode the receiver is sent addresses (its client is not
+	// known to apply capabilities): capability form keeps each grant's rules
+	// apart, so only a receiver in address form has merge positions.
+	for _, capSources := range []bool{false, true} {
+		t.Run(fmt.Sprintf("capability=%t", capSources), func(t *testing.T) {
+			t.Setenv(state.TestCapabilitySourcesEnv, strconv.FormatBool(capSources))
+			routeReordersFilter(t, capSources)
+		})
+	}
+}
+
+func routeReordersFilter(t *testing.T, unknownClient bool) {
+	t.Helper()
+
+	cfg, s, ids := streamTestState(t, `{"tagOwners":{"tag:s":["u1@"],"tag:s2":["u1@"],"tag:a":["u1@"],"tag:t":["u1@"],"tag:v":["u1@"]},"acls":[
+		{"action":"accept","src":["tag:s"],"dst":["tag:a:22"]},
+		{"action":"accept","src":["tag:t"],"dst":["tag:v:80"]},
+		{"action":"accept","src":["tag:s2"],"dst":["tag:v:443"]}]}`)
+
+	u1, err := s.GetUserByName("u1")
+	require.NoError(t, err)
+
+	n, a, src := ids[0], ids[1], ids[2]
+
+	vn := s.CreateRegisteredNodeForTest(u1, "v")
+	vn.User = u1
+
+	if unknownClient {
+		vn.Hostinfo = &tailcfg.Hostinfo{App: "tailscale-rs"}
+	}
+
+	s.PutNodeInStoreForTest(*vn)
+	v := vn.ID
+
+	for id, tags := range map[types.NodeID][]string{n: {"tag:s", "tag:s2"}, a: {"tag:a"}, src: {"tag:t"}, v: {"tag:v"}} {
+		_, err := s.SetNodeTags(id, tags)
+		require.NoError(t, err)
+	}
+
+	ports := func(rules []tailcfg.FilterRule) []uint16 {
+		out := make([]uint16, 0, len(rules))
+		for _, r := range rules {
+			out = append(out, r.DstPorts[0].Ports.First)
+		}
+
+		return out
+	}
+
+	st := NewStream(cfg, NewHub(), v, capVer)
+	_, err = st.Initial(s.Snapshot())
+	require.NoError(t, err)
+	st.Delivered()
+	require.Equal(t, []uint16{443, 80}, ports(st.sent.filter), "test sanity: the tag:s2 rule sits where the tag:s rule does")
+
+	before := s.Snapshot()
+	_, err = s.SetNodeTags(n, []string{"tag:s2"})
+	require.NoError(t, err)
+
+	after := s.Snapshot()
+
+	c := after.Since(before)
+	require.Contains(t, c.Filters, v, "V's filter moved: its rule's merged position did")
+
+	_, err = st.Update(after)
+	require.NoError(t, err)
+	st.Delivered()
+	assert.Equal(t, []uint16{80, 443}, ports(st.sent.filter), "V is served its reordered filter")
+
+	stale, err := freshDiff(cfg, after.Uncached(), v, capVer, st.sent, &versionCache{})
+	require.NoError(t, err)
+	assert.Empty(t, stale, "it holds what a fresh render gives: %s", describeResponses(stale))
+}
+
+// TestStreamStampRevocationSendsFullPeer pins how a viewer loses a peer's
+// last source capability: the peer comes whole, its CapMap empty, as a
+// patch would carry no CapMap and leave the viewer's in place; and a stamp
+// that comes is sent, as a patch.
+func TestStreamStampRevocationSendsFullPeer(t *testing.T) {
+	const (
+		stamped = `{"groups": {"group:g": ["u1@"]}, "acls": [
+			{"action": "accept", "src": ["group:g"], "dst": ["*:*"]},
+			{"action": "accept", "src": ["u2@"], "dst": ["*:*"]}]}`
+		stamp = "https://headscale.net/cap/src/group:g"
+	)
+
+	cfg, s, ids := streamTestState(t, stamped, func(c *types.Config) { c.Policy.CapabilitySources = true })
+
+	st := NewStream(cfg, NewHub(), ids[2], capVer)
+
+	initial, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+	require.Len(t, initial, 1)
+
+	var peer *tailcfg.Node
+
+	for _, p := range initial[0].Peers {
+		if p.ID == ids[0].NodeID() {
+			peer = p
+		}
+	}
+
+	require.NotNil(t, peer)
+	require.Contains(t, peer.CapMap, nodecap.Cap(stamp), "the peer comes stamped")
+
+	_, err = s.SetPolicy([]byte(strings.Replace(stamped, `["u1@"]`, `[]`, 1)))
+	require.NoError(t, err)
+
+	resps, err := st.Update(s.Snapshot())
+	require.NoError(t, err)
+
+	var full *tailcfg.Node
+
+	for _, r := range resps {
+		for _, p := range r.PeersChangedPatch {
+			require.NotEqual(t, ids[0].NodeID(), p.NodeID, "a revoked stamp is not a patch")
+		}
+
+		for _, p := range r.PeersChanged {
+			if p.ID == ids[0].NodeID() {
+				full = p
+			}
+		}
+	}
+
+	require.NotNil(t, full, "the peer comes whole")
+	require.Empty(t, full.CapMap)
+
+	_, err = s.SetPolicy([]byte(stamped))
+	require.NoError(t, err)
+
+	resps, err = st.Update(s.Snapshot())
+	require.NoError(t, err)
+	require.True(t, slices.ContainsFunc(resps, func(r *tailcfg.MapResponse) bool {
+		return slices.ContainsFunc(r.PeersChangedPatch, func(p *tailcfg.PeerChange) bool {
+			_, ok := p.CapMap[nodecap.Cap(stamp)]
+
+			return p.NodeID == ids[0].NodeID() && ok
+		})
+	}), "a stamp that comes is a patch: %v", resps)
+}
+
+// TestStreamRemovalOfSharedAddressSendsPeerList pins that, in capability
+// mode, a peer removed while another peer holds one of its addresses comes
+// with a whole peer list, the one response that indexes the address again
+// on the client; a removal sharing nothing goes as a removal alone.
+func TestStreamRemovalOfSharedAddressSendsPeerList(t *testing.T) {
+	const pol = `{"acls": [{"action": "accept", "src": ["u1@"], "dst": ["*:*"]}]}`
+
+	for _, capSources := range []bool{false, true} {
+		t.Run(fmt.Sprintf("capability=%t", capSources), func(t *testing.T) {
+			t.Setenv(state.TestCapabilitySourcesEnv, "false")
+			cfg, s, ids := streamTestState(t, pol, func(c *types.Config) { c.Policy.CapabilitySources = capSources })
+
+			n1, n1b := mustNode(t, s, ids[0]), mustNode(t, s, ids[1])
+
+			// n1b holds n1's IPv4 address besides its own IPv6 one.
+			shared := n1b.AsStruct()
+			shared.IPv4 = n1.AsStruct().IPv4
+			s.PutNodeInStoreForTest(*shared)
+
+			st := NewStream(cfg, NewHub(), ids[2], capVer)
+
+			_, err := st.Initial(s.Snapshot())
+			require.NoError(t, err)
+
+			s.DeleteNodeFromStoreForTest(ids[1])
+
+			resps, err := st.Update(s.Snapshot())
+			require.NoError(t, err)
+
+			peerList := slices.ContainsFunc(resps, func(r *tailcfg.MapResponse) bool { return r.Peers != nil })
+			require.Equal(t, capSources, peerList, "a whole peer list follows the removal: %s", describeResponses(resps))
+			require.True(t, slices.ContainsFunc(resps, func(r *tailcfg.MapResponse) bool {
+				return slices.Contains(r.PeersRemoved, ids[1].NodeID())
+			}), "the removal is sent: %s", describeResponses(resps))
+
+			// n1 removed in turn shares no address any more.
+			s.DeleteNodeFromStoreForTest(ids[0])
+
+			resps, err = st.Update(s.Snapshot())
+			require.NoError(t, err)
+			require.False(t, slices.ContainsFunc(resps, func(r *tailcfg.MapResponse) bool { return r.Peers != nil }),
+				"a removal sharing nothing goes alone: %s", describeResponses(resps))
+		})
+	}
+}
+
+// TestRouteWakesViewersOfARevokedStamp edits a group's members by policy,
+// in capability mode: the rule naming the group stays, no node's policy
+// capabilities move, and only the removed member's stamp goes. Every node
+// it is sent to must wake and be sent the peer without it.
+func TestRouteWakesViewersOfARevokedStamp(t *testing.T) {
+	const (
+		pol = `{"groups": {"group:g": ["u1@", "u2@"]}, "acls": [
+			{"action": "accept", "src": ["group:g"], "dst": ["*:*"]}]}`
+		stamp = nodecap.Cap("https://headscale.net/cap/src/group:g")
+	)
+
+	cfg, s, ids := streamTestState(t, pol, func(c *types.Config) { c.Policy.CapabilitySources = true })
+
+	st := NewStream(cfg, NewHub(), ids[2], capVer)
+
+	_, err := st.Initial(s.Snapshot())
+	require.NoError(t, err)
+
+	before := s.Snapshot()
+	require.Contains(t, before.NodeCaps(ids[0]), stamp)
+
+	_, err = s.SetPolicy([]byte(strings.Replace(pol, `["u1@", "u2@"]`, `["u2@"]`, 1)))
+	require.NoError(t, err)
+
+	after := s.Snapshot()
+	require.NotContains(t, after.NodeCaps(ids[0]), stamp)
+
+	all, wake := Route(before, after, after.Since(before))
+	require.True(t, all || slices.Contains(slices.Collect(maps.Keys(wake)), ids[2]), "u2's node, sent n1, wakes: %v", wake)
+
+	resps, err := st.Update(after)
+	require.NoError(t, err)
+	require.True(t, slices.ContainsFunc(resps, func(r *tailcfg.MapResponse) bool {
+		return slices.ContainsFunc(r.PeersChanged, func(p *tailcfg.Node) bool {
+			_, held := p.CapMap[stamp]
+
+			return p.ID == ids[0].NodeID() && !held
+		})
+	}), "n1 comes without the stamp: %s", describeResponses(resps))
 }

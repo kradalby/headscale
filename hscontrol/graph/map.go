@@ -159,7 +159,12 @@ func (m *Map[K, V]) Cursor() *Map[K, V] {
 
 // Changes returns the keys whose entry differs between old and m, each
 // once. It reads the edit log when it can and compares every key when it
-// cannot, so it is always correct; old may be nil.
+// cannot; with an equality that decides changes the two agree, and with
+// none (Never, or a Map that never had one) the log names the keys the
+// edits between wrote when it reaches old, and comparison names every key
+// either side holds. old may be nil. old must hold entries: a [Cursor]
+// is a token for [Map.ChangedSince] only, and what [Changes] answers
+// from one is nothing the package promises.
 func Changes[K comparable, V any](old, m *Map[K, V]) []K {
 	if m == old {
 		return nil
@@ -282,8 +287,8 @@ func (e *MapEdit[K, V]) touch(k K) {
 	}
 }
 
-// Done returns the edited Map, or the Map the edit started from when no
-// entry ends up different from it.
+// Done returns the edited Map, or the Map the edit started from — nil
+// included — when no entry ends up different from it.
 func (e *MapEdit[K, V]) Done() *Map[K, V] {
 	eq := e.base.eqOr(nil)
 
@@ -298,7 +303,7 @@ func (e *MapEdit[K, V]) Done() *Map[K, V] {
 		}
 	}
 
-	if len(changed) == 0 && e.base != nil {
+	if len(changed) == 0 {
 		return e.base
 	}
 
@@ -361,11 +366,45 @@ type Grouped[K cmp.Ordered, V any, G comparable] struct {
 // building a set.
 const smallGroupList = 16
 
+// with returns a copy of keys with k at i, in an array of its length: the
+// one copy an edit of a published list costs.
+func with[K any](keys []K, i int, k K) []K {
+	out := make([]K, len(keys)+1)
+	copy(out, keys[:i])
+	out[i] = k
+	copy(out[i+1:], keys[i:])
+
+	return out
+}
+
+// without returns a copy of keys without the key at i, in an array of its
+// length.
+func without[K any](keys []K, i int) []K {
+	out := make([]K, len(keys)-1)
+	copy(out, keys[:i])
+	copy(out[i:], keys[i+1:])
+
+	return out
+}
+
+// exact returns keys in an array of their length. Group lists are copied on
+// every edit and shared once published, readers keep them (peer views kept
+// for offline nodes), and room to grow would only be pinned with them.
+func exact[K any](keys []K) []K {
+	if cap(keys) == len(keys) {
+		return keys
+	}
+
+	return append(make([]K, 0, len(keys)), keys...)
+}
+
 // GroupBy groups the keys of in by groupsOf, which names every group an
 // entry belongs to. Given its previous result, it moves only the keys that
-// changed since prev.In. sameGroups, when not nil, reports that an entry's
-// old and new value name the same groups, sparing groupsOf for a change
-// the grouping does not read.
+// changed since prev.In, by the Map's equality alone: groupsOf must not
+// put two values that equality calls equal into different groups, or a
+// key left in its old group lands in the wrong one. sameGroups, when not
+// nil, reports that an entry's old and new value name the same groups,
+// sparing groupsOf for a change the grouping does not read.
 func GroupBy[K cmp.Ordered, V any, G comparable](
 	prev Grouped[K, V, G],
 	in *Map[K, V],
@@ -383,7 +422,7 @@ func GroupBy[K cmp.Ordered, V any, G comparable](
 
 		for g, keys := range members {
 			slices.Sort(keys)
-			members[g] = slices.Compact(keys)
+			members[g] = exact(slices.Compact(keys))
 		}
 
 		return Grouped[K, V, G]{In: in, Groups: NewMap(slices.Equal[[]K], members)}
@@ -446,11 +485,11 @@ func GroupBy[K cmp.Ordered, V any, G comparable](
 			}
 
 			if i, found := slices.BinarySearch(keys, k); found {
-				if !owned {
-					keys = slices.Clone(keys)
+				if owned {
+					changed[g] = slices.Delete(keys, i, i+1)
+				} else {
+					changed[g] = without(keys, i)
 				}
-
-				changed[g] = slices.Delete(keys, i, i+1)
 			}
 		}
 
@@ -461,11 +500,11 @@ func GroupBy[K cmp.Ordered, V any, G comparable](
 			}
 
 			if i, found := slices.BinarySearch(keys, k); !found {
-				if !owned {
-					keys = slices.Clone(keys)
+				if owned {
+					changed[g] = slices.Insert(keys, i, k)
+				} else {
+					changed[g] = with(keys, i, k)
 				}
-
-				changed[g] = slices.Insert(keys, i, k)
 			}
 		}
 	}
@@ -476,7 +515,7 @@ func GroupBy[K cmp.Ordered, V any, G comparable](
 		if len(keys) == 0 {
 			e.Delete(g)
 		} else {
-			e.Set(g, keys)
+			e.Set(g, exact(keys))
 		}
 	}
 

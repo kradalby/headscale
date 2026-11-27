@@ -11,6 +11,13 @@ nodes](https://tailscale.com/docs/features/exit-nodes) for a tailnet.
   node. Use it to securely access the Internet on an untrusted Wi-Fi or to access online services that expect traffic
   from a specific IP address.
 
+!!! note "Nodes that announce routes are sent addresses"
+
+    A node that announces subnet or exit routes, approved or not, gets its whole packet filter with every source as
+    addresses, even with [capability sources](policy.md#capability-sources) on. When a node starts announcing routes, it
+    accepts ICMP more widely than its policy allows until it installs that filter, normally for one map request round
+    trip. See [ICMP window](policy.md#icmp-window-when-a-node-starts-announcing-routes).
+
 ## Subnet router
 
 The setup of a subnet router requires double opt-in, once from a subnet router and once on the control server to allow
@@ -255,6 +262,10 @@ tagged with `tag:exit1` while user `bob` can only use an exit node tagged with `
 
 A user who matches several `via` grants can use the exit nodes of all of them. A `via` grant does not hide exit nodes
 from a user who also has a rule that allows access to the internet without `via`. Such a user can use all exit nodes.
+
+A grant with `via` accepts only prefixes, hosts and `autogroup:internet` as `dst`, and no prefix that overlaps the
+Tailscale address ranges, except the 4via6 range. A policy that uses anything else is refused, and a stored one stops
+Headscale at startup; see [refused policies](policy.md#refused-policies).
 
 ### Automatically approve an exit node with auto approvers
 

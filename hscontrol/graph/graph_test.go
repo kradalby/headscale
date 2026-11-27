@@ -59,6 +59,37 @@ func TestDerivedRecomputesOnlyOnChange(t *testing.T) {
 	}
 }
 
+// TestUnreadDerivedRecomputes pins that cells are computed at commit, not
+// on read: a derived cell nothing reads still costs its computation at
+// every commit changing what it read.
+func TestUnreadDerivedRecomputes(t *testing.T) {
+	g := New()
+	a := g.NewInput("a", 1, Same[int])
+
+	runs := 0
+	_ = NewDerived(g, "unread", Same[int], func(s *Snapshot, _ int) int {
+		runs++
+
+		return s.Get(a)
+	})
+
+	_, err := g.Update(func(*Tx) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range 3 {
+		_, err := g.Update(func(tx *Tx) error { Set(tx, a, 10+i); return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if runs != 4 {
+		t.Fatalf("unread cell ran %d times over a first and three changing commits, want 4", runs)
+	}
+}
+
 func TestSnapshotsAreImmutable(t *testing.T) {
 	g := New()
 	a := g.NewInput("a", "x", Same[string])
@@ -180,9 +211,11 @@ func TestPanickingUpdateReleasesTheGraph(t *testing.T) {
 	}
 }
 
-// TestGetPanicsOnAnotherGraphsHandle reads a cell through a handle of
-// another graph: it must fail loudly, not return an empty value.
-func TestGetPanicsOnAnotherGraphsHandle(t *testing.T) {
+// TestGetPanicsOnAnotherGraphsHandleOfAnotherType reads a cell of another
+// type through a handle of another graph: only a type mismatch fails
+// loudly. A same-typed foreign handle reads this graph's cell silently
+// (TestGetReadsAnotherGraphsHandleOfTheSameType).
+func TestGetPanicsOnAnotherGraphsHandleOfAnotherType(t *testing.T) {
 	g, other := New(), New()
 	_ = g.NewInput("a", "x", Same[string])
 	n := other.NewInput("n", 1, Same[int])
@@ -196,6 +229,103 @@ func TestGetPanicsOnAnotherGraphsHandle(t *testing.T) {
 	}()
 
 	s.Get(n)
+}
+
+// TestGetReadsAnotherGraphsHandleOfTheSameType pins today's answer for a
+// handle of another graph whose cell holds the same type: Get cannot see
+// the handle is foreign and reads this graph's cell at its index,
+// silently. Only a handle of another type fails the assertion and panics
+// (TestGetPanicsOnAnotherGraphsHandleOfAnotherType). The day the package learns to
+// tell graphs apart, this pin is the test that changes.
+func TestGetReadsAnotherGraphsHandleOfTheSameType(t *testing.T) {
+	g, other := New(), New()
+	a := g.NewInput("a", 42, Same[int])
+	b := other.NewInput("b", 7, Same[int])
+
+	s, err := g.Update(func(*Tx) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := s.Get(a); got != 42 {
+		t.Fatalf("own handle reads %d, want 42", got)
+	}
+
+	if got := s.Get(b); got != 42 {
+		t.Fatalf("a foreign handle of the same type reads %d, want this graph's cell", got)
+	}
+
+	if rev := ChangedAt(s, b); rev != s.Rev() {
+		t.Fatalf("ChangedAt reads revision %d for a foreign handle", rev)
+	}
+}
+
+// TestSubscriberWokenAfterStore pins the promise the mapper's hub sits
+// on: a subscriber is woken only after the new snapshot is stored, so a
+// woken reader never renders the state its commit replaced. The seam
+// parks the writer between the store and the wake; a notify-before-store
+// bug makes the parked wake-up arrive, or the parked snapshot stay old,
+// on every run.
+func TestSubscriberWokenAfterStore(t *testing.T) {
+	g := New()
+	a := g.NewInput("a", 1, Same[int])
+
+	sub := g.Subscribe()
+
+	_, _ = g.Update(func(*Tx) error { return nil }) // rev 1
+
+	<-sub.C // drain the first wake-up
+
+	parked, release := make(chan struct{}), make(chan struct{})
+
+	afterStore = func() {
+		parked <- struct{}{}
+
+		<-release
+	}
+	defer func() { afterStore = nil }()
+
+	done := make(chan *Snapshot, 1)
+
+	go func() {
+		s, _ := g.Update(func(tx *Tx) error { Set(tx, a, 2); return nil })
+		done <- s
+	}()
+
+	select {
+	case <-parked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("writer never reached the seam")
+	}
+
+	// The parked commit is already readable: the store precedes the wake.
+	s := g.Snapshot()
+	if s.Rev() != 2 || s.Get(a) != 2 {
+		t.Fatalf("while parked, snapshot holds rev %d a=%d, want rev 2 a=2", s.Rev(), s.Get(a))
+	}
+
+	// No wake-up may arrive while the writer sits between store and notify.
+	select {
+	case <-sub.C:
+		t.Fatal("subscriber woken before the snapshot was stored")
+	default:
+	}
+
+	close(release)
+
+	select {
+	case <-sub.C:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber never woken after the commit")
+	}
+
+	if s := g.Snapshot(); s.Rev() != 2 || s.Get(a) != 2 {
+		t.Fatalf("after the wake, snapshot holds rev %d a=%d, want rev 2 a=2", s.Rev(), s.Get(a))
+	}
+
+	if s := <-done; s.Rev() != 2 {
+		t.Fatalf("writer returned rev %d, want 2", s.Rev())
+	}
 }
 
 // TestConcurrentUpdatesAndReaders commits from several writers while
@@ -916,5 +1046,249 @@ func BenchmarkMapChanges(b *testing.B) {
 				}
 			})
 		}
+	}
+}
+
+// TestGroupByListsHoldNoSpareRoom pins group lists at their length: they
+// are copied on every edit and shared once published, and readers keep
+// them (a peer view kept for an offline node), so spare capacity would
+// be pinned with them.
+func TestGroupByListsHoldNoSpareRoom(t *testing.T) {
+	in := NewMap[int, int](func(a, b int) bool { return a == b }, map[int]int{1: 0, 2: 0, 3: 0})
+	byGroup := func(_ int, g int) []int { return []int{g} }
+
+	grouped := GroupBy(Grouped[int, int, int]{}, in, byGroup, nil)
+
+	for k := 4; k < 40; k++ {
+		e := in.Edit()
+		e.Set(k, 0)
+
+		// Some commits move several keys into the group at once.
+		if k%3 == 0 {
+			e.Set(-k, 0)
+		}
+
+		if k%5 == 0 {
+			e.Delete(k - 1)
+		}
+
+		in = e.Done()
+		grouped = GroupBy(grouped, in, byGroup, nil)
+
+		if keys, _ := grouped.Groups.Get(0); cap(keys) != len(keys) {
+			t.Fatalf("after key %d: %d keys in an array of %d", k, len(keys), cap(keys))
+		}
+	}
+}
+
+// TestMapEditCostFollowsTheEditNotTheMap holds the Map's cost promise
+// where no machine load can touch it: an edit allocates the paths it
+// replaces — O(k log n) — never the Map's size, and a bigger Map adds only
+// its depth. A structural-sharing bug turns these counts into the size of
+// the Map.
+func TestMapEditCostFollowsTheEditNotTheMap(t *testing.T) {
+	build := func(n int) *Map[int, int] {
+		entries := make(map[int]int, n)
+		for i := range n {
+			entries[i] = i
+		}
+
+		return NewMap(Same[int], entries)
+	}
+
+	small, big := build(16), build(1<<16)
+
+	oneSmall := testing.AllocsPerRun(200, func() {
+		e := small.Edit()
+		e.Set(0, -1)
+		_ = e.Done()
+	})
+
+	oneBig := testing.AllocsPerRun(200, func() {
+		e := big.Edit()
+		e.Set(0, -1)
+		_ = e.Done()
+	})
+
+	// A whole-map copy of 65536 entries allocates as many times; one
+	// path of its tree is a handful.
+	if oneBig > 32 {
+		t.Fatalf("a one-key edit of 65536 entries allocates %.0f times", oneBig)
+	}
+
+	if oneBig > oneSmall+8 {
+		t.Fatalf("a one-key edit allocates %.0f times on 65536 entries, %.0f on 16; the depth of the tree must be all the size adds", oneBig, oneSmall)
+	}
+
+	sixteen := testing.AllocsPerRun(200, func() {
+		e := big.Edit()
+		for i := range 16 {
+			e.Set(i, -i)
+		}
+
+		_ = e.Done()
+	})
+
+	if sixteen > 16*oneBig {
+		t.Fatalf("an edit of 16 keys allocates %.0f times, over 16 times the %.0f of one", sixteen, oneBig)
+	}
+}
+
+// TestMapLogStaysBounded holds the Map's memory promise for the edit log:
+// a chain grows to twice mapLog, then its older half is dropped, so a
+// lineage however long holds at most 2*mapLog edits, and the half kept is
+// the newest one.
+func TestMapLogStaysBounded(t *testing.T) {
+	m := NewMap(Same[int], map[int]int{})
+
+	// ids[i] is the id of the Map edit i started from; version i+1's log
+	// entry for edit i+1 records ids[i].
+	ids := make([]uint64, 0, 3*mapLog)
+
+	for i := range 3 * mapLog {
+		base := m
+		e := base.Edit()
+		e.Set(i, 1)
+		m = e.Done()
+
+		ids = append(ids, base.id)
+
+		if m.log.depth > 2*mapLog {
+			t.Fatalf("edit %d holds a log of depth %d", i+1, m.log.depth)
+		}
+
+		if i+1 == 2*mapLog && m.log.depth != 2*mapLog {
+			t.Fatalf("edit %d holds a log of depth %d, want exactly 2*mapLog before the trim", i+1, m.log.depth)
+		}
+
+		if i+1 == 2*mapLog+1 && m.log.depth != mapLog {
+			t.Fatalf("edit %d holds a log of depth %d, want the older half dropped to mapLog", i+1, m.log.depth)
+		}
+
+		// Past the first trim the chain must reach mapLog back, never
+		// less, and hold exactly its depth in entries, the newest ones.
+		chain := 0
+
+		for e := m.log; e != nil; e = e.prev {
+			if want := ids[i-chain]; e.from != want {
+				t.Fatalf("edit %d: entry %d of the log names edit %d", i+1, chain, i-chain)
+			}
+
+			chain++
+		}
+
+		if chain != m.log.depth {
+			t.Fatalf("edit %d: the log holds %d entries, its depth says %d", i+1, chain, m.log.depth)
+		}
+
+		if i+1 > 2*mapLog && m.log.depth < mapLog {
+			t.Fatalf("edit %d holds a log of depth %d, short of mapLog", i+1, m.log.depth)
+		}
+	}
+}
+
+// TestCursorPinsNoEntries holds the Cursor's memory promise at its root:
+// the token holds neither entries nor a log, so a reader keeping one pins
+// nothing of the Map it stands for.
+func TestCursorPinsNoEntries(t *testing.T) {
+	m := NewMap(Same[int], map[int]int{1: 1, 2: 2})
+
+	e := m.Edit()
+	e.Set(3, 3)
+	next := e.Done()
+
+	if cur := next.Cursor(); cur.items != nil || cur.log != nil {
+		t.Fatal("a cursor holds what it must only stand for")
+	}
+}
+
+// TestMapOfNonIntegerKeys holds the hasher's promise — any comparable
+// key, hashed the way the runtime's maps do — against the integer keys
+// every other test uses: a string and a struct key go through the whole
+// Map API, edits, cursors and log included.
+func TestMapOfNonIntegerKeys(t *testing.T) {
+	base := NewMap(Same[int], map[string]int{"a": 1, "b": 2})
+
+	e := base.Edit()
+	e.Set("c", 3)
+	e.Delete("b")
+	e.Set("a", 10)
+	next := e.Done()
+
+	if got, ok := next.Get("a"); !ok || got != 10 {
+		t.Fatalf(`Get("a") = %d, %t`, got, ok)
+	}
+
+	if _, ok := next.Get("b"); ok {
+		t.Fatal(`deleted "b" still there`)
+	}
+
+	if next.Len() != 2 {
+		t.Fatalf("Len = %d", next.Len())
+	}
+
+	keys, _ := next.ChangedSince(base)
+	slices.Sort(keys)
+
+	if !slices.Equal(keys, []string{"a", "b", "c"}) {
+		t.Fatalf("ChangedSince = %v", keys)
+	}
+
+	if keys, _ := next.ChangedSince(base.Cursor()); !slices.Equal(slices.Sorted(slices.Values(keys)), []string{"a", "b", "c"}) {
+		t.Fatalf("ChangedSince from a cursor = %v", keys)
+	}
+
+	sorted := func(keys []string) []string {
+		out := slices.Clone(keys)
+		slices.Sort(out)
+
+		return out
+	}
+
+	if got := sorted(Changes(base, next)); !slices.Equal(got, []string{"a", "b", "c"}) {
+		t.Fatalf("Changes = %v", got)
+	}
+
+	type point struct{ x, y int }
+
+	pbase := NewMap(Same[int], map[point]int{{1, 2}: 1})
+	pe := pbase.Edit()
+	pe.Set(point{3, 4}, 2)
+	pnext := pe.Done()
+
+	if keys, _ := pnext.ChangedSince(pbase); !slices.Equal(keys, []point{{3, 4}}) {
+		t.Fatalf("ChangedSince of struct keys = %v", keys)
+	}
+
+	if got, ok := pnext.Get(point{1, 2}); !ok || got != 1 {
+		t.Fatalf("Get of a struct key = %d, %t", got, ok)
+	}
+}
+
+// BenchmarkGroupByEdit moves one key into a group of n: one copy of the
+// group's list, at its length, is what the edit should cost.
+func BenchmarkGroupByEdit(b *testing.B) {
+	byGroup := func(_ int, g int) []int { return []int{g} }
+
+	for _, n := range []int{6, 101, 1002, 10002} {
+		b.Run(fmt.Sprintf("len=%d", n), func(b *testing.B) {
+			m := make(map[int]int, n)
+			for i := range n {
+				m[2*i] = 0
+			}
+
+			in := NewMap[int, int](func(a, b int) bool { return a == b }, m)
+			grouped := GroupBy(Grouped[int, int, int]{}, in, byGroup, nil)
+
+			e := in.Edit()
+			e.Set(1, 0)
+			next := e.Done()
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				GroupBy(grouped, next, byGroup, nil)
+			}
+		})
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
+	"tailscale.com/version"
 )
 
 func TestInitialMapNotStarvedByReconnectStorm(t *testing.T) {
@@ -92,7 +93,7 @@ func TestInitialMapNotStarvedByReconnectStorm(t *testing.T) {
 				}
 			}()
 
-			err := s.UpdateNodeFromMapRequest(node.ID(), tailcfg.MapRequest{NodeKey: node.NodeKey(), Hostinfo: &tailcfg.Hostinfo{Hostname: fmt.Sprintf("reconnect-%d", node.ID()), OS: "linux"}})
+			err := s.UpdateNodeFromMapRequest(node.ID(), tailcfg.MapRequest{NodeKey: node.NodeKey(), Hostinfo: &tailcfg.Hostinfo{Hostname: fmt.Sprintf("reconnect-%d", node.ID()), OS: "linux", GoVersion: runtime.Version(), IPNVersion: version.Long()}})
 			if err != nil {
 				t.Errorf("updating reconnect report: %v", err)
 				return

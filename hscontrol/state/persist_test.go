@@ -1313,7 +1313,7 @@ func TestConcurrentDeletesShareACommit(t *testing.T) {
 	require.NoError(t, err)
 
 	user := database.CreateUserForTest("delete-batch-user")
-	nodes := database.CreateNodesForTest(user, 2, "delete-batch-node")
+	nodes := database.CreateRegisteredNodesForTest(user, 2, "delete-batch-node")
 
 	require.NoError(t, database.Close())
 
@@ -1974,6 +1974,43 @@ func TestReauthPublicationExpiresPastSweepWatermark(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestExpireExpiredNodesTakesAConnectedNodeOffline pins the sweep itself:
+// a key that expires by the clock alone leaves the online bit until the
+// sweep recomputes it, and the sweep's write stops there — the node's
+// sessions stay as they are.
+func TestExpireExpiredNodesTakesAConnectedNodeOffline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		_, s, id := persistTestSetup(t)
+		t.Cleanup(func() { _ = s.Close() })
+
+		_, err := s.SetNodeExpiry(id, new(time.Now().Add(time.Hour)))
+		require.NoError(t, err)
+		s.Connect(id)
+
+		node, ok := s.GetNodeByID(id)
+		require.True(t, ok)
+		require.True(t, node.Online(), "test sanity: the node is online")
+
+		// The key expires with no write at all, as the clock passes it.
+		watermark := time.Now()
+
+		<-time.After(90 * time.Minute)
+
+		stale, ok := s.GetNodeByID(id)
+		require.True(t, ok)
+		require.True(t, stale.IsExpired())
+		require.True(t, stale.Online(), "expiry by the clock alone has not written anything")
+
+		_, found := s.ExpireExpiredNodes(watermark)
+		assert.True(t, found, "the sweep sees the node expired since the last check")
+
+		after, ok := s.GetNodeByID(id)
+		require.True(t, ok)
+		assert.False(t, after.Online(), "the sweep takes a connected node offline")
+		assert.Equal(t, 1, after.ActiveSessions(), "the sweep does not touch the node's sessions")
+	})
 }
 
 func BenchmarkPublishRegistrationUnchangedOwner(b *testing.B) {
@@ -2660,6 +2697,85 @@ func TestNewStateDiscardsOversizedHostinfo(t *testing.T) {
 	require.True(t, ok)
 	assert.False(t, nv.Hostinfo().Valid(),
 		"oversized Hostinfo is dropped until the node reports again")
+}
+
+// TestNewStateChecksNodeAddresses pins which stored addresses refuse a start.
+func TestNewStateChecksNodeAddresses(t *testing.T) {
+	const (
+		v4a, v4b = "100.64.0.1", "100.64.0.2"
+		v6a, v6b = "fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2"
+	)
+
+	for _, tt := range []struct {
+		name string
+		// ipv4 and ipv6 of nodes alpha and beta; nil stores NULL.
+		addrs   [2][2]any
+		wantErr []string
+	}{
+		{
+			name:    "shared IPv4",
+			addrs:   [2][2]any{{v4a, v6a}, {v4a, v6b}},
+			wantErr: []string{v4a, `"alpha"`, `"beta"`},
+		},
+		{
+			name:    "shared IPv6",
+			addrs:   [2][2]any{{v4a, v6a}, {v4b, v6a}},
+			wantErr: []string{v6a, `"alpha"`, `"beta"`},
+		},
+		{
+			name:    "no address",
+			addrs:   [2][2]any{{v4a, v6a}, {nil, nil}},
+			wantErr: []string{"no tailnet address", `"beta"`},
+		},
+		{
+			name:  "one family each",
+			addrs: [2][2]any{{v4a, nil}, {nil, v6b}},
+		},
+		{
+			name:    "outside the Tailscale ranges",
+			addrs:   [2][2]any{{v4a, v6a}, {"10.0.0.2", "2001:db8::2"}},
+			wantErr: []string{"outside the Tailscale ranges", `"beta"`, "10.0.0.2", "2001:db8::2"},
+		},
+		{
+			name:    "one family outside",
+			addrs:   [2][2]any{{v4a, v6a}, {"10.0.0.2", v6b}},
+			wantErr: []string{"outside the Tailscale ranges", `"beta"`, "10.0.0.2"},
+		},
+		{
+			name:    "in the ChromeOS block",
+			addrs:   [2][2]any{{v4a, v6a}, {"100.115.92.2", v6b}},
+			wantErr: []string{"outside the Tailscale ranges", `"beta"`, "100.115.92.2"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dbPath := t.TempDir() + "/headscale.db"
+			cfg := persistTestConfig(dbPath)
+			database, err := db.NewHeadscaleDatabase(cfg)
+			require.NoError(t, err)
+
+			user := database.CreateUserForTest("address-user")
+
+			for i, hostname := range []string{"alpha", "beta"} {
+				node := database.CreateRegisteredNodeForTest(user, hostname)
+				require.NoError(t, database.DB.Exec("UPDATE nodes SET ipv4 = ?, ipv6 = ? WHERE id = ?",
+					tt.addrs[i][0], tt.addrs[i][1], node.ID).Error)
+			}
+
+			require.NoError(t, database.Close())
+
+			s, err := NewState(cfg)
+			if tt.wantErr == nil {
+				require.NoError(t, err)
+				require.NoError(t, s.Close())
+
+				return
+			}
+
+			for _, want := range tt.wantErr {
+				require.ErrorContains(t, err, want)
+			}
+		})
+	}
 }
 
 // TestBootKeepsHostinfoTheMapPathStored pins that the startup check keeps
@@ -4091,7 +4207,7 @@ func TestLoadedDuplicateNamesAreResolvedInMemory(t *testing.T) {
 
 	ids := make([]types.NodeID, 0, len(stored))
 	for _, name := range stored {
-		node := database.CreateNodeForTest(user)
+		node := database.CreateRegisteredNodeForTest(user)
 		require.NoError(t, database.DB.Model(&types.Node{}).Where("id = ?", node.ID).
 			Update("given_name", name).Error)
 		ids = append(ids, node.ID)
@@ -4274,7 +4390,7 @@ func TestConcurrentDeleteNodesShareNodeStoreBatch(t *testing.T) {
 	require.NoError(t, err)
 
 	user := database.CreateUserForTest("delete-batch-user")
-	nodes := database.CreateNodesForTest(user, 2, "delete-batch-node")
+	nodes := database.CreateRegisteredNodesForTest(user, 2, "delete-batch-node")
 
 	require.NoError(t, database.Close())
 
@@ -4804,6 +4920,56 @@ func TestNewStateEmptyPolicyFile(t *testing.T) {
 	s, err := NewState(cfg)
 	require.NoError(t, err)
 	require.NoError(t, s.Close())
+}
+
+// refusedPolicyDocuments are documents headscale refuses at validation,
+// as the hosted service does: a tag owner or a group member naming every
+// user of a domain, and a via grant whose destination is not a prefix, a
+// host or autogroup:internet, or lies in the Tailscale address ranges.
+// What a refusal means for a stored document is the same for each, so
+// the tests below table-drive them.
+var refusedPolicyDocuments = map[string]string{
+	"tag-owner-wildcard":    `{"tagOwners": {"tag:web": ["user:*@example.com"]}}`,
+	"group-member-wildcard": `{"groups": {"group:eng": ["user:*@example.com"]}}`,
+	"via-non-ip-dst":        `{"tagOwners": {"tag:web": []}, "grants": [{"src": ["*"], "dst": ["*"], "via": ["tag:web"], "ip": ["*"]}]}`,
+	"via-tailscale-ip-dst":  `{"tagOwners": {"tag:web": []}, "grants": [{"src": ["*"], "dst": ["100.64.0.0/10"], "via": ["tag:web"], "ip": ["*"]}]}`,
+}
+
+// TestNewStateRefusesStoredRefusedPolicy pins that a document headscale
+// refuses at validation stops startup in either policy mode: an upgrade
+// that leaves one stored cannot serve. Recovery is a corrected document:
+// edit the file, or store one with `headscale policy set
+// --bypass-server-and-access-database-directly` while the server is
+// stopped.
+func TestNewStateRefusesStoredRefusedPolicy(t *testing.T) {
+	for name, pol := range refusedPolicyDocuments {
+		t.Run(name+"/database", func(t *testing.T) {
+			cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+
+			// As an upgrade leaves it: stored without validation.
+			d, err := db.NewHeadscaleDatabase(cfg)
+			require.NoError(t, err)
+			_, err = d.SetPolicy(pol)
+			require.NoError(t, err)
+			require.NoError(t, d.Close())
+
+			_, err = NewState(cfg)
+			require.Error(t, err, "a refused document must stop startup")
+		})
+
+		t.Run(name+"/file", func(t *testing.T) {
+			cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+			cfg.Policy = types.PolicyConfig{
+				Mode: types.PolicyModeFile,
+				Path: filepath.Join(t.TempDir(), "policy.hujson"),
+			}
+
+			require.NoError(t, os.WriteFile(cfg.Policy.Path, []byte(pol), 0o600))
+
+			_, err := NewState(cfg)
+			require.Error(t, err, "a refused document must stop startup")
+		})
+	}
 }
 
 func TestNodeNameReplayCompat(t *testing.T) {

@@ -25,6 +25,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/mapper"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/prometheus/client_golang/prometheus"
@@ -2658,6 +2659,153 @@ func (w *breakableResponseWriter) removed(t *testing.T) []tailcfg.NodeID {
 	return out
 }
 
+// frames returns every frame written so far, raw.
+func (w *breakableResponseWriter) frames() [][]byte {
+	w.mu.Lock()
+	body := slices.Clone(w.body)
+	w.mu.Unlock()
+
+	var out [][]byte
+
+	for len(body) >= reservedResponseHeaderSize {
+		n := int(binary.LittleEndian.Uint32(body))
+		if len(body) < reservedResponseHeaderSize+n {
+			break
+		}
+
+		out = append(out, body[reservedResponseHeaderSize:reservedResponseHeaderSize+n])
+		body = body[reservedResponseHeaderSize+n:]
+	}
+
+	return out
+}
+
+// TestChunkedFilterAfterFailedWrite runs real sessions of a node in
+// capability mode whose filter moves while its update fails to write. The
+// session ends, the edit never reaches the client, and the next session's
+// first response must leave the client holding exactly what a fresh
+// session is sent, whatever it held: the chunks of the session before, as
+// a client keeping chunks across sessions holds them (tailscale-rs), or
+// none (the Go client).
+func TestChunkedFilterAfterFailedWrite(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		fails bool
+	}{{name: "write_fails", fails: true}, {name: "written"}} {
+		t.Run(tt.name, func(t *testing.T) {
+			app := createTestApp(t, func(cfg *types.Config) { cfg.Policy.CapabilitySources = true })
+			user := app.state.CreateUserForTest("chunk-user")
+			viewer := app.state.CreateRegisteredNodeForTest(user, "chunk-viewer")
+			app.state.CreateRegisteredNodeForTest(user, "chunk-peer")
+			require.NoError(t, app.state.Close())
+
+			var err error
+
+			app.state, err = state.NewState(app.cfg)
+			require.NoError(t, err)
+			app.mapHub.Close()
+			app.mapHub = mapper.NewHub()
+			app.mapHub.Watch(app.state)
+			t.Cleanup(func() { _ = app.state.Close() })
+
+			policy := func(ports ...string) {
+				t.Helper()
+
+				grants := make([]string, 0, len(ports))
+				for _, p := range ports {
+					grants = append(grants, `{"src":["chunk-user@"],"dst":["chunk-user@"],"ip":["tcp:`+p+`"]}`)
+				}
+
+				_, err := app.state.SetPolicy([]byte(`{"grants":[` + strings.Join(grants, ",") + `]}`))
+				require.NoError(t, err)
+			}
+
+			policy("22", "80", "443")
+			require.True(t, app.state.Snapshot().CapabilitySources())
+
+			serve := func(w http.ResponseWriter) (context.CancelFunc, <-chan struct{}) {
+				nv, ok := app.state.GetNodeByID(viewer.ID)
+				require.True(t, ok)
+
+				ctx, cancel := context.WithCancel(t.Context())
+				done := make(chan struct{})
+
+				go func() {
+					ww := middleware.NewWrapResponseWriter(w, 2)
+					app.newMapSession(ctx, tailcfg.MapRequest{Stream: true, Version: tailcfg.CurrentCapabilityVersion}, ww, nv).serveLongPoll()
+					close(done)
+				}()
+
+				return cancel, done
+			}
+
+			// apply applies the frames w carries past the first skip to
+			// held, as a client does, returning how many there were.
+			apply := func(held *policyv2.FilterChunks, w *breakableResponseWriter, skip int) int {
+				t.Helper()
+
+				frames := w.frames()
+				for _, raw := range frames[skip:] {
+					var resp tailcfg.MapResponse
+					require.NoError(t, json.Unmarshal(raw, &resp))
+
+					*held = held.ApplyResponse(&resp)
+				}
+
+				return len(frames)
+			}
+
+			first := newBreakableResponseWriter()
+			cancel, done := serve(first)
+			require.Eventually(t, first.written, 5*time.Second, 10*time.Millisecond)
+
+			var kept policyv2.FilterChunks
+
+			seen := apply(&kept, first, 0)
+			require.NotZero(t, kept.Len(), "test sanity: the first session sent chunks")
+
+			first.broken.Store(tt.fails)
+			policy("22", "8080")
+
+			if !tt.fails {
+				require.Eventually(t, func() bool { return len(first.frames()) > seen }, 5*time.Second, 10*time.Millisecond)
+				apply(&kept, first, seen)
+				cancel()
+			}
+
+			require.Eventually(t, func() bool { return !app.mapHub.IsConnected(viewer.ID) }, 5*time.Second, 10*time.Millisecond,
+				"the first session must end")
+
+			// The second session ends the first's reconnect grace.
+			firstCancel, firstDone := cancel, done
+			second := newBreakableResponseWriter()
+			cancel, done = serve(second)
+
+			firstCancel()
+			<-firstDone
+
+			t.Cleanup(func() { app.mapHub.Close(); cancel(); <-done })
+			require.Eventually(t, second.written, 5*time.Second, 10*time.Millisecond)
+			require.Contains(t, string(second.frames()[0]), `"*":null`, "the first response clears what the client held")
+
+			var empty policyv2.FilterChunks
+
+			apply(&kept, second, 0)
+			apply(&empty, second, 0)
+
+			nv, ok := app.state.GetNodeByID(viewer.ID)
+			require.True(t, ok)
+
+			fresh, err := mapper.NewStream(app.cfg, mapper.NewHub(), nv.ID(), tailcfg.CurrentCapabilityVersion).Initial(app.state.Snapshot())
+			require.NoError(t, err)
+
+			want := policyv2.FilterChunks{}.ApplyResponse(fresh[0])
+			require.True(t, kept.Equal(want), "a client keeping chunks across sessions holds %v, a fresh session sends %v", kept.Names(), want.Names())
+			require.True(t, empty.Equal(want), "a client starting each session empty holds %v, a fresh session sends %v", empty.Names(), want.Names())
+		})
+	}
+}
+
 // TestRemovalHistoryFollowsWhatWasWritten runs real sessions of a node
 // whose peer is deleted. When the update removing the peer fails to write,
 // or only its flush fails, the next session must announce the removal
@@ -3195,7 +3343,7 @@ func TestSlowOverlappingStreamsRevokePolicyWithQueuedPings(t *testing.T) {
 		require.Eventually(t, func() bool { allow(r); return len(frames(r.writer)) > 0 }, 2*time.Second, time.Millisecond)
 
 		initial := frames(r.writer)[0]
-		require.NotEmpty(t, initial.PacketFilters["base"])
+		require.NotEmpty(t, policyv2.FilterChunks{}.ApplyResponse(&initial).Rules())
 		require.NotNil(t, initial.SSHPolicy)
 		require.NotEmpty(t, initial.SSHPolicy.Rules)
 	}
@@ -3217,11 +3365,14 @@ func TestSlowOverlappingStreamsRevokePolicyWithQueuedPings(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, r := range []running{first, second} {
-		select {
-		case <-r.writer.waiting:
-		case <-time.After(2 * time.Second):
-			t.Fatal("slow stream never blocked")
-		}
+		require.Eventually(t, func() bool {
+			select {
+			case <-r.writer.waiting:
+				return true
+			default:
+				return false
+			}
+		}, 10*time.Second, time.Millisecond, "slow stream never blocked")
 	}
 
 	const pingOne, pingTwo = "https://example.com/slow-one", "https://example.com/slow-two"
@@ -3234,8 +3385,15 @@ func TestSlowOverlappingStreamsRevokePolicyWithQueuedPings(t *testing.T) {
 	restrictive := func(rs []tailcfg.MapResponse) bool {
 		packet, ssh := false, false
 
+		// What the client enforces after each frame, in either mode: the
+		// whole filter as "base", or the chunks it holds.
+		var held policyv2.FilterChunks
+
 		for _, r := range rs {
-			if filter, present := r.PacketFilters["base"]; present {
+			held = held.ApplyResponse(&r)
+
+			if r.PacketFilters != nil {
+				filter := held.Rules()
 				if packet {
 					require.Empty(t, filter, "a later frame restored packet access")
 				}
@@ -3279,9 +3437,10 @@ func TestSlowOverlappingStreamsRevokePolicyWithQueuedPings(t *testing.T) {
 
 	replacementInitial := frames(replacement.writer)[0]
 	require.NotNil(t, replacementInitial.Node, "the replacement opens with its complete self entry")
-	replacementFilter, present := replacementInitial.PacketFilters["base"]
-	require.True(t, present, "the replacement initial map explicitly carries the revoked filter")
-	require.Empty(t, replacementFilter)
+	require.NotNil(t, replacementInitial.PacketFilters, "the replacement initial map explicitly carries the revoked filter")
+
+	stale := policyv2.FilterChunks{}.Apply(map[string][]tailcfg.FilterRule{"base": {{SrcIPs: []string{"*"}}}})
+	require.Empty(t, stale.ApplyResponse(&replacementInitial).Rules(), "whatever the client held")
 	require.NotNil(t, replacementInitial.SSHPolicy)
 	require.Empty(t, replacementInitial.SSHPolicy.Rules, "the replacement starts with SSH revoked")
 	assert.Equal(t, []string{pingOne, pingTwo}, pings(frames(first.writer)))

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -15,7 +17,6 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/db"
-	"github.com/juanfont/headscale/hscontrol/policy"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog"
@@ -132,7 +133,7 @@ func TestSetPolicyRejectsWhatFailsAsPublished(t *testing.T) {
 	var (
 		before      *Snapshot
 		src         []byte
-		filter      policy.PolicyManager
+		was         []tailcfg.FilterRule
 		interleaved bool
 	)
 
@@ -142,7 +143,13 @@ func TestSetPolicyRejectsWhatFailsAsPublished(t *testing.T) {
 		require.NoError(t, s.refreshUsers())
 
 		before = s.Snapshot()
-		src, filter = before.PolicySource(), before.Policy()
+		src = before.PolicySource()
+
+		var err error
+
+		was, err = before.FilterForNode(nodeID)
+		require.NoError(t, err)
+
 		interleaved = true
 	}
 
@@ -156,13 +163,7 @@ func TestSetPolicyRejectsWhatFailsAsPublished(t *testing.T) {
 	assert.Equal(t, before.Rev(), after.Rev(), "a refused document is never published, not even briefly")
 	assert.Equal(t, string(src), string(after.PolicySource()))
 
-	node, ok := after.GetNode(nodeID)
-	require.True(t, ok)
-
-	was, err := filter.FilterForNode(node)
-	require.NoError(t, err)
-
-	is, err := after.Policy().FilterForNode(node)
+	is, err := after.FilterForNode(nodeID)
 	require.NoError(t, err)
 	assert.Equal(t, was, is, "the live filter must stay the last good one")
 }
@@ -201,7 +202,7 @@ func TestSetPolicyEnforcesPolicyTests(t *testing.T) {
 			node, ok := before.GetNode(nodeID)
 			require.True(t, ok)
 
-			wasFilter, err := before.Policy().FilterForNode(node)
+			wasFilter, err := before.FilterForNode(nodeID)
 			require.NoError(t, err)
 
 			wasSSH, err := s.SSHPolicy(node)
@@ -214,7 +215,7 @@ func TestSetPolicyEnforcesPolicyTests(t *testing.T) {
 			assert.Equal(t, before.Rev(), after.Rev(), "a document failing its tests is never published, not even briefly")
 			assert.Equal(t, string(before.PolicySource()), string(after.PolicySource()))
 
-			isFilter, err := after.Policy().FilterForNode(node)
+			isFilter, err := after.FilterForNode(nodeID)
 			require.NoError(t, err)
 			assert.Equal(t, wasFilter, isFilter)
 
@@ -223,6 +224,92 @@ func TestSetPolicyEnforcesPolicyTests(t *testing.T) {
 			assert.Equal(t, wasSSH, isSSH)
 		})
 	}
+}
+
+// TestReloadPolicyRefusedKeepsPolicyInForce pins what an operator sees
+// when the configured document is one headscale refuses at validation: a
+// reload (SIGHUP in either mode) returns the error and keeps the policy
+// in force, and so does a set through the API or CLI. The stored
+// document is not corrected by either.
+func TestReloadPolicyRefusedKeepsPolicyInForce(t *testing.T) {
+	const allowAll = `{"grants": [{"src": ["*"], "dst": ["*"], "ip": ["*"]}]}`
+
+	for name, pol := range refusedPolicyDocuments {
+		t.Run(name, func(t *testing.T) {
+			_, s, _ := persistTestSetup(t)
+			t.Cleanup(func() { _ = s.Close() })
+
+			_, err := s.SetPolicy([]byte(allowAll))
+			require.NoError(t, err)
+
+			t.Run("set", func(t *testing.T) {
+				_, err := s.SetPolicy([]byte(pol))
+				require.Error(t, err, "a refused document must not be set")
+				assert.JSONEq(t, allowAll, string(s.Snapshot().PolicySource()), "the policy in force is unchanged")
+			})
+
+			t.Run("reload-from-database", func(t *testing.T) {
+				_, err := s.SetPolicyInDB(pol)
+				require.NoError(t, err)
+
+				require.Error(t, s.ReloadPolicy(), "a refused document must not reload")
+				assert.JSONEq(t, allowAll, string(s.Snapshot().PolicySource()), "the policy in force is unchanged")
+			})
+
+			t.Run("reload-from-file", func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "policy.hujson")
+				require.NoError(t, os.WriteFile(path, []byte(pol), 0o600))
+				s.cfg.Policy = types.PolicyConfig{Mode: types.PolicyModeFile, Path: path}
+
+				require.Error(t, s.ReloadPolicy(), "a refused document must not reload")
+				assert.JSONEq(t, allowAll, string(s.Snapshot().PolicySource()), "the policy in force is unchanged")
+			})
+		})
+	}
+}
+
+// TestReloadPolicyRefusedKeepsCheckApprovals pins a refused reload's side
+// effects: nothing is published, and the SSH check approvals the policy in
+// force granted stand — the document that would have revoked them never
+// became live. Only a reload that changes the policy revokes them.
+func TestReloadPolicyRefusedKeepsCheckApprovals(t *testing.T) {
+	const (
+		rules    = `"acls":[{"action":"accept","src":["persist-user@"],"dst":["persist-user@:22"]}]`
+		testsOK  = `"tests":[{"src":"persist-user@","accept":["persist-user@:22"]}]`
+		testsBad = `"tests":[{"src":"persist-user@","accept":["persist-user@:80"]}]`
+		widened  = `"acls":[{"action":"accept","src":["persist-user@"],"dst":["persist-user@:22"]},
+			{"action":"accept","src":["persist-user@"],"dst":["persist-user@:80"]}]`
+	)
+
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	_, err := s.SetPolicy([]byte(`{` + rules + `,` + testsOK + `}`))
+	require.NoError(t, err)
+
+	s.SetLastSSHAuth(nodeID, nodeID)
+	_, ok := s.GetLastSSHAuth(nodeID, nodeID)
+	require.True(t, ok, "test sanity: the check approval is recorded")
+
+	_, err = s.SetPolicyInDB(`{` + rules + `,` + testsBad + `}`)
+	require.NoError(t, err)
+
+	before := s.Snapshot()
+	require.Error(t, s.ReloadPolicy(), "a document failing its tests must be refused")
+
+	after := s.Snapshot()
+	assert.Equal(t, before.Rev(), after.Rev(), "a refused reload publishes nothing")
+	assert.Equal(t, string(before.PolicySource()), string(after.PolicySource()))
+
+	_, ok = s.GetLastSSHAuth(nodeID, nodeID)
+	require.True(t, ok, "a refused reload keeps the approvals the policy in force granted")
+
+	_, err = s.SetPolicyInDB(`{` + widened + `,` + testsOK + `}`)
+	require.NoError(t, err)
+	require.NoError(t, s.ReloadPolicy())
+
+	_, ok = s.GetLastSSHAuth(nodeID, nodeID)
+	require.False(t, ok, "a reload that changes the policy revokes the check approvals")
 }
 
 // TestSetPolicyUnchangedDocumentIsANoOp re-sets the live document after a
@@ -242,7 +329,8 @@ func TestSetPolicyUnchangedDocumentIsANoOp(t *testing.T) {
 	node, ok := s.GetNodeByID(nodeID)
 	require.True(t, ok)
 	require.NoError(t, s.DeleteNode(node))
-	require.Error(t, policyRefusal(s.Snapshot().Policy()), "test sanity: the document's tests now fail")
+	snap := s.Snapshot()
+	require.Error(t, policyRefusal(snap, snap.Policy()), "test sanity: the document's tests now fail")
 
 	changed, err := s.SetPolicy(pol)
 	require.NoError(t, err, "an unchanged document is already live")
@@ -380,7 +468,8 @@ func TestUserMutationDropsAmbiguousName(t *testing.T) {
 			_, err := s.SetPolicy([]byte(`{"acls":[{"action":"accept","src":["persist-user@"],"dst":["*:22"]}]}`))
 			require.NoError(t, err)
 
-			rules, _ := s.Snapshot().Policy().Filter()
+			rules, _, err := s.Snapshot().Filter()
+			require.NoError(t, err)
 			require.NotEmpty(t, rules, "precondition: persist-user@ has a node")
 
 			var logged bytes.Buffer
@@ -408,7 +497,8 @@ func TestUserMutationDropsAmbiguousName(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, s.Snapshot().PolicyErr())
 
-			rules, _ = s.Snapshot().Policy().Filter()
+			rules, _, err = s.Snapshot().Filter()
+			require.NoError(t, err)
 			assert.Empty(t, rules, "an ambiguous name grants nothing")
 			assert.Contains(t, logged.String(), `"level":"warn"`, "the operator learns a name went ambiguous")
 			assert.Contains(t, logged.String(), "persist-user", "the warning names the token")

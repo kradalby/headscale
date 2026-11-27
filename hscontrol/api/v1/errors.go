@@ -55,7 +55,9 @@ func mapError(msg string, err error) error {
 		errors.Is(err, state.ErrInvalidPolicy):
 		return huma.Error400BadRequest(msg, err)
 
-	case errors.Is(err, state.ErrNodeKeyInUse),
+	// A create or rename to a user name another user already holds.
+	case errors.Is(err, db.ErrUserExists),
+		errors.Is(err, state.ErrNodeKeyInUse),
 		errors.Is(err, state.ErrAmbiguousNodeOwnership),
 		errors.Is(err, state.ErrAuthCacheEntryExists):
 		return huma.Error409Conflict(msg, err)

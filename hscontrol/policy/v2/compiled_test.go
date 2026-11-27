@@ -14,6 +14,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/views"
@@ -62,14 +63,23 @@ func (pol *Policy) compileOtherDestsReference(
 			dstIPStrings []string
 		)
 
-		for _, dst := range otherDests {
+		for i, dst := range otherDests {
+			if slices.ContainsFunc(otherDests[:i], func(o Alias) bool { return o.String() == dst.String() }) {
+				continue
+			}
+
 			ips, err := dst.Resolve(pol, users, nodes)
 			if err != nil {
 				continue
 			}
 
+			capDsts := ips.Prefixes()
+			if _, wildcard := dst.(Asterix); wildcard {
+				capDsts = []netip.Prefix{tsaddr.AllIPv4(), tsaddr.AllIPv6()}
+			}
+
 			capGrants = append(capGrants, tailcfg.CapGrant{
-				Dsts:   ips.Prefixes(),
+				Dsts:   capDsts,
 				CapMap: grant.App,
 			})
 

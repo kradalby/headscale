@@ -26,11 +26,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go4.org/netipx"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
-	"tailscale.com/wgengine/filter"
 )
 
 // viaCompatTests lists golden captures that exercise via grant steering.
@@ -103,6 +104,15 @@ var viaCompatTests = []struct {
 	{"via-grant-v106", "rule order across grants sharing sources"},
 	{"via-grant-v107", "two via grants from one source through one router"},
 	{"via-grant-v108", "a grant and an ACL with the same sources and IPProto"},
+	{"grant-app-wildcard-destination", "capability grant from members to the wildcard"},
+	{"grant-via-internet-one-family-exit", "the internet via an exit node approved for IPv4 only"},
+	{"grant-via-internet-one-family-exit-bare", "the same exit node without its subnet route"},
+	{"grant-via-internet-one-family-exit-untagged", "the same exit node without the via tag"},
+	{"grant-via-internet-exit-is-source", "the internet via tag:exit with the exit nodes among the sources"},
+	{"grant-app-destination-repeated", "capability grant naming the wildcard twice"},
+	{"grant-via-router-covered", "a subnet via tag:router, one holder with only an exit route over it"},
+	{"grant-via-reach-a", "a public prefix via tag:exit"},
+	{"grant-via-public-prefix-exit-routes", "a public prefix via tag:router, held by a router and an exit node"},
 }
 
 // routesMapCompatTests lists routes captures replayed through the mapper.
@@ -138,13 +148,19 @@ var routesMapCompatTests = []struct {
 	{"routes-exit-offer-no-rules", "a policy without rules offers exit routes"},
 	{"routes-exit-offer-empty-acls", "an empty acls list offers no exit node"},
 	{"routes-exit-offer-empty-grants", "an empty grants list offers no exit node"},
+	{"routes-tailnet-range-route", "routes inside the tailnet range"},
+	{"routes-internet-public-subnet", "autogroup:internet with a public subnet router"},
+	{"routes-destination-wider-than-route", "destination wider than the approved route"},
+	{"routes-exit-node-public-destination-a", "a routed prefix to one public address"},
+	{"routes-exit-node-public-destination-b", "the internet with an exit node approved for IPv6 only"},
 }
 
 // aclMapCompatTests lists ACL captures replayed through the mapper, with only
-// the policy approving routes: a router advertises in each, so each holds
-// auto-approval to SaaS. They are shared with TestACLCompat in policy/v2, which
-// reads their filters; this replay reads the netmaps. In acl-ah01 and acl-h03
-// some nodes have peers only through the route the policy approves.
+// the policy approving routes unless the capture approved them itself: a
+// router advertises in each, so each holds auto-approval to SaaS. They are
+// shared with TestACLCompat in policy/v2, which reads their filters; this
+// replay reads the netmaps. In acl-ah01 and acl-h03 some nodes have peers only
+// through the route the policy approves.
 var aclMapCompatTests = []string{
 	"acl-ah01", "acl-ah02", "acl-au01", "acl-au06", "acl-c09",
 	"acl-d03", "acl-d04", "acl-d08", "acl-e01", "acl-e03",
@@ -153,6 +169,7 @@ var aclMapCompatTests = []string{
 	"acl-mr20", "acl-mu02", "acl-mu07", "acl-o04", "acl-pf03",
 	"acl-r02", "acl-r08", "acl-rs01", "acl-rs02", "acl-rs03",
 	"acl-rs07", "acl-t10", "acl-u11", "acl-w02",
+	"acl-self-routed-by-other-user", "acl-self-routed-by-third-user", "acl-self-routed-wide-route",
 }
 
 // viaCompatSkipReasons lists checks where headscale differs from SaaS, keyed
@@ -194,7 +211,7 @@ func TestACLMapCompat(t *testing.T) {
 			c, err := testcapture.Read(path)
 			require.NoError(t, err, "failed to read %s", path)
 
-			_, clients := startViaMapCompat(t, c, false)
+			_, clients := startViaMapCompat(t, c, routesSetByAPI(c))
 			compareViaMapCompat(t, c, clients)
 		})
 	}
@@ -454,7 +471,21 @@ func startCaptureClients(
 	clients := map[string]*servertest.TestClient{}
 	order := captureNodeOrder(t, c)
 
-	for _, name := range order {
+	// A route inside the Tailscale range covers the nodes it did on SaaS
+	// only when they hold the addresses they held there. Addresses are
+	// handed out in order, so those nodes register in address order.
+	pinAddrs := routesNameTailnetAddrs(c)
+	lastAddr := tsaddr.CGNATRange().Addr()
+	registerOrder := order
+
+	if pinAddrs {
+		registerOrder = slices.SortedFunc(slices.Values(order), func(a, b string) int {
+			return netip.MustParseAddr(c.Topology.Nodes[a].IPv4).
+				Compare(netip.MustParseAddr(c.Topology.Nodes[b].IPv4))
+		})
+	}
+
+	for _, name := range registerOrder {
 		topoNode, exists := c.Topology.Nodes[name]
 		if !exists {
 			continue
@@ -462,6 +493,18 @@ func startCaptureClients(
 
 		if _, inCaptures := c.Captures[name]; !inCaptures {
 			continue
+		}
+
+		if pinAddrs {
+			want := netip.MustParseAddr(topoNode.IPv4)
+			require.Truef(t, lastAddr.Less(want),
+				"node %s: address %s is not after %s, the one before it", name, want, lastAddr)
+
+			for a := lastAddr.Next(); a != want; a = a.Next() {
+				require.NoError(t, srv.State().SkipAddressForTest())
+			}
+
+			lastAddr = want
 		}
 
 		owner := tagUser
@@ -547,6 +590,20 @@ func startCaptureClients(
 	}
 
 	return srv, clients
+}
+
+// routesNameTailnetAddrs reports whether a node of the capture advertises a
+// route inside the Tailscale range.
+func routesNameTailnetAddrs(c *testcapture.Capture) bool {
+	for _, node := range c.Topology.Nodes {
+		for _, r := range node.RoutableIPs {
+			if tsaddr.IsTailscaleIP(netip.MustParsePrefix(r).Addr()) {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // compareViaMapCompat compares every viewer's netmap and own routes with
@@ -770,6 +827,9 @@ func compareNetmap(
 //     entries like 10.44.0.0/16)
 //   - peer-addresses: the Tailscale IPs in AllowedIPs, by count and owner
 //   - peer-primary-routes: PrimaryRoutes
+//   - peer-suggest-exit-node: presence of suggest-exit-node on the peer's
+//     CapMap (presence only, not values — headscale and the service agree
+//     a one-family exit node, offered to nobody, suggests nobody)
 //
 // The last three cover peers both sides list. A check listed in skips as
 // <key>/<check> must differ.
@@ -790,7 +850,7 @@ func comparePeers(
 	check := map[string]require.TestingT{}
 	listed := map[string]*failRecorder{}
 
-	for _, name := range []string{"peers", "peer-allowed-ips", "peer-addresses", "peer-primary-routes"} {
+	for _, name := range []string{"peers", "peer-allowed-ips", "peer-addresses", "peer-primary-routes", "peer-suggest-exit-node"} {
 		check[name] = t
 
 		if _, ok := skips[key+"/"+name]; ok {
@@ -874,6 +934,7 @@ func comparePeers(
 			TailscaleIPs:  tsIPs,
 			RoutePrefixes: routePrefixes,
 			PrimaryRoutes: proutes,
+			SuggestExit:   peer.CapMap().Contains(nodecap.SuggestExitNode),
 		}
 	}
 
@@ -929,6 +990,12 @@ func comparePeers(
 
 		assert.ElementsMatchf(check["peer-primary-routes"], wantPRoutes, gotPeer.PrimaryRoutes,
 			"peer %s: PrimaryRoutes mismatch", name)
+
+		// Only presence: a one-family exit node is offered to nobody,
+		// so the capability must reach nobody's peer view of it.
+		assert.Equalf(check["peer-suggest-exit-node"],
+			wantPeer.CapMap().Contains(nodecap.SuggestExitNode), gotPeer.SuggestExit,
+			"peer %s: suggest-exit-node on the peer's CapMap mismatch", name)
 	}
 
 	// Check for extra peers headscale shows that Tailscale SaaS doesn't.
@@ -1044,7 +1111,7 @@ func comparePacketFilter(
 	}
 
 	wantList := saasFilterTriples(t, want.PacketFilterRules, saasAddrs)
-	gotList := hsFilterTriples(got.PacketFilter, hsAddrsByPeer(clients))
+	gotList := hsFilterTriples(got, hsAddrsByPeer(clients))
 
 	if reason, listed := skips[key]; listed {
 		if slices.Equal(wantList, gotList) {
@@ -1101,21 +1168,38 @@ func saasFilterTriples(t require.TestingT, rules []tailcfg.FilterRule, saasAddrs
 
 // hsFilterTriples renders a client's packet filter as the triples
 // [saasFilterTriples] gives, peers named by hsAddrs.
-func hsFilterTriples(matches []filter.Match, hsAddrs map[netip.Addr]string) []string {
+func hsFilterTriples(nm *netmap.NetworkMap, hsAddrs map[netip.Addr]string) []string {
 	triples := map[string]struct{}{}
 
-	for _, match := range matches {
-		srcs := strings.Join(canonicaliseSrcPrefixes(match.Srcs, hsAddrs), ",")
+	for _, match := range nm.PacketFilter {
+		// A capability source stands for the addresses the client admits
+		// for it: those of the nodes it holds itself and its peers with it.
+		srcs := slices.Clone(match.Srcs)
+		for _, c := range match.SrcCaps {
+			srcs = append(srcs, servertest.CapHolders(nm, c)...)
+		}
+
+		slices.SortFunc(srcs, netip.Prefix.Compare)
+		srcs = slices.Compact(srcs)
+		joined := strings.Join(canonicaliseSrcPrefixes(srcs, hsAddrs), ",")
 
 		for _, dp := range match.Dsts {
 			for _, dst := range peerIdents(dp.Net, hsAddrs) {
-				triples[filterTriple(srcs, dst, dp.Ports.First, dp.Ports.Last)] = struct{}{}
+				triples[filterTriple(joined, dst, dp.Ports.First, dp.Ports.Last)] = struct{}{}
 			}
 		}
 
+		// App capabilities follow address sources only: the client's
+		// CapsWithValues reads no capability source.
+		if len(match.Caps) == 0 {
+			continue
+		}
+
+		addrSrcs := strings.Join(canonicaliseSrcPrefixes(match.Srcs, hsAddrs), ",")
+
 		for _, cm := range match.Caps {
 			for _, dst := range peerIdents(cm.Dst, hsAddrs) {
-				triples[capTriple(srcs, dst, cm.Cap)] = struct{}{}
+				triples[capTriple(addrSrcs, dst, cm.Cap)] = struct{}{}
 			}
 		}
 	}
@@ -1319,6 +1403,7 @@ type peerSummary struct {
 	TailscaleIPs  []netip.Prefix // Tailscale address entries from AllowedIPs
 	RoutePrefixes []string       // non-Tailscale-IP AllowedIPs (sorted)
 	PrimaryRoutes []string       // sorted
+	SuggestExit   bool           // suggest-exit-node on the peer's CapMap
 }
 
 // parsePrefixOrAddr parses a string as a [netip.Prefix]. If the string

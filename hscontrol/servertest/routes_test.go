@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/netip"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ import (
 	"gorm.io/gorm"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
@@ -766,7 +768,7 @@ func TestRoutesNodeRangeSingleNotServed(t *testing.T) {
 	for name, grant := range map[string]string{
 		"plain": `{"src": ["tag:client"], "dst": ["*"], "ip": ["*"]}`,
 		"via": `{"src": ["tag:client"], "ip": ["*"], "via": ["tag:router"],
-			"dst": ["10.9.0.0/24", "100.64.0.0/10", "fd7a:115c:a1e0::/48", "::ffff:0:0/96"]}`,
+			"dst": ["10.9.0.0/24"]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -1173,4 +1175,95 @@ func peerStateEqual(a, b tailcfg.NodeView) bool {
 		slices.Equal(a.PrimaryRoutes().AsSlice(), b.PrimaryRoutes().AsSlice()) &&
 		slices.Equal(a.Hostinfo().RoutableIPs().AsSlice(), b.Hostinfo().RoutableIPs().AsSlice()) &&
 		a.Online().Get() == b.Online().Get()
+}
+
+// TestAddressChangeReachesFiltersAndPeers changes a node's address, a policy
+// fact nothing else moves, and holds a real client's filter and peer to
+// expectations written here: the node it is allowed from appears in its
+// filter under the new address only, and as a peer with it.
+func TestAddressChangeReachesFiltersAndPeers(t *testing.T) {
+	t.Parallel()
+
+	srv := servertest.NewServer(t)
+	alice := srv.CreateUser(t, "addr-alice")
+	bob := srv.CreateUser(t, "addr-bob")
+
+	_, err := srv.State().SetPolicy([]byte(`{"acls":[{"action":"accept","src":["addr-alice@"],"dst":["addr-bob@:22"]}]}`))
+	require.NoError(t, err)
+
+	a := servertest.NewClient(t, srv, "addr-a", servertest.WithUser(alice))
+	b := servertest.NewClient(t, srv, "addr-b", servertest.WithUser(bob))
+	b.WaitForPeers(t, 1, 10*time.Second)
+
+	node, ok := srv.State().GetNodeByID(findNodeID(t, srv, a.Name))
+	require.True(t, ok)
+
+	target, ok := srv.State().GetNodeByID(findNodeID(t, srv, b.Name))
+	require.True(t, ok)
+
+	// allowed reports whether b holds the one rule it must, from the
+	// addresses from to its own port 22.
+	allowed := func(nm *netmap.NetworkMap, from ...netip.Addr) bool {
+		srcs := make([]string, 0, len(from))
+		for _, ip := range from {
+			srcs = append(srcs, ip.String())
+		}
+
+		slices.Sort(srcs)
+
+		dsts := make([]tailcfg.NetPortRange, 0, len(target.IPs()))
+		for _, ip := range target.IPs() {
+			dsts = append(dsts, tailcfg.NetPortRange{IP: ip.String(), Ports: tailcfg.PortRange{First: 22, Last: 22}})
+		}
+
+		rules := nm.PacketFilterRules.AsSlice()
+		if len(rules) != 1 {
+			return false
+		}
+
+		// A capability source stands for the addresses the client admits
+		// for it.
+		var got []string
+
+		for _, s := range rules[0].SrcIPs {
+			c, ok := strings.CutPrefix(s, "cap:")
+			if !ok {
+				got = append(got, s)
+
+				continue
+			}
+
+			for _, p := range servertest.CapHolders(nm, nodecap.Cap(c)) {
+				got = append(got, p.Addr().String())
+			}
+		}
+
+		slices.Sort(got)
+
+		return slices.Equal(got, srcs) && reflect.DeepEqual(rules[0].DstPorts, dsts)
+	}
+
+	b.WaitForCondition(t, "the filter allows a's addresses", 10*time.Second, func(nm *netmap.NetworkMap) bool {
+		return allowed(nm, node.IPs()...)
+	})
+
+	moved := netip.MustParseAddr("100.64.200.1")
+	n := node.AsStruct()
+	n.IPv4 = &moved
+	srv.State().PutNodeInStoreForTest(*n)
+
+	want := []netip.Addr{moved}
+	if node.IPv6().Valid() {
+		want = append(want, node.IPv6().Get())
+	}
+
+	b.WaitForCondition(t, "the filter allows a's new address, not its old one", 10*time.Second, func(nm *netmap.NetworkMap) bool {
+		return allowed(nm, want...)
+	})
+
+	b.WaitForCondition(t, "a is a peer at its new address", 10*time.Second, func(nm *netmap.NetworkMap) bool {
+		peer, ok := peerByHostname(nm, a.Name)
+
+		return ok && slices.Contains(peer.Addresses().AsSlice(), netip.PrefixFrom(moved, 32))
+	})
 }

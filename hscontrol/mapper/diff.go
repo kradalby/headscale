@@ -28,12 +28,26 @@ func fullResponse(cfg *types.Config, nm *netMap) *tailcfg.MapResponse {
 		SSHPolicy:     nm.ssh,
 		DNSConfig:     nm.dns,
 		UserProfiles:  nm.userProfiles(),
-		PacketFilters: map[string][]tailcfg.FilterRule{"base": nm.filter},
+		PacketFilters: filterReset(nm),
 		Peers:         sortedPeers(nm),
 	}
 	resp.CollectServices.Set(false)
 
 	return resp
+}
+
+// filterReset returns the PacketFilters that leave a client holding
+// exactly nm's filter, whatever it held: "*": null, then nm's chunks or its
+// whole filter under "base". Every stream's first response carries it, in
+// every mode: a client may keep the chunks of an earlier map session, of
+// this server or of one before a restart, which this stream knows nothing
+// of, and every supported client applies the clear before the rest.
+func filterReset(nm *netMap) map[string][]tailcfg.FilterRule {
+	if nm.chunked {
+		return nm.chunks.Reset()
+	}
+
+	return map[string][]tailcfg.FilterRule{"*": nil, "base": nm.filter}
 }
 
 // diff returns the responses that take a client holding sent to next, or
@@ -80,6 +94,14 @@ func diff(sent, next *netMap, frames *frameCache) []*tailcfg.MapResponse {
 		}
 	}
 
+	// A peer removed, or moved off an address, takes the address out of
+	// the client's index without indexing another node holding it (see
+	// TestCanaryCapLookupForgetsAddressOnRemoval): a capability source from
+	// it would match no node until a whole peer list indexes it again.
+	if !refresh && next.holders.Valid() {
+		refresh = evictsHeldAddress(sent, next, changedIDs, removed)
+	}
+
 	if refresh {
 		// The client turns a PeersChanged entry back into a patch, which
 		// cannot express this clear; only a whole peer list applies it.
@@ -91,8 +113,8 @@ func diff(sent, next *netMap, frames *frameCache) []*tailcfg.MapResponse {
 		changed = true
 	}
 
-	if !sameRules(sent.filter, next.filter) && !reflect.DeepEqual(sent.filter, next.filter) {
-		resp.PacketFilters = map[string][]tailcfg.FilterRule{"base": next.filter}
+	if pf := filtersToSend(sent, next); pf != nil {
+		resp.PacketFilters = pf
 		changed = true
 	}
 
@@ -142,6 +164,27 @@ func diff(sent, next *netMap, frames *frameCache) []*tailcfg.MapResponse {
 	return out
 }
 
+// filtersToSend returns the PacketFilters that take a client holding sent's
+// filter to next's, nil when it holds it already.
+func filtersToSend(sent, next *netMap) map[string][]tailcfg.FilterRule {
+	switch {
+	case sent.chunked != next.chunked:
+		// The session's delivery changed (its client reports another
+		// client): the client's chunks are no help.
+		return filterReset(next)
+	case sameRules(sent.filter, next.filter):
+		return nil
+	case next.chunked:
+		// A chunk's name is a hash of its rules: the names the client
+		// holds say what it holds.
+		return next.chunks.Delta(sent.chunks)
+	case !reflect.DeepEqual(sent.filter, next.filter):
+		return map[string][]tailcfg.FilterRule{"base": next.filter}
+	}
+
+	return nil
+}
+
 // profilesToCompare returns the users whose profile may differ between
 // sent and next, sorted: when next follows sent with the same owner state,
 // those the class's profiles changed and the node's own; otherwise all of
@@ -164,7 +207,9 @@ func profilesToCompare(sent, next *netMap) []tailcfg.UserID {
 // peerPatch returns the patch taking a client from before to after, nil
 // when they are wire-equal, and false when a changed field cannot be
 // patched. It masks the patchable fields and compares the rest, so a new
-// [tailcfg.Node] field is never silently dropped.
+// [tailcfg.Node] field is never silently dropped. A field changed to its
+// zero value cannot be patched: the wire omits the zero, so the patch
+// would tell the client nothing.
 func peerPatch(before, after *tailcfg.Node) (*tailcfg.PeerChange, bool) {
 	var patch *tailcfg.PeerChange
 
@@ -193,10 +238,18 @@ func peerPatch(before, after *tailcfg.Node) (*tailcfg.PeerChange, bool) {
 	}
 
 	if before.Key != after.Key {
+		if after.Key.IsZero() {
+			return nil, false
+		}
+
 		p().Key = new(after.Key)
 	}
 
 	if before.DiscoKey != after.DiscoKey {
+		if after.DiscoKey.IsZero() {
+			return nil, false
+		}
+
 		p().DiscoKey = new(after.DiscoKey)
 	}
 
@@ -221,10 +274,18 @@ func peerPatch(before, after *tailcfg.Node) (*tailcfg.PeerChange, bool) {
 	// clears it, which a patch cannot say; the Online patch is what the
 	// client acts on, so the stale LastSeen it keeps is harmless.
 	if !equalTimePtr(before.LastSeen, after.LastSeen) && after.LastSeen != nil {
+		if after.LastSeen.IsZero() {
+			return nil, false
+		}
+
 		p().LastSeen = new(*after.LastSeen)
 	}
 
 	if !bytes.Equal(before.KeySignature, after.KeySignature) {
+		if len(after.KeySignature) == 0 {
+			return nil, false
+		}
+
 		p().KeySignature = slices.Clone(after.KeySignature)
 	}
 
@@ -306,14 +367,56 @@ func peerChanges(sent, next *netMap) ([]tailcfg.NodeID, []tailcfg.NodeID) {
 	return peerIDs(next), removed
 }
 
+// evictsHeldAddress reports whether a removed peer, or a changed peer
+// moving off an address, leaves an address of its own that next's node or
+// another of its peers holds.
+func evictsHeldAddress(sent, next *netMap, changed, removed []tailcfg.NodeID) bool {
+	held := func(before, after *tailcfg.Node) bool {
+		for _, p := range before.Addresses {
+			if !p.IsSingleIP() || after != nil && slices.Contains(after.Addresses, p) {
+				continue
+			}
+
+			for _, id := range next.holders.Of(p.Addr()) {
+				other := id.NodeID()
+				if other == before.ID {
+					continue
+				}
+
+				if _, ok := next.peer(other); ok || next.self != nil && other == next.self.ID {
+					return true
+				}
+			}
+		}
+
+		return false
+	}
+
+	for _, id := range removed {
+		if before, ok := sent.peer(id); ok && held(before, nil) {
+			return true
+		}
+	}
+
+	for _, id := range changed {
+		before, ok := sent.peer(id)
+		if after, _ := next.peer(id); ok && before != after && after != nil && held(before, after) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // needsPeerListRefresh reports a change only a whole peer list can apply:
-// clients drop an Endpoints, HomeDERP, Cap or Online clear from both a patch and a
-// PeersChanged entry they turn into one.
+// clients drop an Endpoints, HomeDERP, Cap, Online or KeySignature clear
+// from both a patch and a PeersChanged entry they turn into one.
 func needsPeerListRefresh(before, after *tailcfg.Node) bool {
 	return before.HomeDERP != 0 && after.HomeDERP == 0 ||
 		len(before.Endpoints) > 0 && len(after.Endpoints) == 0 ||
 		before.Cap != 0 && after.Cap == 0 ||
-		before.Online != nil && after.Online == nil
+		before.Online != nil && after.Online == nil ||
+		len(before.KeySignature) > 0 && len(after.KeySignature) == 0
 }
 
 // sameRules reports whether a and b are the same slice, as the policy's

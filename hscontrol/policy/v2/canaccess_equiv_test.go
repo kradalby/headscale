@@ -177,15 +177,20 @@ func peerMapPrefixReference(
 ) map[types.NodeID][]types.NodeID {
 	nodeMatchers := make(map[types.NodeID][]matcher.Match, len(nodes))
 	for _, n := range nodes {
-		if pm.needsPerNodeFilter {
+		if pm.addresses().needsPerNodeFilter {
 			nodeMatchers[n.ID] = matcher.MatchesFromFilterRules(
 				pm.peerRulesForNodeLocked(n.View()))
 		} else {
-			nodeMatchers[n.ID] = pm.matchers
+			nodeMatchers[n.ID] = pm.addresses().matchers
 		}
 	}
 
 	peers := make(map[types.NodeID][]types.NodeID)
+
+	var siblings map[uint]map[types.NodeID]bool
+	if pm.addresses().needsPerNodeFilter {
+		siblings = pm.siblingSelfSources(nodes.ViewSlice())
+	}
 
 	for i, a := range nodes {
 		for _, b := range nodes[i+1:] {
@@ -198,7 +203,11 @@ func peerMapPrefixReference(
 			if linkedByEitherPolicy || sameUser(a.View(), b.View()) {
 				peers[a.ID] = append(peers[a.ID], b.ID)
 				peers[b.ID] = append(peers[b.ID], a.ID)
+
+				continue
 			}
+
+			appendListedOnly(peers, pm, siblings, a.View(), b.View())
 		}
 	}
 

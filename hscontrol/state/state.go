@@ -41,6 +41,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
@@ -85,6 +86,17 @@ var (
 
 // ErrNodeNameNotUnique is returned when a node name is not unique.
 var ErrNodeNameNotUnique = errors.New("already taken")
+
+// ErrNodeAddressShared refuses a database where two nodes hold one address.
+var ErrNodeAddressShared = errors.New("nodes share a tailnet address")
+
+// ErrNodeAddressMissing refuses a database with a node that has neither an
+// IPv4 nor an IPv6 address.
+var ErrNodeAddressMissing = errors.New("node has no tailnet address")
+
+// ErrNodeAddressOutside refuses a database with a node address outside the
+// Tailscale ranges.
+var ErrNodeAddressOutside = errors.New("node address is outside the Tailscale ranges")
 
 // nodeUpdateColumns lists all Node columns that should be written
 // during a struct-based GORM Updates() call.  Listing them explicitly
@@ -152,7 +164,7 @@ func (e invalidPolicyError) Unwrap() []error { return []error{ErrInvalidPolicy, 
 func (s *State) ValidatePolicy(pol []byte) error {
 	snapshot := s.Snapshot()
 
-	err := policy.ValidatePolicy(pol, snapshot.Users(), snapshot.ListNodes())
+	err := policy.ValidatePolicyAgainst(pol, snapshot.Users(), snapshot.ListNodes(), snapshot.globalFilterOf)
 	if err != nil {
 		return invalidPolicyError{err}
 	}
@@ -204,9 +216,12 @@ type State struct {
 	// ipAlloc manages IP address allocation for nodes
 	ipAlloc *hsdb.IPAllocator
 
-	// authCache holds pending Web, OIDC and SSH authentication requests.
-	// Admission preserves unexpired entries at capacity. Expiry resolves the
-	// verdict with ErrRegistrationExpired so waiting goroutines wake.
+	// authCache holds Web, OIDC and SSH authentication requests. A decided
+	// request stays until it expires or a new request needs its slot, so a
+	// follow-up that comes late still reads its verdict. Admission preserves
+	// pending entries at capacity.
+	// Expiry resolves the verdict with ErrRegistrationExpired so waiting
+	// goroutines wake.
 	authCache *expirable.LRU[types.AuthID, *types.AuthRequest]
 
 	authCacheMaxEntries     int
@@ -344,6 +359,51 @@ func lockKeyed[K comparable](locks *xsync.Map[K, *registrationLock], lockKey K) 
 	}
 }
 
+// checkNodeAddresses refuses address states the allocator never produces.
+// Policy, routes and SSH find a node by its address, so a shared address
+// serves one node's grants to the other, and a node without one cannot be
+// served. The policy's * covers only the Tailscale ranges, so an address
+// outside them would be read one way as a source and another as a
+// destination.
+func checkNodeAddresses(nodes types.Nodes) error {
+	var errs []error
+
+	holder := make(map[netip.Addr]*types.Node, 2*len(nodes))
+
+	for _, node := range nodes {
+		ips := node.IPs()
+		if len(ips) == 0 {
+			errs = append(errs, fmt.Errorf(
+				"%w: node %d %q; set its ipv4 or ipv6 column in the nodes table to an unused address from the configured prefixes",
+				ErrNodeAddressMissing, node.ID, node.Hostname))
+		}
+
+		var outside []string
+
+		for _, ip := range ips {
+			if other, ok := holder[ip]; ok {
+				errs = append(errs, fmt.Errorf(
+					"%w: %s is held by node %d %q and node %d %q; give one of them an unused address from the configured prefixes in the nodes table",
+					ErrNodeAddressShared, ip, other.ID, other.Hostname, node.ID, node.Hostname))
+			} else {
+				holder[ip] = node
+			}
+
+			if !tsaddr.IsTailscaleIP(ip) {
+				outside = append(outside, ip.String())
+			}
+		}
+
+		if len(outside) > 0 {
+			errs = append(errs, fmt.Errorf(
+				"%w: node %d %q holds %s; give it addresses from the configured prefixes, inside 100.64.0.0/10 (less 100.115.92.0/23) and fd7a:115c:a1e0::/48, in the nodes table",
+				ErrNodeAddressOutside, node.ID, node.Hostname, strings.Join(outside, ", ")))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
 // NewState creates and initializes a new [State] instance, setting up the database,
 // IP allocator, DERP map, policy manager, and loading existing users and nodes.
 func NewState(cfg *types.Config) (*State, error) {
@@ -415,6 +475,11 @@ func NewState(cfg *types.Config) (*State, error) {
 		}
 	}
 
+	err = checkNodeAddresses(nodes)
+	if err != nil {
+		return nil, fmt.Errorf("checking node addresses: %w", err)
+	}
+
 	users, err := db.ListUsers(nil)
 	if err != nil {
 		return nil, fmt.Errorf("loading users: %w", err)
@@ -425,10 +490,12 @@ func NewState(cfg *types.Config) (*State, error) {
 		return nil, fmt.Errorf("loading policy: %w", err)
 	}
 
-	w, err := newWorld(nodes, users, pol, cfg.DNSView())
+	w, err := newWorldMode(nodes, users, pol, cfg.DNSView(), optionsOf(cfg.Policy))
 	if err != nil {
 		return nil, fmt.Errorf("initializing policy manager: %w", err)
 	}
+
+	censusWorld.Store(w)
 
 	w.batchSize, w.batchTimeout = cfg.Tuning.NodeStoreBatchSize, cfg.Tuning.NodeStoreBatchTimeout
 	w.servesRoute = cfg.ServesRoute
@@ -449,7 +516,9 @@ func NewState(cfg *types.Config) (*State, error) {
 			log.Warn().Err(refErr).Msg("stored policy names users ambiguously, who get nothing; server starting anyway, fix the policy or users")
 		}
 
-		if err := t.RunTests(); err != nil { //nolint:noinlineerr // warn and continue
+		snap := w.snapshot()
+
+		if err := t.RunTestsAgainst(func() ([]tailcfg.FilterRule, error) { return snap.globalFilterFor(snap.Policy()) }); err != nil { //nolint:noinlineerr // warn and continue
 			log.Warn().Err(err).Msg("policy tests failed at boot; server starting anyway, fix the policy and reload")
 		}
 
@@ -578,13 +647,52 @@ func (s *State) ReloadPolicy() error {
 	return nil
 }
 
-// CreateUser creates a new user and refreshes the users the policy reads.
-func (s *State) CreateUser(user types.User) (*types.User, error) {
-	if err := s.db.DB.Save(&user).Error; err != nil { //nolint:noinlineerr
-		return nil, fmt.Errorf("creating user: %w", err)
+// refuseHeldName refuses a name another user already holds. It runs inside
+// the write transaction that adopts the name, so two concurrent renames
+// (or a rename and a create) cannot both pass and both commit.
+func refuseHeldName(tx *gorm.DB, name string, exclude types.UserID) error {
+	var holders int64
+
+	err := tx.Model(&types.User{}).Where("name = ?", name).Where("id <> ?", uint(exclude)).Count(&holders).Error
+	if err != nil {
+		return err
 	}
 
-	err := s.refreshUsers()
+	if holders > 0 {
+		return hsdb.ErrUserExists
+	}
+
+	return nil
+}
+
+// CreateUser creates a new user and refreshes the users the policy reads.
+//
+// A user without a provider identifier may not take a name any user
+// already holds: as the schema's own indexes make the name unique among
+// such users, the API and the CLI, which create them, enforce it here
+// too. A user with a provider identifier shares a name as the schema
+// allows, so a login through the identity provider is not affected.
+func (s *State) CreateUser(user types.User) (*types.User, error) {
+	_, err := hsdb.Write(s.db.DB, func(tx *gorm.DB) (types.User, error) {
+		if !user.ProviderIdentifier.Valid {
+			err := refuseHeldName(tx, user.Name, 0)
+			if err != nil {
+				return user, err
+			}
+		}
+
+		err := tx.Save(&user).Error
+		if err != nil {
+			return user, fmt.Errorf("creating user: %w", err)
+		}
+
+		return user, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	err = s.refreshUsers()
 	if err != nil {
 		return &user, fmt.Errorf("updating policy manager after user creation: %w", err)
 	}
@@ -596,6 +704,17 @@ func (s *State) CreateUser(user types.User) (*types.User, error) {
 
 // UpdateUser modifies an existing user using the provided update function within a transaction.
 func (s *State) UpdateUser(userID types.UserID, updateFn func(*types.User) error) (*types.User, error) {
+	return s.writeUser(userID, updateFn, nil)
+}
+
+// writeUser is [State.UpdateUser] with a check that runs inside the same
+// write transaction, after the user is loaded, so it cannot race the
+// write it guards.
+func (s *State) writeUser(
+	userID types.UserID,
+	updateFn func(*types.User) error,
+	inTx func(*gorm.DB, *types.User) error,
+) (*types.User, error) {
 	s.userUpdateMu.Lock()
 	defer s.userUpdateMu.Unlock()
 
@@ -603,6 +722,13 @@ func (s *State) UpdateUser(userID types.UserID, updateFn func(*types.User) error
 		user, err := hsdb.GetUserByID(tx, userID)
 		if err != nil {
 			return nil, err
+		}
+
+		if inTx != nil {
+			err = inTx(tx, user)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		if err := updateFn(user); err != nil { //nolint:noinlineerr
@@ -648,9 +774,10 @@ func (s *State) DeleteUser(userID types.UserID) error {
 	return nil
 }
 
-// RenameUser changes a user's name. The new name must be unique.
+// RenameUser changes a user's name. The new name must be unique and a valid
+// username. OIDC users are refused: their name comes from the identity provider.
 func (s *State) RenameUser(userID types.UserID, newName string) (*types.User, error) {
-	return s.UpdateUser(userID, func(user *types.User) error {
+	return s.writeUser(userID, func(user *types.User) error {
 		err := util.ValidateUsername(newName)
 		if err != nil {
 			return err
@@ -663,6 +790,12 @@ func (s *State) RenameUser(userID types.UserID, newName string) (*types.User, er
 		user.Name = newName
 
 		return nil
+	}, func(tx *gorm.DB, user *types.User) error {
+		if user.ProviderIdentifier.Valid {
+			return nil
+		}
+
+		return refuseHeldName(tx, newName, userID)
 	})
 }
 
@@ -1761,9 +1894,15 @@ func (s *State) SSHCheckParams(
 	return s.Snapshot().Policy().SSHCheckParams(srcNodeID, dstNodeID, localUser)
 }
 
-// Filter returns the current network filter rules and matches.
+// Filter returns the current network filter rules and matches: the rules
+// every node's filter is reduced from, see [Snapshot.Filter].
 func (s *State) Filter() ([]tailcfg.FilterRule, []matcher.Match) {
-	return s.Snapshot().Policy().Filter()
+	rules, matchers, err := s.Snapshot().Filter()
+	if err != nil {
+		log.Error().Err(err).Msg("expanding the policy's filter")
+	}
+
+	return rules, matchers
 }
 
 // NodeCanHaveTag checks if a node is allowed to have a specific tag.
@@ -1777,7 +1916,7 @@ func (s *State) NodeCanHaveTag(node types.NodeView, tag string) bool {
 type policyTester interface {
 	ValidateUserReferences() error
 	AmbiguousUserReferences() ([]string, error)
-	RunTests() error
+	RunTestsAgainst(global func() ([]tailcfg.FilterRule, error)) error
 	RunSSHTests() error
 }
 
@@ -1854,7 +1993,7 @@ func (s *State) publishPolicy(pol []byte, persist func() error) (bool, error) {
 			return false, invalidPolicyError{err}
 		}
 
-		err = policyRefusal(candidate)
+		err = policyRefusal(snap, candidate)
 		if err != nil {
 			return false, invalidPolicyError{err}
 		}
@@ -1881,7 +2020,7 @@ func (s *State) publishPolicy(pol []byte, persist func() error) (bool, error) {
 	}
 
 	return s.world.SetPolicy(pol, func(next *Snapshot) error {
-		validationErr := multierr.New(next.PolicyErr(), policyRefusal(next.Policy()))
+		validationErr := multierr.New(next.PolicyErr(), policyRefusal(next, next.Policy()))
 		if validationErr != nil {
 			return invalidPolicyError{validationErr}
 		}
@@ -1896,10 +2035,14 @@ func (s *State) publishPolicy(pol []byte, persist func() error) (bool, error) {
 
 // policyRefusal returns why setting pm's document is refused: a user name
 // several users answer to, or failing tests or sshTests. The compile drops
-// such a name, so only a document change checks it, as upstream does.
-func policyRefusal(pm policy.PolicyManager) error {
+// such a name, so only a document change checks it, as upstream does. pm
+// is compiled against snap's users and nodes, whose membership the tests'
+// filter is expanded from.
+func policyRefusal(snap *Snapshot, pm policy.PolicyManager) error {
 	if t, ok := pm.(policyTester); ok {
-		return multierr.New(t.ValidateUserReferences(), t.RunTests(), t.RunSSHTests())
+		global := func() ([]tailcfg.FilterRule, error) { return snap.globalFilterFor(pm) }
+
+		return multierr.New(t.ValidateUserReferences(), t.RunTestsAgainst(global), t.RunSSHTests())
 	}
 
 	return nil
@@ -2162,6 +2305,14 @@ func (s *State) UpdatePolicyManagerNodesForTest() error {
 	return nil
 }
 
+// SkipAddressForTest takes the next node address out of the pool, so a test
+// can register its next node at an address of its choosing.
+func (s *State) SkipAddressForTest() error {
+	_, _, err := s.ipAlloc.Next()
+
+	return err
+}
+
 // CreateRegisteredNodeForTest creates a test node with allocated IPs. This is a convenience wrapper around the database layer.
 func (s *State) CreateRegisteredNodeForTest(user *types.User, hostname ...string) *types.Node {
 	return s.db.CreateRegisteredNodeForTest(user, hostname...)
@@ -2282,16 +2433,29 @@ func (s *State) DeleteExpiredAccessTokens(cutoff time.Time) (int64, error) {
 	return s.db.DeleteExpiredAccessTokens(cutoff)
 }
 
-// GetAuthCacheEntry retrieves a pending auth request from the cache.
+// GetAuthCacheEntry retrieves an auth request still waiting for its verdict,
+// so a decided login or SSH check is never decided again.
 func (s *State) GetAuthCacheEntry(id types.AuthID) (*types.AuthRequest, bool) {
+	rn, ok := s.GetAuthCacheEntryForFollowup(id)
+	if !ok || rn.IsFinished() {
+		return nil, false
+	}
+
+	return rn, true
+}
+
+// GetAuthCacheEntryForFollowup retrieves an auth request whether or not it
+// has been decided, for the follow-up that waits for its verdict.
+func (s *State) GetAuthCacheEntryForFollowup(id types.AuthID) (*types.AuthRequest, bool) {
 	// Preserve insertion order so admission can reclaim expired entries from
 	// the oldest end without scanning every pending authentication.
 	return s.authCache.Peek(id)
 }
 
-// DeleteAuthCacheEntry releases a consumed authentication transaction.
-func (s *State) DeleteAuthCacheEntry(id types.AuthID) {
-	s.authCache.Remove(id)
+// DeleteAuthCacheEntry releases a consumed authentication transaction and
+// reports whether this call removed it.
+func (s *State) DeleteAuthCacheEntry(id types.AuthID) bool {
+	return s.authCache.Remove(id)
 }
 
 // SetAuthCacheEntry admits a pending authentication without displacing
@@ -2334,8 +2498,7 @@ func (s *State) SetAuthCacheEntry(id types.AuthID, entry *types.AuthRequest) err
 		s.authCache.Remove(oldest)
 	}
 
-	if (!entry.IsSSHCheck() && s.authCacheRegularEntries.Load() >= int64(s.authCacheMaxEntries)) ||
-		s.authCache.Len() >= s.authCacheMaxEntries+authCacheSSHReserve {
+	if s.authCacheFullFor(entry) && !s.reclaimFinishedFor(entry) {
 		return ErrAuthCacheFull
 	}
 
@@ -2351,6 +2514,39 @@ func (s *State) SetAuthCacheEntry(id types.AuthID, entry *types.AuthRequest) err
 	s.authCache.Add(id, entry)
 
 	return nil
+}
+
+// authCacheFullFor is called with authCacheMu held.
+func (s *State) authCacheFullFor(entry *types.AuthRequest) bool {
+	return (!entry.IsSSHCheck() && s.authCacheRegularEntries.Load() >= int64(s.authCacheMaxEntries)) ||
+		s.authCache.Len() >= s.authCacheMaxEntries+authCacheSSHReserve
+}
+
+// reclaimFinishedFor removes decided requests, oldest first, until entry fits.
+// A decided request only waits for a late follow-up, which must not cost a new
+// login its admission. Called with authCacheMu held.
+func (s *State) reclaimFinishedFor(entry *types.AuthRequest) bool {
+	for _, id := range s.authCache.Keys() {
+		if rn, ok := s.authCache.Peek(id); ok && rn.IsFinished() {
+			s.authCache.Remove(id)
+
+			if !s.authCacheFullFor(entry) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// releaseAuth returns a login whose approval failed to pending. An expiry
+// dropped while the approval held it is delivered now.
+func (s *State) releaseAuth(id types.AuthID, rn *types.AuthRequest) {
+	rn.Release()
+
+	if _, ok := s.authCache.Peek(id); !ok {
+		rn.FinishAuth(types.AuthVerdict{Err: ErrRegistrationExpired})
+	}
 }
 
 // DeleteAuthCacheEntryForTest drops a pending auth request from the cache,
@@ -2989,7 +3185,7 @@ func (s *State) processReauthTags(
 				Bool(zf.WasAuthKeyTagged, wasAuthKeyTagged).
 				Msg("Reauth: removing all tags, returning node ownership to user")
 
-			node.Tags = []string{}
+			node.Tags = nil
 			node.UserID = &user.ID
 			node.User = user
 
@@ -3084,11 +3280,20 @@ func (s *State) HandleNodeFromAuthPath(
 		expiry = &utc
 	}
 
-	// Get the registration entry from cache
+	// Claimed, the login is this approval's to decide: another approval is
+	// refused, and expiry no longer decides it.
 	regEntry, ok := s.GetAuthCacheEntry(authID)
-	if !ok {
+	if !ok || !regEntry.Claim() {
 		return types.NodeView{}, hsdb.ErrNodeNotFoundRegistrationCache
 	}
+
+	delivered := false
+
+	defer func() {
+		if !delivered {
+			s.releaseAuth(authID, regEntry)
+		}
+	}()
 
 	// Get the user
 	user, err := s.db.GetUserByID(userID)
@@ -3199,11 +3404,11 @@ func (s *State) HandleNodeFromAuthPath(
 		}
 	}
 
-	// Signal to waiting clients
-	regEntry.FinishAuth(types.AuthVerdict{Node: finalNode})
+	// The entry stays cached so a follow-up that looks it up after this
+	// still reads the verdict.
+	regEntry.Deliver(types.AuthVerdict{Node: finalNode})
 
-	// Remove from registration cache
-	s.authCache.Remove(authID)
+	delivered = true
 
 	// The login may have created the user (OIDC), which the policy must see.
 	s.refreshUsersAfterRegistration(finalNode, types.UserID(user.ID))
@@ -4170,7 +4375,7 @@ func (s *State) UpdatePolicy(ctx context.Context, pol []byte) (*types.Policy, er
 
 	current := s.Snapshot()
 
-	err = policy.ValidatePolicy(pol, current.Users(), current.ListNodes())
+	err = policy.ValidatePolicyAgainst(pol, current.Users(), current.ListNodes(), current.globalFilterOf)
 	if err != nil {
 		return nil, invalidPolicyError{err}
 	}

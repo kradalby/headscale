@@ -54,6 +54,7 @@ Headscale provides a metrics and debug endpoint. It allows to introspect differe
 - Information about the Go runtime, memory usage and statistics
 - Connected nodes and pending registrations
 - Active policy, filters and SSH policy
+- Which filter sources are sent as addresses instead of capabilities, and how filters are delivered
 - Current DERPMap
 - Prometheus metrics
 
@@ -159,6 +160,32 @@ When an update appears stuck:
 With `HEADSCALE_DEBUG_DUMP_MAPRESPONSE_PATH` set before server startup, `/debug/mapresponses` exposes dumped responses.
 These are generated responses, dumped before network writes; they do not prove receipt or application by a client.
 
+### Capability sources and filter delivery
+
+`/debug/capability-sources` reports what [capability sources](policy.md#capability-sources) and [filter
+chunks](policy.md#filter-chunks) send, from one snapshot:
+
+- `enabled`: `policy.capability_sources`.
+- `receivers`: nodes by why their whole filter goes as addresses; `capability` counts the nodes sent capabilities.
+- `rules`: rules of filters sent capabilities, by why a source of theirs goes as addresses; `capability` counts the
+  rules with none. An `autogroup:self` rule counts once per owner.
+- `filters_cut_in_address_form`, `rules_cut_with_address_sources`: filters cut with every source as addresses, and rules
+  cut with an address source into filters otherwise in capability form, by reason, since the process started.
+- `filter_chunks`: `policy.filter_chunks`.
+- `filter_deliveries`: how map sessions were sent their filter since the process started: `chunks`, or the whole filter
+  under `"base"` because the option is off (`chunks-off`) or the client is not Tailscale's own (`chunk-client`).
+
+The reasons, described in [Where addresses stay](policy.md#where-addresses-stay), are `address-mode` (the option is
+off), `literal` (addresses by nature), `local-nets` (routes, app connector or service IP), `client`, `cap-grant` (app
+capabilities) and `portless` (other protocols). The same counts are exported as
+`headscale_policy_address_form_receivers{reason}`, `headscale_policy_address_form_rules{reason}`,
+`headscale_policy_address_form_filters_cut_total{reason}`, `headscale_policy_address_form_rules_cut_total{reason}` and
+`headscale_policy_filter_deliveries_total{delivery}`; `headscale_policy_capability_sources_enabled` is 1 with the option
+on.
+
+To see what a node holds, run `tailscale debug netmap` on it: its packet filter, and the `CapMap` of itself and of its
+peers.
+
 ### Revalidating policy and auditing incremental compilation
 
 Installing byte-identical policy through the in-memory `SetPolicy` operation or a file reload skips policy compilation
@@ -175,12 +202,23 @@ headscale policy check --file policy.json
 When the server is stopped, add `--bypass-server-and-access-database-directly` to check against persisted users and nodes.
 At boot, failing stored policy tests log a warning and do not prevent startup.
 
-`HEADSCALE_DEBUG_POLICY_AUDIT=1` compares incremental policy compilation and derived peer classes with fresh compilation
-and peer scans when those graph cells recompute. Mismatches log `policy audit`; integration tests treat them as failures.
-This checks policy-derived results, including filters, route matchers and peer visibility. It does not continuously
-revalidate policy tests, audit endpoint-only commits that skip recompilation, or check DNS rendering, notification
-routing, response diffs, network writes or client state. Fresh peer scans are quadratic, so this diagnostic can add
-substantial cost on large tailnets.
+`HEADSCALE_DEBUG_POLICY_AUDIT=1` holds what clients are sent against the policy compiled from scratch in address form:
+every served packet filter, peer list, route and `via` election. With capability sources, each served filter must allow
+what the address form allows once each capability is read as the addresses of the nodes the receiver is sent holding it:
+itself and its peers. That assumes the client honours every capability it is sent; of which nodes are sent addresses
+instead, the audit checks only that a node announcing routes, acting as an app connector or hosting a service IP is sent
+no capability source. The other fallbacks (clients other than Tailscale's, app capability rules, other protocols) are
+held by the unit tests and the client canaries, not by the audit. The parts of the policy compile that still serve
+clients (SSH policies, node attributes, tag owners and auto-approvers) are held, compiled incrementally, against a
+compile from scratch. The map hub also renders afresh the sessions a change did not wake and logs any whose map would
+differ. Mismatches log `policy audit`; integration tests treat them as failures. The audit does not revalidate policy
+tests, or check DNS rendering, network writes or client state. It scans every pair of nodes, which is quadratic, so it
+can add substantial cost on large tailnets.
+
+`HEADSCALE_DEBUG_BENCHMARK_ASSUME_OFFICIAL_CLIENT=1` treats a client that reports no application, Go version or
+Tailscale version as Tailscale's own client, so that load generators speaking the control protocol directly are sent
+capability sources and chunked filters. A client that names itself is unaffected. For benchmarks only: a real client
+that reports nothing and cannot look capabilities up would drop those rules.
 
 ### Offline peer-history memory
 

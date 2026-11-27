@@ -461,6 +461,47 @@ func TestTailNodeDisableIPv4(t *testing.T) {
 	}
 }
 
+// TestAPeerLeftWithoutAddressesRendersNil pins the render's one form:
+// a peer whose every address is hidden — an IPv4-only node under
+// disable-ipv4 — renders with nil addresses and nil allowed IPs from
+// every path that strips them, so a session, which compares what it sent
+// with slices.Equal, keeps one form.
+func TestAPeerLeftWithoutAddressesRendersNil(t *testing.T) {
+	t.Parallel()
+
+	v4Only := types.Node{GivenName: "v4-only", IPv4: iap("100.64.0.1"), Hostinfo: &tailcfg.Hostinfo{}}
+
+	// The node's own disable-ipv4 strips the one address it holds.
+	tn, err := v4Only.View().TailNode(0, func(types.NodeID) []netip.Prefix { return nil },
+		&types.Config{}, types.DNSView{}, tailcfg.NodeCapMap{types.NodeAttrDisableIPv4: nil})
+	if err != nil {
+		t.Fatalf("TailNode: %v", err)
+	}
+
+	if tn.Addresses != nil {
+		t.Errorf("TailNode under its own disable-ipv4: Addresses %v, want nil", tn.Addresses)
+	}
+
+	if tn.AllowedIPs != nil {
+		t.Errorf("TailNode under its own disable-ipv4: AllowedIPs %v, want nil", tn.AllowedIPs)
+	}
+
+	// A viewer with disable-ipv4 strips a peer's v4 identity.
+	base := &tailcfg.Node{
+		Addresses:  []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+		AllowedIPs: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+	}
+	stripped := withoutIPv4Identity(base)
+
+	if stripped.Addresses != nil {
+		t.Errorf("withoutIPv4Identity: Addresses %v, want nil", stripped.Addresses)
+	}
+
+	if stripped.AllowedIPs != nil {
+		t.Errorf("withoutIPv4Identity: AllowedIPs %v, want nil", stripped.AllowedIPs)
+	}
+}
+
 func TestNodeExpiry(t *testing.T) {
 	tp := func(t time.Time) *time.Time {
 		return &t

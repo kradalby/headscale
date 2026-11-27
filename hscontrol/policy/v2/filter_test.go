@@ -277,7 +277,7 @@ func TestParsing(t *testing.T) {
 `,
 			want: []tailcfg.FilterRule{
 				{
-					SrcIPs: []string{"200.200.200.200"},
+					SrcIPs: []string{"100.64.0.200"},
 					DstPorts: []tailcfg.NetPortRange{
 						{IP: "100.100.100.100", Ports: tailcfg.PortRangeAny},
 					},
@@ -310,7 +310,7 @@ func TestParsing(t *testing.T) {
 `,
 			want: []tailcfg.FilterRule{
 				{
-					SrcIPs: []string{"200.200.200.200"},
+					SrcIPs: []string{"100.64.0.200"},
 					DstPorts: []tailcfg.NetPortRange{
 						{IP: "100.100.100.100", Ports: tailcfg.PortRangeAny},
 					},
@@ -377,7 +377,7 @@ func TestParsing(t *testing.T) {
 						IPv4: ap("100.100.100.100"),
 					},
 					&types.Node{
-						IPv4:     ap("200.200.200.200"),
+						IPv4:     ap("100.64.0.200"),
 						User:     &users[0],
 						Hostinfo: &tailcfg.Hostinfo{},
 					},

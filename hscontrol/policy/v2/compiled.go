@@ -9,6 +9,7 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
 	"go4.org/netipx"
 	"tailscale.com/net/tsaddr"
@@ -195,7 +196,25 @@ func (pol *Policy) compileGrants(
 	users types.Users,
 	nodes views.Slice[types.NodeView],
 ) []compiledGrant {
-	compiled, _ := pol.compileGrantsFrom(nil, nil, users, nodes)
+	if pol == nil || (pol.ACLs == nil && pol.Grants == nil) {
+		return nil
+	}
+
+	grants := pol.allGrants()
+	compiled := make([]compiledGrant, 0, len(grants))
+	srcs := sourceCache{}
+
+	for _, grant := range grants {
+		cg, err := pol.compileOneGrant(grant, users, nodes, srcs)
+		if err != nil {
+			log.Trace().Err(err).Msg("compiling grant")
+		}
+
+		if cg != nil {
+			cg.ruleKeys = ruleKeys(cg.rules)
+			compiled = append(compiled, *cg)
+		}
+	}
 
 	return compiled
 }
@@ -542,14 +561,26 @@ func (pol *Policy) compileOtherDests(
 			dstIPStrings []string
 		)
 
-		for _, dst := range otherDests {
+		for i, dst := range otherDests {
+			// SaaS writes a destination the document repeats once.
+			if slices.ContainsFunc(otherDests[:i], func(o Alias) bool { return o.String() == dst.String() }) {
+				continue
+			}
+
 			ips, err := pol.resolveAlias(dst, users, nodes)
 			if err != nil {
 				continue
 			}
 
+			capDsts := ips.Prefixes()
+			// * is every address as a destination, as for ports: SaaS gives
+			// the sources the subnet routes. A receiver is sent its own.
+			if _, wildcard := dst.(Asterix); wildcard {
+				capDsts = []netip.Prefix{tsaddr.AllIPv4(), tsaddr.AllIPv6()}
+			}
+
 			capGrants = append(capGrants, tailcfg.CapGrant{
-				Dsts:   ips.Prefixes(),
+				Dsts:   capDsts,
 				CapMap: grant.App,
 			})
 
@@ -689,27 +720,52 @@ func ownSelfRules(
 	return userSelfRules(cg, node.User().ID(), userIdx)
 }
 
+// selfUsers returns, sorted, the users whose autogroup:self rules node holds:
+// its own, and every user with a device one of routes covers, as SaaS sends
+// them to a router. Reducing the rules to the node keeps the covered
+// destinations.
+func selfUsers(node types.NodeView, routes []netip.Prefix, userIdx userNodeIndex) []uint {
+	var out []uint
+
+	for _, uid := range slices.Sorted(maps.Keys(userIdx)) {
+		own := nodeHasUserIdentity(node) && node.User().ID() == uid
+		if own || routesCoverAny(routes, userIdx[uid]) {
+			out = append(out, uid)
+		}
+	}
+
+	return out
+}
+
+// routesCoverAny reports whether a route contains an address of any node.
+func routesCoverAny(routes []netip.Prefix, nodes []types.NodeView) bool {
+	return slices.ContainsFunc(nodes, func(n types.NodeView) bool {
+		return slices.ContainsFunc(n.IPs(), func(ip netip.Addr) bool {
+			return slices.ContainsFunc(routes, func(r netip.Prefix) bool { return r.Contains(ip) })
+		})
+	})
+}
+
 // filterSelfRules returns the autogroup:self rules a node's packet filter
-// holds: its own user's, or, on an exit node, whose exit routes contain
-// every self destination, every user's in user order, as Tailscale sends
-// them. Only the packet filter needs other users' rules: they never make
-// the exit node a peer, so the peer paths use [ownSelfRules].
+// holds, in user order: those of [selfUsers] over every route it serves,
+// which on an exit node is every user.
 func filterSelfRules(
 	cg *compiledGrant,
 	node types.NodeView,
 	userIdx userNodeIndex,
 ) keyedRules {
-	if !node.IsExitNode() {
-		return ownSelfRules(cg, node, userIdx)
-	}
-
 	if cg.self == nil {
 		return keyedRules{}
 	}
 
+	routes := slices.Concat(node.SubnetRoutes(), node.ExitRoutes())
+	if len(routes) == 0 {
+		return ownSelfRules(cg, node, userIdx)
+	}
+
 	var all keyedRules
 
-	for _, uid := range slices.Sorted(maps.Keys(userIdx)) {
+	for _, uid := range selfUsers(node, routes, userIdx) {
 		r := userSelfRules(cg, uid, userIdx)
 		all.rules = append(all.rules, r.rules...)
 		all.keys = append(all.keys, r.keys...)
@@ -905,24 +961,23 @@ func viaDstsForNode(
 		return nil, false
 	}
 
-	// [types.NodeView.SubnetRoutes] excludes exit routes, so the overlap
-	// gate below sees only subnet advertisements. autogroup:internet on
-	// a via-tagged exit advertiser is handled separately because its
-	// eligibility is per-node ([types.NodeView.IsExitNode]) rather than
-	// per-prefix overlap.
-	nodeSubnetRoutes := node.SubnetRoutes()
+	// An exit route serves a destination as a subnet route does: SaaS
+	// sends a via-tagged exit node the rule for any destination of its
+	// family. autogroup:internet is handled separately: only an exit node
+	// serves it, whatever else it routes.
+	nodeRoutes := slices.Concat(node.SubnetRoutes(), node.ExitRoutes())
 
 	var viaDstPrefixes []netip.Prefix
 
 	for _, dstPrefix := range cg.via.resolvedDsts {
 		// Equality would reject any broader or narrower dst relative
 		// to the advertised route. Containment in either direction
-		// matches the operator's authorisation: a broader dst restricts
-		// traffic to the subset the router serves; a narrower dst rides
-		// on a router covering more than the operator asked for. The
-		// rule emits the literal dst either way because that is what
-		// the policy authorised.
-		if slices.ContainsFunc(nodeSubnetRoutes, dstPrefix.Overlaps) {
+		// matches the operator's authorisation: the rule emits the
+		// literal dst either way, so a broader dst is served whole
+		// rather than cut to what the router serves, and a narrower
+		// dst rides on a router covering more than the operator
+		// asked for.
+		if slices.ContainsFunc(nodeRoutes, dstPrefix.Overlaps) {
 			viaDstPrefixes = append(viaDstPrefixes, dstPrefix)
 		}
 	}
@@ -987,18 +1042,33 @@ func compileViaForNode(
 	return rules
 }
 
+// reachInternet reports whether one of prefixes holds a public address.
+func reachInternet(prefixes []netip.Prefix) bool {
+	return slices.ContainsFunc(prefixes, util.TheInternet().OverlapsPrefix)
+}
+
 // viaPeerRule returns a rule that links node, as a via router, to the grant's
 // sources. It names the router's own addresses: the filter rule names the route,
 // which would also link a router that is a source to everything else serving
 // that route, and via-grant-v81 shows SaaS does not.
-//
-// shortcut: a node with an approved route over the router's address also matches,
-// as for any rule naming a node. Bind the link to the router if that shape matters.
+// The peer map reads it with the router as destination only, so a node
+// routing over the router's address is not linked by it.
 func viaPeerRule(
 	cg *compiledGrant,
 	node types.NodeView,
 ) []tailcfg.FilterRule {
-	if prefixes, internet := viaDstsForNode(cg, node); len(prefixes) == 0 && !internet {
+	prefixes, internet := viaDstsForNode(cg, node)
+
+	// A router is shown to the sources through a subnet route, or as an
+	// exit node when a destination it is sent the rule for is on the
+	// internet: SaaS shows nobody an exit node sent the rule for a private
+	// destination, or none, for a public one of the other family.
+	subnets := node.SubnetRoutes()
+	serves := internet || slices.ContainsFunc(prefixes, func(p netip.Prefix) bool {
+		return slices.ContainsFunc(subnets, p.Overlaps) || util.TheInternet().OverlapsPrefix(p)
+	})
+
+	if !serves {
 		return nil
 	}
 
@@ -1078,6 +1148,8 @@ func (pol *Policy) compileNodeAttrsFrom(
 
 		ips := n.IPs()
 
+		// Targets resolve to addresses, each held by one node: NewState
+		// refuses a shared or missing one.
 		for _, t := range targets {
 			if slices.ContainsFunc(ips, t.ips.Contains) {
 				for _, attr := range t.attrs {
@@ -1092,6 +1164,8 @@ func (pol *Policy) compileNodeAttrsFrom(
 	result := make(map[types.NodeID]tailcfg.NodeCapMap, len(prev))
 
 	for _, n := range nodes.All() {
+		// An unchanged node keeps its attributes: they read only its own
+		// addresses, which no other node holds.
 		if old, ok := prevNodes[n.ID()]; ok && prev != nil && old == n {
 			if c, ok := prev[n.ID()]; ok {
 				result[n.ID()] = c
@@ -1108,60 +1182,9 @@ func (pol *Policy) compileNodeAttrsFrom(
 	return result, nil
 }
 
-type compiledGrantResult struct {
-	cg *compiledGrant
-}
-
-// compileGrantsFrom compiles every grant, reusing prev, the results of a
-// compile of the same policy and users, for each grant the change since
-// cannot reach. prev and change are nil for a compile from scratch.
-func (pol *Policy) compileGrantsFrom(
-	prev []compiledGrantResult,
-	change *nodeChange,
-	users types.Users,
-	nodes views.Slice[types.NodeView],
-) ([]compiledGrant, []compiledGrantResult) {
-	if pol == nil || (pol.ACLs == nil && pol.Grants == nil) {
-		return nil, nil
-	}
-
-	grants := pol.allGrants()
-
-	if len(prev) != len(grants) {
-		prev, change = nil, nil
-	}
-
-	results := make([]compiledGrantResult, len(grants))
-	compiled := make([]compiledGrant, 0, len(grants))
-	srcs := sourceCache{}
-
-	for i, grant := range grants {
-		if change != nil && !change.reaches(grant) {
-			results[i] = prev[i]
-		} else {
-			cg, err := pol.compileOneGrant(grant, users, nodes, srcs)
-			if err != nil {
-				log.Trace().Err(err).Msg("compiling grant")
-			}
-
-			if cg != nil {
-				cg.ruleKeys = ruleKeys(cg.rules)
-			}
-
-			results[i] = compiledGrantResult{cg: cg}
-		}
-
-		if results[i].cg != nil {
-			compiled = append(compiled, *results[i].cg)
-		}
-	}
-
-	return compiled, results
-}
-
 // nodeChange summarises what changed in the nodes between two compiles,
-// as grant compilation reads them: which tags and users gained or lost a
-// node or one of its addresses or routes, whether an untagged node
+// as alias resolution and SSH read them: which tags and users gained or
+// lost a node or one of its addresses or routes, whether an untagged node
 // changed, and whether approved routes changed.
 type nodeChange struct {
 	tags     map[Tag]struct{}
@@ -1273,19 +1296,6 @@ func diffNodes(prev map[types.NodeID]types.NodeView, nodes views.Slice[types.Nod
 	}
 
 	return c
-}
-
-// reaches reports whether the change can alter grant's compile: one of
-// its aliases resolves differently, see [nodeChange.moves], or a via tag
-// gained or lost a node.
-func (c *nodeChange) reaches(grant Grant) bool {
-	for _, t := range grant.Via {
-		if _, ok := c.tags[t]; ok {
-			return true
-		}
-	}
-
-	return slices.ContainsFunc(slices.Concat(grant.Sources, grant.Destinations), c.moves)
 }
 
 // moves reports whether the change can alter what a resolves to: a tag or
@@ -1444,8 +1454,6 @@ func (pol *Policy) allGrants() []Grant {
 
 	return grants
 }
-
-func sharedRules(grants []compiledGrant) []tailcfg.FilterRule { return globalFilterRules(grants) }
 
 func grantRulesForNode(cg *compiledGrant, node types.NodeView, userIdx userNodeIndex) []tailcfg.FilterRule {
 	switch cg.category {

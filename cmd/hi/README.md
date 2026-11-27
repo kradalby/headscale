@@ -77,6 +77,12 @@ CGO_ENABLED=0 GOOS=linux go test -c ./integration -o integration.test
 go run ./cmd/hi run --test-binary=./integration.test "^TestHeadscale$"
 ```
 
+`HEADSCALE_INTEGRATION_CAPABILITY_SOURCES=true` runs every Headscale a test
+starts with `policy.capability_sources` on, as `hsic.WithCapabilitySources`
+does for one, and `HEADSCALE_INTEGRATION_FILTER_CHUNKS=true` with
+`policy.filter_chunks` on, as `hsic.WithFilterChunks` does; like every
+`HEADSCALE_INTEGRATION_*` variable, `hi` passes them to the test container.
+
 With `--test-binary`, the runner mounts the executable read-only and uses
 `HEADSCALE_INTEGRATION_HEADSCALE_IMAGE` as its runtime image when set.
 Otherwise it uses the usual Go image. Build the binary with `CGO_ENABLED=0`
